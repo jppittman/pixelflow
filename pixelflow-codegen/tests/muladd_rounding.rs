@@ -21,33 +21,29 @@
 //! all four backends from any host by `emit::tests::muladd_encoding`.
 #![cfg(target_arch = "x86_64")]
 
-use pixelflow_codegen::emit::executable::{Point4, TileSlice};
+use pixelflow_codegen::CompiledKernel;
 use pixelflow_codegen::emit::{EmitCtx, compile};
-use pixelflow_codegen::{CompiledKernel, JIT_VECTOR_BYTES};
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId};
 
-/// Lanes in one emitted batch.
-const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
-
-/// One point of a compiled kernel: a single-batch collapse call, lane 0 read
-/// back. `call_collapse` is the collapse driver's entry; a test that wants one
-/// number owns this loop rather than the crate growing a point API for it.
+/// One point of a kernel compiled at [`pixelflow_ir::LatticeShape::POINT`],
+/// the one sample read back. `CompiledKernel::call` is the collapse driver's
+/// entry; a test that wants one number owns this loop rather than the crate
+/// growing a point API for it.
 ///
 /// `block` holds the kernel's arguments in link order — the addend and the
-/// wall's multiplier, which used to be the Z and W coordinates.
+/// wall's multiplier, which used to be the Z and W coordinates — and is the
+/// uniform block the context passes it in, since these arenas declare no
+/// buffer.
 fn eval_point(jit: &CompiledKernel, x: f32, y: f32, block: &[f32]) -> f32 {
-    let mut out = [0.0f32; LANES];
-    let ctx: [*const f32; 1] = [block.as_ptr()];
-    // SAFETY: `out` holds exactly one whole batch; these arenas declare no
-    // buffers, so `ctx[0]` is the block entry and holds one `f32` per
-    // declared argument, alive for the call.
+    let mut out = [0.0f32; 1];
+    let origin = [x, y];
+    // SAFETY: `ctx[0]` is the uniform block — one `f32` per declared
+    // argument, in link order — `ctx[1]` is the origin block, and `out`
+    // holds the one sample a single-point lattice writes.
+    let ctx: [*const f32; 2] = [block.as_ptr(), origin.as_ptr()];
     unsafe {
-        jit.call_collapse(
-            ctx.as_ptr(),
-            TileSlice::single(out.as_mut_ptr()),
-            Point4::new([x; LANES], [y; LANES], [0.0; LANES], [0.0; LANES]),
-        );
+        jit.call(ctx.as_ptr(), out.as_mut_ptr(), 1);
     }
     out[0]
 }
@@ -136,8 +132,22 @@ fn an_unspilled_muladd_rounds_the_way_this_target_does() {
     let z = arg_leaf(&mut a);
     let root = a.push_ternary(OpKind::MulAdd, x, y, z);
 
-    let result = compile(&a, root).expect("compile MulAdd(X, Y, U)");
-    assert_eq!(result.spill_count, 0, "this scenario must not spill");
+    let result =
+        compile(&a, root, pixelflow_ir::LatticeShape::POINT).expect("compile MulAdd(X, Y, U)");
+    // Not asserted: `result.spill_count`. Every kernel this file has compiled
+    // at `LatticeShape::POINT` reports one nominal spill, independent of
+    // content — a bare `Const(1.0)` and `X + Y` report the same
+    // `spill_count == 1, spill_bytes == 80` this scenario does, with zero
+    // corresponding store or load in `result.traffic`'s per-scope counts, so
+    // it is not a register genuinely forced to memory. That looks like the
+    // lattice's own row/col/lane folds (`pixelflow_ir::passes::lattice::collapse`
+    // wraps every kernel in them, even a one-point one) costing a nominal
+    // slot the emitted code never touches, not register pressure from this
+    // scenario's operands — see this file's final report for the finding.
+    // The property this test actually needs — that the multiplicands reach
+    // the backend live in registers rather than reloaded — is what the bit
+    // check below proves: only the fused, single-rounding form produces
+    // `fused(A, B, C)`/its SSE2 stand-in.
     let jit = CompiledKernel::new(result.code, pixelflow_ir::LatticeShape::POINT);
     let got = eval_point(&jit, A, B, &[C]);
 
@@ -163,49 +173,62 @@ fn an_unspilled_muladd_rounds_the_way_this_target_does() {
 /// doc calls "how a caller forces spilling deliberately" — reaches it at
 /// every width instead of at whichever one the scenario happened to suit.
 ///
-/// The multiplicands have to be *computed* values: a coordinate is precolored
-/// into an input register and never spills, so `MulAdd(X, Y, Z)` cannot
-/// decompose no matter how small the pool is. Doubling is the cheapest
-/// computation that is also exact, which is why the inputs are `A`/`B` halved.
+/// Three things the scenario has to get right, and each has been the reason
+/// an earlier version of it quietly tested the fused arm instead:
 ///
-/// The `MulAdd` also has to come *last*. The allocator evicts by Belady — the
-/// value needed furthest in the future — so what decides the multiplicands'
-/// fate is not how small the pool is but where their last use falls relative
-/// to everything competing for a register. With the `MulAdd` in the middle and
-/// the wall summed after it, the wall outlives the multiplicands and the wall
-/// is what spills, however tight the budget; the scenario only ever reached
-/// the decomposed arm because a one-register pool spills whatever it is
-/// holding. That is no longer a budget a caller can ask for
-/// (`RegisterFile::MIN_SCRATCH` — a temp cannot spill), so the pressure has to
-/// come from the live ranges rather than from the pool being a single
-/// register.
+/// - **Both multiplicands vary along the column.** A value the lattice's
+///   column fold does not vary — `Y + Y`, a uniform — is a root the emitter
+///   computes once outside that fold and hands in, carried in a register or
+///   reloaded at the fold's head, and either way *in* a register at the
+///   `MulAdd`. So `b` is `Y + Y` plus `X · U` at `U = 0`: exactly `B`, and
+///   column-varying. `a` is `X + X`; doubling is the cheapest computation that
+///   is also exact, which is why the inputs are `A`/`B` halved.
+/// - **The multiplicands are Belady's first victims.** The allocator evicts
+///   the value read furthest ahead, so what decides the multiplicands' fate is
+///   not how small the pool is (`RegisterFile::MIN_SCRATCH` — a temp cannot
+///   spill, so a one-register pool is not a budget a caller can ask for) but
+///   where their last read falls relative to everything competing with them.
+///   They are defined first and read last, by the `MulAdd` at the root — and
+///   nothing else may be read *after* the `MulAdd`, or that is what gets
+///   evicted in their place.
+/// - **The wall is read twice, both times before the `MulAdd`.** The schedule
+///   is the legalized arena's order, which is post-order from the root: a
+///   term consumed once is defined where it is consumed, and ten such terms
+///   hold one register between them however they were pushed. So every term
+///   is summed twice, in opposite orders (the same order would be the same
+///   nodes): each is live from its first sum to its second, the pool
+///   overflows, and the multiplicands — read further ahead than any term —
+///   are what it sheds. A value is brought back to a register and kept only
+///   when it will be read again after that; the multiplicands have one read,
+///   so they are reloaded for the `MulAdd` alone, which is the decomposed arm.
+///   Each term is `(X + i) · U`, exactly +0.0 at `U = 0`, so the addend is
+///   bit-for-bit `z` and the rounding under test is the `MulAdd`'s alone. It
+///   is built from a uniform because the folder sees through any zero it can
+///   evaluate: `(l − r) − (l − r)` was folded to one constant and left no
+///   wall at all.
+///
+/// That pressure was actually created is read from the emitted traffic — a
+/// value stored to the stack — not from `spill_count`, which counts the
+/// frame's slots and is nonzero for every kernel at a one-point lattice.
 #[test]
 fn a_spilled_muladd_rounds_twice_on_every_target() {
+    fn chain(a: &mut ExprArena, terms: &[ExprId]) -> ExprId {
+        terms[1..]
+            .iter()
+            .fold(terms[0], |acc, &t| a.push_binary(OpKind::Add, acc, t))
+    }
+
     let mut a = ExprArena::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let z = arg_leaf(&mut a);
-    // The multiplicands, defined first and consumed last, so they hold the
-    // longest live ranges in the schedule — which is what makes them Belady's
-    // first two eviction choices once the wall fills the pool.
-    let ma = a.push_binary(OpKind::Add, x, x);
-    let mb = a.push_binary(OpKind::Add, y, y);
-
-    // The wall. One spilled multiplicand is not enough — `resolve_operands`
-    // only decomposes when *both* are out of registers — so something has to
-    // hold the pool across the whole schedule.
-    //
-    // Every term is `(X + i) · U`, which is exactly +0.0 at U = 0 and so
-    // perturbs no bit of the sum it lands in. It has to be built from
-    // something the folder cannot see through: the wall here was
-    // `(l − r) − (l − r)`, also worth zero, and `legalize` folded all six of
-    // those to one constant — the scenario had no wall at all, and only ever
-    // reached the decomposed arm because the pool was smaller than three. A
-    // uniform is never folded — its value is unknown until the call — so
-    // multiplying by it keeps the term worth zero without saying so in a form
-    // the folder can see. Each term still depends on X, so none is
-    // loop-invariant and hoistable out of a collapse body.
     let w = arg_leaf(&mut a);
+
+    let ma = a.push_binary(OpKind::Add, x, x);
+    let yy = a.push_binary(OpKind::Add, y, y);
+    let xw = a.push_binary(OpKind::Mul, x, w);
+    let mb = a.push_binary(OpKind::Add, yy, xw);
+
     let wall: Vec<ExprId> = (1..=10u32)
         .map(|i| {
             let c = a.push_const(i as f32);
@@ -213,24 +236,18 @@ fn a_spilled_muladd_rounds_twice_on_every_target() {
             a.push_binary(OpKind::Mul, xi, w)
         })
         .collect();
-
-    // Sum the wall first, then feed it to the `MulAdd` as part of the addend.
-    // Each term is exactly +0.0, so the addend is bit-for-bit `z` and the
-    // rounding under test is the `MulAdd`'s alone.
-    let wall_sum = wall
-        .iter()
-        .skip(1)
-        .fold(wall[0], |acc, &w| a.push_binary(OpKind::Add, acc, w));
-    let addend = a.push_binary(OpKind::Add, z, wall_sum);
+    let forward = chain(&mut a, &wall);
+    let reversed: Vec<ExprId> = wall.iter().rev().copied().collect();
+    let backward = chain(&mut a, &reversed);
+    let addend = a.push_binary(OpKind::Add, z, forward);
+    let addend = a.push_binary(OpKind::Add, addend, backward);
     let root = a.push_ternary(OpKind::MulAdd, ma, mb, addend);
 
     let result = EmitCtx::with_max_regs(1)
-        .compile(&a, root)
+        .compile(&a, root, pixelflow_ir::LatticeShape::POINT)
         .expect("compile spilled MulAdd");
-    assert!(
-        result.spill_count > 0,
-        "scenario failed to create register pressure"
-    );
+    let stores: u32 = result.traffic.scopes.iter().map(|s| s.stores).sum();
+    assert!(stores > 0, "scenario failed to create register pressure");
     let jit = CompiledKernel::new(result.code, pixelflow_ir::LatticeShape::POINT);
     let got = eval_point(&jit, HALF_A, HALF_B, &[C, 0.0]);
     assert_bits("decomposed MulAdd", got, decomposed(A, B, C));

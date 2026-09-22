@@ -24,8 +24,8 @@ use crate::kind::OpKind;
 /// needed for interning — which an `f32`'s `NaN` would refuse.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub enum ExprData {
-    /// Bound variable: coordinate (0 for X, 1 for Y), reduction binder (4..8),
-    /// or rewrite rule metavariable.
+    /// Bound variable: coordinate (0 for X, 1 for Y), reduction binder (from
+    /// 4, one per slot of the binder space), or rewrite rule metavariable.
     Var(u8),
     /// 32-bit floating point literal stored as raw IEEE 754 bits.
     Const(u32),
@@ -378,7 +378,7 @@ pub fn from_arena_roots(
                     .children(id)
                     .map(|c| map[c.0 as usize].expect("child must be emitted before parent"))
                     .collect();
-                let new_id = match *arena.node(id) {
+                let new_id = match arena.node(id) {
                     ExprNode::Var(i) => b.push_var(i),
                     ExprNode::Const(v) => b.push_const(v),
                     ExprNode::Param(i) => b.push_param(i),
@@ -387,10 +387,16 @@ pub fn from_arena_roots(
                     ExprNode::Ref(key) => b.push_ref(key),
                     ExprNode::Reduce { fold, .. } => b.push_reduce(fold, child_ids[0]),
                     ExprNode::Guard { on, off, .. } => b.push_guard(child_ids[0], on, off),
+                    // Post-legalize only: no `Kernel` holds a store, and a
+                    // term language a `Kernel` is made of has no word for one.
+                    ExprNode::Write { .. } => panic!(
+                        "a Write reached a Kernel's DAG: it is built by the legalize \
+                         passes after extraction, and nothing before them may hold one"
+                    ),
                     ExprNode::Unary(op, _)
                     | ExprNode::Binary(op, _, _)
                     | ExprNode::Ternary(op, _, _, _)
-                    | ExprNode::Nary(op, _, _) => b.push_nary(op, &child_ids),
+                    | ExprNode::Nary(op, _) => b.push_nary(op, &child_ids),
                 };
                 map[id.0 as usize] = Some(new_id);
             }

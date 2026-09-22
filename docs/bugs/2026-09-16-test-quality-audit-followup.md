@@ -17,6 +17,59 @@ naming and scope discipline. `core-term` had its own dedicated
 mutation-testing pass three days ago (`caf99b7`, #1259 — 1374 mutants, not
 part of this doc series but same methodology), so it was not re-swept here.
 
+## Rebased onto the H6 allocator — read the counts below as history
+
+This pass was measured against `regalloc.rs` as it stood at `93d48c8`
+(2,985 lines). Between then and this branch's merge of `main`, #1283 (H6
+step 5, "the emitter executes the lattice's folds") rewrote the allocator's
+scope model. **The sweep numbers in this document describe a file that no
+longer exists in that form, and must not be read as a current statement
+about `regalloc.rs`'s mutation coverage.** A fresh sweep against the H6
+allocator is carried forward as a backlog item; it is the only thing that
+can say what today's gaps are.
+
+What the merge required, and what it says about each test:
+
+- **Three tests deleted as obsolete.** `an_input_register_inside_the_pool_is_refused`,
+  `fixed_registers_disjoint_from_scratch_and_inputs_pass_checked` and
+  `a_fixed_register_aliasing_an_input_is_refused` all exercised
+  `RegisterFile::inputs`, which #1283 deleted outright: the collapse ABI is
+  `fn(ctx, out, pitch)` and passes no vectors, so there are no coordinate
+  input registers left to collide with. The behaviour is gone, not untested.
+- **Four fixtures ported to the scope model.** `a_root_the_body_never_reads_is_never_carried`
+  (now `a_root_the_fold_never_reads_is_never_carried`),
+  `fold_opening_at_matches_the_position_as_well_as_the_parent`, and the two
+  `destination`/`result register` tests were written against
+  `ScopedSchedule.regions` and `Scope::Region`, which became `body` plus
+  `folds`. The first gained a control root in the same allocation, so the
+  zero-use filter is pinned against a root the same budget *does* carry.
+- **Seventeen `Var`-as-coordinate leaves rewritten to `leaf()`.** A `Var`
+  reaching an allocation now names a fold binder and nothing else; the
+  allocator panics on one no enclosing fold binds. These fixtures predate
+  that rule and were building schedules it refuses.
+- **Four pressure fixtures rebuilt on `RegisterFile::MIN_SCRATCH`.** They
+  hardcoded "seven fillers, exactly the pool", which held only while the
+  leaf sat in an input register outside the pool. Post-H6 the leaf occupies
+  a pool register of its own, so the set that fills the pool is the leaf
+  plus `MIN_SCRATCH - 1` fillers. Their "spacer with no pool interaction"
+  also had to change: every value-defining op now needs a register, so the
+  spacer is a `Seq`, which defines no value and takes none.
+
+Because a rebuilt pressure fixture can very easily pass for the wrong
+reason, each was re-verified by mutation rather than by inspection — the
+same bar the rest of this document is written to. Against the restored
+tree, all 259 `pixelflow-codegen` lib tests pass, and:
+
+| mutation at `regalloc.rs`'s keep contest | caught by |
+|---|---|
+| `new_rank > rank(occupant)` → `>=` | `a_tie_with_the_evicted_occupant_does_not_keep_the_new_definition` (**only** this test) |
+| `new_rank > rank(occupant)` → `<` | the two `destination` tests, the constant test, and `constants_are_rematerialized_rather_than_spilled` |
+| the rematerialized-constant exclusion disabled | `a_constant_that_loses_its_keep_contest_is_never_given_a_register` (**only** this test) |
+| the demotion queue's `!keeps` guard disabled | `a_destination_that_forces_an_eviction_but_reads_later_than_the_occupant_is_spilled_next` and the tie test |
+
+Each rebuilt fixture is still the unique detector of the mutant it was
+written for, which is what makes the port a port rather than a rewrite.
+
 ## Mutation testing: `cargo-mutants` v27.1.0
 
 Not present in this environment (consistent with every prior pass) —

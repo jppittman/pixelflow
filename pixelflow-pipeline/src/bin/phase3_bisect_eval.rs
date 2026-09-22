@@ -275,7 +275,7 @@ fn main() {
     let selected: Vec<&(String, ExprArena, ExprId)> = entries
         .iter()
         .filter(|(name, arena, _)| {
-            name.starts_with(&args.name_prefix) && tier_is_classical(arena.nodes_raw().len())
+            name.starts_with(&args.name_prefix) && tier_is_classical(arena.len())
         })
         .collect();
     let selected = if args.limit > 0 {
@@ -317,7 +317,7 @@ fn main() {
         if done.contains(name) {
             continue;
         }
-        let node_count = arena.nodes_raw().len();
+        let node_count = arena.len();
         let class_cap = config_for_node_count(node_count).max_classes;
         let started = Instant::now();
 

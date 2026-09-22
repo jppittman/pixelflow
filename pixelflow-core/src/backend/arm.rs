@@ -28,12 +28,4 @@ impl F32x4 {
     pub(crate) fn splat(val: f32) -> Self {
         unsafe { Self(vdupq_n_f32(val)) }
     }
-
-    #[inline(always)]
-    pub(crate) fn sequential(start: f32) -> Self {
-        unsafe {
-            let arr = [start, start + 1.0, start + 2.0, start + 3.0];
-            Self(vld1q_f32(arr.as_ptr()))
-        }
-    }
 }

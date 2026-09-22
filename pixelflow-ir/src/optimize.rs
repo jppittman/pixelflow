@@ -294,7 +294,11 @@ mod tests {
             },
         ];
         let (out, _) = pipe.optimize(&arena, root).into_changed().expect("changed");
-        // Each bump adds a Const and an Add to whatever it was handed.
-        assert_eq!(out.len(), arena.len() + 6);
+        // Each bump pushes a Const(1.0) and an Add(root, that const). The
+        // arena hash-conses, so the three `Const(1.0)`s collapse into one
+        // node (pushed once, interned twice more) while the three `Add`s
+        // stay distinct — each wraps a different root. +1 for the shared
+        // const, +3 for the three structurally-different adds.
+        assert_eq!(out.len(), arena.len() + 4);
     }
 }

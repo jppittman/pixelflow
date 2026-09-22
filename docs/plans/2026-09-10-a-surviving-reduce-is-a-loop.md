@@ -454,6 +454,10 @@ composes a glyph's distance fold with its winding fold by name, and
 `expand_refs` splices the winding's `Reduce` straight into the distance fold's
 body.
 
+*(Since superseded: `ExpandNestedReduce` is deleted and `extract_folds` carves
+every level — see §5's last-but-one item. Nothing unrolls on either compile
+entry now.)*
+
 Measured over a 95-glyph tile-16 atlas (`pixelflow-pipeline`'s
 `glyph_phase_split`):
 
@@ -472,7 +476,7 @@ what transfers, not the absolute.)
 Code size does **not** collapse, and the reason is the row above it: the
 winding fold is still unrolled, because it is the nested one. Getting the rest
 needs nested fold loops — 2c's own §5 ("No nested reduce loops") is the next
-bite, not a caveat on this one.
+bite, not a caveat on this one. *(Taken: see §5.)*
 
 ### What 2c actually cost: a fold's slots aliased its parent's
 
@@ -810,7 +814,12 @@ tree of scopes with one kind of node.
   what would collapse the font to one program with no padding, and it is a
   separate change: the key must stop carrying the range, and the loop must
   compare against a loaded value rather than an immediate.
-- **No nested reduce loops.** One binder at a time until R1's gate is green on
-  a single level.
+- ~~**No nested reduce loops.** One binder at a time until R1's gate is green on
+  a single level.~~ **Done** (H6 step 1, [collapse-is-a-fold](2026-09-16-collapse-is-a-fold.md)
+  §5): `extract_folds` carves a fold inside a fold's body as a scope whose
+  parent is the outer fold, the allocator keeps every enclosing binder's
+  register out of the inner pool and parks the outer binders for the inner
+  body, and `ExpandNestedReduce` is deleted from both compile entries. A
+  glyph's winding fold is a loop inside its distance fold.
 - **No change to `Select`, `Ref`, or the fold's denotation.** A fold means what
   it meant; this is about what codegen does with one that survives.

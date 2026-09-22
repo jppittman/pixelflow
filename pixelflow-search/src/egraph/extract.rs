@@ -2296,19 +2296,19 @@ impl TieBreak for Insertion {
 pub(crate) struct Canonical;
 
 /// `node`'s position in [`Canonical`]'s order.
-fn canonical_key(egraph: &EGraph, node: &ENode) -> (u8, u64, usize, Vec<u32>) {
+fn canonical_key(egraph: &EGraph, node: &ENode) -> (u8, u128, usize, Vec<u32>) {
     let children: Vec<u32> = node
         .children_slice()
         .iter()
         .map(|&c| egraph.find(c).0)
         .collect();
     match node {
-        ENode::Var(i) => (0, u64::from(*i), 0, children),
-        ENode::Const(bits) => (1, u64::from(*bits), 0, children),
+        ENode::Var(i) => (0, u128::from(*i), 0, children),
+        ENode::Const(bits) => (1, u128::from(*bits), 0, children),
         ENode::Buffer(_) => (2, 0, 0, children),
         ENode::Uniform(_) => (3, 0, 0, children),
-        ENode::Param(i) => (4, u64::from(*i), 0, children),
-        ENode::Op { op, .. } => (5, op.kind() as u64, children.len(), children),
+        ENode::Param(i) => (4, u128::from(*i), 0, children),
+        ENode::Op { op, .. } => (5, op.kind() as u128, children.len(), children),
         // The fold *is* the discriminating part: two folds over one body
         // differ only in their metadata, so that is what orders them.
         ENode::Reduce { fold, .. } => (6, fold.to_bits(), children.len(), children),
@@ -4408,7 +4408,7 @@ mod tests {
         costs: &CostModel,
     ) -> usize {
         use pixelflow_ir::arena::ExprNode;
-        let mut seen = alloc::vec![false; arena.nodes_raw().len()];
+        let mut seen = alloc::vec![false; arena.len()];
         let mut stack = alloc::vec![root];
         let mut total = 0usize;
         while let Some(id) = stack.pop() {
@@ -4422,7 +4422,7 @@ mod tests {
                 | ExprNode::Uniform(_) => None,
                 ExprNode::Unary(k, _)
                 | ExprNode::Binary(k, _, _)
-                | ExprNode::Ternary(k, _, _, _) => Some(*k),
+                | ExprNode::Ternary(k, _, _, _) => Some(k),
                 other => panic!("unexpected extracted node {other:?}"),
             };
             if let Some(k) = kind {

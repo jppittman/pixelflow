@@ -9,10 +9,23 @@
 //! a DAG schedule rather than a tree.
 //!
 //! All four backends run that same allocator behind the same driver
-//! ([`IsaBackend`]). What a backend contributes is its `RegisterFile` — input
-//! registers, the allocatable pool, how many registers its encodings and its
-//! guards destroy, vector width — and its instruction encodings. Nothing else
-//! about a target reaches the allocation, framing, or control-flow logic.
+//! ([`IsaBackend`]). What a backend contributes is its `RegisterFile` — the
+//! allocatable pool, how many registers its encodings and its guards
+//! destroy, vector width, the ABI's three pointer registers — and its
+//! instruction encodings. Nothing else about a target reaches the
+//! allocation, framing, or control-flow logic.
+//!
+//! ## The loop nest
+//!
+//! There is no collapse scaffold. A kernel reaches this module already
+//! wrapped in the lattice's folds — rows, columns, lanes — by
+//! [`pixelflow_ir::passes::legalize`], so the emitted function is one scope
+//! (what runs once per call) with folds nested in it, every one emitted by
+//! the same `Reduce` arm: seed, test, body, combine, step. The lane fold is
+//! the one the `Write` inside names as its lane, and it is executed *by
+//! lanes*: its binder is the constant `[0, 1, …, L−1]`, it has no counter
+//! and no back edge, and its body is inlined into the column fold's
+//! (docs/plans/2026-09-16-collapse-is-a-fold.md §2.2).
 //!
 //! ## Spilling
 //!
@@ -54,7 +67,6 @@ pub mod avx2;
 pub mod avx512;
 #[cfg(test)]
 pub(crate) mod coverage;
-pub(crate) mod demand;
 pub mod encoded;
 pub mod executable;
 mod guards;
@@ -71,16 +83,20 @@ use pixelflow_ir::kind::OpKind;
 
 pub use guards::SelectArm;
 // Production code reads guards off the allocation (`Allocation::select_guards`)
-// rather than calling this directly — see `emit_dag_body_hoisted`. Only the
-// tests, which exercise the analysis against hand-built schedules the
-// allocator never sees, call it themselves.
+// rather than calling this directly — see `emit_scope`. Only the tests, which
+// exercise the analysis against hand-built schedules the allocator never
+// sees, call it themselves.
 #[cfg(test)]
 use guards::analyze_select_guards;
-use traffic::{Counting, EmitTraffic, ScopeTraffic};
+use traffic::{Counting, EmitTraffic};
 
 use alloc::vec::Vec;
 
 use crate::error::CompileError;
+use pixelflow_ir::arena::{UniformDecl, UniformId, UniformIdentity};
+use pixelflow_ir::fold::{Binder, Monoid};
+use pixelflow_ir::passes::lattice::{Collapse, Domain};
+use pixelflow_ir::variance::LatticeShape;
 
 /// The one contract every backend's instruction types satisfy.
 pub trait AsmInsn: Copy {
@@ -866,16 +882,21 @@ pub enum ResolvedOp {
     /// entry after the last buffer — and the scalar at `4 * offset` is
     /// broadcast to every lane: `vbroadcastss` on every x86 tier, `ldr s` +
     /// `dup` on NEON. Its variance is `CONST`, so it lands in the per-call
-    /// prologue.
+    /// scope.
     Uniform { dst: Reg, load: UniformLoad },
+    /// The lane fold's binder, materialized: `dst = [0, 1, …, L−1]` as
+    /// `f32`s, `L` being the backend's lane count. The one vector constant
+    /// that is not a broadcast, and the whole of what "executed by lanes"
+    /// costs the body.
+    Lanes { dst: Reg },
 }
 
 /// Where one uniform lives, relative to the context the kernel is called with.
 ///
 /// Two immediates, both fixed at compile time: which context entry holds the
-/// block (always the one past the kernel's buffer slots, so a kernel with no
-/// uniforms has no such entry and its context is exactly what it was), and
-/// the uniform's dense offset within the block, assigned by the link step.
+/// block — the one past the kernel's buffer slots for the link's uniforms,
+/// the one after that for the origin block every collapse reads — and the
+/// uniform's dense offset within that block, assigned by the link step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UniformLoad {
     /// Index into the context array of the block's base pointer.
@@ -983,10 +1004,21 @@ pub fn operand_sources(op: &ScheduledOp, resident: [bool; 3]) -> [OperandSource;
     };
     let arity = match op {
         ScheduledOp::Var(_)
+        | ScheduledOp::Lanes(_)
         | ScheduledOp::Const(_)
         | ScheduledOp::Uniform(_)
-        | ScheduledOp::Reduce(..) => 0,
-        ScheduledOp::Unary(..) | ScheduledOp::ShiftImm(..) | ScheduledOp::Gather(..) => 1,
+        | ScheduledOp::Reduce(..)
+        | ScheduledOp::Seq(..) => 0,
+        ScheduledOp::Unary(..)
+        | ScheduledOp::ShiftImm(..)
+        | ScheduledOp::Gather(..)
+        | ScheduledOp::Write { .. }
+        // A `Guard`'s one register operand is its mask — its own arm
+        // resolution never reaches `resolve_operands`/`operand_sources`
+        // (`emit_scope` special-cases it before either is called, the same
+        // way it special-cases `Reduce`), but the mask is still resolved the
+        // ordinary way, from wherever the allocator put it.
+        | ScheduledOp::Guard(..) => 1,
         ScheduledOp::Binary(..) => 2,
         ScheduledOp::Ternary(..) => 3,
     };
@@ -1086,19 +1118,62 @@ impl EmitCtx {
         self,
         arena: &pixelflow_ir::arena::ExprArena,
         root: pixelflow_ir::arena::ExprId,
+        shape: LatticeShape,
     ) -> Result<CompileResult, CompileError> {
-        let (arena, root) =
-            pixelflow_ir::passes::legalize(arena, root).map_err(CompileError::Legalize)?;
-        let schedule = arena_to_schedule(&arena, root);
-        compile_via_backend(schedule, &mut Native::new(self))
+        let mut backend = Native::new(self);
+        let lanes = backend.register_file().vector_bytes / BYTES_PER_LANE;
+        let collapse = Collapse {
+            domain: Domain {
+                shape,
+                origin: origin(),
+            },
+            lanes,
+        };
+        let (arena, root) = pixelflow_ir::passes::legalize(arena, root, &collapse)
+            .map_err(CompileError::Legalize)?;
+        let origin_ids = origin_slots(&arena);
+        let schedule = arena_to_schedule(&arena, root, origin_ids);
+        compile_via_backend(schedule, &mut backend)
     }
 }
 
-/// The coordinate inputs, in order: X, Y, Z, W.
+/// A lane is one `f32`.
+const BYTES_PER_LANE: u32 = 4;
+
+/// The two per-call scalars every collapse reads: where the lattice's sample
+/// `(0, 0)` lies, `x0` then `y0`.
 ///
-/// Both ABIs deliver the four vector arguments in the first four vector
-/// registers, so this half of every [`RegisterFile`] is genuinely shared.
-const INPUT_REGS: [Reg; 4] = [Reg(0), Reg(1), Reg(2), Reg(3)];
+/// Declared as uniforms by `passes::lattice::collapse`, so the arena names
+/// them the way it names any per-call scalar and the emitter loads them the
+/// way it loads any uniform — once per call, broadcast. What is particular
+/// to them is *where*: not in the link's block, whose layout is the
+/// caller's, but in a block of their own, the context entry after the
+/// link's (see [`KernelFn`](executable::KernelFn)). One identity per axis for
+/// the whole process, minted once, so every arena declares the same two
+/// instances and [`origin_slots`] can find them by identity afterwards.
+pub fn origin() -> [UniformDecl; 2] {
+    static ORIGIN: std::sync::OnceLock<[UniformDecl; 2]> = std::sync::OnceLock::new();
+    *ORIGIN.get_or_init(|| {
+        [0.0, 0.0].map(|default| UniformDecl {
+            id: UniformIdentity::mint(),
+            default,
+        })
+    })
+}
+
+/// The uniform slots [`origin`]'s two instances hold in a legalized arena —
+/// the two `passes::lattice::collapse` declared, which is why they are always
+/// present.
+fn origin_slots(arena: &pixelflow_ir::arena::ExprArena) -> [UniformId; 2] {
+    origin().map(|decl| {
+        let slot = arena
+            .uniforms()
+            .iter()
+            .position(|d| d.id == decl.id)
+            .unwrap_or_else(|| panic!("a legalized arena declares the origin; this one does not"));
+        UniformId(slot as u16)
+    })
+}
 
 // =============================================================================
 // Functional Emitter (x86-64)
@@ -1119,25 +1194,24 @@ pub struct CompileResult {
     pub spill_bytes: u32,
     /// Register budget that was used.
     pub max_regs: u8,
-    /// X-invariant values hoisted out of the collapse loop into the
-    /// once-per-call prologue (0 for per-batch kernels, and for collapse
-    /// kernels with nothing to hoist).
+    /// Values one scope computes for the scopes inside it and parks in a
+    /// slot of their own — the loop-invariant code motion, counted.
     pub hoisted_values: u32,
-    /// What was emitted, per scope of the collapse nest — the static half of
-    /// a cost model's inputs. Counted, never optimized: see
-    /// [`traffic`](self::traffic).
+    /// What was emitted, per scope of the nest — the static half of a cost
+    /// model's inputs. Counted, never optimized: see [`traffic`](self::traffic).
     pub traffic: EmitTraffic,
 }
 
 /// The architecture seam for the shared driver.
 ///
 /// [`compile_via_backend`] owns the architecture-INDEPENDENT logic — schedule,
-/// register allocation, frame layout, and the Select short-circuit control flow
-/// — and calls an `IsaBackend` for the leaf operations that actually differ
-/// between x86-64 and aarch64 (instruction encoding, branch encoding, the
-/// collapse-loop scaffold, and any arch-specific finalization such as
-/// aarch64's constant pool). Both backends therefore run the *same* driver: there is one
-/// place that decides when to emit a guard branch, where the root goes, etc.
+/// register allocation, frame layout, the fold loops and the Select
+/// short-circuit control flow — and calls an `IsaBackend` for the leaf
+/// operations that actually differ between x86-64 and aarch64 (instruction
+/// encoding, branch encoding, and any arch-specific finalization such as
+/// aarch64's constant pool). Both backends therefore run the *same* driver:
+/// there is one place that decides when to emit a guard branch, how a loop
+/// is seeded and stepped, where a store's address comes from.
 ///
 /// Control flow crosses this seam as *"branch to this [`Label`]"*. It used to
 /// cross as an opaque per-backend fixup token that the driver placed with
@@ -1159,9 +1233,7 @@ trait IsaBackend {
     fn begin(&mut self, schedule: &[regalloc::Def]) -> Result<(), CompileError>;
 
     /// Called once the frame layout is known, BEFORE any body instruction is
-    /// emitted. Backends whose spill addressing depends on the frame mode
-    /// (x86: red zone vs allocated frame) latch it here; `prologue` runs
-    /// after the body is produced and can only prepend bytes.
+    /// emitted.
     fn frame_ready(&mut self, _frame_size: u32) {}
 
     /// Emit one resolved instruction (with its reloads/store).
@@ -1201,23 +1273,8 @@ trait IsaBackend {
     fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label);
 
     // -------------------------------------------------------------------------
-    // Collapse-loop scaffold
-    //
-    // The verbs below exist only to serve `emit_collapse_loop`, which is a
-    // provided method: the loop nest, its branch fixups and its coordinate
-    // stepping are written once, here, and every backend gets the same one.
-    // What a backend supplies is the meaning of each verb on its ISA.
+    // The function around the nest: its frame and what trails it.
     // -------------------------------------------------------------------------
-
-    /// How many bytes the *body's own* spill frame occupies inside the
-    /// scaffold's allocation, given the layout's frame size.
-    ///
-    /// Defaults to that size. x86-64 overrides it: in red-zone mode the body
-    /// spills below `rsp` and allocates nothing, so the scaffold's coordinate
-    /// slots start at zero.
-    fn body_frame_bytes(&self, frame_size: u32) -> u32 {
-        frame_size
-    }
 
     /// Reserve / release `bytes` of stack.
     fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32);
@@ -1230,55 +1287,37 @@ trait IsaBackend {
     /// Takes the whole [`Assembly`], not just its `code`, because aarch64's
     /// anchor names a [`Label`] — the constant pool's not-yet-known position —
     /// rather than a `code.len()` read off and carried by hand.
-    fn scaffold_anchor(&mut self, _asm: &mut Assembly) {}
+    fn anchor(&mut self, _asm: &mut Assembly) {}
 
     /// Append whatever must trail the emitted function — a constant pool and
     /// the label that names it. Default: nothing trails.
-    fn scaffold_finish(&mut self, _asm: &mut Assembly) {}
+    fn finish(&mut self, _asm: &mut Assembly) {}
 
-    /// Save / restore one of the scaffold's coordinate slots.
-    ///
-    /// Distinct from [`IsaBackend::emit_store`], which addresses the *body's*
-    /// spill slots and may reach into x86's red zone. These are always at a
-    /// positive offset from the stack pointer.
+    /// Save / restore a value in a slot outside any scope's own spill frame:
+    /// a fold's binder or accumulator, a root parked for the scopes inside.
     fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32);
     fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32);
 
-    /// Move the caller's loop bounds somewhere the body cannot clobber.
-    /// Default: the ABI already put them out of the body's way.
-    fn latch_bounds(&mut self, _code: &mut Vec<u8>) {}
+    /// Bracket one scope's emission, for a decorator that attributes what is
+    /// emitted to the scope it runs in. Defaults do nothing.
+    fn scope_begin(&mut self) {}
+    fn scope_end(&mut self, _scope: regalloc::Scope, _bytes: u32) {}
 
-    /// `counter = 0`.
-    fn counter_clear(&mut self, code: &mut Vec<u8>, counter: Counter);
-    /// `counter += 1`.
-    fn counter_step(&mut self, code: &mut Vec<u8>, counter: Counter);
-
-    /// Jump to `label` once `counter` has reached the bound it is compared
-    /// against.
-    ///
-    /// The compare and the branch are one verb because they are one fact:
-    /// flags mean nothing apart from the comparison that set them, and keeping
-    /// them together makes testing the wrong one unsayable.
-    fn branch_if_counter_done(&mut self, asm: &mut Assembly, counter: Counter, label: Label);
-
-    /// Store one batch of results through the output pointer.
-    fn store_result(&mut self, code: &mut Vec<u8>, src: Reg);
-    /// Advance the output pointer.
-    fn advance_out(&mut self, code: &mut Vec<u8>, step: OutStep);
+    // -------------------------------------------------------------------------
+    // A surviving `Reduce`'s own loop: the seed, the trip test, the
+    // accumulate and the step.
+    //
+    // None goes through the schedule/`InstructionPlan` machinery — a fold's
+    // roots live where `allocate_nest` put them, a carried register or a
+    // slot outside any scope's frame (see
+    // docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md), and the trip
+    // test compares the binder against a compile-time bound, not another
+    // scheduled value. All are ordinary two- and three-register ALU ops, so
+    // they are spelled as one verb each rather than a new opcode.
+    // -------------------------------------------------------------------------
 
     /// `dst += scalar` across every lane, clobbering `scratch`.
     fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32);
-
-    // -------------------------------------------------------------------------
-    // A surviving `Reduce`'s own scaffold: the accumulate and the trip test.
-    //
-    // Neither goes through the schedule/`InstructionPlan` machinery — a
-    // fold's accumulator lives in a slot outside any `Placement` (see
-    // docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md), and the trip
-    // test compares the binder register against a compile-time bound, not
-    // another scheduled value. Both are ordinary two- and three-register ALU
-    // ops, so they are spelled as one verb each rather than a new opcode.
-    // -------------------------------------------------------------------------
 
     /// Load an `f32` constant, broadcast across every lane.
     fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32);
@@ -1307,266 +1346,42 @@ trait IsaBackend {
         self.alu(code, OpKind::Ge, dst, srcs);
     }
 
+    // -------------------------------------------------------------------------
+    // The lattice's effect: the store.
+    // -------------------------------------------------------------------------
+
+    /// Store `write.lanes` lanes of `write.value` at
+    /// `out + 4 · (row · pitch + col)`, `row` and `col` being the enclosing
+    /// folds' binders wherever their loops keep them (a register, or a slot
+    /// — a broadcast, so any lane is the index). `out` and `pitch` are the
+    /// ABI's, in [`RegisterFile::gpr_out`](regalloc::RegisterFile::gpr_out)
+    /// and [`gpr_pitch`](regalloc::RegisterFile::gpr_pitch). A full batch is
+    /// one vector store; a row's remainder stores exactly its lanes —
+    /// masked where the ISA has a masked store, one lane at a time where it
+    /// does not.
+    fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan);
+
     /// Function return.
     fn emit_ret(&mut self, code: &mut Vec<u8>);
-
-    /// A counted loop: clear the variable, test it, run `body`, step it, and
-    /// go back.
-    ///
-    /// **Every loop codegen emits goes through here** — the collapse nest's
-    /// rows and batches, and a fold that survived extraction. Writing it once
-    /// is the point: the three of them differ only in what the variable is and
-    /// what the body does, which is what the two parameters say, and nothing
-    /// about a back edge is worth spelling three times.
-    ///
-    /// The body is a closure rather than a byte slice because a loop nests: the
-    /// row loop's body *is* the batch loop, and an inner loop needs the same
-    /// `&mut self` and the same [`Assembly`] the outer one is holding. Passing
-    /// them through is why they are one struct.
-    ///
-    /// # Errors
-    ///
-    /// Whatever `body` returns.
-    fn emit_loop(
-        &mut self,
-        asm: &mut Assembly,
-        counter: Counter,
-        body: impl FnOnce(&mut Self, &mut Assembly) -> Result<(), CompileError>,
-    ) -> Result<(), CompileError>
-    where
-        Self: Sized,
-    {
-        let frame = self.loop_open(asm, counter);
-        body(self, asm)?;
-        self.loop_close(asm, frame);
-        Ok(())
-    }
-
-    /// Start a loop: initialise the variable, and emit the test that leaves.
-    ///
-    /// The half of [`IsaBackend::emit_loop`] that a *linear walk* can use. An
-    /// emitter stepping through a schedule cannot pass its remaining work as a
-    /// closure, but it can push the returned frame on a stack and pop it when
-    /// the region ends — which is exactly how the `Select` guards' branch spans
-    /// are already handled a few hundred lines below.
-    fn loop_open(&mut self, asm: &mut Assembly, counter: Counter) -> LoopFrame {
-        // Named after what drives the loop, because that is what tells one
-        // from the loop it nests inside.
-        let (top, exit) = (counter.label("top"), counter.label("exit"));
-        self.counter_clear(&mut asm.code, counter);
-        asm.bind(top);
-        self.branch_if_counter_done(asm, counter, exit);
-        LoopFrame { counter, top, exit }
-    }
-
-    /// Close a loop: step the counter, go back, and land the exit.
-    fn loop_close(&mut self, asm: &mut Assembly, frame: LoopFrame) {
-        self.counter_step(&mut asm.code, frame.counter);
-        self.jump(asm, frame.top);
-        asm.bind(frame.exit);
-    }
-
-    /// Wrap a [`CollapseBody`] in the collapse loop scaffold, producing a
-    /// complete [`KernelFn`](executable::KernelFn): the
-    /// caller's lane-sequential X is an induction value stepped by the batch
-    /// width in the inner loop and reset for each row; Y advances by 1.0 in
-    /// the outer loop. Each batch's result is stored straight to the output
-    /// pointer. The body's branches are self-relative, so inlining it inside
-    /// the loop is sound.
-    ///
-    /// Coordinate state lives in stack slots above the body's spill frame:
-    /// the ABI's vector registers are caller-saved scratch to the body, so
-    /// each iteration reloads the input registers from the slots and the X
-    /// slot alone is stepped.
-    ///
-    /// The scaffold moves [`INPUT_COORDS`] of them and a body reads two: the
-    /// ABI still carries the base coordinates that were Z and W, the caller
-    /// passes zero in both, and no arena that became a `Kernel` can name
-    /// them. Dropping them changes this scaffold's own stores and loads, and
-    /// so every kernel's bytes — L2's step, not L1's
-    /// (docs/plans/2026-09-06-lattice-is-the-index.md).
-    ///
-    /// The two LICM tiers in [`CollapseBody`] park their results in vector
-    /// slots directly above the coordinate slots reserved here.
-    ///
-    /// Every position here is a [`Label`] — a name bound when the scaffold
-    /// reaches it. It used to be a `code.len()` the scaffold read off and
-    /// carried by hand to a `patch_branch` twenty lines later, which is the
-    /// same thing minus the name, and which is why `row_end` had to be computed
-    /// at exactly the one point in the sequence where it was correct.
-    ///
-    /// # Errors
-    ///
-    /// None of its own; the signature carries the body closure's.
-    fn emit_collapse_loop(&mut self, emitted: &CollapseBody<'_>) -> Result<Vec<u8>, CompileError>
-    where
-        Self: Sized,
-    {
-        let vw = self.register_file().vector_bytes;
-        let base = self.body_frame_bytes(emitted.frame_size);
-        let total = base + (COORD_SLOTS + emitted.hoist_slots) * vw;
-        let slot = |k: u32| base + k * vw;
-        let mut asm = Assembly::with_capacity(
-            emitted.frame_hoist.len()
-                + emitted.row_hoist.len()
-                + emitted.batch.len()
-                + SCAFFOLD_HEADROOM,
-        );
-
-        self.frame_alloc(&mut asm.code, total);
-        self.scaffold_anchor(&mut asm);
-        for k in 0..INPUT_COORDS {
-            self.slot_store(&mut asm.code, coord_reg(k), slot(k));
-        }
-        self.slot_store(&mut asm.code, coord_reg(SLOT_X), slot(SLOT_ROW_START_X));
-        // Frame LICM: X/Y-invariant values, computed once per call.
-        asm.code.extend_from_slice(emitted.frame_hoist);
-        self.latch_bounds(&mut asm.code);
-
-        // The nest, outermost first. Two levels today because a lattice has two
-        // axes; nothing here counts them, which is what a surviving `Reduce`
-        // needs — a fold is another level, not another mechanism.
-        let levels = [
-            Level {
-                counter: Counter::Row,
-                // X-invariant values, recomputed once per row.
-                hoist: emitted.row_hoist,
-                // Each row starts where the last one did, whatever the batches
-                // inside it did to X.
-                restore: Some((SLOT_X, SLOT_ROW_START_X)),
-                advance: (SLOT_Y, 1.0),
-                out: OutStep::RowSkip,
-            },
-            Level {
-                counter: Counter::Batch,
-                hoist: emitted.batch,
-                restore: None,
-                advance: (SLOT_X, (vw / BYTES_PER_LANE) as f32),
-                out: OutStep::Batch,
-            },
-        ];
-        self.emit_nest(&mut asm, &levels, emitted, &slot)?;
-
-        self.frame_free(&mut asm.code, total);
-        self.emit_ret(&mut asm.code);
-        // Everything the function needs — the loop nest's branches and
-        // whatever trails the `ret`, aarch64's constant pool included — is one
-        // `Assembly` now, so one `finish` resolves every name in it. It used
-        // to be two: the loop nest's labels were resolved here and the
-        // constant pool's fixup was a separate hand-tracked offset patched
-        // afterward, which is what made the offset's *estimate* — and the
-        // byte-splice when the estimate was wrong — necessary in the first
-        // place. A label the pool binds is just one more name in this pass.
-        self.scaffold_finish(&mut asm);
-        Ok(asm.finish())
-    }
-
-    /// Emit `levels` as a loop nest, outermost first.
-    ///
-    /// One iteration of a level is the same four things at every depth: reload
-    /// the coordinates the level below clobbered, run this level's
-    /// loop-invariant code, run everything inside it, then advance. The
-    /// innermost level's "loop-invariant code" is the body itself, and its
-    /// advance is the one that stores a result — which is not a special case so
-    /// much as the observation that a collapse's loop-carried value is its
-    /// output pointer.
-    ///
-    /// # Errors
-    ///
-    /// Whatever the backend's own emission returns.
-    fn emit_nest(
-        &mut self,
-        asm: &mut Assembly,
-        levels: &[Level<'_>],
-        emitted: &CollapseBody<'_>,
-        slot: &impl Fn(u32) -> u32,
-    ) -> Result<(), CompileError>
-    where
-        Self: Sized,
-    {
-        let Some((level, inner)) = levels.split_first() else {
-            return Ok(());
-        };
-        self.emit_loop(asm, level.counter, |b, asm| {
-            // Reload first: the level below, and this level's own advance, left
-            // the coordinate registers holding something else.
-            for k in 0..INPUT_COORDS {
-                b.slot_load(&mut asm.code, coord_reg(k), slot(k));
-            }
-            asm.code.extend_from_slice(level.hoist);
-            b.emit_nest(asm, inner, emitted, slot)?;
-
-            if inner.is_empty() {
-                b.store_result(&mut asm.code, emitted.result);
-            }
-            if let Some((coord, from)) = level.restore {
-                b.slot_load(&mut asm.code, SCAFFOLD_ACC, slot(from));
-                b.slot_store(&mut asm.code, SCAFFOLD_ACC, slot(coord));
-            }
-            // The coordinate registers are reloaded at the top of the next
-            // iteration, so they are free scratch here.
-            let (coord, by) = level.advance;
-            b.slot_load(&mut asm.code, SCAFFOLD_ACC, slot(coord));
-            b.add_scalar(&mut asm.code, SCAFFOLD_ACC, SCAFFOLD_SCRATCH, by);
-            b.slot_store(&mut asm.code, SCAFFOLD_ACC, slot(coord));
-            b.advance_out(&mut asm.code, level.out);
-            Ok(())
-        })
-    }
 }
 
-/// One level of the collapse nest.
-///
-/// The two levels a lattice has differ only in these values, which is the whole
-/// content of "a loop is a loop": what bounds it, what runs at the top of an
-/// iteration, which coordinate it advances and by how much, and how far the
-/// output moves when the iteration ends.
-struct Level<'a> {
-    /// What ends this level.
-    counter: Counter,
-    /// Code at the top of each iteration: this level's LICM tier, or — at the
-    /// innermost — the body.
-    hoist: &'a [u8],
-    /// A coordinate to put back before advancing, and where its start was
-    /// saved. The level inside this one moved it.
-    restore: Option<(u32, u32)>,
-    /// The coordinate this level advances, and by how much per iteration.
-    advance: (u32, f32),
-    /// How far the output pointer moves per iteration.
-    out: OutStep,
-}
-
-/// The emitted code a collapse loop wraps: the per-batch body, plus the two
-/// LICM tiers lifted out of it and the framing they were laid out against.
-///
-/// One emit pass produces all six together, and the scaffold needs all six —
-/// which is what makes them one argument rather than six.
-struct CollapseBody<'a> {
-    /// X/Y-invariant code, emitted once per call.
-    frame_hoist: &'a [u8],
-    /// X-invariant code, re-emitted at the top of every row.
-    row_hoist: &'a [u8],
-    /// The per-batch body proper.
-    batch: &'a [u8],
-    /// Where the batch leaves its result.
-    result: Reg,
-    /// Bytes of spill frame the body was laid out against.
-    frame_size: u32,
-    /// Vector slots the two hoist tiers park their roots in, directly above
-    /// the scaffold's coordinate slots.
-    hoist_slots: u32,
-}
-
-/// A loop that has been opened and not yet closed.
-///
-/// Carries the two names the back edge and the exit branch are waiting on, so
-/// [`IsaBackend::loop_close`] needs no argument the caller had to remember.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[must_use = "an opened loop that is never closed has no back edge and no exit"]
-struct LoopFrame {
-    counter: Counter,
-    top: Label,
-    exit: Label,
+/// One `Write`, resolved: the value's register, where the two address
+/// binders are, how many lanes to store, and the scratch the allocator
+/// reserved for the address arithmetic.
+#[derive(Clone, Copy, Debug)]
+pub struct WritePlan {
+    /// The value to store, in a register.
+    pub value: Reg,
+    /// The row binder — a broadcast index — where its fold keeps it.
+    pub row: Binding,
+    /// The column binder, likewise.
+    pub col: Binding,
+    /// How many of `value`'s lanes to store, from lane 0: the lane fold's
+    /// trip count, the full batch or a row's remainder.
+    pub lanes: u32,
+    /// This instruction's reservations: two GPRs for the address, and the
+    /// vector or mask temp a backend's remainder store asked for.
+    pub scratch: regalloc::Scratch,
 }
 
 /// A guard's question: is this arm dead for the whole batch?
@@ -1595,75 +1410,11 @@ struct MaskTest {
     arm: SelectArm,
 }
 
-/// Which of the collapse loop's two counters a scaffold verb addresses.
-///
-/// Each is compared against a bound the caller passed in a register, which is
-/// why the backend — not the scaffold — knows where either lives.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Counter {
-    /// Batches within a row, against the caller's group count.
-    Batch,
-    /// Rows, against the caller's row count.
-    Row,
-}
-
-impl Counter {
-    /// This loop's `part`, as a label: `batch_top`, `row_exit`.
-    fn label(self, part: &str) -> Label {
-        let name = match self {
-            Self::Batch => "batch",
-            Self::Row => "row",
-        };
-        Label::new(&alloc::format!("{name}_{part}"))
-    }
-}
-
-/// How far the output pointer moves.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum OutStep {
-    /// Past the batch just written — one vector width.
-    Batch,
-    /// Past whatever tail the row has beyond its last full batch.
-    RowSkip,
-}
-
-/// Coordinate slots the scaffold reserves above the body's frame: the four
-/// the ABI passes, plus a copy of the row's starting X.
-const COORD_SLOTS: u32 = 5;
-/// The leading slots that are reloaded into the ABI's input registers.
-///
-/// Four, of which a body reads two: a lattice has X and Y, and the last two
-/// base coordinates are passed as zero and named by nothing that reaches the
-/// emitter. See [`IsaBackend::emit_collapse_loop`] for why they are still
-/// moved.
-const INPUT_COORDS: u32 = 4;
-const SLOT_X: u32 = 0;
-const SLOT_Y: u32 = 1;
-/// Where the row's starting X is kept so the inner loop's stepping can be undone.
-const SLOT_ROW_START_X: u32 = 4;
-/// Slack for the scaffold's own instructions on top of the code it wraps.
-const SCAFFOLD_HEADROOM: usize = 160;
-/// A lane is one `f32`.
-const BYTES_PER_LANE: u32 = 4;
-
-/// The register a coordinate slot is passed and reloaded in. Every ABI here
-/// puts the four base coordinates in the first four vector registers, in
-/// that order; only the first two are ever read.
-const fn coord_reg(slot: u32) -> Reg {
-    Reg(slot as u8)
-}
-
-/// Scratch the scaffold's own arithmetic uses between iterations. Both
-/// registers hold coordinates inside the body, but every coordinate is
-/// reloaded from its slot at the top of each iteration, so the scaffold is
-/// free to clobber them once the body has run.
-const SCAFFOLD_ACC: Reg = Reg(0);
-const SCAFFOLD_SCRATCH: Reg = Reg(1);
-/// Allocate a straight-line schedule and emit it as a region body.
+/// Allocate a straight-line schedule and emit it as one scope's body.
 ///
 /// Production compiles allocate the whole nest at once
-/// ([`regalloc::RegisterAllocator::allocate_nest`]) so every region's frame
-/// is known before any of them is emitted; this is the one-region
+/// ([`regalloc::RegisterAllocator::allocate_nest`]) so every scope's frame
+/// is known before any of them is emitted; this is the one-scope
 /// convenience the emitter's own tests are written against.
 #[cfg(test)]
 fn emit_dag_body<B: IsaBackend>(
@@ -1672,77 +1423,98 @@ fn emit_dag_body<B: IsaBackend>(
 ) -> Result<(Vec<u8>, Reg, u32, u32), CompileError> {
     use regalloc::RegisterAllocator;
     let nest = regalloc::LinearScan.allocate(schedule, &backend.register_file());
-    emit_dag_body_hoisted(
+    let (code, result, frame, spills) = emit_scope(
         nest.body(),
         backend,
-        HoistCtx::None,
+        &alloc::collections::BTreeMap::new(),
         FramePlan {
             override_size: None,
             fold_slots: &alloc::collections::BTreeMap::new(),
+            binder_slots: &alloc::collections::BTreeMap::new(),
+            guard_slots: &alloc::collections::BTreeMap::new(),
             slot_base: 0,
         },
-    )
+    )?;
+    Ok((
+        code,
+        result.expect("a value-rooted schedule has a result"),
+        frame,
+        spills,
+    ))
 }
 
-/// Where one scope's memory is, as its driver decided it — the three answers
-/// [`emit_dag_body_hoisted`] cannot work out for itself because they are all
-/// facts about the *nest*, not about the scope.
+/// Where one scope's memory is, as its driver decided it — the answers
+/// [`emit_scope`] cannot work out for itself because they are all facts
+/// about the *nest*, not about the scope.
 #[derive(Clone, Copy)]
 struct FramePlan<'a> {
-    /// Frame size to latch instead of this scope's own. The collapse driver
-    /// hands every scope the same `m` so they all address the shared hoist
-    /// slots consistently (and, on x86, all latch the same allocated-frame
-    /// mode). `None` for a scope that is the whole function.
+    /// Frame size to latch instead of this scope's own. The driver hands
+    /// every scope the same `m` so they all address the shared park slots
+    /// consistently. `None` for a scope that is the whole function.
     override_size: Option<u32>,
     /// Each surviving fold's accumulator slot, by its `Reduce`'s own
     /// `ValueId`: a slot outside any single scope's frame, because the scope
     /// that opens the loop and the loop itself both address it. Empty
     /// wherever nothing here can open a fold.
     fold_slots: &'a alloc::collections::BTreeMap<regalloc::ValueId, u32>,
-    /// Where this scope's own spill slots start. Zero for a scope that has
-    /// the frame to itself for as long as its values live — the two collapse
-    /// prologues and the body, which run one after another. A fold's body is
-    /// the case that is not that: it runs nested inside its parent's
-    /// schedule, with the parent's spilled values still live across it, so it
-    /// is based at the parent's `layout.frame_size` and the two cannot alias.
+    /// Each surviving fold's binder slot, by the same `Reduce` `ValueId`: the
+    /// loop seeds and steps the binder there when the allocator did not carry
+    /// it, and a scope inside reads it there through the binder's `Var`. Keyed
+    /// by the fold rather than by that `Var` because sibling folds binding
+    /// the same slot share one `Var` node — which loop's counter it names is
+    /// a fact about the scope reading it, found by walking that scope's
+    /// enclosing folds.
+    binder_slots: &'a alloc::collections::BTreeMap<regalloc::ValueId, u32>,
+    /// Each surviving `Guard`'s result slot, by its `Guard`'s own `ValueId`:
+    /// the accumulator-slot analogue for a branch rather than a loop — a slot
+    /// outside any single scope's frame, because the scope the `Guard` def
+    /// sits in and both of its two arms all address it. Empty wherever
+    /// nothing here can open a guard arm.
+    guard_slots: &'a alloc::collections::BTreeMap<regalloc::ValueId, u32>,
+    /// Where this scope's own spill slots start. Zero for the body, which
+    /// has the frame to itself. A fold's body is the case that is not that:
+    /// it runs nested inside its parent's schedule, with the parent's
+    /// spilled values still live across it, so it is based at the parent's
+    /// `layout.frame_size` and the two cannot alias.
     slot_base: u32,
 }
 
-/// Emit one region's body from a finished allocation, with collapse-loop
-/// LICM support: a hoist map (see
-/// [`HoistCtx`]) and an optional frame-size override. The override replaces
-/// the layout's frame size in the `frame_ready` latch and the returned frame
-/// size — the collapse driver passes the max of the prologue's and body's
-/// frames so both address the shared hoist slots consistently (and, on x86,
-/// so both latch the same allocated-frame mode).
+/// Emit one scope from a finished allocation.
 ///
-/// `fold_slots` is the same idea as a hoist slot, in the opposite direction:
-/// a surviving `Reduce`'s accumulator, addressed by its own `ValueId`, at a
-/// slot that outlives both this scope's frame and the fold's own (see
-/// `ScheduledOp::Reduce`'s arm below, and
+/// `parks` is where every root of the nest is parked, by its `ValueId`: the
+/// slot the scope computing it writes after the def, and the scopes inside
+/// read it from — unless the allocator carried it into them in a register,
+/// which their placement says. Which roots this scope *reads* (an ancestor
+/// computed them: its entries for them are placeholders that emit nothing)
+/// and which it *computes* (its own `roots`) are the allocation's answers,
+/// so one map serves every scope.
+///
+/// `fold_slots` is the same idea for a surviving `Reduce`'s accumulator,
+/// addressed by its own `ValueId`, at a slot that outlives both this scope's
+/// frame and the fold's own (see `ScheduledOp::Reduce`'s arm below, and
 /// docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md's "the design
-/// decision that makes this tractable"). Empty wherever nothing here can
-/// open a fold — every caller but the collapse driver's own body/fold calls.
+/// decision that makes this tractable"); `binder_slots` likewise for its
+/// binder.
 ///
-/// `slot_base` is where this scope's own spill slots start. Zero for a scope
-/// that has the frame to itself for as long as its values live — the two
-/// collapse prologues and the body, which run one after another. A fold's
-/// body is the case that is *not* that: it runs nested inside its parent's
-/// schedule, with the parent's spilled values still live across it, so it is
-/// based at the parent's `layout.frame_size` and the two cannot alias.
-fn emit_dag_body_hoisted<B: IsaBackend>(
+/// Returns the code, the register the scope's result is in — `None` when
+/// the root is an effect and not a value: a `Write`, a `Seq`, a fold over
+/// the unit monoid — the frame size latched, and how many values spilled.
+fn emit_scope<B: IsaBackend>(
     allocation: regalloc::Allocation<'_>,
     backend: &mut B,
-    hoist: HoistCtx<'_>,
+    parks: &alloc::collections::BTreeMap<regalloc::ValueId, u32>,
     frame: FramePlan<'_>,
-) -> Result<(Vec<u8>, Reg, u32, u32), CompileError> {
+) -> Result<(Vec<u8>, Option<Reg>, u32, u32), CompileError> {
     let FramePlan {
         override_size: frame_override,
         fold_slots,
+        binder_slots,
+        guard_slots,
         slot_base,
     } = frame;
     let file = backend.register_file();
-    // Allocation happened before this call — once per region, over the whole
+    backend.scope_begin();
+    // Allocation happened before this call — once per scope, over the whole
     // nest. The allocator chooses the evaluation order, so everything here —
     // guard ranges, program points, the emit loop itself — reads the schedule
     // it handed back rather than the one it was given.
@@ -1752,26 +1524,115 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     // This scope's top is exactly the base for anything nested inside it.
     let nested_slot_base = layout.frame_size;
 
-    // A value an enclosing region parked has no address in this frame — its
-    // slot is the driver's hoist slot, which outlives every region's frame.
-    // Only the address is pinned: whether the value is in that slot or in a
-    // register, at each point, is the placement's answer.
-    if let Some(hoisted) = hoist.preloaded() {
-        for (vid, &offset) in hoisted {
-            layout.pin_slot(*vid, Slot::new(offset, file.vector_bytes));
-        }
-    }
-    // A surviving fold's accumulator, the same idea in the other direction:
-    // its `Reduce` def is a genuine computation *in* this scope (scanned,
-    // never a placeholder), but its slot is the driver's dedicated fold
-    // slot, not whatever offset this scope's own `FrameLayout::resolve` gave
-    // it (`ScheduledOp::Reduce`'s scan-time `Where::Spilled` earns it one
-    // regardless, thrown away here). Harmless to pin one this scope never
-    // reaches — `pin_slot` on a `ValueId` nothing here reads is simply
-    // never read back.
-    for (vid, &offset) in fold_slots {
+    // The roots this scope reads from an enclosing scope's park, and the
+    // ones it parks for the scopes inside. A value an enclosing scope parked
+    // has no address in this frame — its slot is the park, which outlives
+    // every scope's frame. Only the address is pinned: whether the value is
+    // in that slot or in a register, at each point, is the placement's
+    // answer.
+    let preloaded: alloc::collections::BTreeMap<regalloc::ValueId, u32> = schedule
+        .iter()
+        .map(|def| def.value)
+        .filter(|v| allocation.parked_by_an_enclosing_scope(*v))
+        .map(|v| {
+            let slot = *parks
+                .get(&v)
+                .unwrap_or_else(|| panic!("{v:?} is parked by an enclosing scope but has no slot"));
+            (v, slot)
+        })
+        .collect();
+    let parked: alloc::collections::BTreeMap<regalloc::ValueId, u32> = allocation
+        .roots()
+        .iter()
+        .map(|v| {
+            let slot = *parks
+                .get(v)
+                .unwrap_or_else(|| panic!("{v:?} is a root of this scope but has no slot"));
+            (*v, slot)
+        })
+        .collect();
+    for (vid, &offset) in &preloaded {
         layout.pin_slot(*vid, Slot::new(offset, file.vector_bytes));
     }
+    // A surviving fold's roots, the same idea in the other direction. Its
+    // `Reduce` def is a genuine computation *in* this scope (scanned, never a
+    // placeholder), but its slot is the driver's dedicated fold slot, not
+    // whatever offset this scope's own `FrameLayout::resolve` gave it
+    // (`ScheduledOp::Reduce`'s scan-time `Where::Spilled` earns it one
+    // regardless, thrown away here). Harmless to pin one this scope never
+    // reaches — `pin_slot` on a `ValueId` nothing here reads is simply never
+    // read back.
+    // A surviving `Guard`'s result, the same idea again: two arms and the
+    // scope its def sits in must all agree on one address, so the driver's
+    // `guard_slots` overrides whatever this scope's own `FrameLayout::resolve`
+    // gave it too.
+    let mut fold_pins: alloc::vec::Vec<(regalloc::ValueId, u32)> = fold_slots
+        .iter()
+        .chain(guard_slots.iter())
+        .map(|(vid, &offset)| (*vid, offset))
+        .collect();
+    // The binders of this scope's own fold and every enclosing fold, each
+    // where that loop keeps it — innermost first, so a binder shadowing an
+    // enclosing one is the nearer loop's. A `Write` reads its row and column
+    // from here, and a binder's `Var` (found here by the binder's number —
+    // sibling folds binding the same slot share one `Var` node, so which
+    // counter it names is this scope's question) is a placeholder whose def
+    // emits nothing: the loop seeded it. Only one the allocator did not
+    // carry has a slot to pin; pinning a carried one would earn the register
+    // a store nothing reads.
+    let mut enclosing: alloc::vec::Vec<(Binder, Binding)> = alloc::vec::Vec::new();
+    let mut binder_placeholders: alloc::vec::Vec<regalloc::ValueId> = alloc::vec::Vec::new();
+    let mut opened = allocation;
+    while let Some((parent, at)) = opened.opens_at() {
+        let parent = opened.sibling(parent);
+        let def = &parent.schedule()[at];
+        let ScheduledOp::Reduce(fold, _) = &def.op else {
+            unreachable!("a fold scope opens at its parent's Reduce def")
+        };
+        let binder = fold.binder();
+        let at_binder = match opened.fold_roots().binder {
+            regalloc::Where::Reg(r) => Binding::from(r),
+            regalloc::Where::Spilled | regalloc::Where::Remat(_) => {
+                let offset = *binder_slots.get(&def.value).unwrap_or_else(|| {
+                    panic!(
+                        "{:?}'s fold has no binder slot — the driver did not assign one",
+                        def.value
+                    )
+                });
+                Binding::from(Slot::new(offset, file.vector_bytes))
+            }
+        };
+        if !enclosing.iter().any(|(b, _)| *b == binder) {
+            enclosing.push((binder, at_binder));
+        }
+        if let Some(bv) = schedule
+            .iter()
+            .find(|d| matches!(d.op, ScheduledOp::Var(v) if v == binder.var()))
+            .map(|d| d.value)
+            && !binder_placeholders.contains(&bv)
+        {
+            binder_placeholders.push(bv);
+            if let Binding::Loc(Loc::Slot(slot)) = at_binder {
+                fold_pins.push((bv, slot.offset()));
+            }
+        }
+        opened = parent;
+    }
+    for &(vid, offset) in &fold_pins {
+        layout.pin_slot(vid, Slot::new(offset, file.vector_bytes));
+    }
+    let binder_at = |binder: Binder| -> Binding {
+        enclosing
+            .iter()
+            .find(|(b, _)| *b == binder)
+            .map(|(_, at)| *at)
+            .unwrap_or_else(|| {
+                panic!(
+                    "a Write names binder slot {} that no enclosing fold binds",
+                    binder.slot()
+                )
+            })
+    };
 
     let frame_size = frame_override.unwrap_or(layout.frame_size);
     if frame_size < layout.frame_size {
@@ -1781,16 +1642,13 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     }
     backend.frame_ready(frame_size);
 
-    // Select short-circuit guards (disabled in the prologue — see HoistCtx).
-    // Read off the allocation rather than recomputed: `schedule` above is
-    // `allocation.schedule()` verbatim, and the allocator already ran this
-    // same analysis against it to place split ranges around each arm (see
-    // `regalloc::Allocation::select_guards`).
-    let select_guards: &[guards::SelectGuard] = if hoist.parks_values() {
-        &[]
-    } else {
-        allocation.select_guards()
-    };
+    // Select short-circuit guards, read off the allocation rather than
+    // recomputed: `schedule` above is `allocation.schedule()` verbatim, and
+    // the allocator already ran this same analysis against it to place split
+    // ranges around each arm (see `regalloc::Allocation::select_guards`). A
+    // root this scope parks is never inside an arm — the analysis was told
+    // it is read outside the schedule — so a guard can never skip a park.
+    let select_guards: &[guards::SelectGuard] = allocation.select_guards();
     let sched_len = schedule.len();
 
     struct PendingBranch {
@@ -1835,18 +1693,21 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     // becomes one write here at the point it starts — O(total ranges), not a
     // lookup per operand per instruction.
     let mut locs: alloc::vec::Vec<Option<Binding>> = layout.bindings().to_vec();
-    // A surviving fold's accumulator, read back from its dedicated slot
-    // rather than wherever this scope's own `FrameLayout::resolve` happened
-    // to put it. `resolve` gave it a real address (its scan-time
-    // `Where::Spilled` earns one like any other spilled value), but a
-    // throwaway one — `ScheduledOp::Reduce`'s own emission never goes
-    // through the ordinary operand/destination machinery this table serves
-    // everyone else, so nothing but this override ever reads or writes it.
-    for def in schedule {
-        if let ScheduledOp::Reduce(..) = def.op
-            && let Some(&offset) = fold_slots.get(&def.value)
+    // A surviving fold's root in its slot — an accumulator, or a binder the
+    // allocator did not carry — is read back from its dedicated slot rather
+    // than wherever this scope's own `FrameLayout::resolve` happened to put
+    // it. `resolve` gave it a real address (its scan-time `Where::Spilled`
+    // earns one like any other spilled value), but a throwaway one — a
+    // `Reduce` def's own emission never goes through the ordinary
+    // operand/destination machinery this table serves everyone else, and a
+    // binder's placeholder emits nothing, so nothing but this override ever
+    // reads or writes it. Only for a value this scope has: a pin this scope
+    // never reaches has no entry here to override.
+    for &(vid, offset) in &fold_pins {
+        if let Some(entry) = locs.get_mut(vid.0 as usize)
+            && entry.is_some()
         {
-            locs[def.value.0 as usize] = Some(Binding::from(Slot::new(offset, file.vector_bytes)));
+            *entry = Some(Binding::from(Slot::new(offset, file.vector_bytes)));
         }
     }
     let mut moves: alloc::vec::Vec<alloc::vec::Vec<(regalloc::ValueId, Binding)>> =
@@ -1859,7 +1720,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     let mut store_after_def: alloc::vec::Vec<Option<u32>> = alloc::vec![None; sched_len];
     for (i, def) in schedule.iter().enumerate() {
         let v = def.value;
-        if hoist.preloaded().is_some_and(|h| h.contains_key(&v)) {
+        if preloaded.contains_key(&v) {
             // Live-in: an enclosing scope left it somewhere, and the head
             // reconciliation below brings it to where this scope expects it.
             continue;
@@ -1898,33 +1759,75 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     // memory at the head is already in memory on both paths, since a value in
     // memory anywhere is stored right after its definition.
     //
-    // Walked over the schedule, not over the map: an enclosing region parks
+    // Walked over the schedule, not over the map: an enclosing scope parks
     // every root it computes, and a scope inside reads only the subset that
     // reaches it.
-    if let Some(hoisted) = hoist.preloaded() {
-        for vid in schedule.iter().map(|def| def.value) {
-            if !hoisted.contains_key(&vid) {
-                continue;
-            }
-            let placement = allocation.placement(vid);
-            let at_head = allocation.at_head(vid);
-            let head = layout.binding(vid, at_head);
-            if let Binding::Loc(Loc::Reg(r)) = head
-                && placement.at(regalloc::Point::TAIL) != at_head
-            {
-                let from_memory = placement
-                    .locations()
-                    .find(|at| !matches!(at, regalloc::Where::Reg(_)))
-                    .unwrap_or_else(|| {
-                        unreachable!("a value that never leaves a register never changes register")
-                    });
-                locs[vid.0 as usize] = Some(layout.binding(vid, from_memory));
-                let got = backend.emit_resolve(&mut asm.code, vid, r, &locs);
-                debug_assert_eq!(got, r, "a value out of a register reloads into the target");
-            }
-            locs[vid.0 as usize] = Some(head);
+    for vid in schedule.iter().map(|def| def.value) {
+        if !preloaded.contains_key(&vid) {
+            continue;
         }
+        let placement = allocation.placement(vid);
+        let at_head = allocation.at_head(vid);
+        let head = layout.binding(vid, at_head);
+        if let Binding::Loc(Loc::Reg(r)) = head
+            && placement.at(regalloc::Point::TAIL) != at_head
+        {
+            let from_memory = placement
+                .locations()
+                .find(|at| !matches!(at, regalloc::Where::Reg(_)))
+                .unwrap_or_else(|| {
+                    unreachable!("a value that never leaves a register never changes register")
+                });
+            locs[vid.0 as usize] = Some(layout.binding(vid, from_memory));
+            let got = backend.emit_resolve(&mut asm.code, vid, r, &locs);
+            debug_assert_eq!(got, r, "a value out of a register reloads into the target");
+        }
+        locs[vid.0 as usize] = Some(head);
     }
+
+    // Hand a root this scope parks over to the scopes inside, right after
+    // its def, while the value is guaranteed live in `r`. The slot is written
+    // unless nothing inside will ever read it — which is exactly the case
+    // where the value holds one register at every point of every scope
+    // within; read off the placements, not off a flag beside them. Every
+    // scope within, not just the first: a root parked here is live across
+    // all of them, and one of them keeping it somewhere else is what makes
+    // the slot load-bearing. A scope that never reads it has no opinion.
+    let hand_off = |backend: &mut B,
+                    code: &mut Vec<u8>,
+                    vid: regalloc::ValueId,
+                    r: Reg|
+     -> Result<(), CompileError> {
+        let Some(&offset) = parked.get(&vid) else {
+            return Ok(());
+        };
+        let head = allocation
+            .within()
+            .next()
+            .map_or(regalloc::Where::Spilled, |inner| inner.at_head(vid));
+        let resident_throughout = matches!(head, regalloc::Where::Reg(_))
+            && allocation.within().all(|inner| {
+                inner
+                    .placement_of(vid)
+                    .is_none_or(|p| p.locations().all(|at| at == head))
+            });
+        if !resident_throughout {
+            backend.emit_store(code, r, offset)?;
+        }
+        if let regalloc::Where::Reg(head_reg) = head
+            && head_reg != r
+        {
+            backend.emit_mov(code, head_reg, r);
+        }
+        Ok(())
+    };
+
+    // The unit-typed roots — an effect, not a value.
+    let is_unit = |op: &ScheduledOp| match op {
+        ScheduledOp::Write { .. } | ScheduledOp::Seq(..) => true,
+        ScheduledOp::Reduce(fold, _) => fold.monoid() == Monoid::SEQ,
+        _ => false,
+    };
 
     for (sched_idx, def) in schedule.iter().enumerate() {
         let (vid, sched_op) = (&def.value, &def.op);
@@ -1991,42 +1894,128 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             backend.branch_if_arm_is_dead(&mut asm, test, past_arm);
         }
 
-        // A hoisted value's placeholder def emits nothing — the prologue
-        // already parked the value in its slot; consumers reload from there.
-        if let Some(hoisted) = hoist.preloaded()
-            && hoisted.contains_key(vid)
-        {
+        // A parked value's placeholder def emits nothing — the enclosing
+        // scope already parked the value in its slot; consumers reload from
+        // there.
+        if preloaded.contains_key(vid) {
             continue;
         }
 
-        // A surviving fold: seed the accumulator and the binder, run the
-        // loop, combine, step, branch back. `vid`'s own placement was forced
-        // to its dedicated slot at scan time (see `regalloc::LinearScan`),
-        // never a register, so nothing about it needs `resolve_operands` —
-        // this is the whole of what a `Reduce` def does.
+        // A fold's binder, read here through its `Var`: the loop that binds
+        // it seeded it and steps it, wherever the allocator keeps it, so its
+        // def here is a placeholder too. `locs` already names the register
+        // or the slot.
+        if binder_placeholders.contains(vid) {
+            continue;
+        }
+
+        // Sequencing is the unit monoid's combine: two effects, one after
+        // the other, which the schedule's order already is. Nothing to emit.
+        if let ScheduledOp::Seq(..) = sched_op {
+            continue;
+        }
+
+        // The store. Its value is an ordinary operand, reloaded into the
+        // reservation the allocator made when it is not resident; its row and
+        // column are the enclosing folds' binders, wherever those loops keep
+        // them; its width is the lane fold's trip count, folded into the def
+        // when the lane fold was inlined (`arena_to_schedule`).
+        if let ScheduledOp::Write {
+            row,
+            col,
+            lanes,
+            value,
+            ..
+        } = sched_op
+        {
+            let value_reg = match location_of(&locs, *value) {
+                Binding::Loc(Loc::Reg(r)) => r,
+                _ => {
+                    let target = scratch
+                        .reload(0)
+                        .expect("a Write's value is not resident and no reload was reserved");
+                    backend.emit_resolve(&mut asm.code, *value, target, &locs)
+                }
+            };
+            backend.emit_write(
+                &mut asm.code,
+                &WritePlan {
+                    value: value_reg,
+                    row: binder_at(*row),
+                    col: binder_at(*col),
+                    lanes: *lanes,
+                    scratch,
+                },
+            );
+            continue;
+        }
+
+        // A surviving fold: seed its roots, run the loop, combine, step,
+        // branch back. `vid`'s own placement was forced to its dedicated slot
+        // at scan time (see `regalloc::LinearScan`), never a register, so
+        // nothing about it needs `resolve_operands` — this is the whole of
+        // what a `Reduce` def does.
         if let ScheduledOp::Reduce(fold, _) = sched_op {
-            let acc_offset = *fold_slots.get(vid).unwrap_or_else(|| {
+            // The body is a scope of its own, opening exactly here — the
+            // query `Allocation::opens_at` was built to answer, from the
+            // other side, for exactly this walk. A `Reduce` def that opens
+            // no scope here is an enclosing scope's fold, read from its slot
+            // (`extract_folds`'s placeholder): that loop ran before this
+            // scope began, `locs` already names the slot, and there is
+            // nothing to emit.
+            let Some(fold_scope) = allocation.fold_opening_at(sched_idx) else {
+                continue;
+            };
+            let fold_alloc = allocation.sibling(fold_scope);
+            let acc_slot = *fold_slots.get(vid).unwrap_or_else(|| {
                 panic!(
                     "{vid:?}'s Reduce def has no accumulator slot — the driver did not assign one"
                 )
             });
-            let binder = scratch.temp(0).unwrap_or_else(|| {
-                panic!("{vid:?}'s Reduce def reserved no binder register (temps_for must return >= 3 for ScheduledOp::Reduce)")
+            let binder_slot = *binder_slots.get(vid).unwrap_or_else(|| {
+                panic!("{vid:?}'s Reduce def has no binder slot — the driver did not assign one")
             });
-            let t1 = scratch
-                .temp(1)
-                .unwrap_or_else(|| panic!("{vid:?}'s Reduce def reserved fewer than 2 temps"));
-            let t2 = scratch
-                .temp(2)
-                .unwrap_or_else(|| panic!("{vid:?}'s Reduce def reserved fewer than 3 temps"));
+            // Two transient temps (`Scratch::REDUCE_TEMPS`): the trip test's
+            // bound and its mask, reused by the combine's reload and the
+            // step's scratch. Neither outlives the instruction it serves,
+            // so the body's pool is free to hold them too.
+            let temp = |i: usize| {
+                scratch.temp(i).unwrap_or_else(|| {
+                    panic!("{vid:?}'s Reduce def reserved fewer than {} temps", i + 1)
+                })
+            };
+            let (t0, t1) = (temp(0), temp(1));
 
-            // Seed: the accumulator starts at the monoid's identity, parked
-            // in its slot before the loop opens; the binder starts at `lo`,
-            // broadcast into the one register it lives in for the loop's
-            // whole life (never a slot — "the binder is the counter").
-            backend.load_const(&mut asm.code, t1, fold.monoid().identity());
-            backend.slot_store(&mut asm.code, t1, acc_offset);
-            backend.load_const(&mut asm.code, binder, fold.range().start as f32);
+            // The loop's own roots, where the allocator put them: a register
+            // it carries across the body, or a slot. Nothing is reserved for
+            // either — at the floor the answer is "slot", which always fits,
+            // and a body inside gets the whole pool minus what is carried.
+            let carried_in = |at: regalloc::Where| match at {
+                regalloc::Where::Reg(r) => Some(r),
+                regalloc::Where::Spilled | regalloc::Where::Remat(_) => None,
+            };
+            let roots = fold_alloc.fold_roots();
+            let binder_reg = carried_in(roots.binder);
+            let acc_reg = carried_in(roots.accumulator);
+            // A fold over the unit monoid has an accumulator nothing reads:
+            // its combine emits no bytes, so neither does its seed or its
+            // result — the slot it was given stays a dead vector of stack.
+            let accumulates = fold.monoid() != Monoid::SEQ;
+
+            // Seed: the accumulator starts at the monoid's identity and the
+            // binder at `lo`, each where it lives — written through a temp
+            // when that is a slot.
+            let mut seed = |backend: &mut B, at: Option<Reg>, value: f32, slot: u32| match at {
+                Some(r) => backend.load_const(&mut asm.code, r, value),
+                None => {
+                    backend.load_const(&mut asm.code, t0, value);
+                    backend.slot_store(&mut asm.code, t0, slot);
+                }
+            };
+            if accumulates {
+                seed(backend, acc_reg, fold.monoid().identity(), acc_slot);
+            }
+            seed(backend, binder_reg, fold.range().start as f32, binder_slot);
 
             let top = Label::new(&alloc::format!("reduce{}_top", vid.0));
             let exit = Label::new(&alloc::format!("reduce{}_exit", vid.0));
@@ -2035,13 +2024,23 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             // Trip test: exit once every lane agrees the binder has reached
             // `hi` — `SelectArm::False`'s test is exactly "every lane true",
             // which is what an all-lanes-equal broadcast compare produces
-            // the instant it stops being false.
-            backend.load_const(&mut asm.code, t2, fold.range().end as f32);
-            backend.test_ge(&mut asm.code, t1, [binder, t2], scratch.mask_guard_temp);
+            // the instant it stops being false. The compare lands in `t0`,
+            // which is either the binder's own reload or distinct from its
+            // register: the two-operand form the backends share (`dst <-
+            // srcs[0]; dst op= srcs[1]`) is sound for both.
+            let binder_now = match binder_reg {
+                Some(b) => b,
+                None => {
+                    backend.slot_load(&mut asm.code, t0, binder_slot);
+                    t0
+                }
+            };
+            backend.load_const(&mut asm.code, t1, fold.range().end as f32);
+            backend.test_ge(&mut asm.code, t0, [binder_now, t1], scratch.mask_guard_temp);
             backend.branch_if_arm_is_dead(
                 &mut asm,
                 MaskTest {
-                    reg: t1,
+                    reg: t0,
                     scratch: scratch.guard_temp,
                     mask_scratch: scratch.mask_guard_temp,
                     arm: SelectArm::False,
@@ -2049,38 +2048,182 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
                 exit,
             );
 
-            // The body: a scope of its own, opening exactly here — the query
-            // `Allocation::opens_at` was built to answer, from the other
-            // side, for exactly this walk.
-            let fold_scope = allocation
-                .fold_opening_at(sched_idx)
-                .unwrap_or_else(|| panic!("{vid:?}'s Reduce def opens no fold scope in this nest"));
-            let fold_alloc = allocation.sibling(fold_scope);
-            let (fold_code, body_result, _, _) = emit_dag_body_hoisted(
+            // The body, in its own scope.
+            let (fold_code, body_result, _, _) = emit_scope(
                 fold_alloc,
                 backend,
-                HoistCtx::None,
+                parks,
                 FramePlan {
                     override_size: Some(frame_size),
                     fold_slots,
+                    binder_slots,
+                    guard_slots,
                     slot_base: nested_slot_base,
                 },
             )?;
             asm.code.extend_from_slice(&fold_code);
 
-            // Combine: fold the body's result into the accumulator and park
-            // it straight back — an ordinary two-register ALU op, outside
-            // the schedule (see `IsaBackend::alu`'s doc).
-            backend.slot_load(&mut asm.code, t1, acc_offset);
-            backend.alu(&mut asm.code, fold.combine_op(), t1, [t1, body_result]);
-            backend.slot_store(&mut asm.code, t1, acc_offset);
+            // Combine: fold the body's result into the accumulator — an
+            // ordinary two-register ALU op, outside the schedule (see
+            // `IsaBackend::alu`'s doc) — where the accumulator lives. The
+            // body's result may be in either temp, since its pool had both;
+            // a slot-held accumulator round-trips through the other one.
+            if accumulates {
+                let body_result =
+                    body_result.expect("a fold over a value monoid has a value to combine");
+                match acc_reg {
+                    Some(a) => backend.alu(&mut asm.code, fold.combine_op(), a, [a, body_result]),
+                    None => {
+                        let acc = if body_result == t0 { t1 } else { t0 };
+                        backend.slot_load(&mut asm.code, acc, acc_slot);
+                        backend.alu(&mut asm.code, fold.combine_op(), acc, [acc, body_result]);
+                        backend.slot_store(&mut asm.code, acc, acc_slot);
+                    }
+                }
+            }
 
             // Step and loop: the binder is the counter, so stepping it is
-            // the whole of "advance the loop" (`add_scalar` reuses the
-            // scaffold's own broadcast-add verb).
-            backend.add_scalar(&mut asm.code, binder, t2, fold.stride() as f32);
+            // the whole of "advance the loop".
+            let stride = fold.stride() as f32;
+            match binder_reg {
+                Some(b) => backend.add_scalar(&mut asm.code, b, t0, stride),
+                None => {
+                    backend.slot_load(&mut asm.code, t0, binder_slot);
+                    backend.add_scalar(&mut asm.code, t0, t1, stride);
+                    backend.slot_store(&mut asm.code, t0, binder_slot);
+                }
+            }
             backend.jump(&mut asm, top);
             asm.bind(exit);
+
+            // The result is read from the accumulator's slot — where this
+            // scope's placement of the def says it is — so a carried
+            // accumulator lands there once, on the way out.
+            if let Some(a) = acc_reg
+                && accumulates
+            {
+                backend.slot_store(&mut asm.code, a, acc_slot);
+            }
+
+            // A fold this scope parks for the scopes inside is a root like
+            // any other, handed over right here. They read it from the
+            // accumulator's slot, pinned for them as its park — unless the
+            // allocator carries it, and then the carry is loaded once, here,
+            // from the slot the loop just left it in.
+            if parked.contains_key(vid)
+                && let Some(inner) = allocation.within().next()
+                && let regalloc::Where::Reg(carry) = inner.at_head(*vid)
+            {
+                backend.slot_load(&mut asm.code, carry, acc_slot);
+            }
+            continue;
+        }
+
+        // A surviving `Guard`: a mask test, a branch, the taken arm's own
+        // scope, a join — exactly §3's plan
+        // (docs/plans/2026-09-12-emit-should-just-emit.md), and built from
+        // the same primitives as the `Reduce` loop just above (recurse into
+        // `emit_scope` for a nested scope's code) and the guarded-`Select`
+        // block below (`branch_if_arm_is_dead`, `Label`, a join). The
+        // difference from both: only one arm ever runs (a branch, not a
+        // loop), and *neither* arm is this schedule's own code (both are
+        // wholly separate scopes, unlike a blend's two operands sitting
+        // right here as values). `guard_opening_at` finds each arm's scope
+        // by the position of this def, the way `fold_opening_at` finds a
+        // fold's; `None` for the True arm means an enclosing scope's
+        // `Guard` was carved to a placeholder here (its value read from the
+        // pinned slot below, `fold_pins`), exactly as an enclosing scope's
+        // `Reduce` is above.
+        if let ScheduledOp::Guard(mask_vid, ..) = sched_op {
+            let Some(true_scope) = allocation.guard_opening_at(sched_idx, SelectArm::True) else {
+                continue;
+            };
+            let false_scope = allocation
+                .guard_opening_at(sched_idx, SelectArm::False)
+                .expect("a Guard's True arm opens here without its False arm");
+            let guard_slot = *guard_slots.get(vid).unwrap_or_else(|| {
+                panic!("{vid:?}'s Guard def has no result slot — the driver did not assign one")
+            });
+
+            let mask_reg = match location_of(&locs, *mask_vid) {
+                Binding::Loc(Loc::Reg(r)) => r,
+                _ => backend.emit_resolve(&mut asm.code, *mask_vid, guard_mask(), &locs),
+            };
+            let part = |part: &str| Label::new(&alloc::format!("v{}_{part}", vid.0));
+            let (arm_false, join) = (part("arm_false"), part("arm_join"));
+            let test = |arm| MaskTest {
+                reg: mask_reg,
+                scratch: guard_temp,
+                mask_scratch: mask_guard_temp,
+                arm,
+            };
+            // Jump to the False arm when every lane agrees the mask is
+            // false — the True arm's own test, exactly as a guarded
+            // `Select`'s "only_false" branch is reached (mask-uniformly-
+            // true takes the *other* branch there because both arms sit in
+            // the same flat schedule and one is skipped forward over; here
+            // there is no flat schedule to skip through, only two separate
+            // scopes to choose between, so a single branch on "is the True
+            // arm dead" suffices).
+            backend.branch_if_arm_is_dead(&mut asm, test(SelectArm::True), arm_false);
+
+            let (true_code, true_result, _, _) = emit_scope(
+                allocation.sibling(true_scope),
+                backend,
+                parks,
+                FramePlan {
+                    override_size: Some(frame_size),
+                    fold_slots,
+                    binder_slots,
+                    guard_slots,
+                    slot_base: nested_slot_base,
+                },
+            )?;
+            asm.code.extend_from_slice(&true_code);
+            backend.slot_store(
+                &mut asm.code,
+                true_result.expect("a guard arm computes a value"),
+                guard_slot,
+            );
+            backend.jump(&mut asm, join);
+
+            asm.bind(arm_false);
+            let (false_code, false_result, _, _) = emit_scope(
+                allocation.sibling(false_scope),
+                backend,
+                parks,
+                FramePlan {
+                    override_size: Some(frame_size),
+                    fold_slots,
+                    binder_slots,
+                    guard_slots,
+                    slot_base: nested_slot_base,
+                },
+            )?;
+            asm.code.extend_from_slice(&false_code);
+            backend.slot_store(
+                &mut asm.code,
+                false_result.expect("a guard arm computes a value"),
+                guard_slot,
+            );
+
+            asm.bind(join);
+
+            // A guard whose result some scope inside this one reads as a
+            // park, the same idea as a fold's accumulator a few lines above
+            // — though in practice `place_roots` never promotes one this way
+            // today (`schedule_variance`'s answer for a `Guard` is its
+            // mask's, and a mask reaching a fold's own closure at all is
+            // already inside that fold's own binder-dependent territory more
+            // often than not); kept for the same reason the fold case states
+            // its own explicitly, rather than relying on that never changing
+            // silently.
+            if parked.contains_key(vid)
+                && let Some(inner) = allocation.within().next()
+                && let regalloc::Where::Reg(carry) = inner.at_head(*vid)
+            {
+                backend.slot_load(&mut asm.code, carry, guard_slot);
+            }
             continue;
         }
 
@@ -2146,6 +2289,7 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             if let Some(offset) = store_after_def[sched_idx] {
                 backend.emit_store(&mut asm.code, dst, offset)?;
             }
+            hand_off(backend, &mut asm.code, *vid, dst)?;
             continue;
         }
 
@@ -2155,45 +2299,11 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
             backend.emit_store(&mut asm.code, dst_loc.reg(), offset)?;
         }
 
-        // Prologue mode: hand each hoist root over to the scopes inside, right
-        // after its def, while the value is guaranteed live. (Guards are
-        // disabled in this mode, so every def reaches this point — the
-        // guarded-Select early-continue above cannot fire.)
-        if let Some(hoisted) = hoist.parked()
-            && let Some(&offset) = hoisted.get(vid)
-        {
-            // Resident by construction: a hoist root is a computed value, not
-            // a leaf (`plan_collapse_hoist` refuses to hoist one), so its own
-            // definition — the instruction just emitted — wrote it into a
-            // register. There is nothing to resolve.
-            let r = dst_loc.reg();
-            // The slot is written unless nothing inside will ever read it —
-            // which is exactly the case where the value holds one register at
-            // every point of every scope within. Read off the placements, not
-            // off a flag beside them.
-            //
-            // Every scope within, not just the first: a root parked here is
-            // live across all of them, and one of them keeping it somewhere
-            // else is what makes the slot load-bearing. A scope that never
-            // reads it has no opinion.
-            let head = allocation
-                .within()
-                .next()
-                .map_or(regalloc::Where::Spilled, |inner| inner.at_head(*vid));
-            let resident_throughout = matches!(head, regalloc::Where::Reg(_))
-                && allocation.within().all(|inner| {
-                    inner
-                        .placement_of(*vid)
-                        .is_none_or(|p| p.locations().all(|at| at == head))
-                });
-            if !resident_throughout {
-                backend.emit_store(&mut asm.code, r, offset)?;
-            }
-            if let regalloc::Where::Reg(head_reg) = head
-                && head_reg != r
-            {
-                backend.emit_mov(&mut asm.code, head_reg, r);
-            }
+        // Resident by construction: a root is a computed value, not a leaf
+        // (`place_roots` never parks one), so its own definition — the
+        // instruction just emitted — wrote it into a register.
+        if parked.contains_key(vid) {
+            hand_off(backend, &mut asm.code, *vid, dst_loc.reg())?;
         }
     }
 
@@ -2201,26 +2311,30 @@ fn emit_dag_body_hoisted<B: IsaBackend>(
     // `Assembly::finish` panics on a name nobody wrote, which is the same
     // check, stated once, for every branch rather than only these.
 
-    // The scope's result, in a register for the scaffold to store. Usually the
-    // last instruction's own destination; not when the body's root was hoisted
-    // out entirely and is read from its park, which is what the allocator
-    // reserved a target on the last instruction for.
-    let root = schedule
-        .last()
-        .map(|def| def.value)
-        .expect("empty schedule");
-    let result_reg = match location_of(&locs, root) {
-        Binding::Loc(Loc::Reg(r)) => r,
-        _ => {
-            let target = allocation
-                .scratch(sched_len - 1)
-                .result
-                .expect("the allocator reserves a result target on every scope's last instruction");
-            backend.emit_resolve(&mut asm.code, root, target, &locs)
-        }
+    // The scope's result, in a register for the fold around it to combine.
+    // Usually the last instruction's own destination; not when the body's
+    // root was hoisted out entirely and is read from its park, which is what
+    // the allocator reserved a target on the last instruction for. An effect
+    // has no result.
+    let root_def = schedule.last().expect("empty schedule");
+    let result_reg = if is_unit(&root_def.op) {
+        None
+    } else {
+        let root = root_def.value;
+        Some(match location_of(&locs, root) {
+            Binding::Loc(Loc::Reg(r)) => r,
+            _ => {
+                let target = allocation.scratch(sched_len - 1).result.expect(
+                    "the allocator reserves a result target on every scope's last instruction",
+                );
+                backend.emit_resolve(&mut asm.code, root, target, &locs)
+            }
+        })
     };
 
-    Ok((asm.finish(), result_reg, frame_size, real_spill_count))
+    let code = asm.finish();
+    backend.scope_end(allocation.scope(), code.len() as u32);
+    Ok((code, result_reg, frame_size, real_spill_count))
 }
 
 /// Info about an operation in the schedule.
@@ -2251,10 +2365,35 @@ pub enum ScheduledOp {
     /// never becomes a scheduled value. The index is the one real input.
     Gather(regalloc::ValueId, u16),
     /// Per-call scalar, broadcast from the block: a definition with no
-    /// operands — like `Const`, but not a leaf to the hoisting partition,
-    /// since the load is an instruction worth doing once per call rather
-    /// than once per batch.
+    /// operands — like `Const`, but not a leaf to the placement, since the
+    /// load is an instruction worth doing once per call rather than once
+    /// per batch.
     Uniform(UniformLoad),
+    /// The lane fold's binder: the constant `[0, 1, …, L−1]`. The fold
+    /// whose binder this is executes by lanes (its body is inlined into its
+    /// parent's schedule — see [`arena_to_schedule`]), so the binder is a
+    /// leaf here rather than a loop counter. Carries the binder so its
+    /// variance bit is the fold's, which is what "lane-uniform" is read off.
+    Lanes(Binder),
+    /// The store the lattice's folds wrap a kernel in: `value`'s first
+    /// `lanes` lanes at `out + 4·(row·pitch + col)`, `row` and `col` being
+    /// the enclosing folds' binders. This def *is* the lane fold, executed
+    /// by lanes: `lane` is that fold's binder, which it closes over the way
+    /// any `Reduce` closes over its own, and `lanes` its trip count — the
+    /// full batch, or a row's remainder — so two lane folds sharing one
+    /// arena `Write` are two defs of different widths reading one value.
+    Write {
+        row: Binder,
+        col: Binder,
+        lane: Binder,
+        lanes: u32,
+        value: regalloc::ValueId,
+    },
+    /// Two effects, the first then the second: the unit monoid's own
+    /// combine, which is what a `SEQ` fold over a row's main batches and its
+    /// remainder is. Reads no register — the schedule's order *is* the
+    /// sequencing — and defines no value.
+    Seq(regalloc::ValueId, regalloc::ValueId),
     /// A surviving bounded fold: `⊕` over `fold`'s visited indices, whose
     /// body is the value named by the second field — in *this schedule's*
     /// numbering (`arena_to_schedule` maps it like any other child), before
@@ -2267,6 +2406,26 @@ pub enum ScheduledOp {
     /// naming the [`regalloc::Scope::Fold`] this def opens, not from this
     /// `ValueId`.
     Reduce(Fold, regalloc::ValueId),
+    /// A surviving `Guard`: the mask, and its two arms' names. `mask` is a
+    /// real value in *this* schedule (`arena_to_schedule` maps it like any
+    /// other child); the two `KernelKey`s are not — they name kernels whose
+    /// bodies live in wholly separate arenas, resolved through
+    /// `KernelStore::resolve` by `extract_guards`, which schedules each arm
+    /// as its own [`regalloc::Scope::GuardArm`], exactly as [`extract_folds`]
+    /// carves a [`ScheduledOp::Reduce`]'s body into its own
+    /// [`regalloc::Scope::Fold`] — except an arm is not carved *out of*
+    /// anything here, since nothing of it was ever in this schedule to carve.
+    /// The emitter never resolves this def's operands the ordinary way: its
+    /// own `ValueId` is forced to a slot (`regalloc`'s `Scan`, mirroring a
+    /// `Reduce`'s accumulator), and the two arms' scopes — found by
+    /// `regalloc::Allocation::guard_opening_at` — are each emitted as a
+    /// nested scope bracketed by a branch instead of a loop
+    /// (docs/plans/2026-09-12-emit-should-just-emit.md §3).
+    Guard(
+        regalloc::ValueId,
+        pixelflow_ir::key::KernelKey,
+        pixelflow_ir::key::KernelKey,
+    ),
 }
 
 // =============================================================================
@@ -2321,13 +2480,55 @@ fn shift_immediate(op: OpKind, count: f32) -> u8 {
 /// construction). We filter to reachable nodes, remap `ExprId` to `ValueId`,
 /// and translate `ExprNode` to `ScheduledOp`.
 ///
+/// The arena is a legalized one: wrapped in the lattice's folds, with no
+/// coordinate `Var` left. Two of its shapes are not copied one to one:
+///
+/// - **The lane fold is inlined.** A `Reduce` whose body is a `Write` naming
+///   the fold's binder as its lane is the fold executed by lanes; it has no
+///   loop, so its body is not carved into a scope of its own — its `Write`
+///   becomes the fold's own def, in its parent's schedule, with the fold's
+///   trip count folded in as the store width, and the arena's `Write` node
+///   itself gets no `ValueId` (nothing but a lane fold names one). Two lane
+///   folds sharing one `Write` — a row's main batches and its remainder —
+///   are two `Write` defs of different widths reading one value.
+/// - **The lane binder is a constant.** Its `Var` becomes
+///   [`ScheduledOp::Lanes`], the iota every lane-varying value is built on.
+///
+/// `origin` is the uniform slots of the two [`origin`] scalars, which read
+/// from the context entry after the link's block rather than from it.
+///
 /// # Panics
 ///
 /// Panics if a `Param` or `Nary` node is encountered (these are not expected
-/// in JIT compilation).
+/// in JIT compilation), or a coordinate `Var` survived `collapse`.
 fn arena_to_schedule(
     arena: &pixelflow_ir::arena::ExprArena,
     root: pixelflow_ir::arena::ExprId,
+    origin: [UniformId; 2],
+) -> Vec<regalloc::Def> {
+    arena_to_schedule_from(arena, root, origin, 0)
+}
+
+/// [`arena_to_schedule`], numbering `ValueId`s from `starting_id` rather than
+/// `0`.
+///
+/// Every production call site schedules one whole nest's worth of
+/// `ValueId`s at once, all sharing one numbering — a fold's schedule is
+/// *carved out of* its parent's by [`extract_folds`], keeping the parent's
+/// ids, so nothing needs a second range. A `Guard`'s arm is the one
+/// exception: its schedule is built fresh, from a wholly separate arena
+/// (`schedule_guard_arm`), so its own `0..N` would collide with whatever
+/// `ValueId`s the enclosing nest already uses — and a collision here is not
+/// merely a wrong number, it is `regalloc::Allocation::parked_by_an_enclosing_scope`
+/// answering `true` for an arm value that happens to share a number with
+/// some unrelated ancestor's root, reading that root's park slot instead of
+/// computing its own value. `schedule_guard_arm` is the one caller that needs
+/// this, offsetting each arm past every id already in use in the nest so far.
+fn arena_to_schedule_from(
+    arena: &pixelflow_ir::arena::ExprArena,
+    root: pixelflow_ir::arena::ExprId,
+    origin: [UniformId; 2],
+    starting_id: u32,
 ) -> Vec<regalloc::Def> {
     use pixelflow_ir::arena::{ExprId, ExprNode};
     use regalloc::ValueId;
@@ -2336,10 +2537,30 @@ fn arena_to_schedule(
     let mut reachable = alloc::vec![false; len];
     mark_reachable(arena, root, &mut reachable);
 
-    // ExprId to ValueId mapping. u32::MAX = unmapped (unreachable).
+    // The lane binder: the one every reachable `Write` names as its lane.
+    // One slot, by construction (`passes::lattice::pack` builds both lane
+    // folds on `collapse`'s), asserted rather than assumed.
+    let mut lane: Option<Binder> = None;
+    for (idx, _) in reachable.iter().enumerate().filter(|(_, r)| **r) {
+        if let ExprNode::Write { lane: l, .. } = arena.node(ExprId(idx as u32)) {
+            match lane {
+                None => lane = Some(l),
+                Some(seen) => assert_eq!(
+                    seen, l,
+                    "two Writes name different lane binders; a lattice has one lane fold"
+                ),
+            }
+        }
+    }
+
+    // ExprId to ValueId mapping. u32::MAX = unmapped (unreachable, or a
+    // `Write` node, whose defs are its lane folds').
     let mut id_map = alloc::vec![ValueId(u32::MAX); len];
     let mut schedule = Vec::new();
-    let mut next_id = 0u32;
+    let mut next_id = starting_id;
+
+    let buffers = u16::try_from(arena.buffers().len())
+        .expect("buffer table index fits the context slot immediate");
 
     for idx in 0..len {
         if !reachable[idx] {
@@ -2347,11 +2568,14 @@ fn arena_to_schedule(
         }
         let expr_id = ExprId(idx as u32);
         let node = arena.node(expr_id);
+        if let ExprNode::Write { .. } = node {
+            continue;
+        }
         let vid = ValueId(next_id);
         next_id += 1;
         id_map[idx] = vid;
 
-        let map_child = |child: &ExprId| -> ValueId {
+        let map_child = |child: ExprId| -> ValueId {
             let mapped = id_map[child.0 as usize];
             assert!(
                 mapped.0 != u32::MAX,
@@ -2363,8 +2587,16 @@ fn arena_to_schedule(
         };
 
         let sched_op = match node {
-            ExprNode::Var(i) => ScheduledOp::Var(*i),
-            ExprNode::Const(v) => ScheduledOp::Const(*v),
+            ExprNode::Var(i) => match Binder::from_var(i) {
+                None => panic!(
+                    "arena_to_schedule: Var({i}) is a coordinate, which \
+                     passes::lattice::collapse substitutes away -- this schedule was \
+                     built without the lowering pipeline"
+                ),
+                Some(b) if lane == Some(b) => ScheduledOp::Lanes(b),
+                Some(_) => ScheduledOp::Var(i),
+            },
+            ExprNode::Const(v) => ScheduledOp::Const(v),
             ExprNode::Param(i) => panic!(
                 "ExprNode::Param({}) reached the JIT emitter -- \
                  call substitute_params before compile()",
@@ -2376,35 +2608,43 @@ fn arena_to_schedule(
             // placeholder occupying its ValueId slot, exactly as ShiftImm leaves
             // its folded shift-count Const as a dead schedule entry.
             ExprNode::Buffer(_) => ScheduledOp::Const(0.0),
-            // The block pointer sits in the context entry after the buffer
-            // slots; the value's offset is its slot index — the link step
+            // The link's block sits in the context entry after the buffer
+            // slots and the origin's in the one after that; a value's offset
+            // is its slot index within its block — the link step
             // (`jit_cache`) renumbers the table into dense first-occurrence
-            // order before anything reaches here, and a caller compiling an
-            // arena directly gets the table order it declared.
-            ExprNode::Uniform(u) => ScheduledOp::Uniform(UniformLoad {
-                ctx_slot: u16::try_from(arena.buffers().len())
-                    .expect("buffer table index fits the context slot immediate"),
-                offset: u.0,
-            }),
-            ExprNode::Unary(op, child) => ScheduledOp::Unary(*op, map_child(child)),
+            // order before anything reaches here, and the two origin slots
+            // are the last two, declared by `collapse` after the relink.
+            ExprNode::Uniform(u) => {
+                ScheduledOp::Uniform(match origin.iter().position(|&o| o == u) {
+                    Some(axis) => UniformLoad {
+                        ctx_slot: buffers + 1,
+                        offset: axis as u16,
+                    },
+                    None => UniformLoad {
+                        ctx_slot: buffers,
+                        offset: u.0,
+                    },
+                })
+            }
+            ExprNode::Unary(op, child) => ScheduledOp::Unary(op, map_child(child)),
             // Shl/Shr fold their Const shift-count operand into an immediate, so
             // the count never becomes a scheduled value (matching the imm-only
             // hardware shift encoders). The count const may still appear as its
             // own schedule entry (harmless/unused) if shared.
             ExprNode::Binary(op @ (OpKind::Shl | OpKind::Shr), a, b) => {
-                let amount = match arena.node(*b) {
-                    ExprNode::Const(v) => shift_immediate(*op, *v),
+                let amount = match arena.node(b) {
+                    ExprNode::Const(v) => shift_immediate(op, v),
                     _ => panic!(
                         "{:?} shift count must be a Const (lowering guarantees this)",
                         op
                     ),
                 };
-                ScheduledOp::ShiftImm(*op, map_child(a), amount)
+                ScheduledOp::ShiftImm(op, map_child(a), amount)
             }
             // RawGather folds its Buffer leaf into the `slot` immediate (like a
             // shift count); only the index operand becomes a scheduled value.
             ExprNode::Binary(OpKind::RawGather, buf, idx) => {
-                let slot = match arena.node(*buf) {
+                let slot = match arena.node(buf) {
                     ExprNode::Buffer(id) => id.0,
                     other => panic!("RawGather's first child must be a Buffer leaf, got {other:?}"),
                 };
@@ -2422,9 +2662,10 @@ fn arena_to_schedule(
                  either eliminates Dwrt or refuses to compile, so a survivor \
                  means this schedule was built without the lowering pipeline."
             ),
-            ExprNode::Binary(op, a, b) => ScheduledOp::Binary(*op, map_child(a), map_child(b)),
+            ExprNode::Binary(OpKind::Seq, a, b) => ScheduledOp::Seq(map_child(a), map_child(b)),
+            ExprNode::Binary(op, a, b) => ScheduledOp::Binary(op, map_child(a), map_child(b)),
             ExprNode::Ternary(op, a, b, c) => {
-                ScheduledOp::Ternary(*op, map_child(a), map_child(b), map_child(c))
+                ScheduledOp::Ternary(op, map_child(a), map_child(b), map_child(c))
             }
             // Same unreachable precondition as `Dwrt` above: `passes::legalize`
             // runs `expand_refs` first in every compile entry point, so a
@@ -2439,40 +2680,63 @@ fn arena_to_schedule(
                  point, so a survivor means this schedule was built without \
                  the lowering pipeline."
             ),
-            ExprNode::Nary(_, _, _) => panic!("Nary not supported in JIT arena compilation"),
+            ExprNode::Nary(_, _) => panic!("Nary not supported in JIT arena compilation"),
+            // The lane fold, executed by lanes: its body is the store, and
+            // the store is this def, with the fold's trip count as its width.
+            ExprNode::Reduce { fold, body } if matches!(arena.node(body), ExprNode::Write { lane, .. } if lane == fold.binder()) =>
+            {
+                let ExprNode::Write {
+                    row, col, value, ..
+                } = arena.node(body)
+                else {
+                    unreachable!("matched a Write above")
+                };
+                ScheduledOp::Write {
+                    row,
+                    col,
+                    lane: fold.binder(),
+                    lanes: fold.len(),
+                    value: map_child(value),
+                }
+            }
             // A surviving fold: `body` was already walked above (it is an
             // ordinary child, scheduled before its parent by the arena's own
             // topological order), so `map_child(body)` is that per-iteration
             // value's `ValueId` in *this* numbering. `extract_folds` reads
             // it back out into the fold's own `ScopeFold`; nothing after
             // that resolves it as an operand (see `ScheduledOp::Reduce`).
-            ExprNode::Reduce { fold, body } => ScheduledOp::Reduce(*fold, map_child(body)),
-            // G1 only makes `Guard` constructible; nothing chooses one
-            // (extraction has no price for it yet, G3) and nothing lowers
-            // one away (there is no legalization pass for it, unlike
-            // `Reduce`/`Ref` above — a `Guard` is not meant to be expanded
-            // before codegen, it is meant to be *emitted*, which is G2's
-            // job: "a mask test, a branch to a label, the arm's body, the
-            // join" (docs/plans/2026-09-12-emit-should-just-emit.md §3). So
-            // a `Guard` reaching this emitter today can only mean it was
-            // constructed and compiled directly, bypassing every stage that
-            // is supposed to gate it.
-            ExprNode::Guard { mask, on, off } => panic!(
-                "arena_to_schedule: Guard(mask={mask:?}, on={on:?}, off={off:?}) \
-                 reached the JIT emitter -- the emitter cannot emit one yet \
-                 (G2, docs/plans/2026-09-12-emit-should-just-emit.md)"
-            ),
+            ExprNode::Reduce { fold, body } => ScheduledOp::Reduce(fold, map_child(body)),
+            // G2: a `Guard` is not lowered away like `Reduce`/`Ref` above —
+            // it is meant to be *emitted*, not expanded. Its mask is the one
+            // real child in this arena, mapped like any other operand; its
+            // two arms are names (`KernelKey`s) rather than `ExprId`s, so
+            // there is nothing here to `map_child` for them. What emits it
+            // is `allocate_nest`'s `extract_guards` (resolves and schedules
+            // each arm as its own scope) plus `emit_scope`'s `Guard` arm
+            // (the branch itself), not this function.
+            ExprNode::Guard { mask, on, off } => ScheduledOp::Guard(map_child(mask), on, off),
+            ExprNode::Write { .. } => unreachable!("a Write node is skipped above"),
         };
         schedule.push(regalloc::Def {
             value: vid,
             op: sched_op,
         });
     }
+    // A `Write` whose lane fold nothing reached is a lane fold that is not
+    // where `pack` put it — under a column fold — and the schedule would
+    // be silently store-free.
+    assert!(
+        lane.is_none()
+            || schedule
+                .iter()
+                .any(|d| matches!(d.op, ScheduledOp::Write { .. })),
+        "arena_to_schedule: a Write is reachable but no lane fold names it"
+    );
     schedule
 }
 
 // =============================================================================
-// Collapse-loop LICM (X-invariant hoisting)
+// Scopes: which fold computes what
 // =============================================================================
 
 /// Compute [`Variance`](pixelflow_ir::variance::Variance) for every schedule entry.
@@ -2487,17 +2751,20 @@ fn schedule_variance(schedule: &[regalloc::Def]) -> Vec<pixelflow_ir::variance::
         let (vid, op) = (&def.value, &def.op);
         let i = vid.0 as usize;
         v[i] = match op {
-            ScheduledOp::Var(idx) if *idx < 8 => Variance::from_var(*idx),
+            ScheduledOp::Var(idx) if *idx < Variance::VARIABLES => Variance::from_var(*idx),
             ScheduledOp::Var(_) => Variance::ALL,
+            ScheduledOp::Lanes(lane) => Variance::from_var(lane.var()),
             // Invariant across the lattice; unknown until the call. The
-            // `CONST` here is what carries it into the per-call prologue.
+            // `CONST` here is what carries it into the per-call scope.
             ScheduledOp::Const(_) | ScheduledOp::Uniform(_) => Variance::CONST,
             ScheduledOp::Unary(_, a)
             | ScheduledOp::ShiftImm(_, a, _)
             // A gather reads from a bound buffer, whose contents are fixed for
             // the kernel's lifetime — its variance is its index's variance.
             | ScheduledOp::Gather(a, _) => v[a.0 as usize],
-            ScheduledOp::Binary(_, a, b) => v[a.0 as usize].union(v[b.0 as usize]),
+            ScheduledOp::Binary(_, a, b) | ScheduledOp::Seq(a, b) => {
+                v[a.0 as usize].union(v[b.0 as usize])
+            }
             ScheduledOp::Ternary(_, a, b, c) => v[a.0 as usize]
                 .union(v[b.0 as usize])
                 .union(v[c.0 as usize]),
@@ -2507,228 +2774,234 @@ fn schedule_variance(schedule: &[regalloc::Def]) -> Vec<pixelflow_ir::variance::
             // `Variance::without` is exactly "what a binder does to its own
             // index" (see `variance.rs`'s doc).
             ScheduledOp::Reduce(fold, body) => {
-                v[body.0 as usize].without(pixelflow_ir::variance::Variance::from_var(
-                    fold.binder().var(),
-                ))
+                v[body.0 as usize].without(Variance::from_var(fold.binder().var()))
             }
+            // Exactly the mask's, not `Variance::ALL`: an arm's schedule
+            // comes from a wholly separate arena (`extract_guards`, which
+            // runs after `scope_schedule` — see `allocate_nest`) that
+            // `passes::lattice::collapse` never wrapped, so an arm cannot
+            // reference *any* binder of the enclosing nest at all — warping
+            // does not yet reach into a guard's arms
+            // (docs/plans/2026-09-12-emit-should-just-emit.md §8, an open
+            // question this stage does not settle). Whichever arm the mask
+            // picks, the picked arm's own value is structurally invariant in
+            // every binder this schedule has; only the *choice* of arm can
+            // vary, and that varies exactly as the mask does.
+            //
+            // `Variance::ALL` was tried here first and is wrong, not merely
+            // imprecise: `Write`/`Reduce`/`Seq` all union their operands'
+            // variance, so an `ALL` leaf poisons every structural ancestor up
+            // to the root into looking like it depends on binder bits that
+            // do not exist in this nest at all. `extract_folds_bound_by`'s
+            // scope-placement filter (`bits() & deeper == 0`) then reads that
+            // poisoned variance and strips the *ancestor* `Reduce`/`Seq`
+            // nodes themselves out of an outer fold's own remaining
+            // schedule — not overly conservative, wrong: the outer loop's
+            // own structure goes missing, and `attach_folds` fails to find
+            // a child fold's `Reduce` def where extraction said it would be.
+            ScheduledOp::Guard(mask, ..) => v[mask.0 as usize],
+            // A store reads its row and column for the address, so it sits
+            // inside both their folds — which is the whole of why the
+            // lattice's loops can be placed by the same rule as everything
+            // else. And it is the lane fold, so like any `Reduce` it closes
+            // over its own binder: the row fold's result must not read as
+            // lane-varying, or the body would disown it.
+            ScheduledOp::Write {
+                row,
+                col,
+                lane,
+                value,
+                ..
+            } => v[value.0 as usize]
+                .without(Variance::from_var(lane.var()))
+                .union(Variance::from_var(row.var()))
+                .union(Variance::from_var(col.var())),
         };
     }
     v
 }
 
-/// The collapse loop's LICM partition: which values leave the X loop, and the
-/// two schedules that result.
+/// Split a flat schedule into its nest, placing every value in the outermost
+/// scope that binds all the binders it depends on.
 ///
-/// `roots[i]` is parked in hoist slot `i`. `prologue` computes the roots (the
-/// full X-invariant sub-DAG, original order); `body` is the loop schedule with
-/// each root's entry replaced by a `Const(0.0)` placeholder — never emitted,
-/// its location overridden to the hoist slot so consumers reload it through
-/// the ordinary spill machinery.
-struct HoistPlan {
-    roots: Vec<regalloc::ValueId>,
-    prologue: Vec<regalloc::Def>,
-    body: Vec<regalloc::Def>,
-}
-
-/// Partition a collapse schedule for LICM.
-///
-/// A hoist root is an X-invariant, non-leaf value consumed by at least one
-/// X-dependent op (or the schedule root itself, when the whole kernel is
-/// X-invariant — the loop degenerates to a store). `Gather`s — and anything
-/// computed from one — are never hoisted: hoisting moves a value out of any
-/// select-guard arm it sits in, and while speculating arithmetic is free,
-/// keeping memory reads exactly where the per-batch kernel had them costs
-/// nothing today (winding kernels are gather-free). A `Uniform` load is the
-/// one memory read that *is* hoisted: it is invariant for the whole call, it
-/// cannot fault, and loading it once is the entire point of the leaf.
-///
-/// Returns `None` when nothing qualifies, leaving the caller on the plain
-/// un-hoisted path.
-fn plan_collapse_hoist(
-    schedule: &[regalloc::Def],
-    variance: &[pixelflow_ir::variance::Variance],
-    scope_mask: u8,
-) -> Option<HoistPlan> {
-    use regalloc::ValueId;
-    let n = schedule.len();
-    if n == 0 {
-        return None;
-    }
-    let max_vid = schedule.iter().map(|def| def.value.0).max().unwrap_or(0) as usize;
-
-    let operands = |op: &ScheduledOp| -> alloc::vec::Vec<ValueId> {
-        match op {
-            // A `Reduce` reaching here has already had its body carved out by
-            // `extract_folds` (which runs before this partition, over the
-            // arena's full schedule) — its body's `ValueId` lives in the
-            // fold's own `ScopeFold` now, not in this schedule, so from this
-            // partition's perspective it is a leaf like `Uniform`.
-            ScheduledOp::Var(_)
-            | ScheduledOp::Const(_)
-            | ScheduledOp::Uniform(_)
-            | ScheduledOp::Reduce(..) => {
-                alloc::vec![]
-            }
-            ScheduledOp::Unary(_, a)
-            | ScheduledOp::ShiftImm(_, a, _)
-            | ScheduledOp::Gather(a, _) => {
-                alloc::vec![*a]
-            }
-            ScheduledOp::Binary(_, a, b) => alloc::vec![*a, *b],
-            ScheduledOp::Ternary(_, a, b, c) => alloc::vec![*a, *b, *c],
-        }
-    };
-
-    // Which values are consumed by an op varying inside this scope, and which contain a
-    // gather anywhere in their sub-DAG (forward pass — schedule is topological).
-    let mut feeds_varying = alloc::vec![false; max_vid + 1];
-    let mut contains_gather = alloc::vec![false; max_vid + 1];
-    for def in schedule {
-        let (vid, op) = (&def.value, &def.op);
-        let i = vid.0 as usize;
-        let ops = operands(op);
-        contains_gather[i] = matches!(op, ScheduledOp::Gather(_, _))
-            || ops.iter().any(|a| contains_gather[a.0 as usize]);
-        if variance[i].bits() & scope_mask != 0 {
-            for a in &ops {
-                feeds_varying[a.0 as usize] = true;
-            }
-        }
-    }
-
-    let is_leaf = |op: &ScheduledOp| matches!(op, ScheduledOp::Var(_) | ScheduledOp::Const(_));
-    let root_vid = schedule.last().map(|def| def.value)?;
-
-    let mut is_root = alloc::vec![false; max_vid + 1];
-    let mut roots: Vec<ValueId> = Vec::new();
-    for def in schedule {
-        let (vid, op) = (&def.value, &def.op);
-        let i = vid.0 as usize;
-        let hoistable = variance[i].bits() & scope_mask == 0
-            && !is_leaf(op)
-            && !contains_gather[i]
-            && (feeds_varying[i] || *vid == root_vid);
-        if hoistable {
-            is_root[i] = true;
-            roots.push(*vid);
-        }
-    }
-    if roots.is_empty() {
-        return None;
-    }
-
-    // Prologue: the transitive operand closure of the roots (all X-invariant
-    // by construction), kept in original topological order.
-    let mut in_prologue = alloc::vec![false; max_vid + 1];
-    for r in &roots {
-        in_prologue[r.0 as usize] = true;
-    }
-    for def in schedule.iter().rev() {
-        if in_prologue[def.value.0 as usize] {
-            for a in operands(&def.op) {
-                in_prologue[a.0 as usize] = true;
-            }
-        }
-    }
-    let prologue: Vec<_> = schedule
-        .iter()
-        .filter(|def| in_prologue[def.value.0 as usize])
-        .cloned()
-        .collect();
-
-    // Body: backward reachability from the schedule root, treating hoist roots
-    // as leaves (their entries become placeholders; operands not followed).
-    let mut in_body = alloc::vec![false; max_vid + 1];
-    in_body[root_vid.0 as usize] = true;
-    for def in schedule.iter().rev() {
-        let i = def.value.0 as usize;
-        if in_body[i] && !is_root[i] {
-            for a in operands(&def.op) {
-                in_body[a.0 as usize] = true;
-            }
-        }
-    }
-    let body: Vec<_> = schedule
-        .iter()
-        .filter(|def| in_body[def.value.0 as usize])
-        .map(|def| {
-            if is_root[def.value.0 as usize] {
-                // placeholder; never emitted
-                regalloc::Def {
-                    value: def.value,
-                    op: ScheduledOp::Const(0.0),
-                }
-            } else {
-                def.clone()
-            }
-        })
-        .collect();
-
-    // Keep only roots the body actually reads (an interior invariant value
-    // consumed solely by other hoisted values needs no slot). The schedule
-    // root always keeps its slot — the loop stores it.
-    let roots: Vec<ValueId> = roots
-        .into_iter()
-        .filter(|r| in_body[r.0 as usize])
-        .collect();
-    if roots.is_empty() {
-        return None;
-    }
-
-    Some(HoistPlan {
-        roots,
-        prologue,
-        body,
-    })
-}
-
-/// Split a schedule by scope over `binders`, given innermost first.
-///
-/// One rule, applied once per binder from the outside in: a value is lifted
-/// out of a binder when its variance does not name that binder or any binder
-/// inside it. That is loop-invariant code motion, hoisting out of a
-/// reduction, and constant folding — the same question asked at each level,
-/// which is why this is a loop over binders rather than a tier per scope.
-///
-/// The lifted roots of an outer region are leaves to every region inside it,
-/// so each level sees a strictly smaller schedule and the last remainder is
-/// the per-sample body.
-fn partition_by_scope(
+/// Two steps, and the second is the placement. [`extract_folds`] carves each
+/// surviving `Reduce`'s closure out into a scope of its own, one level per
+/// fold; what that leaves in a fold's schedule is everything its body
+/// reaches whose variance names no binder deeper than the fold's own — which
+/// still includes values invariant *in* the fold, computed in it once per
+/// trip. [`place_roots`] then moves each of those up to the outermost scope
+/// binding its binders, where it is computed once, and leaves a placeholder
+/// behind for the scope that read it. That is loop-invariant code motion
+/// out of every fold at once — the lattice's rows and columns included, so
+/// a per-call value is computed per call and a per-row one per row
+/// (docs/plans/2026-09-16-collapse-is-a-fold.md §2.2) — asked as one
+/// question of the variance rather than as a tier per loop.
+fn scope_schedule(
     schedule: Vec<regalloc::Def>,
     variance: &[pixelflow_ir::variance::Variance],
-    binders: &[u8],
 ) -> regalloc::ScopedSchedule {
-    let mut remaining = schedule;
-    let mut regions = Vec::with_capacity(binders.len());
-    // Outermost first: the scope outside binder `j` cannot depend on `j` or
-    // on anything bound inside it.
-    for j in (0..binders.len()).rev() {
-        let mask = binders[..=j].iter().fold(0u8, |m, b| m | (1 << b));
-        match plan_collapse_hoist(&remaining, variance, mask) {
-            Some(plan) => {
-                remaining = plan.body;
-                regions.push(regalloc::ScopeRegion {
-                    roots: plan.roots,
-                    schedule: plan.prologue,
-                });
+    let (body, pending) = extract_folds(schedule, variance);
+    // Every scope's selects are guarded where a branch pays, so this is
+    // where an arm's entries are worth gathering into one run. A no-op
+    // unless it buys a branch. Before `attach_folds`, because it is a
+    // permutation and a fold's position is a fact about its parent's final
+    // order.
+    let body = guards::cluster_select_arms(body);
+    let pending = pending.into_iter().map(cluster_pending).collect();
+    let mut scoped = regalloc::ScopedSchedule {
+        body: regalloc::ScopeRegion {
+            roots: Vec::new(),
+            schedule: body,
+        },
+        folds: Vec::new(),
+        // Not `extract_guards`'s job: that runs after this function returns
+        // (`allocate_nest`), on the settled body and fold schedules
+        // `cluster_select_arms`/`attach_folds`/`place_roots` below produce —
+        // see `extract_guards`'s own doc for why it cannot run in here.
+        guard_arms: Vec::new(),
+    };
+    attach_folds(&mut scoped, pending);
+    place_roots(&mut scoped, variance);
+    scoped
+}
+
+/// [`guards::cluster_select_arms`] over a pending fold's schedule and, one
+/// level down, each of its children's.
+fn cluster_pending(fold: PendingFold) -> PendingFold {
+    PendingFold {
+        reduce_vid: fold.reduce_vid,
+        schedule: guards::cluster_select_arms(fold.schedule),
+        children: fold.children.into_iter().map(cluster_pending).collect(),
+    }
+}
+
+/// Whether a def is one the placement never parks: a leaf that is cheaper
+/// rebuilt than reloaded (a constant rematerializes in one instruction), a
+/// binder's placeholder (found where its fold keeps it), or a `Reduce` that
+/// is not this scope's own (a placeholder already, read from its
+/// accumulator slot).
+fn stays_put(op: &ScheduledOp) -> bool {
+    matches!(
+        op,
+        ScheduledOp::Const(_)
+            | ScheduledOp::Var(_)
+            | ScheduledOp::Lanes(_)
+            | ScheduledOp::Reduce(..)
+            | ScheduledOp::Guard(..)
+    )
+}
+
+/// The second half of [`scope_schedule`]: in every fold, each def whose
+/// variance does not name the fold's binder is computed by an enclosing
+/// scope — the outermost binding every binder it *does* name — and read
+/// here from that scope's park.
+///
+/// The value is already in the enclosing scope's schedule: a fold's closure
+/// was carved out of its parent's, and a value invariant in the fold has no
+/// bit deeper than the parent's, so the parent kept it. What changes is that
+/// the fold's own copy becomes a placeholder, and the value joins the
+/// computing scope's `roots`.
+fn place_roots(
+    scoped: &mut regalloc::ScopedSchedule,
+    variance: &[pixelflow_ir::variance::Variance],
+) {
+    use pixelflow_ir::variance::Variance;
+    use regalloc::Scope;
+
+    // What each scope binds, read off before any def is edited: a fold's
+    // own binder, plus the lane binder of any store it holds (the lane fold
+    // is inlined into the scope that stores — see `extract_folds_bound_by`).
+    // The same index answers for a fold as a scope and as an ancestor.
+    let body_binds = lane_binders(&scoped.body.schedule);
+    let binds: Vec<Variance> = (0..scoped.folds.len())
+        .map(|j| {
+            Variance::from_var(binder_of_fold(scoped, j))
+                .union(lane_binders(&scoped.folds[j].schedule))
+        })
+        .collect();
+    for j in 0..scoped.folds.len() {
+        let own = binds[j];
+        // Ancestors, nearest first, each with what it binds; the body is
+        // where the chain ends.
+        let mut ancestors: Vec<(Scope, Variance)> = Vec::new();
+        let mut up = scoped.folds[j].parent;
+        loop {
+            match up {
+                Scope::Body => {
+                    ancestors.push((Scope::Body, body_binds));
+                    break;
+                }
+                Scope::Fold(p) => {
+                    ancestors.push((up, binds[p]));
+                    up = scoped.folds[p].parent;
+                }
+                Scope::GuardArm(_) => {
+                    unreachable!("a fold's parent is never a guard arm (none nest in one)")
+                }
             }
-            None => regions.push(regalloc::ScopeRegion {
-                roots: Vec::new(),
-                schedule: Vec::new(),
-            }),
+        }
+        let mut moved: Vec<(Scope, regalloc::ValueId)> = Vec::new();
+        for def in &mut scoped.folds[j].schedule {
+            let deps = variance[def.value.0 as usize];
+            if deps.bits() & own.bits() != 0 || stays_put(&def.op) {
+                continue;
+            }
+            // The outermost ancestor binding every binder `deps` names: the
+            // nearest one binding any of them, or the body when none does —
+            // an ancestor's binder in `deps` puts the value inside that
+            // ancestor, and outside every scope nearer than it.
+            let computing = ancestors
+                .iter()
+                .find(|(_, binds)| deps.bits() & binds.bits() != 0)
+                .map_or(Scope::Body, |(scope, _)| *scope);
+            moved.push((computing, def.value));
+            // The placeholder; never emitted, located at the park.
+            def.op = ScheduledOp::Const(0.0);
+        }
+        for (computing, vid) in moved {
+            let roots = match computing {
+                Scope::Body => &mut scoped.body.roots,
+                Scope::Fold(p) => &mut scoped.folds[p].roots,
+                Scope::GuardArm(_) => {
+                    unreachable!("place_roots never computes an ancestor as a guard arm")
+                }
+            };
+            if !roots.contains(&vid) {
+                roots.push(vid);
+            }
         }
     }
-    regalloc::ScopedSchedule {
-        regions,
-        body: remaining,
-        // A surviving `Reduce` was already carved out of `schedule` by
-        // `extract_folds`, run by the caller before this partition — this
-        // function only ever sees the fold-body-free schedule it left, and
-        // has no way to say which region or the body the carved-out
-        // `Reduce` def landed in. `attach_folds` fills this in afterward,
-        // once that is known.
-        folds: Vec::new(),
-    }
+}
+
+/// The lane binders a scope binds by holding a store: the lane fold is
+/// executed by lanes, inlined into the scope its `Write` def sits in, so
+/// that scope is where a lane-varying value lives — nothing deeper binds
+/// the lane, and nothing shallower may compute a value that varies by it.
+fn lane_binders(schedule: &[regalloc::Def]) -> pixelflow_ir::variance::Variance {
+    use pixelflow_ir::variance::Variance;
+    schedule
+        .iter()
+        .fold(Variance::CONST, |acc, def| match def.op {
+            ScheduledOp::Write { lane, .. } => acc.union(Variance::from_var(lane.var())),
+            _ => acc,
+        })
+}
+
+/// A fold's binder, read off the `Reduce` def it opens at in its parent.
+fn binder_of_fold(scoped: &regalloc::ScopedSchedule, j: usize) -> u8 {
+    use regalloc::Scope;
+    let fold = &scoped.folds[j];
+    let def = match fold.parent {
+        Scope::Body => &scoped.body.schedule[fold.at],
+        Scope::Fold(p) => &scoped.folds[p].schedule[fold.at],
+        Scope::GuardArm(_) => {
+            unreachable!("a fold's parent is never a guard arm (none nest in one)")
+        }
+    };
+    let ScheduledOp::Reduce(meta, _) = &def.op else {
+        panic!("Fold({j}) opens at a def that is not a Reduce")
+    };
+    meta.binder().var()
 }
 
 /// A fold `extract_folds` carved out of a flat schedule, still looking for
@@ -2742,179 +3015,244 @@ struct PendingFold {
     /// The fold's own per-iteration computation, in topological order,
     /// ending at the body's root.
     schedule: Vec<regalloc::Def>,
+    /// The folds whose `Reduce` def sits in `schedule`: a fold inside this
+    /// one's body. The nest is a tree, and this is the recursion.
+    children: Vec<PendingFold>,
 }
 
-/// Carve every surviving `Reduce`'s body out of `schedule`, before anything
-/// else — in particular before [`partition_by_scope`]'s X/Y split — sees it.
+/// Carve every surviving `Reduce`'s body out of `schedule`.
 ///
-/// Doing this *before* the X/Y split matters: that split masks only bits
-/// 0/1, so a fold-body node computed purely from the binder (X/Y-invariant,
-/// but *not* call-invariant) would otherwise read as hoistable and be lifted
-/// into a region that runs once instead of `len()` times.
-///
-/// A schedule's `ValueId`s are dense and positional —
-/// `arena_to_schedule` assigns them in the same order it pushes `Def`s, so
-/// `schedule[v.0 as usize]` is always the def of `v` — which is what makes a
-/// bitset over positions double as a reachability set here.
+/// A fold inside a fold's body is carved the same way, one level down: the
+/// outer fold's closure is a schedule like any other, and the inner fold is
+/// a `Reduce` def in it. `variance` is indexed by `ValueId` (dense and
+/// positional in the arena's own schedule — `arena_to_schedule` assigns
+/// them in the order it pushes `Def`s), which is what lets one array answer
+/// for every level.
 fn extract_folds(
     schedule: Vec<regalloc::Def>,
     variance: &[pixelflow_ir::variance::Variance],
 ) -> (Vec<regalloc::Def>, Vec<PendingFold>) {
-    let n = schedule.len();
-    let mut pending: Vec<PendingFold> = Vec::new();
+    let top = alloc::vec![false; variance.len()];
+    extract_folds_bound_by(
+        schedule,
+        variance,
+        pixelflow_ir::variance::Variance::CONST,
+        &top,
+    )
+}
 
-    for def in &schedule {
-        let ScheduledOp::Reduce(_, body_vid) = def.op else {
+/// [`extract_folds`] for one scope, `bound` being the binders that scope is
+/// *inside*: none at the top, a fold's own binder and its ancestors' for
+/// that fold's body.
+///
+/// `bound` is what decides which values leave. Nothing outside a fold can
+/// read its own binder — that is what makes it a binder — so a value whose
+/// variance names a binder this scope is *not* inside can only belong to a
+/// fold nested deeper, and dropping it here is safe by construction. A value
+/// a fold's closure also reached but whose variance names no deeper binder
+/// (a shared invariant leaf, or one that varies only with an enclosing
+/// binder) is not dropped: it stays here too, and stays in the fold's own
+/// schedule as well — where [`place_roots`] turns it into a placeholder read
+/// from the enclosing scope's park, unless it is a leaf cheaper to rebuild.
+/// Getting this backwards — removing the whole closure — would orphan
+/// exactly that shared leaf's other consumer.
+///
+/// The one thing that is *not* recomputed inside a fold is another fold
+/// that does not depend on its binder: a whole loop per iteration is the
+/// glyph's winding sum run once per piece of its distance fold, and once
+/// more at the top for the coverage that reads it. Such a `Reduce` stays
+/// the enclosing scope's fold, and the fold that reads its result keeps its
+/// def as a **placeholder** — in the schedule, so the reads resolve, but
+/// opening no scope here; `allocate_nest` parks it in its accumulator slot,
+/// where the enclosing scope's loop left it before this one began.
+/// `placeholder` is that verdict from the level above, by `ValueId`, so a
+/// level never mistakes one for a fold of its own.
+fn extract_folds_bound_by(
+    schedule: Vec<regalloc::Def>,
+    variance: &[pixelflow_ir::variance::Variance],
+    bound: pixelflow_ir::variance::Variance,
+    placeholder: &[bool],
+) -> (Vec<regalloc::Def>, Vec<PendingFold>) {
+    use pixelflow_ir::variance::Variance;
+
+    // `ValueId` space, not this schedule's length: a fold's schedule is a
+    // subset of its parent's, keeping the parent's ids.
+    let n = variance.len();
+    let mut position: Vec<Option<usize>> = alloc::vec![None; n];
+    for (i, def) in schedule.iter().enumerate() {
+        position[def.value.0 as usize] = Some(i);
+    }
+    // The lane fold is executed by lanes, inlined into the scope holding its
+    // store — so that scope binds its binder, and a lane-varying value is
+    // computed here, not somewhere deeper.
+    let bound = bound.union(lane_binders(&schedule));
+    // A binder this scope is not inside: what a value carrying one is
+    // nested under, and what a fold read from outside does not carry.
+    let deeper = Variance::BINDERS.bits() & !bound.bits();
+    let hoisted = |v: regalloc::ValueId| {
+        placeholder[v.0 as usize] || variance[v.0 as usize].bits() & deeper == 0
+    };
+
+    let mut pending: Vec<PendingFold> = Vec::new();
+    // A `Reduce` inside another's closure is that one's child, not this
+    // scope's own fold. The schedule is topological, so an outer fold's def
+    // comes after everything its body reaches; walking it backwards meets
+    // the outer fold first, and what its closure claims is skipped here and
+    // carved out by the recursion instead.
+    let mut claimed = alloc::vec![false; n];
+
+    for def in schedule.iter().rev() {
+        let ScheduledOp::Reduce(fold, body_vid) = def.op else {
             continue;
         };
+        if claimed[def.value.0 as usize] || placeholder[def.value.0 as usize] {
+            continue;
+        }
         // The fold's own closure: everything its body needs, reachable by
         // operand from its root. This *includes* any invariant leaf it
         // shares with code outside it (a `Uniform`, a shared sub-expression)
         // — reachability says nothing about whether such a value depends on
         // *this* binder, which is why it is not what decides removal below.
+        //
+        // A nested `Reduce` that depends on a binder bound here is followed
+        // *into*: its body is not an operand (`regalloc::operands` says so —
+        // the def's own emission never reads it), but it is this closure's
+        // to carry, so the recursion below can carve it out again one level
+        // down. One that does not is a placeholder (see the fn doc): its def
+        // is kept, nothing behind it is.
         let mut mark = alloc::vec![false; n];
-        let mut stack = alloc::vec![body_vid];
+        let mut placeholder_here = alloc::vec![false; n];
+        let is_fold = |v: regalloc::ValueId| {
+            position[v.0 as usize]
+                .is_some_and(|p| matches!(schedule[p].op, ScheduledOp::Reduce(..)))
+        };
+        let mut stack = Vec::new();
         mark[body_vid.0 as usize] = true;
+        // The root too: a body that *is* another fold's result reads that
+        // result from its slot, and the whole schedule is the placeholder.
+        if is_fold(body_vid) && hoisted(body_vid) {
+            placeholder_here[body_vid.0 as usize] = true;
+        } else {
+            stack.push(body_vid);
+        }
         while let Some(v) = stack.pop() {
-            for operand in regalloc::operands(&schedule[v.0 as usize].op) {
-                if !mark[operand.0 as usize] {
-                    mark[operand.0 as usize] = true;
-                    stack.push(operand);
+            let at = position[v.0 as usize].unwrap_or_else(|| {
+                panic!(
+                    "{v:?} is read by {:?}'s body but is not in its scope",
+                    def.value
+                )
+            });
+            let op = &schedule[at].op;
+            let nested_body = match op {
+                ScheduledOp::Reduce(..) => {
+                    claimed[v.0 as usize] = true;
+                    None
                 }
+                _ => None,
+            };
+            for operand in regalloc::structural_children(op).chain(nested_body) {
+                if mark[operand.0 as usize] {
+                    continue;
+                }
+                mark[operand.0 as usize] = true;
+                if is_fold(operand) && hoisted(operand) {
+                    placeholder_here[operand.0 as usize] = true;
+                    continue;
+                }
+                stack.push(operand);
             }
         }
-        assert!(
-            (0..n).all(|i| !mark[i] || !matches!(schedule[i].op, ScheduledOp::Reduce(..))),
-            "{:?}'s body reads another fold's result -- nested reduce loops \
-             are not carved out by this stage (2c handles one level; see \
-             docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md section 5)",
-            def.value
-        );
-        let fold_schedule: Vec<regalloc::Def> = (0..n)
-            .filter(|&i| mark[i])
-            .map(|i| schedule[i].clone())
+        let fold_schedule: Vec<regalloc::Def> = schedule
+            .iter()
+            .filter(|d| mark[d.value.0 as usize])
+            .cloned()
             .collect();
+        let inside = bound.union(Variance::from_var(fold.binder().var()));
+        let (fold_schedule, children) =
+            extract_folds_bound_by(fold_schedule, variance, inside, &placeholder_here);
         pending.push(PendingFold {
             reduce_vid: def.value,
             schedule: fold_schedule,
+            children,
         });
     }
+    // Schedule order, so fold indices are stable whichever way this walked.
+    pending.reverse();
 
     if pending.is_empty() {
         return (schedule, pending);
     }
 
-    // Variance, not reachability, decides what leaves the outer schedule.
-    // Nothing outside a fold can read its own binder — that is what makes it
-    // a binder — so a value whose variance carries *any* binder bit can only
-    // ever be part of that fold's own closure, and dropping it here is safe
-    // by construction. A value the closure above *also* reached but whose
-    // variance carries no binder bit (a shared invariant leaf) is not
-    // dropped: it stays here too, genuinely computed on both sides, and is
-    // recomputed once per iteration inside the fold — a missed hoist
-    // (docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md's "ask B"), not
-    // a wrong split. Getting this backwards — removing the whole closure —
-    // would orphan exactly that shared leaf's other consumer.
     let remaining: Vec<regalloc::Def> = schedule
         .into_iter()
-        .enumerate()
-        .filter(|(i, _)| {
-            variance[*i].bits() & pixelflow_ir::variance::Variance::BINDERS.bits() == 0
-        })
-        .map(|(_, def)| def)
+        .filter(|def| variance[def.value.0 as usize].bits() & deeper == 0)
         .collect();
     (remaining, pending)
 }
 
-/// Locate each [`PendingFold`]'s `Reduce` def in the schedule
-/// [`partition_by_scope`] (and, for the body, [`guards::cluster_select_arms`])
-/// produced, and record it as a [`regalloc::ScopeFold`].
+/// Locate each [`PendingFold`]'s `Reduce` def in the body's schedule and
+/// record it as a [`regalloc::ScopeFold`].
 ///
-/// A fold's parent is wherever its `Reduce` def landed: a region, on the rare
-/// fold whose completed result is invariant enough to hoist, or the body
-/// otherwise. Searched by value rather than carried through as a position,
-/// because both of those passes are schedule *permutations* — they move a
-/// `Def`, never rename the `ValueId` it defines.
+/// Searched by value rather than carried through as a position, because
+/// [`guards::cluster_select_arms`] is a schedule *permutation* — it moves a
+/// `Def`, never renames the `ValueId` it defines.
 fn attach_folds(scoped: &mut regalloc::ScopedSchedule, pending: Vec<PendingFold>) {
     for fold in pending {
-        let found = scoped
-            .regions
+        let at = scoped
+            .body
+            .schedule
             .iter()
-            .enumerate()
-            .find_map(|(i, region)| {
-                region
-                    .schedule
-                    .iter()
-                    .position(|def| def.value == fold.reduce_vid)
-                    .map(|at| (regalloc::Scope::Region(i), at))
-            })
-            .or_else(|| {
-                scoped
-                    .body
-                    .iter()
-                    .position(|def| def.value == fold.reduce_vid)
-                    .map(|at| (regalloc::Scope::Body, at))
+            .position(|def| def.value == fold.reduce_vid)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?}'s Reduce def is not in the body after extract_folds",
+                    fold.reduce_vid
+                )
             });
-        let (parent, at) = found.unwrap_or_else(|| {
-            panic!(
-                "{:?}'s Reduce def is not in any region or the body after \
-                 partition_by_scope -- extract_folds and partition_by_scope \
-                 disagree about the schedule",
-                fold.reduce_vid
-            )
-        });
-        scoped.folds.push(regalloc::ScopeFold {
-            parent,
-            at,
-            roots: Vec::new(),
-            schedule: fold.schedule,
-        });
+        attach_fold(scoped, fold, regalloc::Scope::Body, at);
     }
 }
 
-/// How [`emit_dag_body_hoisted`] treats hoisted values, if any.
-enum HoistCtx<'a> {
-    /// No hoisting (per-batch kernels, and collapse kernels with nothing to
-    /// hoist).
-    None,
-    /// Emitting the once-per-call prologue: after each mapped value's def,
-    /// store it to its hoist slot. Select short-circuit guards are disabled —
-    /// a guard could skip a hoist root's def on a uniform mask, leaving its
-    /// slot garbage for the loop to read (and the prologue runs once, so the
-    /// guard buys nothing).
-    Prologue {
-        /// Values parked by an enclosing loop and reloaded as leaves here.
-        preloaded: Option<&'a alloc::collections::BTreeMap<regalloc::ValueId, u32>>,
-        /// Values this prologue computes and parks for its inner loop.
-        parked: &'a alloc::collections::BTreeMap<regalloc::ValueId, u32>,
-    },
-    /// Emitting the loop body: mapped values are never emitted; their
-    /// locations are overridden — to a carried register where the allocator
-    /// found one, and otherwise to the hoist slot, where every consumer
-    /// reloads through the ordinary spill machinery.
-    Body {
-        slots: &'a alloc::collections::BTreeMap<regalloc::ValueId, u32>,
-    },
-}
-
-impl<'a> HoistCtx<'a> {
-    fn preloaded(&self) -> Option<&'a alloc::collections::BTreeMap<regalloc::ValueId, u32>> {
-        match self {
-            Self::None => None,
-            Self::Prologue { preloaded, .. } => *preloaded,
-            Self::Body { slots, .. } => Some(slots),
-        }
-    }
-
-    fn parked(&self) -> Option<&'a alloc::collections::BTreeMap<regalloc::ValueId, u32>> {
-        match self {
-            Self::Prologue { parked, .. } => Some(parked),
-            Self::None | Self::Body { .. } => None,
-        }
-    }
-
-    fn parks_values(&self) -> bool {
-        matches!(self, Self::Prologue { .. })
+/// Record `fold` as a [`regalloc::ScopeFold`] opening at `at` in `parent`,
+/// then each of its children inside it — depth first, so a parent's index is
+/// always below its children's, which is the order `allocate_nest` and the
+/// frame layout both walk the tree in.
+///
+/// A child's position is a search of its parent's schedule, for the same
+/// reason [`attach_folds`] searches rather than carries: the allocator keeps
+/// a fold's evaluation order, but a position is a fact about a schedule and
+/// this is the schedule it will be asked of.
+fn attach_fold(
+    scoped: &mut regalloc::ScopedSchedule,
+    fold: PendingFold,
+    parent: regalloc::Scope,
+    at: usize,
+) {
+    let PendingFold {
+        reduce_vid,
+        schedule,
+        children,
+    } = fold;
+    let index = scoped.folds.len();
+    scoped.folds.push(regalloc::ScopeFold {
+        parent,
+        at,
+        roots: Vec::new(),
+        schedule,
+    });
+    for child in children {
+        let at = scoped.folds[index]
+            .schedule
+            .iter()
+            .position(|def| def.value == child.reduce_vid)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?}'s Reduce def is not in {reduce_vid:?}'s body, which \
+                     extract_folds said it was nested in",
+                    child.reduce_vid
+                )
+            });
+        attach_fold(scoped, child, regalloc::Scope::Fold(index), at);
     }
 }
 
@@ -3032,9 +3370,17 @@ pub fn resolve_operands(
 
     let resolved_op = match op {
         ScheduledOp::Var(_) => {
-            // Precolored to input register — no code needed.
+            // A binder's placeholder: the loop seeded it — no code needed.
             ResolvedOp::Nop
         }
+        ScheduledOp::Lanes(_) => ResolvedOp::Lanes { dst },
+        // Unreachable precondition: both are effects the emit loop handles
+        // before this function is ever called, the same way a hoisted
+        // placeholder never reaches here either.
+        ScheduledOp::Write { .. } | ScheduledOp::Seq(..) => unreachable!(
+            "resolve_operands: an effect reached the generic resolver -- \
+             emit_scope must special-case it before calling this"
+        ),
         ScheduledOp::Const(val) => ResolvedOp::LoadConst {
             dst,
             val_bits: val.to_bits(),
@@ -3072,7 +3418,14 @@ pub fn resolve_operands(
         // hoisted placeholder never reaches here either.
         ScheduledOp::Reduce(..) => unreachable!(
             "resolve_operands: a Reduce def reached the generic resolver -- \
-             emit_dag_body_hoisted must special-case it before calling this"
+             emit_scope must special-case it before calling this"
+        ),
+        // Same unreachable precondition, for the same reason: `emit_scope`
+        // special-cases a `Guard` def (its branch, its two arms, its result
+        // store) before this function is ever called.
+        ScheduledOp::Guard(..) => unreachable!(
+            "resolve_operands: a Guard def reached the generic resolver -- \
+             emit_scope must special-case it before calling this"
         ),
         ScheduledOp::Binary(op_kind, left, right) => {
             // `left` goes to `dst` when it needs reloading — the two-operand
@@ -3250,26 +3603,17 @@ type Native = avx2::driver::Avx2Backend;
 ))]
 type Native = x86_64::driver::X86Backend;
 
-/// Compile an [`ExprArena`] DAG into a **collapse** kernel: the X/Y loop nest is
-/// emitted *inside* the code, so one call fills `rows * groups` output batches
-/// with no per-row or per-batch Rust↔JIT boundary. This is the internal-loop
-/// realization of a lattice collapse.
-///
-/// The per-batch body (produced by [`emit_dag_body_hoisted`], with derivatives /
-/// reductions / gathers / transcendentals already lowered) is wrapped in the
-/// build width's
-/// [`IsaBackend::emit_collapse_loop`] scaffold: X steps by the batch width and
-/// resets per row, Y steps by 1.0, the two dead base coordinates stay as the
-/// caller passed them, gathers read buffer bases from the context register,
-/// and each batch stores straight to `out`.
-/// Matches the
-/// [`KernelFn`](executable::KernelFn) ABI
-/// `(ctx, out, groups, rows, row_skip_bytes, x0, y0, z, w)`.
+/// Compile an [`ExprArena`] DAG into a **collapse** kernel for a lattice of
+/// `shape`: the kernel is wrapped in the lattice's folds by
+/// [`pixelflow_ir::passes::legalize`], and every fold is emitted as a loop
+/// inside the code — one call fills the whole extent with no per-row or
+/// per-batch Rust↔JIT boundary. Matches the
+/// [`KernelFn`](executable::KernelFn) ABI `(ctx, out, pitch)`.
 ///
 /// The context is one base pointer per declared buffer, in the arena's slot
-/// order, followed — only when the arena declares a uniform — by the uniform
-/// block's base pointer: `f32` values in the arena's uniform-slot order, read
-/// once per call in the frame prologue.
+/// order, followed by the uniform block's base pointer (`f32` values in the
+/// arena's uniform-slot order, read once per call) and then the origin
+/// block's: `x0`, `y0`.
 ///
 /// # Panics
 ///
@@ -3277,20 +3621,14 @@ type Native = x86_64::driver::X86Backend;
 /// the old Z and W). This is the boundary the check belongs on, because it
 /// is the *only* one every route to machine code passes through — the
 /// shape-keyed cache is one caller, and the benchmark harnesses, the corpus
-/// tools and several tests come straight here. It is also the *diagnostic*
-/// place: a panic naming `Var(2)` at the first `cargo test` is worth far
-/// more than what the alternative produces, which is a silent numeric
-/// disagreement between this kernel and the scalar oracle, surfacing on
-/// whichever machine happens to run the comparison.
-///
-/// A retired axis reaching here is not merely unread. The scaffold passes
-/// zero in those two lanes, and `Variance::from_var(2)` sits outside both
-/// `COORDS` and `BINDERS` — so the node reads as frame-uniform and LICM
-/// lifts it into the per-call prologue. Plausible pixels, computed once,
-/// from a lane that means nothing.
+/// tools and several tests come straight here. `collapse` substitutes only
+/// `X` and `Y`, so a retired axis would survive into the schedule as a `Var`
+/// no fold binds, and the allocator's refusal there names a binder, not an
+/// axis; this one names the axis.
 pub fn compile(
     arena: &pixelflow_ir::arena::ExprArena,
     root: pixelflow_ir::arena::ExprId,
+    shape: LatticeShape,
 ) -> Result<CompileResult, CompileError> {
     assert!(
         arena.retired_axis(root).is_none(),
@@ -3298,147 +3636,215 @@ pub fn compile(
          lattice no longer has; a per-call scalar is a Uniform",
         arena.retired_axis(root)
     );
-    EmitCtx::default().compile(arena, root)
+    EmitCtx::default().compile(arena, root, shape)
 }
 
-/// Drive a schedule to a complete collapse kernel via an
-/// [`IsaBackend`]: the body from [`emit_dag_body_hoisted`], framed by the backend's
-/// [`IsaBackend::emit_collapse_loop`] scaffold.
-fn compile_via_backend<B: IsaBackend>(
+/// The nest, scoped and allocated: what every scope's frame and code are
+/// read off. One allocation pass over the whole nest, so each scope's frame
+/// is a function of its own allocation and the shared frame is read off
+/// these rather than computed by allocating everything twice.
+fn allocate_nest(
     schedule: Vec<regalloc::Def>,
-    backend: &mut B,
-) -> Result<CompileResult, CompileError> {
+    file: &regalloc::RegisterFile,
+) -> regalloc::NestAllocation {
     use regalloc::RegisterAllocator;
 
-    let file = backend.register_file();
     // Variance first, over the arena's *full* schedule — a surviving
     // `Reduce`'s own result depends on its body's, and the body's def is
     // about to move (`extract_folds`, next) out of this array entirely.
     let variance = schedule_variance(&schedule);
-    let (schedule, pending_folds) = extract_folds(schedule, &variance);
+    let mut scoped = scope_schedule(schedule, &variance);
+    // After `scope_schedule`, not inside it: a guard arm's schedule is not
+    // carved out of this nest's own the way a fold's is (`extract_folds`) —
+    // it comes from resolving a wholly separate `KernelKey` — and
+    // `place_roots`'s LICM is keyed on *this* nest's own binder variance
+    // array, which has no meaning for a value in an arm's arena. See
+    // `extract_guards`'s own doc.
+    extract_guards(&mut scoped);
+    regalloc::LinearScan.allocate_nest(scoped, file)
+}
 
-    // The collapse ABI's nest, innermost first: X steps by the batch width
-    // and resets per row, Y steps by one. Z and W are per-call in this ABI,
-    // so a value invariant in X and Y is invariant for the whole call.
-    // `partition_by_scope` asks one question per binder; the two regions it
-    // returns are the per-call and per-row prologues the scaffold frames.
-    const COLLAPSE_BINDERS: [u8; 2] = [0, 1];
-    let mut scoped = partition_by_scope(schedule, &variance, &COLLAPSE_BINDERS);
-    // The body is the only scope whose selects are guarded (the prologues run
-    // once, so a branch buys nothing there), and it is the schedule the guard
-    // analysis will read — so this is where an arm's entries are worth
-    // gathering into one run. A no-op unless it buys a branch.
-    scoped.body = guards::cluster_select_arms(scoped.body);
-    // After clustering, not before: a fold's `Reduce` def can move with
-    // everything else a permutation touches, and this is a search by value
-    // rather than a position carried through, so running it last costs
-    // nothing and running it earlier would risk `at` naming a stale index.
-    attach_folds(&mut scoped, pending_folds);
+/// Resolve every surviving `Guard`'s two arms and attach them to `scoped` as
+/// [`regalloc::ScopeGuardArm`]s.
+///
+/// Runs once over the body and every fold's own schedule (both already
+/// settled by [`scope_schedule`] — the folds carved out, their arms
+/// clustered, their roots placed), looking for a [`ScheduledOp::Guard`] def
+/// at each position. Unlike [`extract_folds`], there is no schedule to carve
+/// a subset out of: an arm's `KernelKey` names a kernel in a wholly separate
+/// arena, so its schedule is built fresh, from scratch, by
+/// [`schedule_guard_arm`] — extraction and attachment are the same step here,
+/// which is why this function does both rather than handing a
+/// `Vec<PendingGuardArm>` to a second pass the way [`attach_folds`] follows
+/// [`extract_folds`].
+///
+/// Pushes a `Guard`'s `True` arm immediately before its `False` one, which is
+/// the pairing [`regalloc::NestAllocation::guard_count`] relies on.
+fn extract_guards(scoped: &mut regalloc::ScopedSchedule) {
+    // Every arm gets `ValueId`s past every id already in use anywhere in the
+    // nest — see `arena_to_schedule_from`'s doc for why a collision is a
+    // correctness bug, not merely an odd number. One counter for every arm
+    // of every guard, not one per arm: two arms sharing ids with each other
+    // is harmless (neither ever parks anything the other reads), but keeping
+    // one counter is simpler than arguing that case is fine.
+    let max_vid = |schedule: &[regalloc::Def]| {
+        schedule
+            .iter()
+            .map(|d| d.value.0)
+            .max()
+            .map_or(0, |m| m + 1)
+    };
+    let mut next_id = max_vid(&scoped.body.schedule);
+    for fold in &scoped.folds {
+        next_id = next_id.max(max_vid(&fold.schedule));
+    }
 
-    // One allocation pass over the whole nest. Each region's frame is a
-    // function of its own allocation, so the shared frame below is read off
-    // these rather than computed by allocating everything a second time.
-    let nest = regalloc::LinearScan.allocate_nest(scoped, &file);
-    assert_eq!(
-        nest.regions(),
-        COLLAPSE_BINDERS.len(),
-        "one region per collapse binder"
-    );
-    let frame_alloc = nest.scope(regalloc::Scope::Region(0));
-    let row_alloc = nest.scope(regalloc::Scope::Region(1));
+    let mut arms: alloc::vec::Vec<regalloc::ScopeGuardArm> = alloc::vec::Vec::new();
+    let mut schedule_arm = |parent, at, arm, key| {
+        let scheduled = schedule_guard_arm(parent, at, arm, key, next_id);
+        next_id = scheduled
+            .schedule
+            .iter()
+            .map(|d| d.value.0)
+            .max()
+            .map_or(next_id, |m| m + 1);
+        arms.push(scheduled);
+    };
+    for (at, def) in scoped.body.schedule.iter().enumerate() {
+        if let ScheduledOp::Guard(_, on, off) = def.op {
+            schedule_arm(regalloc::Scope::Body, at, guards::SelectArm::True, on);
+            schedule_arm(regalloc::Scope::Body, at, guards::SelectArm::False, off);
+        }
+    }
+    for (j, fold) in scoped.folds.iter().enumerate() {
+        for (at, def) in fold.schedule.iter().enumerate() {
+            if let ScheduledOp::Guard(_, on, off) = def.op {
+                let parent = regalloc::Scope::Fold(j);
+                schedule_arm(parent, at, guards::SelectArm::True, on);
+                schedule_arm(parent, at, guards::SelectArm::False, off);
+            }
+        }
+    }
+    scoped.guard_arms = arms;
+}
+
+/// Uniform slots [`schedule_guard_arm`] hands `arena_to_schedule` in place of
+/// a real [`origin_slots`] answer.
+///
+/// A guard arm's arena is never wrapped by `passes::lattice::collapse` (see
+/// [`schedule_guard_arm`]'s doc), so it declares no origin uniform — these
+/// two slot numbers exist only so a real [`UniformId`] in the arm never
+/// aliases them by coincidence, and `u16::MAX` down is far past any arena's
+/// own uniform table.
+const GUARD_ARM_NO_ORIGIN: [UniformId; 2] = [UniformId(u16::MAX), UniformId(u16::MAX - 1)];
+
+/// Resolve `key`, legalize it short of the lattice, and schedule it as one
+/// arm of a `Guard`.
+///
+/// **Short of the lattice**: only `expand_refs`/`lower_dwrt`, never
+/// `passes::lattice::{collapse, pack}`. A guard arm is inlined *at its site*
+/// in an already-collapsed schedule — it is a value the enclosing kernel
+/// consumes, not a second output plane — so wrapping it in its own row/column
+/// /lane folds and `Write` would be a second, nonsensical lattice around a
+/// value that already lives inside one. `passes::lattice::collapse` already
+/// refuses a reachable `Guard` for exactly this reason (its own doc): coordinate
+/// warping does not yet reach into a guard's arms at all — a question
+/// docs/plans/2026-09-12-emit-should-just-emit.md's §8 leaves open — so an
+/// arm referencing a raw coordinate `Var` fails loudly right here, in
+/// `arena_to_schedule`'s own "a coordinate that survived collapse" panic,
+/// rather than silently.
+///
+/// # Panics
+///
+/// - If `key` resolves to nothing (an arm must be interned before it can
+///   reach codegen).
+/// - If lowering finds a `Dwrt` with no derivative rule.
+/// - If the arm's own schedule contains a nested `Reduce` or `Guard` — not
+///   supported in this stage (G2's stated non-goal): a guard arm is a
+///   straight-line expression, not a second loop nest or a second branch.
+fn schedule_guard_arm(
+    parent: regalloc::Scope,
+    at: usize,
+    arm: guards::SelectArm,
+    key: pixelflow_ir::key::KernelKey,
+    starting_id: u32,
+) -> regalloc::ScopeGuardArm {
+    let kernel = pixelflow_ir::store::KernelStore::resolve(key).unwrap_or_else(|| {
+        panic!(
+            "schedule_guard_arm: {key:?} names no kernel in the KernelStore -- \
+             a Guard's arm must be interned (KernelStore::intern) before it \
+             reaches codegen"
+        )
+    });
+    let (arena, root) = kernel.parts();
+    let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
+    let (arena, root) = pixelflow_ir::passes::lower_dwrt_owned(&arena, root).unwrap_or_else(|e| {
+        panic!("schedule_guard_arm: {key:?}'s arm has no derivative rule: {e}")
+    });
+    let schedule = arena_to_schedule_from(&arena, root, GUARD_ARM_NO_ORIGIN, starting_id);
+    for def in &schedule {
+        assert!(
+            !matches!(def.op, ScheduledOp::Reduce(..) | ScheduledOp::Guard(..)),
+            "schedule_guard_arm: {key:?}'s arm schedules a {:?} -- a guard \
+             arm nesting a fold or another guard is not supported in this \
+             stage (G2, docs/plans/2026-09-12-emit-should-just-emit.md); a \
+             guard's arm must be a straight-line expression",
+            def.op
+        );
+    }
+    regalloc::ScopeGuardArm {
+        parent,
+        at,
+        arm,
+        schedule,
+    }
+}
+
+/// Drive a schedule to a complete collapse kernel via an [`IsaBackend`]: the
+/// body from [`emit_scope`], which emits every fold nested in it, framed by
+/// the function's own frame.
+fn compile_via_backend<B: IsaBackend>(
+    schedule: Vec<regalloc::Def>,
+    backend: &mut B,
+) -> Result<CompileResult, CompileError> {
+    let file = backend.register_file();
+    let nest = allocate_nest(schedule, &file);
     let body_alloc = nest.body();
-    let (frame_roots, row_roots) = (frame_alloc.roots(), row_alloc.roots());
 
     // Every byte below is emitted through this decorator, so the counts it
     // hands back cover the whole function by construction (see `traffic`).
     let mut counting = Counting::new(backend);
 
-    if frame_roots.is_empty() && row_roots.is_empty() && nest.fold_count() == 0 {
-        // Nothing loop-invariant worth hoisting, and no fold accumulator
-        // needing a slot outside any single scope's own frame: the plain
-        // loop nest.
-        let (body, result_reg, frame_size, spill_count) = emit_dag_body_hoisted(
-            body_alloc,
-            &mut counting,
-            HoistCtx::None,
-            FramePlan {
-                override_size: None,
-                fold_slots: &alloc::collections::BTreeMap::new(),
-                slot_base: 0,
-            },
-        )?;
-        let body_traffic = counting.take(body.len() as u32);
-        let code = counting.emit_collapse_loop(&CollapseBody {
-            frame_hoist: &[],
-            row_hoist: &[],
-            batch: &body,
-            result: result_reg,
-            frame_size,
-            hoist_slots: 0,
-        })?;
-        let scaffold = counting.take(code.len() as u32 - body.len() as u32);
-        let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
-        return Ok(CompileResult {
-            code: exec,
-            spill_count,
-            spill_bytes: frame_size,
-            max_regs: file.scratch.len(),
-            hoisted_values: 0,
-            traffic: EmitTraffic {
-                frame: ScopeTraffic::default(),
-                row: ScopeTraffic::default(),
-                body: body_traffic,
-                scaffold,
-                vector_bytes: file.vector_bytes,
-                pool: file.scratch.len(),
-                carried: 0,
-            },
-        });
-    };
-
-    // The two prologues and the loop body share one stack frame: spill slots
-    // in [0, m), the scaffold's five coordinate slots (four base coordinates
-    // plus row-start
-    // X) at [m, m + 5·vector_bytes), and hoist slots above those. `m` is the
-    // max of the three frames — each region is only live while its own code
-    // runs, but the hoist slots outlive all of them. Allocation and frame
-    // layout are pure, so pre-sizing here computes exactly the frames the
-    // emissions below will.
-    //
-    // The floor keeps x86's SSE2 backend out of red-zone mode: hoist offsets
-    // are far past the 128-byte zone, so both emissions must latch
-    // allocated-frame (`[rsp + offset]`) addressing.
-    const RED_ZONE_FLOOR: u32 = 144;
+    // Every scope shares one stack frame: spill slots in [0, m), and the
+    // park and fold slots above. `m` is the tree max — a fold's frame is
+    // based at its parent's top, since its loop runs *in the middle of* its
+    // parent's schedule with the parent's spilled values live across it —
+    // rounded to a whole slot so the slots above stay naturally aligned.
+    // Allocation and frame layout are pure, so pre-sizing here computes
+    // exactly the frames the emissions below will.
     let vector_bytes = file.vector_bytes;
-    // Rounded to a whole slot so the scaffold's coordinate and hoist slots,
-    // which sit at `m + k·vector_bytes`, stay naturally aligned. Every fold's
-    // own frame has to fit under the same `m` too — its emission below is
-    // handed the same override, exactly as the two prologues are.
-    //
-    // **The frame is a tree, not a max.** The two prologues and the body run
-    // one after another, each parking what the next needs in a hoist slot
-    // above `m`, so their own frames are dead by the time the next one opens
-    // and all three share a base of 0. A fold is the one scope that is not
-    // like that: its loop runs *in the middle of* its parent's schedule, with
-    // the parent's spilled values still live across it, so it is based at its
-    // parent's top and the two cannot alias. Taking a plain max over scopes
-    // sized the frame correctly and let a fold's spills land on its parent's
-    // slots — a glyph's 2,472-def fold body over its parent's 2,130, which is
-    // every slot the parent had.
     let mut top_of: alloc::collections::BTreeMap<regalloc::Scope, u32> =
         alloc::collections::BTreeMap::new();
-    let mut m = RED_ZONE_FLOOR;
-    // Regions first, then the body, then the folds in nest order: a fold's
-    // parent is always an earlier scope (asserted where the nest is built),
-    // so every `top_of` lookup below is already populated.
-    let scopes = (0..nest.regions())
-        .map(regalloc::Scope::Region)
-        .chain(core::iter::once(regalloc::Scope::Body))
-        .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
+    let mut m = 0u32;
+    // The body, then the folds in nest order: a fold's parent is always an
+    // earlier scope (asserted where the nest is built), so every `top_of`
+    // lookup below is already populated.
+    let scopes = core::iter::once(regalloc::Scope::Body)
+        .chain((0..nest.fold_count()).map(regalloc::Scope::Fold))
+        .chain((0..nest.guard_count()).flat_map(|k| {
+            [
+                regalloc::Scope::GuardArm(2 * k),
+                regalloc::Scope::GuardArm(2 * k + 1),
+            ]
+        }));
     for scope in scopes {
         let base = match scope {
-            regalloc::Scope::Region(_) | regalloc::Scope::Body => 0,
+            regalloc::Scope::Body => 0,
             regalloc::Scope::Fold(j) => top_of[&nest.fold_parent(j)],
+            // Both of a guard's arms open at the same position, in the same
+            // parent, as the fold that would have opened there instead — see
+            // `Scope::GuardArm`'s doc.
+            regalloc::Scope::GuardArm(i) => top_of[&nest.guard_parent(i / 2)],
         };
         let allocation = nest.scope(scope);
         let top = if allocation.schedule().is_empty() {
@@ -3450,130 +3856,153 @@ fn compile_via_backend<B: IsaBackend>(
         m = m.max(top);
     }
     let m = m.next_multiple_of(vector_bytes);
-    // Hoist slot k sits above the scaffold's five coordinate slots.
-    let hoist_slot = |k: usize| m + (5 + k as u32) * vector_bytes;
-    let frame_map: alloc::collections::BTreeMap<regalloc::ValueId, u32> = frame_roots
-        .iter()
-        .enumerate()
-        .map(|(i, vid)| (*vid, hoist_slot(i)))
-        .collect();
-    let row_map: alloc::collections::BTreeMap<regalloc::ValueId, u32> = row_roots
-        .iter()
-        .enumerate()
-        .map(|(i, vid)| (*vid, hoist_slot(frame_roots.len() + i)))
-        .collect();
-    let hoist_map: alloc::collections::BTreeMap<regalloc::ValueId, u32> = frame_map
-        .iter()
-        .chain(&row_map)
-        .map(|(vid, offset)| (*vid, *offset))
-        .collect();
-    // Each surviving fold's accumulator gets a slot the same way a hoist
-    // root does — one that outlives both the scope reading it (wherever the
-    // `Reduce` def is) and the fold's own frame — sitting right above the
-    // LICM roots' slots.
+    // Each surviving fold's two roots get a slot the same way a park does —
+    // one that outlives both the scope reading it (wherever the `Reduce`
+    // def is) and the fold's own frame: the accumulator's, then the
+    // binder's, both by the fold's `Reduce`. Whether either is used is the
+    // allocator's answer, read where the loop is emitted.
+    let fold_slot = |j: usize, root: usize| m + (2 * j + root) as u32 * vector_bytes;
     let fold_map: alloc::collections::BTreeMap<regalloc::ValueId, u32> = (0..nest.fold_count())
-        .map(|j| {
-            (
-                nest.fold_reduce_vid(j),
-                hoist_slot(frame_roots.len() + row_roots.len() + j),
-            )
-        })
+        .map(|j| (nest.fold_reduce_vid(j), fold_slot(j, 0)))
         .collect();
+    let binder_map: alloc::collections::BTreeMap<regalloc::ValueId, u32> = (0..nest.fold_count())
+        .map(|j| (nest.fold_reduce_vid(j), fold_slot(j, 1)))
+        .collect();
+    // Each surviving `Guard`'s one result, the same idea, right after the
+    // fold slots: an address outside any single scope's frame, because the
+    // scope that opens the branch and the two arms that each store into it
+    // all address the same one (see `ScheduledOp::Guard`'s doc — this is
+    // its accumulator-slot analogue).
+    let guard_slot_base = m + 2 * nest.fold_count() as u32 * vector_bytes;
+    let guard_slot = |k: usize| guard_slot_base + k as u32 * vector_bytes;
+    let guard_map: alloc::collections::BTreeMap<regalloc::ValueId, u32> = (0..nest.guard_count())
+        .map(|k| (nest.guard_reduce_vid(k), guard_slot(k)))
+        .collect();
+    // Every root of every scope, parked above the fold and guard slots. A
+    // root that is a fold's own result is parked where the loop already
+    // leaves it — its accumulator slot — rather than copied. A value two
+    // sibling scopes both compute (a row's main batches and its remainder
+    // share their closures) is one root with one slot: the two never run at
+    // once, and each writes it before its own scopes read it.
+    let park_base = guard_slot_base + nest.guard_count() as u32 * vector_bytes;
+    let mut parks: alloc::collections::BTreeMap<regalloc::ValueId, u32> =
+        alloc::collections::BTreeMap::new();
+    let scopes = core::iter::once(regalloc::Scope::Body)
+        .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
+    for scope in scopes {
+        for &root in nest.scope(scope).roots() {
+            if parks.contains_key(&root) {
+                continue;
+            }
+            let slot = match fold_map.get(&root) {
+                Some(&acc) => acc,
+                None => park_base + parks.len() as u32 * vector_bytes,
+            };
+            parks.insert(root, slot);
+        }
+    }
+    let park_slots = parks.values().filter(|&&slot| slot >= park_base).count() as u32;
+    let total = park_base + park_slots * vector_bytes;
 
-    let (frame_code, frame_spills) = if frame_alloc.schedule().is_empty() {
-        (Vec::new(), 0)
-    } else {
-        let (code, _, _, spills) = emit_dag_body_hoisted(
-            frame_alloc,
-            &mut counting,
-            HoistCtx::Prologue {
-                preloaded: None,
-                parked: &frame_map,
-            },
-            FramePlan {
-                override_size: Some(m),
-                fold_slots: &fold_map,
-                slot_base: 0,
-            },
-        )?;
-        (code, spills)
-    };
-    let frame_traffic = counting.take(frame_code.len() as u32);
-    let (row_code, row_spills) = if row_alloc.schedule().is_empty() {
-        (Vec::new(), 0)
-    } else {
-        let (code, _, _, spills) = emit_dag_body_hoisted(
-            row_alloc,
-            &mut counting,
-            HoistCtx::Prologue {
-                preloaded: if frame_map.is_empty() {
-                    None
-                } else {
-                    Some(&frame_map)
-                },
-                parked: &row_map,
-            },
-            FramePlan {
-                override_size: Some(m),
-                fold_slots: &fold_map,
-                slot_base: 0,
-            },
-        )?;
-        (code, spills)
-    };
-    let row_traffic = counting.take(row_code.len() as u32);
-    let (body, result_reg, _, body_spills) = emit_dag_body_hoisted(
+    let (body, _, _, spill_count) = emit_scope(
         body_alloc,
         &mut counting,
-        HoistCtx::Body { slots: &hoist_map },
+        &parks,
         FramePlan {
             override_size: Some(m),
             fold_slots: &fold_map,
+            binder_slots: &binder_map,
+            guard_slots: &guard_map,
             slot_base: 0,
         },
     )?;
-    let body_traffic = counting.take(body.len() as u32);
 
-    let hoisted_values = (frame_roots.len() + row_roots.len() + nest.fold_count()) as u32;
-    let code = counting.emit_collapse_loop(&CollapseBody {
-        frame_hoist: &frame_code,
-        row_hoist: &row_code,
-        batch: &body,
-        result: result_reg,
-        frame_size: m,
-        hoist_slots: hoisted_values,
-    })?;
-    let emitted = (frame_code.len() + row_code.len() + body.len()) as u32;
-    let scaffold = counting.take(code.len() as u32 - emitted);
-    // A parked root that holds a register at the head of the scopes inside it
-    // is carried rather than reloaded per iteration — read off the placement,
-    // which is where the answer lives.
-    let carried = [(frame_alloc, frame_roots), (row_alloc, row_roots)]
-        .into_iter()
-        .flat_map(|(alloc, roots)| {
-            roots
-                .iter()
-                .filter(move |vid| alloc.carried(**vid).is_some())
-        })
+    // The function around it: the frame, the anchor for whatever the body's
+    // constants are relative to, and what trails the return.
+    let mut asm = Assembly::with_capacity(body.len() + FRAME_HEADROOM);
+    counting.frame_alloc(&mut asm.code, total);
+    counting.anchor(&mut asm);
+    asm.code.extend_from_slice(&body);
+    counting.frame_free(&mut asm.code, total);
+    counting.emit_ret(&mut asm.code);
+    let ret_end = asm.code.len();
+    counting.finish(&mut asm);
+    let trailing = (asm.code.len() - ret_end) as u32;
+    let code = asm.finish();
+    let scaffold = counting.take(code.len() as u32 - body.len() as u32 - trailing);
+    let scopes = counting.scopes();
+
+    // How many times one call runs each scope: the body once, a fold its
+    // trip count times its parent's. A fold's parent is an earlier scope,
+    // so each entry is computed after the one it multiplies.
+    let mut trips: alloc::vec::Vec<u64> = alloc::vec![1];
+    for j in 0..nest.fold_count() {
+        let parent = nest.fold_parent(j);
+        let vid = nest.fold_reduce_vid(j);
+        let len = nest
+            .scope(parent)
+            .schedule()
+            .iter()
+            .find_map(|def| match def.op {
+                ScheduledOp::Reduce(fold, _) if def.value == vid => Some(u64::from(fold.len())),
+                _ => None,
+            })
+            .expect("a fold opens at its parent's Reduce def");
+        let parent_trips = match parent {
+            regalloc::Scope::Body => trips[0],
+            regalloc::Scope::Fold(p) => trips[p + 1],
+            regalloc::Scope::GuardArm(_) => {
+                unreachable!("a fold's parent is never a guard arm (none nest in one)")
+            }
+        };
+        trips.push(parent_trips * len);
+    }
+    // Every guard arm, the same idea: it runs at most once per time its
+    // parent's own def is reached, so its trip count is its parent's,
+    // conservatively — as if the branch always ran that arm, since which
+    // arm actually runs is a runtime property this static count does not
+    // see (G3's coherence prior is what will eventually price that). Both
+    // arms share the same parent, so the same count twice.
+    for k in 0..nest.guard_count() {
+        let parent_trips = match nest.guard_parent(k) {
+            regalloc::Scope::Body => trips[0],
+            regalloc::Scope::Fold(p) => trips[p + 1],
+            regalloc::Scope::GuardArm(_) => {
+                unreachable!("a guard's parent is never a guard arm (none nest in one)")
+            }
+        };
+        trips.push(parent_trips);
+        trips.push(parent_trips);
+    }
+
+    // A parked root that holds a register at the head of the scopes inside
+    // its own is carried rather than reloaded per iteration — read off the
+    // placement, which is where the answer lives.
+    let carried = parks
+        .keys()
+        .filter(|root| nest.carried(**root).is_some())
         .count() as u32;
     let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
     Ok(CompileResult {
         code: exec,
-        spill_count: frame_spills + row_spills + body_spills,
+        spill_count,
         spill_bytes: m,
         max_regs: file.scratch.len(),
-        hoisted_values,
+        hoisted_values: parks.len() as u32,
         traffic: EmitTraffic {
-            frame: frame_traffic,
-            row: row_traffic,
-            body: body_traffic,
+            scopes: EmitTraffic::by_index(scopes, trips.len(), nest.fold_count()),
+            trips,
             scaffold,
+            trailing,
             vector_bytes: file.vector_bytes,
             pool: file.scratch.len(),
             carried,
         },
     })
 }
+
+/// Slack for the function's own instructions on top of the body it wraps.
+const FRAME_HEADROOM: usize = 64;
 
 // =============================================================================
 // Tests
@@ -3582,69 +4011,128 @@ fn compile_via_backend<B: IsaBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pixelflow_ir::arena::ExprArena;
-    // Only the 128-bit x86 helpers (`run1`, `run_xy`, `run2`) take an `ExprId`
-    // at this level; the wider-ISA submodules import their own.
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx512f"),
-        not(target_feature = "avx2")
-    ))]
-    use pixelflow_ir::arena::ExprId;
-
-    // The three helpers below are shared by ISA-gated tests; which subset is
-    // live depends on the build's target features, so none is unconditionally
-    // used.
+    use pixelflow_ir::arena::{ExprArena, ExprId};
 
     /// Lanes in one SIMD batch for this build.
-    #[allow(dead_code)]
     const LANES: usize = crate::JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
 
-    /// Evaluate one batch at arbitrary per-lane coordinates.
+    /// One sample, so the lattice's origin *is* the point the kernel is
+    /// evaluated at: what a test about arithmetic rather than about the loop
+    /// nest compiles for.
+    const POINT: LatticeShape = LatticeShape::new([1, 1]);
+
+    /// One full batch of one row: `x` runs `x0 .. x0 + LANES`, which is what
+    /// a test about per-lane behaviour needs.
+    const BATCH: LatticeShape = LatticeShape::new([LANES as u32, 1]);
+
+    /// Run the collapse `code` is over a plane of exactly `shape`'s extent,
+    /// and hand the plane back.
     ///
-    /// `V` is `[f32; LANES]`, which is the emitted vector type *by size*, so
-    /// this needs neither intrinsics nor a hand-written `extern "C"` signature
-    /// — the two things every caller in this file used to spell for itself,
-    /// once per ISA. `ctx` may be empty: a kernel that declares no buffer never
-    /// reads the pointer.
-    #[allow(dead_code)]
-    fn eval_batch(
+    /// `buffers` binds the arena's buffer slots, `uniforms` its uniform
+    /// block, and `(x, y)` is where the lattice's sample `(0, 0)` lies. The
+    /// pitch is the width, so a sample reads as `out[row * width + col]`.
+    fn collapse_into(
         code: &executable::ExecutableCode,
-        ctx: &[*const f32],
-        origin: executable::Point4<[f32; LANES]>,
-    ) -> [f32; LANES] {
-        let mut out = [0.0f32; LANES];
-        // SAFETY: `out` holds exactly one batch; size_of::<[f32; LANES]>() is
-        // JIT_VECTOR_BYTES by construction; `ctx` binds every declared buffer.
+        buffers: &[*const f32],
+        uniforms: &[f32],
+        (x, y): (f32, f32),
+        shape: LatticeShape,
+    ) -> Vec<f32> {
+        let [width, height] = shape.extent().map(|n| n as usize);
+        let mut out = alloc::vec![f32::NAN; width * height];
+        let origin = [x, y];
+        let mut ctx: Vec<*const f32> = buffers.to_vec();
+        ctx.push(uniforms.as_ptr());
+        ctx.push(origin.as_ptr());
+        // SAFETY: `ctx` binds every buffer the arena declared, then the
+        // uniform block and the origin block, each live for the call; `out`
+        // is the whole plane the kernel was compiled at.
         unsafe {
-            code.call_collapse(
-                ctx.as_ptr(),
-                executable::TileSlice::single(out.as_mut_ptr()),
-                origin,
-            );
+            code.call(ctx.as_ptr(), out.as_mut_ptr(), width);
         }
         out
     }
 
-    /// Evaluate at a single point (all lanes the same X).
-    #[allow(dead_code)]
-    fn eval_point(code: &executable::ExecutableCode, x: f32, y: f32, z: f32, w: f32) -> f32 {
-        let o = executable::Point4::new([x; LANES], [y; LANES], [z; LANES], [w; LANES]);
-        eval_batch(code, &[], o)[0]
+    /// Evaluate a kernel compiled at [`POINT`] at one lattice point.
+    fn eval_point(code: &executable::ExecutableCode, x: f32, y: f32) -> f32 {
+        collapse_into(code, &[], &[], (x, y), POINT)[0]
     }
+
+    /// Evaluate a kernel compiled at [`BATCH`]: one row of `LANES` samples
+    /// from `(x, y)`.
+    fn eval_batch(
+        code: &executable::ExecutableCode,
+        buffers: &[*const f32],
+        uniforms: &[f32],
+        x: f32,
+        y: f32,
+    ) -> Vec<f32> {
+        collapse_into(code, buffers, uniforms, (x, y), BATCH)
+    }
+
+    /// `passes::legalize` at `shape` for a target of `lanes` lanes, then
+    /// `arena_to_schedule`: everything a compile entry point runs before the
+    /// emitter is handed a schedule.
+    pub(super) fn schedule_for(
+        a: &ExprArena,
+        root: ExprId,
+        shape: LatticeShape,
+        lanes: u32,
+    ) -> Vec<regalloc::Def> {
+        let collapse = Collapse {
+            domain: Domain {
+                shape,
+                origin: origin(),
+            },
+            lanes,
+        };
+        let (a, root) = pixelflow_ir::passes::legalize(a, root, &collapse).expect("legalize");
+        let ids = origin_slots(&a);
+        arena_to_schedule(&a, root, ids)
+    }
+
+    /// [`schedule_for`] at this host's own lane count.
+    fn native_schedule(a: &ExprArena, root: ExprId, shape: LatticeShape) -> Vec<regalloc::Def> {
+        schedule_for(a, root, shape, LANES as u32)
+    }
+
+    /// The uniform slots a schedule built by hand names for the origin.
+    ///
+    /// A raw arena declares no uniform at all, so [`origin_slots`] has
+    /// nothing to find; the tests below that feed the scheduler an
+    /// unlegalized arena on purpose name the slots themselves.
+    const RAW_ORIGIN: [UniformId; 2] = [UniformId(0), UniformId(1)];
 
     /// A `Dwrt` that reaches the scheduler (a caller bypassed the lowering
     /// pipeline) must fail loudly at the schedule boundary, not as a cryptic
     /// emit panic. The compile entry points run `lower_dwrt` first, so this
     /// exercises calling `arena_to_schedule` directly.
+    ///
+    /// Its operand is a fold binder rather than `X`: a coordinate `Var` is a
+    /// survivor of its own, refused a line earlier (see
+    /// `a_surviving_coordinate_fails_loudly`), and would answer for the
+    /// `Dwrt` before the `Dwrt` was ever reached.
     #[test]
     #[should_panic(expected = "Dwrt (autodiff) node reached the JIT")]
     fn surviving_dwrt_fails_loudly() {
         let mut a = ExprArena::new();
-        let x = a.push_var(0);
+        let i = a.push_var(Binder::from_slot(0).expect("slot 0 exists").var());
         let v = a.push_const(0.0);
-        let root = a.push_binary(OpKind::Dwrt, x, v);
-        let _ = arena_to_schedule(&a, root);
+        let root = a.push_binary(OpKind::Dwrt, i, v);
+        let _ = arena_to_schedule(&a, root, RAW_ORIGIN);
+    }
+
+    /// A coordinate `Var` is the survivor the collapse ABI added: the
+    /// lattice's folds substitute `X` and `Y` away, so one reaching the
+    /// scheduler is an arena that never went through `passes::lattice`.
+    #[test]
+    #[should_panic(expected = "is a coordinate")]
+    fn a_surviving_coordinate_fails_loudly() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let two = a.push_const(2.0);
+        let root = a.push_binary(OpKind::Mul, x, two);
+        let _ = arena_to_schedule(&a, root, RAW_ORIGIN);
     }
 
     /// And the same for a `Ref`: its body is not in this arena at all, so a
@@ -3657,7 +4145,7 @@ mod tests {
             .mul(&pixelflow_ir::Kernel::constant(3.0))
             .by_ref();
         let (arena, root) = named.parts();
-        let _ = arena_to_schedule(arena, root);
+        let _ = arena_to_schedule(arena, root, RAW_ORIGIN);
     }
 
     /// The route that *does* work: the compile entry expands the reference
@@ -3670,11 +4158,11 @@ mod tests {
         let direct = body.add(&pixelflow_ir::Kernel::y());
         let (n_arena, n_root) = named.parts();
         let (d_arena, d_root) = direct.parts();
-        let named_code = compile(n_arena, n_root).expect("a named kernel compiles");
-        let direct_code = compile(d_arena, d_root).expect("and so does the spliced one");
+        let named_code = compile(n_arena, n_root, POINT).expect("a named kernel compiles");
+        let direct_code = compile(d_arena, d_root, POINT).expect("and so does the spliced one");
         for (x, y) in [(0.0f32, 0.0f32), (1.5, -2.0), (-3.25, 7.5)] {
-            let want = eval_point(&direct_code.code, x, y, 0.0, 0.0);
-            let got = eval_point(&named_code.code, x, y, 0.0, 0.0);
+            let want = eval_point(&direct_code.code, x, y);
+            let got = eval_point(&named_code.code, x, y);
             assert_eq!(got, want, "at ({x}, {y})");
         }
     }
@@ -3704,12 +4192,12 @@ mod tests {
         let body = sum_arena.push_binary(OpKind::Add, x, i);
         let sum_fold = Fold::new(Monoid::SUM, binder, 0..4);
         let sum_root = sum_arena.push_reduce(sum_fold, body);
-        let sum_schedule = arena_to_schedule(&sum_arena, sum_root);
-        let sum_code = compile_via_backend(sum_schedule, &mut Native::new(EmitCtx::default()))
+        let sum_code = EmitCtx::default()
+            .compile(&sum_arena, sum_root, POINT)
             .expect("a surviving SUM Reduce compiles");
 
         for x in [0.0f32, 2.0, -1.5, 10.0] {
-            let got = eval_point(&sum_code.code, x, 0.0, 0.0, 0.0);
+            let got = eval_point(&sum_code.code, x, 0.0);
             let want = 4.0 * x + 6.0;
             assert_eq!(got, want, "SUM at x={x}");
         }
@@ -3721,12 +4209,12 @@ mod tests {
         let body = min_arena.push_binary(OpKind::Sub, x, i);
         let min_fold = Fold::new(Monoid::MIN, binder, 0..4);
         let min_root = min_arena.push_reduce(min_fold, body);
-        let min_schedule = arena_to_schedule(&min_arena, min_root);
-        let min_code = compile_via_backend(min_schedule, &mut Native::new(EmitCtx::default()))
+        let min_code = EmitCtx::default()
+            .compile(&min_arena, min_root, POINT)
             .expect("a surviving MIN Reduce compiles");
 
         for x in [0.0f32, 2.0, -1.5, 10.0] {
-            let got = eval_point(&min_code.code, x, 0.0, 0.0, 0.0);
+            let got = eval_point(&min_code.code, x, 0.0);
             let want = x - 3.0;
             assert_eq!(got, want, "MIN at x={x}");
         }
@@ -3762,12 +4250,12 @@ mod tests {
         let plus_shared = a.push_binary(OpKind::Add, reduce, shared);
         let root = a.push_binary(OpKind::Add, plus_shared, y);
 
-        let schedule = arena_to_schedule(&a, root);
-        let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
+        let code = EmitCtx::default()
+            .compile(&a, root, POINT)
             .expect("a fold that feeds further arithmetic compiles");
 
         for (x, y) in [(0.0f32, 0.0f32), (2.0, 1.0), (-1.5, 3.0), (10.0, -4.0)] {
-            let got = eval_point(&code.code, x, y, 0.0, 0.0);
+            let got = eval_point(&code.code, x, y);
             let want = 4.0 * x * x + 3.0 + y;
             assert_eq!(got, want, "at (x={x}, y={y})");
         }
@@ -3818,12 +4306,12 @@ mod tests {
         let reduce = a.push_reduce(fold, body);
         let root = a.push_binary(OpKind::Add, shared, reduce);
 
-        let schedule = arena_to_schedule(&a, root);
-        let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
+        let code = EmitCtx::default()
+            .compile(&a, root, POINT)
             .expect("interleaved shared-leaf order compiles");
 
         for x in [0.0f32, 2.0, -1.5, 10.0] {
-            let got = eval_point(&code.code, x, 0.0, 0.0, 0.0);
+            let got = eval_point(&code.code, x, 0.0);
             let shared_val = 3.0 * x + 3.0;
             let want = shared_val + (4.0 * shared_val + 6.0);
             assert_eq!(got, want, "at x={x}");
@@ -3853,9 +4341,6 @@ mod tests {
     /// `root = Σ_k (p_k + reduce)`.
     #[test]
     fn a_folds_spill_slots_do_not_alias_its_parents() {
-        // Its own `ExprId`, not the module's: that one is imported only for
-        // the 128-bit x86 baseline, and this test is target-agnostic.
-        use pixelflow_ir::arena::ExprId;
         use pixelflow_ir::fold::{Binder, Fold, Monoid};
 
         const K: usize = 20;
@@ -3907,12 +4392,12 @@ mod tests {
             .collect();
         let root = tree_sum(&mut a, joined);
 
-        let schedule = arena_to_schedule(&a, root);
-        let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
+        let code = EmitCtx::default()
+            .compile(&a, root, POINT)
             .expect("a fold under register pressure compiles");
 
         for xv in [0.0f32, 1.0, -2.5, 7.0] {
-            let got = eval_point(&code.code, xv, 0.0, 0.0, 0.0);
+            let got = eval_point(&code.code, xv, 0.0);
             let pv = |k: usize| xv + k as f32;
             let reduce_v: f32 = (0..R)
                 .map(|iv| (0..K).map(|j| (iv as f32 + j as f32) * pv(j)).sum::<f32>())
@@ -3929,71 +4414,411 @@ mod tests {
         }
     }
 
-    /// The scaffold's size does not depend on the frame it wraps.
+    /// A fold inside a fold's body is a loop inside a loop.
     ///
-    /// Every backend now shares one `emit_collapse_loop`, so the loop nest's
-    /// branch displacements are computed in exactly one place — and they are
-    /// only correct if the instructions between two labels keep their widths
-    /// as the frame grows. A slot displacement that silently widened from an
-    /// 8-bit to a 32-bit form would move every label after it.
+    /// `extract_folds` used to refuse this shape (one level, with
+    /// `expand_nested_reduce` unrolling the inner fold ahead of it); it
+    /// carves the inner fold out of the outer fold's closure now, the same
+    /// way it carves the outer one out of the body. The inner body reads
+    /// *both* binders — a contraction — which is what exercises the outer
+    /// binder staying in its register across the inner loop, and the inner
+    /// scope being handed the outer binder's park.
     ///
-    /// Checking it needs no host CPU: emission is a pure function into
-    /// `Vec<u8>`, so all four backends are measured from whichever host runs
-    /// the tests.
+    /// `inner(j) = Σ_{i<3} (X + i·j) = 3X + 3j`;
+    /// `root = Σ_{j<2} inner(j) = 6X + 3`.
     #[test]
-    fn scaffold_size_is_independent_of_the_frame() {
-        let ctx = EmitCtx::default();
-        let batch: Vec<u8> = alloc::vec![0x90; 8];
-        let fh: Vec<u8> = alloc::vec![0x90; 4];
-        let rh: Vec<u8> = alloc::vec![0x90; 12];
-        let wrapped = |result, frame_size, hoist_slots| CollapseBody {
-            frame_hoist: &fh,
-            row_hoist: &rh,
-            batch: &batch,
-            result,
-            frame_size,
-            hoist_slots,
-        };
-        // Red-zone and allocated frames, with and without hoisted values.
-        const SHAPES: [(u32, u32); 3] = [(0, 0), (64, 2), (160, 3)];
+    fn a_reduce_inside_a_reduce_compiles_and_runs() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
 
-        let mut sizes = alloc::vec::Vec::new();
-        for (frame_size, hoist_slots) in SHAPES {
-            let mut sse2 = x86_64::driver::X86Backend::new(ctx.clone());
-            sse2.frame_ready(frame_size);
-            let mut avx2b = avx2::driver::Avx2Backend::new(ctx.clone());
-            avx2b.frame_ready(frame_size);
-            let mut avx512b = avx512::driver::Avx512Backend::new(ctx.clone());
-            avx512b.frame_ready(frame_size);
-            let mut neon = aarch64::driver::Aarch64Backend::new(ctx.clone());
-            neon.frame_ready(frame_size);
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let inner_binder = Binder::from_slot(0).expect("slot 0 exists");
+        let outer_binder = Binder::from_slot(1).expect("slot 1 exists");
+        let i = a.push_var(inner_binder.var());
+        let j = a.push_var(outer_binder.var());
+        let ij = a.push_binary(OpKind::Mul, i, j);
+        let inner_body = a.push_binary(OpKind::Add, x, ij);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, inner_binder, 0..3), inner_body);
+        let root = a.push_reduce(Fold::new(Monoid::SUM, outer_binder, 0..2), inner);
 
-            let scaffold = |code: Result<alloc::vec::Vec<u8>, CompileError>| {
-                code.expect("the scaffold's own branches always reach")
-                    .len()
-            };
-            let neon_code =
-                scaffold(neon.emit_collapse_loop(&wrapped(Reg(16), frame_size, hoist_slots)));
-            assert!(
-                neon_code.is_multiple_of(4),
-                "aarch64 is fixed-width, got {neon_code} bytes"
-            );
-            sizes.push([
-                scaffold(sse2.emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))),
-                scaffold(avx2b.emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))),
-                scaffold(avx512b.emit_collapse_loop(&wrapped(Reg(4), frame_size, hoist_slots))),
-                neon_code,
-            ]);
+        // With the whole pool and at the floor: the outer body never reads
+        // its own binder, only the inner one does, so at the floor the inner
+        // scope reads an enclosing loop's counter from that loop's slot.
+        for ctx in [
+            EmitCtx::default(),
+            EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH),
+        ] {
+            let code = ctx
+                .compile(&a, root, POINT)
+                .expect("a fold inside a fold compiles");
+            for x in [0.0f32, 2.0, -1.5, 10.0] {
+                let got = eval_point(&code.code, x, 0.0);
+                let want = 6.0 * x + 3.0;
+                assert_eq!(got, want, "at x={x}");
+            }
         }
-        assert!(sizes[0].iter().all(|&n| n > 0), "every backend emits");
+    }
+
+    /// Three deep, every level's binder read at the bottom, and the inner
+    /// fold's result feeding further arithmetic in its parent's body rather
+    /// than being the parent's whole body.
+    ///
+    /// `Σ_{k<2} (k + Σ_{j<2} (j + Σ_{i<2} (X + i + j + k)))`: the innermost
+    /// sums to `2X + 1 + 2j + 2k`, the middle to `Σ_j (2X + 1 + 2k + 3j)` =
+    /// `4X + 5 + 4k`, the outer to `Σ_k (4X + 5 + 5k)` = `8X + 15`.
+    #[test]
+    fn a_reduce_three_deep_compiles_and_runs() {
+        let (a, root) = three_deep_contraction();
+        let code = EmitCtx::default()
+            .compile(&a, root, POINT)
+            .expect("a fold three deep compiles");
+        assert_three_deep(&code);
+    }
+
+    /// The three-deep contraction of the test above, as an arena.
+    fn three_deep_contraction() -> (ExprArena, ExprId) {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let bi = Binder::from_slot(0).expect("slot 0 exists");
+        let bj = Binder::from_slot(1).expect("slot 1 exists");
+        let bk = Binder::from_slot(2).expect("slot 2 exists");
+        let i = a.push_var(bi.var());
+        let j = a.push_var(bj.var());
+        let k = a.push_var(bk.var());
+        let xi = a.push_binary(OpKind::Add, x, i);
+        let xij = a.push_binary(OpKind::Add, xi, j);
+        let xijk = a.push_binary(OpKind::Add, xij, k);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..2), xijk);
+        let j_inner = a.push_binary(OpKind::Add, j, inner);
+        let middle = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..2), j_inner);
+        let k_middle = a.push_binary(OpKind::Add, k, middle);
+        let root = a.push_reduce(Fold::new(Monoid::SUM, bk, 0..2), k_middle);
+        (a, root)
+    }
+
+    /// `8X + 15`, at four points.
+    fn assert_three_deep(code: &CompileResult) {
+        for x in [0.0f32, 2.0, -1.5, 10.0] {
+            let got = eval_point(&code.code, x, 0.0);
+            let want = 8.0 * x + 15.0;
+            assert_eq!(got, want, "at x={x}");
+        }
+    }
+
+    /// Two sibling folds binding the same slot read one `Var` node, and
+    /// each reads its own counter through it.
+    ///
+    /// A glyph's distance and winding folds are this shape, and the e-graph
+    /// hash-conses their binder leaf into one node. A binder slot keyed by
+    /// that node would be one slot for two loops: the fold allocated last
+    /// would own it, and the other would step its own counter but test and
+    /// read the sibling's. At the floor neither binder is carried, so both
+    /// are read from their slots.
+    ///
+    /// `Σ_{i<3} (X + i) + Σ_{i<2} 2i = (3X + 3) + 2 = 3X + 5`.
+    #[test]
+    fn sibling_folds_sharing_a_binder_node_read_their_own_counters() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let bi = Binder::from_slot(0).expect("slot 0 exists");
+        let i = a.push_var(bi.var());
+        let xi = a.push_binary(OpKind::Add, x, i);
+        let left = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), xi);
+        let two = a.push_const(2.0);
+        let two_i = a.push_binary(OpKind::Mul, two, i);
+        let right = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..2), two_i);
+        let root = a.push_binary(OpKind::Add, left, right);
+
+        for ctx in [
+            EmitCtx::default(),
+            EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH),
+        ] {
+            let code = ctx.compile(&a, root, POINT).expect("sibling folds compile");
+            for x in [0.0f32, 2.0, -1.5, 10.0] {
+                let got = eval_point(&code.code, x, 0.0);
+                let want = 3.0 * x + 5.0;
+                assert_eq!(got, want, "at x={x}");
+            }
+        }
+    }
+
+    /// A fold invariant across the lattice is the **body's** own fold — it
+    /// opens once per call, outside the lattice's row, column and lane folds
+    /// — and its result reaches the scopes inside from wherever its loop left
+    /// it.
+    ///
+    /// The `Reduce` arm ends its def early, past the hand-off, so a carried
+    /// fold result used to reach the scopes inside in a register nothing had
+    /// loaded. `X + Σ_{i<3} 2i = X + 6`.
+    #[test]
+    fn a_lattice_invariant_fold_is_the_bodys_own() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let bi = Binder::from_slot(0).expect("slot 0 exists");
+        let i = a.push_var(bi.var());
+        let two = a.push_const(2.0);
+        let two_i = a.push_binary(OpKind::Mul, two, i);
+        let sum = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), two_i);
+        let root = a.push_binary(OpKind::Add, x, sum);
+
+        let file = Native::new(EmitCtx::default()).register_file();
+        let nest = allocate_nest(native_schedule(&a, root, POINT), &file);
+        let j = kernel_fold(&nest, 3).expect("the kernel's fold is three trips");
         assert_eq!(
-            sizes[0], sizes[1],
-            "frame mode must not resize the scaffold"
+            nest.fold_parent(j),
+            regalloc::Scope::Body,
+            "a fold reading no coordinate belongs to the scope that runs once \
+             per call, not to a lattice fold that reruns it per sample"
         );
+
+        let code = EmitCtx::default()
+            .compile(&a, root, POINT)
+            .expect("a hoisted fold compiles");
+        for x in [0.0f32, 2.0, -1.5, 10.0] {
+            let got = eval_point(&code.code, x, 0.0);
+            assert_eq!(got, x + 6.0, "at x={x}");
+        }
+    }
+
+    /// Which fold of `nest` runs `trips` times — the one a test built, as
+    /// opposed to the lattice's own row, column and lane folds, whose trip
+    /// counts come from the shape.
+    fn kernel_fold(nest: &regalloc::NestAllocation, trips: u32) -> Option<usize> {
+        (0..nest.fold_count()).find(|&j| {
+            let vid = nest.fold_reduce_vid(j);
+            nest.scope(nest.fold_parent(j)).schedule().iter().any(|d| {
+                d.value == vid && matches!(d.op, ScheduledOp::Reduce(f, _) if f.len() == trips)
+            })
+        })
+    }
+
+    /// A fold's binder and accumulator are roots the allocator places under
+    /// its budget, not registers reserved across the body.
+    ///
+    /// Two pools, the same three-deep contraction. At the floor
+    /// (`MIN_SCRATCH`) the budget is zero at every depth, so every fold's
+    /// roots go to slots and the loops step and test them from memory —
+    /// the case a reserved binder could not serve past one level, since each
+    /// level took a register from the pool below until an instruction there
+    /// had nowhere to put its scratch. With headroom the ranking spends it,
+    /// deepest loop first, because that is what a carry saves most per call.
+    /// Both compile and run.
+    #[test]
+    fn a_folds_roots_are_placed_by_the_budget() {
+        let (a, root) = three_deep_contraction();
+        let carried = |file: &regalloc::RegisterFile| -> usize {
+            let nest = allocate_nest(native_schedule(&a, root, POINT), file);
+            (0..nest.fold_count())
+                .flat_map(|j| {
+                    let roots = nest.fold_roots(j);
+                    [roots.binder, roots.accumulator]
+                })
+                .filter(|at| matches!(at, regalloc::Where::Reg(_)))
+                .count()
+        };
+        let floor = regalloc::RegisterFile::MIN_SCRATCH;
+        let mut previous = None;
+        for above in [0, 5] {
+            let ctx = EmitCtx::with_max_regs(floor + above);
+            let file = Native::new(ctx.clone()).register_file();
+            assert_eq!(
+                file.scratch.len(),
+                floor + above,
+                "the pool did not cap where the test expects"
+            );
+            let count = carried(&file);
+            if above == 0 {
+                assert_eq!(
+                    count, 0,
+                    "at the floor the budget is zero, so every fold root is in a slot"
+                );
+            }
+            if let Some(fewer) = previous {
+                assert!(
+                    count > fewer,
+                    "{above} registers above the floor carried {count} fold \
+                     roots, no more than the smaller pool's {fewer}"
+                );
+            }
+            previous = Some(count);
+            let code = ctx
+                .compile(&a, root, POINT)
+                .expect("a fold three deep compiles");
+            assert_three_deep(&code);
+        }
+    }
+
+    /// A fold inside a fold's body that does not depend on the outer binder
+    /// is the outer scope's fold, run once, and read inside from its slot —
+    /// not a loop per iteration. Both readings of it here: the outer body
+    /// reads it under its own binder, and the root reads it again outside.
+    ///
+    /// `inner = Σ_{i<3} (X + i) = 3X + 3`; `outer = Σ_{j<2} (inner + j) =
+    /// 2·inner + 1`; `root = outer + inner = 3·inner + 1 = 9X + 10`.
+    #[test]
+    fn an_invariant_reduce_inside_a_reduce_is_hoisted_and_shared() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let bi = Binder::from_slot(0).expect("slot 0 exists");
+        let bj = Binder::from_slot(1).expect("slot 1 exists");
+        let i = a.push_var(bi.var());
+        let xi = a.push_binary(OpKind::Add, x, i);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), xi);
+        let j = a.push_var(bj.var());
+        let inner_j = a.push_binary(OpKind::Add, inner, j);
+        let outer = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..2), inner_j);
+        let root = a.push_binary(OpKind::Add, outer, inner);
+
+        // The structure: two folds, neither inside the other — the inner's
+        // def sits in the outer's schedule as a placeholder, opening nothing.
+        let file = Native::new(EmitCtx::default()).register_file();
+        let nest = allocate_nest(native_schedule(&a, root, POINT), &file);
+        let inner_j = kernel_fold(&nest, 3).expect("the inner fold is three trips");
+        let outer_j = kernel_fold(&nest, 2).expect("the outer fold is two trips");
+        let inner_vid = nest.fold_reduce_vid(inner_j);
         assert_eq!(
-            sizes[1], sizes[2],
-            "hoist slots must not resize the scaffold"
+            nest.fold_parent(inner_j),
+            nest.fold_parent(outer_j),
+            "both folds belong to the same scope; the inner one is not run \
+             once per trip of the outer"
         );
+        let outer_scope = nest.scope(regalloc::Scope::Fold(outer_j));
+        let placeholder = outer_scope
+            .schedule()
+            .iter()
+            .find(|d| d.value == inner_vid)
+            .expect("the inner fold's def stays in the outer body as a placeholder");
+        let ScheduledOp::Reduce(_, inner_body) = placeholder.op else {
+            panic!("a fold's def is a Reduce")
+        };
+        assert!(
+            !outer_scope.schedule().iter().any(|d| d.value == inner_body),
+            "nothing behind the placeholder is copied in"
+        );
+
+        let code = EmitCtx::default()
+            .compile(&a, root, POINT)
+            .expect("a hoisted fold compiles");
+        for x in [0.0f32, 2.0, -1.5, 10.0] {
+            let got = eval_point(&code.code, x, 0.0);
+            let want = 9.0 * x + 10.0;
+            assert_eq!(got, want, "at x={x}");
+        }
+    }
+
+    /// The same hoist when the invariant fold *is* the outer body: the
+    /// outer's schedule is one placeholder, and its result comes from the
+    /// slot. `Σ_{j<2} Σ_{i<3} (X + i) = 2·(3X + 3) = 6X + 6`.
+    #[test]
+    fn an_invariant_reduce_as_a_folds_whole_body_is_hoisted() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let bi = Binder::from_slot(0).expect("slot 0 exists");
+        let bj = Binder::from_slot(1).expect("slot 1 exists");
+        let i = a.push_var(bi.var());
+        let xi = a.push_binary(OpKind::Add, x, i);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), xi);
+        let root = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..2), inner);
+
+        let code = EmitCtx::default()
+            .compile(&a, root, POINT)
+            .expect("a fold whose body is a hoisted fold compiles");
+        for x in [0.0f32, 2.0, -1.5, 10.0] {
+            let got = eval_point(&code.code, x, 0.0);
+            let want = 6.0 * x + 6.0;
+            assert_eq!(got, want, "at x={x}");
+        }
+    }
+
+    /// `a_folds_spill_slots_do_not_alias_its_parents`, one level deeper: the
+    /// outer fold's body holds `K` values live across the inner loop, and the
+    /// inner loop holds `K` more, so both scopes go to slots and the inner
+    /// fold's frame is based at the outer fold's top rather than at its
+    /// parent's. The outer binder is read on both sides of the inner loop.
+    ///
+    /// `p_k = X + j + k` (in the outer body); `inner(j) = Σ_{i<R} Σ_k (i +
+    /// p_k)`; `outer body = Σ_k (p_k + inner(j))`; `root = Σ_{j<J} outer`.
+    #[test]
+    fn a_nested_folds_spill_slots_do_not_alias_its_parents() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        const K: usize = 20;
+        const R: u32 = 3;
+        const J: u32 = 2;
+
+        fn tree_sum(a: &mut ExprArena, mut ids: alloc::vec::Vec<ExprId>) -> ExprId {
+            while ids.len() > 1 {
+                let mut next = alloc::vec::Vec::new();
+                for pair in ids.chunks(2) {
+                    next.push(match pair {
+                        [l, r] => a.push_binary(OpKind::Add, *l, *r),
+                        [only] => *only,
+                        _ => unreachable!("chunks(2) yields 1 or 2"),
+                    });
+                }
+                ids = next;
+            }
+            ids[0]
+        }
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let bi = Binder::from_slot(0).expect("slot 0 exists");
+        let bj = Binder::from_slot(1).expect("slot 1 exists");
+        let i = a.push_var(bi.var());
+        let j = a.push_var(bj.var());
+        let xj = a.push_binary(OpKind::Add, x, j);
+        // Live across the inner loop: defined in the outer body, consumed
+        // only past the inner `Reduce`.
+        let p: alloc::vec::Vec<ExprId> = (0..K)
+            .map(|k| {
+                let c = a.push_const(k as f32);
+                a.push_binary(OpKind::Add, xj, c)
+            })
+            .collect();
+        let q: alloc::vec::Vec<ExprId> = (0..K)
+            .map(|k| a.push_binary(OpKind::Add, i, p[k]))
+            .collect();
+        let inner_body = tree_sum(&mut a, q);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..R), inner_body);
+        let joined: alloc::vec::Vec<ExprId> = p
+            .iter()
+            .map(|&pk| a.push_binary(OpKind::Add, pk, inner))
+            .collect();
+        let outer_body = tree_sum(&mut a, joined);
+        let root = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..J), outer_body);
+
+        let code = EmitCtx::default()
+            .compile(&a, root, POINT)
+            .expect("nested folds under register pressure compile");
+
+        for xv in [0.0f32, 1.0, -2.5, 7.0] {
+            let got = eval_point(&code.code, xv, 0.0);
+            let want: f32 = (0..J)
+                .map(|jv| {
+                    let pv = |k: usize| xv + jv as f32 + k as f32;
+                    let inner_v: f32 = (0..R)
+                        .map(|iv| (0..K).map(|k| iv as f32 + pv(k)).sum::<f32>())
+                        .sum();
+                    (0..K).map(|k| pv(k) + inner_v).sum::<f32>()
+                })
+                .sum();
+            let tol = want.abs() * 1e-4 + 1e-3;
+            assert!(
+                (got - want).abs() <= tol,
+                "at x={xv}: got {got}, want {want}"
+            );
+        }
     }
 
     // =========================================================================
@@ -4014,7 +4839,7 @@ mod tests {
     /// dispatch arm — not only the encoder behind it — is what emits here.
     #[test]
     fn every_backend_emits_from_this_host() {
-        use pixelflow_ir::arena::{ExprArena, UniformDecl, UniformIdentity};
+        use pixelflow_ir::arena::{UniformDecl, UniformIdentity};
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
@@ -4025,13 +4850,6 @@ mod tests {
         let u = a.push_uniform(u);
         let scaled = a.push_binary(OpKind::Mul, y, u);
         let root = a.push_binary(OpKind::Add, a.clone().push_var(0).max(x).min(x), scaled);
-        let (a, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
-        assert!(
-            arena_to_schedule(&a, root)
-                .iter()
-                .any(|d| matches!(d.op, ScheduledOp::Uniform(_))),
-            "the schedule must carry the uniform load for the backends to dispatch on"
-        );
 
         let ctx = EmitCtx::default();
         let mut neon = aarch64::driver::Aarch64Backend::new(ctx.clone());
@@ -4039,9 +4857,22 @@ mod tests {
         let mut avx2b = avx2::driver::Avx2Backend::new(ctx.clone());
         let mut avx512b = avx512::driver::Avx512Backend::new(ctx);
 
-        let neon_len = emit_dag_body(arena_to_schedule(&a, root), &mut neon)
+        // Each backend is handed a schedule legalized at *its own* lane
+        // count: the lattice's lane fold is the one part of a collapse whose
+        // shape belongs to the target.
+        let for_backend = |file: regalloc::RegisterFile| {
+            schedule_for(&a, root, POINT, file.vector_bytes / BYTES_PER_LANE)
+        };
+        assert!(
+            for_backend(neon.register_file())
+                .iter()
+                .any(|d| matches!(d.op, ScheduledOp::Uniform(_))),
+            "the schedule must carry the uniform load for the backends to dispatch on"
+        );
+
+        let neon_len = compile_via_backend(for_backend(neon.register_file()), &mut neon)
             .expect("NEON emit")
-            .0
+            .code
             .len();
         assert!(
             neon_len > 0 && neon_len.is_multiple_of(4),
@@ -4050,23 +4881,23 @@ mod tests {
         for (name, len) in [
             (
                 "SSE2",
-                emit_dag_body(arena_to_schedule(&a, root), &mut sse2)
+                compile_via_backend(for_backend(sse2.register_file()), &mut sse2)
                     .expect("SSE2")
-                    .0
+                    .code
                     .len(),
             ),
             (
                 "AVX2",
-                emit_dag_body(arena_to_schedule(&a, root), &mut avx2b)
+                compile_via_backend(for_backend(avx2b.register_file()), &mut avx2b)
                     .expect("AVX2")
-                    .0
+                    .code
                     .len(),
             ),
             (
                 "AVX-512",
-                emit_dag_body(arena_to_schedule(&a, root), &mut avx512b)
+                compile_via_backend(for_backend(avx512b.register_file()), &mut avx512b)
                     .expect("AVX-512")
-                    .0
+                    .code
                     .len(),
             ),
         ] {
@@ -4074,27 +4905,41 @@ mod tests {
         }
     }
 
-    /// The aarch64 constant pool must APPEND across the two bodies a collapse
+    /// The aarch64 constant pool must APPEND across the scopes a collapse
     /// compile pushes through one backend, never reset.
     ///
-    /// The prologue's bytes already have the first pool's X17-relative offsets
-    /// baked in, so a reset leaves them pointing at different constants — the
-    /// "macOS glyph-ink regression", which painted glyphs with the wrong ink
-    /// and was only ever observable by running the app on a Mac.
+    /// An earlier scope's bytes already have the first pool's X17-relative
+    /// offsets baked in, so a reset leaves them pointing at different
+    /// constants — the "macOS glyph-ink regression", which painted glyphs with
+    /// the wrong ink and was only ever observable by running the app on a Mac.
     ///
     /// It is an aarch64 bug, not a macOS one, and now it is a sub-millisecond
     /// unit test on every host.
     #[test]
-    fn aarch64_const_pool_appends_across_bodies() {
-        use pixelflow_ir::arena::ExprArena;
-
-        fn schedule_for(k: f32) -> Vec<regalloc::Def> {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let c = a.push_const(k);
-            let root = a.push_binary(OpKind::Mul, x, c);
-            let (a, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
-            arena_to_schedule(&a, root)
+    fn aarch64_const_pool_appends_across_scopes() {
+        /// One scope: a uniform times a constant only the pool can hold.
+        fn scope_for(k: f32) -> Vec<regalloc::Def> {
+            alloc::vec![
+                regalloc::Def {
+                    value: regalloc::ValueId(0),
+                    op: ScheduledOp::Uniform(UniformLoad {
+                        ctx_slot: 0,
+                        offset: 0,
+                    }),
+                },
+                regalloc::Def {
+                    value: regalloc::ValueId(1),
+                    op: ScheduledOp::Const(k),
+                },
+                regalloc::Def {
+                    value: regalloc::ValueId(2),
+                    op: ScheduledOp::Binary(
+                        OpKind::Mul,
+                        regalloc::ValueId(0),
+                        regalloc::ValueId(1),
+                    ),
+                },
+            ]
         }
 
         // Two constants that genuinely need the pool (not FMOV-immediate).
@@ -4103,15 +4948,16 @@ mod tests {
         assert!(aarch64::needs_const_pool(second));
 
         let mut backend = aarch64::driver::Aarch64Backend::new(EmitCtx::default());
-        emit_dag_body(schedule_for(first), &mut backend).expect("first body");
+        emit_dag_body(scope_for(first), &mut backend).expect("first scope");
         let after_first = backend.pool_entries().to_vec();
-        emit_dag_body(schedule_for(second), &mut backend).expect("second body");
+        assert!(!after_first.is_empty(), "the first scope pooled nothing");
+        emit_dag_body(scope_for(second), &mut backend).expect("second scope");
 
         assert!(
             backend.pool_entries().starts_with(&after_first),
-            "the second body RESET the constant pool: the first body's baked-in \
-             X17-relative offsets now name different constants — the glyph-ink \
-             regression. Pool was {after_first:?}, became {:?}",
+            "the second scope RESET the constant pool: the first scope's \
+             baked-in X17-relative offsets now name different constants — the \
+             glyph-ink regression. Pool was {after_first:?}, became {:?}",
             backend.pool_entries()
         );
     }
@@ -4120,41 +4966,35 @@ mod tests {
     // What the nest does and does not partition
     // =========================================================================
 
-    /// A leaf shared between an invariant expression and a varying one lands
-    /// in **both** scopes' schedules, with a location chosen independently in
-    /// each.
+    /// A leaf shared between a lattice-invariant expression and a varying one
+    /// lands in **both** scopes' schedules, with a location chosen
+    /// independently in each.
     ///
-    /// It is tempting to assume `partition_by_scope` partitions `ValueId`s —
+    /// It is tempting to assume the nest partitions `ValueId`s —
     /// `arena_to_schedule` numbers them sequentially, and every non-leaf is
-    /// either lifted or left behind. Leaves are the exception: `plan_collapse_hoist`
-    /// refuses to make one a hoist root (there is nothing to save by parking a
-    /// value one instruction rebuilds), so a `Const` feeding both sides is
-    /// simply computed twice. A nest-wide placement map that assumed one
-    /// answer per value would have to pick one of the two, and the emitter
-    /// would then read a register the other scope never wrote.
+    /// either parked by an enclosing scope or left behind. Leaves are the
+    /// exception: `place_roots` leaves one where it is (there is nothing to
+    /// save by parking a value one instruction rebuilds), so a `Const` feeding
+    /// both sides is simply computed twice. A nest-wide placement map that
+    /// assumed one answer per value would have to pick one of the two, and the
+    /// emitter would then read a register the other scope never wrote.
     #[test]
     fn a_leaf_feeding_both_scopes_is_scheduled_in_both() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let y = a.push_var(1);
-        // One constant, read by an X-invariant term and an X-varying one.
-        let k = a.push_const(3.5);
-        let invariant = a.push_binary(OpKind::Mul, y, k);
-        let varying = a.push_binary(OpKind::Mul, x, k);
-        let root = a.push_binary(OpKind::Add, invariant, varying);
-
-        let (arena, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
-        let schedule = arena_to_schedule(&arena, root);
+        let (a, root) = shared_leaf_kernel();
+        let schedule = native_schedule(&a, root, BATCH);
         let variance = schedule_variance(&schedule);
-        let scoped = partition_by_scope(schedule, &variance, &[0u8, 1]);
+        let scoped = scope_schedule(schedule, &variance);
 
-        let in_body: alloc::vec::Vec<regalloc::ValueId> =
-            scoped.body.iter().map(|d| d.value).collect();
+        let outer: alloc::vec::Vec<regalloc::ValueId> =
+            scoped.body.schedule.iter().map(|d| d.value).collect();
+        let parked = |v: &regalloc::ValueId| {
+            scoped.body.roots.contains(v) || scoped.folds.iter().any(|f| f.roots.contains(v))
+        };
         let shared: alloc::vec::Vec<regalloc::ValueId> = scoped
-            .regions
+            .folds
             .iter()
-            .flat_map(|r| r.schedule.iter().map(|d| d.value))
-            .filter(|v| in_body.contains(v) && !scoped.regions.iter().any(|r| r.roots.contains(v)))
+            .flat_map(|f| f.schedule.iter().map(|d| d.value))
+            .filter(|v| outer.contains(v) && !parked(v))
             .collect();
 
         assert!(
@@ -4168,30 +5008,18 @@ mod tests {
     /// per scope, and each range is that scope's own answer.
     #[test]
     fn a_shared_leaf_is_placed_once_per_scope() {
-        use regalloc::{RegisterAllocator, Scope};
-
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let y = a.push_var(1);
-        let k = a.push_const(3.5);
-        let invariant = a.push_binary(OpKind::Mul, y, k);
-        let varying = a.push_binary(OpKind::Mul, x, k);
-        let root = a.push_binary(OpKind::Add, invariant, varying);
-
-        let (arena, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
-        let schedule = arena_to_schedule(&arena, root);
-        let variance = schedule_variance(&schedule);
-        let scoped = partition_by_scope(schedule, &variance, &[0u8, 1]);
-
+        let (a, root) = shared_leaf_kernel();
         let file = Native::new(EmitCtx::default()).register_file();
-        let nest = regalloc::LinearScan.allocate_nest(scoped, &file);
+        let nest = allocate_nest(native_schedule(&a, root, BATCH), &file);
 
-        // Every value the body schedules has an answer at a body point, and
-        // every value a region schedules has one at a point in that region —
-        // which is exactly what a single answer per value could not give.
+        // Every value a scope schedules has an answer at a point in that
+        // scope — which is exactly what a single answer per value could not
+        // give.
         let mut answered = 0;
         let mut scheduled = 0;
-        for scope in [Scope::Region(0), Scope::Region(1), Scope::Body] {
+        let scopes = core::iter::once(regalloc::Scope::Body)
+            .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
+        for scope in scopes {
             let view = nest.scope(scope);
             for (i, def) in view.schedule().iter().enumerate() {
                 scheduled += 1;
@@ -4210,6 +5038,19 @@ mod tests {
         );
     }
 
+    /// `y·k + x·k`: one constant, read by a row-invariant term and a
+    /// column-varying one, so both scopes need it.
+    fn shared_leaf_kernel() -> (ExprArena, ExprId) {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let y = a.push_var(1);
+        let k = a.push_const(3.5);
+        let invariant = a.push_binary(OpKind::Mul, y, k);
+        let varying = a.push_binary(OpKind::Mul, x, k);
+        let root = a.push_binary(OpKind::Add, invariant, varying);
+        (a, root)
+    }
+
     // =========================================================================
     // FrameLayout unit tests — the Placement -> address arrow
     // =========================================================================
@@ -4217,13 +5058,16 @@ mod tests {
     /// Build an allocation with the given placements, in schedule order.
     fn allocation_of(placements: &[(u32, regalloc::Where)]) -> regalloc::NestAllocation {
         use regalloc::{Def, RegisterAllocator, ValueId};
-        // Allocate a trivial all-Var schedule to get a well-formed Allocation,
+        // Allocate a schedule of bare leaves to get a well-formed Allocation,
         // then pin each value where the test wants it.
         let schedule: alloc::vec::Vec<Def> = placements
             .iter()
             .map(|&(v, _)| Def {
                 value: ValueId(v),
-                op: ScheduledOp::Var(0),
+                op: ScheduledOp::Uniform(UniformLoad {
+                    ctx_slot: 0,
+                    offset: v as u16,
+                }),
             })
             .collect();
         let mut a = regalloc::LinearScan.allocate(schedule, &TEST_FILE);
@@ -4328,12 +5172,13 @@ mod tests {
     /// `TEST_SCRATCH`, exactly as the allocator hands one its reservations.
     const TEST_FILE: regalloc::RegisterFile = regalloc::RegisterFile {
         fixed: &[],
-        inputs: INPUT_REGS,
         scratch: regalloc::RegSet::range(4, regalloc::RegisterFile::MIN_SCRATCH),
         temps_for: regalloc::no_temps,
         guard_temps: 0,
         vector_bytes: 16,
         gpr_ctx: None,
+        gpr_out: None,
+        gpr_pitch: None,
         gpr_scratch: regalloc::GprSet::EMPTY,
         gpr_temps_for: regalloc::no_temps,
         mask_scratch: regalloc::MaskSet::EMPTY,
@@ -4628,92 +5473,85 @@ mod tests {
     }
 
     // =========================================================================
-    // DAG integration tests — expressions that previously crashed (SIGSEGV)
-    // =========================================================================
-
-    /// Test that Select short-circuits: when mask is all-true, the false arm
-    /// (which contains a division by zero) must NOT produce NaN in the output.
-    /// Test Select with all-false mask: should return false arm.
-    /// Test Select with mixed mask: BSL path, both arms evaluated.
-    // =========================================================================
     // Arena compilation tests
     // =========================================================================
 
-    // These three tests call the private `arena_to_schedule`/`arena_to_uses`
-    // directly rather than through `compile`: value numbering and
-    // dead-node filtering are schedule-shape invariants with no output-value
-    // signature (a regression here wastes registers/instructions, it doesn't
-    // change what a compiled kernel computes), so there is no public
-    // black-box assertion that would catch a break here.
-    #[test]
-    fn arena_to_schedule_simple() {
-        use pixelflow_ir::arena::ExprArena;
+    // These tests call the private `arena_to_schedule` directly rather than
+    // through `compile`: value numbering and dead-node filtering are
+    // schedule-shape invariants with no output-value signature (a regression
+    // here wastes registers/instructions, it doesn't change what a compiled
+    // kernel computes), so there is no public black-box assertion that would
+    // catch a break here.
 
+    /// Every operand a schedule names is defined earlier in it, and no value
+    /// twice: the numbering is topological and total, which is what the emit
+    /// loop walks.
+    #[test]
+    fn arena_to_schedule_defines_every_operand_before_it_is_read() {
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
         let sum = arena.push_binary(OpKind::Add, x, y);
 
-        let schedule = arena_to_schedule(&arena, sum);
-
-        // Should have 3 values: X, Y, X+Y
-        assert_eq!(
-            schedule.len(),
-            3,
-            "expected 3 schedule entries, got {}",
-            schedule.len()
-        );
-
-        // Verify the operations
-        assert!(matches!(schedule[0].op, ScheduledOp::Var(0)));
-        assert!(matches!(schedule[1].op, ScheduledOp::Var(1)));
-        assert!(matches!(
-            schedule[2].op,
-            ScheduledOp::Binary(OpKind::Add, _, _)
-        ));
+        let schedule = native_schedule(&arena, sum, POINT);
+        assert!(!schedule.is_empty(), "a collapse schedules something");
+        let mut defined: alloc::vec::Vec<regalloc::ValueId> = alloc::vec::Vec::new();
+        for def in &schedule {
+            for operand in regalloc::structural_children(&def.op) {
+                assert!(
+                    defined.contains(&operand),
+                    "{operand:?} is read by {:?} before it is defined",
+                    def.value
+                );
+            }
+            assert!(
+                !defined.contains(&def.value),
+                "{:?} is defined twice",
+                def.value
+            );
+            defined.push(def.value);
+        }
     }
 
+    /// A node nothing reaches never becomes a schedule entry.
     #[test]
     fn arena_to_schedule_filters_unreachable() {
-        use pixelflow_ir::arena::ExprArena;
-
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let _garbage = arena.push_const(999.0); // unreachable
-        let y = arena.push_var(1);
-        let sum = arena.push_binary(OpKind::Add, x, y);
-
-        let schedule = arena_to_schedule(&arena, sum);
-
-        // Should have 3 values (garbage node filtered out)
+        let length = |garbage: bool| {
+            let mut arena = ExprArena::new();
+            let x = arena.push_var(0);
+            if garbage {
+                let _unreachable = arena.push_const(999.0);
+            }
+            let y = arena.push_var(1);
+            let sum = arena.push_binary(OpKind::Add, x, y);
+            native_schedule(&arena, sum, POINT).len()
+        };
         assert_eq!(
-            schedule.len(),
-            3,
+            length(true),
+            length(false),
             "unreachable garbage node should be filtered"
         );
     }
 
     #[test]
-    #[cfg(target_arch = "aarch64")]
     fn arena_compile_simple() {
-        use pixelflow_ir::arena::ExprArena;
-
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
         let sum = arena.push_binary(OpKind::Add, x, y);
 
-        let result = compile(&arena, sum).expect("arena DAG compile failed");
-        assert_eq!(result.spill_count, 0);
+        let result = compile(&arena, sum, POINT).expect("arena DAG compile failed");
+        // Two leaves and one add force nothing to memory: no scope of the
+        // nest stores or reloads a value. Not `spill_count`, which counts the
+        // frame's slots — the lattice's own folds reserve one the emitted
+        // code never touches, on every backend.
+        assert_eq!(result.traffic.dynamic_memory_ops(), 0);
 
-        assert_eq!(eval_point(&result.code, 3.0, 4.0, 0.0, 0.0), 7.0);
+        assert_eq!(eval_point(&result.code, 3.0, 4.0), 7.0);
     }
 
     #[test]
-    #[cfg(target_arch = "aarch64")]
     fn arena_compile_with_constant() {
-        use pixelflow_ir::arena::ExprArena;
-
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
         let two = arena.push_const(2.0);
@@ -4721,10 +5559,10 @@ mod tests {
         let prod = arena.push_binary(OpKind::Mul, x, two);
         let sum = arena.push_binary(OpKind::Add, prod, y);
 
-        let result = compile(&arena, sum).expect("arena DAG compile failed");
+        let result = compile(&arena, sum, POINT).expect("arena DAG compile failed");
 
         // 3*2 + 4 = 10
-        assert_eq!(eval_point(&result.code, 3.0, 4.0, 0.0, 0.0), 10.0);
+        assert_eq!(eval_point(&result.code, 3.0, 4.0), 10.0);
     }
 
     /// `Σᵢ (X+i)·(Y+i)` for i in 1..=10, summed as a balanced tree: ten
@@ -4741,10 +5579,7 @@ mod tests {
     /// subject here — what spilling *does* — no longer depends on how small
     /// the pool can be made.
     #[test]
-    #[cfg(target_arch = "aarch64")]
     fn arena_compile_with_spills() {
-        use pixelflow_ir::arena::ExprArena;
-
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
@@ -4768,7 +5603,7 @@ mod tests {
         let root = terms[0];
 
         let result = EmitCtx::with_max_regs(4)
-            .compile(&arena, root)
+            .compile(&arena, root, POINT)
             .expect("arena DAG compile with spills failed");
 
         assert!(
@@ -4778,7 +5613,7 @@ mod tests {
 
         // Σᵢ (3+i)·(4+i) = 20+30+42+56+72+90+110+132+156+182 = 890, every
         // term and partial sum exact in f32.
-        assert_eq!(eval_point(&result.code, 3.0, 4.0, 0.0, 0.0), 890.0);
+        assert_eq!(eval_point(&result.code, 3.0, 4.0), 890.0);
     }
 
     // =========================================================================
@@ -4799,7 +5634,6 @@ mod tests {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     mod select_guard_driver {
         use super::*;
-        use pixelflow_ir::arena::{ExprArena, ExprId};
 
         /// Padding that makes an arm worth a branch, and what it adds.
         ///
@@ -4850,20 +5684,73 @@ mod tests {
             a.push_binary(OpKind::Add, sel, carried)
         }
 
+        /// How many terms the filler below has.
+        const FILLER: usize = 8;
+
+        /// Coprime with [`FILLER`], so the pairing has no short cycle.
+        fn pair(i: usize) -> usize {
+            (i * 7 + 3) % FILLER
+        }
+
+        /// Filler that is live all at once whatever the evaluation order.
+        ///
+        /// [`FILLER`] terms off `seed`, multiplied in pairs by a permutation,
+        /// so each is read twice with the others in between: no order keeps
+        /// them all in registers, which is what makes the tests below about a
+        /// *spilled* value rather than about an arithmetic identity. Defining
+        /// them all before consuming any is not enough on its own —
+        /// `passes::lattice::collapse` rebuilds the arena from the root, and
+        /// the order it hands the scheduler is its own.
+        fn filler(a: &mut ExprArena, seed: ExprId) -> ExprId {
+            let terms: alloc::vec::Vec<ExprId> = (0..FILLER)
+                .map(|i| {
+                    let c = a.push_const(i as f32 + 1.0);
+                    a.push_binary(OpKind::Add, seed, c)
+                })
+                .collect();
+            let mut sum = a.push_const(0.0);
+            for i in 0..FILLER {
+                let product = a.push_binary(OpKind::Mul, terms[i], terms[pair(i)]);
+                sum = a.push_binary(OpKind::Add, sum, product);
+            }
+            sum
+        }
+
+        /// [`filler`], in scalar `f32`.
+        fn filler_value(seed: f32) -> f32 {
+            let term = |i: usize| seed + i as f32 + 1.0;
+            (0..FILLER).map(|i| term(i) * term(pair(i))).sum()
+        }
+
         /// Assert a guard region actually formed for `root`.
         ///
         /// Without this the tests below still pass when the guard stops
         /// forming — they would just be testing an ordinary `Select`, which is
         /// the silent-decay shape this file has been bitten by before.
         fn assert_guard_forms(a: &ExprArena, root: ExprId) {
-            let schedule = arena_to_schedule(a, root);
-            let guards = analyze_select_guards(&schedule);
-            let guarded = guards.iter().any(|g| g.has_guarded_arm());
+            let file = Native::new(EmitCtx::default()).register_file();
+            let nest = allocate_nest(native_schedule(a, root, POINT), &file);
             assert!(
-                guarded,
-                "no Select in this schedule has an arm-exclusive range, so the \
+                guarded_scope(&nest).is_some(),
+                "no Select in this nest has an arm-exclusive range, so the \
                  short-circuit guard this test exists for is never emitted"
             );
+        }
+
+        /// The scope of an allocated nest whose schedule carries a guarded
+        /// select, and that guard — every allocation question below is asked
+        /// of the scope that actually branches.
+        fn guarded_scope(
+            nest: &regalloc::NestAllocation,
+        ) -> Option<(regalloc::Allocation<'_>, guards::SelectGuard)> {
+            let scopes = core::iter::once(regalloc::Scope::Body)
+                .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
+            scopes.map(|s| nest.scope(s)).find_map(|view| {
+                analyze_select_guards(view.schedule(), view.roots())
+                    .into_iter()
+                    .find(|g| g.has_guarded_arm())
+                    .map(|g| (view, g))
+            })
         }
 
         /// A select whose true arm contains a select, with entries belonging
@@ -4946,13 +5833,13 @@ mod tests {
         /// How many entries each select has under a guard, by schedule
         /// position, for a schedule built the way `compile` builds it.
         fn guarded_entries(a: &ExprArena, root: ExprId, cluster: bool) -> alloc::vec::Vec<usize> {
-            let schedule = arena_to_schedule(a, root);
+            let schedule = native_schedule(a, root, POINT);
             let schedule = if cluster {
                 guards::cluster_select_arms(schedule)
             } else {
                 schedule
             };
-            analyze_select_guards(&schedule)
+            analyze_select_guards(&schedule, &[])
                 .iter()
                 .map(|g| g.total_guarded_entries())
                 .collect()
@@ -4992,12 +5879,12 @@ mod tests {
         fn a_nested_guarded_select_agrees_lane_for_lane() {
             let mut a = ExprArena::new();
             let (root, _outer, _inner) = nested_guarded_selects(&mut a);
-            let result = compile(&a, root).expect("nested guarded select compile");
+            let point = compile(&a, root, POINT).expect("nested guarded select compile");
 
             // One point at a time: all four combinations of the two masks,
             // each of which takes a pair of branches.
             for &(x, y) in &[(3.0f32, 4.0f32), (3.0, -4.0), (-3.0, 4.0), (-3.0, -4.0)] {
-                let got = eval_point(&result.code, x, y, 0.0, 0.0);
+                let got = eval_point(&point.code, x, y);
                 assert_eq!(
                     got,
                     nested_expected(x, y),
@@ -5005,21 +5892,22 @@ mod tests {
                 );
             }
 
-            // Mixed lanes: both masks vary within the batch, so neither guard
-            // fires and the blend has to produce every lane.
-            let xs: [f32; LANES] = core::array::from_fn(|i| if i % 2 == 0 { 3.0 } else { -3.0 });
-            let ys: [f32; LANES] = core::array::from_fn(|i| if i % 3 == 0 { 4.0 } else { -4.0 });
-            let got = eval_batch(
-                &result.code,
-                &[],
-                executable::Point4::new(xs, ys, [0.0; LANES], [0.0; LANES]),
-            );
-            for lane in 0..LANES {
-                assert_eq!(
-                    got[lane],
-                    nested_expected(xs[lane], ys[lane]),
-                    "lane {lane} of a mixed-mask batch"
-                );
+            // Mixed lanes: the batch straddles `x = 0`, so the outer mask
+            // varies by lane, its guard cannot fire and the blend has to
+            // produce every lane. `y` is the row, so the inner mask is
+            // uniform over a batch and takes its branch — both paths, in one
+            // call.
+            let batch = compile(&a, root, BATCH).expect("nested guarded select compile");
+            let x0 = -(LANES as f32) / 2.0;
+            for y in [4.0f32, -4.0] {
+                let got = eval_batch(&batch.code, &[], &[], x0, y);
+                for (lane, got) in got.iter().enumerate() {
+                    assert_eq!(
+                        *got,
+                        nested_expected(x0 + lane as f32, y),
+                        "lane {lane} of a mixed-mask batch at y={y}"
+                    );
+                }
             }
         }
 
@@ -5032,7 +5920,7 @@ mod tests {
             let root = guarded_select(&mut a);
             assert_guard_forms(&a, root);
 
-            let result = compile(&a, root).expect("guarded select compile");
+            let result = compile(&a, root, POINT).expect("guarded select compile");
             for &(x, y) in &[
                 (3.0f32, 4.0f32), // all-true  -> B³
                 (-2.0, 0.5),      // all-false -> 3B
@@ -5041,7 +5929,7 @@ mod tests {
             ] {
                 let b = x * y;
                 let want = if x > 0.0 { b * b * b } else { 3.0 * b } + PADDING + (x - y);
-                let got = eval_point(&result.code, x, y, 0.0, 0.0);
+                let got = eval_point(&result.code, x, y);
                 assert!(
                     (got - want).abs() <= 1e-3,
                     "guarded select at ({x}, {y}): got {got}, want {want}"
@@ -5059,12 +5947,11 @@ mod tests {
         ///
         /// Getting the mask to be the value that spills takes care, and the
         /// test asserts it rather than assuming: eviction is Belady, so the
-        /// victim is whatever is used farthest out. The mask is computed first
-        /// and read last, and everything between it and the `Select` is
-        /// consumed before the `Select` — so the mask is the farthest-out live
-        /// value when the filler fills the pool, and it is the one to go. A
-        /// plain `spill_count > 0` would pass with the mask still resident and
-        /// this path never taken.
+        /// victim is whatever is used farthest out. The mask is read only at
+        /// the `Select`, and the [`filler`] between fills the pool — so the
+        /// mask is the farthest-out live value there, and it is the one to
+        /// go. A plain `spill_count > 0` would pass with the mask still
+        /// resident and this path never taken.
         #[test]
         fn a_guarded_select_survives_a_spilled_mask() {
             let mut a = ExprArena::new();
@@ -5074,18 +5961,7 @@ mod tests {
 
             // Read only at the very end: the farthest-out live value.
             let cond = a.push_binary(OpKind::Gt, x, zero);
-
-            // Filler that is all live at once and all consumed *before* the
-            // select, so the mask outlives every one of them.
-            let terms: alloc::vec::Vec<ExprId> = (1..=8u32)
-                .map(|i| {
-                    let c = a.push_const(i as f32);
-                    a.push_binary(OpKind::Add, x, c)
-                })
-                .collect();
-            let mid = terms[1..]
-                .iter()
-                .fold(terms[0], |acc, &t| a.push_binary(OpKind::Add, acc, t));
+            let mid = filler(&mut a, x);
 
             // Shared-base arms, as in `guarded_select`.
             let base = a.push_binary(OpKind::Mul, mid, y);
@@ -5101,31 +5977,24 @@ mod tests {
             assert_guard_forms(&a, root);
 
             // The mask must actually be the value that spills.
-            let file = Native::new(EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH))
-                .register_file();
-            let allocation = {
-                use regalloc::RegisterAllocator;
-                regalloc::LinearScan.allocate(arena_to_schedule(&a, root), &file)
-            };
-            let mask_vid = analyze_select_guards(allocation.body().schedule())
-                .first()
-                .expect("a guard formed above")
-                .mask_vid;
+            let ctx = EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH);
+            let file = Native::new(ctx.clone()).register_file();
+            let nest = allocate_nest(native_schedule(&a, root, POINT), &file);
+            let (view, guard) = guarded_scope(&nest).expect("a guard formed above");
             assert!(
-                allocation.body().placement(mask_vid).spills(),
+                view.placement(guard.mask_vid).spills(),
                 "the mask stayed in a register, so the spilled-mask path this \
                  test exists for is never reached"
             );
 
-            let result = EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH)
-                .compile(&a, root)
+            let result = ctx
+                .compile(&a, root, POINT)
                 .expect("spilled guarded select compile");
 
             for &(px, py) in &[(3.0f32, 2.0f32), (-2.0, 0.5), (0.5, -1.0)] {
-                let m: f32 = (1..=8).map(|i| px + i as f32).sum();
-                let b = m * py;
+                let b = filler_value(px) * py;
                 let want = if px > 0.0 { b * b * b } else { 3.0 * b } + PADDING + (px - py);
-                let got = eval_point(&result.code, px, py, 0.0, 0.0);
+                let got = eval_point(&result.code, px, py);
                 assert!(
                     (got - want).abs() <= 1e-2 * want.abs().max(1.0),
                     "spilled guarded select at ({px}, {py}): got {got}, want {want}"
@@ -5144,36 +6013,37 @@ mod tests {
         /// because a value in memory anywhere is stored right after its
         /// definition, which is outside the arm.
         ///
-        /// Returns the arena, the root, the value that gets split, and the
-        /// select's true-arm range, so the two tests below can assert on the
-        /// same shape rather than each rebuilding it.
-        fn split_across_a_guarded_arm() -> (
-            ExprArena,
-            ExprId,
-            regalloc::ValueId,
-            (usize, usize),
-            regalloc::NestAllocation,
-        ) {
-            use regalloc::RegisterAllocator;
+        /// The fixture, so the two tests below assert on one shape rather
+        /// than each rebuilding it.
+        struct SplitFixture {
+            arena: ExprArena,
+            root: ExprId,
+            /// The value that loses its register and is brought back inside
+            /// the arm.
+            split: regalloc::ValueId,
+            /// The select's true-arm range, in `scope`.
+            arm: (usize, usize),
+            nest: regalloc::NestAllocation,
+            /// The scope holding the select.
+            scope: regalloc::Scope,
+        }
+
+        fn split_across_a_guarded_arm() -> SplitFixture {
             let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let zero = a.push_const(0.0);
 
-            // Computed first, read last: the farthest-out live values, so
-            // these are what eviction takes when the filler fills the pool.
+            // `split` seeds the filler, so it is live across all of it and is
+            // the farthest-out live value where the pool fills; its next read
+            // after that is inside the arm. It wears an `Abs` so the schedule
+            // can be searched for it by op: the coordinates are folds'
+            // binders now, and `X·Y` is no longer a product of two `Var`s to
+            // look for.
             let cond = a.push_binary(OpKind::Gt, x, zero);
-            let split = a.push_binary(OpKind::Mul, x, y);
-
-            let terms: alloc::vec::Vec<ExprId> = (1..=8u32)
-                .map(|i| {
-                    let c = a.push_const(i as f32);
-                    a.push_binary(OpKind::Add, x, c)
-                })
-                .collect();
-            let mid = terms[1..]
-                .iter()
-                .fold(terms[0], |acc, &t| a.push_binary(OpKind::Add, acc, t));
+            let xy = a.push_binary(OpKind::Mul, x, y);
+            let split = a.push_unary(OpKind::Abs, xy);
+            let mid = filler(&mut a, split);
 
             // Shared-base arms, so neither arm's leaves land outside it and
             // the arms' own nodes stay adjacent (see `guarded_select`).
@@ -5198,43 +6068,51 @@ mod tests {
 
             let file = Native::new(EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH))
                 .register_file();
-            let schedule = arena_to_schedule(&a, root);
-            let allocation = regalloc::LinearScan.allocate(schedule, &file);
-            let guard = analyze_select_guards(allocation.body().schedule())
-                .into_iter()
-                .find(|g| g.is_guarded(SelectArm::True))
+            let nest = allocate_nest(native_schedule(&a, root, POINT), &file);
+            let mut scopes = core::iter::once(regalloc::Scope::Body)
+                .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
+            let (scope, guard) = scopes
+                .find_map(|s| {
+                    let view = nest.scope(s);
+                    analyze_select_guards(view.schedule(), view.roots())
+                        .into_iter()
+                        .find(|g| g.is_guarded(SelectArm::True))
+                        .map(|g| (s, g))
+                })
                 .expect("the true arm is exclusive and contiguous, so it is guarded");
 
-            // Which `ValueId` the arena's `split` became. `X·Y` is the only
-            // product of two `Var`s in this kernel.
-            let body = allocation.body().schedule();
-            let is_var = |v: regalloc::ValueId| {
-                body.iter()
-                    .any(|d| d.value == v && matches!(d.op, ScheduledOp::Var(_)))
-            };
-            let split_vid = body
+            // Which `ValueId` the arena's `split` became: the one `Abs`.
+            let split = nest
+                .scope(scope)
+                .schedule()
                 .iter()
-                .find(|d| {
-                    matches!(d.op, ScheduledOp::Binary(OpKind::Mul, l, r) if is_var(l) && is_var(r))
-                })
+                .find(|d| matches!(d.op, ScheduledOp::Unary(OpKind::Abs, _)))
                 .map(|d| d.value)
-                .expect("X·Y is in the schedule");
-            (a, root, split_vid, guard.true_range(), allocation)
+                .expect("|X·Y| is in the schedule");
+            let arm = guard.true_range();
+            SplitFixture {
+                arena: a,
+                root,
+                split,
+                arm,
+                nest,
+                scope,
+            }
         }
 
         /// The value is right after the arm, on the path that skips it.
         #[test]
         fn a_split_range_inside_a_guarded_arm_is_correct_when_the_arm_is_skipped() {
-            let (a, root, split_vid, arm, allocation) = split_across_a_guarded_arm();
+            let f = split_across_a_guarded_arm();
+            let view = f.nest.scope(f.scope);
             assert!(
-                allocation.body().placement(split_vid).spills(),
+                view.placement(f.split).spills(),
                 "the value under test stayed in a register, so nothing is split"
             );
-            let kept = allocation
-                .body()
-                .placement(split_vid)
+            let kept = view
+                .placement(f.split)
                 .spans()
-                .any(|s| matches!(s.at, regalloc::Where::Reg(_)) && s.from.index >= arm.0);
+                .any(|s| matches!(s.at, regalloc::Where::Reg(_)) && s.from.index >= f.arm.0);
             assert!(
                 kept,
                 "the value was never brought back into a register inside the \
@@ -5242,22 +6120,21 @@ mod tests {
             );
 
             let result = EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH)
-                .compile(&a, root)
+                .compile(&f.arena, f.root, POINT)
                 .expect("split-across-a-guard compile");
             // x < 0 is the all-false mask: the true arm — and the reload
             // inside it — never runs, and the read after it must still be the
             // value.
             for &(px, py) in &[(-2.0f32, 3.0f32), (-0.5, -4.0), (3.0, 2.0), (0.25, 1.5)] {
-                let m: f32 = (1..=8).map(|i| px + i as f32).sum();
-                let b = m * py;
-                let v = px * py;
+                let v = (px * py).abs();
+                let b = filler_value(v) * py;
                 let arm_value = if px > 0.0 {
                     (b * v + v) * b
                 } else {
                     (b + b) + b
                 };
                 let want = arm_value + PADDING + v + (px - py);
-                let got = eval_point(&result.code, px, py, 0.0, 0.0);
+                let got = eval_point(&result.code, px, py);
                 assert!(
                     (got - want).abs() <= 1e-2 * want.abs().max(1.0),
                     "split across a guarded arm at ({px}, {py}): got {got}, want {want}"
@@ -5273,22 +6150,22 @@ mod tests {
         /// what makes "exactly" a statement about one answer rather than two.
         #[test]
         fn a_kept_reload_inside_a_guarded_arm_ends_at_the_arm() {
-            let (_, _, split_vid, arm, allocation) = split_across_a_guarded_arm();
+            let f = split_across_a_guarded_arm();
             let spans: alloc::vec::Vec<regalloc::Span> =
-                allocation.body().placement(split_vid).spans().collect();
+                f.nest.scope(f.scope).placement(f.split).spans().collect();
             let kept = spans
                 .iter()
-                .position(|s| matches!(s.at, regalloc::Where::Reg(_)) && s.from.index >= arm.0)
+                .position(|s| matches!(s.at, regalloc::Where::Reg(_)) && s.from.index >= f.arm.0)
                 .expect("a register range begins inside the arm");
             assert!(
-                spans[kept].from.index < arm.1,
+                spans[kept].from.index < f.arm.1,
                 "the range begins outside the arm it was confined to"
             );
             let reverted = spans
                 .get(kept + 1)
                 .expect("a confined range is followed by the range it reverts to");
             assert_eq!(
-                reverted.from.index, arm.1,
+                reverted.from.index, f.arm.1,
                 "a register range that begins inside a guarded arm must end \
                  where the arm does: a read after it would name a register the \
                  skipped path never loaded"
@@ -5308,28 +6185,27 @@ mod tests {
         }
     }
 
-    /// Run an arena kernel at `x` (Y = 0) and return lane 0. The
-    /// builtin-parity tests below use it. Gated off `+avx512f` (those builtins
-    /// aren't in the AVX-512 op set yet anyway).
+    /// Run an arena kernel at `(x, 0)`. The builtin-parity tests below use
+    /// it. Gated off `+avx512f` (those builtins aren't in the AVX-512 op set
+    /// yet anyway).
     #[cfg(all(
         target_arch = "x86_64",
         not(target_feature = "avx512f"),
         not(target_feature = "avx2")
     ))]
     fn run1(arena: &ExprArena, root: ExprId, x: f32) -> f32 {
-        let r = compile(arena, root).expect("compile failed");
-        eval_point(&r.code, x, 0.0, 0.0, 0.0)
+        run_xy(arena, root, x, 0.0)
     }
 
-    /// Eval at (X=x, Y=y, Z=W=0), lane 0. Gated off `+avx512f` like `run1`.
+    /// Eval at `(x, y)`. Gated off `+avx512f` like `run1`.
     #[cfg(all(
         target_arch = "x86_64",
         not(target_feature = "avx512f"),
         not(target_feature = "avx2")
     ))]
     fn run_xy(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
-        let r = compile(arena, root).expect("compile failed");
-        eval_point(&r.code, x, y, 0.0, 0.0)
+        let r = compile(arena, root, POINT).expect("compile failed");
+        eval_point(&r.code, x, y)
     }
 
     /// A `Dwrt`-carrying arena must JIT-compile end-to-end: the compile entry
@@ -5380,48 +6256,60 @@ mod tests {
         let g = a.push_ternary(OpKind::Gather, bufleaf, x, y);
         let v0 = a.push_const(0.0);
         let root = a.push_binary(OpKind::Dwrt, g, v0);
-        assert!(compile(&a, root).is_err());
+        assert!(compile(&a, root, POINT).is_err());
     }
 
-    /// A spill frame past the 128-byte red zone must allocate a real frame
-    /// (`sub rsp`) and produce correct results — the glyph-scale-kernel case
-    /// that used to refuse with "exceeds 128-byte red zone". 40 products are
-    /// all pushed before any is consumed, so dozens are simultaneously live
-    /// against 6 allocatable registers.
+    /// A deep spill frame must compile and produce correct results — the
+    /// glyph-scale-kernel case that used to refuse with "exceeds 128-byte red
+    /// zone". There is no red zone any more, so what is under test is only
+    /// that a frame dozens of slots deep is emitted and addressed correctly.
+    ///
+    /// Forty terms, **paired by a permutation** so that each is read twice,
+    /// far apart: no evaluation order keeps them all in registers. Pushing
+    /// them all before consuming any is no longer enough on its own, because
+    /// `passes::lattice::collapse` rebuilds the arena from the root and the
+    /// order it hands the scheduler is its own.
     #[test]
     #[cfg(all(
         target_arch = "x86_64",
         not(target_feature = "avx512f"),
         not(target_feature = "avx2")
     ))]
-    fn spill_frame_beyond_red_zone_compiles_correctly() {
+    fn a_deep_spill_frame_compiles_correctly() {
+        const TERMS: usize = 40;
+        /// Coprime with `TERMS`, so `i -> PAIR(i)` is a permutation with no
+        /// short cycle: a term's two readers are far apart in every order.
+        fn pair(i: usize) -> usize {
+            (i * 7 + 3) % TERMS
+        }
+
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
-        let mut products = alloc::vec::Vec::new();
-        for i in 0..40u32 {
-            let c = a.push_const(i as f32 + 1.0);
-            let xa = a.push_binary(OpKind::Add, x, c);
-            let yb = a.push_binary(OpKind::Add, y, c);
-            products.push(a.push_binary(OpKind::Mul, xa, yb));
-        }
-        let mut root = products[0];
-        for p in &products[1..] {
-            root = a.push_binary(OpKind::Add, root, *p);
+        let terms: alloc::vec::Vec<ExprId> = (0..TERMS)
+            .map(|i| {
+                let c = a.push_const(i as f32 + 1.0);
+                let xc = a.push_binary(OpKind::Add, x, c);
+                a.push_binary(OpKind::Mul, xc, y)
+            })
+            .collect();
+        let mut root = a.push_const(0.0);
+        for i in 0..TERMS {
+            let product = a.push_binary(OpKind::Mul, terms[i], terms[pair(i)]);
+            root = a.push_binary(OpKind::Add, root, product);
         }
 
-        let result = compile(&a, root).expect("large spill frame must compile");
+        let result = compile(&a, root, POINT).expect("large spill frame must compile");
         assert!(
             result.spill_bytes > 128,
-            "test did not force a frame beyond the red zone (spill_bytes = {})",
+            "test did not force a deep frame (spill_bytes = {})",
             result.spill_bytes
         );
 
         for (px, py) in [(1.5f32, -2.0f32), (0.0, 0.0), (3.0, 4.0)] {
             let got = run_xy(&a, root, px, py);
-            let want: f32 = (0..40)
-                .map(|i| (px + i as f32 + 1.0) * (py + i as f32 + 1.0))
-                .sum();
+            let term = |i: usize| (px + i as f32 + 1.0) * py;
+            let want: f32 = (0..TERMS).map(|i| term(i) * term(pair(i))).sum();
             let tol = 1e-3 * want.abs().max(1.0);
             assert!(
                 (got - want).abs() <= tol,
@@ -5560,8 +6448,7 @@ mod tests {
     fn x86_binary_ternary_builtins_match_scalar() {
         // Helper: compile f(X, Y) and eval at (x, y).
         fn run2(arena: &ExprArena, root: ExprId, x: f32, y: f32) -> f32 {
-            let r = compile(arena, root).expect("compile failed");
-            eval_point(&r.code, x, y, 0.0, 0.0)
+            run_xy(arena, root, x, y)
         }
 
         // atan2(y, x): arena Binary(Atan2, Y, X)  (op order: src1=y, src2=x)
@@ -5846,32 +6733,63 @@ mod tests {
     mod sched {
         use super::*;
 
-        /// One batch of a kernel whose single argument is bound to `u` — the
+        /// One point of a kernel whose single argument is bound to `u` — the
         /// lattice-invariant third input a test used to spell `Var(2)`.
         fn eval_point_with_arg(code: &executable::ExecutableCode, x: f32, y: f32, u: f32) -> f32 {
-            let block = [u];
-            let ctx: [*const f32; 1] = [block.as_ptr()];
-            let o = executable::Point4::new([x; LANES], [y; LANES], [0.0; LANES], [0.0; LANES]);
-            eval_batch(code, &ctx, o)[0]
+            collapse_into(code, &[], &[u], (x, y), POINT)[0]
         }
 
         /// Declare one argument in `a` and return its leaf.
-        fn arg_leaf(a: &mut ExprArena, default: f32) -> pixelflow_ir::ExprId {
+        fn arg_leaf(a: &mut ExprArena, default: f32) -> ExprId {
             let slot = a.declare_uniform(pixelflow_ir::Uniform::new(default).decl());
             a.push_uniform(slot)
         }
 
-        use pixelflow_ir::arena::ExprArena;
-
-        fn run(res: &CompileResult, x: f32, y: f32, z: f32, w: f32) -> f32 {
-            eval_point(&res.code, x, y, z, w)
+        fn run(res: &CompileResult, x: f32, y: f32) -> f32 {
+            eval_point(&res.code, x, y)
         }
 
-        const PTS: &[(f32, f32, f32, f32)] = &[
-            (3.0, 4.0, 0.0, 1.0),
-            (1.0, 2.0, 3.0, 4.0),
-            (-2.0, 0.5, 1.5, -1.0),
-            (0.7, -1.3, 2.1, 0.2),
+        /// How many of its own values the scope that stores spills.
+        ///
+        /// Not [`CompileResult::spill_count`], which is the body's alone and
+        /// which counts a scope's parked roots and its store along with them
+        /// — both are in a slot by construction rather than by pressure, so
+        /// no kernel ever reaches zero by that measure.
+        fn sample_spills(a: &ExprArena, root: ExprId, ctx: EmitCtx) -> usize {
+            let file = Native::new(ctx).register_file();
+            let nest = allocate_nest(native_schedule(a, root, POINT), &file);
+            let scopes = core::iter::once(regalloc::Scope::Body)
+                .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
+            scopes
+                .map(|s| nest.scope(s))
+                .filter(|view| {
+                    view.schedule()
+                        .iter()
+                        .any(|d| matches!(d.op, ScheduledOp::Write { .. }))
+                })
+                .map(|view| {
+                    view.schedule()
+                        .iter()
+                        .filter(|d| {
+                            !matches!(
+                                d.op,
+                                ScheduledOp::Write { .. }
+                                    | ScheduledOp::Seq(..)
+                                    | ScheduledOp::Reduce(..)
+                            ) && !view.parked_by_an_enclosing_scope(d.value)
+                                && view.placement(d.value).spills()
+                        })
+                        .count()
+                })
+                .max()
+                .expect("a collapse stores somewhere")
+        }
+
+        const PTS: &[(f32, f32, f32)] = &[
+            (3.0, 4.0, 0.0),
+            (1.0, 2.0, 3.0),
+            (-2.0, 0.5, 1.5),
+            (0.7, -1.3, 2.1),
         ];
 
         /// An expression that fits in registers compiles without spilling and
@@ -5897,22 +6815,26 @@ mod tests {
             let sub = a.push_binary(OpKind::Sub, dist, yz); // dist - Y*Z
             let root = sub;
 
-            let sched = compile(&a, root).expect("compile");
-            assert_eq!(sched.spill_count, 0, "should fit without spilling");
+            let sched = compile(&a, root, POINT).expect("compile");
+            assert_eq!(
+                sample_spills(&a, root, EmitCtx::default()),
+                0,
+                "should fit without spilling"
+            );
 
-            for &(px, py, pz, _pw) in PTS {
+            for &(px, py, pz) in PTS {
                 let want = (px * px + py * py).sqrt() - py * pz;
                 let got = eval_point_with_arg(&sched.code, px, py, pz);
                 assert!((got - want).abs() <= 1e-4, "got {got} want {want}");
             }
         }
 
-        /// A wide expression that exceeds the 7 allocatable registers must spill
-        /// (to the red zone) and still compute the right answer.
+        /// A wide expression that exceeds the allocatable registers must spill
+        /// and still compute the right answer.
         #[test]
         fn sched_spills_and_is_correct() {
-            // sum_{i=1..=10} (X + i) * (Y + i), as a balanced tree so the 10
-            // products are live together — forcing spills with only 7 regs.
+            // sum_{i=1..=10} (X + i) * (Y + i), as a balanced tree, against a
+            // pool at the floor: more live at once than seven registers hold.
             let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
@@ -5937,18 +6859,22 @@ mod tests {
             }
             let root = terms[0];
 
-            let sched = compile(&a, root).expect("scheduled compile");
+            let ctx = EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH);
+            let sched = ctx
+                .clone()
+                .compile(&a, root, POINT)
+                .expect("scheduled compile");
             assert!(
-                sched.spill_count > 0,
+                sample_spills(&a, root, ctx) > 0,
                 "expected spilling; widen the expression if this regresses"
             );
 
-            for &(px, py, _pz, _pw) in PTS {
+            for &(px, py, _pz) in PTS {
                 let mut want = 0.0f32;
                 for i in 1..=10u32 {
                     want += (px + i as f32) * (py + i as f32);
                 }
-                let got = run(&sched, px, py, 0.0, 0.0);
+                let got = run(&sched, px, py);
                 let tol = 1e-3 * want.abs().max(1.0);
                 assert!((got - want).abs() <= tol, "spill: got {got} want {want}");
             }
@@ -5975,12 +6901,12 @@ mod tests {
             let zzz = a.push_binary(OpKind::Add, zz, x); // false arm: 3X
             let root = a.push_ternary(OpKind::Select, cond, yyy, zzz);
 
-            let sched = compile(&a, root).expect("scheduled compile");
+            let sched = compile(&a, root, POINT).expect("scheduled compile");
 
             // x>0 -> all-true -> Y^3 ; x<=0 -> all-false -> 3X.
-            for &(px, py, _pz, _pw) in PTS {
+            for &(px, py, _pz) in PTS {
                 let want = if px > 0.0 { py * py * py } else { 3.0 * px };
-                let got = run(&sched, px, py, 0.0, 0.0);
+                let got = run(&sched, px, py);
                 assert!(
                     (got - want).abs() <= 1e-3,
                     "select: ({px},{py}) got {got} want {want}"
@@ -6028,10 +6954,10 @@ mod tests {
         }
 
         /// `x + u·u`: the uniform's load and the product that depends on it
-        /// alone are per-call work. Asserted on the partition — which region
-        /// holds them — not on timing.
+        /// alone are per-call work. Asserted on the nest — which scope holds
+        /// them — not on timing.
         #[test]
-        fn a_uniform_and_what_depends_on_it_alone_land_in_the_frame_prologue() {
+        fn a_uniform_and_what_depends_on_it_alone_land_in_the_body() {
             let mut a = ExprArena::new();
             let u = a.declare_uniform(decl(3.0));
             let x = a.push_var(0);
@@ -6039,37 +6965,41 @@ mod tests {
             let sq = a.push_binary(OpKind::Mul, uu, uu);
             let root = a.push_binary(OpKind::Add, x, sq);
 
-            let (arena, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
-            let schedule = arena_to_schedule(&arena, root);
+            let schedule = native_schedule(&a, root, BATCH);
             let variance = schedule_variance(&schedule);
-            let scoped = partition_by_scope(schedule, &variance, &[0u8, 1]);
+            let scoped = scope_schedule(schedule, &variance);
 
-            let frame = &scoped.regions[0];
+            // The kernel's own uniform, told from the origin's two by the
+            // block it is read from: the link's, at the context slot after
+            // the (empty) buffer table, rather than the origin block after
+            // that.
+            let kernel_uniform =
+                |op: &ScheduledOp| matches!(op, ScheduledOp::Uniform(load) if load.ctx_slot == 0);
             assert!(
-                frame
-                    .schedule
-                    .iter()
-                    .any(|d| matches!(d.op, ScheduledOp::Uniform(_))),
+                scoped.body.schedule.iter().any(|d| kernel_uniform(&d.op)),
                 "the broadcast load is once per call"
             );
+            let sq_vid = scoped
+                .body
+                .schedule
+                .iter()
+                .find(|d| match d.op {
+                    ScheduledOp::Binary(OpKind::Mul, l, r) => l == r,
+                    _ => false,
+                })
+                .map(|d| d.value)
+                .expect("u·u is computed once per call");
             assert!(
-                frame
-                    .schedule
-                    .iter()
-                    .any(|d| matches!(d.op, ScheduledOp::Binary(OpKind::Mul, ..))),
-                "and so is u·u"
+                scoped.body.roots.contains(&sq_vid),
+                "the product is parked for the scopes inside, not recomputed"
             );
-            assert_eq!(frame.roots.len(), 1, "the product is the one parked value");
             assert!(
                 !scoped
-                    .body
+                    .folds
                     .iter()
-                    .any(|d| matches!(d.op, ScheduledOp::Uniform(_))),
-                "the body reads the parked product, never the block"
-            );
-            assert!(
-                scoped.regions[1].schedule.is_empty(),
-                "nothing about a uniform is per row"
+                    .flat_map(|f| f.schedule.iter())
+                    .any(|d| kernel_uniform(&d.op)),
+                "the folds read the parked product, never the block"
             );
         }
 
@@ -6088,17 +7018,11 @@ mod tests {
             let scaled = a.push_binary(OpKind::Mul, r1, two);
             let sum = a.push_binary(OpKind::Add, x, r0);
             let root = a.push_binary(OpKind::Add, sum, scaled);
-            let res = compile(&a, root).expect("compile");
+            let res = compile(&a, root, BATCH).expect("compile");
             assert!(res.hoisted_values >= 1, "2·u₁ is per call");
 
-            let xs: [f32; LANES] = core::array::from_fn(|i| i as f32);
             for block in [[1.0f32, 10.0], [-2.5, 0.25]] {
-                let ctx = [block.as_ptr()];
-                let out = eval_batch(
-                    &res.code,
-                    &ctx,
-                    executable::Point4::new(xs, [0.0; LANES], [0.0; LANES], [0.0; LANES]),
-                );
+                let out = eval_batch(&res.code, &[], &block, 0.0, 0.0);
                 for (i, got) in out.iter().enumerate() {
                     assert_eq!(
                         *got,
@@ -6127,16 +7051,9 @@ mod tests {
             let g = a.push_gather(buf, x, zero);
             let r = a.push_uniform(u);
             let root = a.push_binary(OpKind::Add, g, r);
-            let res = compile(&a, root).expect("compile");
+            let res = compile(&a, root, BATCH).expect("compile");
 
-            let block = [0.5f32];
-            let ctx = [data.as_ptr(), block.as_ptr()];
-            let xs: [f32; LANES] = core::array::from_fn(|i| i as f32);
-            let out = eval_batch(
-                &res.code,
-                &ctx,
-                executable::Point4::new(xs, [0.0; LANES], [0.0; LANES], [0.0; LANES]),
-            );
+            let out = eval_batch(&res.code, &[data.as_ptr()], &[0.5f32], 0.0, 0.0);
             for (i, got) in out.iter().enumerate() {
                 assert_eq!(*got, data[i.min(3)] + 0.5, "lane {i}");
             }
@@ -6637,28 +7554,143 @@ mod tests {
         /// arena builder that never emitted it) would silently take away.
         #[test]
         fn a_muladd_dag_emits_the_fused_encoding() {
-            use pixelflow_ir::arena::ExprArena;
-
             let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
             let z = a.push_binary(OpKind::Add, y, x);
             let root = a.push_ternary(OpKind::MulAdd, x, y, z);
-            let (a, root) = pixelflow_ir::passes::legalize(&a, root).expect("legalize");
 
-            let (code, _, _, _) = emit_dag_body(
-                arena_to_schedule(&a, root),
-                &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
-            )
-            .expect("AVX2 emit");
+            let mut backend = avx2::driver::Avx2Backend::new(EmitCtx::default());
+            let lanes = backend.register_file().vector_bytes / BYTES_PER_LANE;
+            let result = compile_via_backend(schedule_for(&a, root, POINT, lanes), &mut backend)
+                .expect("AVX2 emit");
+            let code = result.code.as_bytes();
             // vfmadd231ps: VEX.256.66.0F38 B8 — the opcode byte after the
-            // 3-byte prefix. Nothing else this body emits uses it.
+            // 3-byte prefix. Nothing else this kernel emits uses it.
             assert!(
                 code.windows(4)
                     .any(|w| w[0] == 0xc4 && w[1] == 0xe2 && w[3] == 0xb8),
                 "a MulAdd DAG did not reach the AVX2 backend as FusedMulAdd \
                  (no VEX.0F38 B8 in {code:02x?})"
             );
+        }
+    }
+
+    /// G2's end-to-end gate: a hand-built `Guard` reaching the JIT emitter
+    /// compiles, and both of its arms run and produce the right value —
+    /// chosen at *runtime*, by a per-call uniform, so one compiled kernel
+    /// exercises both "every lane takes the True arm" and "every lane takes
+    /// the False arm" (docs/plans/2026-09-12-emit-should-just-emit.md).
+    mod guard_arms {
+        use super::*;
+        use pixelflow_ir::kernel::Uniform;
+        use pixelflow_ir::passes::lattice;
+        use pixelflow_ir::{Kernel, KernelStore};
+
+        /// A binder slot the lattice's row/col/lane folds never claim — far
+        /// past the three `collapse` picks — used only as a placeholder
+        /// `Var` while `collapse`/`pack` build the `Write` around it.
+        ///
+        /// Why a placeholder at all: `lattice::collapse` refuses any
+        /// *reachable* `Guard` outright (its own doc — coordinate warping
+        /// does not reach into a guard's arms yet, this plan's §8), so a
+        /// `Guard` cannot be the kernel `collapse` wraps. `Write` is
+        /// `pub(crate)` in `pixelflow-ir` on purpose ("Constructible only by
+        /// the legalize passes", CLAUDE.md's own citation of it), so nothing
+        /// outside that crate may build one directly either. What *is*
+        /// public is `substitute_vars_with` — the same primitive
+        /// `Kernel::at` warps coordinates with — so this builds the `Write`
+        /// around an inert marker first and substitutes the `Guard` in
+        /// afterward, the one route to a guarded `Write` this stage has.
+        const MARKER: u8 = 40;
+
+        /// Compile a `Guard(flag == 1.0, on, off)` at [`POINT`], and return a
+        /// closure that runs it for a given `flag` value.
+        fn compile_guard(on: Kernel, off: Kernel) -> impl Fn(f32) -> f32 {
+            let on_key = KernelStore::intern(&on);
+            let off_key = KernelStore::intern(&off);
+
+            // `Uniform::new` is the properly-declared route to a fresh
+            // uniform slot — `ExprArena::uniform_slot_for` is `pub(crate)`,
+            // and `push_uniform` asserts its `UniformId` is one the table
+            // already knows, so a raw slot number picked by hand is refused
+            // rather than silently aliasing `collapse`'s own two (x0, y0).
+            // `Uniform::kernel()` builds its own tiny arena declaring it;
+            // cloning that arena inherits the declaration and gives a
+            // legitimately mutable `ExprArena` to keep building on.
+            let flag = Uniform::new(0.0);
+            let flag_kernel = flag.kernel();
+            let (flag_arena, flag_root) = flag_kernel.parts();
+            let mut arena = flag_arena.clone();
+
+            // The mask: `flag == 1.0` — `Variance::CONST`, so every lane
+            // agrees on it by construction, which is what makes both a
+            // "true" and a "false" run reachable from the same compiled
+            // kernel.
+            let one = arena.push_const(1.0);
+            let mask = arena.push_binary(OpKind::Eq, flag_root, one);
+            let guard = arena.push_guard(mask, on_key, off_key);
+
+            let marker = arena.push_var(MARKER);
+            let domain = lattice::Domain {
+                shape: POINT,
+                origin: origin(),
+            };
+            let write_root = lattice::collapse(&mut arena, marker, domain);
+            let packed_root = lattice::pack(&mut arena, write_root, LANES as u32);
+            let root = arena.substitute_vars_with(packed_root, &[(MARKER, guard)]);
+
+            let ids = origin_slots(&arena);
+            let schedule = arena_to_schedule(&arena, root, ids);
+            let code = compile_via_backend(schedule, &mut Native::new(EmitCtx::default()))
+                .expect("a hand-built Guard should compile")
+                .code;
+
+            move |flag_value: f32| -> f32 {
+                let uniforms = [flag_value];
+                let origin_vals = [0.0f32, 0.0f32];
+                let mut out = [f32::NAN; 1];
+                let ctx: [*const f32; 2] = [uniforms.as_ptr(), origin_vals.as_ptr()];
+                // SAFETY: this arena declares no buffers and one uniform
+                // (`flag`, at slot 0), so `ctx[0]` is a one-`f32` uniform
+                // block and `ctx[1]` the origin block; `out` holds the one
+                // sample a `POINT`-shaped lattice writes.
+                unsafe {
+                    code.call(ctx.as_ptr(), out.as_mut_ptr(), 1);
+                }
+                out[0]
+            }
+        }
+
+        /// The mask uniformly true: every lane (there is one, at `POINT`)
+        /// takes the `on` arm.
+        #[test]
+        fn a_uniformly_true_mask_takes_the_on_arm() {
+            let run = compile_guard(Kernel::constant(6.0), Kernel::constant(9.0));
+            assert_eq!(run(1.0), 6.0);
+        }
+
+        /// The mask uniformly false: every lane takes the `off` arm — the
+        /// same compiled kernel as above, a different runtime value, which
+        /// is the whole point of a *runtime* branch (as opposed to a
+        /// compile-time choice extraction would have made for a constant
+        /// mask).
+        #[test]
+        fn a_uniformly_false_mask_takes_the_off_arm() {
+            let run = compile_guard(Kernel::constant(6.0), Kernel::constant(9.0));
+            assert_eq!(run(0.0), 9.0);
+        }
+
+        /// Each arm doing real (if small) arithmetic, not just naming a
+        /// `Const` — so the test exercises an arm's own scope actually
+        /// computing something, not merely handing back a leaf.
+        #[test]
+        fn each_arm_computes_its_own_arithmetic() {
+            let on = Kernel::constant(2.0).mul(&Kernel::constant(3.0));
+            let off = Kernel::constant(10.0).sub(&Kernel::constant(1.0));
+            let run = compile_guard(on, off);
+            assert_eq!(run(1.0), 6.0, "on arm: 2.0 * 3.0");
+            assert_eq!(run(0.0), 9.0, "off arm: 10.0 - 1.0");
         }
     }
 }

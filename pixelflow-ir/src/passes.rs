@@ -1,24 +1,35 @@
 //! IR-to-IR transforms: legalization.
 //!
-//! Five passes, each `(arena, root) -> (arena, root)`, each turning nodes no
-//! backend can emit into nodes every backend can:
+//! [`legalize`] runs six passes, each `(arena, root) -> (arena, root)`, each
+//! turning nodes no backend can emit into nodes every backend can:
 //!
 //! | pass | consumes | produces |
 //! |---|---|---|
 //! | [`expand_refs`] | `Ref` | the referent, spliced in |
 //! | [`lower_dwrt`] | `Dwrt` | arithmetic, and *re-introduces* transcendentals |
-//! | [`expand_reduce`] | `Reduce` | the unrolled body, `extent` copies |
+//! | [`lattice::collapse`] | a kernel over `X`/`Y` | the same kernel wrapped in the lattice's row/col/lane folds around one `Write` |
+//! | [`lattice::pack`] | `collapse`'s degenerate `[0,1)` lane fold | the same folds strip-mined to the target's lane width |
 //! | [`expand_gather`] | `Gather` | index arithmetic + `RawGather` |
 //! | [`expand_transcendentals`] | `Sin`..`Pow` | arithmetic + bit-manip atoms |
 //!
 //! The order in that table is the order they must run: differentiating a `sin`
 //! produces a `cos`, so `lower_dwrt` has to go before the pass that expands
-//! them, and you cannot differentiate a *name*, so `expand_refs` goes before
-//! everything. Every pass is idempotent and has an identity fast-path, so
-//! running one that has nothing to do is free.
+//! them; you cannot differentiate a *name*, so `expand_refs` goes before
+//! everything; a derivative is taken with respect to `X` before `collapse`
+//! substitutes `X` away, and a read's address arithmetic is built over the
+//! lattice's binders after it, so the two lattice passes sit between
+//! (docs/plans/2026-09-16-collapse-is-a-fold.md §2.3). Every pass is
+//! idempotent and has an identity fast-path, so running one that has nothing
+//! to do is free — except the two lattice passes, which always wrap: after
+//! them no coordinate `Var` exists and the root is a `Reduce` over the unit
+//! monoid whose body is a `Write`. That is the shape every backend emits, and
+//! the only shape.
 //!
-//! **`Reduce` is legal in the arena, but [`legalize`] still unrolls every one
-//! unconditionally — see [`legalize`]'s own doc comment for why.**
+//! **`Reduce` is legal in the arena and [`legalize`] leaves every one
+//! standing**, nested or not: codegen emits a surviving fold as a loop, and a
+//! fold inside a fold's body as a loop inside a loop. [`expand_reduce`] is
+//! still here for a caller that wants a fold unrolled — a test comparing the
+//! two shapes — and is on no production path.
 //!
 //! **Nothing here knows what it is lowering *for*.** There is no `cfg` in this
 //! module beyond `#[cfg(test)]`, and no import outside `crate::{arena, kind,
@@ -50,7 +61,19 @@ use crate::variance::Variance;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-/// Run every legalization pass, in the one order they compose in.
+/// The lattice's own two folds — `collapse(extent)`, `pack(lanes)` — as
+/// legalize passes. See the module doc above for their place in the order.
+pub mod lattice;
+
+/// Control dependence as a DAG property: the condition under which a value
+/// is observed. Not a legalize pass (it does not rewrite the arena), but a
+/// query over it — see the module's own doc for what reads it and why it
+/// lives here rather than in `pixelflow-codegen`.
+pub mod demand;
+
+/// Run every legalization pass, in the one order they compose in, for the
+/// collapse `collapse` describes: the kernel comes back wrapped in the
+/// lattice's folds, strip-mined to the target's lane width.
 ///
 /// This is the whole pipeline. It was previously four calls copied into each
 /// compile entry, which is how two since-deleted entries came to run none of
@@ -59,37 +82,41 @@ use alloc::vec::Vec;
 /// refuses a surviving `Dwrt`. An order that has to be retyped is an order
 /// that can be forgotten.
 ///
-/// Every pass has an identity fast-path, so calling this on an arena that
-/// needs nothing lowered costs four comparisons and no allocation. There is
-/// no reason for a caller to want a subset.
-///
 /// # Errors
 ///
 /// Propagates [`lower_dwrt_owned`]'s error for expressions with no derivative
 /// rule — bound-memory reads, integer/bit ops, reductions.
-pub fn legalize(arena: &ExprArena, root: ExprId) -> Result<(ExprArena, ExprId), &'static str> {
+pub fn legalize(
+    arena: &ExprArena,
+    root: ExprId,
+    collapse: &lattice::Collapse,
+) -> Result<(ExprArena, ExprId), &'static str> {
     // `expand_refs` before anything else: every pass below reads structure,
     // and a reference has none to read — you cannot differentiate a name.
     let (arena, root) = expand_refs_owned(arena, root);
     // `lower_dwrt` next: differentiating a `sin` manufactures a `cos`, so it
     // has to precede the pass that expands them.
-    let (arena, root) = lower_dwrt_owned(&arena, root)?;
-    // `expand_nested_reduce`, not `expand_reduce`: a `Reduce` is legal for
-    // codegen now (stage 2c — `pixelflow-codegen` emits a surviving fold as a
-    // loop), so the legalizer's job here shrank to the one shape codegen's
-    // `extract_folds` genuinely cannot carve out — a `Reduce` inside another
-    // `Reduce`'s own body, which `Kernel::by_ref` produces whenever two folds
-    // are composed by name and `expand_refs` splices one into the other. That
-    // one is unrolled; every other fold is left standing.
+    let (mut arena, root) = lower_dwrt_owned(&arena, root)?;
+    // The lattice, as folds: after `collapse` no coordinate `Var` exists,
+    // and `pack` strip-mines its column fold to the width the caller's
+    // target executes by lanes. Before `expand_gather`, so a read's address
+    // arithmetic is built over the binders and its variance read off them.
+    let root = lattice::collapse(&mut arena, root, collapse.domain);
+    let root = lattice::pack(&mut arena, root, collapse.lanes);
+    // No reduce pass. A `Reduce` is legal for codegen (stage 2c —
+    // `pixelflow-codegen` emits a surviving fold as a loop), and since
+    // `extract_folds` carves a fold inside a fold's body as a loop inside a
+    // loop, so is the shape `Kernel::by_ref` produces whenever two folds are
+    // composed by name and `expand_refs` splices one into the other. That
+    // shape was the last thing unrolled here (`expand_nested_reduce`, now
+    // deleted), and for a glyph it was the winding fold: N copies of a body
+    // the language had written once, N being the piece count.
     //
-    // This is the whole of the trade stage 2c was for. Unrolling every fold
-    // here meant the assembler saw N copies of a body the language had
-    // written once, and for a glyph N is the piece count. Over a 95-glyph
-    // tile-16 atlas, same host, before and after: emit 4,640 ms -> 1,431 ms,
-    // the emitted atlas 21.1 MB -> 15.8 MB, and `'@'` alone 655,866 B ->
-    // 478,404 B, on nothing but declining to unroll. Saturation is unmoved
-    // (2,534 ms -> 2,569 ms), which is the point of legalizing last.
-    let (arena, root) = expand_nested_reduce_owned(&arena, root);
+    // Declining to unroll is the whole of the trade stage 2c was for. Over a
+    // 95-glyph tile-16 atlas, same host, before and after 2c's one level:
+    // emit 4,640 ms -> 1,431 ms, the emitted atlas 21.1 MB -> 15.8 MB, and
+    // `'@'` alone 655,866 B -> 478,404 B. Saturation is unmoved (2,534 ms ->
+    // 2,569 ms), which is the point of legalizing last.
     let (arena, root) = expand_gather_owned(&arena, root);
     Ok(expand_transcendentals_owned(&arena, root))
 }
@@ -145,7 +172,7 @@ fn try_rebuild_arena<E, F>(arena: &mut ExprArena, root: ExprId, mut lower: F) ->
 where
     F: FnMut(&mut ExprArena, &ExprNode, &dyn Fn(ExprId) -> ExprId) -> Result<Option<ExprId>, E>,
 {
-    let old_len = arena.nodes_raw().len();
+    let old_len = arena.len();
     let mut id_map: Vec<Option<ExprId>> = alloc::vec![None; old_len];
 
     enum Task {
@@ -171,11 +198,11 @@ where
                 if id_map[id.0 as usize].is_some() {
                     continue;
                 }
-                let node = arena.node(id).clone();
+                let node = arena.node(id);
                 let m = |old: ExprId| id_map[old.0 as usize].expect("child lowered before parent");
                 let new_id = match lower(arena, &node, &m)? {
                     Some(new) => new,
-                    None => copy_node(arena, &node, &m),
+                    None => copy_node(arena, id, &node, &m),
                 };
                 id_map[id.0 as usize] = Some(new_id);
             }
@@ -187,7 +214,16 @@ where
 
 /// Structural copy of `node` into `arena` with its children remapped by `m`.
 /// The default action for any node a lowering hook does not replace.
-fn copy_node(arena: &mut ExprArena, node: &ExprNode, m: &dyn Fn(ExprId) -> ExprId) -> ExprId {
+///
+/// `source` is `node`'s own id — needed only for the `Nary` arm, to read its
+/// children through [`ExprArena::children`] rather than the n-ary slab's raw
+/// offsets (docs/plans/2026-09-09-exprarena-on-dag.md, Stage A).
+fn copy_node(
+    arena: &mut ExprArena,
+    source: ExprId,
+    node: &ExprNode,
+    m: &dyn Fn(ExprId) -> ExprId,
+) -> ExprId {
     match node {
         ExprNode::Var(i) => arena.push_var(*i),
         ExprNode::Const(v) => arena.push_const(*v),
@@ -199,9 +235,8 @@ fn copy_node(arena: &mut ExprArena, node: &ExprNode, m: &dyn Fn(ExprId) -> ExprI
         ExprNode::Unary(op, a) => arena.push_unary(*op, m(*a)),
         ExprNode::Binary(op, a, b) => arena.push_binary(*op, m(*a), m(*b)),
         ExprNode::Ternary(op, a, b, c) => arena.push_ternary(*op, m(*a), m(*b), m(*c)),
-        ExprNode::Nary(op, start, len) => {
-            let (s, l) = (*start as usize, *len as usize);
-            let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
+        ExprNode::Nary(op, ..) => {
+            let children: Vec<ExprId> = arena.children(source).collect();
             let mapped: Vec<ExprId> = children.into_iter().map(&m).collect();
             arena.push_nary(*op, &mapped)
         }
@@ -215,6 +250,14 @@ fn copy_node(arena: &mut ExprArena, node: &ExprNode, m: &dyn Fn(ExprId) -> ExprI
         // this pass while the mask — a real child, rebuilt through `m` like
         // any other child — is legalized like the rest of the graph.
         ExprNode::Guard { mask, on, off } => arena.push_guard(m(*mask), *on, *off),
+        // The binders are metadata, copied as a fold's are; the value is
+        // the one child.
+        ExprNode::Write {
+            row,
+            col,
+            lane,
+            value,
+        } => arena.push_write(*row, *col, *lane, m(*value)),
     }
 }
 
@@ -296,11 +339,7 @@ fn splice_referent(_arena: &mut ExprArena, key: crate::key::KernelKey) -> ExprId
 /// fast-path when the arena holds no `Ref`, otherwise clone-and-expand.
 #[must_use]
 pub fn expand_refs_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    if !arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Ref(_)))
-    {
+    if !arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))) {
         return (arena.clone(), root);
     }
     let mut owned = arena.clone();
@@ -338,9 +377,9 @@ pub(crate) fn expand_transcendentals_owned(arena: &ExprArena, root: ExprId) -> (
     // re-order / re-dedup nodes), which would perturb register allocation for
     // transcendental-free kernels; skipping it keeps lowering a true no-op for
     // them.
-    if !arena.nodes_raw().iter().any(|n| match n {
-        ExprNode::Unary(op, _) => is_transcendental_unary(*op),
-        ExprNode::Binary(op, _, _) => is_transcendental_binary(*op),
+    if !arena.nodes().any(|(_, n)| match n {
+        ExprNode::Unary(op, _) => is_transcendental_unary(op),
+        ExprNode::Binary(op, _, _) => is_transcendental_binary(op),
         _ => false,
     }) {
         return (arena.clone(), root);
@@ -375,9 +414,8 @@ pub fn expand_gather(arena: &mut ExprArena, root: ExprId) -> ExprId {
 #[must_use]
 pub(crate) fn expand_gather_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
     if !arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Ternary(OpKind::Gather, _, _, _)))
+        .nodes()
+        .any(|(_, n)| matches!(n, ExprNode::Ternary(OpKind::Gather, _, _, _)))
     {
         return (arena.clone(), root);
     }
@@ -393,7 +431,7 @@ pub(crate) fn expand_gather_owned(arena: &ExprArena, root: ExprId) -> (ExprArena
 /// matching `DiscreteManifold::eval`.
 fn lower_gather(arena: &mut ExprArena, buf: ExprId, x: ExprId, y: ExprId) -> ExprId {
     let decl = match arena.node(buf) {
-        ExprNode::Buffer(id) => *arena.buffer_decl(*id),
+        ExprNode::Buffer(id) => *arena.buffer_decl(id),
         other => panic!("lower_gather: first child must be a Buffer leaf, got {other:?}"),
     };
 
@@ -443,9 +481,8 @@ pub fn expand_reduce(arena: &mut ExprArena, root: ExprId) -> ExprId {
 #[must_use]
 pub fn expand_reduce_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
     if !arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Reduce { .. }))
+        .nodes()
+        .any(|(_, n)| matches!(n, ExprNode::Reduce { .. }))
     {
         return (arena.clone(), root);
     }
@@ -602,9 +639,8 @@ impl<'a> Substitution<'a> {
                 let c = self.apply(arena, c);
                 arena.push_ternary(op, a, b, c)
             }
-            ExprNode::Nary(op, start, len) => {
-                let (s, l) = (start as usize, len as usize);
-                let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
+            ExprNode::Nary(op, ..) => {
+                let children: Vec<ExprId> = arena.children(id).collect();
                 let mapped: Vec<ExprId> = children
                     .into_iter()
                     .map(|ch| self.apply(arena, ch))
@@ -625,6 +661,18 @@ impl<'a> Substitution<'a> {
             ExprNode::Guard { mask, on, off } => {
                 let mask = self.apply(arena, mask);
                 arena.push_guard(mask, on, off)
+            }
+            // The value may read the index; the binders name folds that
+            // are never unrolled — a lattice fold survives to codegen as a
+            // loop — so they pass through untouched.
+            ExprNode::Write {
+                row,
+                col,
+                lane,
+                value,
+            } => {
+                let value = self.apply(arena, value);
+                arena.push_write(row, col, lane, value)
             }
         };
         if let Some(slot) = self.memo.get_mut(idx) {
@@ -659,14 +707,14 @@ pub fn lower_dwrt(arena: &mut ExprArena, root: ExprId) -> Result<ExprId, &'stati
     try_rebuild_arena(arena, root, |arena, node, m| match node {
         ExprNode::Binary(OpKind::Dwrt, expr, var) => {
             let var_idx = match arena.node(m(*var)) {
-                ExprNode::Const(v) => *v as u8,
+                ExprNode::Const(v) => v as u8,
                 _ => return Err("lower_dwrt: Dwrt's variable operand must be a Const"),
             };
             differentiate(arena, m(*expr), var_idx).map(Some)
         }
         ExprNode::Unary(OpKind::Dwrt, _)
         | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-        | ExprNode::Nary(OpKind::Dwrt, _, _) => {
+        | ExprNode::Nary(OpKind::Dwrt, _) => {
             Err("lower_dwrt: malformed Dwrt node (must be Binary(expr, var))")
         }
         _ => Ok(None),
@@ -679,13 +727,13 @@ pub fn lower_dwrt_owned(
     arena: &ExprArena,
     root: ExprId,
 ) -> Result<(ExprArena, ExprId), &'static str> {
-    if !arena.nodes_raw().iter().any(|n| {
+    if !arena.nodes().any(|(_, n)| {
         matches!(
             n,
             ExprNode::Unary(OpKind::Dwrt, _)
                 | ExprNode::Binary(OpKind::Dwrt, _, _)
                 | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-                | ExprNode::Nary(OpKind::Dwrt, _, _)
+                | ExprNode::Nary(OpKind::Dwrt, _)
         )
     }) {
         return Ok((arena.clone(), root));
@@ -720,7 +768,7 @@ fn differentiate(arena: &mut ExprArena, expr: ExprId, var: u8) -> Result<ExprId,
         if !marked.insert(id) {
             continue;
         }
-        push_deriv_children(arena.node(id), &mut stack);
+        push_deriv_children(&arena.node(id), &mut stack);
     }
 
     // A tabulation is the one rule that asks about *dependence* rather than
@@ -840,7 +888,7 @@ fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
             }
             _ => {}
         },
-        ExprNode::Nary(_, _, _) => {}
+        ExprNode::Nary(_, _) => {}
         // No rule: `diff_node` raises the error for the fold itself.
         ExprNode::Reduce { .. } => {}
         // No rule: differentiating a branch is not a question this design
@@ -851,6 +899,8 @@ fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
         // calculus, not G1). `diff_node` raises the error for the node
         // itself, so nothing here needs its mask's derivative.
         ExprNode::Guard { .. } => {}
+        // An effect has no derivative; `diff_node` refuses it.
+        ExprNode::Write { .. } => {}
     }
 }
 
@@ -1082,7 +1132,7 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
             _ => Err("lower_dwrt: no derivative rule for this ternary op"),
         },
 
-        ExprNode::Nary(_, _, _) => Err("lower_dwrt: cannot differentiate an Nary op (Tuple)"),
+        ExprNode::Nary(_, _) => Err("lower_dwrt: cannot differentiate an Nary op (Tuple)"),
         // Linearity — `d(⊕_k f) = ⊕_k d(f)` — holds for `Σ` and for nothing
         // else in the monoid set: `Π` needs the product rule, and `min`/`max`
         // are selections, not sums. The rule is not written here because
@@ -1095,6 +1145,9 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
         // calculus. G1 only makes the node constructible, so this declines
         // rather than guess.
         ExprNode::Guard { .. } => Err("lower_dwrt: no derivative rule for a Guard"),
+        // A store is an effect, not a function of the coordinates; and
+        // `lower_dwrt` runs before the passes that build one.
+        ExprNode::Write { .. } => Err("lower_dwrt: no derivative of a store"),
     }
 }
 
@@ -1116,11 +1169,11 @@ fn sqrt_one_minus_sq(arena: &mut ExprArena, u: ExprId) -> ExprId {
 }
 
 fn is_const_zero(arena: &ExprArena, id: ExprId) -> bool {
-    matches!(arena.node(id), ExprNode::Const(v) if *v == 0.0)
+    matches!(arena.node(id), ExprNode::Const(v) if v == 0.0)
 }
 
 fn is_const_one(arena: &ExprArena, id: ExprId) -> bool {
-    matches!(arena.node(id), ExprNode::Const(v) if *v == 1.0)
+    matches!(arena.node(id), ExprNode::Const(v) if v == 1.0)
 }
 
 // Peephole constructors for derivative arithmetic. Most leaf derivatives are
@@ -1672,7 +1725,7 @@ mod dwrt_tests {
         let y = a.push_var(1);
         let e = a.push_binary(OpKind::Add, x, y);
         let (out, root) = lower_dwrt_owned(&a, e).expect("lower_dwrt");
-        assert_eq!(out.nodes_raw().len(), a.nodes_raw().len());
+        assert_eq!(out.len(), a.len());
         assert_eq!(root, e);
     }
 
@@ -1694,8 +1747,8 @@ mod dwrt_tests {
         let v0 = a.push_const(0.0);
         let root = a.push_binary(OpKind::Dwrt, e, v0);
         let (out, out_root) = lower_dwrt_owned(&a, root).expect("lower_dwrt");
-        assert!(out.nodes_raw().len() > a.nodes_raw().len());
-        assert!((out_root.0 as usize) < out.nodes_raw().len());
+        assert!(out.len() > a.len());
+        assert!((out_root.0 as usize) < out.len());
     }
 
     #[test]
@@ -1744,7 +1797,7 @@ mod dwrt_tests {
         let mut a = ExprArena::new();
         let body = a.push_var(4);
         let red = a.push_reduce(Fold::new(Monoid::SUM, binder(), 0..4), body);
-        let ExprNode::Reduce { fold, .. } = *a.node(red) else {
+        let ExprNode::Reduce { fold, .. } = a.node(red) else {
             panic!("expected a fold");
         };
         assert_eq!(fold.len(), 4);
@@ -1903,7 +1956,7 @@ mod dwrt_tests {
         let (lowered, lroot) =
             lower_dwrt_owned(&a, root).expect("a binder-indexed read is a constant");
         assert!(
-            matches!(lowered.node(lroot), ExprNode::Const(v) if *v == 0.0),
+            matches!(lowered.node(lroot), ExprNode::Const(v) if v == 0.0),
             "expected Const(0.0), got {:?}",
             lowered.node(lroot)
         );
@@ -1917,7 +1970,7 @@ mod dwrt_tests {
         let (lowered, lroot) =
             lower_dwrt_owned(&a, root).expect("a binder-indexed read is a constant");
         assert!(
-            matches!(lowered.node(lroot), ExprNode::Const(v) if *v == 0.0),
+            matches!(lowered.node(lroot), ExprNode::Const(v) if v == 0.0),
             "expected Const(0.0), got {:?}",
             lowered.node(lroot)
         );
@@ -1939,7 +1992,7 @@ mod dwrt_tests {
         let (lowered, lroot) =
             lower_dwrt_owned(&a, root).expect("an X-indexed read is constant in Y");
         assert!(
-            matches!(lowered.node(lroot), ExprNode::Const(v) if *v == 0.0),
+            matches!(lowered.node(lroot), ExprNode::Const(v) if v == 0.0),
             "expected Const(0.0), got {:?}",
             lowered.node(lroot)
         );
@@ -1947,9 +2000,9 @@ mod dwrt_tests {
 
     #[test]
     fn rebuild_copies_nary_children_slice_correctly() {
-        // `copy_node`'s Nary arm reads `nodes_raw()[start..start+len]` — a
-        // second Nary node makes `start` nonzero, which is what distinguishes
-        // `start+len` from `start*len` (they coincide when start is 0).
+        // `copy_node`'s Nary arm reads `arena.children(source)` — a second
+        // Nary node makes the first's internal slab offset nonzero, which is
+        // what would expose an off-by-one in that slice if one existed.
         let mut a = ExprArena::new();
         let p = a.push_var(0);
         let _throwaway = a.push_nary(OpKind::Tuple, &[p]); // start=0, len=1
@@ -1963,14 +2016,16 @@ mod dwrt_tests {
         // its non-matching arms; `expand_transcendentals` is the simplest
         // public one and this arena has nothing for it to actually lower.
         let new_root = expand_transcendentals(&mut a, root);
-        let ExprNode::Nary(OpKind::Tuple, start, len) = a.node(new_root) else {
-            panic!("expected a rebuilt Tuple, got {:?}", a.node(new_root));
-        };
-        let children = a.nary_children_slice(*start, *len);
+        assert!(
+            matches!(a.node(new_root), ExprNode::Nary(OpKind::Tuple, ..)),
+            "expected a rebuilt Tuple, got {:?}",
+            a.node(new_root)
+        );
+        let children: Vec<ExprId> = a.children(new_root).collect();
         assert_eq!(children.len(), 3, "wrong slice length");
         for (child, expected_var) in children.iter().zip([0u8, 1, 4]) {
             assert!(
-                matches!(a.node(*child), ExprNode::Var(v) if *v == expected_var),
+                matches!(a.node(*child), ExprNode::Var(v) if v == expected_var),
                 "child {child:?} should be Var({expected_var})"
             );
         }
@@ -2039,11 +2094,7 @@ pub struct ExpandRefs;
 
 impl Optimize for ExpandRefs {
     fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if !arena
-            .nodes_raw()
-            .iter()
-            .any(|n| matches!(n, ExprNode::Ref(_)))
-        {
+        if !arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))) {
             return Rewritten::Unchanged;
         }
         let mut owned = arena.clone();
@@ -2070,13 +2121,13 @@ pub struct LowerDwrt;
 
 impl Optimize for LowerDwrt {
     fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if !arena.nodes_raw().iter().any(|n| {
+        if !arena.nodes().any(|(_, n)| {
             matches!(
                 n,
                 ExprNode::Unary(OpKind::Dwrt, _)
                     | ExprNode::Binary(OpKind::Dwrt, _, _)
                     | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-                    | ExprNode::Nary(OpKind::Dwrt, _, _)
+                    | ExprNode::Nary(OpKind::Dwrt, _)
             )
         }) {
             return Rewritten::Unchanged;
@@ -2101,9 +2152,8 @@ pub struct ExpandReduce;
 impl Optimize for ExpandReduce {
     fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
         if !arena
-            .nodes_raw()
-            .iter()
-            .any(|n| matches!(n, ExprNode::Reduce { .. }))
+            .nodes()
+            .any(|(_, n)| matches!(n, ExprNode::Reduce { .. }))
         {
             return Rewritten::Unchanged;
         }
@@ -2113,189 +2163,90 @@ impl Optimize for ExpandReduce {
     }
 }
 
-/// The `body` of every `Reduce` reachable from `root` that has *another*
-/// `Reduce` somewhere inside its own body — the one shape
-/// `pixelflow-codegen`'s loop emission does not carve out (one level at a
-/// time; see docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md §5, "No
-/// nested reduce loops"). Keyed by `body` rather than the `Reduce` node's own
-/// id because that is the field [`expand_nested_reduce`]'s rewrite hook can
-/// actually match against — [`rebuild_arena`]'s hook sees a node's content,
-/// not its id, and a `body` is exactly as unique to its `Reduce` as the node
-/// itself is.
-///
-/// This is not a hypothetical. `Kernel::by_ref` composes two folds by name —
-/// a glyph's distance fold reads its winding fold's result this way, so the
-/// boundary test only evaluates the winding once per piece rather than
-/// splicing a copy of it into every piece — and `expand_refs`, which runs
-/// unconditionally ahead of everything else in [`legalize`], resolves that
-/// reference by splicing the referenced arena in. The winding's `Reduce`
-/// then sits inside the distance fold's own body: two folds, composed by a
-/// caller who never wrote either one inside the other.
-fn nested_reduce_bodies(arena: &ExprArena, root: ExprId) -> BTreeSet<ExprId> {
-    // Every `Reduce` reachable from `root` at all, as (its own id, its body).
-    let mut reduces: Vec<(ExprId, ExprId)> = Vec::new();
-    let mut seen = alloc::vec![false; arena.len()];
-    let mut stack = alloc::vec![root];
-    while let Some(id) = stack.pop() {
-        let idx = id.0 as usize;
-        if core::mem::replace(&mut seen[idx], true) {
-            continue;
-        }
-        if let ExprNode::Reduce { body, .. } = arena.node(id) {
-            reduces.push((id, *body));
-        }
-        stack.extend(arena.children(id));
-    }
-    // For each one, walk its own body's closure for another.
-    let mut nested = BTreeSet::new();
-    for &(r, body) in &reduces {
-        let mut seen = alloc::vec![false; arena.len()];
-        let mut stack = alloc::vec![body];
-        while let Some(id) = stack.pop() {
-            let idx = id.0 as usize;
-            if core::mem::replace(&mut seen[idx], true) {
-                continue;
-            }
-            if id != r
-                && let ExprNode::Reduce {
-                    body: inner_body, ..
-                } = arena.node(id)
-            {
-                nested.insert(*inner_body);
-            }
-            stack.extend(arena.children(id));
-        }
-    }
-    nested
-}
-
-/// [`expand_nested_reduce`] as an owned rewrite, for [`legalize`]'s chain.
-///
-/// The fast path is the common one: an arena with no `Reduce` nested inside
-/// another's body is handed straight back, which after `expand_refs` is every
-/// kernel that does not compose two folds by name.
-#[must_use]
-pub fn expand_nested_reduce_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    if nested_reduce_bodies(arena, root).is_empty() {
-        return (arena.clone(), root);
-    }
-    let mut owned = arena.clone();
-    let new_root = expand_nested_reduce(&mut owned, root);
-    (owned, new_root)
-}
-
-/// Unroll only the `Reduce`s [`nested_reduce_bodies`] finds, leaving every
-/// other one standing — `expand_reduce`'s rewrite rule (`unroll_reduce`),
-/// applied selectively rather than to every `Reduce` in the arena. Because
-/// [`rebuild_arena`] rebuilds bottom-up, an inner fold this selects is
-/// already unrolled by the time its outer fold's own `body` is visited
-/// (through `m`), so the outer `Reduce` is copied — not matched — with its
-/// now-unrolled body.
-fn expand_nested_reduce(arena: &mut ExprArena, root: ExprId) -> ExprId {
-    let nested = nested_reduce_bodies(arena, root);
-    rebuild_arena(arena, root, |arena, node, m| match node {
-        ExprNode::Reduce { fold, body } if nested.contains(body) => {
-            Some(unroll_reduce(arena, *fold, m(*body)))
-        }
-        _ => None,
-    })
-}
-
-/// The fallback stage 2c's own plan named and did not yet need: "it unrolls
-/// what survived only when codegen cannot take it" — which turned out not to
-/// be "nothing" the moment a real glyph's `by_ref` composition was tried.
-/// Unrolls exactly the `Reduce`s [`nested_reduce_bodies`] finds; a
-/// non-nested `Reduce` is left standing, and `pixelflow-codegen` emits it as
-/// a loop.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ExpandNestedReduce;
-
-impl Optimize for ExpandNestedReduce {
-    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if nested_reduce_bodies(arena, root).is_empty() {
-            return Rewritten::Unchanged;
-        }
-        let mut owned = arena.clone();
-        let new_root = expand_nested_reduce(&mut owned, root);
-        Rewritten::Changed(owned, new_root)
-    }
-}
-
 #[cfg(test)]
 mod nested_reduce_tests {
     use super::*;
     use crate::fold::{Binder, Fold, Monoid};
 
-    /// A non-nested `Reduce` is left standing exactly as-is: `Unchanged`,
-    /// not merely equal after a rebuild.
-    #[test]
-    fn a_non_nested_reduce_is_unchanged() {
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let binder = Binder::from_slot(0).expect("slot 0 exists");
-        let i = a.push_var(binder.var());
-        let body = a.push_binary(OpKind::Add, x, i);
-        let fold = Fold::new(Monoid::SUM, binder, 0..4);
-        let root = a.push_reduce(fold, body);
-
-        assert!(nested_reduce_bodies(&a, root).is_empty());
-        assert!(matches!(
-            ExpandNestedReduce.optimize(&a, root),
-            Rewritten::Unchanged
-        ));
+    /// Every `Reduce` reachable from `root`.
+    fn reachable_reduces(arena: &ExprArena, root: ExprId) -> usize {
+        let mut seen = alloc::vec![false; arena.len()];
+        let mut stack = alloc::vec![root];
+        let mut count = 0;
+        while let Some(id) = stack.pop() {
+            if core::mem::replace(&mut seen[id.0 as usize], true) {
+                continue;
+            }
+            if matches!(arena.node(id), ExprNode::Reduce { .. }) {
+                count += 1;
+            }
+            stack.extend(arena.children(id));
+        }
+        count
     }
 
-    /// A `Reduce` whose body reads another `Reduce`'s result is unrolled;
-    /// the outer `Reduce` survives, now reading the unrolled body directly
-    /// rather than a nested node.
+    /// A `Reduce` whose body reads another `Reduce`'s result reaches the
+    /// backend as written: two folds, one inside the other, both inside the
+    /// lattice's three. This used to be the one shape `legalize` still
+    /// unrolled (`expand_nested_reduce`, deleted), because codegen carved
+    /// fold bodies out one level at a time; it carves a fold inside a fold
+    /// now, and the pass went with the restriction it existed for.
     ///
-    /// `inner = sum_{i<3}(X+i) = 3X+3`; `outer = sum_{j<2}(inner+j) =
-    /// 2*inner+1`.
+    /// `inner = sum_{i<3}(X+i)`; `outer = sum_{j<2}(inner+j)`.
     #[test]
-    fn a_nested_reduce_is_unrolled_and_the_outer_one_survives() {
+    fn legalize_leaves_a_nested_reduce_standing_inside_the_lattices_folds() {
+        use crate::arena::{UniformDecl, UniformIdentity};
+        use crate::variance::LatticeShape;
+
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let inner_binder = Binder::from_slot(0).expect("slot 0 exists");
         let i = a.push_var(inner_binder.var());
         let inner_body = a.push_binary(OpKind::Add, x, i);
-        let inner_fold = Fold::new(Monoid::SUM, inner_binder, 0..3);
-        let inner = a.push_reduce(inner_fold, inner_body);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, inner_binder, 0..3), inner_body);
 
         let outer_binder = Binder::from_slot(1).expect("slot 1 exists");
         let j = a.push_var(outer_binder.var());
         let outer_body = a.push_binary(OpKind::Add, inner, j);
-        let outer_fold = Fold::new(Monoid::SUM, outer_binder, 0..2);
-        let root = a.push_reduce(outer_fold, outer_body);
+        let root = a.push_reduce(Fold::new(Monoid::SUM, outer_binder, 0..2), outer_body);
 
-        let nested = nested_reduce_bodies(&a, root);
-        assert_eq!(nested.len(), 1, "only inner's body is nested");
-        assert!(nested.contains(&inner_body));
-
-        let Rewritten::Changed(owned, new_root) = ExpandNestedReduce.optimize(&a, root) else {
-            panic!("a nested Reduce must rewrite");
+        let origin = |default| UniformDecl {
+            id: UniformIdentity::mint(),
+            default,
         };
-        // The outer Reduce survives; its body no longer contains any Reduce.
-        let ExprNode::Reduce {
-            fold: surviving_fold,
-            body: surviving_body,
-        } = owned.node(new_root)
-        else {
-            panic!("root must still be the outer Reduce");
+        let collapse = lattice::Collapse {
+            domain: lattice::Domain {
+                shape: LatticeShape::new([4, 1]),
+                origin: [origin(0.0), origin(0.0)],
+            },
+            lanes: 4,
         };
-        assert_eq!(surviving_fold.range(), 0..2);
-        let mut stack = alloc::vec![*surviving_body];
-        let mut seen = alloc::vec![false; owned.len()];
-        while let Some(id) = stack.pop() {
-            let idx = id.0 as usize;
-            if core::mem::replace(&mut seen[idx], true) {
-                continue;
-            }
-            assert!(
-                !matches!(owned.node(id), ExprNode::Reduce { .. }),
-                "the outer body must no longer nest a Reduce"
-            );
-            stack.extend(owned.children(id));
-        }
+        let (legalized, new_root) = legalize(&a, root, &collapse).expect("legalize");
+        // The lattice's row, column and lane folds around the kernel's two.
+        assert_eq!(
+            reachable_reduces(&legalized, new_root),
+            5,
+            "both folds must survive legalization, inside the lattice's three"
+        );
+        let ExprNode::Reduce { fold, .. } = legalized.node(new_root) else {
+            panic!("root must be the lattice's row fold");
+        };
+        assert_eq!(fold.monoid(), Monoid::SEQ);
+        assert_eq!(fold.range(), 0..1);
+        let outer = (0..legalized.len())
+            .map(|k| ExprId(k as u32))
+            .find(|id| matches!(legalized.node(*id), ExprNode::Reduce { fold, .. } if fold.range() == (0..2)))
+            .expect("the outer kernel fold survives");
+        let ExprNode::Reduce { body, .. } = legalized.node(outer) else {
+            unreachable!()
+        };
+        let ExprNode::Binary(OpKind::Add, lhs, _) = legalized.node(body) else {
+            panic!("the outer body must still be `inner + j`");
+        };
+        assert!(
+            matches!(legalized.node(lhs), ExprNode::Reduce { fold, .. } if fold.range() == (0..3)),
+            "the inner Reduce must be the outer body's own operand, not unrolled into it"
+        );
     }
 }
 
@@ -2328,11 +2279,7 @@ mod ref_expansion_tests {
         let (arena, root) = k.parts();
         let (out, out_root) = expand_refs_owned(arena, root);
         assert_eq!(out_root, root, "the root cannot move");
-        assert_eq!(
-            out.nodes_raw().len(),
-            arena.nodes_raw().len(),
-            "no node may be added or dropped"
-        );
+        assert_eq!(out.len(), arena.len(), "no node may be added or dropped");
         assert_eq!(canonical(&out, out_root).key, canonical(arena, root).key);
         assert!(matches!(
             ExpandRefs.optimize(arena, root),
@@ -2393,11 +2340,11 @@ mod ref_expansion_tests {
         let on_key = Kernel::x().sqrt().by_ref();
         let off_key = Kernel::y().neg().by_ref();
         let on_key = match on_key.parts().0.node(on_key.parts().1) {
-            ExprNode::Ref(k) => *k,
+            ExprNode::Ref(k) => k,
             other => panic!("Kernel::by_ref must produce a Ref, got {other:?}"),
         };
         let off_key = match off_key.parts().0.node(off_key.parts().1) {
-            ExprNode::Ref(k) => *k,
+            ExprNode::Ref(k) => k,
             other => panic!("Kernel::by_ref must produce a Ref, got {other:?}"),
         };
 
@@ -2417,15 +2364,15 @@ mod ref_expansion_tests {
 
         match expanded.node(expanded_root) {
             ExprNode::Guard { mask, on, off } => {
-                assert_eq!(*on, on_key, "on must survive expand_refs untouched");
-                assert_eq!(*off, off_key, "off must survive expand_refs untouched");
+                assert_eq!(on, on_key, "on must survive expand_refs untouched");
+                assert_eq!(off, off_key, "off must survive expand_refs untouched");
                 assert!(
-                    !matches!(expanded.node(*mask), ExprNode::Ref(_)),
+                    !matches!(expanded.node(mask), ExprNode::Ref(_)),
                     "the mask, a real child, must still be expanded — got {:?}",
-                    expanded.node(*mask)
+                    expanded.node(mask)
                 );
                 assert!(
-                    matches!(expanded.node(*mask), ExprNode::Var(0)),
+                    matches!(expanded.node(mask), ExprNode::Var(0)),
                     "the mask named X, so its expansion must read X directly"
                 );
             }

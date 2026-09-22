@@ -16,15 +16,17 @@
 //!   name_len: u16 (little-endian)
 //!   name: [u8; name_len]       (UTF-8)
 //!   node_count: u32 (le)
-//!   nary_count: u32 (le)
 //!   root_index: u32 (le)       (ExprId.0)
 //!   nodes: node_count encoded ExprNodes (variable per-node)
-//!   nary_children: [u32; nary_count] (le) (ExprId.0 values)
 //! ```
 //!
 //! Each ExprNode is encoded as:
 //!   tag: u8  (0=Var, 1=Const, 2=Param, 3=Unary, 4=Binary, 5=Ternary, 6=Nary)
-//!   payload varies by tag.
+//!   payload varies by tag — a `Nary`'s children are inline (`len: u16` then
+//!   `len` `ExprId`s), not a separate trailing section, so this format never
+//!   names an arena-internal offset: `write_node` reads a `Nary`'s children
+//!   through `ExprArena::children`, the same accessor everything outside
+//!   `arena.rs` uses (docs/plans/2026-09-09-exprarena-on-dag.md, Stage A).
 //!
 //! ## Only the reachable subtree is stored
 //!
@@ -191,8 +193,8 @@ const TAG_BUFFER: u8 = 7;
 /// DAG sharing is preserved: a node referenced from several parents is
 /// emitted once and referenced by the same new id, so compaction never
 /// expands a shared subgraph into a tree. Children are emitted before their
-/// parents, so the result satisfies [`ExprArena::from_raw`]'s ordering
-/// contract.
+/// parents — the ordering every arena keeps by construction, and the one
+/// `read_node_into` relies on to rebuild an entry node by node.
 ///
 /// This is what makes stored size mean expression size. Callers that
 /// generate expressions into a long-lived scratch arena (`BwdGenerator`, the
@@ -242,9 +244,9 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
                         .expect("reachable_subtree: child must be emitted before its parent")
                 };
                 let new_id = match arena.node(id) {
-                    ExprNode::Var(i) => out_arena.push_var(*i),
-                    ExprNode::Const(v) => out_arena.push_const(*v),
-                    ExprNode::Param(i) => out_arena.push_param(*i),
+                    ExprNode::Var(i) => out_arena.push_var(i),
+                    ExprNode::Const(v) => out_arena.push_const(v),
+                    ExprNode::Param(i) => out_arena.push_param(i),
                     ExprNode::Buffer(b) => panic!(
                         "reachable_subtree: expression references Buffer({}), whose declaration \
                          the corpus format does not serialize — writing it would store a node \
@@ -270,15 +272,19 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
                          off={off:?}) — a corpus outlives the process these keys are \
                          interned in"
                     ),
-                    ExprNode::Unary(op, a) => out_arena.push_unary(*op, map(*a)),
-                    ExprNode::Binary(op, a, b) => out_arena.push_binary(*op, map(*a), map(*b)),
+                    ExprNode::Write { .. } => panic!(
+                        "reachable_subtree: expression holds a Write — a corpus entry is \
+                         pre-legalize, and a store is built after extraction"
+                    ),
+                    ExprNode::Unary(op, a) => out_arena.push_unary(op, map(a)),
+                    ExprNode::Binary(op, a, b) => out_arena.push_binary(op, map(a), map(b)),
                     ExprNode::Ternary(op, a, b, c) => {
-                        out_arena.push_ternary(*op, map(*a), map(*b), map(*c))
+                        out_arena.push_ternary(op, map(a), map(b), map(c))
                     }
-                    ExprNode::Reduce { fold, body } => out_arena.push_reduce(*fold, map(*body)),
-                    ExprNode::Nary(op, _, _) => {
+                    ExprNode::Reduce { fold, body } => out_arena.push_reduce(fold, map(body)),
+                    ExprNode::Nary(op, _) => {
                         let mapped_children: Vec<ExprId> = arena.children(id).map(map).collect();
-                        out_arena.push_nary(*op, &mapped_children)
+                        out_arena.push_nary(op, &mapped_children)
                     }
                 };
                 id_map[id.0 as usize] = Some(new_id);
@@ -348,14 +354,14 @@ fn write_entry(w: &mut impl Write, name: &str, arena: &ExprArena, root: ExprId) 
 fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<()> {
     match arena.node(id) {
         ExprNode::Var(i) => {
-            w.write_all(&[TAG_VAR, *i])?;
+            w.write_all(&[TAG_VAR, i])?;
         }
         ExprNode::Const(v) => {
             w.write_all(&[TAG_CONST])?;
             w.write_all(&v.to_le_bytes())?;
         }
         ExprNode::Param(i) => {
-            w.write_all(&[TAG_PARAM, *i])?;
+            w.write_all(&[TAG_PARAM, i])?;
         }
         ExprNode::Unary(op, a) => {
             w.write_all(&[TAG_UNARY])?;
@@ -375,7 +381,7 @@ fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<(
             w.write_all(&b.0.to_le_bytes())?;
             w.write_all(&c.0.to_le_bytes())?;
         }
-        ExprNode::Nary(op, _, _) => {
+        ExprNode::Nary(op, _) => {
             w.write_all(&[TAG_NARY])?;
             w.write_all(&op.marshal().to_bytes())?;
             let children = arena.children(id);
@@ -428,6 +434,12 @@ fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<(
                     "Guard(on={on:?}, off={off:?}) has no corpus encoding: its arms name \
                      process-local kernels"
                 ),
+            ));
+        }
+        ExprNode::Write { .. } => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a Write has no corpus encoding: a corpus entry is pre-legalize",
             ));
         }
     }
@@ -508,19 +520,47 @@ fn read_entry(r: &mut Cursor<'_>) -> io::Result<(String, ExprArena, ExprId)> {
     };
 
     let node_count = r.read_u32()? as usize;
-    let root_index = r.read_u32()?;
+    let root_index = r.read_u32()? as usize;
 
+    // `id_map[write_time_index]` is the live `ExprId` that position's push
+    // actually returned. The writer's arena (`reachable_subtree`'s output)
+    // was dense and unconsed, so on-disk child references are write-time
+    // positions, not live ids — and `arena` here hash-conses, so a later
+    // push can return an id a structurally-equal earlier node already
+    // holds. Without this indirection, two on-disk `Const(1.0)` leaves
+    // (say) would collapse to one live node, every position after the
+    // second would drift out of step with its own child references, and
+    // the entry would silently decode to the wrong graph rather than fail.
+    let mut id_map: Vec<ExprId> = Vec::with_capacity(node_count);
     let mut arena = ExprArena::new();
     for _ in 0..node_count {
-        read_node_into(r, &mut arena)?;
+        let id = read_node_into(r, &mut arena, &id_map)?;
+        id_map.push(id);
     }
 
-    let root = ExprId(root_index);
+    let root = *id_map
+        .get(root_index)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "root_index out of range"))?;
 
     Ok((name, arena, root))
 }
 
-fn read_node_into(r: &mut Cursor<'_>, arena: &mut ExprArena) -> io::Result<ExprId> {
+/// Translate an on-disk write-time child index through `id_map` into the
+/// live `ExprId` that position's push actually returned — see `read_entry`.
+fn resolve_child(id_map: &[ExprId], raw: u32) -> io::Result<ExprId> {
+    id_map.get(raw as usize).copied().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("child index {raw} not yet written (arena is not in topological order)"),
+        )
+    })
+}
+
+fn read_node_into(
+    r: &mut Cursor<'_>,
+    arena: &mut ExprArena,
+    id_map: &[ExprId],
+) -> io::Result<ExprId> {
     let tag = r.read_u8()?;
     match tag {
         TAG_VAR => {
@@ -537,20 +577,20 @@ fn read_node_into(r: &mut Cursor<'_>, arena: &mut ExprArena) -> io::Result<ExprI
         }
         TAG_UNARY => {
             let op = read_opkind(r)?;
-            let a = ExprId(r.read_u32()?);
+            let a = resolve_child(id_map, r.read_u32()?)?;
             Ok(arena.push_unary(op, a))
         }
         TAG_BINARY => {
             let op = read_opkind(r)?;
-            let a = ExprId(r.read_u32()?);
-            let b = ExprId(r.read_u32()?);
+            let a = resolve_child(id_map, r.read_u32()?)?;
+            let b = resolve_child(id_map, r.read_u32()?)?;
             Ok(arena.push_binary(op, a, b))
         }
         TAG_TERNARY => {
             let op = read_opkind(r)?;
-            let a = ExprId(r.read_u32()?);
-            let b = ExprId(r.read_u32()?);
-            let c = ExprId(r.read_u32()?);
+            let a = resolve_child(id_map, r.read_u32()?)?;
+            let b = resolve_child(id_map, r.read_u32()?)?;
+            let c = resolve_child(id_map, r.read_u32()?)?;
             Ok(arena.push_ternary(op, a, b, c))
         }
         TAG_NARY => {
@@ -558,7 +598,7 @@ fn read_node_into(r: &mut Cursor<'_>, arena: &mut ExprArena) -> io::Result<ExprI
             let len = r.read_u16()? as usize;
             let mut children = Vec::with_capacity(len);
             for _ in 0..len {
-                children.push(ExprId(r.read_u32()?));
+                children.push(resolve_child(id_map, r.read_u32()?)?);
             }
             Ok(arena.push_nary(op, &children))
         }
@@ -567,14 +607,14 @@ fn read_node_into(r: &mut Cursor<'_>, arena: &mut ExprArena) -> io::Result<ExprI
             Ok(arena.push_buffer(b))
         }
         TAG_REDUCE => {
-            let bits = r.read_u64()?;
+            let bits = r.read_u128()?;
             let fold = Fold::from_bits(bits).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("corpus fold bits {bits} name no fold"),
                 )
             })?;
-            let body = ExprId(r.read_u32()?);
+            let body = resolve_child(id_map, r.read_u32()?)?;
             Ok(arena.push_reduce(fold, body))
         }
         _ => Err(io::Error::new(
@@ -673,6 +713,12 @@ impl<'a> Cursor<'a> {
         self.read_exact(&mut buf)?;
         Ok(u64::from_le_bytes(buf))
     }
+
+    fn read_u128(&mut self) -> io::Result<u128> {
+        let mut buf = [0u8; 16];
+        self.read_exact(&mut buf)?;
+        Ok(u128::from_le_bytes(buf))
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -715,14 +761,14 @@ mod tests {
         assert_eq!(loaded[0].1.len(), 3);
         assert_eq!(loaded[0].2.0, root.0);
 
-        // Verify node equality
-        for (i, node) in entries[0].1.nodes_raw().iter().enumerate() {
-            assert_eq!(
-                node,
-                loaded[0].1.node(ExprId(i as u32)),
-                "node {i} mismatch"
-            );
-        }
+        // Structural equality through the same comparison `key.rs` and
+        // `subtree_eq` use elsewhere — not a raw node-by-node walk, which
+        // would compare `Nary`'s internal offsets across two different
+        // arenas rather than the expression they encode.
+        assert!(
+            entries[0].1.subtree_eq(root, &loaded[0].1, loaded[0].2),
+            "round-tripped arena is not structurally equal to the original"
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }
@@ -792,7 +838,7 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         match loaded[0].1.node(loaded[0].2) {
-            ExprNode::Nary(OpKind::Tuple, _, _) => {
+            ExprNode::Nary(OpKind::Tuple, _) => {
                 let children: Vec<_> = loaded[0].1.children(loaded[0].2).collect();
                 assert_eq!(children.len(), 3);
             }

@@ -10,8 +10,8 @@
 //! 3-operand form which avoids extra MOV instructions in multi-step sequences.
 
 use super::{
-    AsmInsn, AsmProgram, Counter, EncodedInst, Gpr, Label, LabelRef, OutStep, PtrReg, Reg,
-    SourceOperand, assemble, unimplemented_op,
+    AsmInsn, AsmProgram, EncodedInst, Gpr, Label, LabelRef, PtrReg, Reg, SourceOperand, assemble,
+    unimplemented_op,
 };
 use alloc::vec::Vec;
 use pixelflow_ir::kind::OpKind;
@@ -732,12 +732,18 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         // The gather truncates the float indices into one vector register and
         // loads each element through another.
         ScheduledOp::Gather(..) => 2,
-        // A surviving fold's own loop scaffold: the persistent binder
-        // register (broadcast, stepped once per iteration) plus two
-        // transient registers for the trip test's bound and the
-        // accumulate's slot round-trip — see `emit_dag_body_hoisted`'s
-        // `Reduce` arm.
+        // A surviving fold's own loop: two transient registers for the trip
+        // test's bound and mask, reused by the accumulate's slot round-trip
+        // and the step — see `emit_scope`'s `Reduce` arm. The binder and the
+        // accumulator are the fold's roots, placed by the allocator, not
+        // scratch.
         ScheduledOp::Reduce(..) => super::regalloc::Scratch::REDUCE_TEMPS as u8,
+        // A remainder store has no masked `movups` on this tier: it shifts a
+        // copy of the value down a lane at a time through one temp. A full
+        // batch is one store and needs none.
+        ScheduledOp::Write { lanes, .. } if *lanes < 4 => 1,
+        // The iota's high lane pair rides in through a second register.
+        ScheduledOp::Lanes(_) => 1,
         _ => 0,
     }
 }
@@ -746,15 +752,18 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
 /// [`regalloc::RegisterFile::gpr_ctx`].
 ///
 /// `Gather`'s scalar-load sequence needs a base-pointer GPR (loaded from the
-/// context) and a per-lane index GPR; `Uniform` needs only the base pointer.
-/// Both used to be `rax`/`rcx` chosen by hand — invisible to the allocator,
-/// and correct only because nothing else in the schedule ever asks for a
-/// GPR — and are `RegisterFile::gpr_scratch` reservations now.
+/// context) and a per-lane index GPR; `Uniform` needs only the base pointer;
+/// a `Write` converts its row and column into one each before combining
+/// them into the address; the iota carries each lane pair in through one.
+/// The gather's pair used to be `rax`/`rcx` chosen by hand — invisible to
+/// the allocator, and correct only because nothing else in the schedule
+/// ever asked for a GPR — and are `RegisterFile::gpr_scratch` reservations
+/// now.
 pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
-        ScheduledOp::Gather(..) => 2,
-        ScheduledOp::Uniform(..) => 1,
+        ScheduledOp::Gather(..) | ScheduledOp::Write { .. } => 2,
+        ScheduledOp::Uniform(..) | ScheduledOp::Lanes(_) => 1,
         _ => 0,
     }
 }
@@ -1249,7 +1258,8 @@ mod tests {
 pub(crate) mod driver {
     use super::super::*;
     use super::{
-        AsmProgram, Imm8, Imm32, Inst, Mem, NoDisp, gpr, movups_load, movups_store, ptr, scaffold,
+        AsmProgram, Imm8, Imm32, Inst, Mem, NoDisp, cvttss2si_mem, cvttss2si_xmm, gpr, movss_store,
+        movups_load, movups_store, psrldq_imm, ptr,
     };
     use crate::error::CompileError;
     use alloc::vec::Vec;
@@ -1257,19 +1267,14 @@ pub(crate) mod driver {
 
     /// The SSE2 register file (xmm, 128-bit).
     ///
-    /// SysV has no callee-saved XMM registers, so every register past the
-    /// inputs is fair game — and every one of them is now the allocator's.
+    /// SysV has no callee-saved XMM registers and the collapse ABI passes no
+    /// vector, so every one of the sixteen is the allocator's.
     pub(crate) const SSE2_FILE: regalloc::RegisterFile = regalloc::RegisterFile {
-        inputs: INPUT_REGS,
-        // xmm4-15: twelve of sixteen, which is every register the ABI does
-        // not use for an argument. xmm11 and xmm12 are the last two to join —
-        // they were `reload`, held out of every kernel's pool so that a
-        // spilled operand had somewhere to land and a spilled destination had
-        // somewhere to be computed. Both are per-instruction reservations now
-        // (`Scratch::reload`), as xmm13 (`select_reload`), xmm14/15 (the
-        // gather's) and xmm10 (the sign mask, the select blend, the `MulAdd`
-        // stand-in's product) became before them.
-        scratch: regalloc::RegSet::range(4, 12),
+        // xmm0-15, all sixteen. xmm0-3 are the last to join: they carried the
+        // coordinate vectors of the per-batch ABI, which a call no longer
+        // passes — the lattice's coordinates are built inside the code, from
+        // the origin and the fold binders.
+        scratch: regalloc::RegSet::range(0, 16),
         // Nothing. This was the last backend holding a register for its own
         // encodings, and the one that held it for a *register* rather than an
         // op: `emit_binary_safe` stashed `right` whenever the allocator chose
@@ -1283,15 +1288,17 @@ pub(crate) mod driver {
         // no vector register at all.
         guard_temps: 0,
         vector_bytes: 16,
-        // The context pointer (array of buffer base pointers) arrives in
-        // rdi; `Gather`/`Uniform` never touch it through the allocator, but
-        // declaring it here is what lets `checked` prove `gpr_scratch` misses
-        // it, rather than a comment asserting the two constants never
-        // collide.
+        // SysV's first three integer arguments, in the ABI's order: the
+        // context (the array of buffer base pointers, then the uniform and
+        // origin blocks), the output plane, its pitch. Declared here so
+        // `checked` proves `gpr_scratch` misses all three, rather than a
+        // comment asserting the constants never collide.
         gpr_ctx: Some(gpr::RDI),
-        // rax/rcx: the gather's base pointer and per-lane index, chosen by
-        // hand before this work and now `Scratch` reservations like every
-        // vector temp.
+        gpr_out: Some(gpr::RSI),
+        gpr_pitch: Some(gpr::RDX),
+        // rax/rcx: the gather's base pointer and per-lane index, the store's
+        // row and column — chosen by hand before this work and now `Scratch`
+        // reservations like every vector temp.
         gpr_scratch: regalloc::GprSet::of(&[gpr::RAX, gpr::RCX]),
         gpr_temps_for: super::gpr_temps_for,
         // No mask-register file on this tier: masks are ordinary vectors.
@@ -1302,8 +1309,7 @@ pub(crate) mod driver {
     .checked();
 
     /// A slot in the allocated spill frame. Kernels are leaves with no base
-    /// pointer, so a slot *is* `rsp + offset`; the `disp32` is what makes the
-    /// frame mode able to address a frame the red zone could not.
+    /// pointer, so a slot *is* `rsp + offset`.
     const fn frame_slot(offset: u32) -> Mem<Imm32> {
         Mem {
             base: ptr::RSP,
@@ -1311,66 +1317,77 @@ pub(crate) mod driver {
         }
     }
 
-    /// Map a `FrameLayout` spill offset to a red-zone `[rsp+disp8]` displacement.
-    fn x86_redzone_disp(offset: u32) -> Result<i8, CompileError> {
-        // Slots live below rsp: offset 0 -> [rsp-16], 16 -> [rsp-32], ...
-        // Only called in red-zone mode (the prologue switches to an allocated
-        // frame when the layout exceeds the zone), so overflow here is an
-        // internal invariant violation, not a kernel-size limit.
-        let disp = -(offset as i64 + 16);
-        if disp < -128 {
-            return Err(CompileError::Internal(
-                "red-zone offset exceeded 128 bytes despite frame fitting the zone",
-            ));
-        }
-        Ok(disp as i8)
-    }
+    /// The iota `[0, 1, 2, 3]` as two 64-bit halves, each two `f32`s little
+    /// end first: what `movabs` carries into a GPR and `movq` into a lane pair.
+    const IOTA_LO: u64 = (1.0f32.to_bits() as u64) << 32;
+    const IOTA_HI: u64 = ((3.0f32.to_bits() as u64) << 32) | 2.0f32.to_bits() as u64;
 
     /// x86-64 implementation of the shared driver's leaf operations.
-    ///
-    /// `frame_bytes` is set by `prologue`: 0 = spills fit the 128-byte red zone
-    /// (no frame is allocated), otherwise the size of the allocated frame and
-    /// spill slots are `[rsp + offset]`.
     pub(crate) struct X86Backend {
-        frame_bytes: u32,
         file: regalloc::RegisterFile,
     }
 
     impl X86Backend {
         pub(crate) fn new(ctx: EmitCtx) -> Self {
             Self {
-                frame_bytes: 0,
                 file: SSE2_FILE.capped(ctx.max_regs),
             }
         }
 
-        fn spill_store(&self, code: &mut Vec<u8>, src: Reg, offset: u32) {
-            match self.red_zone_slot(offset) {
-                Some(addr) => AsmProgram::from([movups_store(src, addr)]).assemble(code),
-                None => AsmProgram::from([movups_store(src, frame_slot(offset))]).assemble(code),
-            }
+        fn spill_store(code: &mut Vec<u8>, src: Reg, offset: u32) {
+            AsmProgram::from([movups_store(src, frame_slot(offset))]).assemble(code);
         }
 
-        fn spill_load(&self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
-            match self.red_zone_slot(offset) {
-                Some(addr) => AsmProgram::from([movups_load(dst, addr)]).assemble(code),
-                None => AsmProgram::from([movups_load(dst, frame_slot(offset))]).assemble(code),
-            }
+        fn spill_load(code: &mut Vec<u8>, dst: Reg, offset: u32) {
+            AsmProgram::from([movups_load(dst, frame_slot(offset))]).assemble(code);
         }
+    }
 
-        /// The slot at `offset` as a red-zone address, when the body is in
-        /// red-zone mode. `None` means an allocated frame, whose slots are
-        /// [`frame_slot`]s — a disp32 away, not a disp8 below `rsp`.
-        fn red_zone_slot(&self, offset: u32) -> Option<Mem<Imm8>> {
-            if self.frame_bytes != 0 {
-                return None;
+    /// `dst = trunc(index)` as a 64-bit integer, wherever a fold keeps its
+    /// binder: a broadcast, so lane 0 of a register or the first word of a
+    /// slot is the index. Shared by the three x86 tiers, which differ only
+    /// in the *vector* encoding this reads through — the GPR half is the
+    /// architecture's.
+    pub(in crate::emit) fn index_into(code: &mut Vec<u8>, dst: Gpr, at: Binding, convert: Convert) {
+        match at {
+            Binding::Loc(Loc::Reg(r)) => (convert.from_xmm)(code, dst, r),
+            Binding::Loc(Loc::Slot(slot)) => {
+                (convert.from_mem)(code, dst, frame_slot(slot.offset()))
             }
-            let disp = x86_redzone_disp(offset).expect("red-zone mode implies fitting offsets");
-            Some(Mem {
-                base: ptr::RSP,
-                disp: Imm8(disp),
-            })
+            // A fold whose binder folded to a constant: the trip count was
+            // one and the allocator rematerialized it. Truncate on the host,
+            // which is what the instruction would have done.
+            Binding::Remat(bits) => super::movabs(code, dst, f32::from_bits(bits) as i64 as u64),
         }
+    }
+
+    /// One tier's `cvttss2si` pair — the legacy, VEX or EVEX spelling of the
+    /// same instruction, which is the only thing that varies.
+    #[derive(Clone, Copy)]
+    pub(in crate::emit) struct Convert {
+        pub from_xmm: fn(&mut Vec<u8>, Gpr, Reg),
+        pub from_mem: fn(&mut Vec<u8>, Gpr, Mem<Imm32>),
+    }
+
+    /// The store's address into `scratch[0]`: `out + 4 · (row · pitch + col)`,
+    /// leaving `scratch[1]` free. The row and column indices are converted
+    /// through `convert`, the tier's own `cvttss2si`.
+    pub(in crate::emit) fn write_address(
+        code: &mut Vec<u8>,
+        file: &regalloc::RegisterFile,
+        write: &WritePlan,
+        convert: Convert,
+    ) -> Gpr {
+        let row = crate::emit::declared_gpr_temp(write.scratch.gpr_temp(0));
+        let col = crate::emit::declared_gpr_temp(write.scratch.gpr_temp(1));
+        let out = file.gpr_out.expect("x86's store needs the output pointer");
+        let pitch = file.gpr_pitch.expect("x86's store needs the pitch");
+        index_into(code, row, write.row, convert);
+        super::imul(code, row, pitch);
+        index_into(code, col, write.col, convert);
+        AsmProgram::from([Inst::Add { dst: row, src: col }]).assemble(code);
+        super::lea_scaled4(code, row, out, row);
+        row
     }
 
     impl IsaBackend for X86Backend {
@@ -1387,14 +1404,6 @@ pub(crate) mod driver {
             Ok(()) // x86 const loads are self-contained; no pool.
         }
 
-        fn frame_ready(&mut self, frame_size: u32) {
-            // Red zone when it fits (max slot offset frame_size-16 maps to disp
-            // -(frame_size) >= -128); otherwise an allocated frame, with slots at
-            // [rsp + offset]. Latched here so the body's spill addressing agrees
-            // with the prologue emitted afterwards.
-            self.frame_bytes = if frame_size <= 128 { 0 } else { frame_size };
-        }
-
         fn emit_plan(
             &mut self,
             code: &mut Vec<u8>,
@@ -1404,7 +1413,7 @@ pub(crate) mod driver {
             for reload in &plan.reloads {
                 match reload {
                     Reload::FromStack { target, slot } => {
-                        self.spill_load(code, *target, slot.offset());
+                        Self::spill_load(code, *target, slot.offset());
                     }
                     Reload::Const { target, val_bits } => {
                         emit_const(code, *target, f32::from_bits(*val_bits));
@@ -1418,6 +1427,17 @@ pub(crate) mod driver {
                 ResolvedOp::Nop => {}
                 ResolvedOp::LoadConst { dst, val_bits } => {
                     emit_const(code, *dst, f32::from_bits(*val_bits));
+                }
+                // The iota, two lane pairs at a time: no SSE2 instruction
+                // builds four distinct lanes from nothing, and the tier has
+                // no constant pool, so each pair rides in through a GPR.
+                ResolvedOp::Lanes { dst } => {
+                    let gpr = crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0));
+                    let hi = crate::emit::declared_temp(plan.scratch.temp(0));
+                    movabs(code, gpr, IOTA_LO);
+                    AsmProgram::from([movq_xmm_r64(*dst, gpr)]).assemble(code);
+                    movabs(code, gpr, IOTA_HI);
+                    AsmProgram::from([movq_xmm_r64(hi, gpr), movlhps(*dst, hi)]).assemble(code);
                 }
                 ResolvedOp::Unary { op, dst, src } => {
                     emit_unary(code, *op, *dst, *src, plan.scratch.temp(0));
@@ -1506,7 +1526,7 @@ pub(crate) mod driver {
                     emit_binary(code, OpKind::Mul, *dst, *a, *b);
                     match c_deferred {
                         Some(DeferredReload::FromStack(slot)) => {
-                            self.spill_load(code, *c, slot.offset());
+                            Self::spill_load(code, *c, slot.offset());
                         }
                         Some(DeferredReload::Const(bits)) => {
                             emit_const(code, *c, f32::from_bits(*bits));
@@ -1529,7 +1549,7 @@ pub(crate) mod driver {
             src: Reg,
             offset: u32,
         ) -> Result<(), CompileError> {
-            self.spill_store(code, src, offset);
+            Self::spill_store(code, src, offset);
             Ok(())
         }
 
@@ -1547,7 +1567,7 @@ pub(crate) mod driver {
                     target
                 }
                 Binding::Loc(Loc::Slot(slot)) => {
-                    self.spill_load(code, target, slot.offset());
+                    Self::spill_load(code, target, slot.offset());
                     target
                 }
             }
@@ -1567,18 +1587,9 @@ pub(crate) mod driver {
             asm.push(super::Jcc::je(label));
         }
 
-        // SysV: rdi = ctx (read-only in the body's gathers), rsi = out,
-        // rdx = groups, rcx = rows, r8 = row-skip bytes, xmm0..3 = x0/y0/z/w.
-        // Loop registers: r9 = batch counter, r10 = preserved row count, r11 =
-        // row counter; the body's scratch GPRs are rax/rcx (gather, movmskps)
-        // — disjoint.
-
-        /// In red-zone mode the body spills *below* `rsp` and allocates
-        /// nothing, so the scaffold's slots start at zero rather than above a
-        /// frame that does not exist.
-        fn body_frame_bytes(&self, _frame_size: u32) -> u32 {
-            self.frame_bytes
-        }
+        // SysV: rdi = ctx (read-only in the body's gathers and uniform
+        // loads), rsi = out, rdx = pitch; the body's scratch GPRs are rax/rcx
+        // (gather, store address, movmskps) — disjoint, and `checked` says so.
 
         fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {
             AsmProgram::from([Inst::SubImm32 {
@@ -1596,47 +1607,12 @@ pub(crate) mod driver {
             .assemble(code);
         }
 
-        // The scaffold's slots are always at a positive displacement, unlike
-        // `emit_store`/`emit_resolve`, which follow the body's frame mode.
         fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
             AsmProgram::from([movups_store(src, frame_slot(offset))]).assemble(code);
         }
 
         fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
             AsmProgram::from([movups_load(dst, frame_slot(offset))]).assemble(code);
-        }
-
-        /// Preserve the row count away from `rcx`, which the body's gather and
-        /// select guards may clobber.
-        fn latch_bounds(&mut self, code: &mut Vec<u8>) {
-            scaffold::latch_bounds(code);
-        }
-
-        fn counter_clear(&mut self, code: &mut Vec<u8>, counter: Counter) {
-            scaffold::counter_clear(code, counter);
-        }
-
-        fn counter_step(&mut self, code: &mut Vec<u8>, counter: Counter) {
-            scaffold::counter_step(code, counter);
-        }
-
-        fn branch_if_counter_done(&mut self, asm: &mut Assembly, counter: Counter, label: Label) {
-            scaffold::branch_if_counter_done(asm, counter, label);
-        }
-
-        fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
-            AsmProgram::from([movups_store(
-                src,
-                Mem {
-                    base: scaffold::OUT_PTR,
-                    disp: NoDisp,
-                },
-            )])
-            .assemble(code);
-        }
-
-        fn advance_out(&mut self, code: &mut Vec<u8>, step: OutStep) {
-            scaffold::advance_out(code, step, self.file.vector_bytes);
         }
 
         fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
@@ -1652,148 +1628,54 @@ pub(crate) mod driver {
             super::emit_binary(code, op, dst, srcs[0], srcs[1]);
         }
 
+        /// A full batch is one `movups`. A remainder has no masked store on
+        /// this tier, so it is `movss` per lane, shifting the next lane down
+        /// into lane 0 through the reserved temp between stores.
+        fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan) {
+            let addr = write_address(
+                code,
+                &self.file,
+                write,
+                Convert {
+                    from_xmm: |code, dst, src| {
+                        AsmProgram::from([cvttss2si_xmm(dst, src)]).assemble(code)
+                    },
+                    from_mem: |code, dst, addr| {
+                        AsmProgram::from([cvttss2si_mem(dst, addr)]).assemble(code)
+                    },
+                },
+            );
+            let lanes = self.file.vector_bytes / 4;
+            if write.lanes == lanes {
+                AsmProgram::from([movups_store(
+                    write.value,
+                    Mem {
+                        base: addr,
+                        disp: NoDisp,
+                    },
+                )])
+                .assemble(code);
+                return;
+            }
+            let shifted = crate::emit::declared_temp(write.scratch.temp(0));
+            super::emit_movaps(code, shifted, write.value);
+            for lane in 0..write.lanes {
+                AsmProgram::from([movss_store(
+                    shifted,
+                    Mem {
+                        base: addr,
+                        disp: Imm8((lane * 4) as i8),
+                    },
+                )])
+                .assemble(code);
+                if lane + 1 < write.lanes {
+                    AsmProgram::from([psrldq_imm(shifted, 4)]).assemble(code);
+                }
+            }
+        }
+
         fn emit_ret(&mut self, code: &mut Vec<u8>) {
             AsmProgram::from([Inst::Ret]).assemble(code);
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn x86_redzone_disp_negates_the_offset_and_biases_by_the_red_zone_size() {
-            assert_eq!(x86_redzone_disp(0), Ok(-16));
-            assert_eq!(x86_redzone_disp(16), Ok(-32));
-            // 112 is the largest offset production can reach: `frame_ready`
-            // picks red-zone mode only for `frame_size <= 128`, and
-            // `FrameLayout::resolve` advances by `vector_bytes`, so the last
-            // slot sits at `frame_size - 16`. -(112 + 16) == -128, the last
-            // value disp8 represents.
-            assert_eq!(x86_redzone_disp(112), Ok(-128));
-        }
-
-        // A test that `x86_redzone_disp(113)` returns the internal
-        // out-of-range error stood here, and was removed for the same reason
-        // as the `Vex { w: true }` one below: 113 is not a reachable offset.
-        // Offsets advance in `vector_bytes` steps from 0, so they are all
-        // multiples of 16, and red-zone mode caps them at 112 besides. The
-        // assertion pinned an internal error message rather than any
-        // behaviour a kernel can produce. The reachable boundary it was
-        // wrapped around — 112 — is kept above, where it belongs.
-
-        // Two tests characterizing `emit_binary_safe` stood here. They were
-        // deleted, not ported: main's #1177/#1183 removed the function along
-        // with the fixed-scratch-register model they encoded (`X86_SCRATCH`,
-        // one reserved `Reg(10)`), which is now an allocator-managed pool
-        // (`scratch: RegSet::range(4, 12)`, reached as `plan.scratch.temp(n)`).
-        // There is no translation of "stashes `right` into the scratch
-        // register" into a world with no such register. The only occurrence of
-        // the name left in this file is the past-tense comment above line 1058.
-
-        // `X86Backend::prologue`/`epilogue` — and the `if self.frame_bytes > 0`
-        // conditional they gated — were deleted outright by main's #1082
-        // ("one kernel ABI, one compile entry"), which replaced them with
-        // `frame_alloc`/`frame_free`: unconditional `emit_sub_rsp`/`emit_add_rsp`
-        // delegations called by the shared collapse-loop scaffold on a `total`
-        // that always includes the scaffold's own coordinate slots and so is
-        // never zero. There is no surviving red-zone-omits-the-adjustment
-        // branch to test; `frame_ready`'s red-zone bookkeeping now only feeds
-        // `red_zone_slot`'s body-spill addressing (covered by
-        // `x86_redzone_disp`'s tests above), not whether a prologue/epilogue is
-        // emitted at all. Removed rather than rewritten against a coincidence.
-    }
-}
-
-// =============================================================================
-// The SysV collapse-loop scaffold
-// =============================================================================
-
-/// The general-register half of the collapse loop, shared by every x86 vector
-/// width.
-///
-/// Counters, bounds and the output pointer are the same registers stepped by
-/// the same instructions whether the body is SSE2, AVX2 or AVX-512 — these are
-/// general-register ops, and the width only reaches them as the batch stride.
-pub(in crate::emit) mod scaffold {
-    use super::gpr::*;
-    use super::ptr;
-    use super::{AsmProgram, Counter, Gpr, Imm8, Inst, OutStep, PtrReg};
-    use alloc::vec::Vec;
-
-    /// The output pointer the scaffold writes through.
-    pub(in crate::emit) const OUT_PTR: PtrReg = ptr::RSI;
-
-    /// The register each loop counter lives in.
-    const fn counter_reg(counter: Counter) -> Gpr {
-        match counter {
-            Counter::Batch => R9,
-            Counter::Row => R11,
-        }
-    }
-
-    /// The register each counter is compared against: the caller's group count
-    /// arrives in `rdx`, and the row count is latched out of `rcx`.
-    const fn bound_reg(counter: Counter) -> Gpr {
-        match counter {
-            Counter::Batch => RDX,
-            Counter::Row => R10,
-        }
-    }
-
-    /// Preserve the row count away from `rcx`, which the body's gather and
-    /// select guards may clobber.
-    #[inline(always)]
-    pub(in crate::emit) fn latch_bounds(code: &mut Vec<u8>) {
-        AsmProgram::from([Inst::Mov { dst: R10, src: RCX }]).assemble(code);
-    }
-
-    #[inline(always)]
-    pub(in crate::emit) fn counter_clear(code: &mut Vec<u8>, counter: Counter) {
-        let r = counter_reg(counter);
-        AsmProgram::from([Inst::Xor { dst: r, src: r }]).assemble(code);
-    }
-
-    #[inline(always)]
-    pub(in crate::emit) fn counter_step(code: &mut Vec<u8>, counter: Counter) {
-        AsmProgram::from([Inst::Inc {
-            dst: counter_reg(counter),
-        }])
-        .assemble(code);
-    }
-
-    /// The loop's exit test: jump to `label` on unsigned `counter >= bound`.
-    ///
-    /// Shared by all three x86 tiers — the counters are GPRs, so the vector
-    /// width does not reach this.
-    #[inline(always)]
-    pub(in crate::emit) fn branch_if_counter_done(
-        asm: &mut crate::emit::Assembly,
-        counter: Counter,
-        label: crate::emit::Label,
-    ) {
-        AsmProgram::from([Inst::Cmp {
-            lhs: counter_reg(counter),
-            rhs: bound_reg(counter),
-        }])
-        .assemble(&mut asm.code);
-        // The counter runs up to an unsigned bound, so "done" is `>=`.
-        asm.push(super::Jcc::jae(label));
-    }
-
-    #[inline(always)]
-    pub(in crate::emit) fn advance_out(code: &mut Vec<u8>, step: OutStep, vector_bytes: u32) {
-        match step {
-            OutStep::Batch => {
-                AsmProgram::from([Inst::AddImm8 {
-                    dst: RSI,
-                    imm: Imm8(vector_bytes as i8),
-                }])
-                .assemble(code);
-            }
-            OutStep::RowSkip => {
-                AsmProgram::from([Inst::Add { dst: RSI, src: R8 }]).assemble(code);
-            }
         }
     }
 }
@@ -1815,7 +1697,8 @@ pub(in crate::emit) mod scaffold {
 // scalar half of a gather — which is why the vocabulary below is nine
 // instructions rather than an assembler.
 
-/// SysV argument and scratch registers the emitted kernels use.
+/// The general registers the emitted kernels name. Which is *for* what is
+/// the register file's to say (`driver::SSE2_FILE`), not a constant's.
 pub mod gpr {
     use super::Gpr;
 
@@ -1824,25 +1707,22 @@ pub mod gpr {
     /// Scratch aliases for RAX.
     pub const AX: Gpr = RAX;
     pub const RX: Gpr = RAX;
-    /// 4th integer argument; the collapse loop's row count on entry.
+    /// Scratch; SysV's 4th integer argument, which the kernel ABI does not use.
     pub const RCX: Gpr = Gpr(1);
-    /// 3rd integer argument: group count.
+    /// 3rd integer argument: the pitch.
     pub const RDX: Gpr = Gpr(2);
-    /// 2nd integer argument: the output pointer, advanced per batch.
+    /// 2nd integer argument: the output plane.
     pub const RSI: Gpr = Gpr(6);
     /// 1st integer argument: the context pointer — the array of bound buffer
-    /// bases and the uniform block a gather or a uniform load reads its
-    /// slot from. Read-only for the whole kernel.
+    /// bases, then the uniform and origin blocks. Read-only for the whole
+    /// kernel.
     pub const RDI: Gpr = Gpr(7);
     /// The stack pointer.
     pub const RSP: Gpr = Gpr(4);
-    /// 5th integer argument: row-skip in bytes.
+    /// The extended registers, named for the encoders' tests.
     pub const R8: Gpr = Gpr(8);
-    /// Inner (batch) loop counter.
     pub const R9: Gpr = Gpr(9);
-    /// Preserved copy of the row count, away from `rcx`.
     pub const R10: Gpr = Gpr(10);
-    /// Outer (row) loop counter.
     pub const R11: Gpr = Gpr(11);
 }
 
@@ -2294,6 +2174,211 @@ fn patch_rel32(code: &mut [u8], pos: usize, target: usize) {
 }
 
 // =============================================================================
+// The store's address arithmetic and the iota, in the general file
+// =============================================================================
+
+/// `movabs dst, imm64` — `REX.W B8+rd io`.
+#[inline(always)]
+pub fn movabs(code: &mut Vec<u8>, dst: Gpr, imm: u64) {
+    code.push(0x48 | ((dst.0 >> 3) & 1));
+    code.push(0xB8 | (dst.0 & 7));
+    code.extend_from_slice(&imm.to_le_bytes());
+}
+
+/// `mov r32, imm32` — `B8+rd id`, zero-extended into the 64-bit register.
+#[inline(always)]
+pub fn mov_imm32(code: &mut Vec<u8>, dst: Gpr, imm: u32) {
+    if dst.0 >= 8 {
+        code.push(0x41);
+    }
+    code.push(0xB8 | (dst.0 & 7));
+    code.extend_from_slice(&imm.to_le_bytes());
+}
+
+/// `imul dst, src` — `REX.W 0F AF /r`, the two-operand 64-bit multiply.
+#[inline(always)]
+pub fn imul(code: &mut Vec<u8>, dst: Gpr, src: Gpr) {
+    code.extend_from_slice(&[rex_w(dst, src), 0x0F, 0xAF, modrm_rr(dst.0, src)]);
+}
+
+/// `lea dst, [base + index*4]` — `REX.W 8D /r` with a SIB: the element
+/// address of a plane of `f32`s, in one instruction.
+///
+/// `rbp`/`r13` have no `mod = 00` form as a SIB base (that encoding means
+/// "no base"), so those two take `mod = 01` with a zero `disp8`.
+#[inline(always)]
+pub fn lea_scaled4(code: &mut Vec<u8>, dst: Gpr, base: Gpr, index: Gpr) {
+    debug_assert!(index.0 & 7 != RM_SIB, "rsp/r12 cannot index a SIB");
+    let rex = 0x48 | (((dst.0 >> 3) & 1) << 2) | (((index.0 >> 3) & 1) << 1) | ((base.0 >> 3) & 1);
+    let disp8_form = base.0 & 7 == RM_RIP_AT_MOD0;
+    code.push(rex);
+    code.push(0x8D);
+    code.push(if disp8_form { 0x40 } else { 0x00 } | ((dst.0 & 7) << 3) | RM_SIB);
+    code.push((0b10 << 6) | ((index.0 & 7) << 3) | (base.0 & 7));
+    if disp8_form {
+        code.push(0);
+    }
+}
+
+/// `cvttss2si r64, xmm` — `F3 REX.W 0F 2C /r`: lane 0, truncated to a 64-bit
+/// integer. How a fold's binder, a broadcast `f32`, becomes an index.
+#[must_use]
+pub fn cvttss2si_xmm(dst: Gpr, src: Reg) -> EncodedInst {
+    let mut inst = EncodedInst::new();
+    inst.push(0xF3);
+    inst.push(rex_w(dst, Gpr(src.0)));
+    inst.extend(&[0x0F, 0x2C]);
+    inst.push(modrm_rr(dst.0, Gpr(src.0)));
+    inst
+}
+
+/// `cvttss2si r64, m32` — the same, reading the first word of a slot, so a
+/// binder the allocator left in memory costs no vector register to index by.
+#[must_use]
+pub fn cvttss2si_mem<D: Disp, P: BaseReg>(dst: Gpr, addr: Mem<D, P>) -> EncodedInst {
+    let mut inst = EncodedInst::new();
+    inst.push(0xF3);
+    inst.push(rex_w(dst, Gpr(addr.base.reg_num())));
+    inst.extend(&[0x0F, 0x2C]);
+    mem_operand_into(&mut inst, dst.0, addr);
+    inst
+}
+
+/// `movq xmm, r64` — `66 REX.W 0F 6E /r`: a GPR into the low two lanes, the
+/// upper two zeroed.
+#[must_use]
+pub fn movq_xmm_r64(dst: Reg, src: Gpr) -> EncodedInst {
+    let mut inst = EncodedInst::new();
+    inst.push(0x66);
+    inst.push(rex_w(Gpr(dst.0), src));
+    inst.extend(&[0x0F, 0x6E]);
+    inst.push(modrm_rr(dst.0, src));
+    inst
+}
+
+/// `movlhps dst, src` — `0F 16 /r`: `src`'s low two lanes into `dst`'s high
+/// two.
+#[must_use]
+pub fn movlhps(dst: Reg, src: Reg) -> EncodedInst {
+    sse_rr(&[0x0F, 0x16], dst, src)
+}
+
+/// `movss [addr], xmm` — `F3 0F 11 /r`: lane 0 alone.
+#[must_use]
+pub fn movss_store<D: Disp, P: BaseReg>(src: Reg, addr: Mem<D, P>) -> EncodedInst {
+    let mut inst = EncodedInst::new();
+    inst.push(0xF3);
+    let rex = 0x40 | (u8::from(src.0 >= 8) << 2) | u8::from(addr.base.reg_num() >= 8);
+    if rex != 0x40 {
+        inst.push(rex);
+    }
+    inst.extend(&[0x0F, 0x11]);
+    mem_operand_into(&mut inst, src.0, addr);
+    inst
+}
+
+/// `psrldq xmm, imm8` — `66 0F 73 /3 ib`: the whole register shifted right by
+/// `bytes`, so the next lane lands in lane 0 for a `movss`.
+#[must_use]
+pub fn psrldq_imm(reg: Reg, bytes: u8) -> EncodedInst {
+    let mut inst = EncodedInst::new();
+    inst.push(0x66);
+    if reg.0 >= 8 {
+        inst.push(0x41);
+    }
+    inst.extend(&[0x0F, 0x73]);
+    inst.push(0xC0 | (3 << 3) | (reg.0 & 7));
+    inst.push(bytes);
+    inst
+}
+
+#[cfg(test)]
+mod store_encoder_tests {
+    use super::gpr::*;
+    use super::*;
+
+    fn asm(f: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let mut c = Vec::new();
+        f(&mut c);
+        c
+    }
+
+    fn one(inst: EncodedInst) -> Vec<u8> {
+        asm(|c| AsmProgram::from([inst]).assemble(c))
+    }
+
+    /// Each encoding checked against the Intel SDM's form for that mnemonic.
+    #[test]
+    fn encodings_match_the_manual() {
+        // REX.W B8+rd io — MOV r64, imm64
+        assert_eq!(
+            asm(|c| movabs(c, RAX, 0x3F80_0000_0000_0000)),
+            [0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0x80, 0x3F]
+        );
+        assert_eq!(asm(|c| movabs(c, R9, 1))[..2], [0x49, 0xB9]);
+        // B8+rd id — MOV r32, imm32
+        assert_eq!(asm(|c| mov_imm32(c, RCX, 7)), [0xB9, 7, 0, 0, 0]);
+        assert_eq!(asm(|c| mov_imm32(c, R9, 7)), [0x41, 0xB9, 7, 0, 0, 0]);
+        // REX.W 0F AF /r — IMUL r64, r/m64
+        assert_eq!(asm(|c| imul(c, RAX, RDX)), [0x48, 0x0F, 0xAF, 0xC2]);
+        // REX.W 8D /r — LEA r64, [base + index*4]
+        assert_eq!(
+            asm(|c| lea_scaled4(c, RAX, RSI, RAX)),
+            [0x48, 0x8D, 0x04, 0x86]
+        );
+        assert_eq!(
+            asm(|c| lea_scaled4(c, RCX, Gpr(5), RCX)),
+            [0x48, 0x8D, 0x4C, 0x8D, 0x00],
+            "rbp as a base takes the disp8 form"
+        );
+        assert_eq!(
+            asm(|c| lea_scaled4(c, R9, RSI, R10))[0],
+            0x4E,
+            "REX.R and REX.X"
+        );
+        // F3 REX.W 0F 2C /r — CVTTSS2SI r64, xmm/m32
+        assert_eq!(
+            one(cvttss2si_xmm(RAX, Reg(3))),
+            [0xF3, 0x48, 0x0F, 0x2C, 0xC3]
+        );
+        assert_eq!(
+            one(cvttss2si_mem(
+                RCX,
+                Mem {
+                    base: RSP,
+                    disp: Imm32(16),
+                }
+            )),
+            [0xF3, 0x48, 0x0F, 0x2C, 0x8C, 0x24, 16, 0, 0, 0]
+        );
+        // 66 REX.W 0F 6E /r — MOVQ xmm, r64
+        assert_eq!(
+            one(movq_xmm_r64(Reg(1), RAX)),
+            [0x66, 0x48, 0x0F, 0x6E, 0xC8]
+        );
+        // 0F 16 /r — MOVLHPS
+        assert_eq!(one(movlhps(Reg(1), Reg(2))), [0x0F, 0x16, 0xCA]);
+        // F3 0F 11 /r — MOVSS m32, xmm
+        assert_eq!(
+            one(movss_store(
+                Reg(2),
+                Mem {
+                    base: RAX,
+                    disp: Imm8(4),
+                }
+            )),
+            [0xF3, 0x0F, 0x11, 0x50, 0x04]
+        );
+        // 66 0F 73 /3 ib — PSRLDQ xmm, imm8
+        assert_eq!(one(psrldq_imm(Reg(2), 4)), [0x66, 0x0F, 0x73, 0xDA, 0x04]);
+        assert_eq!(
+            one(psrldq_imm(Reg(10), 4)),
+            [0x66, 0x41, 0x0F, 0x73, 0xDA, 0x04]
+        );
+    }
+}
+
+// =============================================================================
 // Memory operands
 // =============================================================================
 
@@ -2429,8 +2514,6 @@ mod gpr_tests {
     }
 
     /// Each encoding checked against the Intel SDM's form for that mnemonic.
-    /// These are the exact bytes the collapse-loop scaffold used to spell
-    /// inline, which is what makes the replacement provably byte-identical.
     #[test]
     fn encodings_match_the_manual() {
         // REX.W 89 /r — MOV r/m64, r64

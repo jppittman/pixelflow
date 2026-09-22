@@ -34,8 +34,8 @@ fn fixture() -> (ExprArena, ExprId) {
     (a, cur)
 }
 
-fn arena_shape(arena: &ExprArena, root: ExprId) -> String {
-    format!("{root:?}|{:?}", arena.nodes_raw())
+fn arena_shape(arena: &ExprArena, root: ExprId) -> Vec<u8> {
+    pixelflow_ir::key::canonical(arena, root).key
 }
 
 fn optimize(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {

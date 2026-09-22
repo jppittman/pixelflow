@@ -26,7 +26,7 @@ const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf")
 
 /// Count reachable nodes matching `pred` from `root`.
 fn count_reachable(arena: &ExprArena, root: ExprId, pred: impl Fn(&ExprNode) -> bool) -> usize {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut seen = vec![false; len];
     let mut stack = vec![root];
     let mut count = 0;
@@ -34,7 +34,7 @@ fn count_reachable(arena: &ExprArena, root: ExprId, pred: impl Fn(&ExprNode) -> 
         if std::mem::replace(&mut seen[id.0 as usize], true) {
             continue;
         }
-        if pred(arena.node(id)) {
+        if pred(&arena.node(id)) {
             count += 1;
         }
         stack.extend(arena.children(id));
@@ -215,7 +215,7 @@ fn lowered_glyph_ops_are_all_egraph_representable() {
     let (arena, root) = glyph.kernel().linked_parts();
     let (lowered, lroot) = lower_dwrt_owned(&arena, root).expect("lower");
     let mut missing = std::collections::BTreeSet::new();
-    let len = lowered.nodes_raw().len();
+    let len = lowered.len();
     let mut seen = vec![false; len];
     let mut stack = vec![lroot];
     while let Some(id) = stack.pop() {
@@ -223,9 +223,9 @@ fn lowered_glyph_ops_are_all_egraph_representable() {
             continue;
         }
         let kind = match lowered.node(id) {
-            ExprNode::Unary(k, _) => Some(*k),
-            ExprNode::Binary(k, _, _) => Some(*k),
-            ExprNode::Ternary(k, _, _, _) => Some(*k),
+            ExprNode::Unary(k, _) => Some(k),
+            ExprNode::Binary(k, _, _) => Some(k),
+            ExprNode::Ternary(k, _, _, _) => Some(k),
             ExprNode::Param(i) => {
                 missing.insert(format!("Param({i})"));
                 None

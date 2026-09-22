@@ -57,6 +57,14 @@ impl Monoid {
     /// Mask `∧`, identity all-set — the universal quantifier over a bounded
     /// domain.
     pub const ALL: Self = Self(OpKind::BitAnd);
+    /// Sequencing, the **unit monoid**: combine is "then", identity is
+    /// nothing. The algebra a lattice's folds are over — rows, batches and
+    /// lanes wrapped around a [`Write`](crate::arena::ExprNode::Write)
+    /// (docs/plans/2026-09-16-collapse-is-a-fold.md §2.4). A fold over it
+    /// goes through the fold machinery unchanged; what its combine emits is
+    /// no bytes, and the accumulator it would seed with
+    /// [`identity`](Self::identity) is one nothing ever reads.
+    pub const SEQ: Self = Self(OpKind::Seq);
 
     /// The combining operation. Crate-private: the op set is an IR concept,
     /// and consumers name algebras, not opcodes.
@@ -144,10 +152,13 @@ impl Binder {
 ///
 /// `⟦Reduce { fold, body }⟧ = ⊕_{k ∈ lo, lo+s, lo+2s, …, hi-s} ⟦body⟧[fold.binder() := k]`
 ///
-/// `s` is [`Fold::stride`]: 1 until something calls [`Fold::halve`], the only
-/// thing that ever changes it. [`Fold::range`] still names the bounding
-/// `[lo, hi)`, which is why it is a poor stand-in for "every index visited"
-/// once the stride is not 1 — [`Fold::len`] is the count that stays exact.
+/// `s` is [`Fold::stride`]: 1 from [`Fold::new`], or whatever [`Fold::strided`]
+/// was given directly — `pack` strip-mining a lattice's column fold is the
+/// reason a second constructor exists at all. After construction, only
+/// [`Fold::halve`] ever changes it, by doubling. [`Fold::range`] still names
+/// the bounding `[lo, hi)`, which is why it is a poor stand-in for "every
+/// index visited" once the stride is not 1 — [`Fold::len`] is the count that
+/// stays exact.
 ///
 /// [`Reduce`]: crate::arena::ExprNode::Reduce
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -155,65 +166,69 @@ pub struct Fold {
     monoid: Monoid,
     binder: Binder,
     /// Half-open `[lo, hi)`, `lo <= hi` by construction.
-    lo: u16,
-    hi: u16,
-    /// The step between visited indices. `1` for every [`Fold::new`]; only
+    ///
+    /// `u32`, the width [`Fold::range`] speaks. These were `u16`, first "so
+    /// the two fit the node in the 16 bytes `ExprNode` is capped at" — a
+    /// width nothing depended on, made into a cap on how many terms a
+    /// reduction may have — and then because an unrolled fold could not
+    /// afford more copies of its body. A surviving `Reduce` is a loop now
+    /// (docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md), so a trip
+    /// count costs a counter, and the control plane is 64-bit: an extent
+    /// describing a program is not narrowed without a measurement asking.
+    lo: u32,
+    hi: u32,
+    /// The step between visited indices. `1` for every [`Fold::new`], or
+    /// whatever [`Fold::strided`] was constructed with. After that, only
     /// [`Fold::halve`] ever doubles it, and only when `hi - lo` stays an
-    /// exact multiple of it — an invariant [`Fold::new`] establishes
-    /// (`stride` starts at 1, which divides anything) and [`Fold::halve`]
-    /// preserves (it only fires on an even trip count, so the new stride
-    /// still divides `hi - lo` exactly). That invariant is what makes
-    /// [`Fold::len`] integer division rather than an approximation.
-    stride: u16,
+    /// exact multiple of it — an invariant [`Fold::strided`] checks directly
+    /// (it refuses a stride that does not divide the span), [`Fold::new`]
+    /// gets for free by going through it with a stride of 1 (which divides
+    /// anything), and [`Fold::halve`] preserves (it only fires on an even
+    /// trip count, so the new stride still divides `hi - lo` exactly). That
+    /// invariant is what makes [`Fold::len`] integer division rather than an
+    /// approximation.
+    stride: u32,
 }
 
 impl Fold {
-    /// The largest index a fold may run to.
-    ///
-    /// **A `Reduce` is not a loop**: the language is a DAG with no iteration
-    /// binder, so a fold that survives to codegen is emitted as `len()` copies
-    /// of its body. A trip count is therefore bounded by what one can afford
-    /// to *emit* — the e-graph's `max_classes` budget dies orders of magnitude
-    /// below this ceiling — and a range that does not fit is a program that
-    /// was never going to compile. [`Fold::new`] rejects it rather than
-    /// wrapping.
-    ///
-    /// This doc used to add "and the two ends fit the node in the 16 bytes
-    /// `ExprNode` is capped at", which was circular: that width was itself
-    /// only whatever the largest variant then needed, and nothing depends on
-    /// it (see `arena.rs`'s assertion). A number nothing depends on had become
-    /// a cap on how many terms a reduction may have.
-    ///
-    /// **The remaining reason is on its way out too.** Once a surviving
-    /// `Reduce` is emitted as a loop rather than unrolled
-    /// (docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md, stage 2c), a
-    /// large trip count costs a counter rather than `len()` copies, and the
-    /// "cannot afford to emit it" argument goes with it. Revisit `u16` then,
-    /// on its merits — not because of a byte budget.
-    pub const MAX_INDEX: u32 = u16::MAX as u32;
-
-    /// The fold of `monoid` over `range`, binding `binder`.
+    /// The fold of `monoid` over `range`, binding `binder`, visiting every
+    /// index in it — [`Fold::strided`] with a stride of `1`.
     ///
     /// # Panics
     ///
-    /// Panics if `range` is reversed or runs past [`Fold::MAX_INDEX`].
+    /// Panics if `range` is reversed.
     #[must_use]
     pub fn new(monoid: Monoid, binder: Binder, range: Range<u32>) -> Self {
+        Self::strided(monoid, binder, range, 1)
+    }
+
+    /// The fold of `monoid` over `range`, binding `binder`, visiting every
+    /// `stride`-th index from `range.start` — the strip-mining `pack` uses to
+    /// carve a lattice's column fold into a lane-width main fold and a
+    /// narrower remainder (docs/plans/2026-09-16-collapse-is-a-fold.md §2.3).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `range` is reversed, `stride` is `0`, or `stride` does not
+    /// divide `range.end - range.start` exactly — the invariant [`Fold::len`]
+    /// and [`Fold::from_bits`] both rely on.
+    #[must_use]
+    pub fn strided(monoid: Monoid, binder: Binder, range: Range<u32>, stride: u32) -> Self {
         assert!(
             range.start <= range.end,
             "a fold's range runs forwards: {range:?}"
         );
+        assert!(stride != 0, "a fold's stride must be nonzero");
         assert!(
-            range.end <= Self::MAX_INDEX,
-            "a fold over {range:?} would emit more than {} copies of its body",
-            Self::MAX_INDEX
+            (range.end - range.start).is_multiple_of(stride),
+            "a fold's stride must divide its span exactly: {range:?} step {stride}"
         );
         Self {
             monoid,
             binder,
-            lo: range.start as u16,
-            hi: range.end as u16,
-            stride: 1,
+            lo: range.start,
+            hi: range.end,
+            stride,
         }
     }
 
@@ -254,14 +269,15 @@ impl Fold {
     /// consecutive. [`Fold::len`] is the count that stays exact either way.
     #[must_use]
     pub fn range(self) -> Range<u32> {
-        u32::from(self.lo)..u32::from(self.hi)
+        self.lo..self.hi
     }
 
-    /// The step between one visited index and the next. `1` until
-    /// [`Fold::halve`] doubles it.
+    /// The step between one visited index and the next. `1` from
+    /// [`Fold::new`], or [`Fold::strided`]'s own argument; [`Fold::halve`] is
+    /// the only thing that doubles it afterward.
     #[must_use]
     pub fn stride(self) -> u32 {
-        u32::from(self.stride)
+        self.stride
     }
 
     /// How many terms the fold combines — the *trip count*, which
@@ -271,7 +287,7 @@ impl Fold {
     /// evaluated), never the span.
     #[must_use]
     pub fn len(self) -> u32 {
-        (u32::from(self.hi) - u32::from(self.lo)) / u32::from(self.stride)
+        (self.hi - self.lo) / self.stride
     }
 
     /// Whether the domain is empty — in which case the fold *is* its monoid's
@@ -299,7 +315,7 @@ impl Fold {
                 lo: self.lo + self.stride,
                 ..self
             };
-            (u32::from(self.lo), rest)
+            (self.lo, rest)
         })
     }
 
@@ -344,12 +360,12 @@ impl Fold {
     /// the combining opcode, which stays crate-private because the op set is
     /// an IR concept and a consumer names algebras.
     #[must_use]
-    pub fn to_bits(self) -> u64 {
-        u64::from(self.stride) << 48
-            | u64::from(self.monoid.op().index() as u8) << 40
-            | u64::from(self.binder.slot()) << 32
-            | u64::from(self.lo) << 16
-            | u64::from(self.hi)
+    pub fn to_bits(self) -> u128 {
+        u128::from(self.stride) << 80
+            | u128::from(self.monoid.op().index() as u8) << 72
+            | u128::from(self.binder.slot()) << 64
+            | u128::from(self.lo) << 32
+            | u128::from(self.hi)
     }
 
     /// The fold [`Fold::to_bits`] wrote, or `None` if the bits do not name
@@ -361,12 +377,12 @@ impl Fold {
     /// Total, so a corrupt cache key or a hand-written token stream is a
     /// `None` at the boundary rather than a fold that means something else.
     #[must_use]
-    pub fn from_bits(bits: u64) -> Option<Self> {
-        let stride = ((bits >> 48) & 0xffff) as u16;
-        let monoid = Monoid::of(OpKind::from_index(((bits >> 40) & 0xff) as usize)?)?;
-        let binder = Binder::from_slot(((bits >> 32) & 0xff) as u8)?;
-        let lo = ((bits >> 16) & 0xffff) as u16;
-        let hi = (bits & 0xffff) as u16;
+    pub fn from_bits(bits: u128) -> Option<Self> {
+        let stride = ((bits >> 80) & 0xffff_ffff) as u32;
+        let monoid = Monoid::of(OpKind::from_index(((bits >> 72) & 0xff) as usize)?)?;
+        let binder = Binder::from_slot(((bits >> 64) & 0xff) as u8)?;
+        let lo = ((bits >> 32) & 0xffff_ffff) as u32;
+        let hi = (bits & 0xffff_ffff) as u32;
         (lo <= hi && stride != 0 && (hi - lo).is_multiple_of(stride)).then_some(Self {
             monoid,
             binder,
@@ -396,7 +412,7 @@ impl Fold {
                 hi: self.hi - self.stride,
                 ..self
             };
-            (rest, u32::from(rest.hi))
+            (rest, rest.hi)
         })
     }
 }
@@ -451,11 +467,70 @@ mod tests {
         assert!(Fold::new(Monoid::SUM, b, lo..hi).is_empty());
     }
 
+    /// A trip count past what a `u16` held. A surviving fold is a loop, so
+    /// this costs a counter, not sixty-six thousand copies of a body.
     #[test]
-    #[should_panic(expected = "copies of its body")]
-    fn a_range_past_the_emit_ceiling_is_refused() {
+    fn a_range_past_sixteen_bits_is_a_fold_like_any_other() {
         let b = Binder::from_slot(0).expect("slot 0 exists");
-        assert!(Fold::new(Monoid::SUM, b, 0..Fold::MAX_INDEX + 1).is_empty());
+        let wide = Fold::new(Monoid::SUM, b, 1_000..1_000_000);
+        assert_eq!(wide.len(), 999_000);
+        assert_eq!(wide.range(), 1_000..1_000_000);
+        let halved = wide.halve().expect("an even trip count halves");
+        assert_eq!(halved.len(), 499_500);
+        let back = Fold::from_bits(wide.to_bits()).expect("a fold's own bits name a fold");
+        assert_eq!(back, wide);
+    }
+
+    /// The unit monoid: a fold over it is a loop whose combine says nothing.
+    #[test]
+    fn seq_is_a_monoid_whose_combine_is_sequencing() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        let fold = Fold::new(Monoid::SEQ, b, 0..4);
+        assert_eq!(fold.combine_op(), OpKind::Seq);
+        assert_eq!(fold.monoid(), Monoid::SEQ);
+        // The seed of an accumulator no combine ever reads.
+        assert_eq!(Monoid::SEQ.identity(), 0.0);
+        assert_eq!(Monoid::of(OpKind::Seq), Some(Monoid::SEQ));
+        let back = Fold::from_bits(fold.to_bits()).expect("a SEQ fold round-trips");
+        assert_eq!(back, fold);
+    }
+
+    #[test]
+    fn strided_builds_with_the_given_step() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        let fold = Fold::strided(Monoid::SUM, b, 0..12, 3);
+        assert_eq!(fold.stride(), 3);
+        assert_eq!(
+            fold.range(),
+            0..12,
+            "range() names the bound, not stride's steps"
+        );
+        assert_eq!(fold.len(), 4);
+        let back = Fold::from_bits(fold.to_bits()).expect("a strided fold's own bits name it");
+        assert_eq!(back, fold);
+    }
+
+    #[test]
+    #[should_panic(expected = "must divide")]
+    fn strided_refuses_a_stride_that_does_not_divide_the_span() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        assert!(!Fold::strided(Monoid::SUM, b, 0..10, 3).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "nonzero")]
+    fn strided_refuses_a_zero_stride() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        assert!(!Fold::strided(Monoid::SUM, b, 0..10, 0).is_empty());
+    }
+
+    #[test]
+    fn new_is_strided_with_a_stride_of_one() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        assert_eq!(
+            Fold::new(Monoid::SUM, b, 2..9),
+            Fold::strided(Monoid::SUM, b, 2..9, 1)
+        );
     }
 
     #[test]
@@ -594,31 +669,30 @@ mod tests {
         // Corrupt the stride field (bits 48..64) to 2, which does not divide
         // `5 - 0`: a fold that claims this would silently drop or duplicate
         // an index, so `from_bits` must refuse it rather than build one.
-        bits = (bits & !(0xffffu64 << 48)) | (2u64 << 48);
+        bits = (bits & !(0xffff_ffffu128 << 80)) | (2u128 << 80);
         assert_eq!(Fold::from_bits(bits), None);
     }
 
     /// `ExprNode`'s crate-wide budget (see the static assertion in
     /// `arena.rs`) is a ceiling every variant shares, not a per-variant
     /// promise — it grew from 16 to 24 when `Guard` arrived with two
-    /// `KernelKey`s, and `Reduce`'s own contribution (a `Fold` plus one
-    /// `ExprId`) is untouched by that move. Pinned here as a byte count
-    /// rather than left to the crate-wide assertion alone, so a future field
-    /// that also fits the crate-wide check but pushes `Fold` itself past
-    /// what a `Reduce` node ought to need fails here with a number, not
-    /// just "too big".
+    /// `KernelKey`s, and a `Fold` with `u32` ends fits a `Reduce` node in
+    /// that same 24. Pinned here as a byte count rather than left to the
+    /// crate-wide assertion alone, so a future field that also fits the
+    /// crate-wide check but pushes `Fold` itself past what a `Reduce` node
+    /// ought to need fails here with a number, not just "too big".
     #[test]
-    fn fold_and_expr_node_stay_within_the_sixteen_byte_budget() {
+    fn fold_and_expr_node_stay_within_the_node_budget() {
         assert_eq!(
             core::mem::size_of::<Fold>(),
-            8,
-            "Fold: monoid(1) + binder(1) + lo(2) + hi(2) + stride(2), no padding"
+            16,
+            "Fold: monoid(1) + binder(1) + pad(2) + lo(4) + hi(4) + stride(4)"
         );
         assert!(
-            core::mem::size_of::<Fold>() + core::mem::size_of::<crate::arena::ExprId>() <= 16,
-            "a Reduce node is a Fold plus one ExprId, and stays small on its \
-             own — this is a fact about Reduce, not a budget Fold's fields \
-             were chosen to meet; see MAX_INDEX"
+            core::mem::size_of::<Fold>() + core::mem::size_of::<crate::arena::ExprId>() <= 24,
+            "a Reduce node is a Fold plus one ExprId, and fits the width a \
+             Guard already needs — a fact about Reduce, not a budget Fold's \
+             fields were chosen to meet"
         );
         assert!(
             core::mem::size_of::<crate::arena::ExprNode>() <= 32,

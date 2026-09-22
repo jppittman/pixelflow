@@ -71,6 +71,29 @@ impl fmt::Debug for Id {
     }
 }
 
+impl Id {
+    /// This id's dense position — the same integer [`Node::index`] reads
+    /// off a handle at this position.
+    ///
+    /// `pub(crate)`, not part of the withholding [`fmt::Debug`] respects:
+    /// a representation that keeps its own *translated* public handle over
+    /// this crate's boundary — [`ExprArena`](crate::arena::ExprArena)'s
+    /// `ExprId`, dense from zero in exactly this same order — needs to
+    /// convert one of its handles into an `Id` to grow the `Dag` further,
+    /// and back into its own handle to hand out. Ordinary consumers reach
+    /// the DAG through [`Node`], never through this.
+    pub(crate) fn index(self) -> u32 {
+        self.0
+    }
+
+    /// The id at dense position `ix` — the inverse of [`Self::index`], for
+    /// the same translated-handle reason. Does not check `ix` against any
+    /// `Dag`; the caller's own translated handle already came from one.
+    pub(crate) fn from_index(ix: u32) -> Self {
+        Self(ix)
+    }
+}
+
 struct Slot<T> {
     value: T,
     edge_start: u32,
@@ -154,6 +177,22 @@ impl<T> Dag<T> {
         }
     }
 
+    /// Truncate to zero nodes without deallocating backing storage — the
+    /// same "ready for reuse" shape
+    /// [`ExprArena::clear`](crate::arena::ExprArena::clear) already
+    /// promised before it was `Builder`-backed, for a caller (a generator
+    /// clearing its scratch arena once per draw) that reuses one `Dag`
+    /// across many builds rather than allocating a fresh one each time.
+    ///
+    /// Mints a new identity: an old `Scratch`/`SideTable` sized for the
+    /// pre-clear node count must not silently be accepted by the
+    /// post-clear (and generally smaller) one.
+    pub(crate) fn clear(&mut self) {
+        self.identity = DagIdentity::mint();
+        self.nodes.clear();
+        self.edges.clear();
+    }
+
     /// Add a node whose children already exist. Panics on a foreign or
     /// not-yet-created child, which is the only way a cycle could appear.
     fn push(&mut self, value: T, children: &[Id]) -> Id {
@@ -195,6 +234,25 @@ impl<T> Dag<T> {
         }
         self.iter().filter(move |n| !has_parent[n.ix as usize])
     }
+
+    /// The node at dense position `ix` — [`Id::index`]/[`Node::index`]'s
+    /// inverse, for the same translated-handle reason
+    /// ([`ExprArena`](crate::arena::ExprArena)'s `ExprId`): a caller
+    /// holding one of those needs to look a node up by the bare integer it
+    /// carries, which [`iter`](Self::iter)/[`roots`](Self::roots) do not
+    /// offer (they hand out `Node`s, never take one back by position).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ix >= self.len()`.
+    pub(crate) fn get(&self, ix: u32) -> Node<'_, T> {
+        assert!(
+            (ix as usize) < self.nodes.len(),
+            "Dag::get: {ix} is out of bounds for {} nodes",
+            self.nodes.len()
+        );
+        Node { dag: self, ix }
+    }
 }
 
 /// A node, borrowed. This is the whole consumption surface.
@@ -224,7 +282,12 @@ impl<'a, T> Node<'a, T> {
         self.dag
     }
 
-    fn ix(self) -> u32 {
+    /// This node's dense position in its `Dag` — [`Id::index`]'s inverse,
+    /// for the same translated-handle reason
+    /// ([`ExprArena`](crate::arena::ExprArena)'s `ExprId`). Ordinary
+    /// consumers never need this: a `Node` is already the handle, and
+    /// `descendants`/`children`/equality all work from it directly.
+    pub(crate) fn index(self) -> u32 {
         self.ix
     }
 
@@ -396,6 +459,22 @@ pub(crate) struct Builder<T: Key> {
     memo: Memo<(T, Vec<u32>), u32>,
 }
 
+// Manual, like `Dag<T>`'s own: a clone's `dag` mints a new identity (see
+// `Dag`'s `Clone` impl), and the memo clones in lockstep since its `u32`
+// values are dense positions into that same `dag`, meaningful only paired
+// with it. A representation that keeps a `Builder` growing across many
+// calls — `ExprArena` — clones the whole arena the way every `Kernel`
+// combinator already does (composition is "fresh graph, splice, done"),
+// so this has to exist for that `#[derive(Clone)]` to keep working.
+impl<T: Key> Clone for Builder<T> {
+    fn clone(&self) -> Self {
+        Builder {
+            dag: self.dag.clone(),
+            memo: self.memo.clone(),
+        }
+    }
+}
+
 impl<T: Key> Default for Builder<T> {
     fn default() -> Self {
         Self::new()
@@ -421,6 +500,25 @@ impl<T: Key> Builder<T> {
             },
             memo: Memo::new(),
         }
+    }
+
+    /// Read access to what has been built so far, before [`Self::finish`].
+    ///
+    /// A representation that grows a `Dag` incrementally over its own
+    /// public API calls, rather than accumulating everything and finishing
+    /// once — [`ExprArena`](crate::arena::ExprArena) is the one today —
+    /// needs to look a node up (by [`Dag::get`], keyed by its own
+    /// translated handle) between pushes, which nothing on `Builder`
+    /// itself offers.
+    pub(crate) fn dag(&self) -> &Dag<T> {
+        &self.dag
+    }
+
+    /// Truncate to zero nodes without deallocating backing storage, and
+    /// forget every interned key. See [`Dag::clear`].
+    pub(crate) fn clear(&mut self) {
+        self.dag.clear();
+        self.memo.clear();
     }
 
     pub(crate) fn intern(&mut self, value: T, children: &[Id]) -> Id {
@@ -601,7 +699,7 @@ impl<V> SideTable<V> {
             n.dag.identity, self.owner,
             "side table used with a node from another DAG"
         );
-        n.ix() as usize
+        n.index() as usize
     }
 
     #[must_use]

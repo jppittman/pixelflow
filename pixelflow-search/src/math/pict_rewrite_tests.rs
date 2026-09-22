@@ -102,7 +102,7 @@ fn pairwise(level_counts: &[usize]) -> Vec<Vec<usize>> {
 // ============================================================================
 
 fn expr_to_egraph(arena: &ExprArena, id: ExprId, egraph: &mut EGraph) -> crate::egraph::EClassId {
-    match *arena.node(id) {
+    match arena.node(id) {
         ExprNode::Var(idx) => egraph.add(ENode::Var(idx)),
         ExprNode::Const(val) => egraph.add(ENode::Const(val.to_bits())),
         ExprNode::Ref(k) => panic!("Ref({k:?}) reached the pict rewrite tests"),
@@ -110,6 +110,7 @@ fn expr_to_egraph(arena: &ExprArena, id: ExprId, egraph: &mut EGraph) -> crate::
         ExprNode::Guard { .. } => {
             panic!("a Guard reached the pict rewrite tests (G1: never chosen)")
         }
+        ExprNode::Write { .. } => panic!("a Write reached the pict rewrite tests"),
         ExprNode::Unary(kind, a) => {
             let ca = expr_to_egraph(arena, a, egraph);
             let op = crate::egraph::ops::op_from_kind(kind).expect("op");
@@ -161,7 +162,7 @@ fn expr_to_egraph(arena: &ExprArena, id: ExprId, egraph: &mut EGraph) -> crate::
 /// a test oracle, never a runtime path.
 fn eval_arena(arena: &ExprArena, id: ExprId, vars: &[f32; 4]) -> f32 {
     let rec = |c| eval_arena(arena, c, vars);
-    match *arena.node(id) {
+    match arena.node(id) {
         ExprNode::Var(i) => vars[i as usize],
         ExprNode::Const(c) => c,
         ExprNode::Unary(op, a) => exact_unary(op, rec(a)),

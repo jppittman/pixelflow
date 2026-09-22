@@ -143,7 +143,6 @@ struct FailureRecord<'a> {
 fn bench_error_reason(e: &BenchError) -> &'static str {
     match e {
         BenchError::CompileFailed(_) => "compile_failed",
-        BenchError::UnsupportedArch => "unsupported_arch",
         BenchError::InvalidMeasurement(_) => "invalid_measurement",
     }
 }

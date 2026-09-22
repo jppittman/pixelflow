@@ -189,9 +189,8 @@ fn binder_weighted_sum_over_reads_every_column_exactly() {
 /// `extent` inlined copies of its body — each with the binder substituted as
 /// a distinct `Const`, which is what let the following `expand_gather` see a
 /// constant index — and the node count scaled with the extent. Codegen emits
-/// a surviving fold as a loop now, so legalization unrolls only a `Reduce`
-/// nested inside another's body (`expand_nested_reduce`), and a bare one like
-/// this reaches the assembler folded.
+/// a surviving fold as a loop now, nested or not, so legalization unrolls
+/// nothing and a `Reduce` reaches the assembler folded.
 ///
 /// Two extents, because a count that is merely *small* proves nothing: the
 /// claim is that the arena is the **same size** at extent 3 and extent 16,
@@ -213,23 +212,34 @@ fn legalize_keeps_a_bare_reduce_and_its_size_does_not_track_the_extent() {
         let (_binding, table) = bind_table();
         let kernel = Kernel::sum_over(extent, |i| table.at(&Kernel::constant(0.0), i));
         let (arena, root) = kernel.parts();
-        let before = arena.nodes_raw().len();
-        let (legalized, new_root) = pixelflow_ir::passes::legalize(arena, root).expect("legalize");
-        let after = legalized.nodes_raw().len();
-        // From the root, not over `nodes_raw`: each rewrite appends and leaves
+        let before = arena.len();
+        // Legalized for a lattice, as a compile does: the lattice's own folds
+        // are wrapped around the kernel here, and every one of them is a
+        // `Monoid::SEQ` fold, which is how the count below tells them apart
+        // from the kernel's.
+        let collapse = pixelflow_ir::passes::lattice::Collapse {
+            domain: pixelflow_ir::passes::lattice::Domain {
+                shape: pixelflow_ir::LatticeShape::new([1, 1]),
+                origin: pixelflow_codegen::emit::origin(),
+            },
+            lanes: 4,
+        };
+        let (legalized, new_root) =
+            pixelflow_ir::passes::legalize(arena, root, &collapse).expect("legalize");
+        let after = legalized.len();
+        // From the root, not over every node: each rewrite appends and leaves
         // what it replaced behind, so the raw array still holds the pre-pass
         // `Reduce` as garbage. Reachability is the question being asked.
-        let mut seen = vec![false; legalized.nodes_raw().len()];
+        let mut seen = vec![false; legalized.len()];
         let mut stack = vec![new_root];
         let mut reduces = 0usize;
         while let Some(id) = stack.pop() {
             if std::mem::replace(&mut seen[id.0 as usize], true) {
                 continue;
             }
-            if matches!(
-                legalized.node(id),
-                pixelflow_ir::arena::ExprNode::Reduce { .. }
-            ) {
+            if let pixelflow_ir::arena::ExprNode::Reduce { fold, .. } = legalized.node(id)
+                && fold.monoid() != pixelflow_ir::fold::Monoid::SEQ
+            {
                 reduces += 1;
             }
             stack.extend(legalized.children(id));
@@ -258,4 +268,70 @@ fn legalize_keeps_a_bare_reduce_and_its_size_does_not_track_the_extent() {
         "legalized size tracks the extent ({TABLE_ROWS} -> {after_3}, \
          {WIDE_EXTENT} -> {after_16}) -- the body is being copied per trip"
     );
+}
+
+/// `Σ_{row} table[row][col] · (row + 1) · Σ_{w<3} w`, by plain host iteration,
+/// which is what the nested kernel below denotes: the outer fold weights each
+/// row's read by the inner fold, and the inner fold reads the outer binder.
+fn host_column_nested_sum(col: usize) -> f32 {
+    TABLE
+        .iter()
+        .enumerate()
+        .map(|(row, cols)| {
+            let inner: f32 = (0..3).map(|w| (row as f32 + 1.0) * w as f32).sum();
+            cols[col] * inner
+        })
+        .sum()
+}
+
+/// A fold inside a fold, reading a bound table at the outer binder and the
+/// outer binder again inside the inner body, reaches the numbers through the
+/// whole compiled path — `Kernel::over` twice, `legalize` leaving both
+/// standing, codegen emitting a loop inside a loop.
+///
+/// `Σ_{row} table[row][col] · Σ_{w<3} (row + 1)·w`, at every column.
+#[test]
+fn a_nested_sum_over_reads_every_column_exactly() {
+    for col in 0..TABLE_COLS {
+        let (binding, table) = bind_table();
+        let kernel = Kernel::sum_over(TABLE_ROWS as u32, |row| {
+            let read = table.at(&Kernel::constant(col as f32), row);
+            let row_plus_one = row.add(&Kernel::constant(1.0));
+            let inner = Kernel::sum_over(3, |w| row_plus_one.mul(w));
+            read.mul(&inner)
+        });
+        let got = collapse_scalar(&kernel, binding);
+        let want = host_column_nested_sum(col);
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "nested sum_over column {col}: got {got}, want {want}"
+        );
+    }
+}
+
+/// A second composition of a table kernel, at a second lattice, reads its
+/// *own* table. The optimizer saturates a structure once and shares that
+/// across compositions and shapes; what each gets back is the term in its
+/// own names, or it would gather from the first composition's memory. Every
+/// sample of the lattice, since the kernel varies with neither axis.
+#[test]
+fn a_second_composition_at_a_second_shape_reads_its_own_table() {
+    for col in 0..TABLE_COLS {
+        let (binding, table) = bind_table();
+        let kernel = Kernel::sum_over(TABLE_ROWS as u32, |i| {
+            table.at(&Kernel::constant(col as f32), i).mul(i)
+        });
+        let program = Manifold::compile(&kernel, [3, 2]);
+        let bound = program.bind(&[binding]);
+        let out = Lattice::frame(3, 2).collapse(&bound);
+        let want = host_column_weighted_sum(col);
+        for (k, got) in out.buffer().iter().enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "column {col}, sample {k}: got {got}, want {want}"
+            );
+        }
+    }
 }

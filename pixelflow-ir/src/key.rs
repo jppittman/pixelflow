@@ -161,7 +161,7 @@ pub struct Canonical {
 /// one shape share code.
 #[must_use]
 pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut reachable = vec![false; len];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -199,7 +199,7 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
         match arena.node(ExprId(idx as u32)) {
             ExprNode::Var(i) => {
                 key.push(0);
-                key.push(*i);
+                key.push(i);
             }
             ExprNode::Const(v) => {
                 key.push(1);
@@ -207,39 +207,41 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
             }
             ExprNode::Param(i) => {
                 key.push(2);
-                key.push(*i);
+                key.push(i);
             }
             ExprNode::Unary(op, a) => {
                 key.push(3);
                 key.extend_from_slice(&op.marshal().to_bytes());
-                push_id(&mut key, &dense, *a);
+                push_id(&mut key, &dense, a);
             }
             ExprNode::Binary(op, a, b) => {
                 key.push(4);
                 key.extend_from_slice(&op.marshal().to_bytes());
-                push_id(&mut key, &dense, *a);
-                push_id(&mut key, &dense, *b);
+                push_id(&mut key, &dense, a);
+                push_id(&mut key, &dense, b);
             }
             ExprNode::Ternary(op, a, b, c) => {
                 key.push(5);
                 key.extend_from_slice(&op.marshal().to_bytes());
-                push_id(&mut key, &dense, *a);
-                push_id(&mut key, &dense, *b);
-                push_id(&mut key, &dense, *c);
+                push_id(&mut key, &dense, a);
+                push_id(&mut key, &dense, b);
+                push_id(&mut key, &dense, c);
             }
-            ExprNode::Nary(op, start, n) => {
+            ExprNode::Nary(op, _) => {
+                let children = arena.children(ExprId(idx as u32));
+                let n = u16::try_from(children.len())
+                    .expect("push_nary already asserted children.len() <= u16::MAX");
                 key.push(6);
                 key.extend_from_slice(&op.marshal().to_bytes());
                 key.extend_from_slice(&n.to_le_bytes());
-                let (s, l) = (*start as usize, *n as usize);
-                for child in &arena.nary_children_raw()[s..s + l] {
-                    push_id(&mut key, &dense, *child);
+                for child in children {
+                    push_id(&mut key, &dense, child);
                 }
             }
             // Slot by first occurrence, extents in the key: the code folds
             // its address arithmetic against them.
             ExprNode::Buffer(b) => {
-                let decl = *arena.buffer_decl(*b);
+                let decl = *arena.buffer_decl(b);
                 key.push(7);
                 key.extend_from_slice(&dense_slot(&mut buffers, decl).to_le_bytes());
                 key.extend_from_slice(&decl.width.to_le_bytes());
@@ -248,7 +250,7 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
             // Offset by first occurrence; the default is the block's
             // business, not the code's.
             ExprNode::Uniform(u) => {
-                let decl = *arena.uniform_decl(*u);
+                let decl = *arena.uniform_decl(u);
                 key.push(8);
                 key.extend_from_slice(&dense_slot(&mut uniforms, decl).to_le_bytes());
             }
@@ -266,7 +268,7 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
             ExprNode::Reduce { fold, body } => {
                 key.push(10);
                 key.extend_from_slice(&fold.to_bits().to_le_bytes());
-                push_id(&mut key, &dense, *body);
+                push_id(&mut key, &dense, body);
             }
             // The mask is a real child, densified like any other; `on` and
             // `off` are content-addressed names, keyed the same way `Ref`
@@ -275,9 +277,22 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
             // either side is a different key.
             ExprNode::Guard { mask, on, off } => {
                 key.push(11);
-                push_id(&mut key, &dense, *mask);
+                push_id(&mut key, &dense, mask);
                 key.extend_from_slice(&on.bits().to_le_bytes());
                 key.extend_from_slice(&off.bits().to_le_bytes());
+            }
+            // The value is a real child; the three binders are metadata in
+            // the tag bytes, as a fold's is: a store of the same value
+            // under different binders is a different program.
+            ExprNode::Write {
+                row,
+                col,
+                lane,
+                value,
+            } => {
+                key.push(12);
+                push_id(&mut key, &dense, value);
+                key.extend_from_slice(&[row.slot(), col.slot(), lane.slot()]);
             }
         }
         dense[idx] = next;
@@ -295,6 +310,58 @@ pub fn canonical(arena: &ExprArena, root: ExprId) -> Canonical {
 mod tests {
     use super::*;
     use crate::kind::OpKind;
+
+    /// Pins `canonical`'s bytes for a root that reaches an `Nary` node — the
+    /// one shape whose encoding could drift when its children stop coming
+    /// from a raw slab offset (Stage A,
+    /// docs/plans/2026-09-09-exprarena-on-dag.md) and its node stops naming
+    /// one at all (Stage B). The expected bytes were captured from
+    /// `canonical`'s Stage-A output, itself checked byte-for-byte against an
+    /// oracle built the pre-Stage-A raw-offset way (see that commit); Stage B
+    /// changes only where `Nary`'s children live in the type, never what
+    /// `canonical` computes, so this must keep reading back unchanged.
+    #[test]
+    fn nary_canonical_bytes_are_pinned() {
+        let mut arena = ExprArena::new();
+        let v0 = arena.push_var(0);
+        let v1 = arena.push_var(1);
+        let c = arena.push_const(2.0);
+        // A second Nary node makes the first's slab position nonzero, which
+        // is what would expose an off-by-one in the child slice.
+        let inner = arena.push_nary(OpKind::Tuple, &[v0, c]);
+        let root = arena.push_nary(OpKind::Tuple, &[v1, inner, v0]);
+
+        #[rustfmt::skip]
+        let expected: &[u8] = &[
+            // v0 = Var(0)
+            0, 0,
+            // v1 = Var(1)
+            0, 1,
+            // c = Const(2.0)
+            1, 0, 0, 0, 0x40,
+            // inner = Nary(Tuple, [v0, c]) -> dense [0, 2]
+            6, 37, 2, 0, 0, 0, 0, 0, 2, 0, 0, 0,
+            // root = Nary(Tuple, [v1, inner, v0]) -> dense [1, 3, 0]
+            6, 37, 3, 0, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(canonical(&arena, root).key, expected);
+    }
+
+    /// A store of one value under different binders is a different program,
+    /// and the key says so from the tag bytes alone.
+    #[test]
+    fn a_write_under_different_binders_is_a_different_key() {
+        use crate::fold::Binder;
+        let slot = |s: u8| Binder::from_slot(s).expect("a binder slot");
+        let (row, col, lane) = (slot(0), slot(1), slot(2));
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let one = a.push_write(row, col, lane, x);
+        let other = a.push_write(col, row, lane, x);
+        let same = a.push_write(row, col, lane, x);
+        assert_ne!(canonical(&a, one).key, canonical(&a, other).key);
+        assert_eq!(canonical(&a, one).key, canonical(&a, same).key);
+    }
 
     /// `√(x² + y²)`, optionally preceded by unreachable construction garbage.
     fn circle(garbage: bool) -> (ExprArena, ExprId) {
@@ -338,8 +405,8 @@ mod tests {
         let (clean, rc) = circle(false);
         let (littered, rl) = circle(true);
         assert_ne!(
-            clean.nodes_raw().len(),
-            littered.nodes_raw().len(),
+            clean.len(),
+            littered.len(),
             "the littered arena must actually hold more nodes"
         );
         assert_ne!(rc, rl, "and its root must sit at a different id");

@@ -213,6 +213,35 @@ fn a_guard_is_declined_by_every_vocabulary() {
     }
 }
 
+/// A `Write` is declined for a standing reason: an effect is not a value
+/// any rule may rewrite, and the legalize passes build one *after*
+/// extraction (docs/plans/2026-09-16-collapse-is-a-fold.md §2.4), so a term
+/// carrying one into saturation skipped the pipeline. `Seq`, the unit
+/// monoid's combine, is declined as an op no vocabulary resolves.
+#[test]
+fn a_write_and_a_seq_are_declined_by_every_vocabulary() {
+    let (arena, write) = pixelflow_ir::internal_test_support::write_fixture();
+    let mut seq_arena = ExprArena::new();
+    let x = seq_arena.push_var(0);
+    let y = seq_arena.push_var(1);
+    let seq = seq_arena.push_binary(OpKind::Seq, x, y);
+
+    for vocab in [Vocabulary::Runtime, Vocabulary::Templates] {
+        let mut eg = EGraph::new();
+        assert_eq!(
+            insert(&arena, write, &mut eg, vocab),
+            Err(Declined::Write),
+            "{vocab:?} must decline a Write"
+        );
+        let mut eg = EGraph::new();
+        assert_eq!(
+            insert(&seq_arena, seq, &mut eg, vocab),
+            Err(Declined::Op(OpKind::Seq)),
+            "{vocab:?} must decline Seq"
+        );
+    }
+}
+
 /// And the runtime tier as a whole does not decline it: `ExpandRefs` runs
 /// first, so what reaches the e-graph is the referent's body and the kernel
 /// optimizes exactly as the spliced composition does.
@@ -268,7 +297,9 @@ fn project_then_embed_round_trips() {
 }
 
 /// `embed` owns buffer declaration: one slot per distinct identity, however
-/// many leaves name it.
+/// many leaves name it — and, because the arena hash-conses, two leaves
+/// naming the *same* identity are the same value (`Buffer(slot)`, slot equal
+/// both times) and so land on the very same node, not merely the same slot.
 #[test]
 fn embed_declares_one_slot_per_buffer_identity() {
     let decl = BufferDecl {
@@ -284,7 +315,11 @@ fn embed_declares_one_slot_per_buffer_identity() {
         1,
         "one identity must claim exactly one slot"
     );
-    assert_ne!(a, b, "each leaf is its own node, sharing one slot");
+    assert_eq!(
+        a, b,
+        "two Buffer leaves over the same identity are structurally identical \
+         (the same slot both times), so hash-consing interns them to one node"
+    );
 }
 
 /// Projection reports the arity the node actually has, so a caller rebuilding

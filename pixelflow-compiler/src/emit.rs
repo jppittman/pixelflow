@@ -169,25 +169,25 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
                 )
             }
             pixelflow_ir::arena::ExprNode::Unary(op, child) => {
-                let op_code = opkind_to_tokens(*op);
+                let op_code = opkind_to_tokens(op);
                 let child_ident = format_ident!("__e{}", child.0);
                 quote! { __arena.push_unary(#op_code, #child_ident) }
             }
             pixelflow_ir::arena::ExprNode::Binary(op, a, b) => {
-                let op_code = opkind_to_tokens(*op);
+                let op_code = opkind_to_tokens(op);
                 let a_ident = format_ident!("__e{}", a.0);
                 let b_ident = format_ident!("__e{}", b.0);
                 quote! { __arena.push_binary(#op_code, #a_ident, #b_ident) }
             }
             pixelflow_ir::arena::ExprNode::Ternary(op, a, b, c) => {
-                let op_code = opkind_to_tokens(*op);
+                let op_code = opkind_to_tokens(op);
                 let a_ident = format_ident!("__e{}", a.0);
                 let b_ident = format_ident!("__e{}", b.0);
                 let c_ident = format_ident!("__e{}", c.0);
                 quote! { __arena.push_ternary(#op_code, #a_ident, #b_ident, #c_ident) }
             }
             pixelflow_ir::arena::ExprNode::Nary(op, ..) => {
-                let op_code = opkind_to_tokens(*op);
+                let op_code = opkind_to_tokens(op);
                 let child_idents: Vec<_> = arena
                     .children(id)
                     .map(|c| format_ident!("__e{}", c.0))
@@ -221,6 +221,15 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
                     "kernel! produced ExprNode::Guard(mask={mask:?}, on={on:?}, off={off:?}) \
                      — there is no surface syntax for a hard branch yet; it is built directly \
                      against an ExprArena, not lowered from a kernel! body"
+                )
+            }
+            // A store is post-legalize vocabulary: the passes that wrap a
+            // kernel in the lattice's folds build one, after extraction,
+            // and no kernel! body can spell it.
+            pixelflow_ir::arena::ExprNode::Write { .. } => {
+                panic!(
+                    "kernel! produced ExprNode::Write — a store has no surface syntax; \
+                     the legalize passes build one after extraction"
                 )
             }
         };

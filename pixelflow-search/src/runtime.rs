@@ -24,21 +24,26 @@
 //!
 //! # Saturation telemetry
 //!
-//! Build with `--features saturation-telemetry` to have every call here emit
-//! one JSONL record of its saturation run (budget, stop reason, cost, wall
-//! clock — see [`crate::telemetry`]). Point it at a file with
+//! Build with `--features saturation-telemetry` to have every *saturation*
+//! here emit one JSONL record (budget, stop reason, cost, wall clock — see
+//! [`crate::telemetry`]); a call that extracts from a structure already
+//! saturated records nothing. Point it at a file with
 //! `PIXELFLOW_SATURATION_TELEMETRY=/path/to/log.jsonl cargo run --features saturation-telemetry`,
 //! or leave it unset to see records on stderr.
 
-use crate::egraph::{EClassId, EGraph, ENode, Optimizer};
-use crate::saturate_pass::Saturate;
+use crate::egraph::{
+    EClassId, EGraph, ENode, Optimizer, OptimizerStats, RuleSet, Vocabulary, insert,
+    reachable_count,
+};
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, ExprNode};
+use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, ExprNode, UniformDecl};
+use pixelflow_ir::key::{Canonical, canonical};
 use pixelflow_ir::optimize::{Identity, Optimize};
-use pixelflow_ir::passes::{ExpandNestedReduce, ExpandRefs, LowerDwrt};
+use pixelflow_ir::passes::{ExpandRefs, LowerDwrt};
 use pixelflow_ir::pipeline;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Optimize a runtime-built arena via bounded e-graph saturation, through
@@ -72,151 +77,258 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// hash-consed by identity, redeclared by extraction. Nothing folds one.
 ///
 /// Callers compile the original arena unchanged in that case — `optimize_runtime_arena`
-/// is strictly an optimization, never required for correctness.
+/// is strictly an optimization, never required for correctness. The
+/// declining is memoized by structure like a result is.
 ///
-/// `shape` is the extent of the lattice the kernel is compiled for. It is
-/// part of the cache key and is consulted by no rewrite yet (stage 0′ of
-/// `docs/plans/2026-09-01-loop-aware-codegen.md`), so that extent-weighted
-/// extraction (stage 1) is a policy change here and a signature change
-/// nowhere. Saturation does not depend on it; when stage 1 lands, this cache
-/// should hold the saturated e-graph per structure and extract per extent.
+/// # One saturation per structure, one extraction per lattice
 ///
-/// Cached by the structural shape of the reachable subgraph (mirroring
-/// `pixelflow_codegen::jit_cache`'s own canonical-key cache): a caller that bakes
-/// the same `Kernel` across many frames — every glyph, on the common path
-/// through `GlyphCache` — pays saturation once, not once per bake. Skipping
-/// this cache would make `optimize_runtime_arena` slower than not optimizing
-/// at all for any repeatedly-baked kernel, since the JIT compile it feeds is
-/// itself cached downstream.
+/// Saturation does not depend on `shape`: the rules, the budget (a function
+/// of the input's size) and the graph they produce are the same at every
+/// extent. Extraction does — [`Optimizer::for_lattice`] prices a node by how
+/// many times the loop nest evaluates it, so the term that is cheapest at
+/// one extent need not be at another. So the cache here holds the
+/// **saturated e-graph**, keyed on the structure of the reachable subgraph,
+/// and extracts from it for every `shape` asked. A second band height, a
+/// resized frame, a glyph at another tile: an extraction (milliseconds),
+/// not a saturation (seconds).
 ///
-/// The cached value is `Arc`-wrapped for the same reason `jit_cache` hands
-/// back `Arc<CompiledKernel>` rather than owned code: a hit must be an atomic
-/// refcount bump, not a deep clone of the (potentially large — real glyph
-/// arenas run to thousands of nodes once construction garbage is counted)
-/// optimized `ExprArena`. Returning an owned tuple here would silently
-/// reintroduce a per-call cost the cache exists to eliminate.
+/// Keyed on structure, never on identity. Two compositions of one shape —
+/// every glyph of a bucket, every frame of a resized terminal — differ only
+/// in which buffers and uniforms their leaves name, and nothing in the
+/// e-graph reads a name: `Buffer` and `Uniform` are opaque to every rule, so
+/// the saturated graphs are isomorphic and the extraction is the same term
+/// with other names in its leaves. The names come from the caller: the
+/// extracted arena is relinked into canonical slot order by the names the
+/// graph carries, this caller's declarations take those slots
+/// ([`ExprArena::with_tables`]), and the result is relinked into the order
+/// this caller declared — slot order is ABI. That identity was the reason
+/// buffer- and uniform-bearing arenas used to bypass the cache entirely (a
+/// key on identity never hits twice and never evicts), which for every
+/// kernel that binds a table — a glyph, the cell grid — was no optimizer
+/// cache at all.
+///
+/// [`saturation_count`] counts the saturations this process has run, for a
+/// test that wants to assert the second shape did not pay one.
+///
+/// # Saturation telemetry
+///
+/// With `--features saturation-telemetry`, one record per *saturation* —
+/// a cache hit extracts and records nothing, since nothing was saturated.
 #[must_use]
 pub fn optimize_runtime_arena(
     arena: &ExprArena,
     root: ExprId,
     shape: LatticeShape,
 ) -> Option<Arc<(ExprArena, ExprId)>> {
-    static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Option<Arc<(ExprArena, ExprId)>>>>> =
-        OnceLock::new();
-
-    // Buffer-bearing arenas bypass the cache entirely: `BufferIdentity` is
-    // process-unique and minted per construction, so two compiles never
-    // share a key — every lookup would miss while every insert stayed
-    // forever (the cache is static and unbounded). A terminal resizing all
-    // day would leak one full optimized arena per recompile for zero hits.
-    //
-    // Uniform-bearing arenas bypass it for the same reason and one more: the
-    // optimized arena carries its uniforms' identities, and the link step
-    // downstream maps *those* to block offsets. A hit keyed on structure
-    // alone would hand a second composition an arena naming the first one's
-    // instances. The JIT cache in front of this one is keyed on structure
-    // (dense offsets, not identities), so the saturation is still paid once
-    // per shape.
-    if !arena.buffers().is_empty() || !arena.uniforms().is_empty() {
-        return optimize_runtime_arena_uncached(arena, root, shape).map(Arc::new);
+    if saturation_switch() == SaturationSwitch::Off {
+        return without_saturation(arena, root).map(Arc::new);
     }
-
-    let mut key = canonical_key(arena, root);
-    key.extend_from_slice(&shape.key_bytes());
-    // Optimization is a deterministic function of the arena, the shape, and
-    // the *optimizer configuration* — the third term was missing, and the
-    // claim that the first two suffice becomes false the moment two
-    // configurations coexist in a process (a warm-up at one budget and
-    // steady state at another, some kernels reranked and some not). It is a
-    // constant today because production names exactly one configuration;
-    // keying on it is what keeps that from being load-bearing.
-    key.extend_from_slice(&Optimizer::production().fingerprint().to_bytes());
-    key.push(saturation_switch() as u8);
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(hit) = cache
-        .lock()
-        .expect("optimize_runtime_arena: lock poisoned")
-        .get(&key)
-    {
-        return hit.clone();
-    }
-
-    let result = optimize_runtime_arena_uncached(arena, root, shape).map(Arc::new);
-    cache
-        .lock()
-        .expect("optimize_runtime_arena: lock poisoned")
-        .entry(key)
-        .or_insert(result)
-        .clone()
+    let mut expanded = None;
+    let (arena, root) = with_refs_expanded(arena, root, &mut expanded);
+    let canon = canonical(arena, root);
+    let saturated = saturated_for(&canon, arena, root, shape)?;
+    extract_for(&saturated, &canon, arena, root, shape).map(Arc::new)
 }
 
+/// [`optimize_runtime_arena`] with the cache bypassed: a fresh saturation
+/// whatever this process has seen, for a measurement that must not report a
+/// cached answer as its own.
 fn optimize_runtime_arena_uncached(
     arena: &ExprArena,
     root: ExprId,
     shape: LatticeShape,
 ) -> Option<(ExprArena, ExprId)> {
-    // The tier's pipeline, as a composition rather than three hand-sequenced
-    // calls. The order is load-bearing and is now the expression itself:
-    //
-    // `ExpandRefs` first, because every step after it reads structure and a
-    // reference has none to read — its body is in the `KernelStore`, not in
-    // this arena. It is an identity when nothing composed by reference, which
-    // is every kernel production builds today.
-    //
-    // `Saturate` next, on the arena as *written* — folds still folded,
-    // derivatives still `Dwrt`. Both are things the graph knows: the chain
-    // rule and a fold's decompositions are rule sets (`egraph::derivative`,
-    // `egraph::fold_rules`), so the graph resolves what it judges worth
-    // resolving and keeps the rest folded.
-    //
-    // **`LowerDwrt` and the reduce legalizer come last, and that is the whole
-    // point.** Legalization is the *fallback*: it takes whatever illegal
-    // shape survived saturation — a `Dwrt` the chain rule did not reach, a
-    // `Reduce` the graph declined to peel — and makes it emittable. It owns
-    // nothing the graph does not also know, so running it first only takes
-    // choices away.
-    //
-    // Size is not symmetric across that boundary, which is why the order is
-    // not arbitrary. Unrolling a 34-piece fold *before* saturation hands the
-    // e-graph 141,530 nodes for one glyph, and an e-graph is quadratic-ish in
-    // what it is fed: that is where the budget goes. Unrolling it *after*
-    // hands the same expansion to the assembler, which is linear and does not
-    // care — a million-node IR is a routine afternoon for a register
-    // allocator and a catastrophe for saturation. So the emitted node count
-    // rises when the legalizer moves back, and that is the trade being made,
-    // not a regression: the e-graph gets to see the small, high-level program
-    // it can actually reason about.
-    //
-    // `ExpandNestedReduce`, not `ExpandReduce`: stage 2c's codegen compiles a
-    // surviving `Reduce` as a loop, so legalization only has to unroll the one
-    // shape `extract_folds` cannot carve out — a `Reduce` nested inside
-    // another's own body, which is what `Kernel::by_ref` composition plus
-    // `ExpandRefs` produces. Everything else stays folded all the way to the
-    // assembler. Mirrors `pixelflow-ir::passes::legalize`, which says the same
-    // thing at the other compile entry.
-    //
-    // A declining step short-circuits the rest and yields `None` here, which
-    // means exactly what it always meant: the caller compiles its own arena
-    // unchanged, unoptimized but correct — and legalizes it itself, since
-    // `Manifold::compile` runs `passes::legalize` regardless of whether this
-    // function returned anything.
-    match saturation_switch() {
-        SaturationSwitch::On => pipeline![
-            ExpandRefs,
-            Saturate::runtime(shape),
-            LowerDwrt,
-            ExpandNestedReduce
-        ]
-        .optimize(arena, root)
-        .into_changed(),
-        // The `Identity` path: the same legalizing tail, no saturation.
-        // What `Lattice::bake` would emit if the e-graph did not exist —
-        // the "F" column of docs/plans/2026-09-06-egraph-at-production-scale.md
-        // §7, measured by docs/results/2026-09-07-egraph-off-vs-on-real-shaders.md.
-        SaturationSwitch::Off => pipeline![ExpandRefs, Identity, LowerDwrt, ExpandNestedReduce]
-            .optimize(arena, root)
-            .into_changed(),
+    if saturation_switch() == SaturationSwitch::Off {
+        return without_saturation(arena, root);
     }
+    let mut expanded = None;
+    let (arena, root) = with_refs_expanded(arena, root, &mut expanded);
+    let canon = canonical(arena, root);
+    let saturated = saturate(&canon, arena, root, shape)?;
+    extract_for(&saturated, &canon, arena, root, shape)
+}
+
+/// The `Identity` path: the same legalizing tail, no saturation. What
+/// `Lattice::bake` would emit if the e-graph did not exist — the "F" column
+/// of docs/plans/2026-09-06-egraph-at-production-scale.md §7, measured by
+/// docs/results/2026-09-07-egraph-off-vs-on-real-shaders.md.
+fn without_saturation(arena: &ExprArena, root: ExprId) -> Option<(ExprArena, ExprId)> {
+    pipeline![ExpandRefs, Identity, LowerDwrt]
+        .optimize(arena, root)
+        .into_changed()
+}
+
+/// References first: every step of optimization reads structure, and a name
+/// has none to read — its referent is not in this arena. Guarded rather than
+/// called unconditionally, since the pass's own identity path still clones
+/// the arena; `expanded` is where the clone lives when there is one.
+fn with_refs_expanded<'a>(
+    arena: &'a ExprArena,
+    root: ExprId,
+    expanded: &'a mut Option<(ExprArena, ExprId)>,
+) -> (&'a ExprArena, ExprId) {
+    if !arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))) {
+        return (arena, root);
+    }
+    let (owned, owned_root) = expanded.insert(pixelflow_ir::passes::expand_refs_owned(arena, root));
+    (owned, *owned_root)
+}
+
+/// Extract `saturated` for `shape` and hand the term back in `arena`'s own
+/// names and slot order, lowered.
+fn extract_for(
+    saturated: &Saturated,
+    canon: &Canonical,
+    arena: &ExprArena,
+    root: ExprId,
+    shape: LatticeShape,
+) -> Option<(ExprArena, ExprId)> {
+    let optimizer = runtime_optimizer(shape);
+    let optimized = optimizer.extract(&saturated.egraph, saturated.root, saturated.stats.clone());
+    let (extracted, extracted_root) = optimized.to_arena(&saturated.egraph, saturated.root);
+
+    // Names. The graph's are the saturating composition's, in extraction
+    // order; this caller's go in their slots, in this caller's own order.
+    let (in_canonical_order, extracted_root) =
+        extracted.relink(extracted_root, &saturated.buffers, &saturated.uniforms);
+    let (in_callers_order, extracted_root) = in_canonical_order
+        .with_tables(canon.buffers.clone(), canon.uniforms.clone())
+        .relink(extracted_root, arena.buffers(), arena.uniforms());
+    let _ = root;
+
+    // `LowerDwrt` last, and that is the whole point: legalization is the
+    // *fallback*, taking whatever illegal shape survived saturation — a
+    // `Dwrt` the chain rule did not reach — and making it emittable. It owns
+    // nothing the graph does not also know, so running it first only takes
+    // choices away. A `Reduce` is not illegal, nested or not: codegen emits
+    // a surviving fold as a loop, and a fold inside a fold as a loop inside
+    // a loop, so every fold stays folded all the way to the assembler.
+    // Mirrors `pixelflow-ir::passes::legalize`, which says the same thing at
+    // the other compile entry.
+    pixelflow_ir::passes::lower_dwrt_owned(&in_callers_order, extracted_root).ok()
+}
+
+/// How many terms this process has saturated.
+///
+/// The cache's own measure, for a test: a second shape, or a second
+/// composition, of a structure already saturated leaves it unchanged.
+#[must_use]
+pub fn saturation_count() -> usize {
+    SATURATIONS.load(Ordering::Relaxed)
+}
+
+static SATURATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// A term saturated once, for every lattice it is later extracted at.
+struct Saturated {
+    egraph: EGraph,
+    root: EClassId,
+    stats: OptimizerStats,
+    /// The saturating composition's declarations in canonical slot order:
+    /// what an extraction's leaves — which carry that composition's names —
+    /// relink to, before another composition's take the slots.
+    buffers: Vec<BufferDecl>,
+    uniforms: Vec<UniformDecl>,
+}
+
+/// The runtime tier's optimizer: production policy over the runtime
+/// vocabulary's rules, priced against `shape`.
+fn runtime_optimizer(shape: LatticeShape) -> Optimizer {
+    Optimizer::production()
+        .rules(RuleSet::runtime())
+        .for_lattice(shape)
+}
+
+/// The saturated graph for `canon`'s structure, saturating `arena` if this
+/// process has not seen the structure before. `None`, memoized, for a term
+/// the e-graph declines.
+fn saturated_for(
+    canon: &Canonical,
+    arena: &ExprArena,
+    root: ExprId,
+    shape: LatticeShape,
+) -> Option<Arc<Saturated>> {
+    static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Option<Arc<Saturated>>>>> = OnceLock::new();
+
+    let mut key = canon.key.clone();
+    // Saturation is a deterministic function of the structure and the
+    // *optimizer configuration* — and the second term was once missing, so
+    // the claim that the first suffices became false the moment two
+    // configurations coexisted in a process (a warm-up at one budget and
+    // steady state at another, some kernels reranked and some not). It is a
+    // constant today because production names exactly one configuration;
+    // keying on it is what keeps that from being load-bearing.
+    key.extend_from_slice(&runtime_optimizer(shape).fingerprint().to_bytes());
+
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache
+        .lock()
+        .expect("saturated_for: lock poisoned")
+        .get(&key)
+    {
+        return hit.clone();
+    }
+    // Saturate outside the lock so concurrent distinct structures don't
+    // serialize. A racing duplicate saturation wastes work; the first
+    // insertion wins so all callers share one graph.
+    let fresh = saturate(canon, arena, root, shape).map(Arc::new);
+    cache
+        .lock()
+        .expect("saturated_for: lock poisoned")
+        .entry(key)
+        .or_insert(fresh)
+        .clone()
+}
+
+/// Insert `arena` and saturate it under the runtime tier's configuration.
+///
+/// `shape` is not what saturation depends on; it prices the one extraction
+/// the telemetry record carries, the extraction this saturation was asked
+/// for.
+fn saturate(
+    canon: &Canonical,
+    arena: &ExprArena,
+    root: ExprId,
+    shape: LatticeShape,
+) -> Option<Saturated> {
+    let mut optimizer = runtime_optimizer(shape);
+    let mut egraph = optimizer.egraph();
+    let root_class = insert(arena, root, &mut egraph, Vocabulary::Runtime).ok()?;
+    let node_count = reachable_count(arena, root);
+    #[cfg(feature = "saturation-telemetry")]
+    let inserted_classes = egraph.num_classes();
+    #[cfg(feature = "saturation-telemetry")]
+    let telemetry_start = std::time::Instant::now();
+    let stats = optimizer.saturate_term(&mut egraph, node_count);
+    SATURATIONS.fetch_add(1, Ordering::Relaxed);
+
+    #[cfg(feature = "saturation-telemetry")]
+    {
+        let optimized = optimizer.extract(&egraph, root_class, stats.clone());
+        let (extracted, extracted_root) = optimized.to_arena(&egraph, root_class);
+        crate::telemetry::record(crate::telemetry::SaturationInvocation {
+            tier: crate::tier::Tier::Runtime,
+            node_count,
+            inserted_classes,
+            extraction: optimized.extraction,
+            stats: &optimized.stats,
+            union_count: optimized.stats.unions,
+            extracted_arena: &extracted,
+            extracted_root,
+            wall_clock: telemetry_start.elapsed(),
+            kernel_label: None,
+        });
+    }
+    #[cfg(not(feature = "saturation-telemetry"))]
+    let _ = node_count;
+
+    Some(Saturated {
+        egraph,
+        root: root_class,
+        stats,
+        buffers: canon.buffers.clone(),
+        uniforms: canon.uniforms.clone(),
+    })
 }
 
 /// Whether the runtime tier saturates at all.
@@ -258,134 +370,6 @@ fn saturation_switch() -> SaturationSwitch {
             other => panic!("PIXELFLOW_SATURATION must be `on` or `off` (or unset), got {other:?}"),
         }
     })
-}
-
-/// Canonical serialization of the subgraph reachable from `root`: nodes in
-/// ascending original id order (the arena is append-only, so children always
-/// precede parents), child references remapped to dense indices — the same
-/// shape as `pixelflow_codegen::jit_cache`'s private `canonical_key`, reimplemented
-/// here since that one isn't exported and this cache's correctness condition
-/// is different (it needs a key for *every* reachable node kind, including
-/// `Buffer`/`Nary`, to memoize the bail-out case too, not just the
-/// e-graph-representable ones).
-fn canonical_key(arena: &ExprArena, root: ExprId) -> Vec<u8> {
-    let len = arena.len();
-    let mut reachable = vec![false; len];
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
-        if core::mem::replace(&mut reachable[id.0 as usize], true) {
-            continue;
-        }
-        stack.extend(arena.children(id));
-    }
-
-    let mut dense: Vec<u32> = vec![u32::MAX; len];
-    let mut next = 0u32;
-    let mut key: Vec<u8> = Vec::with_capacity(len * 8);
-
-    let push_id = |key: &mut Vec<u8>, dense: &[u32], id: ExprId| {
-        let d = dense[id.0 as usize];
-        debug_assert_ne!(d, u32::MAX, "canonical_key: child densified before parent");
-        key.extend_from_slice(&d.to_le_bytes());
-    };
-
-    for idx in 0..len {
-        if !reachable[idx] {
-            continue;
-        }
-        let id = ExprId(idx as u32);
-        match arena.node(id) {
-            &ExprNode::Var(i) => {
-                key.push(0);
-                key.push(i);
-            }
-            &ExprNode::Const(v) => {
-                key.push(1);
-                key.extend_from_slice(&v.to_bits().to_le_bytes());
-            }
-            &ExprNode::Param(i) => {
-                key.push(2);
-                key.push(i);
-            }
-            &ExprNode::Buffer(b) => {
-                key.push(3);
-                // Key by process-unique BufferIdentity, NOT the arena-local
-                // slot index: two arenas can both call their own buffer "slot
-                // 0" with equal extents while naming different memory, and a
-                // slot-keyed cache would hand one of them the other's
-                // optimized arena — whose redeclared identity binds the wrong
-                // pixels. Identity is process-local, which is exactly the
-                // lifetime of this in-process cache. It has no byte accessor,
-                // so serialize its (injective) Debug form.
-                let BufferDecl { id, width, height } = *arena.buffer_decl(b);
-                key.extend_from_slice(alloc::format!("{id:?}").as_bytes());
-                key.extend_from_slice(&width.to_le_bytes());
-                key.extend_from_slice(&height.to_le_bytes());
-            }
-            &ExprNode::Uniform(u) => {
-                // Keyed by identity for the reason `Buffer` is; unreachable
-                // in practice, since uniform-bearing arenas bypass the cache.
-                key.push(8);
-                let decl = *arena.uniform_decl(u);
-                key.extend_from_slice(alloc::format!("{:?}", decl.id).as_bytes());
-                key.extend_from_slice(&decl.default.to_bits().to_le_bytes());
-            }
-            // A reference's key IS its referent's content, digested, so
-            // encoding the key is encoding the kernel it names.
-            &ExprNode::Ref(k) => {
-                key.push(9);
-                key.extend_from_slice(&k.bits().to_le_bytes());
-            }
-            // The fold is metadata, so it goes in the key's tag bytes rather
-            // than as three child nodes. Two folds over one body under
-            // different algebras, binders or ranges must not share a cache
-            // entry, and this is where that is said.
-            &ExprNode::Reduce { fold, body } => {
-                key.push(10);
-                key.extend_from_slice(&fold.to_bits().to_le_bytes());
-                push_id(&mut key, &dense, body);
-            }
-            // Same shape as `pixelflow_ir::key`'s canonical form: the mask
-            // densifies as a child, `on`/`off` are content-addressed and go
-            // in directly.
-            &ExprNode::Guard { mask, on, off } => {
-                key.push(11);
-                push_id(&mut key, &dense, mask);
-                key.extend_from_slice(&on.bits().to_le_bytes());
-                key.extend_from_slice(&off.bits().to_le_bytes());
-            }
-            &ExprNode::Unary(op, a) => {
-                key.push(4);
-                key.extend_from_slice(&op.marshal().to_bytes());
-                push_id(&mut key, &dense, a);
-            }
-            &ExprNode::Binary(op, a, b) => {
-                key.push(5);
-                key.extend_from_slice(&op.marshal().to_bytes());
-                push_id(&mut key, &dense, a);
-                push_id(&mut key, &dense, b);
-            }
-            &ExprNode::Ternary(op, a, b, c) => {
-                key.push(6);
-                key.extend_from_slice(&op.marshal().to_bytes());
-                push_id(&mut key, &dense, a);
-                push_id(&mut key, &dense, b);
-                push_id(&mut key, &dense, c);
-            }
-            &ExprNode::Nary(op, _start, n) => {
-                key.push(7);
-                key.extend_from_slice(&op.marshal().to_bytes());
-                key.extend_from_slice(&n.to_le_bytes());
-                for child in arena.children(id) {
-                    push_id(&mut key, &dense, child);
-                }
-            }
-        }
-        dense[idx] = next;
-        next += 1;
-    }
-
-    key
 }
 
 /// Whether the runtime tier can represent `kind` in its e-graph — i.e.,
@@ -469,8 +453,8 @@ mod tests {
         let warm = warm_start.elapsed();
 
         assert_eq!(
-            opt1.nodes_raw().len(),
-            opt2.nodes_raw().len(),
+            opt1.len(),
+            opt2.len(),
             "cached and fresh optimization must agree on the result shape"
         );
         assert!(
@@ -482,7 +466,7 @@ mod tests {
 
     /// Ids of every node reachable from `root`, discovery order.
     fn reachable_ids(arena: &ExprArena, root: ExprId) -> Vec<ExprId> {
-        let mut seen = vec![false; arena.nodes_raw().len()];
+        let mut seen = vec![false; arena.len()];
         let mut stack = vec![root];
         let mut out = Vec::new();
         while let Some(id) = stack.pop() {
@@ -510,7 +494,7 @@ mod tests {
         reachable_ids(arena, root)
             .iter()
             .filter_map(|&id| match arena.node(id) {
-                &ExprNode::Buffer(b) => Some(arena.buffer_decl(b).id),
+                ExprNode::Buffer(b) => Some(arena.buffer_decl(b).id),
                 _ => None,
             })
             .collect()
@@ -569,12 +553,96 @@ mod tests {
         assert_eq!(input, output, "slot order must survive optimization");
     }
 
+    /// One structure, two compositions: fresh buffer identities, and a
+    /// uniform with a different default in each. The second saturates
+    /// nothing (the count is process-global, so `one_compile_per_shape`
+    /// asserts it alone in its own binary) and gets the term back in its
+    /// *own* names — its identities, its slot order, its default — never the
+    /// first composition's, whose names are what the shared graph carries.
+    #[test]
+    fn a_second_composition_of_one_structure_keeps_its_own_names() {
+        use pixelflow_ir::arena::{BufferIdentity, UniformIdentity};
+
+        fn composition(default: f32) -> (ExprArena, ExprId) {
+            let mut a = ExprArena::new();
+            let buf_a = a.declare_buffer(BufferDecl {
+                id: BufferIdentity::mint(),
+                width: 4,
+                height: 1,
+            });
+            let buf_b = a.declare_buffer(BufferDecl {
+                id: BufferIdentity::mint(),
+                width: 8,
+                height: 2,
+            });
+            let u = a.declare_uniform(UniformDecl {
+                id: UniformIdentity::mint(),
+                default,
+            });
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let gb = a.push_gather(buf_b, x, y);
+            let ga = a.push_gather(buf_a, x, y);
+            let uu = a.push_uniform(u);
+            let sum = a.push_binary(OpKind::Add, gb, ga);
+            let root = a.push_binary(OpKind::Mul, sum, uu);
+            (a, root)
+        }
+
+        let shape = pixelflow_ir::LatticeShape::new([8, 2]);
+        let (first, first_root) = composition(1.5);
+        let (second, second_root) = composition(-2.0);
+        let out1 = optimize_runtime_arena(&first, first_root, shape).expect("optimizes");
+        let out2 = optimize_runtime_arena(&second, second_root, shape).expect("optimizes");
+
+        for (input, out) in [(&first, &out1.0), (&second, &out2.0)] {
+            let want: Vec<_> = input
+                .buffers()
+                .iter()
+                .map(|d| (d.id, d.width, d.height))
+                .collect();
+            let got: Vec<_> = out
+                .buffers()
+                .iter()
+                .map(|d| (d.id, d.width, d.height))
+                .collect();
+            assert_eq!(
+                got, want,
+                "the buffer table is the caller's, in the caller's order"
+            );
+            let want_u: Vec<_> = input
+                .uniforms()
+                .iter()
+                .map(|d| (d.id, d.default.to_bits()))
+                .collect();
+            let got_u: Vec<_> = out
+                .uniforms()
+                .iter()
+                .map(|d| (d.id, d.default.to_bits()))
+                .collect();
+            assert_eq!(
+                got_u, want_u,
+                "the uniform table is the caller's, default included"
+            );
+        }
+        assert_eq!(
+            reachable_ids(&out1.0, out1.1).len(),
+            reachable_ids(&out2.0, out2.1).len(),
+            "one structure, one term"
+        );
+        assert_eq!(
+            reachable_buffer_identities(&out2.0, out2.1),
+            second.buffers().iter().map(|d| d.id).collect(),
+            "every reachable leaf names the second composition's own memory"
+        );
+    }
+
     /// Whether any `Nary` (the `Reduce` binder) is reachable from `root`.
     /// Whether a binder survives to the optimized arena. Named for what it
     /// asks rather than for the node shape it used to look for: a fold is
     /// `ExprNode::Reduce` now, not an `Nary`.
     fn reaches_a_binder(arena: &ExprArena, root: ExprId) -> bool {
-        let mut seen = vec![false; arena.nodes_raw().len()];
+        let mut seen = vec![false; arena.len()];
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
             if core::mem::replace(&mut seen[id.0 as usize], true) {
@@ -699,7 +767,7 @@ mod congruence_gap_probe {
     /// quantity this computes; the arena walk is kept as the independent
     /// check that they agree.
     fn arena_static_cost(model: &CostModel, arena: &ExprArena, root: ExprId) -> usize {
-        let len = arena.nodes_raw().len();
+        let len = arena.len();
         let mut seen = vec![false; len];
         let mut stack = vec![root];
         let mut total = 0usize;
@@ -710,7 +778,7 @@ mod congruence_gap_probe {
             let kind = match arena.node(id) {
                 ExprNode::Unary(k, _)
                 | ExprNode::Binary(k, _, _)
-                | ExprNode::Ternary(k, _, _, _) => Some(*k),
+                | ExprNode::Ternary(k, _, _, _) => Some(k),
                 _ => None,
             };
             if let Some(k) = kind {
@@ -1705,7 +1773,7 @@ pub(crate) mod production_telemetry {
     /// (#1111) is this same number read off the choices instead of the
     /// materialized arena; this walk stays as the independent check.
     fn arena_cost(arena: &ExprArena, root: ExprId, costs: &CostModel) -> usize {
-        let len = arena.nodes_raw().len();
+        let len = arena.len();
         let mut seen = vec![false; len];
         let mut stack = vec![root];
         let mut total = 0usize;
@@ -1720,14 +1788,15 @@ pub(crate) mod production_telemetry {
                 | ExprNode::Uniform(_) => None,
                 ExprNode::Unary(k, _)
                 | ExprNode::Binary(k, _, _)
-                | ExprNode::Ternary(k, _, _, _) => Some(*k),
+                | ExprNode::Ternary(k, _, _, _) => Some(k),
                 // A fold survives extraction now; the legalizer unrolls it
                 // afterwards, and this walk prices the node it is.
                 ExprNode::Reduce { .. } => Some(OpKind::Reduce),
                 other @ (ExprNode::Param(_)
                 | ExprNode::Nary(..)
                 | ExprNode::Ref(_)
-                | ExprNode::Guard { .. }) => {
+                | ExprNode::Guard { .. }
+                | ExprNode::Write { .. }) => {
                     panic!("extracted arena contains {other:?}")
                 }
             };
@@ -2245,7 +2314,7 @@ mod production_equivalence {
     /// reason: it has to be reproducible by a different build.
     fn digest(arena: &ExprArena, root: ExprId) -> String {
         let mut text = String::new();
-        let len = arena.nodes_raw().len();
+        let len = arena.len();
         let mut reachable = vec![false; len];
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {

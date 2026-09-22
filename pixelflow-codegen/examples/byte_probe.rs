@@ -145,7 +145,7 @@ fn cases() -> Vec<(&'static str, ExprArena, ExprId)> {
 
 fn main() {
     for (name, arena, root) in cases() {
-        match compile(&arena, root) {
+        match compile(&arena, root, pixelflow_ir::LatticeShape::POINT) {
             Ok(r) => {
                 let bytes = r.code.as_bytes();
                 println!(

@@ -80,7 +80,6 @@ pub fn pattern_match_arena(
         match t_node {
             // Var(n) is a metavariable: bind or check consistency.
             ExprNode::Var(n) => {
-                let n = *n;
                 if let Some(&existing) = bindings.get(&n) {
                     // Already bound — the subtrees must be structurally equal.
                     // Compare arena-native to avoid Arc allocation.
@@ -92,17 +91,14 @@ pub fn pattern_match_arena(
                 }
             }
             // Const must match exactly (within epsilon).
-            ExprNode::Const(c) => {
-                let c = *c;
-                match arena.node(e_id) {
-                    ExprNode::Const(e) => {
-                        if fabsf(e - c) >= 1e-6 {
-                            return None;
-                        }
+            ExprNode::Const(c) => match arena.node(e_id) {
+                ExprNode::Const(e) => {
+                    if fabsf(e - c) >= 1e-6 {
+                        return None;
                     }
-                    _ => return None,
                 }
-            }
+                _ => return None,
+            },
             // Param must match the same index.
             ExprNode::Param(i) => match arena.node(e_id) {
                 ExprNode::Param(j) if i == j => {}
@@ -128,27 +124,27 @@ pub fn pattern_match_arena(
             // Structural match: op must match, push children onto the stack.
             ExprNode::Unary(t_op, t_a) => match arena.node(e_id) {
                 ExprNode::Unary(e_op, e_a) if e_op == t_op => {
-                    stack.push((*e_a, *t_a));
+                    stack.push((e_a, t_a));
                 }
                 _ => return None,
             },
             ExprNode::Binary(t_op, t_a, t_b) => match arena.node(e_id) {
                 ExprNode::Binary(e_op, e_a, e_b) if e_op == t_op => {
-                    stack.push((*e_a, *t_a));
-                    stack.push((*e_b, *t_b));
+                    stack.push((e_a, t_a));
+                    stack.push((e_b, t_b));
                 }
                 _ => return None,
             },
             ExprNode::Ternary(t_op, t_a, t_b, t_c) => match arena.node(e_id) {
                 ExprNode::Ternary(e_op, e_a, e_b, e_c) if e_op == t_op => {
-                    stack.push((*e_a, *t_a));
-                    stack.push((*e_b, *t_b));
-                    stack.push((*e_c, *t_c));
+                    stack.push((e_a, t_a));
+                    stack.push((e_b, t_b));
+                    stack.push((e_c, t_c));
                 }
                 _ => return None,
             },
-            ExprNode::Nary(t_op, _, _) => match arena.node(e_id) {
-                ExprNode::Nary(e_op, _, _) if e_op == t_op => {
+            ExprNode::Nary(t_op, _) => match arena.node(e_id) {
+                ExprNode::Nary(e_op, _) if e_op == t_op => {
                     let e_children = arena.children(e_id);
                     let t_children = template.children(t_id);
                     if e_children.len() == t_children.len() {
@@ -170,6 +166,8 @@ pub fn pattern_match_arena(
             // contains a `Guard` (extraction cannot choose one yet, G3), so
             // a `Guard` in the target simply matches nothing.
             ExprNode::Guard { .. } => return None,
+            // Nor a store: post-legalize vocabulary no template names.
+            ExprNode::Write { .. } => return None,
         }
     }
 
@@ -248,6 +246,10 @@ pub fn substitute_template_arena(
                 "Guard(on={on:?}, off={off:?}) in a rewrite template — no rule \
                  this harness writes rewrites into a Guard yet (G3)"
             ),
+            ExprNode::Write { .. } => panic!(
+                "a Write in a rewrite template — a store is an effect the legalize \
+                 passes build after extraction, and no rule rewrites into one"
+            ),
             ExprNode::Unary(op, t_a) => {
                 let a = ExprId(remap[t_a.0 as usize]);
                 target_arena.push_unary(op, a)
@@ -263,7 +265,7 @@ pub fn substitute_template_arena(
                 let c = ExprId(remap[t_c.0 as usize]);
                 target_arena.push_ternary(op, a, b, c)
             }
-            ExprNode::Nary(op, _, _) => {
+            ExprNode::Nary(op, _) => {
                 let t_children: Vec<ExprId> = template
                     .children(*id)
                     .map(|tc| ExprId(remap[tc.0 as usize]))
@@ -899,6 +901,8 @@ impl BwdGenerator {
                 Shape::Guard { on, off, .. } => {
                     panic!("junkify: Guard(on={on:?}, off={off:?}) in a corpus expression")
                 }
+                // A corpus expression is pre-legalize by construction.
+                Shape::Write { .. } => panic!("junkify: a Write in a corpus expression"),
                 Shape::Op(op, children) => match children {
                     Children::Zero => panic!("junkify: op with 0 children"),
                     Children::One(a) => self.arena.push_unary(op, remap[a.0 as usize]),

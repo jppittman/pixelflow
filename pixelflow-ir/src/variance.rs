@@ -11,8 +11,10 @@
 //! - Bits 2..4: retired. They were the Z and W axes; a lattice has
 //!   [`COORD_AXES`](crate::arena::COORD_AXES) axes and a per-call scalar is a
 //!   uniform, whose variance is `CONST`.
-//! - Bits 4..8: the four reduction index slots — vary per step of the binder
-//!   that binds them
+//! - Bits 4..64: the reduction index slots — vary per step of the binder
+//!   that binds them. Every bit the word has past the axes: the control
+//!   plane is 64-bit, and how deep folds may nest is what the word holds,
+//!   not a count chosen on its own.
 //!
 //! ## Scopes are binders
 //!
@@ -34,16 +36,18 @@
 
 /// Which variables an expression depends on: one bit per variable.
 ///
-/// Coordinates X=bit0, Y=bit1; reduction index slots `4..8` in bits `4..8`.
+/// Coordinates X=bit0, Y=bit1; reduction index slots in bits `4..64`.
 /// Bits 2 and 3 are the retired Z and W axes and are never set. Operations:
 /// - `union`: bitwise OR (join — a binary op depends on both operands' vars)
 /// - `meet`: minimum across e-class representatives (pick lowest-deps form)
 /// - `without`: set difference — what a binder does to its own index
 ///
-/// This type is `no_std` compatible and zero-cost (single `u8`).
+/// This type is `no_std` compatible and zero-cost (single `u64`). It was a
+/// `u8`, which capped nesting at four folds — a width no measurement asked
+/// for, and one the lattice's own three folds would have all but used up.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct Variance(u8);
+pub struct Variance(u64);
 
 /// Bit positions for each variable.
 impl Variance {
@@ -59,15 +63,22 @@ impl Variance {
     /// The coordinates the lattice nest binds (X, Y).
     pub const COORDS: Self = Self(0b0000_0011);
 
-    /// The four reduction index slots a binder can bind.
-    pub const BINDERS: Self = Self(0b1111_0000);
+    /// How many variable indices the bitset names: the coordinates, the two
+    /// retired axes, and every reduction index slot. [`Self::from_var`]
+    /// accepts `0..VARIABLES`, and a `Var` past it is not a variable this
+    /// analysis knows.
+    pub const VARIABLES: u8 = u64::BITS as u8;
+
+    /// The reduction index slots a binder can bind: every bit past the
+    /// coordinates and the retired axes.
+    pub const BINDERS: Self = Self(u64::MAX << crate::arena::REDUCE_BINDER_BASE);
 
     /// Every variable — the top of the lattice, and the answer whenever the
     /// analysis cannot prove something narrower.
-    pub const ALL: Self = Self(0b1111_1111);
+    pub const ALL: Self = Self(u64::MAX);
 
-    /// Create from a variable index: `0..2` are the coordinates X/Y, `4..8`
-    /// the reduction index slots.
+    /// Create from a variable index: `0..2` are the coordinates X/Y,
+    /// `4..VARIABLES` the reduction index slots.
     ///
     /// Indices 2 and 3 were the Z and W axes.
     /// [`ExprArena::push_var`](crate::arena::ExprArena::push_var) still
@@ -85,25 +96,28 @@ impl Variance {
     ///
     /// # Panics
     ///
-    /// Panics if `var_idx >= 8`.
+    /// Panics if `var_idx >= VARIABLES`.
     #[inline]
     #[must_use]
     pub const fn from_var(var_idx: u8) -> Self {
-        assert!(var_idx < 8, "variable index must be 0..8");
+        assert!(
+            var_idx < Self::VARIABLES,
+            "variable index must be below Variance::VARIABLES"
+        );
         Self(1 << var_idx)
     }
 
-    /// Create from raw bits. All eight bits are meaningful.
+    /// Create from raw bits. Every bit is a variable.
     #[inline]
     #[must_use]
-    pub const fn from_bits(bits: u8) -> Self {
+    pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
     }
 
     /// Get the raw bits.
     #[inline]
     #[must_use]
-    pub const fn bits(self) -> u8 {
+    pub const fn bits(self) -> u64 {
         self.0
     }
 
@@ -168,7 +182,7 @@ impl Variance {
     ///
     /// # Panics
     ///
-    /// Panics if `var_idx >= 8`.
+    /// Panics if `var_idx >= VARIABLES`.
     #[inline]
     #[must_use]
     pub const fn depends_on(self, var_idx: u8) -> bool {
@@ -183,7 +197,7 @@ impl Variance {
     ///
     /// # Panics
     ///
-    /// Panics if `var_idx >= 8`.
+    /// Panics if `var_idx >= VARIABLES`.
     #[inline]
     #[must_use]
     pub const fn is_invariant_in(self, var_idx: u8) -> bool {
@@ -238,7 +252,7 @@ impl Variance {
         self.0 & Self::COORDS.0 != 0
     }
 
-    /// Number of variables this expression depends on (0-8).
+    /// Number of variables this expression depends on (`0..=VARIABLES`).
     #[inline]
     #[must_use]
     pub const fn popcount(self) -> u32 {
@@ -253,7 +267,7 @@ impl core::fmt::Debug for Variance {
         }
         write!(f, "Variance{{")?;
         let mut first = true;
-        for bit in 0..8u8 {
+        for bit in 0..Self::VARIABLES {
             if self.0 & (1 << bit) == 0 {
                 continue;
             }
@@ -331,11 +345,11 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
     for i in 0..n {
         let id = ExprId(i as u32);
         let v = match arena.node(id) {
-            // Coordinates (0..4) and reduction index slots (4..8) each get their
-            // own bit. Anything above that is not a variable this analysis knows.
+            // Coordinates and reduction index slots each get their own bit.
+            // Anything past them is not a variable this analysis knows.
             ExprNode::Var(idx) => {
-                if *idx < 8 {
-                    Variance::from_var(*idx)
+                if idx < Variance::VARIABLES {
+                    Variance::from_var(idx)
                 } else {
                     Variance::ALL
                 }
@@ -349,7 +363,7 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
             // prologue — and unknown on the parameter space, which is why it
             // is not a `Const`.
             ExprNode::Uniform(_) => Variance::CONST,
-            ExprNode::Ref(key) => referent_variance(*key),
+            ExprNode::Ref(key) => referent_variance(key),
             ExprNode::Param(_) => {
                 // Parameters are substituted before JIT compilation.
                 // If we see one here, treat conservatively as all-varying.
@@ -379,12 +393,24 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
             // honest answer is the union of every value the branch could
             // read, exactly as `Select`'s soft form already does.
             ExprNode::Guard { mask, on, off } => result[mask.0 as usize]
-                .union(referent_variance(*on))
-                .union(referent_variance(*off)),
-            ExprNode::Nary(_, start, len) => {
-                let children = arena.nary_children_slice(*start, *len);
+                .union(referent_variance(on))
+                .union(referent_variance(off)),
+            // A store varies with what it stores and with where: its three
+            // binders are read for the address, so it sits inside all three
+            // folds — which is the whole of why the lattice's loops can be
+            // placed by the same rule as everything else.
+            ExprNode::Write {
+                row,
+                col,
+                lane,
+                value,
+            } => result[value.0 as usize]
+                .union(Variance::from_var(row.var()))
+                .union(Variance::from_var(col.var()))
+                .union(Variance::from_var(lane.var())),
+            ExprNode::Nary(..) => {
                 let mut v = Variance::CONST;
-                for &child in children {
+                for child in arena.children(id) {
                     v = v.union(result[child.0 as usize]);
                 }
                 v
@@ -413,7 +439,7 @@ pub fn compute_dag_variance(
     for node in dag.iter() {
         let v = match *node {
             ExprData::Var(idx) => {
-                if idx < 8 {
+                if idx < Variance::VARIABLES {
                     Variance::from_var(idx)
                 } else {
                     Variance::ALL
@@ -505,7 +531,7 @@ pub fn find_hoistable_arena_nodes(
 ///
 /// # Panics
 ///
-/// Panics if `var >= 8`.
+/// Panics if `var >= Variance::VARIABLES`.
 #[must_use]
 pub fn find_hoistable_out_of(
     var: u8,
@@ -517,7 +543,10 @@ pub fn find_hoistable_out_of(
     use crate::arena::{ExprId, ExprNode};
     use crate::kind::OpKind;
 
-    assert!(var < 8, "variable index must be 0..8");
+    assert!(
+        var < Variance::VARIABLES,
+        "variable index must be below Variance::VARIABLES"
+    );
     let n = arena.len();
 
     // Mark which nodes are reachable from root
@@ -591,7 +620,7 @@ pub fn find_hoistable_out_of(
                 _,
             ) => 3, // Transcendentals: highest priority
             ExprNode::Unary(_, _) => 1,
-            ExprNode::Binary(op, _, _) => match *op {
+            ExprNode::Binary(op, _, _) => match op {
                 OpKind::Div => 2, // Division is expensive
                 OpKind::Pow | OpKind::Atan2 => 3,
                 _ => 1, // Add, Sub, Mul are cheap
@@ -659,7 +688,7 @@ impl LatticeShape {
     #[inline]
     #[must_use]
     pub const fn varying(self) -> Variance {
-        let mut bits = 0u8;
+        let mut bits = 0u64;
         let mut axis = 0;
         while axis < crate::arena::COORD_AXES {
             if self.0[axis] > 1 {
@@ -734,16 +763,25 @@ mod tests {
         assert_eq!(Variance::from_var(0), Variance::X);
         assert_eq!(Variance::from_var(1), Variance::Y);
         // The reduction index slots are variables in the same space, so the
-        // hoisting question can be asked of them too.
+        // hoisting question can be asked of them too — every slot a binder
+        // can take, and no other bit.
+        let binders = crate::fold::Binder::all()
+            .map(|b| Variance::from_var(b.var()))
+            .fold(Variance::CONST, Variance::union);
+        assert_eq!(binders, Variance::BINDERS);
         assert_eq!(
-            Variance::from_var(4)
-                .union(Variance::from_var(5))
-                .union(Variance::from_var(6))
-                .union(Variance::from_var(7)),
-            Variance::BINDERS
+            Variance::BINDERS.popcount() as usize,
+            crate::fold::Binder::COUNT
         );
         // The retired axes' bits sit between the two, in no scope at all.
         assert!(Variance::COORDS.union(Variance::BINDERS) != Variance::ALL);
+        assert_eq!(
+            Variance::COORDS
+                .union(Variance::from_var(2))
+                .union(Variance::from_var(3))
+                .union(Variance::BINDERS),
+            Variance::ALL
+        );
     }
 
     #[test]
@@ -805,10 +843,11 @@ mod tests {
             format!("{:?}", Variance::Y.union(Variance::from_var(5))),
             "Variance{Y,i5}"
         );
-        assert_eq!(
-            format!("{:?}", Variance::ALL),
-            "Variance{X,Y,?2,?3,i4,i5,i6,i7}"
-        );
+        // Every variable, the last binder included.
+        let all = format!("{:?}", Variance::ALL);
+        assert!(all.starts_with("Variance{X,Y,?2,?3,i4,i5,"), "{all}");
+        let last = Variance::VARIABLES - 1;
+        assert!(all.ends_with(&format!(",i{last}}}")), "{all}");
     }
 
     #[test]
@@ -817,8 +856,11 @@ mod tests {
         assert_eq!(Variance::X.popcount(), 1);
         assert_eq!(Variance::X.union(Variance::Y).popcount(), 2);
         assert_eq!(Variance::COORDS.popcount(), 2);
-        assert_eq!(Variance::BINDERS.popcount(), 4);
-        assert_eq!(Variance::ALL.popcount(), 8);
+        assert_eq!(
+            Variance::BINDERS.popcount(),
+            u32::from(Variance::VARIABLES) - 4
+        );
+        assert_eq!(Variance::ALL.popcount(), u32::from(Variance::VARIABLES));
     }
 
     /// A reference's variance is its referent's — resolved, not guessed. A
@@ -1022,6 +1064,101 @@ mod tests {
         assert_eq!(v[root.0 as usize], Variance::X);
     }
 
+    /// A store varies with what it stores and with the three binders it
+    /// stores under — it is inside all three lattice folds by its bits,
+    /// which is what places it by the same rule as everything else.
+    #[test]
+    fn a_write_varies_with_its_value_and_its_binders() {
+        use crate::fold::Binder;
+        use crate::kind::OpKind;
+
+        let slot = |s: u8| Binder::from_slot(s).expect("a binder slot");
+        let (row, col, lane) = (slot(0), slot(1), slot(2));
+        let mut arena = crate::arena::ExprArena::new();
+        let y = arena.push_var(1);
+        let l = arena.push_var(lane.var());
+        let value = arena.push_binary(OpKind::Add, y, l);
+        let write = arena.push_write(row, col, lane, value);
+
+        let v = super::compute_arena_variance(&arena);
+        assert_eq!(
+            v[value.0 as usize],
+            Variance::Y.union(Variance::from_var(lane.var()))
+        );
+        assert_eq!(
+            v[write.0 as usize],
+            Variance::Y
+                .union(Variance::from_var(row.var()))
+                .union(Variance::from_var(col.var()))
+                .union(Variance::from_var(lane.var())),
+            "the store reads every binder for its address"
+        );
+    }
+
+    /// Folds nest past four. Each level takes the lowest free slot, so six
+    /// nested sums bind six slots — the fifth and sixth were unrepresentable
+    /// when the bitset was a byte — and every one is bound by the time the
+    /// root is reached.
+    #[test]
+    fn six_nested_binders_each_take_a_slot() {
+        use crate::Kernel;
+        use crate::arena::ExprNode;
+
+        // Past four: the depth the byte-wide bitset could not hold.
+        const DEPTH: usize = 6;
+        let mut k = Kernel::x();
+        for _ in 0..DEPTH {
+            let inner = k.clone();
+            k = Kernel::sum_over(2, move |i| inner.add(i));
+        }
+        let (arena, root) = k.parts();
+        let v = super::compute_arena_variance(arena);
+        assert_eq!(
+            v[root.0 as usize],
+            Variance::X,
+            "every binder is bound at the root"
+        );
+
+        let mut slots: alloc::vec::Vec<u8> = (0..arena.len())
+            .filter_map(|i| match arena.node(crate::arena::ExprId(i as u32)) {
+                ExprNode::Reduce { fold, .. } => Some(fold.binder().slot()),
+                _ => None,
+            })
+            .collect();
+        slots.sort_unstable();
+        assert_eq!(slots, (0..DEPTH as u8).collect::<alloc::vec::Vec<u8>>());
+
+        // And no fold's rename captured an inner fold's index: every fold's
+        // body still reads the `Var` of the binder that fold chose. A body
+        // is built against a placeholder that is renamed to a real slot once
+        // the inner folds have taken theirs; were a placeholder's index a
+        // slot an inner fold could take, the outer rename would rewrite the
+        // inner index too — `Σ_i Σ_j f(i, j)` as `Σ_i Σ_j f(i, i)` — and
+        // nothing downstream could tell. The placeholders sit past the whole
+        // binder space, and this is the check that keeps them there.
+        for i in 0..arena.len() {
+            let id = crate::arena::ExprId(i as u32);
+            let ExprNode::Reduce { fold, body } = arena.node(id) else {
+                continue;
+            };
+            let own = fold.binder().var();
+            let mut reads_own = false;
+            let mut stack = alloc::vec![body];
+            while let Some(n) = stack.pop() {
+                if matches!(arena.node(n), ExprNode::Var(v) if v == own) {
+                    reads_own = true;
+                    break;
+                }
+                stack.extend(arena.children(n));
+            }
+            assert!(
+                reads_own,
+                "the fold binding slot {} lost its own index",
+                fold.binder().slot()
+            );
+        }
+    }
+
     /// The LICM rule and the reduction-hoisting rule are one query at different
     /// variables: `⊕_i (f(i) · c) = c · ⊕_i f(i)` when `deps(c) ∩ {i} = {}`
     /// (REDUCTIONS_AND_FOLDS.md:109) is `find_hoistable_out_of(i, …)`.
@@ -1040,8 +1177,6 @@ mod tests {
         let ExprNode::Reduce { body, .. } = arena.node(root) else {
             panic!("expected a Reduce at the root");
         };
-        let body = *body;
-
         let out_of_binder = super::find_hoistable_out_of(4, arena, body, &v, 8);
         let sin = out_of_binder
             .iter()

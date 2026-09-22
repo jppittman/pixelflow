@@ -3,11 +3,8 @@
 //! The middle width between the SSE2 leaf encoders (`x86_64.rs`, 128-bit) and
 //! the AVX-512 EVEX encoders (`avx512.rs`, 512-bit). Register numbering is
 //! identical to SSE2 (ymm0-15, no extended file — AVX2 has no REX2/EVEX), so
-//! this backend reuses the register *roles* `X86Backend` established (inputs
-//! 0-3, reload 11-12) and only the instruction *encoding*
-//! changes. The pool itself differs: see `AVX2_FILE` for why the gather's
-//! half-temporaries cost it ymm8/ymm9, and why ymm10 — SSE2's own fixed
-//! scratch — is allocatable here.
+//! this backend reuses the register file `X86Backend` declares and only the
+//! instruction *encoding* changes.
 //!
 //! Unlike legacy SSE2, VEX is 3-operand and non-destructive — same property
 //! AVX-512's EVEX has — so there is no two-operand hazard to route around
@@ -30,7 +27,7 @@
 
 use super::x86_64;
 use super::x86_64::{Disp, Imm8, Imm32, Mem, MovLoadPtr, NoDisp, ptr};
-use super::{AsmProgram, EncodedInst, PtrReg, Reg, SourceOperand, assemble, unimplemented_op};
+use super::{AsmProgram, EncodedInst, Gpr, PtrReg, Reg, SourceOperand, assemble, unimplemented_op};
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
 
@@ -77,15 +74,20 @@ enum Map {
     M0F3A = 3,
 }
 
-/// The identity of one VEX-256 instruction: opcode map, implied legacy
-/// prefix, W bit, opcode byte. This quadruple is *which instruction* — it is
-/// constant per mnemonic, so each mnemonic below states it exactly once and
-/// the operand form (`rrr`/`imm`/`rm`) supplies the per-call parts.
+/// The identity of one VEX instruction: opcode map, implied legacy prefix, W
+/// bit, opcode byte, and whether it is the 256-bit form. This is *which
+/// instruction* — it is constant per mnemonic, so each mnemonic below states
+/// it exactly once and the operand form (`rrr`/`imm`/`rm`) supplies the
+/// per-call parts.
 #[derive(Clone, Copy)]
 struct Vex {
     map: Map,
     pp: Pp,
     w: bool,
+    /// `VEX.L`: set for the `ymm` form, clear for the few `xmm`-only
+    /// instructions this tier needs (`vmovq`, `vextractps`), which `#UD` at
+    /// `L = 1`.
+    l256: bool,
     opcode: u8,
 }
 
@@ -99,8 +101,20 @@ impl Vex {
             map,
             pp,
             w: false,
+            l256: true,
             opcode,
         }
+    }
+    /// The 128-bit (`VEX.L = 0`) form of this instruction.
+    const fn xmm(self) -> Self {
+        Self {
+            l256: false,
+            ..self
+        }
+    }
+    /// The 64-bit-operand (`VEX.W = 1`) form of this instruction.
+    const fn w1(self) -> Self {
+        Self { w: true, ..self }
     }
     /// Map `0F`, no prefix — the packed-single arithmetic family.
     const fn m0f(opcode: u8) -> Self {
@@ -137,7 +151,9 @@ impl Vex {
         let bbit = if rm >= 8 { 0x00 } else { 0x20 };
         inst.push(0xC4);
         inst.push(rbit | xbit | bbit | self.map as u8);
-        inst.push(((self.w as u8) << 7) | ((!vvvv & 0xF) << 3) | (1 << 2) | self.pp as u8); // L=1
+        inst.push(
+            ((self.w as u8) << 7) | ((!vvvv & 0xF) << 3) | ((self.l256 as u8) << 2) | self.pp as u8,
+        );
         inst.push(self.opcode);
         inst.push(0xC0 | ((dst & 7) << 3) | (rm & 7));
         inst
@@ -153,7 +169,7 @@ impl Vex {
         let bbit = if addr.base.0 >= 8 { 0x00 } else { 0x20 };
         inst.push(0xC4);
         inst.push(rbit | 0x40 | bbit | self.map as u8);
-        inst.push(((self.w as u8) << 7) | (0xF << 3) | (1 << 2) | self.pp as u8); // vvvv unused, L=1
+        inst.push(((self.w as u8) << 7) | (0xF << 3) | ((self.l256 as u8) << 2) | self.pp as u8); // vvvv unused
         inst.push(self.opcode);
         x86_64::mem_operand_into(&mut inst, reg, addr);
         inst
@@ -167,7 +183,9 @@ impl Vex {
         let bbit = if addr.base.0 >= 8 { 0x00 } else { 0x20 };
         inst.push(0xC4);
         inst.push(rbit | 0x40 | bbit | self.map as u8);
-        inst.push(((self.w as u8) << 7) | ((!vvvv & 0xF) << 3) | (1 << 2) | self.pp as u8); // L=1
+        inst.push(
+            ((self.w as u8) << 7) | ((!vvvv & 0xF) << 3) | ((self.l256 as u8) << 2) | self.pp as u8,
+        );
         inst.push(self.opcode);
         x86_64::mem_operand_into(&mut inst, dst, addr);
         inst
@@ -202,6 +220,12 @@ impl VexImm {
     /// Register form with the imm8 appended.
     fn rrr(self, dst: u8, vvvv: u8, rm: u8) -> EncodedInst {
         let mut inst = self.vex.rrr(dst, vvvv, rm);
+        inst.push(self.imm);
+        inst
+    }
+    /// Memory form with the imm8 appended.
+    fn rm<D: Disp>(self, reg: u8, addr: Mem<D>) -> EncodedInst {
+        let mut inst = self.vex.rm(reg, addr);
         inst.push(self.imm);
         inst
     }
@@ -459,13 +483,62 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         // index and value registers, plus one of each to carry the high half
         // while the low one is assembled in `dst`.
         ScheduledOp::Gather(..) => 4,
-        // A surviving fold's own loop scaffold: the persistent binder
-        // register plus two transient registers for the trip test and the
-        // accumulate — see `emit_dag_body_hoisted`'s `Reduce` arm.
+        // A surviving fold's own loop: two transient registers for the trip
+        // test and the accumulate — see `emit_scope`'s `Reduce` arm. The
+        // binder and the accumulator are the fold's roots, placed by the
+        // allocator, not scratch.
         ScheduledOp::Reduce(..) => super::regalloc::Scratch::REDUCE_TEMPS as u8,
+        // A remainder past the low half stores its upper lanes out of the
+        // high 128 bits, extracted into one temp; one that fits the low half
+        // reads them straight out of the value, and a full batch is one
+        // `vmovups`.
+        ScheduledOp::Write { lanes, .. } if *lanes > 4 && *lanes < 8 => 1,
         _ => 0,
     }
 }
+
+// =============================================================================
+// The store, and the iota
+// =============================================================================
+
+/// `vcvttss2si r64, xmm` — `VEX.LIG.F3.0F.W1 2C /r`: lane 0, truncated to a
+/// 64-bit integer.
+#[must_use]
+fn vcvttss2si_xmm(dst: Gpr, src: Reg) -> EncodedInst {
+    Vex::m0f_f3(0x2C).w1().rrr(dst.0, UNUSED_VVVV, src.0)
+}
+
+/// `vcvttss2si r64, m32` — the same, reading the first word of a slot.
+#[must_use]
+fn vcvttss2si_mem<D: Disp>(dst: Gpr, addr: Mem<D>) -> EncodedInst {
+    Vex::m0f_f3(0x2C).w1().rm(dst.0, addr)
+}
+
+/// `vmovq xmm, r64` — `VEX.128.66.0F.W1 6E /r`: eight bytes into the low
+/// lanes, the rest zeroed.
+#[must_use]
+fn vmovq_xmm_r64(dst: Reg, src: Gpr) -> EncodedInst {
+    Vex::m0f_66(0x6E).w1().xmm().rrr(dst.0, UNUSED_VVVV, src.0)
+}
+
+/// `vpmovzxbd ymm, xmm` — `VEX.256.66.0F38.WIG 31 /r`: eight bytes widened
+/// to eight dword lanes.
+#[must_use]
+fn vpmovzxbd(dst: Reg, src: Reg) -> EncodedInst {
+    Vex::m0f38_66(0x31).rrr(dst.0, UNUSED_VVVV, src.0)
+}
+
+/// `vextractps m32, xmm, lane` — `VEX.128.66.0F3A.WIG 17 /r ib`: one lane of
+/// the low half, stored.
+#[must_use]
+fn vextractps_store<D: Disp>(addr: Mem<D>, src: Reg, lane: u8) -> EncodedInst {
+    debug_assert!(lane < 4, "vextractps reads the low 128 bits");
+    Vex::m0f3a_66(0x17).xmm().imm(lane).rm(src.0, addr)
+}
+
+/// The bytes `0..8`, little end first: what one `movabs` carries in for
+/// `vpmovzxbd` to widen into the iota.
+const IOTA_BYTES: u64 = 0x0706_0504_0302_0100;
 
 /// Emit a shift of i32 lanes by a compile-time immediate.
 pub fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount: u8) {
@@ -937,46 +1010,32 @@ mod tests {
 )]
 pub(crate) mod driver {
     use super::super::*;
-    use super::{AsmProgram, Mem, NoDisp, UNUSED_VVVV, Vex, frame_slot};
+    use super::{
+        AsmProgram, IOTA_BYTES, Mem, NoDisp, UNUSED_VVVV, Vex, frame_slot, vcvttss2si_mem,
+        vcvttss2si_xmm, vextractf128, vextractps_store, vmovq_xmm_r64, vpmovzxbd,
+    };
     use crate::emit::x86_64 as x86;
-    use crate::emit::x86_64::driver::SSE2_FILE;
+    use crate::emit::x86_64::driver::{Convert, SSE2_FILE, write_address};
     use crate::error::CompileError;
     use alloc::vec::Vec;
     use pixelflow_ir::kind::OpKind;
 
     /// The AVX2 register file (ymm, 256-bit).
     ///
-    /// Same register roles as SSE2 (ymm0-15 is the same physical file as xmm0-15)
-    /// at twice the width, with a pool of **five**, one fewer than SSE2's six.
-    /// AVX2's gather splits into 128-bit halves and so needs two scratch registers
-    /// beyond the pair SSE2 uses (ymm13/14) to hold the high-half indices and the
-    /// high-half result across the recombine. Those live in ymm8/ymm9, which must
-    /// therefore sit OUTSIDE the allocator's range: with them allocatable the
-    /// allocator could hand `dst` or `idx` an ymm8/9 that the gather then
-    /// overwrites mid-sequence, silently returning wrong lanes — reachable
-    /// whenever five values stay live across a gather.
-    ///
-    /// The cost is more spilling in AVX2 kernels than SSE2 sees, to fix a bug on
-    /// the gather path specifically. Spilling the two half-temporaries to the red
-    /// zone instead would restore those two as well; that is a contained change
-    /// to `super::emit_gather_scalar` and is the better long-term fix.
+    /// The same sixteen registers as SSE2's at twice the width. The gather
+    /// borrows four of them across its own sequence (the high half's index
+    /// and result beside the low half's pair), the sign mask and the select
+    /// blend borrow one — all reservations the allocator makes for one
+    /// instruction, so all of them are its the rest of the time.
     const AVX2_FILE: regalloc::RegisterFile = regalloc::RegisterFile {
-        // ymm4-15: every register the ABI does not use for an argument. The
-        // gather borrows four of them across its own sequence (ymm8/9 for the
-        // high half, ymm14/15 for the low), the sign mask and the select blend
-        // borrow one, and ymm11/12 were the reload pair — all reservations the
-        // allocator makes for one instruction, so all of them are its the rest
-        // of the time.
-        scratch: regalloc::RegSet::range(4, 12),
-        // Nothing. Every register this backend's encodings destroy is now a
-        // per-instruction reservation, so ymm8/9/14/15 are the allocator's
-        // except across the one gather that borrows them.
+        scratch: regalloc::RegSet::range(0, 16),
         fixed: &[],
         temps_for: super::temps_for,
         vector_bytes: 32,
         ..SSE2_FILE
     }
     .checked();
+
     /// AVX2 implementation of the shared driver's leaf operations.
     pub(crate) struct Avx2Backend {
         file: regalloc::RegisterFile,
@@ -1033,6 +1092,18 @@ pub(crate) mod driver {
                 ResolvedOp::LoadConst { dst, val_bits } => {
                     super::emit_const(code, *dst, f32::from_bits(*val_bits));
                 }
+                // The iota: the bytes `0..8` in through a GPR, widened to
+                // dwords, converted. No vector temp — `dst` is every stage's.
+                ResolvedOp::Lanes { dst } => {
+                    let gpr = crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0));
+                    x86::movabs(code, gpr, IOTA_BYTES);
+                    AsmProgram::from([
+                        vmovq_xmm_r64(*dst, gpr),
+                        vpmovzxbd(*dst, *dst),
+                        Vex::m0f(0x5B).rrr(dst.0, UNUSED_VVVV, dst.0),
+                    ])
+                    .assemble(code);
+                }
                 ResolvedOp::Unary { op, dst, src } => {
                     super::emit_unary(code, *op, *dst, *src, plan.scratch.temp(0));
                 }
@@ -1049,13 +1120,9 @@ pub(crate) mod driver {
                     // in `AVX2_FILE.gpr_ctx` (rdi); arithmetic/const emit
                     // never touches it, so it survives to here. The base
                     // pointer and index GPRs are `AVX2_FILE.gpr_scratch`'s
-                    // allocated reservations. ymm13/14 mirror X86Backend's
-                    // gather scratch; ymm8/9 are the AVX2-only high-half
-                    // scratch this two-half gather needs (see
-                    // `super::emit_gather_scalar`). ymm8/9 are non-allocatable
-                    // by construction — see `AVX2_SCHED_NUM_REGS`, which caps
-                    // the pool at ymm4-7 so the allocator can never place
-                    // `dst`/`idx` where this clobbers.
+                    // allocated reservations; the four vector temps are the
+                    // two halves' index and value registers (see
+                    // `super::emit_gather_scalar`).
                     let ctx_gpr = self
                         .file
                         .gpr_ctx
@@ -1189,11 +1256,6 @@ pub(crate) mod driver {
             asm.push(x86::Jcc::je(label));
         }
 
-        // Same scaffold register roles as SSE2 — see `x86_64::scaffold` — at
-        // this vector width. Unlike SSE2 there is no red-zone mode: the body
-        // always spills into an allocated frame, and the scaffold's coordinate
-        // slots sit above it.
-
         fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {
             AsmProgram::from([x86::Inst::SubImm32 {
                 dst: x86::gpr::RSP,
@@ -1218,37 +1280,6 @@ pub(crate) mod driver {
             AsmProgram::from([Vex::m0f(0x10).rm(dst.0, frame_slot(offset))]).assemble(code);
         }
 
-        fn latch_bounds(&mut self, code: &mut Vec<u8>) {
-            x86::scaffold::latch_bounds(code);
-        }
-
-        fn counter_clear(&mut self, code: &mut Vec<u8>, counter: Counter) {
-            x86::scaffold::counter_clear(code, counter);
-        }
-
-        fn counter_step(&mut self, code: &mut Vec<u8>, counter: Counter) {
-            x86::scaffold::counter_step(code, counter);
-        }
-
-        fn branch_if_counter_done(&mut self, asm: &mut Assembly, counter: Counter, label: Label) {
-            x86::scaffold::branch_if_counter_done(asm, counter, label);
-        }
-
-        fn store_result(&mut self, code: &mut Vec<u8>, src: Reg) {
-            AsmProgram::from([Vex::m0f(0x11).rm(
-                src.0,
-                Mem {
-                    base: x86::scaffold::OUT_PTR,
-                    disp: NoDisp,
-                },
-            )])
-            .assemble(code);
-        }
-
-        fn advance_out(&mut self, code: &mut Vec<u8>, step: OutStep) {
-            x86::scaffold::advance_out(code, step, self.file.vector_bytes);
-        }
-
         fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
             super::emit_const(code, scratch, scalar);
             super::emit_binary(code, OpKind::Add, dst, dst, scratch);
@@ -1260,6 +1291,48 @@ pub(crate) mod driver {
 
         fn alu(&mut self, code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2]) {
             super::emit_binary(code, op, dst, srcs[0], srcs[1]);
+        }
+
+        /// A full batch is one `vmovups`. A remainder is `vextractps` per
+        /// lane: the low four straight out of the value, the rest out of its
+        /// high half extracted into the reserved temp.
+        fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan) {
+            let addr = write_address(
+                code,
+                &self.file,
+                write,
+                Convert {
+                    from_xmm: |code, dst, src| {
+                        AsmProgram::from([vcvttss2si_xmm(dst, src)]).assemble(code)
+                    },
+                    from_mem: |code, dst, addr| {
+                        AsmProgram::from([vcvttss2si_mem(dst, addr)]).assemble(code)
+                    },
+                },
+            );
+            let base = PtrReg(addr.0);
+            let lanes = self.file.vector_bytes / 4;
+            if write.lanes == lanes {
+                AsmProgram::from([Vex::m0f(0x11).rm(write.value.0, Mem { base, disp: NoDisp })])
+                    .assemble(code);
+                return;
+            }
+            let mut half = write.value;
+            for lane in 0..write.lanes {
+                if lane == 4 {
+                    half = crate::emit::declared_temp(write.scratch.temp(0));
+                    vextractf128(code, half.0, write.value.0, 1);
+                }
+                AsmProgram::from([vextractps_store(
+                    Mem {
+                        base,
+                        disp: x86::Imm8((lane * 4) as i8),
+                    },
+                    half,
+                    (lane % 4) as u8,
+                )])
+                .assemble(code);
+            }
         }
 
         fn emit_ret(&mut self, code: &mut Vec<u8>) {

@@ -22,22 +22,23 @@ pub mod error;
 
 pub mod compiled_kernel;
 pub use compiled_kernel::CompiledKernel;
-pub use emit::executable::{Extent2D, Point4, TileSlice};
 pub use error::CompileError;
 
 // x86-64 and aarch64 are the architectures with emitters.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub mod jit_cache;
 
-/// Byte width of the SIMD vector this build's JIT emits and calls — i.e. the
-/// size of one [`KernelFn`](emit::executable::KernelFn) argument vector.
+/// Byte width of the SIMD vector this build's JIT emits — the batch the
+/// lattice's lane fold is executed by.
 ///
 /// The JIT has no dependency on `pixelflow-core`, so it cannot name `Field`
-/// directly. This const is the single source of truth for the width the emitter
-/// and the `KernelFn` ABI agree on. Callers that bridge `Field` to a JIT kernel
-/// assert `size_of::<Field>() == JIT_VECTOR_BYTES` at compile time, turning any
-/// width disagreement into a clear build error rather than a raw `transmute` size
-/// error (or, worse, a silent miscompile).
+/// directly. This const is the single source of truth for the width the
+/// emitter strip-mines a lattice's columns to (`passes::lattice::pack`'s
+/// `L`). Nothing about it reaches the [`KernelFn`](emit::executable::KernelFn)
+/// ABI any more — a call passes pointers and a pitch — so a disagreement
+/// with `Field` no longer miscompiles anything; `pixelflow-core` still
+/// asserts the two agree, because its `Field` is the width its own buffers
+/// are laid out for.
 ///
 /// A genuine 3-way split, checked against `target_feature` — the flag that
 /// actually governs what the compiler may emit. `pixelflow-core` gates
