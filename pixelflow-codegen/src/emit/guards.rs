@@ -681,6 +681,9 @@ fn select_arms(schedule: &[Def], external: &[ValueId]) -> Vec<SelectArms> {
                         ScheduledOp::ShiftImm(op, _, _) => cycles.cost(*op),
                         ScheduledOp::Ternary(op, _, _, _) => cycles.cost(*op),
                         ScheduledOp::Gather(_, _) => cycles.cost(OpKind::RawGather),
+                        // One scalar load broadcast, which is what a
+                        // uniform read is too.
+                        ScheduledOp::Broadcast(_, _) => cycles.cost(OpKind::Uniform),
                         // A whole loop, not one instruction — this heuristic
                         // is a cluster-ordering cost estimate (docs/BACKLOG.md
                         // X1), not a correctness question, and a surviving

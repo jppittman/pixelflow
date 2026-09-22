@@ -196,11 +196,9 @@ impl Vex {
     /// `op reg, [baseGPR + indexGPR*4]` — SIB, scale 4, no displacement.
     fn rm_scaled4(self, reg: Reg, base_gpr: u8, index_gpr: u8) -> EncodedInst {
         debug_assert!(base_gpr < 8 && index_gpr < 8, "Vex::rm_scaled4: GPR8 only");
-        debug_assert!(base_gpr != 5, "base rbp/r13 would force a disp form");
         let mut inst = EncodedInst::new();
         self.head_into(&mut inst, reg.0, UNUSED_VVVV, base_gpr);
-        inst.push(((reg.0 & 7) << 3) | 0b100); // mod=00, rm=SIB
-        inst.push((0b10 << 6) | ((index_gpr & 7) << 3) | (base_gpr & 7)); // scale=4
+        scaled4_operand_into(&mut inst, reg.0, Gpr(base_gpr), Gpr(index_gpr));
         inst
     }
 
@@ -704,6 +702,40 @@ pub fn emit_gather_scalar(code: &mut Vec<u8>, dst: Reg, idx: Reg, slot: u16, s: 
     }
 }
 
+/// The GPRs a broadcast load runs through: the buffer base and the one
+/// index, both this instruction's `RegisterFile::gpr_scratch` reservations,
+/// and the caller's context pointer (`RegisterFile::gpr_ctx`, read-only).
+#[derive(Clone, Copy)]
+pub struct BroadcastGprs {
+    /// Receives the buffer base pointer.
+    pub base: Gpr,
+    /// Receives the truncated index.
+    pub index: Gpr,
+    /// Holds the caller's context pointer.
+    pub ctx: PtrReg,
+}
+
+/// `dst = splat(buffer[slot][idx])`, the index being the same in every lane
+/// of `idx` — [`ResolvedOp`](super::ResolvedOp)`::Broadcast`. `cvttss2si
+/// index, xmm<idx>` truncates lane 0, `mov base, [ctx + slot*8]` fetches the
+/// buffer as a gather does, and `vbroadcastss xmm<dst>, [base + index*4]`
+/// (VEX.128.66.0F38.W0 18 /r, SIB scale 4) reads the element once into every
+/// lane. Three instructions where the gather is thirteen; `dst` may alias
+/// `idx`, since the index is in a GPR before `dst` is written.
+pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, slot: u16, gprs: BroadcastGprs) {
+    AsmProgram::from([
+        cvttss2si_xmm(gprs.index, idx),
+        MovLoadPtr {
+            dst: PtrReg(gprs.base.0),
+            base: gprs.ctx,
+            disp: i32::from(slot) * PTR_BYTES,
+        }
+        .encode(),
+        Vex::m0f38_66(0x18).rm_scaled4(dst, gprs.base.0, gprs.index.0),
+    ])
+    .assemble(code);
+}
+
 /// VPADDD dst, src1, src2 — packed i32 add.
 fn emit_vpaddd(code: &mut Vec<u8>, dst: Reg, src1: Reg, src2: Reg) {
     assemble(code, [Vex::m0f_66(0xFE).rrr(dst, src1, src2)]); // VEX.128.66.0F.WIG FE /r
@@ -818,17 +850,17 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
 /// [`regalloc::RegisterFile::gpr_ctx`].
 ///
 /// `Gather`'s scalar-load sequence needs a base-pointer GPR (loaded from the
-/// context) and a per-lane index GPR; `Uniform` needs only the base pointer;
-/// a `Write` converts its row and column into one each before combining
-/// them into the address; the iota carries each lane pair in through one.
-/// The gather's pair used to be `rax`/`rcx` chosen by hand — invisible to
-/// the allocator, and correct only because nothing else in the schedule
-/// ever asked for a GPR — and are `RegisterFile::gpr_scratch` reservations
-/// now.
+/// context) and a per-lane index GPR, and `Broadcast` the same pair for its
+/// one index; `Uniform` needs only the base pointer; a `Write` converts its
+/// row and column into one each before combining them into the address; the
+/// iota carries each lane pair in through one. The gather's pair used to be
+/// `rax`/`rcx` chosen by hand — invisible to the allocator, and correct only
+/// because nothing else in the schedule ever asked for a GPR — and are
+/// `RegisterFile::gpr_scratch` reservations now.
 pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
-        ScheduledOp::Gather(..) | ScheduledOp::Write { .. } => 2,
+        ScheduledOp::Gather(..) | ScheduledOp::Broadcast(..) | ScheduledOp::Write { .. } => 2,
         ScheduledOp::Uniform(..) | ScheduledOp::Lanes(_) => 1,
         _ => 0,
     }
@@ -1551,6 +1583,23 @@ pub(crate) mod driver {
                             ctx_gpr: ctx_gpr.0,
                             idx_lanes: crate::emit::declared_temp(plan.scratch.temp(0)),
                             value: crate::emit::declared_temp(plan.scratch.temp(1)),
+                        },
+                    );
+                }
+                ResolvedOp::Broadcast { dst, idx, slot } => {
+                    let ctx = self
+                        .file
+                        .gpr_ctx
+                        .expect("SSE2's broadcast load needs a GPR context input");
+                    super::emit_broadcast_load(
+                        code,
+                        *dst,
+                        *idx,
+                        *slot,
+                        super::BroadcastGprs {
+                            base: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)),
+                            index: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1)),
+                            ctx: PtrReg(ctx.0),
                         },
                     );
                 }
@@ -2570,6 +2619,26 @@ const RM_RIP_AT_MOD0: u8 = 0b101;
 
 /// SIB naming the base register alone: scale 1, index `100` (none).
 const SIB_BASE_ONLY: u8 = 0x24;
+
+/// Write the ModRM/SIB tail for `[base + index*4]` into an `EncodedInst`:
+/// `mod = 00`, a SIB with scale 4 and no displacement — the element of a
+/// plane of `f32`s, addressed in one instruction. The tail is the
+/// architecture's, not the prefix's, so the VEX and EVEX tiers share it the
+/// way they share [`mem_operand_into`].
+pub(in crate::emit) fn scaled4_operand_into(
+    inst: &mut EncodedInst,
+    reg: u8,
+    base: Gpr,
+    index: Gpr,
+) {
+    debug_assert!(
+        base.0 & 7 != RM_RIP_AT_MOD0,
+        "[rbp/r13 + index*4] has no mod=00 form: that base means no base"
+    );
+    debug_assert!(index.0 & 7 != RM_SIB, "rsp/r12 cannot index a SIB");
+    inst.push(((reg & 7) << 3) | RM_SIB);
+    inst.push((0b10 << 6) | ((index.0 & 7) << 3) | (base.0 & 7));
+}
 
 /// Write the ModRM/SIB/disp tail into an `EncodedInst`.
 pub(in crate::emit) fn mem_operand_into<D: Disp, P: BaseReg>(

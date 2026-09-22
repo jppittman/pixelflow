@@ -71,6 +71,7 @@ pub enum Inst {
     InsW { dst: Reg, lane: u8, src: Gpr },
     MvnW { dst: Gpr, src: Gpr },
     Fcvtzs(Reg, Reg),
+    FcvtzsX { dst: Gpr, src: Reg },
     Scvtf(Reg, Reg),
     AddI32(Reg, Reg, Reg),
     And(Reg, Reg, Reg),
@@ -117,6 +118,11 @@ impl Inst {
     #[inline(always)]
     pub fn ldr_w(dst: Gpr, addr: MemIndexed) -> Self {
         Self::Ldr(Ldr::w(dst, addr))
+    }
+    #[must_use]
+    #[inline(always)]
+    pub fn ldr_s_indexed(dst: Reg, addr: MemIndexed) -> Self {
+        Self::Ldr(Ldr::s_indexed(dst, addr))
     }
     #[must_use]
     #[inline(always)]
@@ -197,6 +203,7 @@ impl Inst {
             Inst::InsW { dst, lane, src } => InsW::new(dst, lane, src).encode(),
             Inst::MvnW { dst, src } => table::MvnW::new(dst, src).encode(),
             Inst::Fcvtzs(dst, src) => Fcvtzs::new(dst, src).encode(),
+            Inst::FcvtzsX { dst, src } => FcvtzsX::new(dst, src).encode(),
             Inst::Scvtf(dst, src) => Scvtf::new(dst, src).encode(),
             Inst::AddI32(dst, s1, s2) => AddI32::new(dst, s1, s2).encode(),
             Inst::And(dst, s1, s2) => And::new(dst, s1, s2).encode(),
@@ -640,6 +647,49 @@ pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx_int: Reg, gprs: GatherGprs)
     .assemble(code);
 }
 
+/// The GP registers a broadcast load runs through: the buffer base and the
+/// one index, both this instruction's `RegisterFile::gpr_scratch`
+/// reservations, and the caller's context pointer (`RegisterFile::gpr_ctx`).
+pub struct BroadcastGprs {
+    /// Receives the buffer base pointer.
+    pub base: PtrReg,
+    /// Receives the truncated index.
+    pub index: Gpr,
+    /// Holds the caller's context pointer (read-only).
+    pub ctx: PtrReg,
+}
+
+/// `dst = splat(buffer[slot][idx])`, the index being the same in every lane
+/// of `idx`: `fcvtzs x<index>, s<idx>` truncates lane 0, `ldr base, [ctx,
+/// #slot*8]` fetches the buffer as a gather does, `ldr s<dst>, [base,
+/// w<index>, uxtw #2]` reads the element and `dup` spreads it. Four
+/// instructions where the gather is fourteen; `dst` may alias `idx`, since
+/// the index is in a GPR before `dst` is written.
+pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, slot: u16, gprs: BroadcastGprs) {
+    AsmProgram::from([
+        Inst::FcvtzsX {
+            dst: gprs.index,
+            src: idx,
+        },
+        Inst::ldr_x(
+            gprs.base,
+            Mem {
+                base: gprs.ctx,
+                offset: u32::from(slot) * X_BYTES,
+            },
+        ),
+        Inst::ldr_s_indexed(
+            dst,
+            MemIndexed {
+                base: gprs.base,
+                index: gprs.index,
+            },
+        ),
+        Inst::DupLane0(dst, dst),
+    ])
+    .assemble(code);
+}
+
 // =============================================================================
 // Integer Vector Operations (for bit manipulation in transcendentals)
 // =============================================================================
@@ -725,15 +775,16 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
 /// [`regalloc::RegisterFile::gpr_ctx`].
 ///
 /// `Gather`'s scalar-load sequence needs a base pointer, a per-lane index and
-/// a loaded value, each a GPR; `Uniform` needs only the base pointer; a
-/// `Write` converts its row and column into one each before combining them
-/// into the address. All were `x9`/`x10`/`x11` chosen by hand before this
-/// work and are `RegisterFile::gpr_scratch` reservations now.
+/// a loaded value, each a GPR; `Broadcast` a base pointer and its one index,
+/// the element landing straight in a vector lane; `Uniform` only the base
+/// pointer; a `Write` converts its row and column into one each before
+/// combining them into the address. All were `x9`/`x10`/`x11` chosen by hand
+/// before this work and are `RegisterFile::gpr_scratch` reservations now.
 pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
         ScheduledOp::Gather(..) => 3,
-        ScheduledOp::Write { .. } => 2,
+        ScheduledOp::Write { .. } | ScheduledOp::Broadcast(..) => 2,
         ScheduledOp::Uniform(..) => 1,
         _ => 0,
     }
@@ -2259,11 +2310,7 @@ pub(crate) mod driver {
                 return;
             }
         };
-        // fcvtzs dst, s(from) — scalar, 64-bit destination.
-        AsmProgram::from([Inst::Raw(
-            0x9E38_0000 | (u32::from(from.0) << 5) | u32::from(dst.0),
-        )])
-        .assemble(code);
+        AsmProgram::from([Inst::FcvtzsX { dst, src: from }]).assemble(code);
     }
     /// Emit machine code for a resolved instruction plan.
     ///
@@ -2434,6 +2481,19 @@ pub(crate) mod driver {
                     },
                 ])
                 .assemble(code);
+            }
+            ResolvedOp::Broadcast { dst, idx, slot } => {
+                super::emit_broadcast_load(
+                    code,
+                    *dst,
+                    *idx,
+                    *slot,
+                    super::BroadcastGprs {
+                        base: PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0),
+                        index: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1)),
+                        ctx: ptr::X0,
+                    },
+                );
             }
             ResolvedOp::Uniform { dst, load } => {
                 let base = PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0);

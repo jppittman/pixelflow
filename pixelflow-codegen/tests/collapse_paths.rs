@@ -103,6 +103,54 @@ fn a_gather_reads_the_bound_buffer() {
     check(&out, |x, y| table[x as usize] + y);
 }
 
+/// `table[y] + x`: a gather whose address is the row alone — the same in
+/// every lane of a batch — so it is one scalar load broadcast, not a
+/// per-lane gather. The row varies by call, so the element read must too.
+#[test]
+fn a_lane_uniform_read_is_one_broadcast_load() {
+    let table: Vec<f32> = (0..16).map(|i| 100.0 + i as f32 * 3.0).collect();
+    let mut a = ExprArena::new();
+    let buffer = a.declare_buffer(BufferDecl {
+        id: BufferIdentity::mint(),
+        width: table.len() as u32,
+        height: 1,
+    });
+    let x = a.push_var(0);
+    let y = a.push_var(1);
+    let buf = a.push_buffer(buffer);
+    let gathered = a.push_binary(OpKind::RawGather, buf, y);
+    let root = a.push_binary(OpKind::Add, gathered, x);
+
+    let out = collapse(&a, root, &[&table], &[]);
+    check(&out, |x, y| table[y as usize] + x);
+}
+
+/// `sum_{k in [0, 6)} table[k] * (x + k)`: a fold whose table reads are
+/// addressed by its own binder and nothing else — a glyph's shape. Each read
+/// is a broadcast inside the loop, once per trip, while the body it feeds
+/// varies by lane.
+#[test]
+fn a_folds_table_reads_are_broadcasts() {
+    let table: Vec<f32> = (0..8).map(|i| 1.5 + i as f32).collect();
+    let mut a = ExprArena::new();
+    let buffer = a.declare_buffer(BufferDecl {
+        id: BufferIdentity::mint(),
+        width: table.len() as u32,
+        height: 1,
+    });
+    let x = a.push_var(0);
+    let binder = Binder::from_slot(0).expect("slot 0");
+    let k = a.push_var(binder.var());
+    let buf = a.push_buffer(buffer);
+    let tk = a.push_binary(OpKind::RawGather, buf, k);
+    let xk = a.push_binary(OpKind::Add, x, k);
+    let body = a.push_binary(OpKind::Mul, tk, xk);
+    let root = a.push_reduce(Fold::new(Monoid::SUM, binder, 0..6), body);
+
+    let out = collapse(&a, root, &[&table], &[]);
+    check(&out, |x, _| (0..6).map(|k| table[k] * (x + k as f32)).sum());
+}
+
 /// `sum_{k in [0, 5)} (x + k) * y`: a surviving fold nested inside the
 /// lattice's own, whose body reads both coordinates.
 #[test]
