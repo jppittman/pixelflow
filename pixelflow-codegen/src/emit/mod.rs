@@ -7629,8 +7629,11 @@ mod tests {
         /// is the one that says so.
         #[test]
         fn a_context_pointer_is_loaded_once_per_call() {
+            // The 128-bit tier's own batch, whatever this host's is: the
+            // schedule is packed at the lane count the backend stores.
+            const SSE_LANES: u32 = 4;
             let (a, root) = gather_by_row();
-            let schedule = native_schedule(&a, root, BATCH);
+            let schedule = schedule_for(&a, root, LatticeShape::new([SSE_LANES, 1]), SSE_LANES);
             let pointers = schedule
                 .iter()
                 .filter(|d| matches!(d.op, ScheduledOp::Context(_)))
