@@ -1,8 +1,7 @@
 //! The op-coverage completeness contract every [`super::IsaBackend`] must satisfy.
 //!
 //! This is test-only infrastructure (see `emit/mod.rs`'s `backend_op_coverage`
-//! tests, and `x86_64.rs`'s `X86BinaryInsn::select` coverage test), not a
-//! production API. It exists because nothing previously enumerated "the ops a
+//! tests), not a production API. It exists because nothing previously enumerated "the ops a
 //! backend must support" anywhere: AVX-512's binary-op dispatch
 //! (`avx512::emit_binary`) implemented 6 of the 15 required ops and nothing
 //! caught the gap until 36 tests failed by accident the first time someone
@@ -28,8 +27,8 @@
 //! - Is structural and never becomes a `ScheduledOp` at all (`Var`, `Const`,
 //!   `Tuple`, `Buffer`) — likewise absent.
 //! - `RawGather` (bound-memory read) reaches `ResolvedOp::Gather`, but is
-//!   intentionally backend-asymmetric today (native `vgatherdps` on AVX-512;
-//!   a four-lane scalar-load sequence on SSE2/aarch64) — deliberately NOT
+//!   intentionally backend-asymmetric today (native `vgatherdps` on AVX2 and
+//!   AVX-512; a four-lane scalar-load sequence on aarch64) — deliberately NOT
 //!   included in a "every backend must support this" list; its own test
 //!   coverage lives with the gather-specific tests. A `RawGather` whose
 //!   index the lane binder does not reach is `ResolvedOp::Broadcast`

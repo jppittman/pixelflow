@@ -1,8 +1,10 @@
 //! x86-64 AVX-512 (EVEX) JIT encoder — 512-bit, 16-lane `zmm` kernels.
 //!
-//! This is the wide counterpart to the SSE2 (`x86_64.rs`) leaf encoders. It
-//! targets the full `zmm0..zmm31` register file via EVEX, so it can also use the
-//! extended registers (`zmm16..31`) that VEX cannot reach.
+//! The widest of the x86-64 tiers (`crate::isa`), above the AVX2 VEX
+//! encoders (`avx2.rs`, 256-bit). It targets the full `zmm0..zmm31` register
+//! file via EVEX, so it can also use the extended registers (`zmm16..31`)
+//! that VEX cannot reach; the general-register half of every kernel is
+//! `x86_64.rs`'s, shared with AVX2.
 //!
 //! Scope: arithmetic, FMA, sqrt/recip/rsqrt, min/max, bitwise, comparisons,
 //! select, constant broadcast, the integer bit-manipulation atoms
@@ -20,10 +22,10 @@
 //! rule here are refused up front rather than mis-emitted.
 //!
 //! Spills use a real stack frame (a `zmm` is 64 bytes — far past the 128-byte
-//! red zone the SSE2 path relies on).
+//! red zone).
 
 use super::x86_64;
-use super::x86_64::{Disp, Imm32, Mem, NoDisp, ptr};
+use super::x86_64::{Disp, Imm32, Mem, NoDisp, frame_slot};
 use super::{AsmProgram, EncodedInst, Gpr, KReg, PtrReg, Reg, assemble, unimplemented_op};
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
@@ -60,7 +62,7 @@ enum Pp {
 /// it exactly once and the operand form (`rrr`/`rm`) supplies the per-call
 /// parts.
 ///
-/// The 128- and 256-bit twins are `x86_64::Vex` and `avx2::Vex`.
+/// The 256-bit twin is `avx2::Vex`.
 #[derive(Clone, Copy)]
 struct Evex {
     map: Map,
@@ -406,7 +408,7 @@ fn vrndscaleps(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
 /// vrcp14ps zmmD, zmmS — EVEX.512.66.0F38.W0 4C /r ; vvvv unused. AVX-512F's
 /// replacement for AVX's `vrcpps` (EVEX has no `0F 53` form); ~2^-14 relative
 /// error, matching `Recip`'s existing "approximate reciprocal" contract on
-/// every other backend (SSE2's `rcpps`, AVX2's `vrcpps`).
+/// every other backend (AVX2's `vrcpps`, NEON's `FRECPE`).
 fn vrcp14ps(c: &mut Vec<u8>, d: u8, s: u8) {
     assemble(c, [Evex::m0f38_66(0x4C).rrr(d, UNUSED_VVVV, s)]);
 }
@@ -456,15 +458,6 @@ pub fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     assemble(code, [Evex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0)]);
 }
 
-/// A slot in the allocated spill frame. AVX-512 kernels are leaves with no
-/// base pointer, so a slot *is* `rsp + offset`.
-const fn frame_slot(offset: u32) -> Mem<Imm32> {
-    Mem {
-        base: ptr::RSP,
-        disp: Imm32(offset as i32),
-    }
-}
-
 /// `dst = splat(val)`: `vbroadcastss zmm, [pool]` (EVEX.512.66.0F38.W0 18
 /// /r), one instruction from the kernel's constant pool. Zero is `vxorps`.
 ///
@@ -483,7 +476,8 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::Con
 /// `dst = splat(base[offset])` at 512 bits: `vbroadcastss zmm<dst>, [base +
 /// 4*offset]` (EVEX.512.66.0F38.W0 18 /r). A full `disp32`, as
 /// [`emit_const`]'s is, so EVEX's compressed-`disp8` scaling never enters
-/// into it. See `x86_64::emit_uniform_load`.
+/// into it. `base` is the block's address, wherever the allocator keeps
+/// that pointer value.
 pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, base: PtrReg, offset: u16) {
     AsmProgram::from([Evex::m0f38_66(0x18).rm(
         dst.0,
@@ -498,8 +492,9 @@ pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, base: PtrReg, offset: u16
 /// `dst = splat(base[idx])` at 512 bits, the index being the same in every
 /// lane of `idx`: `vcvttss2si index, xmm<idx>`, `vbroadcastss zmm<dst>,
 /// [base + index*4]` (EVEX.512.66.0F38.W0 18 /r). Two instructions, no
-/// writemask, no `vgatherdps`. See `x86_64::emit_broadcast_load` for the
-/// register contract.
+/// writemask, no `vgatherdps`. See [`x86_64::BroadcastGprs`] for the
+/// register contract; `dst` may alias `idx`, since the index is in a GPR
+/// before `dst` is written.
 pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64::BroadcastGprs) {
     AsmProgram::from([
         vcvttss2si_xmm(gprs.index, idx),
@@ -518,8 +513,8 @@ pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64:
 
 /// Emit `dst = op(src1, src2)` for a binary arithmetic op.
 ///
-/// EVEX is 3-operand and non-destructive, so unlike SSE there is no
-/// two-operand hazard: `src1`/`src2` are never clobbered and may alias `dst`.
+/// EVEX is 3-operand and non-destructive: `src1`/`src2` are never clobbered
+/// and may alias `dst`.
 /// Returns `Err` for ops not in the Stage-1 arithmetic subset.
 pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Reg) {
     let (d, s1, s2) = (dst.0, src1.0, src2.0);
@@ -548,7 +543,7 @@ pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Re
 // `mask_guard_temp` rather than a hardcoded constant.
 // =============================================================================
 
-/// `vcmpps`/`vpternlog` predicate (imm8). Same ordering as the SSE2 path.
+/// `vcmpps`/`vpternlog` predicate (imm8). Same ordering as the AVX2 path.
 const CMP_EQ: u8 = 0;
 const CMP_LT: u8 = 1;
 const CMP_LE: u8 = 2;
@@ -602,7 +597,7 @@ pub fn emit_compare(code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2], k:
 }
 
 /// Emit `dst = mask ? if_true : if_false`, with the vector mask already in
-/// `dst` (placed there by `setup_mov`, matching the SSE2/NEON convention).
+/// `dst` (placed there by `setup_mov`, matching the AVX2/NEON convention).
 ///
 /// One `vpternlogd dst, if_true, if_false, 0xCA` (EVEX.512.66.0F3A.W0 25 /r ib):
 /// the truth table 0xCA computes `A?B:C` per bit with A=dst(mask), B=if_true,
@@ -1221,15 +1216,15 @@ pub(crate) mod driver {
         vcvttss2si_mem, vcvttss2si_xmm, vmovq_xmm_r64, vmovups_store_masked, vpinsrq_hi, vpmovzxbd,
     };
     use crate::emit::x86_64 as x86;
-    use crate::emit::x86_64::driver::{Convert, SSE2_FILE, write_address};
+    use crate::emit::x86_64::{Convert, write_address};
     use crate::error::CompileError;
     use alloc::vec::Vec;
     use pixelflow_ir::kind::OpKind;
 
     /// The AVX-512 register file (zmm, 512-bit).
     ///
-    /// Identical register *roles* to SSE2 — the shared driver depends on that —
-    /// at four times the width, over the whole extended file.
+    /// The same GPR roles as AVX2's — SysV's, and the shared driver depends
+    /// on them — at twice the width, over the whole extended vector file.
     const AVX512_FILE: regalloc::RegisterFile = regalloc::RegisterFile {
         // zmm0-31, all thirty-two. The pool was *six* when this work
         // started, because a contiguous range could not reach past the reload
@@ -1242,12 +1237,24 @@ pub(crate) mod driver {
         // consumes its three operands.
         fixed: &[],
         temps_for: super::temps_for,
+        // A guard reduces its mask through `k1` and `kortestw` into the
+        // flags, which costs no vector register.
+        guard_temps: 0,
         vector_bytes: 64,
-        // The gather/uniform base pointer is one GPR (`vgatherdps`'s native
-        // addressing needs no per-lane index GPR, unlike the scalar-load
-        // tiers); the store's row and column are two.
+        // SysV's first three integer arguments, in the ABI's order: the
+        // context, the output plane, its pitch — declared so `checked`
+        // proves `gpr_scratch` misses all three.
+        gpr_ctx: Some(x86::gpr::RDI),
+        gpr_out: Some(x86::gpr::RSI),
+        gpr_pitch: Some(x86::gpr::RDX),
+        // rax/rcx: the broadcast's index, the store's row and column, the
+        // iota's bytes. `vgatherdps`'s native addressing needs no per-lane
+        // index GPR.
         gpr_scratch: regalloc::GprSet::of(&[x86::gpr::RAX, x86::gpr::RCX]),
         gpr_temps_for: super::gpr_temps_for,
+        // r9-r11: the pointer class's pool, the caller-saved GPRs left after
+        // the arguments, the scratch and `r8` (the constant pool's anchor).
+        pointers: regalloc::GprSet::of(&[x86::gpr::R9, x86::gpr::R10, x86::gpr::R11]),
         // AVX-512's mask-register file: k1, transient scratch for a
         // compare's `vcmpps` destination, a guard's `vptestmd` destination
         // and a remainder store's writemask, never the same instruction's
@@ -1256,10 +1263,9 @@ pub(crate) mod driver {
         mask_temps_for: super::mask_temps_for,
         // `vptestmd`'s k-register destination, reduced to flags by
         // `kortestw` — the mask-class mirror of a vector `guard_temps`,
-        // needed because this tier's guard (unlike SSE2/AVX2's
-        // `movmskps`/flags) goes through the mask-register file.
+        // needed because this tier's guard (unlike AVX2's
+        // `vmovmskps`/flags) goes through the mask-register file.
         mask_guard_temps: 1,
-        ..SSE2_FILE
     }
     .checked();
 
@@ -1407,7 +1413,7 @@ pub(crate) mod driver {
                     left,
                     right,
                 } => {
-                    // EVEX 3-operand: no two-operand hazard, emit directly.
+                    // EVEX 3-operand: either source may alias `dst`.
                     // Comparisons produce a vector mask (vcmpps -> vpmovm2d),
                     // through the mask-register temp `mask_temps_for` reserved.
                     if super::is_compare(*op) {
@@ -1531,7 +1537,7 @@ pub(crate) mod driver {
 
         // Select short-circuit guards: reduce the vector mask to flags (vptestmd +
         // kortestw) and branch. jz = all-false (skip true arm); jc = all-true (skip
-        // false arm). Mirrors the SSE2 MOVMSKPS guards, k-register-based.
+        // false arm). The k-register spelling of AVX2's `vmovmskps` guards.
         /// [`MaskTest::scratch`] is unused: this tier reduces the mask with
         /// `kortest` into the flags, needing no *vector* register. It is the
         /// one tier that wants [`MaskTest::mask_scratch`], because `vptestmd`
@@ -1646,11 +1652,11 @@ pub(crate) mod driver {
     mod tests {
         use super::*;
 
-        /// `AVX512_FILE`'s field values are restated (not delegated to
-        /// `..SSE2_FILE`) because they genuinely differ — thirty-two
-        /// registers and this backend's own `temps_for` rather than SSE2's
-        /// sixteen and its select-reload-aware one — so nothing catches a
-        /// regression back to the SSE2 shape except a direct assertion.
+        /// `AVX512_FILE` states every field itself rather than borrowing
+        /// AVX2's through `..`, because the two genuinely differ — thirty-two
+        /// registers and this backend's own `temps_for` rather than AVX2's
+        /// sixteen — so nothing catches a regression back to the narrower
+        /// shape except a direct assertion.
         #[test]
         fn avx512_file_reserves_the_whole_zmm_file_with_no_fixed_registers() {
             assert_eq!(AVX512_FILE.scratch, regalloc::RegSet::range(0, 32));

@@ -857,7 +857,7 @@ mod tests {
         use crate::emit::tests::schedule_for;
         use crate::emit::{
             BYTES_PER_LANE, CONST_POOL_ALIGN, IsaBackend, aarch64, avx2, avx512,
-            compile_via_backend, x86_64,
+            compile_via_backend,
         };
 
         fn traffic<B: IsaBackend>(mut backend: B, arena: &ExprArena, root: ExprId) -> EmitTraffic {
@@ -875,11 +875,6 @@ mod tests {
                 "NEON",
                 traffic(aarch64::driver::Aarch64Backend::new(tight()), &arena, root),
                 traffic(aarch64::driver::Aarch64Backend::new(loose()), &arena, root),
-            ),
-            (
-                "SSE2",
-                traffic(x86_64::driver::X86Backend::new(tight()), &arena, root),
-                traffic(x86_64::driver::X86Backend::new(loose()), &arena, root),
             ),
             (
                 "AVX2",

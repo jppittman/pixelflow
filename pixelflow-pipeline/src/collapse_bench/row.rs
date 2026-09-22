@@ -54,7 +54,7 @@ pub struct StaticFeatures {
     pub carried: u32,
     /// Registers the allocator could hand out.
     pub pool: u32,
-    /// Bytes one spilled register occupies — 16 for SSE2/NEON, 64 for AVX-512.
+    /// Bytes one spilled register occupies — 16 for NEON, 32 for AVX2, 64 for AVX-512.
     pub vector_bytes: u32,
     /// Σ over scopes of (memory ops in scope × executions per call).
     pub dyn_memory_ops: u64,
