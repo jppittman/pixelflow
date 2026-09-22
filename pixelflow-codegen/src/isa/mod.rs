@@ -31,6 +31,8 @@ use std::sync::OnceLock;
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
 use x86_64::runnable;
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) use x86_64::skip_unless_host_runs;
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
@@ -171,22 +173,6 @@ fn names(tiers: &[Isa]) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
-
-/// In a test: return early, with a note on stderr, unless this host can
-/// execute `$isa`'s kernels. The harness has no skip, so an early `return`
-/// with a note is what "this host cannot run it" looks like — never a
-/// silent pass, and never a failure for a fact about the machine.
-#[cfg(test)]
-macro_rules! skip_unless_host_runs {
-    ($isa:expr) => {
-        if !$crate::isa::host_runs($isa) {
-            std::eprintln!("skipped: this host cannot execute {:?} kernels", $isa);
-            return;
-        }
-    };
-}
-#[cfg(test)]
-pub(crate) use skip_unless_host_runs;
 
 #[cfg(test)]
 mod tests {
