@@ -22,7 +22,7 @@
 //! than a silently dropped term.
 
 use super::regalloc::{Scope, ValueId};
-use super::{Binding, InstructionPlan, IsaBackend, Loc, Reg, Reload, WritePlan};
+use super::{Binding, InstructionPlan, IsaBackend, Loc, PtrReg, Reg, Reload, WritePlan};
 use crate::error::CompileError;
 use alloc::vec::Vec;
 
@@ -251,7 +251,7 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         current.instructions += 1;
         for reload in &plan.reloads {
             match reload {
-                Reload::FromStack { .. } => current.loads_transient += 1,
+                Reload::FromStack { .. } | Reload::Ptr { .. } => current.loads_transient += 1,
                 Reload::Const { .. } => current.remats += 1,
             }
         }
@@ -286,9 +286,26 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
             Some(Binding::Loc(Loc::Slot(_))) => self.current().loads_kept += 1,
             Some(Binding::Remat(_)) => self.current().remats += 1,
             // Already in a register, or not placed at all: nothing is emitted.
-            Some(Binding::Loc(Loc::Reg(_))) | None => {}
+            Some(Binding::Loc(Loc::Reg(_) | Loc::Ptr(_))) | None => {}
         }
         self.inner.emit_resolve(code, vid, target, locs)
+    }
+
+    // The pointer class's traffic is traffic: a stored address is a store, a
+    // reloaded one a kept load (it is read for the whole scope that follows,
+    // like a vector root's), a copy between registers nothing.
+    fn ptr_store(&mut self, code: &mut Vec<u8>, src: PtrReg, offset: u32) {
+        self.current().stores += 1;
+        self.inner.ptr_store(code, src, offset);
+    }
+
+    fn ptr_load(&mut self, code: &mut Vec<u8>, dst: PtrReg, offset: u32) {
+        self.current().loads_kept += 1;
+        self.inner.ptr_load(code, dst, offset);
+    }
+
+    fn ptr_mov(&mut self, code: &mut Vec<u8>, dst: PtrReg, src: PtrReg) {
+        self.inner.ptr_mov(code, dst, src);
     }
 
     fn branch_if_arm_is_dead(
@@ -398,7 +415,7 @@ mod tests {
     use super::super::regalloc::{self, Scope};
     use super::super::storage::Slot;
     use super::super::{
-        Assembly, Binding, InstructionPlan, IsaBackend, Label, Loc, MaskTest, Reg, Reload,
+        Assembly, Binding, InstructionPlan, IsaBackend, Label, Loc, MaskTest, PtrReg, Reg, Reload,
         ResolvedOp, WritePlan,
     };
     use super::{Counting, EmitTraffic, ScopeTraffic};
@@ -463,6 +480,12 @@ mod tests {
         ) -> Reg {
             target
         }
+
+        fn ptr_store(&mut self, _code: &mut Vec<u8>, _src: PtrReg, _offset: u32) {}
+
+        fn ptr_load(&mut self, _code: &mut Vec<u8>, _dst: PtrReg, _offset: u32) {}
+
+        fn ptr_mov(&mut self, _code: &mut Vec<u8>, _dst: PtrReg, _src: PtrReg) {}
 
         fn branch_if_arm_is_dead(&mut self, _asm: &mut Assembly, _test: MaskTest, _label: Label) {}
 

@@ -673,8 +673,11 @@ fn select_arms(schedule: &[Def], external: &[ValueId]) -> Vec<SelectArms> {
                         // One store, priced as the load a gather is.
                         ScheduledOp::Write { .. } => cycles.cost(OpKind::RawGather),
                         // One broadcast load; priced as the leaf it is
-                        // in the prologue, where it lands.
-                        ScheduledOp::Uniform(_) => cycles.cost(OpKind::Uniform),
+                        // in the prologue, where it lands. A context
+                        // pointer's one load lands there too.
+                        ScheduledOp::Uniform(..) | ScheduledOp::Context(_) => {
+                            cycles.cost(OpKind::Uniform)
+                        }
                         ScheduledOp::Unary(op, _) | ScheduledOp::Binary(op, _, _) => {
                             cycles.cost(*op)
                         }

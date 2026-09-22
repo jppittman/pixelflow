@@ -23,7 +23,7 @@
 //! red zone the SSE2 path relies on).
 
 use super::x86_64;
-use super::x86_64::{Disp, Imm32, Mem, MovLoadPtr, NoDisp, ptr};
+use super::x86_64::{Disp, Imm32, Mem, NoDisp, ptr};
 use super::{AsmProgram, EncodedInst, Gpr, KReg, PtrReg, Reg, assemble, unimplemented_op};
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
@@ -293,19 +293,18 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
 /// How many GPRs this backend's encoding of `op` needs beyond
 /// [`regalloc::RegisterFile::gpr_ctx`].
 ///
-/// `Gather`/`Uniform` each need one GPR to hold the buffer/block base pointer
-/// loaded from the context — `rax`, chosen by hand before this work and now a
-/// `RegisterFile::gpr_scratch` reservation — and `Broadcast` that plus one
-/// for its index, since it addresses the element through a SIB rather than
-/// a vector of indices. A `Write` converts its row and column into one each
-/// before combining them into the address, and the remainder's writemask
-/// rides in through the second once the address is done with it; the iota
-/// carries each eight bytes in through one.
+/// `Gather` and `Uniform` need none: the base each addresses is a pointer
+/// value the allocator carries, and `vgatherdps` takes its indices as a
+/// vector. `Broadcast` needs one for its index, since it addresses the
+/// element through a SIB. A `Write` converts its row and column into one
+/// each before combining them into the address, and the remainder's
+/// writemask rides in through the second once the address is done with it;
+/// the iota carries each eight bytes in through one.
 pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
-        ScheduledOp::Write { .. } | ScheduledOp::Broadcast(..) => 2,
-        ScheduledOp::Gather(..) | ScheduledOp::Uniform(..) | ScheduledOp::Lanes(_) => 1,
+        ScheduledOp::Write { .. } => 2,
+        ScheduledOp::Broadcast(..) | ScheduledOp::Lanes(_) => 1,
         _ => 0,
     }
 }
@@ -481,57 +480,30 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::Con
     assemble(code, [Evex::m0f38_66(0x18).rm(dst.0, pool.operand(bits))]);
 }
 
-/// `dst = splat(block[offset])` at 512 bits: `mov base, [ctx + ctx_slot*8]`
-/// then `vbroadcastss zmm<dst>, [base + 4*offset]` (EVEX.512.66.0F38.W0 18
-/// /r). A full `disp32`, as [`emit_const`]'s is, so EVEX's compressed-`disp8`
-/// scaling never enters into it. See `x86_64::emit_uniform_load` for the
-/// register contract.
-pub fn emit_uniform_load(
-    code: &mut Vec<u8>,
-    dst: Reg,
-    load: super::UniformLoad,
-    base: PtrReg,
-    ctx: PtrReg,
-) {
-    AsmProgram::from([
-        MovLoadPtr {
-            dst: base,
-            base: ctx,
-            disp: i32::from(load.ctx_slot) * 8,
-        }
-        .encode(),
-        Evex::m0f38_66(0x18).rm(
-            dst.0,
-            Mem {
-                base,
-                disp: Imm32(i32::from(load.offset) * 4),
-            },
-        ),
-    ])
+/// `dst = splat(base[offset])` at 512 bits: `vbroadcastss zmm<dst>, [base +
+/// 4*offset]` (EVEX.512.66.0F38.W0 18 /r). A full `disp32`, as
+/// [`emit_const`]'s is, so EVEX's compressed-`disp8` scaling never enters
+/// into it. See `x86_64::emit_uniform_load`.
+pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, base: PtrReg, offset: u16) {
+    AsmProgram::from([Evex::m0f38_66(0x18).rm(
+        dst.0,
+        Mem {
+            base,
+            disp: Imm32(i32::from(offset) * 4),
+        },
+    )])
     .assemble(code);
 }
 
-/// `dst = splat(buffer[slot][idx])` at 512 bits, the index being the same in
-/// every lane of `idx`: `vcvttss2si index, xmm<idx>`, `mov base, [ctx +
-/// slot*8]`, `vbroadcastss zmm<dst>, [base + index*4]` (EVEX.512.66.0F38.W0
-/// 18 /r). Three instructions, no writemask, no `vgatherdps`. See
-/// `x86_64::emit_broadcast_load` for the register contract.
-pub fn emit_broadcast_load(
-    code: &mut Vec<u8>,
-    dst: Reg,
-    idx: Reg,
-    slot: u16,
-    gprs: x86_64::BroadcastGprs,
-) {
+/// `dst = splat(base[idx])` at 512 bits, the index being the same in every
+/// lane of `idx`: `vcvttss2si index, xmm<idx>`, `vbroadcastss zmm<dst>,
+/// [base + index*4]` (EVEX.512.66.0F38.W0 18 /r). Two instructions, no
+/// writemask, no `vgatherdps`. See `x86_64::emit_broadcast_load` for the
+/// register contract.
+pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64::BroadcastGprs) {
     AsmProgram::from([
         vcvttss2si_xmm(gprs.index, idx),
-        MovLoadPtr {
-            dst: PtrReg(gprs.base.0),
-            base: gprs.ctx,
-            disp: i32::from(slot) * 8,
-        }
-        .encode(),
-        Evex::m0f38_66(0x18).rm_scaled4(dst.0, gprs.base, gprs.index),
+        Evex::m0f38_66(0x18).rm_scaled4(dst.0, gprs.base.as_gpr(), gprs.index),
     ])
     .assemble(code);
 }
@@ -767,24 +739,6 @@ pub fn emit_set_gather_mask(code: &mut Vec<u8>) {
     );
 }
 
-/// `mov dstGPR, [ctxGPR + disp32]` (REX.W 8B /r) — load a 64-bit buffer base
-/// pointer out of the context struct. `dst_gpr`/`ctx_gpr` are raw GP register
-/// numbers (e.g. `rax`=0, `rdi`=7). Only low-8 GPRs are supported (no REX.B),
-/// which is all the emitter needs (`rax` dest, `rdi` context).
-pub fn emit_load_ptr_from_ctx(code: &mut Vec<u8>, dst_gpr: u8, ctx_gpr: u8, disp: i32) {
-    debug_assert!(
-        dst_gpr < 8 && ctx_gpr < 8,
-        "emit_load_ptr_from_ctx: GPR8 only"
-    );
-    // REX.W ; 8B ; mod=10 reg=dst r/m=ctx ; disp32
-    let mut inst = EncodedInst::new();
-    inst.push(0x48);
-    inst.push(0x8B);
-    inst.push(0x80 | ((dst_gpr & 7) << 3) | (ctx_gpr & 7));
-    inst.extend(&disp.to_le_bytes());
-    assemble(code, [inst]);
-}
-
 /// `vgatherdps zmmDST{k1}, [baseGPR + zmmINDEX*4]`
 /// (EVEX.512.66.0F38.W0 92 /vsib, mask = k1, scale = 4).
 ///
@@ -857,22 +811,6 @@ mod tests {
         let mut via_vandps = Vec::new();
         vandps(&mut via_vandps, 3, 1, 2);
         assert_eq!(via_and, via_vandps);
-    }
-
-    #[test]
-    fn emit_load_ptr_from_ctx_encodes_arbitrary_low_gpr_pairs() {
-        // The only production caller (`emit_uniform_load`) always passes
-        // dst_gpr=rax(0), ctx_gpr=rdi(7) — values that happen to make this
-        // function's `&`/`<<` bit ops indistinguishable from `|`/`>>`
-        // (0 shifted either direction is 0; `7 & 7 == 7 | 7`). Pin the byte
-        // encoding directly with values that don't share that coincidence.
-        let mut c = Vec::new();
-        emit_load_ptr_from_ctx(&mut c, 5, 3, 0x10);
-        assert_eq!(
-            c,
-            vec![0x48, 0x8B, 0x80 | (5 << 3) | 3, 0x10, 0x00, 0x00, 0x00],
-            "REX.W mov r5, [r3 + 0x10]"
-        );
     }
 
     #[cfg(target_feature = "avx512f")]
@@ -1330,6 +1268,7 @@ pub(crate) mod driver {
                 Reload::Const { target, val_bits } => {
                     super::emit_const(code, *target, f32::from_bits(*val_bits), &mut self.consts);
                 }
+                Reload::Ptr { target, slot } => self.ptr_load(code, *target, slot.offset()),
             }
         }
     }
@@ -1398,31 +1337,18 @@ pub(crate) mod driver {
                 } => {
                     super::emit_shift_imm(code, *op, *dst, *src, *amount);
                 }
-                ResolvedOp::Gather { dst, idx, slot } => {
-                    // dst = buffer[slot][idx]. The context pointer (array of
-                    // buffer base pointers) is caller-provided in
-                    // `AVX512_FILE.gpr_ctx` (rdi); arithmetic/const emit
-                    // never touches it, so it survives to here. The buffer
-                    // base pointer is `AVX512_FILE.gpr_scratch`'s allocated
-                    // reservation for this instruction.
+                ResolvedOp::Gather { dst, idx, base } => {
+                    // dst = base[idx]: `vgatherdps` through `k1`, `base`
+                    // being the buffer's address wherever the allocator
+                    // keeps it (never `rbp`/`r13` — the pointer pool is
+                    // `r9`-`r11`, so the SIB's no-base encoding is unreachable).
                     let idx_int = crate::emit::declared_temp(plan.scratch.temp(0));
                     let gather_dst = crate::emit::declared_temp(plan.scratch.temp(1));
-                    let base_ptr = crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0));
-                    let ctx_ptr = self
-                        .file
-                        .gpr_ctx
-                        .expect("AVX-512's gather needs a GPR context input");
                     AsmProgram::from([
                         Evex::m0f_f3(0x5B).rrr(idx_int.0, UNUSED_VVVV, idx.0),
                         EncodedInst::from_slice(&[0xB8, 0xFF, 0xFF, 0x00, 0x00]),
                         EncodedInst::from_slice(&[0xC5, 0xF8, 0x92, 0xC8]),
-                        x86::MovLoadPtr {
-                            dst: PtrReg(base_ptr.0),
-                            base: PtrReg(ctx_ptr.0),
-                            disp: (*slot as i32) * 8,
-                        }
-                        .encode(),
-                        super::gather(gather_dst, base_ptr.0, idx_int),
+                        super::gather(gather_dst, base.0, idx_int),
                     ])
                     .assemble(code);
                     if *dst != gather_dst {
@@ -1430,32 +1356,32 @@ pub(crate) mod driver {
                             .assemble(code);
                     }
                 }
-                ResolvedOp::Broadcast { dst, idx, slot } => {
-                    let ctx = self
-                        .file
-                        .gpr_ctx
-                        .expect("AVX-512's broadcast load needs a GPR context input");
+                ResolvedOp::Broadcast { dst, idx, base } => {
                     super::emit_broadcast_load(
                         code,
                         *dst,
                         *idx,
-                        *slot,
                         x86::BroadcastGprs {
-                            base: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)),
-                            index: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1)),
-                            ctx: PtrReg(ctx.0),
+                            base: *base,
+                            index: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)),
                         },
                     );
                 }
-                ResolvedOp::Uniform { dst, load } => {
-                    let base = PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0);
-                    let ctx = PtrReg(
-                        self.file
-                            .gpr_ctx
-                            .expect("AVX-512's uniform load needs a GPR context input")
-                            .0,
-                    );
-                    super::emit_uniform_load(code, *dst, *load, base, ctx);
+                ResolvedOp::Uniform { dst, base, offset } => {
+                    super::emit_uniform_load(code, *dst, *base, *offset);
+                }
+                ResolvedOp::Context { dst, slot } => {
+                    let ctx = self
+                        .file
+                        .gpr_ctx
+                        .expect("x86's context read needs the GPR context input");
+                    AsmProgram::from([x86::MovLoadPtr {
+                        dst: *dst,
+                        base: PtrReg(ctx.0),
+                        disp: i32::from(*slot) * x86::PTR_BYTES,
+                    }
+                    .encode()])
+                    .assemble(code);
                 }
                 ResolvedOp::Binary {
                     op,
@@ -1547,7 +1473,34 @@ pub(crate) mod driver {
                         .assemble(code);
                     target
                 }
+                Binding::Loc(Loc::Ptr(p)) => {
+                    unreachable!("{vid:?} is an address in {p:?}; the pointer class resolves it")
+                }
             }
+        }
+
+        fn ptr_store(&mut self, code: &mut Vec<u8>, src: PtrReg, offset: u32) {
+            AsmProgram::from([x86::MovStorePtr {
+                src,
+                base: x86::ptr::RSP,
+                disp: offset as i32,
+            }
+            .encode()])
+            .assemble(code);
+        }
+
+        fn ptr_load(&mut self, code: &mut Vec<u8>, dst: PtrReg, offset: u32) {
+            AsmProgram::from([x86::MovLoadPtr {
+                dst,
+                base: x86::ptr::RSP,
+                disp: offset as i32,
+            }
+            .encode()])
+            .assemble(code);
+        }
+
+        fn ptr_mov(&mut self, code: &mut Vec<u8>, dst: PtrReg, src: PtrReg) {
+            x86::mov(code, dst.as_gpr(), src.as_gpr());
         }
 
         fn anchor(&mut self, asm: &mut Assembly) {

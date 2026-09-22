@@ -26,7 +26,7 @@
 //! with `vinsertf128`.
 
 use super::x86_64;
-use super::x86_64::{Disp, Imm32, Mem, MovLoadPtr, NoDisp, ptr};
+use super::x86_64::{Disp, Imm32, Mem, NoDisp, ptr};
 use super::{AsmProgram, EncodedInst, Gpr, PtrReg, Reg, SourceOperand, assemble, unimplemented_op};
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
@@ -386,54 +386,27 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::Con
     assemble(code, [Vex::m0f38_66(0x18).rm(dst.0, pool.operand(bits))]);
 }
 
-/// `dst = splat(block[offset])` at 256 bits: `mov base, [ctx + ctx_slot*8]`
-/// then `vbroadcastss ymm<dst>, [base + 4*offset]` (VEX.256.66.0F38.W0 18
-/// /r). See `x86_64::emit_uniform_load` for the register contract.
-pub fn emit_uniform_load(
-    code: &mut Vec<u8>,
-    dst: Reg,
-    load: super::UniformLoad,
-    base: PtrReg,
-    ctx: PtrReg,
-) {
-    AsmProgram::from([
-        MovLoadPtr {
-            dst: base,
-            base: ctx,
-            disp: i32::from(load.ctx_slot) * 8,
-        }
-        .encode(),
-        Vex::m0f38_66(0x18).rm(
-            dst.0,
-            Mem {
-                base,
-                disp: Imm32(i32::from(load.offset) * 4),
-            },
-        ),
-    ])
+/// `dst = splat(base[offset])` at 256 bits: `vbroadcastss ymm<dst>, [base +
+/// 4*offset]` (VEX.256.66.0F38.W0 18 /r). See `x86_64::emit_uniform_load`.
+pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, base: PtrReg, offset: u16) {
+    AsmProgram::from([Vex::m0f38_66(0x18).rm(
+        dst.0,
+        Mem {
+            base,
+            disp: Imm32(i32::from(offset) * 4),
+        },
+    )])
     .assemble(code);
 }
 
-/// `dst = splat(buffer[slot][idx])` at 256 bits, the index being the same in
-/// every lane of `idx`: `vcvttss2si index, xmm<idx>`, `mov base, [ctx +
-/// slot*8]`, `vbroadcastss ymm<dst>, [base + index*4]` (VEX.256.66.0F38.W0
-/// 18 /r). See `x86_64::emit_broadcast_load` for the register contract.
-pub fn emit_broadcast_load(
-    code: &mut Vec<u8>,
-    dst: Reg,
-    idx: Reg,
-    slot: u16,
-    gprs: x86_64::BroadcastGprs,
-) {
+/// `dst = splat(base[idx])` at 256 bits, the index being the same in every
+/// lane of `idx`: `vcvttss2si index, xmm<idx>`, `vbroadcastss ymm<dst>,
+/// [base + index*4]` (VEX.256.66.0F38.W0 18 /r). See
+/// `x86_64::emit_broadcast_load` for the register contract.
+pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64::BroadcastGprs) {
     AsmProgram::from([
         vcvttss2si_xmm(gprs.index, idx),
-        MovLoadPtr {
-            dst: PtrReg(gprs.base.0),
-            base: gprs.ctx,
-            disp: i32::from(slot) * 8,
-        }
-        .encode(),
-        Vex::m0f38_66(0x18).rm_scaled4(dst.0, gprs.base, gprs.index),
+        Vex::m0f38_66(0x18).rm_scaled4(dst.0, gprs.base.as_gpr(), gprs.index),
     ])
     .assemble(code);
 }
@@ -662,20 +635,21 @@ pub struct GatherScratch {
     pub res_hi: Reg,
 }
 
-/// `dst = buffer[slot][idx_lane]` for 8 lanes. `idx` holds FLOAT indices
-/// (already clamped in range by the `Gather` lowering — `x86_64::emit_gather_scalar`
+/// `dst = base[idx_lane]` for 8 lanes. `idx` holds FLOAT indices (already
+/// clamped in range by the `Gather` lowering — `x86_64::emit_gather_scalar`
 /// does its own float->int truncation per half, so `idx` must not be
-/// pre-truncated here). Clobbers everything in `s`.
-pub fn emit_gather_scalar(code: &mut Vec<u8>, dst: Reg, idx: Reg, slot: u16, s: GatherScratch) {
+/// pre-truncated here); `base` the buffer's address. Clobbers everything in
+/// `s`.
+pub fn emit_gather_scalar(code: &mut Vec<u8>, dst: Reg, idx: Reg, base: PtrReg, s: GatherScratch) {
     // idx's low 128 already holds lanes 0..4 (float); split off lanes 4..8
     // into idx_hi before either gather call touches idx/dst (which may alias).
     vextractf128(code, s.idx_hi.0, idx.0, 1);
 
     // Low half: lanes 0..4. May write dst == idx (the callee handles that:
     // it converts idx to int in scratch before ever writing dst).
-    x86_64::emit_gather_scalar(code, dst, idx, slot, s.half);
+    x86_64::emit_gather_scalar(code, dst, idx, base, s.half);
     // High half: lanes 4..8, into res_hi (a 128-bit scratch distinct from dst).
-    x86_64::emit_gather_scalar(code, s.res_hi, s.idx_hi, slot, s.half);
+    x86_64::emit_gather_scalar(code, s.res_hi, s.idx_hi, base, s.half);
 
     // Recombine: dst[0..4] already holds the low half; splice in the high.
     vinsertf128(code, dst.0, dst.0, s.res_hi.0, 1);
@@ -1131,6 +1105,7 @@ pub(crate) mod driver {
                 Reload::Const { target, val_bits } => {
                     super::emit_const(code, *target, f32::from_bits(*val_bits), &mut self.consts);
                 }
+                Reload::Ptr { target, slot } => self.ptr_load(code, *target, slot.offset()),
             }
         }
     }
@@ -1196,30 +1171,21 @@ pub(crate) mod driver {
                 } => {
                     super::emit_shift_imm(code, *op, *dst, *src, *amount);
                 }
-                ResolvedOp::Gather { dst, idx, slot } => {
-                    // Context pointer (array of buffer base pointers) arrives
-                    // in `AVX2_FILE.gpr_ctx` (rdi); arithmetic/const emit
-                    // never touches it, so it survives to here. The base
-                    // pointer and index GPRs are `AVX2_FILE.gpr_scratch`'s
-                    // allocated reservations; the four vector temps are the
-                    // two halves' index and value registers (see
+                ResolvedOp::Gather { dst, idx, base } => {
+                    // `base` is the buffer's address wherever the allocator
+                    // keeps it; the index GPR is `AVX2_FILE.gpr_scratch`'s
+                    // reservation; the four vector temps are the two halves'
+                    // index and value registers (see
                     // `super::emit_gather_scalar`).
-                    let ctx_gpr = self
-                        .file
-                        .gpr_ctx
-                        .expect("AVX2's gather needs a GPR context input");
                     super::emit_gather_scalar(
                         code,
                         *dst,
                         *idx,
-                        *slot,
+                        *base,
                         super::GatherScratch {
                             half: x86_64::GatherScratch {
-                                base_gpr: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0))
+                                index_gpr: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0))
                                     .0,
-                                index_gpr: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1))
-                                    .0,
-                                ctx_gpr: ctx_gpr.0,
                                 idx_lanes: crate::emit::declared_temp(plan.scratch.temp(0)),
                                 value: crate::emit::declared_temp(plan.scratch.temp(1)),
                             },
@@ -1228,32 +1194,32 @@ pub(crate) mod driver {
                         },
                     );
                 }
-                ResolvedOp::Broadcast { dst, idx, slot } => {
-                    let ctx = self
-                        .file
-                        .gpr_ctx
-                        .expect("AVX2's broadcast load needs a GPR context input");
+                ResolvedOp::Broadcast { dst, idx, base } => {
                     super::emit_broadcast_load(
                         code,
                         *dst,
                         *idx,
-                        *slot,
                         x86::BroadcastGprs {
-                            base: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)),
-                            index: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1)),
-                            ctx: PtrReg(ctx.0),
+                            base: *base,
+                            index: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)),
                         },
                     );
                 }
-                ResolvedOp::Uniform { dst, load } => {
-                    let base = PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0);
-                    let ctx = PtrReg(
-                        self.file
-                            .gpr_ctx
-                            .expect("AVX2's uniform load needs a GPR context input")
-                            .0,
-                    );
-                    super::emit_uniform_load(code, *dst, *load, base, ctx);
+                ResolvedOp::Uniform { dst, base, offset } => {
+                    super::emit_uniform_load(code, *dst, *base, *offset);
+                }
+                ResolvedOp::Context { dst, slot } => {
+                    let ctx = self
+                        .file
+                        .gpr_ctx
+                        .expect("x86's context read needs the GPR context input");
+                    AsmProgram::from([x86::MovLoadPtr {
+                        dst: *dst,
+                        base: PtrReg(ctx.0),
+                        disp: i32::from(*slot) * x86::PTR_BYTES,
+                    }
+                    .encode()])
+                    .assemble(code);
                 }
                 ResolvedOp::Binary {
                     op,
@@ -1333,7 +1299,34 @@ pub(crate) mod driver {
                         .assemble(code);
                     target
                 }
+                Binding::Loc(Loc::Ptr(p)) => {
+                    unreachable!("{vid:?} is an address in {p:?}; the pointer class resolves it")
+                }
             }
+        }
+
+        fn ptr_store(&mut self, code: &mut Vec<u8>, src: PtrReg, offset: u32) {
+            AsmProgram::from([x86::MovStorePtr {
+                src,
+                base: x86::ptr::RSP,
+                disp: offset as i32,
+            }
+            .encode()])
+            .assemble(code);
+        }
+
+        fn ptr_load(&mut self, code: &mut Vec<u8>, dst: PtrReg, offset: u32) {
+            AsmProgram::from([x86::MovLoadPtr {
+                dst,
+                base: x86::ptr::RSP,
+                disp: offset as i32,
+            }
+            .encode()])
+            .assemble(code);
+        }
+
+        fn ptr_mov(&mut self, code: &mut Vec<u8>, dst: PtrReg, src: PtrReg) {
+            x86::mov(code, dst.as_gpr(), src.as_gpr());
         }
 
         fn anchor(&mut self, asm: &mut Assembly) {

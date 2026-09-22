@@ -354,30 +354,16 @@ pub fn emit_dup_lane0(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     assemble(code, [DupLane0::new(dst, src)]);
 }
 
-/// `dst = splat(block[offset])`: `ldr base, [ctx, #ctx_slot*8]` fetches the
-/// block's base out of the context, `ldr s<dst>, [base, #offset*4]` the
-/// value, and `dup` spreads it. `base` is this instruction's
-/// `RegisterFile::gpr_scratch` reservation; `ctx` is `RegisterFile::gpr_ctx`.
-pub fn emit_uniform_load(
-    code: &mut Vec<u8>,
-    dst: Reg,
-    load: super::UniformLoad,
-    base: PtrReg,
-    ctx: PtrReg,
-) {
+/// `dst = splat(base[offset])`: `ldr s<dst>, [base, #offset*4]` reads the
+/// value and `dup` spreads it. `base` is the block's address, wherever the
+/// allocator keeps that pointer value.
+pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, base: PtrReg, offset: u16) {
     AsmProgram::from([
-        Inst::ldr_x(
-            base,
-            Mem {
-                base: ctx,
-                offset: u32::from(load.ctx_slot) * X_BYTES,
-            },
-        ),
         Inst::ldr_s(
             dst,
             Mem {
                 base,
-                offset: u32::from(load.offset) * S_BYTES,
+                offset: u32::from(offset) * S_BYTES,
             },
         ),
         Inst::DupLane0(dst, dst),
@@ -611,10 +597,8 @@ pub const IOTA: PoolEntry = [
 // Bound-Memory Gather (scalar-load lowering — NEON has no native gather)
 // =============================================================================
 
-/// GP registers used by the scalar-load gather sequence.
+/// GP scratch the scalar-load gather sequence clobbers.
 pub struct GatherGprs {
-    /// Holds the buffer base pointer (survives the whole sequence).
-    pub base: PtrReg,
     /// Scratch: one extracted lane index at a time. Clobbered.
     pub idx: Gpr,
     /// Scratch: one loaded value at a time. Clobbered.
@@ -622,12 +606,13 @@ pub struct GatherGprs {
 }
 
 /// dst.4S = base[idx_int.S[lane]] for each lane — the NEON gather: four scalar
-/// loads through GP scratch. `gprs.base` holds the buffer base pointer;
-/// `idx_int` holds int32 lane indices (already converted and in-bounds by the
-/// `expand_gather` lowering). Clobbers `gprs.idx` and `gprs.val`.
-pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx_int: Reg, gprs: GatherGprs) {
+/// loads through GP scratch. `base` is the buffer's address, wherever the
+/// allocator keeps that pointer value; `idx_int` holds int32 lane indices
+/// (already converted and in-bounds by the `expand_gather` lowering).
+/// Clobbers `gprs.idx` and `gprs.val`.
+pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx_int: Reg, base: PtrReg, gprs: GatherGprs) {
     let mem = MemIndexed {
-        base: gprs.base,
+        base,
         index: gprs.idx,
     };
     AsmProgram::from([
@@ -647,37 +632,27 @@ pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx_int: Reg, gprs: GatherGprs)
     .assemble(code);
 }
 
-/// The GP registers a broadcast load runs through: the buffer base and the
-/// one index, both this instruction's `RegisterFile::gpr_scratch`
-/// reservations, and the caller's context pointer (`RegisterFile::gpr_ctx`).
+/// The GP registers a broadcast load runs through: the buffer's address,
+/// wherever the allocator keeps that pointer value, and the one index, this
+/// instruction's `RegisterFile::gpr_scratch` reservation.
 pub struct BroadcastGprs {
-    /// Receives the buffer base pointer.
+    /// The buffer base pointer.
     pub base: PtrReg,
     /// Receives the truncated index.
     pub index: Gpr,
-    /// Holds the caller's context pointer (read-only).
-    pub ctx: PtrReg,
 }
 
-/// `dst = splat(buffer[slot][idx])`, the index being the same in every lane
-/// of `idx`: `fcvtzs x<index>, s<idx>` truncates lane 0, `ldr base, [ctx,
-/// #slot*8]` fetches the buffer as a gather does, `ldr s<dst>, [base,
-/// w<index>, uxtw #2]` reads the element and `dup` spreads it. Four
-/// instructions where the gather is fourteen; `dst` may alias `idx`, since
+/// `dst = splat(base[idx])`, the index being the same in every lane of
+/// `idx`: `fcvtzs x<index>, s<idx>` truncates lane 0, `ldr s<dst>, [base,
+/// w<index>, uxtw #2]` reads the element and `dup` spreads it. Three
+/// instructions where the gather is thirteen; `dst` may alias `idx`, since
 /// the index is in a GPR before `dst` is written.
-pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, slot: u16, gprs: BroadcastGprs) {
+pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: BroadcastGprs) {
     AsmProgram::from([
         Inst::FcvtzsX {
             dst: gprs.index,
             src: idx,
         },
-        Inst::ldr_x(
-            gprs.base,
-            Mem {
-                base: gprs.ctx,
-                offset: u32::from(slot) * X_BYTES,
-            },
-        ),
         Inst::ldr_s_indexed(
             dst,
             MemIndexed {
@@ -774,18 +749,18 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
 /// How many GPRs this backend's encoding of `op` needs beyond
 /// [`regalloc::RegisterFile::gpr_ctx`].
 ///
-/// `Gather`'s scalar-load sequence needs a base pointer, a per-lane index and
-/// a loaded value, each a GPR; `Broadcast` a base pointer and its one index,
-/// the element landing straight in a vector lane; `Uniform` only the base
-/// pointer; a `Write` converts its row and column into one each before
-/// combining them into the address. All were `x9`/`x10`/`x11` chosen by hand
-/// before this work and are `RegisterFile::gpr_scratch` reservations now.
+/// `Gather`'s scalar-load sequence needs a per-lane index and a loaded
+/// value, each a GPR; `Broadcast` its one index, the element landing
+/// straight in a vector lane; `Uniform` none — the base each addresses is a
+/// pointer value the allocator carries, not scratch. A `Write` converts its
+/// row and column into one each before combining them into the address. All
+/// were `x9`/`x10`/`x11` chosen by hand before this work and are
+/// `RegisterFile::gpr_scratch` reservations now.
 pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
-        ScheduledOp::Gather(..) => 3,
-        ScheduledOp::Write { .. } | ScheduledOp::Broadcast(..) => 2,
-        ScheduledOp::Uniform(..) => 1,
+        ScheduledOp::Gather(..) | ScheduledOp::Write { .. } => 2,
+        ScheduledOp::Broadcast(..) => 1,
         _ => 0,
     }
 }
@@ -1747,8 +1722,8 @@ mod tests {
             &mut code,
             Reg(6),
             Reg(28),
+            ptr::X9,
             GatherGprs {
-                base: ptr::X9,
                 idx: Gpr(10),
                 val: Gpr(11),
             },
@@ -1985,6 +1960,24 @@ pub(crate) mod driver {
         // the const-pool anchor (x17).
         gpr_scratch: regalloc::GprSet::of(&[ptr::X9.as_gpr(), gpr::X10, gpr::X11]),
         gpr_temps_for: super::gpr_temps_for,
+        // x3-x8 and x12-x15: the caller-saved GPRs AAPCS64 leaves after the
+        // three arguments, the three scratch, the intra-procedure pair
+        // (x16 the branch guard, x17 the const-pool anchor) and the
+        // platform register x18. The pointer class's pool — buffer bases
+        // and block addresses are carried here across the loops that read
+        // them (docs/plans/2026-09-22-a-pointer-is-a-value.md).
+        pointers: regalloc::GprSet::of(&[
+            gpr::X3,
+            gpr::X4,
+            gpr::X5,
+            gpr::X6,
+            gpr::X7,
+            gpr::X8,
+            gpr::X12,
+            gpr::X13,
+            gpr::X14,
+            gpr::X15,
+        ]),
         // No mask-register file on this tier: masks are ordinary vectors.
         mask_scratch: regalloc::MaskSet::EMPTY,
         mask_temps_for: regalloc::no_temps,
@@ -2111,7 +2104,22 @@ pub(crate) mod driver {
                         .assemble(code);
                     target
                 }
+                Binding::Loc(Loc::Ptr(p)) => {
+                    unreachable!("{vid:?} is an address in {p:?}; the pointer class resolves it")
+                }
             }
+        }
+
+        fn ptr_store(&mut self, code: &mut Vec<u8>, src: PtrReg, offset: u32) {
+            AsmProgram::from([Inst::str_x(src, frame_slot(offset))]).assemble(code);
+        }
+
+        fn ptr_load(&mut self, code: &mut Vec<u8>, dst: PtrReg, offset: u32) {
+            AsmProgram::from([Inst::ldr_x(dst, frame_slot(offset))]).assemble(code);
+        }
+
+        fn ptr_mov(&mut self, code: &mut Vec<u8>, dst: PtrReg, src: PtrReg) {
+            AsmProgram::from([table::MovX::new(dst, src)]).assemble(code);
         }
 
         /// `scratch` is this instruction's own reservation, live for these two
@@ -2297,6 +2305,7 @@ pub(crate) mod driver {
                 AsmProgram::from([Inst::ldr_s(via, frame_slot(slot.offset()))]).assemble(code);
                 via
             }
+            Binding::Loc(Loc::Ptr(_)) => unreachable!("a fold's binder is a vector"),
             // A fold whose binder folded to a constant: the trip count was
             // one and the allocator rematerialized it. Truncate on the host,
             // which is what the instruction would have done.
@@ -2333,6 +2342,10 @@ pub(crate) mod driver {
                 }
                 Reload::Const { target, val_bits } => {
                     emit_const_load(code, *target, *val_bits, pool);
+                }
+                Reload::Ptr { target, slot } => {
+                    AsmProgram::from([Inst::ldr_x(*target, frame_slot(slot.offset()))])
+                        .assemble(code);
                 }
             }
         }
@@ -2383,121 +2396,51 @@ pub(crate) mod driver {
             } => {
                 super::emit_shift_imm(code, *op, *dst, *src, *amount);
             }
-            ResolvedOp::Gather { dst, idx, slot } => {
-                // dst = buffer[slot][idx], via four scalar loads (NEON has no
-                // native gather). The context pointer (array of buffer base
-                // pointers) is caller-provided in x0 per AAPCS64
-                // (`AARCH64_FILE.gpr_ctx`) — disjoint from the coordinate
-                // vectors in v0..3 and never touched by the arithmetic/const
-                // emit, so it survives to here.
-                // v30 is declared in `AARCH64_FILE.fixed`, so
-                // `RegisterFile::checked` proves it misses the pool, the reload
-                // pair and the guard scratch (v28) rather than a comment claiming
-                // it; x9-x11 are `AARCH64_FILE.gpr_scratch`'s allocated
-                // reservations for this instruction, clear of the branch guard
-                // (w16) and the const-pool anchor (x17).
+            ResolvedOp::Gather { dst, idx, base } => {
+                // dst = base[idx], via four scalar loads (NEON has no native
+                // gather). `base` is the buffer's address wherever the
+                // allocator keeps it; x10/x11 are `AARCH64_FILE.gpr_scratch`'s
+                // reservations for this instruction, clear of the branch
+                // guard (w16) and the const-pool anchor (x17).
                 let idx_int = crate::emit::declared_temp(plan.scratch.temp(0));
-                let base_gpr = PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0);
-                let idx_gpr = crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1));
-                let val_gpr = crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(2));
-                /// Bytes per pointer in the context array.
-                const PTR_BYTES: u32 = 8;
-                AsmProgram::from([
-                    Inst::Fcvtzs(idx_int, *idx),
-                    Inst::ldr_x(
-                        base_gpr,
-                        Mem {
-                            base: X0,
-                            offset: u32::from(*slot) * PTR_BYTES,
-                        },
-                    ),
-                    Inst::UmovW {
-                        dst: idx_gpr,
-                        src: idx_int,
-                        lane: 0,
+                AsmProgram::from([Inst::Fcvtzs(idx_int, *idx)]).assemble(code);
+                super::emit_gather(
+                    code,
+                    *dst,
+                    idx_int,
+                    *base,
+                    super::GatherGprs {
+                        idx: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)),
+                        val: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1)),
                     },
-                    Inst::ldr_w(
-                        val_gpr,
-                        MemIndexed {
-                            base: base_gpr,
-                            index: idx_gpr,
-                        },
-                    ),
-                    Inst::InsW {
-                        dst: *dst,
-                        lane: 0,
-                        src: val_gpr,
-                    },
-                    Inst::UmovW {
-                        dst: idx_gpr,
-                        src: idx_int,
-                        lane: 1,
-                    },
-                    Inst::ldr_w(
-                        val_gpr,
-                        MemIndexed {
-                            base: base_gpr,
-                            index: idx_gpr,
-                        },
-                    ),
-                    Inst::InsW {
-                        dst: *dst,
-                        lane: 1,
-                        src: val_gpr,
-                    },
-                    Inst::UmovW {
-                        dst: idx_gpr,
-                        src: idx_int,
-                        lane: 2,
-                    },
-                    Inst::ldr_w(
-                        val_gpr,
-                        MemIndexed {
-                            base: base_gpr,
-                            index: idx_gpr,
-                        },
-                    ),
-                    Inst::InsW {
-                        dst: *dst,
-                        lane: 2,
-                        src: val_gpr,
-                    },
-                    Inst::UmovW {
-                        dst: idx_gpr,
-                        src: idx_int,
-                        lane: 3,
-                    },
-                    Inst::ldr_w(
-                        val_gpr,
-                        MemIndexed {
-                            base: base_gpr,
-                            index: idx_gpr,
-                        },
-                    ),
-                    Inst::InsW {
-                        dst: *dst,
-                        lane: 3,
-                        src: val_gpr,
-                    },
-                ])
-                .assemble(code);
+                );
             }
-            ResolvedOp::Broadcast { dst, idx, slot } => {
+            ResolvedOp::Broadcast { dst, idx, base } => {
                 super::emit_broadcast_load(
                     code,
                     *dst,
                     *idx,
-                    *slot,
                     super::BroadcastGprs {
-                        base: PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0),
-                        index: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1)),
-                        ctx: ptr::X0,
+                        base: *base,
+                        index: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)),
                     },
                 );
             }
-            ResolvedOp::Uniform { dst, load } => {
-                let base = PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0);
-                super::emit_uniform_load(code, *dst, *load, base, ptr::X0);
+            ResolvedOp::Uniform { dst, base, offset } => {
+                super::emit_uniform_load(code, *dst, *base, *offset);
+            }
+            ResolvedOp::Context { dst, slot } => {
+                // The one read of the context pointer (x0 per AAPCS64):
+                // `ldr dst, [x0, #slot*8]`, once per call for a value the
+                // allocator then carries or parks like any other.
+                AsmProgram::from([Inst::ldr_x(
+                    *dst,
+                    Mem {
+                        base: ptr::X0,
+                        offset: u32::from(*slot) * X_BYTES,
+                    },
+                )])
+                .assemble(code);
             }
             ResolvedOp::Binary {
                 op,
@@ -2606,15 +2549,22 @@ pub mod gpr {
     pub const XZR: Gpr = Gpr(31);
     /// 3rd argument: the pitch.
     pub const X2: Gpr = Gpr(2);
-    /// Named for the encoders' tests.
+    /// The pointer pool (`RegisterFile::pointers`), and the encoders' tests.
     pub const X3: Gpr = Gpr(3);
     pub const X4: Gpr = Gpr(4);
     pub const X5: Gpr = Gpr(5);
     pub const X6: Gpr = Gpr(6);
+    pub const X7: Gpr = Gpr(7);
+    pub const X8: Gpr = Gpr(8);
     /// Scratch: a gather's index, a store's column.
     pub const X10: Gpr = Gpr(10);
     /// Scratch: a gather's value.
     pub const X11: Gpr = Gpr(11);
+    /// The pointer pool, continued past the scratch.
+    pub const X12: Gpr = Gpr(12);
+    pub const X13: Gpr = Gpr(13);
+    pub const X14: Gpr = Gpr(14);
+    pub const X15: Gpr = Gpr(15);
 }
 
 /// AAPCS64 registers the emitted kernels use.

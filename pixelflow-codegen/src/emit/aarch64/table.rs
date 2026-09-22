@@ -908,6 +908,34 @@ impl AsmInsn for UmovW {
     }
 }
 
+/// MOV Xd, Xm — `ORR Xd, XZR, Xm`: an address between pointer registers.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MovX {
+    pub dst: PtrReg,
+    pub src: PtrReg,
+}
+
+impl MovX {
+    #[must_use]
+    #[inline]
+    pub const fn new(dst: PtrReg, src: PtrReg) -> Self {
+        Self { dst, src }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn encode(self) -> u32 {
+        0xAA00_03E0 | ((self.src.0 as u32) << 16) | (self.dst.0 as u32)
+    }
+}
+
+impl AsmInsn for MovX {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        code.extend_from_slice(&self.encode().to_le_bytes());
+    }
+}
+
 /// FCVTZS Xd, Sn — truncate the scalar float in lane 0 to a signed 64-bit
 /// integer in a GP register: how a fold's binder, or a broadcast load's
 /// index, becomes an address. The scalar form of [`Fcvtzs`], whose `.4S`
