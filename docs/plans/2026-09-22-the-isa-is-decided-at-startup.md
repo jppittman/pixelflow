@@ -2,8 +2,8 @@
 
 ## Metadata
 - **Author**: JP (decision), Claude (draft)
-- **Status**: `Landed` — the decision and every subtraction below are in the
-  tree; the SSE2 driver's deletion is the one follow-up (§7).
+- **Status**: `Done` — the decision and every subtraction below are in the
+  tree, and the SSE2 driver's deletion (§7) followed in its own PR.
 - **Created**: 2026-09-22
 - **Verified against**: `735cb9de` (main with #1286 and #1289)
 - **Continues**: [collapse-is-a-fold](2026-09-16-collapse-is-a-fold.md) — that
@@ -149,14 +149,27 @@ shared driver, not an encoding, and their inputs avoid every row of CLAUDE.md's
 divergence table (the one `Round` tie, `1.5`, rounds to `2` under both
 ties-even and ties-away).
 
-## 7. The follow-up: delete the SSE2 driver
+## 7. The follow-up: delete the SSE2 driver — done
 
-`x86_64::driver::X86Backend` has no arm in `compile_native`; it is typechecked,
-swept for op coverage and unit-tested, and never instantiated (`#[allow(dead_code)]`,
-unconditional, says so). The follow-up removes: the driver module and its
-`SSE2_FILE` (the AVX2 driver borrows `Convert` and `write_address` from it, so
-those move first), `emit_gather_scalar` and the scalar-insert gather the AVX2
-backend still assembles from it, the `movaps`/`mulps`/`addps` `FusedMulAdd`
-stand-in, and the byte-pin tests on those encoders. The leaf encoders the AVX2
-and AVX-512 files import from `x86_64.rs` (`ret`, `mov`, the `ConstPool`,
-`Disp`/`Mem`/`ptr`) stay; they are x86-64, not SSE2.
+`x86_64::driver::X86Backend` had no arm in `compile_native`; it was typechecked,
+swept for op coverage and unit-tested, and never instantiated. The follow-up
+removed it, in three commits:
+
+| what | lines | note |
+|---|---|---|
+| the AVX2 scalar-insert gather (two 128-bit halves of `emit_gather_scalar`, four temps and a GPR) | −60 net in `avx2.rs` | replaced by `vcvttps2dq`, `vpcmpeqd`, `vgatherdps ymm, [base + ymm*4], ymm` (VEX.256.66.0F38.W0 92 /r): two temps, no GPR, pinned bytewise and executed on the host |
+| `x86_64::driver` — `X86Backend`, `SSE2_FILE`, its `IsaBackend` impl | ~510 | `Convert`, `index_into`, `write_address` and `frame_slot` moved to `x86_64.rs`'s top level first: they are the store's GPR arithmetic, shared by both surviving tiers |
+| the 128-bit encoders only it called — `sse_rr` and the legacy `movaps`/`addps`/…, the VEX.128 `Vex`/`VexImm`, `emit_unary`/`emit_binary`/`emit_select`/`emit_const`, `X86BinaryInsn`, `emit_gather_scalar`, the `xmm` `emit_uniform_load`/`emit_broadcast_load`, `cvttss2si_*`, `movq`/`movlhps`/`movss`/`psrldq`, `movups_*`, `emit_movmskps_eax`/`emit_cmp_eax_imm8`, the `MulAdd` stand-in | ~900 | `x86_64.rs` went from 2,935 to 1,397 lines and is the leaf-encoder module its name says |
+| `resolve_operands`' two-operand invariant (the aliasing `debug_assert` and its comment) | ~25 | `operand_sources` still reloads a binary's left into `dst` — a free reload target on a three-operand ISA, not a hazard |
+| the SSE arm of every "every backend" byte test, `x86_backend_covers_required_ops`, the SSE2 `MulAdd` byte pins, the `X86Backend` row of the traffic test | ~120 | `pointer_class::a_context_pointer_is_loaded_once_per_call` now compiles through the AVX2 backend at eight lanes |
+
+The leaf encoders the AVX2 and AVX-512 files import from `x86_64.rs` (`ret`,
+`mov`, the `ConstPool`, `Disp`/`Mem`/`ptr`, `MovLoadPtr`/`MovStorePtr`,
+`BroadcastGprs`, `Jmp`/`Jcc`) stayed; they are x86-64, not SSE2. Each tier's
+register file now states every field itself — the SysV roles were `SSE2_FILE`'s
+to inherit from, and are the architecture's to restate.
+
+`Scratch::MAX_TEMPS` is still four: it was sized for the scalar-insert gather,
+the widest instruction is now a guarded `Select` at six registers, and lowering
+`MAX_TEMPS` (and so `MIN_SCRATCH`) moves every carry budget, which is a
+measurement of its own.
