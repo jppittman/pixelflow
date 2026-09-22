@@ -519,10 +519,9 @@ impl RegisterFile {
     ///
     /// | worst instruction | temps | operands | guard | result | dst | total |
     /// |---|---|---|---|---|---|---|
-    /// | AVX2 gather at a guarded arm's head | 4 | 1 | 1 | 0 | 1 | **7** |
-    /// | AVX2 gather anywhere else | 4 | 1 | 0 | 0 | 1 | 6 |
-    /// | aarch64 `Select` at a guarded arm's head | 0 | 3 | 2 | 0 | 1 | 6 |
-    /// | SSE2 `Select` at a guarded arm's head | 1 | 3 | 1 | 0 | 1 | 6 |
+    /// | aarch64 `Select` at a guarded arm's head | 0 | 3 | 2 | 0 | 1 | **6** |
+    /// | AVX2 `Select` at a guarded arm's head | 1 | 3 | 1 | 0 | 1 | **6** |
+    /// | AVX2 gather at a guarded arm's head | 2 | 1 | 1 | 0 | 1 | 5 |
     ///
     /// The `result` column is 0 everywhere because it is reserved only for a
     /// body whose root was hoisted out entirely — a placeholder that emits
@@ -532,6 +531,13 @@ impl RegisterFile {
     /// producing an instruction with nowhere to put its scratch: every *value*
     /// survives a small pool by going to memory, and scratch the encoder
     /// destroys mid-instruction has no such escape.
+    ///
+    /// The floor is stated through [`Scratch::MAX_TEMPS`], which was sized
+    /// for the AVX2 gather when it was two scalar-insert halves and asked
+    /// for four; `vgatherdps` asks for two, so the table's worst case is now
+    /// one below the floor. Lowering `MAX_TEMPS` to two moves every carry
+    /// budget, so it is a change to measure on its own rather than fold in
+    /// here.
     pub const MIN_SCRATCH: u8 = Scratch::MAX_TEMPS as u8 + 3;
 
     /// The smallest pointer pool a schedule holding a pointer can be
