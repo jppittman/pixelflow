@@ -111,7 +111,7 @@ mod tests {
     }
 
     #[test]
-    fn map_key_multiple_bindings_first_match() {
+    fn map_key_event_to_action_returns_the_first_matching_binding_when_several_match() {
         let bindings = vec![
             Keybinding {
                 key: KeySymbol::Char('A'),
@@ -126,7 +126,6 @@ mod tests {
         ];
         let config = config_with_bindings(bindings);
         let result = map_key_event_to_action(KeySymbol::Char('A'), Modifiers::ALT, &config);
-        // Should match the first one
         assert_eq!(result, Some(UserInputAction::RequestZoomIn));
     }
 }

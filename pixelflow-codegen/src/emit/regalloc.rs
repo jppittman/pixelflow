@@ -3279,6 +3279,146 @@ mod tests {
     use super::*;
     use pixelflow_ir::kind::OpKind;
 
+    // --- bit sets ---
+
+    #[test]
+    fn reg_set_of_contains_exactly_the_given_registers() {
+        let s = RegSet::of(&[Reg(2), Reg(5)]);
+        assert!(s.contains(Reg(2)));
+        assert!(s.contains(Reg(5)));
+        assert!(!s.contains(Reg(3)));
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn reg_set_range_is_the_contiguous_run_it_names() {
+        let s = RegSet::range(4, 3);
+        assert!(!s.contains(Reg(3)));
+        assert!(s.contains(Reg(4)));
+        assert!(s.contains(Reg(5)));
+        assert!(s.contains(Reg(6)));
+        assert!(!s.contains(Reg(7)));
+        assert_eq!(s.len(), 3);
+    }
+
+    #[test]
+    fn reg_set_union_holds_every_member_of_both_sets_and_nothing_else() {
+        let u = RegSet::of(&[Reg(1)]).union(RegSet::of(&[Reg(2)]));
+        assert!(u.contains(Reg(1)));
+        assert!(u.contains(Reg(2)));
+        assert!(!u.contains(Reg(3)));
+        assert_eq!(u.len(), 2);
+
+        // A member shared by both operands must survive the union: `^`
+        // would cancel it out where `|` keeps it.
+        let shared = RegSet::of(&[Reg(1), Reg(2)]).union(RegSet::of(&[Reg(2), Reg(3)]));
+        assert_eq!(shared, RegSet::of(&[Reg(1), Reg(2), Reg(3)]));
+    }
+
+    #[test]
+    fn reg_set_without_removes_only_the_named_members() {
+        let d = RegSet::of(&[Reg(1), Reg(2), Reg(3)]).without(RegSet::of(&[Reg(2)]));
+        assert!(d.contains(Reg(1)));
+        assert!(!d.contains(Reg(2)));
+        assert!(d.contains(Reg(3)));
+    }
+
+    #[test]
+    fn reg_set_contains_is_false_one_past_its_highest_member() {
+        let s = RegSet::of(&[Reg(31)]);
+        assert!(s.contains(Reg(31)));
+        assert!(!s.contains(Reg(30)));
+        // Reg(31) is the highest bit a 32-register file can hold; a set
+        // holding it must not treat Reg(32) as a member too (an `<=` bound
+        // check would shift by 32, which is out of range for a `u32`).
+        assert!(!s.contains(Reg(32)));
+    }
+
+    #[test]
+    fn reg_set_is_empty_is_true_only_for_the_empty_set() {
+        assert!(RegSet::EMPTY.is_empty());
+        assert!(!RegSet::of(&[Reg(0)]).is_empty());
+    }
+
+    #[test]
+    fn reg_set_take_keeps_only_the_lowest_n_members() {
+        let t = RegSet::of(&[Reg(1), Reg(3), Reg(5)]).take(2);
+        assert!(t.contains(Reg(1)));
+        assert!(t.contains(Reg(3)));
+        assert!(!t.contains(Reg(5)));
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn reg_set_take_beyond_its_size_returns_the_whole_set() {
+        let s = RegSet::of(&[Reg(1), Reg(3)]);
+        assert_eq!(s.take(10), s);
+    }
+
+    #[test]
+    fn reg_set_iter_yields_every_member_low_to_high() {
+        let s = RegSet::of(&[Reg(5), Reg(1), Reg(3)]);
+        assert_eq!(s.iter().collect::<Vec<_>>(), vec![Reg(1), Reg(3), Reg(5)]);
+    }
+
+    #[test]
+    fn gpr_set_of_contains_exactly_the_given_registers() {
+        let s = GprSet::of(&[Gpr(2), Gpr(5)]);
+        assert!(s.contains(Gpr(2)));
+        assert!(s.contains(Gpr(5)));
+        assert!(!s.contains(Gpr(3)));
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn gpr_set_contains_is_false_one_past_its_highest_member() {
+        let s = GprSet::of(&[Gpr(31)]);
+        assert!(s.contains(Gpr(31)));
+        assert!(!s.contains(Gpr(30)));
+        assert!(!s.contains(Gpr(32)));
+    }
+
+    #[test]
+    fn gpr_set_is_empty_is_true_only_for_the_empty_set() {
+        assert!(GprSet::EMPTY.is_empty());
+        assert!(!GprSet::of(&[Gpr(0)]).is_empty());
+    }
+
+    #[test]
+    fn gpr_set_iter_yields_every_member_low_to_high() {
+        let s = GprSet::of(&[Gpr(5), Gpr(1)]);
+        assert_eq!(s.iter().collect::<Vec<_>>(), vec![Gpr(1), Gpr(5)]);
+    }
+
+    #[test]
+    fn mask_set_of_contains_exactly_the_given_registers() {
+        let s = MaskSet::of(&[KReg(1), KReg(4)]);
+        assert!(s.contains(KReg(1)));
+        assert!(s.contains(KReg(4)));
+        assert!(!s.contains(KReg(2)));
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn mask_set_contains_is_false_one_past_its_highest_member() {
+        let s = MaskSet::of(&[KReg(7)]);
+        assert!(s.contains(KReg(7)));
+        assert!(!s.contains(KReg(6)));
+        assert!(!s.contains(KReg(8)));
+    }
+
+    #[test]
+    fn mask_set_is_empty_is_true_only_for_the_empty_set() {
+        assert!(MaskSet::EMPTY.is_empty());
+        assert!(!MaskSet::of(&[KReg(0)]).is_empty());
+    }
+
+    #[test]
+    fn mask_set_iter_yields_every_member_low_to_high() {
+        let s = MaskSet::of(&[KReg(3), KReg(0)]);
+        assert_eq!(s.iter().collect::<Vec<_>>(), vec![KReg(0), KReg(3)]);
+    }
+
     /// The smallest pool a register file may declare, so pressure tests need
     /// only a handful of values to reach spilling.
     const TEST_FILE: RegisterFile = RegisterFile {
@@ -3399,6 +3539,209 @@ mod tests {
             leaf(1),
             def(2, ScheduledOp::Binary(OpKind::Add, ValueId(0), ValueId(1))),
         ]
+    }
+
+    // --- scan internals: record, guarded_arms, Reservations, Pass ---
+
+    /// A second placement recorded at the same schedule index replaces the
+    /// first rather than appending a range: an eviction that puts a value
+    /// back where it already was is not a move, and a repeated `from` would
+    /// break `Placement`'s strictly-increasing invariant.
+    #[test]
+    fn record_collapses_consecutive_ranges_at_the_same_index_into_one() {
+        let scan = Scan {
+            schedule: Vec::new(),
+            ranges: vec![vec![(0, Where::Reg(Reg(4))), (2, Where::Reg(Reg(4)))]],
+            scratch: Vec::new(),
+            guards: Vec::new(),
+        };
+        let placements = record(&scan, &BTreeMap::new());
+        let placement = placements[0].as_ref().expect("value 0 was placed");
+        assert_eq!(
+            placement.spans().collect::<Vec<_>>(),
+            vec![Span {
+                from: Point { index: 0 },
+                at: Where::Reg(Reg(4)),
+            }],
+            "an eviction that put the value back in the same register it \
+             already held is not a move, so the second entry must not add \
+             a second span"
+        );
+    }
+
+    /// The narrowest arm containing an index wins, not the first or the
+    /// widest: ending a kept reload at the inner arm's end is safe under an
+    /// outer one too, so the narrower answer is always the safe one to keep.
+    #[test]
+    fn guarded_arms_prefers_the_narrowest_covering_arm() {
+        use super::super::guards::ArmPair;
+        let guard = |select_idx: usize, mask: u32, true_arm: (usize, usize)| SelectGuard {
+            select_idx,
+            mask_vid: ValueId(mask),
+            ranges: ArmPair::new(true_arm, (0, 0)),
+        };
+        // A clear case (width 10 vs. width 2): the narrower arm wins.
+        let wide = guard(100, 0, (0, 10));
+        let narrow = guard(101, 1, (3, 5));
+        // A genuine tie (width 2 each, processed first): the earlier one is
+        // kept rather than overwritten — distinguishes `<` from `<=`/`==`.
+        let tie_a = guard(102, 2, (15, 17));
+        let tie_b = guard(103, 3, (16, 18));
+        // A clear case the other way (width 3 vs. width 1): distinguishes
+        // `<` from `>`, which the tie case above cannot (both agree there).
+        let wider = guard(104, 4, (25, 28));
+        let narrower = guard(105, 5, (26, 27));
+        // The new arm's own width (`end - start`): distinguishes `-` from
+        // `+`/`/` on that computation specifically.
+        let own_width_prior = guard(106, 6, (35, 37));
+        let own_width_narrower = guard(107, 7, (36, 37));
+        // The stored arm's width (`e - s`): a tie (width 4 each) that must
+        // stay with the first-recorded arm — distinguishes `-` from `+`/`/`
+        // on *that* computation, which the tie case above cannot (it never
+        // exercises a stored span with a nonzero `s`).
+        let stored_width_prior = guard(108, 8, (41, 45));
+        let stored_width_current = guard(109, 9, (40, 44));
+
+        let arms = guarded_arms(
+            &[
+                wide,
+                narrow,
+                tie_a,
+                tie_b,
+                wider,
+                narrower,
+                own_width_prior,
+                own_width_narrower,
+                stored_width_prior,
+                stored_width_current,
+            ],
+            46,
+        );
+
+        for (i, arm) in arms.iter().enumerate().take(10) {
+            let expected = if (3..5).contains(&i) {
+                Some((3, 5))
+            } else {
+                Some((0, 10))
+            };
+            assert_eq!(*arm, expected, "index {i}: narrowest of a clear pair");
+        }
+        assert_eq!(arms[15], Some((15, 17)), "only tie_a covers index 15");
+        assert_eq!(
+            arms[16],
+            Some((15, 17)),
+            "tie_a and tie_b tie in width at index 16; the first recorded must stand"
+        );
+        assert_eq!(arms[17], Some((16, 18)), "only tie_b covers index 17");
+        assert_eq!(
+            arms[25],
+            Some((25, 28)),
+            "only the wider arm covers index 25"
+        );
+        assert_eq!(
+            arms[26],
+            Some((26, 27)),
+            "the strictly narrower arm must win at index 26"
+        );
+        assert_eq!(
+            arms[27],
+            Some((25, 28)),
+            "only the wider arm covers index 27"
+        );
+        assert_eq!(
+            arms[35],
+            Some((35, 37)),
+            "only the first arm covers index 35"
+        );
+        assert_eq!(
+            arms[36],
+            Some((36, 37)),
+            "the new arm's own width (1) must beat the stored one (2) at index 36"
+        );
+        for (i, arm) in arms.iter().enumerate().take(44).skip(41) {
+            assert_eq!(
+                *arm,
+                Some((41, 45)),
+                "index {i}: tied stored width (4 each) keeps the first-recorded arm"
+            );
+        }
+        assert_eq!(
+            arms[40],
+            Some((40, 44)),
+            "only the second arm covers index 40"
+        );
+        assert_eq!(
+            arms[44],
+            Some((41, 45)),
+            "only the first arm covers index 44"
+        );
+    }
+
+    /// `ROLES` is guard mask, guard temp, result and the destination on top
+    /// of the widest encoding's temps and reloads — not any other mix of the
+    /// same numbers.
+    #[test]
+    fn reservations_roles_covers_temps_reloads_and_the_four_named_slots() {
+        assert_eq!(
+            Reservations::ROLES,
+            10,
+            "Scratch::MAX_TEMPS (4) + Scratch::MAX_RELOADS (2) + 4 named roles"
+        );
+    }
+
+    /// `rank`'s distance is measured forward from the point asked about, not
+    /// from the value's own definition.
+    #[test]
+    fn rank_measures_distance_from_the_point_asked_about() {
+        let dag = vec![
+            leaf(0),
+            leaf(1),
+            leaf(2),
+            def(3, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
+        ];
+        let sites = vec![Vec::new(); dag.len()];
+        let mut pass = Pass::new(&dag, &TEST_FILE, dag.len(), &BTreeMap::new(), &sites);
+        let rank = pass.rank(ValueId(0), 1, &[]);
+        assert_eq!(
+            rank.nearest.0, 2,
+            "value 0's only read is at index 3, two steps ahead of index 1"
+        );
+    }
+
+    /// A second `place` at the same index overwrites the first, matching
+    /// `record`'s own rule for the ranges it consumes.
+    #[test]
+    fn place_overwrites_a_range_recorded_at_the_same_index() {
+        let dag = vec![leaf(0)];
+        let sites = vec![Vec::new(); 1];
+        let mut pass = Pass::new(&dag, &TEST_FILE, 1, &BTreeMap::new(), &sites);
+        pass.place(ValueId(0), 3, Where::Reg(Reg(4)));
+        pass.place(ValueId(0), 3, Where::Spilled);
+        assert_eq!(
+            pass.ranges[0],
+            vec![(3, Where::Spilled)],
+            "the second placement at index 3 must replace the first, not add a range"
+        );
+    }
+
+    /// `place` marks a value's slot as already valid in memory exactly when
+    /// it places it `Spilled` — never for a register or a remat, and it
+    /// never un-marks a value memory has already seen once.
+    #[test]
+    fn place_marks_in_slot_only_when_placing_spilled() {
+        let dag = vec![leaf(0), leaf(1)];
+        let sites = vec![Vec::new(); 2];
+        let mut pass = Pass::new(&dag, &TEST_FILE, 2, &BTreeMap::new(), &sites);
+        pass.place(ValueId(0), 0, Where::Reg(Reg(4)));
+        assert!(
+            !pass.in_slot[0],
+            "landing in a register is not a reason to believe memory is valid"
+        );
+        pass.place(ValueId(1), 0, Where::Spilled);
+        assert!(
+            pass.in_slot[1],
+            "placing a value Spilled is exactly what makes its slot valid"
+        );
     }
 
     #[test]
@@ -3632,6 +3975,186 @@ mod tests {
         assert_eq!(s.reload(wanted), None, "nothing reserved past the demand");
     }
 
+    /// `select_guards` is the guard analysis on file, not an empty stand-in:
+    /// a schedule with a genuine exclusive arm reports it back unchanged.
+    #[test]
+    fn select_guards_reports_the_arm_the_schedule_actually_has() {
+        let schedule = vec![
+            leaf(0),
+            leaf(1),
+            def(2, ScheduledOp::Unary(OpKind::Rsqrt, ValueId(1))),
+            def(
+                3,
+                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(2), ValueId(0)),
+            ),
+        ];
+        let a = alloc(schedule);
+        let guards = a.body().select_guards();
+        assert_eq!(guards.len(), 1, "the schedule has exactly one Select");
+        assert_eq!(guards[0].select_idx, 3);
+        assert_eq!(guards[0].mask_vid, ValueId(0));
+        assert_eq!(guards[0].true_range(), (1, 3));
+        assert_eq!(guards[0].false_range(), (3, 3));
+    }
+
+    /// A spilled operand read inside a guarded arm is *not* worth promoting
+    /// back into a register when its very next read is at or after the arm's
+    /// end: the promotion would not even reach the read it was for, so an
+    /// ordinary reload serves it just as well.
+    ///
+    /// `X` is forced to spill under pressure (seven fillers exactly fill
+    /// `TEST_FILE`'s pool, and `X`'s own next read — deep inside the arm — is
+    /// the farthest among the candidates, so `X` is the one evicted). The
+    /// arm then reads `X` twice: once inside it, and again as the `Select`'s
+    /// own false-arm operand — a read at exactly the arm's end.
+    #[test]
+    fn a_spilled_operand_read_again_only_at_the_arms_end_is_not_kept() {
+        let x = ValueId(1);
+        let mut schedule = vec![leaf(0), def(1, ScheduledOp::Unary(OpKind::Neg, ValueId(0)))];
+        let fillers: Vec<u32> = (10..16).collect(); // f1..f6.
+        for &f in &fillers {
+            schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        schedule.push(def(16, ScheduledOp::Unary(OpKind::Neg, ValueId(0)))); // f7: 8th value, forces eviction.
+        let eviction_index = schedule.len() - 1; // index 8.
+        for (i, &f) in fillers.iter().enumerate() {
+            schedule.push(def(
+                100 + i as u32,
+                ScheduledOp::Unary(OpKind::Neg, ValueId(f)),
+            )); // dist 1..6.
+        }
+        schedule.push(leaf(50)); // mask, index 15.
+        let rsqrt_index = schedule.len();
+        schedule.push(def(60, ScheduledOp::Unary(OpKind::Rsqrt, x))); // index 16: reads X.
+        let select_index = schedule.len();
+        schedule.push(def(
+            70,
+            ScheduledOp::Ternary(OpKind::Select, ValueId(50), ValueId(60), x), // X again, as the false arm.
+        ));
+
+        let a = alloc(schedule);
+        let guards = a.body().select_guards();
+        assert_eq!(
+            guards
+                .iter()
+                .find(|g| g.select_idx == select_index)
+                .map(SelectGuard::true_range),
+            Some((rsqrt_index, select_index)),
+            "fixture assumes the Rsqrt alone forms the true arm's exclusive range"
+        );
+        assert_eq!(
+            a.body().where_at(x, eviction_index),
+            Where::Spilled,
+            "fixture assumes X, not a filler, is the one evicted"
+        );
+        assert_eq!(
+            a.body().where_at(x, rsqrt_index),
+            Where::Spilled,
+            "X's next read (the Select's own false arm) lands exactly at the \
+             arm's end, so keeping X in a register here would not even reach \
+             it — an ordinary reload serves the Rsqrt instead"
+        );
+    }
+
+    /// A value defined *at* a guarded arm's own first instruction is arm-
+    /// internal, not something the arm merely reads from outside — so even
+    /// once pressure evicts and then re-promotes it within the same arm, it
+    /// gets no revert scheduled at the arm's end: nothing outside the arm
+    /// ever reads it, by the same exclusivity that put it in the arm at all.
+    ///
+    /// The pressure has to come from *inside* the arm: an external filler's
+    /// own read is necessarily scheduled after the whole arm (anything it
+    /// reads earlier would break the arm's contiguous range), which always
+    /// makes it farther out than a within-arm read and so never a genuine
+    /// rival for `loser`. Eight independent leaves feeding one reduction give
+    /// the arm its own pressure — `Y` is the first leaf (so `defined_at`
+    /// equals the arm's `start` exactly) but the last one consumed, so it is
+    /// the one `loser` evicts when the eighth leaf needs a register. `Y` is
+    /// then read twice more, and directly again right before the `Select` —
+    /// that last read is what keeps it resident (protected as an operand)
+    /// all the way to the arm's end without any other reason to hold it,
+    /// which is what makes a spurious revert there observable.
+    #[test]
+    fn a_value_defined_at_the_arms_own_start_needs_no_revert_at_its_end() {
+        let y = ValueId(1);
+        let mut schedule = vec![leaf(0), def(1, ScheduledOp::Unary(OpKind::Neg, ValueId(0)))];
+        let leaves: Vec<u32> = (10..17).collect(); // 7 more leaves alongside Y: 8 live at once.
+        for &l in &leaves {
+            schedule.push(def(l, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        let eviction_index = schedule.len() - 1; // the 8th leaf: pool is full, so this evicts Y.
+        // Pair the other seven leaves off soonest-first, so Y — read only by
+        // the last pair — is the farthest-out candidate when the 8th leaf
+        // needs a register.
+        let p1 = 200;
+        schedule.push(def(
+            p1,
+            ScheduledOp::Binary(OpKind::Add, ValueId(leaves[0]), ValueId(leaves[1])),
+        ));
+        let p2 = 201;
+        schedule.push(def(
+            p2,
+            ScheduledOp::Binary(OpKind::Add, ValueId(leaves[2]), ValueId(leaves[3])),
+        ));
+        let p3 = 202;
+        schedule.push(def(
+            p3,
+            ScheduledOp::Binary(OpKind::Add, ValueId(leaves[4]), ValueId(leaves[5])),
+        ));
+        let p4 = 203; // Y's first re-read, and the farthest among the pairs' operands at eviction time.
+        schedule.push(def(
+            p4,
+            ScheduledOp::Binary(OpKind::Add, y, ValueId(leaves[6])),
+        ));
+        let extra = 204; // Y's second re-read.
+        schedule.push(def(extra, ScheduledOp::Binary(OpKind::Add, ValueId(p4), y)));
+        let q1 = 210;
+        schedule.push(def(
+            q1,
+            ScheduledOp::Binary(OpKind::Add, ValueId(p1), ValueId(p2)),
+        ));
+        let q2 = 211;
+        schedule.push(def(
+            q2,
+            ScheduledOp::Binary(OpKind::Add, ValueId(p3), ValueId(extra)),
+        ));
+        let q3 = 212;
+        schedule.push(def(
+            q3,
+            ScheduledOp::Binary(OpKind::Add, ValueId(q1), ValueId(q2)),
+        ));
+        let root = 220; // Y's third re-read, right before the Select.
+        schedule.push(def(root, ScheduledOp::Binary(OpKind::Add, ValueId(q3), y)));
+        let select_index = schedule.len();
+        schedule.push(def(
+            70,
+            ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(root), ValueId(0)),
+        ));
+
+        let a = alloc(schedule);
+        let guards = a.body().select_guards();
+        assert_eq!(
+            guards
+                .iter()
+                .find(|g| g.select_idx == select_index)
+                .map(SelectGuard::true_range),
+            Some((1, select_index)),
+            "fixture assumes the whole reduction, starting at Y's own \
+             definition, is the true arm's exclusive range"
+        );
+        assert_eq!(
+            a.body().where_at(y, eviction_index),
+            Where::Spilled,
+            "fixture assumes Y, not one of the other leaves, is the one evicted"
+        );
+        assert!(
+            matches!(a.body().where_at(y, select_index), Where::Reg(_)),
+            "Y is arm-internal from its own definition on, so re-promoting it \
+             inside the arm needs no revert at the arm's end — it should \
+             still be resident at the Select"
+        );
+    }
+
     /// Nothing is reserved for an operand that is already in a register.
     #[test]
     fn a_resident_operand_reserves_no_reload_target() {
@@ -3778,6 +4301,241 @@ mod tests {
                 "{vid:?} rematerializes the wrong constant"
             );
         }
+    }
+
+    /// A constant that loses its own keep contest never touches a register at
+    /// all: it is rebuilt at each use, so eviction never has to run for it.
+    ///
+    /// Seven fillers fill `TEST_FILE`'s pool exactly, each with a read late
+    /// enough to survive to the constant's own definition (an unread value
+    /// would simply expire, never reaching a contest at all); the eighth
+    /// definition, a constant, forces an eviction, and its own contest is
+    /// decided by `traffic` alone (0 for a constant against 2 for the
+    /// filler), regardless of how the reads are staggered.
+    #[test]
+    fn a_constant_that_loses_its_keep_contest_is_never_given_a_register() {
+        // `leaf(0)` occupies a pool register of its own and stays live for
+        // every filler's definition, so the set that fills `TEST_FILE`'s pool
+        // exactly is the leaf plus `MIN_SCRATCH - 1` fillers. It used to be
+        // `MIN_SCRATCH` of them, back when the leaf was a coordinate sitting
+        // in an input register outside the pool; the collapse ABI passes no
+        // vectors, so there is no such register any more.
+        let pool = RegisterFile::MIN_SCRATCH as u32;
+        let mut schedule = vec![leaf(0)];
+        let fillers: Vec<u32> = (10..10 + pool - 1).collect();
+        for &f in &fillers {
+            schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        schedule.push(def(90, ScheduledOp::Const(99.0)));
+        // The pool is full, so this definition evicts someone.
+        let const_def_index = schedule.len() - 1;
+        // The leaf is read once more, first and nearest, for two reasons: it
+        // is still live at the constant's definition (so the pool really is
+        // full there, and a contest really does run), and its next read is
+        // the soonest of anyone's (so it is not the occupant the constant
+        // evicts — a filler is).
+        schedule.push(def(99, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        // Every filler reads once, after the constant's own definition, so
+        // none of them expire before the constant's contest runs.
+        for (i, &f) in fillers.iter().enumerate() {
+            schedule.push(def(
+                100 + i as u32,
+                ScheduledOp::Unary(OpKind::Neg, ValueId(f)),
+            ));
+        }
+        let a = alloc(schedule);
+        assert_eq!(
+            a.body().where_at(ValueId(90), const_def_index),
+            Where::Remat(99.0f32.to_bits()),
+            "the constant should never occupy a register even at its own \
+             definition, let alone evict the filler it forced open"
+        );
+    }
+
+    /// A destination that forces an eviction to be written keeps the register
+    /// past its own instruction only when its own next read beats what the
+    /// occupant it evicted offered — not merely because it forced room open.
+    ///
+    /// Seven fillers fill `TEST_FILE`'s pool exactly; an eighth definition
+    /// forces an eviction, and the evicted occupant (`f7`, farthest among the
+    /// fillers) sets the bar the new definition has to beat. The check runs
+    /// at a `Var` spacer right after `new_val`'s own definition — not the
+    /// literal next instruction, which would otherwise need a destination of
+    /// its own and could evict `new_val` on that unrelated contest, masking
+    /// whether *this* one demoted it.
+    #[test]
+    fn a_destination_that_forces_an_eviction_but_reads_later_than_the_occupant_is_spilled_next() {
+        // `leaf(0)` occupies a pool register of its own and stays live for
+        // every filler's definition, so the set that fills `TEST_FILE`'s pool
+        // exactly is the leaf plus `MIN_SCRATCH - 1` fillers. It used to be
+        // `MIN_SCRATCH` of them, back when the leaf was a coordinate sitting
+        // in an input register outside the pool; the collapse ABI passes no
+        // vectors, so there is no such register any more.
+        let pool = RegisterFile::MIN_SCRATCH as u32;
+        let mut schedule = vec![leaf(0)];
+        let fillers: Vec<u32> = (10..10 + pool - 1).collect();
+        for &f in &fillers {
+            schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        let new_val = 90;
+        schedule.push(def(new_val, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        // The spacer is a `Seq`: it defines no value and so takes no pool
+        // register, which is what this check needs and what a `leaf` spacer
+        // can no longer be.
+        schedule.push(def(91, ScheduledOp::Seq(ValueId(0), ValueId(0))));
+        let check_index = schedule.len() - 1;
+        // f1..f7 read once each, staggered — f1 soonest, f7 last of the
+        // fillers (distance 7 from `new_val`'s own definition) — and
+        // `new_val`'s own read even later still (distance 9), so it is used
+        // farther out than the occupant (`f7`, distance 8) that `loser`
+        // picks to evict for it. The check runs at the spacer right after
+        // `new_val`'s own definition, not the literal next instruction,
+        // which would otherwise need a destination of its own and could
+        // evict `new_val` on that unrelated contest, masking whether *this*
+        // one demoted it.
+        for (i, &f) in fillers.iter().enumerate() {
+            schedule.push(def(
+                100 + i as u32,
+                ScheduledOp::Unary(OpKind::Neg, ValueId(f)),
+            ));
+        }
+        schedule.push(def(200, ScheduledOp::Unary(OpKind::Neg, ValueId(new_val))));
+
+        let a = alloc(schedule);
+        assert_eq!(
+            a.body().where_at(ValueId(new_val), check_index),
+            Where::Spilled,
+            "new_val forced f7's eviction to be written, but its own next \
+             read is even farther out than f7's was, so it does not keep \
+             the register past its own instruction"
+        );
+    }
+
+    /// The mirror image of the above: a destination whose own next read beats
+    /// the occupant's keeps the register, so it is not queued for a demotion
+    /// at all.
+    #[test]
+    fn a_destination_that_reads_sooner_than_the_occupant_keeps_its_register() {
+        // `leaf(0)` occupies a pool register of its own and stays live for
+        // every filler's definition, so the set that fills `TEST_FILE`'s pool
+        // exactly is the leaf plus `MIN_SCRATCH - 1` fillers. It used to be
+        // `MIN_SCRATCH` of them, back when the leaf was a coordinate sitting
+        // in an input register outside the pool; the collapse ABI passes no
+        // vectors, so there is no such register any more.
+        let pool = RegisterFile::MIN_SCRATCH as u32;
+        let mut schedule = vec![leaf(0)];
+        let fillers: Vec<u32> = (10..10 + pool - 1).collect();
+        for &f in &fillers {
+            schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        let new_val = 90;
+        schedule.push(def(new_val, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        let def_index = schedule.len() - 1;
+        // f1..f6 read soon (distance 1..6); f7 read at distance 10, the
+        // farthest among the fillers, so `loser` picks it. `new_val` is read
+        // at distance 2 — nearer than f7's 10 — so it should win the contest
+        // and keep the register `f7` gave up.
+        schedule.push(def(
+            300,
+            ScheduledOp::Unary(OpKind::Neg, ValueId(fillers[0])),
+        ));
+        schedule.push(def(301, ScheduledOp::Unary(OpKind::Neg, ValueId(new_val))));
+        for &f in &fillers[1..fillers.len() - 1] {
+            schedule.push(def(300 + f, ScheduledOp::Unary(OpKind::Neg, ValueId(f))));
+        }
+        schedule.push(def(
+            999,
+            ScheduledOp::Unary(OpKind::Neg, ValueId(*fillers.last().unwrap())),
+        ));
+
+        let a = alloc(schedule);
+        assert!(
+            matches!(
+                a.body().where_at(ValueId(new_val), def_index + 1),
+                Where::Reg(_)
+            ),
+            "new_val reads sooner than the occupant it evicted, so it should \
+             still be resident one instruction later"
+        );
+    }
+
+    /// A tie between the new definition and the occupant it evicted goes to
+    /// the occupant: `keeps` is a strict `>`, not `>=`.
+    ///
+    /// As above, the check runs at a `Var` spacer right after `new_val`'s
+    /// own definition, so an unrelated instruction's own destination contest
+    /// (which would also be entitled to evict `new_val`, tie or no tie)
+    /// cannot stand in for the answer this test is actually asking.
+    #[test]
+    fn a_tie_with_the_evicted_occupant_does_not_keep_the_new_definition() {
+        // `leaf(0)` occupies a pool register of its own and stays live for
+        // every filler's definition, so the set that fills `TEST_FILE`'s pool
+        // exactly is the leaf plus `MIN_SCRATCH - 1` fillers. It used to be
+        // `MIN_SCRATCH` of them, back when the leaf was a coordinate sitting
+        // in an input register outside the pool; the collapse ABI passes no
+        // vectors, so there is no such register any more.
+        let pool = RegisterFile::MIN_SCRATCH as u32;
+        let mut schedule = vec![leaf(0)];
+        let fillers: Vec<u32> = (10..10 + pool - 1).collect();
+        for &f in &fillers {
+            schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        let new_val = 90;
+        schedule.push(def(new_val, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        // As in the test above, a `Seq` is the spacer that takes no register.
+        schedule.push(def(91, ScheduledOp::Seq(ValueId(0), ValueId(0))));
+        let check_index = schedule.len() - 1;
+        // f1..f6 read soon, so f7 (unread so far) is the farthest among the
+        // fillers and is the one `loser` evicts.
+        let (early, last) = fillers.split_at(fillers.len() - 1);
+        for (i, &f) in early.iter().enumerate() {
+            schedule.push(def(
+                100 + i as u32,
+                ScheduledOp::Unary(OpKind::Neg, ValueId(f)),
+            ));
+        }
+        // One instruction reads both f7 and new_val, so both have the exact
+        // same next-read distance from `new_val`'s own definition — a
+        // genuine tie.
+        schedule.push(def(
+            999,
+            ScheduledOp::Binary(OpKind::Add, ValueId(last[0]), ValueId(new_val)),
+        ));
+
+        let a = alloc(schedule);
+        assert_eq!(
+            a.body().where_at(ValueId(new_val), check_index),
+            Where::Spilled,
+            "tied against the occupant it evicted, new_val must not keep the \
+             register — `keeps` requires strictly beating it"
+        );
+    }
+
+    /// A demotion is never queued past the schedule's own end: the loser of
+    /// the schedule's very last instruction has no `i + 1` to be reset at,
+    /// and `demotions` is sized to `dag.len()`, so queuing one there would be
+    /// an out-of-bounds write, not merely a wasted one.
+    ///
+    /// Eight unread values tied at "never read again": the eighth (also the
+    /// schedule's last instruction) forces an eviction among the other
+    /// seven, and every candidate — including the new definition itself —
+    /// has the identical worst-case rank, so it loses its own contest
+    /// exactly as any of the others would have.
+    #[test]
+    fn a_demoted_last_instruction_queues_no_demotion_past_the_schedule() {
+        let mut schedule = vec![leaf(0)];
+        for f in 10..17u32 {
+            schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        schedule.push(def(20, ScheduledOp::Unary(OpKind::Neg, ValueId(0)))); // 8th value: the last instruction.
+        let last = schedule.len() - 1;
+
+        let a = alloc(schedule);
+        assert!(
+            matches!(a.body().where_at(ValueId(20), last), Where::Reg(_)),
+            "nothing later reverses its own destination write; only a queued \
+             demotion could, and there is nowhere to queue one to"
+        );
     }
 
     /// Belady: with no constants in play, the value used farthest in the
@@ -4187,6 +4945,51 @@ mod tests {
         }
     }
 
+    /// A root nothing inside the fold reads is never a carry candidate, no
+    /// matter how much budget is free: carrying it would spend a register for
+    /// the whole loop to save reloads that do not exist.
+    ///
+    /// `read` is the control. Both roots are parked by the same scope, in one
+    /// allocation, under a budget that demonstrably carries one of them — so
+    /// the only thing that can be refusing the other is the zero-use filter.
+    #[test]
+    fn a_root_the_fold_never_reads_is_never_carried() {
+        let read = ValueId(5);
+        let unused = ValueId(6);
+        let alloc = LinearScan.allocate_nest(
+            ScopedSchedule {
+                body: ScopeRegion {
+                    roots: vec![read, unused],
+                    schedule: vec![
+                        leaf(0),
+                        def(5, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
+                        def(6, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
+                        def(1, ScheduledOp::Reduce(fold_meta(), read)),
+                    ],
+                },
+                folds: vec![ScopeFold {
+                    parent: Scope::Body,
+                    at: 3,
+                    roots: Vec::new(),
+                    // The fold names `read` every trip and `unused` never.
+                    schedule: vec![def(50, ScheduledOp::Unary(OpKind::Neg, read))],
+                }],
+                guard_arms: Vec::new(),
+            },
+            &NEST_FILE,
+        );
+        assert!(
+            alloc.body().carried(read).is_some(),
+            "fixture assumes NEST_FILE's budget carries a root the fold does read"
+        );
+        assert_eq!(
+            alloc.body().carried(unused),
+            None,
+            "budget is available (the control above proves it), so only the \
+             zero-use filter can be refusing this"
+        );
+    }
+
     /// `within` is a subtree, not a suffix of a chain.
     ///
     /// A fold opens in the *middle* of its parent, so it is a sibling of the
@@ -4240,6 +5043,25 @@ mod tests {
             "and a nested fold opens inside its parent's schedule"
         );
         assert_eq!(alloc.body().opens_at(), None);
+    }
+
+    /// `fold_opening_at` asks [`Allocation::opens_at`]'s question from the
+    /// other end, and both halves of its match must hold: the right parent
+    /// at the wrong position finds nothing, just as the wrong parent would.
+    #[test]
+    fn fold_opening_at_matches_the_position_as_well_as_the_parent() {
+        let alloc = nest_with_sibling_folds();
+        let body = alloc.body();
+        assert_eq!(
+            body.fold_opening_at(2),
+            Some(Scope::Fold(0)),
+            "the fold does open here"
+        );
+        assert_eq!(
+            body.fold_opening_at(0),
+            None,
+            "the body is the fold's parent, but the fold opens at 2, not 0"
+        );
     }
 
     /// A scope encloses itself, so "is this in scope here" needs no special
@@ -4409,6 +5231,79 @@ mod tests {
                 "{vid:?} is carried in {carry:?}, which the loop also writes"
             );
         }
+    }
+
+    /// The schedule's last instruction needs no separate result register when
+    /// its own destination already gave it one: the three-way `&&` in the
+    /// reservation's guard all have to hold, and here none of them do.
+    #[test]
+    fn the_last_instructions_own_destination_needs_no_extra_result_register() {
+        let a = alloc(vec![
+            leaf(0),
+            leaf(1),
+            def(2, ScheduledOp::Binary(OpKind::Add, ValueId(0), ValueId(1))),
+        ]);
+        let last = a.body().schedule().len() - 1;
+        assert!(
+            matches!(a.body().where_at(ValueId(2), last), Where::Reg(_)),
+            "fixture assumes the root already has a register from its own destination"
+        );
+        assert_eq!(
+            a.body().scratch(last).result,
+            None,
+            "a root that already computed into a register needs no separate result slot"
+        );
+    }
+
+    /// A root already resident *because it was carried* also needs no extra
+    /// result register, even though it is `live_in` — the other half of the
+    /// same three-way `&&`: `live_in` alone is not enough, residency is what
+    /// decides it.
+    #[test]
+    fn a_carried_roots_result_register_is_not_reserved_when_it_is_already_resident() {
+        let root = ValueId(5);
+        let alloc = LinearScan.allocate_nest(
+            ScopedSchedule {
+                body: ScopeRegion {
+                    roots: vec![root],
+                    schedule: vec![
+                        leaf(0),
+                        def(5, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
+                        def(1, ScheduledOp::Reduce(fold_meta(), root)),
+                    ],
+                },
+                folds: vec![ScopeFold {
+                    parent: Scope::Body,
+                    at: 2,
+                    roots: Vec::new(),
+                    schedule: vec![
+                        // A real use, so `root` is ranked for carrying at all.
+                        def(200, ScheduledOp::Unary(OpKind::Neg, root)),
+                        // The enclosing park's own placeholder, last in the
+                        // schedule — the live_in value this final check
+                        // answers for.
+                        def(5, ScheduledOp::Const(0.0)),
+                    ],
+                }],
+                guard_arms: Vec::new(),
+            },
+            &NEST_FILE,
+        );
+        assert!(
+            alloc.body().carried(root).is_some(),
+            "fixture assumes NEST_FILE's budget carries the only root"
+        );
+        let inside = alloc.scope(Scope::Fold(0));
+        let last = inside.schedule().len() - 1;
+        assert!(
+            matches!(inside.where_at(root, last), Where::Reg(_)),
+            "a carried root is resident from a register, not a slot"
+        );
+        assert_eq!(
+            inside.scratch(last).result,
+            None,
+            "already resident through the carry, so no result register is reserved for it"
+        );
     }
 
     /// A root's placement is the whole of what used to need a `carries` map

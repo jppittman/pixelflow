@@ -116,7 +116,7 @@ fn read_from_pty_with_timeout(pty: &mut NixPty, expected_str: &str) -> Result<St
 }
 
 #[test]
-fn pty_spawn_successful() {
+fn spawned_pty_relays_the_childs_stdout_to_the_master_fd() {
     // Use sh -c to be more robust across platforms and ensure output flushing
     let config = PtyConfig {
         command_executable: "/bin/sh",
@@ -154,7 +154,7 @@ fn pty_spawn_successful() {
 }
 
 #[test]
-fn pty_read_write_interaction() {
+fn bytes_written_to_the_pty_are_read_back_from_the_childs_stdout() {
     let shell_command = "read r_line; echo \"input was: $r_line\"";
     let config = PtyConfig {
         command_executable: "/bin/sh",
@@ -232,7 +232,7 @@ fn pty_child_gets_default_sigpipe() {
 }
 
 #[test]
-fn pty_resize_successful() {
+fn pty_resize_returns_ok_for_a_running_child() {
     // Use `sleep` from PATH to be cross-platform (macOS has /bin/sleep, Linux /usr/bin/sleep)
     let config = PtyConfig {
         command_executable: "sleep",
@@ -331,7 +331,7 @@ fn pty_child_termination_on_drop() {
 }
 
 #[test]
-fn pty_spawn_invalid_command() {
+fn pty_spawn_returns_an_error_for_a_nonexistent_command() {
     let non_existent_cmd = "/path/to/absolutely/nonexistent/command_39291az";
     let config = PtyConfig {
         command_executable: non_existent_cmd,
