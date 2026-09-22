@@ -18,12 +18,11 @@
 //! for two different slot widths is not worth it for a bit of frame reuse on
 //! tiny kernels).
 //!
-//! Gather has no direct AVX2 hardware analogue reused here: `vgatherdps`'s
-//! VSIB + vector-mask-with-clearing semantics are a bigger lift than this
-//! backend's scope warrants, so — like `X86Backend` — a gather is assembled
-//! from scalar loads via the existing 128-bit lane-insert sequence
-//! (`x86_64::emit_gather_scalar`), run once per 128-bit half and combined
-//! with `vinsertf128`.
+//! A gather is the hardware's: `vgatherdps ymm, [base + ymm*4], ymm` reads
+//! one element per lane through a VSIB, under a vector mask the instruction
+//! clears as it completes lanes — so each gather sets its mask to all-ones
+//! first, from a register the allocator reserved for it, the way the
+//! AVX-512 tier resets `k1`.
 
 use super::x86_64;
 use super::x86_64::{Disp, Imm32, Mem, NoDisp, ptr};
@@ -181,6 +180,26 @@ impl Vex {
         inst
     }
 
+    /// `op reg, [base + ymmINDEX*4], vvvv` — the VSIB form, whose index is
+    /// a *vector* register: one address per lane, scale 4, no displacement.
+    /// X carries the index's high bit exactly as it does for a GPR index;
+    /// the SIB tail is the same bytes with a vector number in the index
+    /// field. `vvvv` is the gather's mask.
+    fn vsib_scaled4(self, reg: u8, vvvv: u8, base: Gpr, index: Reg) -> EncodedInst {
+        let mut inst = EncodedInst::new();
+        let rbit = if reg >= 8 { 0x00 } else { 0x80 };
+        let xbit = if index.0 >= 8 { 0x00 } else { 0x40 };
+        let bbit = if base.0 >= 8 { 0x00 } else { 0x20 };
+        inst.push(0xC4);
+        inst.push(rbit | xbit | bbit | self.map as u8);
+        inst.push(
+            ((self.w as u8) << 7) | ((!vvvv & 0xF) << 3) | ((self.l256 as u8) << 2) | self.pp as u8,
+        );
+        inst.push(self.opcode);
+        x86_64::scaled4_operand_into(&mut inst, reg, base, Gpr(index.0));
+        inst
+    }
+
     /// `op dst, vvvv, [addr]` — 3-operand VEX.256 with memory operand.
     #[allow(dead_code)]
     fn rrm<D: Disp>(self, dst: u8, vvvv: u8, addr: Mem<D>) -> EncodedInst {
@@ -333,13 +352,15 @@ fn vpslld_imm(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
 fn vpsrld_imm(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
     assemble(c, [Vex::m0f_66(0x72).imm(imm).rrr(2, d, s)]); // /2
 }
-
-// --- lane insert/extract between 256-bit and 128-bit (0F3A, 66 prefix, W0) ---
-/// `vinsertf128 ymmDST, ymmSRC1, xmmSRC2, imm8[0]` — copy `src1`, then place
-/// `src2` into the low (`imm=0`) or high (`imm=1`) 128 bits.
-fn vinsertf128(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8, imm: u8) {
-    assemble(c, [Vex::m0f3a_66(0x18).imm(imm).rrr(d, s1, s2)]);
+/// `vpcmpeqd ymmD, ymmS1, ymmS2` — `VEX.256.66.0F.WIG 76 /r`. With every
+/// operand the same register it is the idiom for all-ones: what a gather's
+/// mask has to be before the gather.
+#[must_use]
+fn vpcmpeqd(d: Reg, s1: Reg, s2: Reg) -> EncodedInst {
+    Vex::m0f_66(0x76).rrr(d.0, s1.0, s2.0)
 }
+
+// --- lane extract from 256-bit to 128-bit (0F3A, 66 prefix, W0) ---
 /// `vextractf128 xmmDST, ymmSRC, imm8[0]` — extract the low (`imm=0`) or high
 /// (`imm=1`) 128 bits of `src` into `dst`.
 fn vextractf128(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
@@ -472,10 +493,9 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
     match op {
         ScheduledOp::Unary(OpKind::Neg | OpKind::Abs, _) => 1,
         ScheduledOp::Ternary(OpKind::Select, ..) => 1,
-        // A 256-bit gather is two 128-bit halves: the half-sequence's own
-        // index and value registers, plus one of each to carry the high half
-        // while the low one is assembled in `dst`.
-        ScheduledOp::Gather(..) => 4,
+        // The gather's truncated-index lanes and its all-ones mask, which the
+        // instruction requires distinct from each other and from `dst`.
+        ScheduledOp::Gather(..) => 2,
         // A surviving fold's own loop: two transient registers for the trip
         // test and the accumulate — see `emit_scope`'s `Reduce` arm. The
         // binder and the accumulator are the fold's roots, placed by the
@@ -486,6 +506,24 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         // reads them straight out of the value, and a full batch is one
         // `vmovups`.
         ScheduledOp::Write { lanes, .. } if *lanes > 4 && *lanes < 8 => 1,
+        _ => 0,
+    }
+}
+
+/// How many GPRs this backend's encoding of `op` needs beyond
+/// [`regalloc::RegisterFile::gpr_ctx`].
+///
+/// `Gather` and `Uniform` need none: the base each addresses is a pointer
+/// value the allocator carries, and `vgatherdps` takes its indices as a
+/// vector. `Broadcast` needs one for its index, since it addresses the
+/// element through a SIB. A `Write` converts its row and column into one
+/// each before combining them into the address; the iota carries its eight
+/// bytes in through one.
+pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
+    use super::ScheduledOp;
+    match op {
+        ScheduledOp::Write { .. } => 2,
+        ScheduledOp::Broadcast(..) | ScheduledOp::Lanes(_) => 1,
         _ => 0,
     }
 }
@@ -599,45 +637,55 @@ pub fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
 // =============================================================================
 // Bound-memory gather (RawGather lowering target)
 //
-// No native vgatherdps here (see the module doc): truncate all 8 lanes at
-// once, split into two 128-bit halves, run the existing SSE2/AVX scalar-load
-// sequence (`x86_64::emit_gather_scalar`) on each half (it only ever touches
-// the low 128 bits of whatever register it's given — ymm0's low 128 IS
-// xmm0), then recombine with vinsertf128.
+// `vgatherdps ymmDST, [base + ymmIDX*4], ymmMASK` reads one f32 per lane from
+// a bound buffer. The lowered index is a float (`clamp(floor(x))·1 + …`), so
+// it is first truncated to signed int32 lanes with `vcvttps2dq`. The mask
+// must have every lane's sign bit set going in — the instruction clears the
+// lanes it completes — so it is set to all-ones before every gather.
 // =============================================================================
 
-/// Scratch the 256-bit gather clobbers: the 128-bit sequence's own scratch,
-/// which both halves reuse, plus the two vector registers that carry the high
-/// half while the low half is being assembled. All of it must be distinct from
-/// the gather's `dst` and `idx`.
+/// The two registers a gather destroys beside its destination: the
+/// truncated indices and the all-ones mask. The instruction `#UD`s unless
+/// all three are distinct, and the allocator's temps are disjoint from
+/// the destination and each other by construction.
 #[derive(Clone, Copy)]
-pub struct GatherScratch {
-    /// Scratch for one 128-bit half — see [`x86_64::GatherScratch`].
-    pub half: x86_64::GatherScratch,
-    /// Vector register receiving lanes 4..8 of the float indices.
-    pub idx_hi: Reg,
-    /// Vector register receiving the high half's gathered values.
-    pub res_hi: Reg,
+pub struct GatherTemps {
+    /// Vector register for the truncated integer indices.
+    pub idx_int: Reg,
+    /// Vector register for the mask, all-ones going in and cleared on exit.
+    pub mask: Reg,
 }
 
-/// `dst = base[idx_lane]` for 8 lanes. `idx` holds FLOAT indices (already
-/// clamped in range by the `Gather` lowering — `x86_64::emit_gather_scalar`
-/// does its own float->int truncation per half, so `idx` must not be
-/// pre-truncated here); `base` the buffer's address. Clobbers everything in
-/// `s`.
-pub fn emit_gather_scalar(code: &mut Vec<u8>, dst: Reg, idx: Reg, base: PtrReg, s: GatherScratch) {
-    // idx's low 128 already holds lanes 0..4 (float); split off lanes 4..8
-    // into idx_hi before either gather call touches idx/dst (which may alias).
-    vextractf128(code, s.idx_hi.0, idx.0, 1);
+/// `vgatherdps ymmDST, [baseGPR + ymmINDEX*4], ymmMASK` —
+/// `VEX.256.66.0F38.W0 92 /r /vsib`, scale 4: one f32 per lane at
+/// `base + index_lane*4`, for every lane whose `mask` sign bit is set. The
+/// caller has truncated the indices and set the mask; `base` is never
+/// `rbp`/`r13` (the pointer pool is `r9`–`r11`, so the SIB's no-base
+/// encoding is unreachable).
+#[must_use]
+pub fn gather(dst: Reg, base: PtrReg, index: Reg, mask: Reg) -> EncodedInst {
+    debug_assert!(
+        dst != index && dst != mask && index != mask,
+        "vgatherdps: dst, index and mask must be three registers"
+    );
+    Vex::m0f38_66(0x92).vsib_scaled4(dst.0, mask.0, base.as_gpr(), index)
+}
 
-    // Low half: lanes 0..4. May write dst == idx (the callee handles that:
-    // it converts idx to int in scratch before ever writing dst).
-    x86_64::emit_gather_scalar(code, dst, idx, base, s.half);
-    // High half: lanes 4..8, into res_hi (a 128-bit scratch distinct from dst).
-    x86_64::emit_gather_scalar(code, s.res_hi, s.idx_hi, base, s.half);
-
-    // Recombine: dst[0..4] already holds the low half; splice in the high.
-    vinsertf128(code, dst.0, dst.0, s.res_hi.0, 1);
+/// `dst = base[idx_lane]` for 8 lanes — the whole gather sequence. `idx`
+/// holds the *float* indices (the lowering already clamped them in range);
+/// `base` the buffer's address. `dst` may alias `idx`: the indices are
+/// truncated into `t.idx_int` before the first write to `dst`.
+pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx: Reg, base: PtrReg, t: GatherTemps) {
+    debug_assert!(
+        t.idx_int != idx,
+        "the truncated indices must not overwrite the float ones"
+    );
+    AsmProgram::from([
+        Vex::m0f_f3(0x5B).rrr(t.idx_int.0, UNUSED_VVVV, idx.0),
+        vpcmpeqd(t.mask, t.mask, t.mask),
+        gather(dst, base, t.idx_int, t.mask),
+    ])
+    .assemble(code);
 }
 
 #[cfg(test)]
@@ -987,13 +1035,14 @@ mod tests {
             check(run(&c, xs, ys, zs), |i| xs[i] * ys[i], "spill roundtrip");
         }
 
+        /// The gather sequence executes: `dst` may alias the float index
+        /// register, and every lane reads its own element. Matches the
+        /// production ABI (mod.rs's `ResolvedOp::Gather`): the base is a
+        /// pointer register the allocator placed — here the first argument,
+        /// `rdi`, holding the buffer's own address.
         #[test]
-        fn emit_gather_scalar_reads_the_value_at_each_lanes_index() {
+        fn emit_gather_reads_the_value_at_each_lanes_index() {
             skip_unless_host_runs!(Isa::Avx2);
-            // Matches the production ABI (mod.rs's `ResolvedOp::Gather`): the
-            // base is a pointer register the allocator placed — here the
-            // first argument, `rdi`, holding the buffer's own address — not a
-            // context slot the gather loads it from.
             #[allow(improper_ctypes_definitions)]
             type G = unsafe extern "C" fn(*const f32, __m256) -> __m256;
 
@@ -1001,7 +1050,11 @@ mod tests {
             ///
             /// The host must execute AVX2 (checked above).
             #[target_feature(enable = "avx2")]
-            unsafe fn gather(exec: &ExecutableCode, base: *const f32, idx: [f32; 8]) -> [f32; 8] {
+            unsafe fn run_gather(
+                exec: &ExecutableCode,
+                base: *const f32,
+                idx: [f32; 8],
+            ) -> [f32; 8] {
                 unsafe {
                     let f: G = exec.as_fn();
                     let r = f(base, _mm256_loadu_ps(idx.as_ptr()));
@@ -1011,38 +1064,80 @@ mod tests {
                 }
             }
 
-            let mut c = Vec::new();
-            // idx (zmm/ymm0) -> int truncate happens inside emit_gather_scalar.
-            let s = x86_64::GatherScratch {
-                index_gpr: 1, // rcx
-                idx_lanes: Reg(13),
-                value: Reg(14),
-            };
-            emit_gather_scalar(
-                &mut c,
-                Reg(0),
-                Reg(0),
-                x86_64::ptr::RDI,
-                GatherScratch {
-                    half: s,
-                    idx_hi: Reg(9),
-                    res_hi: Reg(8),
-                },
-            );
-            crate::emit::x86_64::ret(&mut c);
-
             let buf: Vec<f32> = (0..64).map(|i| (i as f32) * 1.5 + 0.25).collect();
             let idx: [f32; 8] = [0.0, 63.0, 1.0, 2.0, 10.0, 5.0, 32.0, 7.0];
+            // Twice: into a register of its own, and over the float index.
+            for dst in [Reg(5), Reg(0)] {
+                let mut c = Vec::new();
+                emit_gather(
+                    &mut c,
+                    dst,
+                    Reg(0),
+                    x86_64::ptr::RDI,
+                    GatherTemps {
+                        idx_int: Reg(13),
+                        mask: Reg(14),
+                    },
+                );
+                if dst != Reg(0) {
+                    emit_mov(&mut c, Reg(0), dst);
+                }
+                crate::emit::x86_64::ret(&mut c);
 
-            let exec = unsafe { ExecutableCode::from_code(&c).expect("mmap") };
-            // SAFETY: the host runs AVX2, checked at the top of this test.
-            let out = unsafe { gather(&exec, buf.as_ptr(), idx) };
-
-            for i in 0..8 {
-                let want = buf[idx[i] as usize];
-                assert_eq!(out[i], want, "gather lane {i}: idx {}", idx[i]);
+                let exec = unsafe { ExecutableCode::from_code(&c).expect("mmap") };
+                // SAFETY: the host runs AVX2, checked at the top of this test.
+                let out = unsafe { run_gather(&exec, buf.as_ptr(), idx) };
+                for i in 0..8 {
+                    let want = buf[idx[i] as usize];
+                    assert_eq!(
+                        out[i], want,
+                        "gather into {dst:?}, lane {i}: idx {}",
+                        idx[i]
+                    );
+                }
             }
         }
+    }
+
+    /// The gather's bytes against `objdump -M intel` (binutils 2.42) and
+    /// `llvm-mc`: `vpcmpeqd ymm7, ymm7, ymm7`, `vcvttps2dq ymm6, ymm0`,
+    /// then `vgatherdps ymm5, [r9 + ymm6*4], ymm7`. VEX.R, X and B each
+    /// carry one operand's high bit — the destination's, the vector
+    /// index's and the base's — pinned by the all-high and mixed forms.
+    #[test]
+    fn the_gather_encodes_as_the_manual_says() {
+        let mut c = Vec::new();
+        emit_gather(
+            &mut c,
+            Reg(5),
+            Reg(0),
+            PtrReg(9),
+            GatherTemps {
+                idx_int: Reg(6),
+                mask: Reg(7),
+            },
+        );
+        assert_eq!(
+            c,
+            [
+                0xC4, 0xE1, 0x7E, 0x5B, 0xF0, // vcvttps2dq ymm6, ymm0
+                0xC4, 0xE1, 0x45, 0x76, 0xFF, // vpcmpeqd ymm7, ymm7, ymm7
+                0xC4, 0xC2, 0x45, 0x92, 0x2C, 0xB1, // vgatherdps ymm5, [r9+ymm6*4], ymm7
+            ]
+        );
+        let mut c = Vec::new();
+        AsmProgram::from([
+            gather(Reg(13), PtrReg(11), Reg(14), Reg(15)),
+            gather(Reg(0), x86_64::ptr::RDI, Reg(13), Reg(14)),
+        ])
+        .assemble(&mut c);
+        assert_eq!(
+            c,
+            [
+                0xC4, 0x02, 0x05, 0x92, 0x2C, 0xB3, // vgatherdps ymm13, [r11+ymm14*4], ymm15
+                0xC4, 0xA2, 0x0D, 0x92, 0x04, 0xAF, // vgatherdps ymm0, [rdi+ymm13*4], ymm14
+            ]
+        );
     }
 }
 
@@ -1078,15 +1173,19 @@ pub(crate) mod driver {
     /// The AVX2 register file (ymm, 256-bit).
     ///
     /// The same sixteen registers as SSE2's at twice the width. The gather
-    /// borrows four of them across its own sequence (the high half's index
-    /// and result beside the low half's pair), the sign mask and the select
-    /// blend borrow one — all reservations the allocator makes for one
-    /// instruction, so all of them are its the rest of the time.
+    /// borrows two of them across its own sequence (the truncated indices
+    /// and the mask), the sign mask and the select blend borrow one — all
+    /// reservations the allocator makes for one instruction, so all of them
+    /// are its the rest of the time.
     const AVX2_FILE: regalloc::RegisterFile = regalloc::RegisterFile {
         scratch: regalloc::RegSet::range(0, 16),
         fixed: &[],
         temps_for: super::temps_for,
         vector_bytes: 32,
+        // `vgatherdps` addresses through a vector index, so the gather needs
+        // no per-lane GPR: only the broadcast's index, the store's row and
+        // column, and the iota's bytes ride through `rax`/`rcx`.
+        gpr_temps_for: super::gpr_temps_for,
         ..SSE2_FILE
     }
     .checked();
@@ -1181,25 +1280,18 @@ pub(crate) mod driver {
                     super::emit_shift_imm(code, *op, *dst, *src, *amount);
                 }
                 ResolvedOp::Gather { dst, idx, base } => {
-                    // `base` is the buffer's address wherever the allocator
-                    // keeps it; the index GPR is `AVX2_FILE.gpr_scratch`'s
-                    // reservation; the four vector temps are the two halves'
-                    // index and value registers (see
-                    // `super::emit_gather_scalar`).
-                    super::emit_gather_scalar(
+                    // dst = base[idx]: `vgatherdps` under an all-ones mask,
+                    // `base` being the buffer's address wherever the
+                    // allocator keeps it; the two vector temps are this
+                    // instruction's reservations (`super::temps_for`).
+                    super::emit_gather(
                         code,
                         *dst,
                         *idx,
                         *base,
-                        super::GatherScratch {
-                            half: x86_64::GatherScratch {
-                                index_gpr: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0))
-                                    .0,
-                                idx_lanes: crate::emit::declared_temp(plan.scratch.temp(0)),
-                                value: crate::emit::declared_temp(plan.scratch.temp(1)),
-                            },
-                            idx_hi: crate::emit::declared_temp(plan.scratch.temp(2)),
-                            res_hi: crate::emit::declared_temp(plan.scratch.temp(3)),
+                        super::GatherTemps {
+                            idx_int: crate::emit::declared_temp(plan.scratch.temp(0)),
+                            mask: crate::emit::declared_temp(plan.scratch.temp(1)),
                         },
                     );
                 }
