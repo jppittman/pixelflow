@@ -365,6 +365,7 @@ mod tests {
             args,
             initial_cols: 80,
             initial_rows: 24,
+            working_directory: None,
         })
         .expect("Failed to spawn PTY");
 
@@ -444,6 +445,7 @@ mod tests {
             args: &[],
             initial_cols: 80,
             initial_rows: 24,
+            working_directory: None,
         })
         .expect("pty");
         let sink = CaptureSink::default();
@@ -479,6 +481,7 @@ mod tests {
             args: &[],
             initial_cols: 80,
             initial_rows: 24,
+            working_directory: None,
         })
         .expect("pty");
         let sink = CaptureSink::default();

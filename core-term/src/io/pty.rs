@@ -46,6 +46,8 @@ pub struct PtyConfig<'a> {
     pub initial_cols: u16,
     /// Initial rows.
     pub initial_rows: u16,
+    /// The directory the command starts in; the terminal's own when `None`.
+    pub working_directory: Option<&'a std::path::Path>,
 }
 
 /// Trait abstracting a PTY channel.
@@ -197,6 +199,11 @@ impl NixPty {
             .context("PTY slave path contains NUL")?;
         let exe =
             CString::new(config.command_executable).context("Command executable contains NUL")?;
+        let working_directory = config
+            .working_directory
+            .map(|dir| CString::new(dir.as_os_str().to_owned().into_vec()))
+            .transpose()
+            .context("Working directory contains NUL")?;
         let mut argv: Vec<CString> = Vec::with_capacity(config.args.len() + 1);
         argv.push(exe.clone());
         for arg in config.args {
@@ -254,6 +261,11 @@ impl NixPty {
                 libc::STDIN_FILENO,
                 libc::STDERR_FILENO,
             );
+            // A directory that cannot be entered fails the spawn itself, so
+            // the error surfaces below rather than as a shell in the wrong place.
+            if let Some(dir) = &working_directory {
+                super::spawn::add_chdir(&mut actions, dir.as_ptr());
+            }
 
             // Reset every signal disposition and unblock everything. Rust
             // sets SIGPIPE to SIG_IGN, and ignored dispositions survive

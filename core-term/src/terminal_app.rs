@@ -1131,6 +1131,7 @@ mod tests {
             args: &["-c", "yes"],
             initial_cols: 80,
             initial_rows: 24,
+            working_directory: None,
         })
         .expect("spawn pty running yes");
         let child = pty.child_pid();

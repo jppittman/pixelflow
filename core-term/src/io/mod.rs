@@ -27,6 +27,13 @@ pub struct Resize {
 mod pty_tests;
 
 // Platform-specific event monitoring implementations
+#[cfg(target_os = "linux")]
+#[path = "spawn_linux.rs"]
+mod spawn;
+#[cfg(target_os = "macos")]
+#[path = "spawn_macos.rs"]
+mod spawn;
+
 #[cfg(target_os = "macos")]
 pub mod kqueue;
 

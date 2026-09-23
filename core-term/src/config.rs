@@ -31,10 +31,8 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
             cfg
         }
         Err(e) => {
-            // If load_config_from_file_or_defaults itself can return an error
-            // (e.g., for critical unrecoverable parsing issues not handled by defaulting internally),
-            // we log it here and still proceed with hardcoded defaults.
-            // The current placeholder always returns Ok(Config::default()).
+            // The terminal still starts, on defaults, but says loudly why
+            // the user's settings are not in effect.
             error!(
                 "Critical error during configuration loading: {:?}. Using emergency default configuration.",
                 e
@@ -44,50 +42,51 @@ pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
     }
 });
 
-/// Placeholder function representing the logic to load configuration.
+/// The configuration file's name inside the configuration directory.
+const CONFIG_FILE: &str = "core-term/config.json";
+
+/// Where the configuration file lives: `$XDG_CONFIG_HOME/core-term/config.json`,
+/// else `~/.config/core-term/config.json`. `None` when neither variable is set.
+fn config_path() -> Option<PathBuf> {
+    let dir = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(dir.join(CONFIG_FILE))
+}
+
+/// Loads the configuration file, or the defaults when there is none.
 ///
-/// In a real application, this would:
-/// 1. Determine the configuration file path(s).
-/// 2. Read the file content.
-/// 3. Deserialize it (e.g., from TOML) into the `Config` struct.
-/// 4. If any step fails (file not found, parse error), it could log a warning
-///    and return `Ok(Config::default())`, or return an `Err` for more critical issues.
-///
-/// For simplicity, this version now directly returns `Ok(Config::default())`
-/// or could return `anyhow::Result<Config>`.
+/// Every setting is optional: a file names only what it changes. A file that
+/// exists but cannot be read or parsed is an error rather than a silent
+/// fall-back, so a typo is reported instead of quietly ignored.
 fn load_config_from_file_or_defaults() -> anyhow::Result<Config> {
-    // This function is now expected to handle its own errors internally if it wants
-    // to try loading and then fall back to defaults, or it can propagate an error
-    // if the loading process itself is critically unrecoverable.
+    let Some(path) = config_path() else {
+        info!("No home directory to look for a configuration file in; using defaults.");
+        return Ok(Config::default());
+    };
+    load_config_from(&path)
+}
 
-    // Example: If you were loading from "core-term.toml"
-    // let config_path = PathBuf::from("core-term.toml");
-    // match std::fs::read_to_string(&config_path) {
-    //     Ok(content) => {
-    //         match toml::from_str(&content) {
-    //             Ok(cfg) => {
-    //                 info!("Successfully loaded configuration from {:?}.", config_path);
-    //                 Ok(cfg)
-    //             }
-    //             Err(e) => {
-    //                 warn!("Failed to parse config file {:?}: {}. Using default configuration.", config_path, e);
-    //                 Ok(Config::default()) // Fallback to defaults on parse error
-    //             }
-    //         }
-    //     }
-    //     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-    //         info!("Config file not found at {:?}. Using default configuration.", config_path);
-    //         Ok(Config::default()) // Fallback to defaults if file not found
-    //     }
-    //     Err(e) => {
-    //         // For other I/O errors, you might want to propagate them
-    //         Err(anyhow::Error::from(e).context(format!("Failed to read config file {:?}", config_path)))
-    //     }
-    // }
-
-    // Current placeholder behavior: always succeeds with defaults.
-    info!("Placeholder: `load_config_from_file_or_defaults` called. Returning default config.");
-    Ok(Config::default())
+fn load_config_from(path: &std::path::Path) -> anyhow::Result<Config> {
+    use anyhow::Context;
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!(
+                "No configuration file at {}; using defaults.",
+                path.display()
+            );
+            return Ok(Config::default());
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to read {}", path.display()));
+        }
+    };
+    let config = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    info!("Configuration loaded from {}.", path.display());
+    Ok(config)
 }
 
 // --- Configuration Structures ---
@@ -395,5 +394,68 @@ impl Default for MouseConfig {
             cursor_shape: "xterm".to_string(),
             force_modifier: "ShiftMask".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch directory unique to one test.
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("core-term-config-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn a_missing_file_is_the_defaults() {
+        let path = scratch("missing").join("config.json");
+        let config = load_config_from(&path).expect("defaults");
+        assert_eq!(
+            config.appearance.cell_height_px,
+            Config::default().appearance.cell_height_px
+        );
+    }
+
+    #[test]
+    fn a_file_names_only_what_it_changes() {
+        let path = scratch("partial").join("config.json");
+        std::fs::write(&path, r#"{ "appearance": { "cell_height_px": 22 } }"#).expect("write");
+
+        let config = load_config_from(&path).expect("parses");
+        assert_eq!(config.appearance.cell_height_px, 22);
+        assert_eq!(
+            config.appearance.cell_width_px,
+            Config::default().appearance.cell_width_px,
+            "unnamed settings keep their defaults"
+        );
+    }
+
+    #[test]
+    fn every_default_setting_round_trips_through_the_file_format() {
+        let path = scratch("round-trip").join("config.json");
+        let written = serde_json::to_string_pretty(&Config::default()).expect("serialize");
+        std::fs::write(&path, written).expect("write");
+
+        let config = load_config_from(&path).expect("parses what it wrote");
+        let copy = Some(UserInputAction::InitiateCopy);
+        assert_eq!(
+            config.keybindings.lookup.get(&crate::keys::chord(
+                KeySymbol::Char('c'),
+                Modifiers::CONTROL | Modifiers::SHIFT
+            )),
+            copy.as_ref(),
+            "bindings are rebuilt from the file"
+        );
+    }
+
+    #[test]
+    fn a_file_that_does_not_parse_is_an_error_not_the_defaults() {
+        let path = scratch("invalid").join("config.json");
+        std::fs::write(&path, r#"{ "appearance": { "cell_height_px": "tall" } }"#).expect("write");
+
+        assert!(load_config_from(&path).is_err());
     }
 }

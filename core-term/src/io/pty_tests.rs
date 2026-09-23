@@ -123,6 +123,7 @@ fn spawned_pty_relays_the_childs_stdout_to_the_master_fd() {
         args: &["-c", "echo hello pty world"],
         initial_cols: DEFAULT_COLS,
         initial_rows: DEFAULT_ROWS,
+        working_directory: None,
     };
 
     match NixPty::spawn_with_config(&config) {
@@ -163,6 +164,7 @@ fn bytes_written_to_the_pty_are_read_back_from_the_childs_stdout() {
         args: &["-c", shell_command],
         initial_cols: DEFAULT_COLS,
         initial_rows: DEFAULT_ROWS,
+        working_directory: None,
     };
 
     let mut pty = match NixPty::spawn_with_config(&config) {
@@ -205,6 +207,7 @@ fn pty_child_acquires_controlling_terminal() {
         args: &["-c", "echo ctty-ok > /dev/tty"],
         initial_cols: DEFAULT_COLS,
         initial_rows: DEFAULT_ROWS,
+        working_directory: None,
     };
 
     let mut pty = NixPty::spawn_with_config(&config).expect("Failed to spawn PTY");
@@ -223,6 +226,7 @@ fn pty_child_gets_default_sigpipe() {
         args: &["-c", "yes | head -c 4 > /dev/null && echo pipe-done"],
         initial_cols: DEFAULT_COLS,
         initial_rows: DEFAULT_ROWS,
+        working_directory: None,
     };
 
     let mut pty = NixPty::spawn_with_config(&config).expect("Failed to spawn PTY");
@@ -239,6 +243,7 @@ fn pty_resize_returns_ok_for_a_running_child() {
         args: &["0.1"], // Arg for sleep is just the duration
         initial_cols: DEFAULT_COLS,
         initial_rows: DEFAULT_ROWS,
+        working_directory: None,
     };
 
     let pty = match NixPty::spawn_with_config(&config) {
@@ -276,6 +281,7 @@ fn pty_child_termination_on_drop() {
         args: &["2"], // Arg for sleep is just the duration
         initial_cols: DEFAULT_COLS,
         initial_rows: DEFAULT_ROWS,
+        working_directory: None,
     };
 
     let pty = match NixPty::spawn_with_config(&config) {
@@ -338,6 +344,7 @@ fn pty_spawn_returns_an_error_for_a_nonexistent_command() {
         args: &[],
         initial_cols: DEFAULT_COLS,
         initial_rows: DEFAULT_ROWS,
+        working_directory: None,
     };
 
     // With `std::process::Command`, spawning a non-existent command should return an error immediately,
@@ -371,4 +378,35 @@ fn pty_spawn_returns_an_error_for_a_nonexistent_command() {
             );
         }
     }
+}
+
+#[test]
+fn the_child_starts_in_the_configured_working_directory() {
+    let dir = std::env::temp_dir().canonicalize().expect("temp dir");
+    let config = PtyConfig {
+        command_executable: "/bin/sh",
+        args: &["-c", "pwd -P"],
+        initial_cols: DEFAULT_COLS,
+        initial_rows: DEFAULT_ROWS,
+        working_directory: Some(&dir),
+    };
+    let mut pty = NixPty::spawn_with_config(&config).expect("spawn in the temp dir");
+
+    let expected = dir.to_str().expect("temp dir is UTF-8");
+    let output = read_from_pty_with_timeout(&mut pty, expected)
+        .unwrap_or_else(|err_msg| panic!("working directory test failed: {}", err_msg));
+    assert!(output.contains(expected));
+}
+
+#[test]
+fn a_working_directory_that_cannot_be_entered_fails_the_spawn() {
+    let missing = std::path::Path::new("/nonexistent/core-term/working-directory");
+    let config = PtyConfig {
+        command_executable: "/bin/sh",
+        args: &["-c", "true"],
+        initial_cols: DEFAULT_COLS,
+        initial_rows: DEFAULT_ROWS,
+        working_directory: Some(missing),
+    };
+    assert!(NixPty::spawn_with_config(&config).is_err());
 }
