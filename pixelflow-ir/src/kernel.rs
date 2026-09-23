@@ -709,32 +709,45 @@ impl Kernel {
         Self::wrap(b.finish(&[root]), env, buffers)
     }
 
-    /// `⊕_{i ∈ 0..extent} body(i)` — **the** reduction binder: fold `body` over
+    /// `⊕_{i ∈ range} body(i)` — **the** reduction binder: fold `body` over
     /// a bounded discrete domain under `monoid`, eliminating that dimension.
     ///
     /// This is the primitive; [`Kernel::sum_over`] and friends are one-line
-    /// helpers over it, and a new [`Monoid`] extends the language without
-    /// touching this method.
+    /// helpers over it at `0..extent`, and a new [`Monoid`] extends the
+    /// language without touching this method.
     ///
     /// The closure receives the bound index as a `Kernel` of its own, so Rust's
     /// scoping *is* the binder's scoping — an index cannot escape the fold that
     /// binds it, and a repeated index in nested folds is a genuine contraction
-    /// rather than an accident. `extent` is a static count, which is what keeps
-    /// the language total and its cost closed-form (`|D| × cost(body)`); the
+    /// rather than an accident. `range` is static, which is what keeps the
+    /// language total and its cost closed-form (`|D| × cost(body)`); the
     /// backend unrolls, so the domain is bounded in practice as well as in
     /// principle.
+    ///
+    /// **Where the domain starts is the fold's, not the body's.** Two folds
+    /// whose bodies read `table[i]` over different rows of one table have
+    /// one body, and the e-graph reasons about it once; spelling the second
+    /// as `table[i + offset]` over `0..len` gives it a body of its own.
     ///
     /// Nesting is supported (up to [`Binder::COUNT`] live binders — the
     /// reserved index space): each fold takes the lowest index slot its body
     /// does not already bind.
     ///
+    /// # Panics
+    ///
+    /// Panics if `range` runs backwards.
+    ///
     /// ```ignore
     /// // Σ_d q(d)·k(d) — a contraction over the shared index.
-    /// Kernel::over(Monoid::SUM, 64, |d| q.at_index(d).mul(&k.at_index(d)))
+    /// Kernel::over(Monoid::SUM, 0..64, |d| q.at_index(d).mul(&k.at_index(d)))
     /// ```
     #[must_use]
-    pub fn over(monoid: Monoid, extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::bind_fresh(|binder| Fold::new(monoid, binder, 0..extent), body)
+    pub fn over(
+        monoid: Monoid,
+        range: core::ops::Range<u32>,
+        body: impl FnOnce(&Kernel) -> Kernel,
+    ) -> Self {
+        Self::bind_fresh(|binder| Fold::new(monoid, binder, range), body)
     }
 
     /// `∫∫` of `self` over the pixel: `∫_{u_y ∈ [-½, ½)} ∫_{u_x ∈ [-½, ½)}
@@ -817,41 +830,41 @@ impl Kernel {
     /// sum over a bounded index.
     #[must_use]
     pub fn sum_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::SUM, extent, body)
+        Self::over(Monoid::SUM, 0..extent, body)
     }
 
     /// `Π_{i ∈ 0..extent} body(i)`.
     #[must_use]
     pub fn product_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::PRODUCT, extent, body)
+        Self::over(Monoid::PRODUCT, 0..extent, body)
     }
 
     /// `max_{i ∈ 0..extent} body(i)` — the stabilizer half of a softmax, and
     /// the shape of any "best over a bounded set" query.
     #[must_use]
     pub fn max_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::MAX, extent, body)
+        Self::over(Monoid::MAX, 0..extent, body)
     }
 
     /// `min_{i ∈ 0..extent} body(i)` — e.g. the nearest hit of a bounded set
     /// of SDFs.
     #[must_use]
     pub fn min_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::MIN, extent, body)
+        Self::over(Monoid::MIN, 0..extent, body)
     }
 
     /// `∃_{i ∈ 0..extent} body(i)` — a mask that is set where *any* index
     /// satisfies `body`.
     #[must_use]
     pub fn any_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::ANY, extent, body)
+        Self::over(Monoid::ANY, 0..extent, body)
     }
 
     /// `∀_{i ∈ 0..extent} body(i)` — a mask that is set where *every* index
     /// satisfies `body`.
     #[must_use]
     pub fn all_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::ALL, extent, body)
+        Self::over(Monoid::ALL, 0..extent, body)
     }
 
     /// Sample `self` at warped coordinates — contramap / `.at()`. Each of

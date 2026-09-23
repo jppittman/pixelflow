@@ -139,8 +139,8 @@ fn main() {
 /// Captured contents for each buffer `arena` declares, matched to the data
 /// `glyph.kernel` itself carries
 /// ([`Kernel::buffer_data`](pixelflow_ir::Kernel::buffer_data)) by
-/// [`BufferIdentity`](pixelflow_ir::arena::BufferIdentity) — the winding
-/// sum's real piece table, not a restatement of its shape. `None` at a slot
+/// [`BufferIdentity`](pixelflow_ir::arena::BufferIdentity) — the area
+/// fold's real piece table, not a restatement of its shape. `None` at a slot
 /// means this glyph declared a buffer its kernel carries no data for, which
 /// `dummy_context` reports loudly at replay rather than silently zeroing.
 fn buffer_data_for(arena: &ExprArena, glyph: &Glyph) -> Vec<Option<Arc<Vec<f32>>>> {
@@ -186,9 +186,8 @@ fn capture(out: &std::path::Path, font: Option<&std::path::Path>) {
                 missing += 1;
                 continue;
             };
-            // Linked: the winding sum is composed by reference, and the
-            // corpus holds the arena the optimizer sees — the referent
-            // spliced in, declaring the table it reads.
+            // Linked: the corpus holds the arena the optimizer sees, every
+            // reference resolved, declaring the table it reads.
             let coverage = glyph.kernel();
             let (arena, root) = coverage.linked_parts();
             let buffer_data = buffer_data_for(&arena, &glyph);

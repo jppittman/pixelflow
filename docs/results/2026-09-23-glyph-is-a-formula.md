@@ -103,6 +103,18 @@ algebra polishes a form that is already closed. One fold with one body is
 one `ArcMoment` firing per span; `HELLO`'s five spans close in one graph,
 well under the 38 separate arcs the step-5 review found the cap admits.
 
+**Corrected by review: a longer run did not close.** Each span was its own
+integral, because each fold read `table[i + offset]`, and the closing phase
+stopped on the class cap in its first round from about thirty characters
+on. At 16 px: 3 of 68 integrals were left to quadrature at 34 characters,
+33 of 100 at 50, and all 188 for the 94 printable glyphs in one `text()`,
+whose coverage then moved by up to 0.43. A span's first row is now its
+fold's range rather than an offset in its body, so every span shares one
+body and a run is one integral: `HELLO` inserts 158 classes (4 rounds,
+4800 classes at the cap, 5277 applications, 110 ms in debug) and the
+94-glyph run 1404, both closed. A single glyph's texels are bit-identical;
+`HELLO`'s differ in 55 of 1200 texels by at most `6·10⁻⁸`.
+
 ## 4. What a glyph costs
 
 | | before | after |

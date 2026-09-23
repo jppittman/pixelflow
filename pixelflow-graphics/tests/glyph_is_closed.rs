@@ -12,9 +12,9 @@
 //! point sample, an aliased edge — and nothing downstream would notice: the
 //! coverage stays in range and the ink stays where it was. So this counts.
 //!
-//! For every printable ASCII glyph at 7, 16 and 32 px, and `HELLO` at 16,
-//! each composed and shaped as the atlas bakes it (texel centres,
-//! `tile_px × tile_px`):
+//! For every printable ASCII glyph at 7, 16 and 32 px, `HELLO` at 16, and
+//! every printable glyph as one run at 16, each composed and shaped as the
+//! atlas bakes it (texel centres, `tile_px × tile_px`):
 //!
 //! - `optimize_runtime_arena` optimizes it — `None` would mean the tier
 //!   declined, and the arena compiled would be the one written;
@@ -144,11 +144,32 @@ fn every_glyph_closes_at_32px() {
     every_glyph_closes_at(32);
 }
 
-/// A run is one fold per character over one table, so its closure is five
-/// integrals' closure in one graph — the case the closing phase's class cap
-/// would decide first.
+/// A run is one fold per character over one table, each over its own range
+/// of rows.
 #[test]
 fn a_run_closes() {
     let font = Font::parse(FONT_DATA).expect("parse font");
     assert_closed("HELLO@16", &text(&font, "HELLO", 16.0), 16);
+}
+
+/// **How long a run is decides nothing.** Every character's fold reads its
+/// rows through one body, so the e-graph holds one integral whatever the
+/// run's length, and the closing phase's class cap never meets it.
+///
+/// The run's integrals once had a body per character — each fold read
+/// `table[i + offset]` — so a run was as many integrals as characters, and
+/// the closing phase, which shares the saturation's class cap, stopped in
+/// its first round from about thirty characters on: 3 of 68 integrals left
+/// to quadrature at 34 characters, 33 of 100 at 50, and at 80 the graph
+/// was at the cap before a rule fired. The per-glyph pins above could not
+/// see it; a run of 94 would.
+#[test]
+fn a_run_of_every_glyph_closes() {
+    let font = Font::parse(FONT_DATA).expect("parse font");
+    let every: String = ('!'..='~').collect();
+    assert_closed(
+        &format!("{} glyphs@16", every.len()),
+        &text(&font, &every, 16.0),
+        16,
+    );
 }

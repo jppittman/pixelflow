@@ -711,6 +711,22 @@ Not on this list:
    - **Also:** the compound 2×2 was read transposed (`0df10f6`, found by
      step 6's preparation review) — output-neutral for this font, pinned by
      a quarter-turned component judged by the exact-area oracle.
+   - **Adversarial review:** a run's closure was decided by its length.
+     Each character's fold read `table[i + offset]`, so a run held one
+     integral per character, and the closing phase shares the saturation's
+     class cap: from about thirty characters it stopped in its first round
+     with the rest left to one-point quadrature — 3 of 68 integrals at 34
+     characters, 33 of 100 at 50, all 188 for the 94 printable glyphs in
+     one `text()`, whose coverage then moved by up to 0.43 against the
+     closed form. The per-glyph gate could not see it. The offset is now
+     the fold's range (`Kernel::over` takes a `Range` where it took an
+     extent; `sum_over` and friends are `0..extent`), so every character's
+     fold has one body and a run is one integral however long it is:
+     `HELLO` inserts 158 classes where it inserted 358, and a single
+     glyph's texels are bit-identical. `glyph_is_closed` gained the
+     94-glyph run, which fails without the change. The production font
+     (`NotoSansMono-Regular.ttf`, large-file storage, so not in CI's
+     checkout) closes at 7, 16, 24, 32 and 64 px, measured by hand.
    - **Not built:** the per-piece row cut is not yet a jump — the guard
      analysis owns its 109 entries but 21 others sit inside their run — so
      a glyph pays every piece's closed form at every batch in its box. The

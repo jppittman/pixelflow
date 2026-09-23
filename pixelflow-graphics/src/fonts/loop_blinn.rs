@@ -326,8 +326,16 @@ pub fn glyph(outline: &Outline) -> Glyph {
 /// so a five-character run would not compile
 /// (docs/plans/2026-09-09-composition-is-linking.md §4 named this limit as
 /// the cost of naming memory a slot at a time). Concatenating the rows and
-/// giving each outline's fold an offset costs one add per fold and binds
-/// one slot however long the run is.
+/// folding each outline over its own range of them binds one slot however
+/// long the run is.
+///
+/// **One body, not one per outline.** Where an outline's rows start is its
+/// fold's range, not an offset inside the body, so every outline's fold
+/// reads `table[i]` through the same body and the e-graph closes the run's
+/// integrals once. With the offset in the body each outline was an integral
+/// of its own, and past about thirty characters the closing phase ran into
+/// the saturation's class cap and left the rest to one-point quadrature —
+/// point-sampled, aliased glyphs (`tests/glyph_is_closed.rs`).
 ///
 /// [`glyph`] is this at one outline.
 #[must_use]
@@ -373,11 +381,8 @@ pub fn run(outlines: &[Outline]) -> Glyph {
     let placed: Vec<Glyph> = spans
         .iter()
         .map(|&(start, count, bounds)| {
-            let offset = constant(start as f32);
-            let area = SignedArea(Kernel::sum_over(count, |i| {
-                let row = i.add(&offset);
-                let c = row_at(&table, &row);
-                piece_term(&c)
+            let area = SignedArea(Kernel::over(Monoid::SUM, start..start + count, |i| {
+                piece_term(&row_at(&table, i))
             }));
             Glyph {
                 area,
@@ -543,7 +548,7 @@ fn coverage(area: &SignedArea) -> Kernel {
 //
 // Every term below reads a piece's numbers **by column**, from a bound table
 // at the fold's binder, so a glyph is one fold with a fixed body rather than
-// one arena fragment per piece: [`glyph`]'s `Kernel::sum_over` is the signed
+// one arena fragment per piece: [`glyph`]'s `Kernel::over` is the signed
 // area, and row `i` of the table is piece `i` — or, past the outline's own
 // piece count and up to its bucketed trip count ([`bucketed_trip_count`]), a
 // [`padding_row`]. The [`Coeff`] indirection is what keeps the read one

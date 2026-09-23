@@ -208,9 +208,9 @@ fn corpus(cli: &Cli) -> Vec<Case> {
             if n >= cli.max_glyphs {
                 break;
             }
-            // `glyph_kernel_scaled` yields a `Glyph` — its two folds and its
-            // support — and `kernel()` is the single exit that applies the
-            // coverage ramp once. See fonts/loop_blinn.rs.
+            // `glyph_kernel_scaled` yields a `Glyph` — its area fold and its
+            // support — and `kernel()` is the single exit that turns the
+            // signed area into coverage once. See fonts/loop_blinn.rs.
             let Some(kernel) = parsed
                 .glyph_kernel_scaled(ch, tile as f32)
                 .map(|g| g.kernel())
