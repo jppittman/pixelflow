@@ -2,7 +2,7 @@
 
 use super::{key_translator, FocusState, TerminalEmulator};
 use crate::term::{
-    action::{EmulatorAction, UserInputAction},
+    action::{EmulatorAction, Selection, UserInputAction},
     layout::Zoom,
     snapshot::{Point, SelectionMode},
     ControlEvent, MIN_GRID_DIMENSION,
@@ -56,18 +56,23 @@ pub(super) fn process_user_input_action(
         }
         UserInputAction::ApplySelectionClear => {
             emulator.apply_selection_clear();
-            Some(EmulatorAction::RequestRedraw)
+            // Highlighted text becomes the primary selection, for a
+            // middle-click paste here or anywhere else.
+            match emulator.get_selected_text().filter(|text| !text.is_empty()) {
+                Some(text) => Some(EmulatorAction::Copy {
+                    selection: Selection::Primary,
+                    text,
+                }),
+                None => Some(EmulatorAction::RequestRedraw),
+            }
         }
-        UserInputAction::RequestClipboardPaste => {
-            debug!(
-                "UserInputAction: RequestClipboardPaste received. Requesting clipboard content."
-            );
-            Some(EmulatorAction::RequestClipboardContent)
-        }
+        UserInputAction::RequestClipboardPaste => Some(EmulatorAction::RequestClipboardContent(
+            Selection::Clipboard,
+        )),
         UserInputAction::RequestPrimaryPaste => {
-            debug!("UserInputAction: RequestPrimaryPaste received. (Currently not fully implemented, forwarding to RequestClipboardContent)");
-            Some(EmulatorAction::RequestClipboardContent)
+            Some(EmulatorAction::RequestClipboardContent(Selection::Primary))
         }
+        UserInputAction::RequestToggleFullscreen => Some(EmulatorAction::ToggleFullscreen),
         UserInputAction::InitiateCopy => handle_initiate_copy(emulator),
         UserInputAction::PasteText(text_to_paste) => handle_paste_text(emulator, &text_to_paste),
         UserInputAction::RequestQuit => Some(EmulatorAction::Quit),
@@ -80,14 +85,6 @@ pub(super) fn process_user_input_action(
         UserInputAction::RequestScrollPageDown => scroll(emulator, -page(emulator)),
         UserInputAction::RequestScrollToTop => scroll(emulator, i32::MAX),
         UserInputAction::RequestScrollToBottom => scroll(emulator, i32::MIN),
-        // Add catch-all for other UserInputAction variants to satisfy exhaustiveness
-        _ => {
-            log::debug!(
-                "Unhandled UserInputAction variant in input_handler: {:?}",
-                action
-            );
-            None
-        }
     }
 }
 
@@ -188,7 +185,10 @@ fn handle_extend_selection(
 fn handle_initiate_copy(emulator: &mut TerminalEmulator) -> Option<EmulatorAction> {
     if let Some(text) = emulator.get_selected_text() {
         if !text.is_empty() {
-            return Some(EmulatorAction::CopyToClipboard(text));
+            return Some(EmulatorAction::Copy {
+                selection: Selection::Clipboard,
+                text,
+            });
         }
     }
     debug!("UserInputAction: InitiateCopy called but no text selected or selection empty.");

@@ -31,6 +31,7 @@
 //! - **Invariants**: Constraints that must always hold
 
 use crate::keys::{KeySymbol, Modifiers};
+pub use pixelflow_runtime::input::Selection;
 use serde::{Deserialize, Serialize};
 
 // --- User Input Actions ---
@@ -178,9 +179,10 @@ pub enum UserInputAction {
     /// **Precondition**: User released mouse button or completed selection gesture.
     ///
     /// **Emulator**:
-    /// - If selection is non-empty: finalizes it (text is now selectable for copy)
-    /// - If selection is empty (click without drag): clears any previous selection
-    /// - Queues `RequestRedraw` to refresh selection appearance
+    /// - If selection is non-empty: finalizes it and generates `Copy` to the
+    ///   primary selection (text is also available to `InitiateCopy`)
+    /// - If selection is empty (click without drag): clears any previous
+    ///   selection and queues `RequestRedraw`
     ///
     /// **Postcondition**: Selection is finalized or cleared
     ///
@@ -495,26 +497,18 @@ pub enum EmulatorAction {
     /// - Selection is modified → RequestRedraw
     RequestRedraw,
 
-    /// Copy text to the system clipboard.
+    /// Put text in a selection, for other applications to paste.
     ///
     /// # Contract
     ///
     /// **Emulator**: Generated when:
-    /// 1. User selects text and presses copy command (Ctrl+Shift+C)
-    /// 2. ANSI escape sequence requests clipboard write (OSC 52)
+    /// 1. User selects text and presses copy command (Ctrl+Shift+C) → `Clipboard`
+    /// 2. User finishes highlighting text with the mouse → `Primary`
     ///
-    /// **Orchestrator**:
-    /// 1. Stores the text in the system clipboard
-    /// 2. May update primary selection (X11)
-    /// 3. Other applications can now paste this text
+    /// **Orchestrator**: Asks the platform to set that selection.
     ///
-    /// **Postcondition**: Clipboard contains the text
-    ///
-    /// # Example
-    ///
-    /// User selects "$ hello world" and presses Ctrl+Shift+C
-    /// → `CopyToClipboard("$ hello world")`
-    CopyToClipboard(String),
+    /// **Postcondition**: The selection holds the text
+    Copy { selection: Selection, text: String },
 
     /// Request the orchestrator to fetch clipboard content.
     ///
@@ -539,7 +533,10 @@ pub enum EmulatorAction {
     /// # Note
     ///
     /// This is asynchronous—the emulator doesn't block waiting for the response.
-    RequestClipboardContent,
+    RequestClipboardContent(Selection),
+
+    /// Enter full screen, or leave it.
+    ToggleFullscreen,
 
     /// Resize the pseudo-terminal to match the terminal grid.
     ///
