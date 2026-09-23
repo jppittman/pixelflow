@@ -129,20 +129,30 @@ pub const RADICAND_FLOOR: f32 = 0.0;
 pub const ROOT_FLOOR: f32 = 1.0 / 1_267_650_600_228_229_401_496_703_205_376.0;
 
 /// A floor for a [`monotone_root`]'s denominator: a literal in
-/// `(0, ROOT_FLOOR]`.
+/// `[f32::MIN_POSITIVE, ROOT_FLOOR]`.
 ///
 /// Positive, so the quotient never divides by zero — not even where the
 /// e-graph could prove the rest of the denominator is (see
 /// [`mean_of_clamp`], "The divisor"); at most [`ROOT_FLOOR`], so the root it
 /// floors is the rise's inverse everywhere but a height of `2⁻¹⁰⁰`.
+///
+/// **Normal**, not merely positive. A subnormal floor is zero wherever a
+/// kernel runs with denormals-are-zero — which the renderer's workers do
+/// (`FastMathGuard`) — and there `δ/max(0, floor)` is `0/0`. Its reciprocal
+/// also overflows `f32`, so the exact `1/floor` the root multiplies by
+/// cannot be a finite literal. Measured before the bound: a vertical line of
+/// literal columns under the subnormal floor `2⁻¹³⁶` read `1` for `0` along
+/// the pixel edge it starts on (`pixelflow-core/tests/arc_adversarial.rs`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RootFloor(f32);
 
 impl RootFloor {
-    /// The floor `value`, or `None` outside `(0, ROOT_FLOOR]`.
+    /// The floor `value`, or `None` outside `[f32::MIN_POSITIVE, ROOT_FLOOR]`.
     #[must_use]
     pub fn new(value: f32) -> Option<Self> {
-        (value > 0.0 && value <= ROOT_FLOOR).then_some(Self(value))
+        (f32::MIN_POSITIVE..=ROOT_FLOOR)
+            .contains(&value)
+            .then_some(Self(value))
     }
 
     /// The literal.
@@ -322,42 +332,48 @@ pub fn mean_of_clamp(arena: &mut ExprArena, sweep: Sweep, band: Band) -> ExprId 
 /// The root is exact at every height the band holds but a sliver of
 /// `floor ≤ 2⁻¹⁰⁰` at its start, and never divides by zero.
 ///
-/// **Floating point.** The product, the sum, the square root and the
-/// quotient each round once, so `τ` is good to a few ulps of itself away
-/// from the band's start; the parameter's absolute resolution is `2⁻²⁴`
-/// near `1`, which is what an arc's length multiplies
-/// ([`IntervalFold::arc_moment`]).
+/// **Floating point.** The product, the sum, the square root, the
+/// reciprocal and the product by it each round once, so `τ` is good to a
+/// few ulps of itself away from the band's start; the parameter's absolute
+/// resolution is `2⁻²⁴` near `1`, which is what an arc's length multiplies
+/// ([`IntervalFold::arc_moment`]). The floor is normal ([`RootFloor`]), so
+/// `1/denominator ≤ 2¹²⁶` is finite and `δ` times it is never `0·∞`.
 ///
-/// A denominator that is all literals — a literal step over a literal zero
-/// bend: a line whose columns are constants — is folded here, and `τ`
-/// emitted as `δ` times its literal reciprocal, rounded once. A `Div` by a
-/// value that does not vary is what the e-graph's `MulRecip`
-/// canonicalization turns into `δ·recip(d)`, the `recip` computed once and
-/// the product cheaper than the quotient — and `recip` is an *estimate*
-/// that no rule may fold (CLAUDE.md, "Floating point at the edges").
-/// Measured: a literal line's area extracted one per rise. The fold is the
-/// one `ConstantFold` would make: a product, a sum, a square root and a
-/// `max` of finite values, each correctly rounded on every target.
+/// **Emitted as `δ·(1/d)`**, the reciprocal an exact `Div`, not as `δ/d`.
+/// Where `d` does not vary — the bend is zero, so the radicand drops `δ` —
+/// the e-graph's `MulRecip` canonicalization turns `δ/d` into `δ·recip(d)`,
+/// computed once and priced below a quotient per sample; and `recip` is an
+/// *estimate* (CLAUDE.md, "Floating point at the edges"). Spelled with
+/// `1/d`, the reciprocal's class holds the exact quotient too, which the
+/// latency prior prices below `Recip`, so the one computed once is exact.
+/// The bend need not be zero when the rule fires: measured, a line whose
+/// two steps are one uniform read twice closes while `a = s − s` is still a
+/// difference, the algebra proves it zero afterwards, and `δ/d` extracted a
+/// `recip` — `3.9e-2` of coverage wrong at AVX2, `3.5e-3` at AVX-512
+/// (`pixelflow-core/tests/arc_adversarial.rs`). All-literal, `1/d` is folded
+/// by `ConstantFold` like any other quotient of finite literals, and a
+/// literal zero bend drops `bend·δ` here so that happens in the closing
+/// phase.
 #[must_use]
 pub fn monotone_root(arena: &mut ExprArena, delta: ExprId, rise: Rise, floor: RootFloor) -> ExprId {
-    if let (Some(step), Some(0.0)) = (literal(arena, rise.step), literal(arena, rise.bend)) {
-        let denominator = (step + (step * step).max(RADICAND_FLOOR).sqrt()).max(floor.get());
-        let reciprocal = 1.0 / denominator;
-        if denominator.is_finite() && reciprocal.is_finite() {
-            let reciprocal = arena.push_const(reciprocal);
-            return arena.push_binary(OpKind::Mul, delta, reciprocal);
-        }
-    }
     let square = arena.push_binary(OpKind::Mul, rise.step, rise.step);
-    let reach = arena.push_binary(OpKind::Mul, rise.bend, delta);
-    let radicand = arena.push_binary(OpKind::Add, square, reach);
+    // A float pattern matches by `==`, so `-0.0` is a zero bend too.
+    let radicand = match arena.node(rise.bend) {
+        ExprNode::Const(0.0) => square,
+        _ => {
+            let reach = arena.push_binary(OpKind::Mul, rise.bend, delta);
+            arena.push_binary(OpKind::Add, square, reach)
+        }
+    };
     let real = arena.push_const(RADICAND_FLOOR);
     let radicand = arena.push_binary(OpKind::Max, radicand, real);
     let root = arena.push_unary(OpKind::Sqrt, radicand);
     let denominator = arena.push_binary(OpKind::Add, rise.step, root);
     let floor = arena.push_const(floor.get());
     let denominator = arena.push_binary(OpKind::Max, denominator, floor);
-    arena.push_binary(OpKind::Div, delta, denominator)
+    let one = arena.push_const(1.0);
+    let reciprocal = arena.push_binary(OpKind::Div, one, denominator);
+    arena.push_binary(OpKind::Mul, delta, reciprocal)
 }
 
 /// One end of a cut inside the interval: a value the arena computes, or an
@@ -606,14 +622,6 @@ impl IntervalFold {
     }
 }
 
-/// The value of `id` when it is a literal in `arena`.
-fn literal(arena: &ExprArena, id: ExprId) -> Option<f32> {
-    match arena.node(id) {
-        ExprNode::Const(value) => Some(value),
-        _ => None,
-    }
-}
-
 /// `x + shift`, or `x` itself when the shift is 0.
 fn shifted(arena: &mut ExprArena, x: ExprId, shift: f32) -> ExprId {
     if shift == 0.0 {
@@ -717,18 +725,29 @@ mod tests {
     use super::*;
 
     /// **The floor is `2⁻¹⁰⁰`, and nothing above it is one.** A floor must
-    /// be positive — the root divides by it — and at most `2⁻¹⁰⁰`, the
-    /// height below which the root may not be the rise's inverse.
+    /// be normal — the root divides by it, and denormals-are-zero reads a
+    /// subnormal as `0` — and at most `2⁻¹⁰⁰`, the height below which the
+    /// root may not be the rise's inverse.
     #[test]
-    fn a_root_floor_is_positive_and_at_most_two_to_the_minus_100() {
+    fn a_root_floor_is_normal_and_at_most_two_to_the_minus_100() {
         assert_eq!(ROOT_FLOOR, 2.0f32.powi(-100));
         assert_eq!(
             RootFloor::new(ROOT_FLOOR).map(RootFloor::get),
             Some(ROOT_FLOOR)
         );
         assert!(RootFloor::new(ROOT_FLOOR / 8.0).is_some());
-        for refused in [2.0 * ROOT_FLOOR, 0.0, -0.0, -ROOT_FLOOR, f32::NAN] {
-            assert_eq!(RootFloor::new(refused), None, "{refused:e}");
+        assert!(RootFloor::new(f32::MIN_POSITIVE).is_some());
+        let refused = [
+            2.0 * ROOT_FLOOR,
+            f32::MIN_POSITIVE / 2.0,
+            f32::from_bits(1),
+            0.0,
+            -0.0,
+            -ROOT_FLOOR,
+            f32::NAN,
+        ];
+        for floor in refused {
+            assert_eq!(RootFloor::new(floor), None, "{floor:e}");
         }
     }
 }

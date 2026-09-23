@@ -571,30 +571,30 @@ Not on this list:
      - The clamp's band may be any literal `[P, Q]` (the extra terms are
        `P·Δ(t_a, p)` and the `Q` scale), and the argument any positive
        literal multiple of the rise — both a product or two, and `P = 0`,
-       `Q = 1` emit nothing extra.
-     - The floor is any literal in `(0, 2⁻¹⁰⁰]` (`RootFloor`), and the
-       right-hand side uses the author's: a larger floor is refused, since
-       the formula is then false over a visible height, and a zero one
-       divides by zero.
+       `Q = 1` emit nothing extra. Only `[0, 1]` is reachable today:
+       `Kernel::area`'s inner integral narrows to that band whatever the
+       author writes. The slope is reachable, as a crossing drawn in a
+       frame scaled in `x` (`[2x < x₀ + R]`).
+     - The floor is any normal literal no larger than `2⁻¹⁰⁰`
+       (`RootFloor`), and the right-hand side uses the author's: a larger
+       floor is refused, since the formula is then false over a visible
+       height, a zero one divides by zero, and a subnormal one is zero
+       under denormals-are-zero.
      - `K`'s `/3` is a product by `⅓`.
      - **A literal line extracted reciprocal estimates.** With constant
        columns the bend is provably zero, each root's denominator is
        loop-invariant, and the e-graph's `a/b = a·recip(b)` then extracts
-       `recip` — a 12–14-bit estimate — once per rise. A root whose
-       denominator is all literals is now folded into a product by the
-       literal reciprocal, and the recognizer reads a bend whose two steps
-       are literals as their literal difference (the rule fires in the
-       round the certificates fold). Denominators that vary — every column
-       a table or a uniform holds — keep the exact `Div`. The general
-       hazard, an estimate standing in for a division, is the algebra's and
-       not this rule's; the oracle's reciprocal pin is what caught it.
+       `recip` — a 12–14-bit estimate — once per rise. The recognizer reads
+       a bend whose two steps are literals as their literal difference (the
+       rule fires in the round the certificates fold), and every root is
+       now spelled `δ·(1/d)` (adversarial review, below).
    - **Gate:** `pixelflow-core/tests/arc_oracle.rs`, `f64` polygon clipping
      against the compiled closed form, tolerance
      `2⁻²²·(1 + |X| + |Y| + 2·extent)` per texel (critique 0, §2). Max
      error/tolerance per category over `16 × 8` frames: curves 0.18,
      straight lines 0.12, far (to `1000`) 0.005, near-flat (spans to `0`)
      0.06, near-collinear and hooked 0.09, tiny 0.002, long (100–600 px)
-     0.33 at `1.0e-4` absolute, on the pixel grid 0.05; a closed contour of
+     0.26 at `7.1e-5` absolute, on the pixel grid 0.03; a closed contour of
      lines and arcs as one `Σ_p` fold over a table 0.03; a literal line
      0.03. The reference agrees with itself flattened four times finer to
      `7e-10`. With one step's certificate removed the rule declines, and
@@ -604,6 +604,45 @@ Not on this list:
      for that one, no reciprocal estimate is extracted, and none reaches
      the emitter. Glyph output is bit-identical: nothing a font builds
      holds an integral yet.
+   - **Adversarial review.** A second gate,
+     `pixelflow-core/tests/arc_adversarial.rs`, judges by Green's theorem
+     on the raw, unoriented quadratic — cut where it meets the pixel's
+     edges, each piece of the integrand a cubic that three-point
+     Gauss–Legendre integrates exactly — with its own host orientation, and
+     aims at what the e-graph can prove: literal zero steps, spellings,
+     every admitted floor, collapses with denormals flushed as the
+     renderer's workers flush them. It found two miscompiles:
+     - **A bend the algebra proves zero over a step it cannot fold.** One
+       uniform read as both steps of a line: the rule closes while
+       `a = s − s` is a difference, the algebra proves it zero afterwards,
+       both roots' denominators stop varying, and `δ/d` extracted as a
+       hoisted `δ·recip(d)` — `3.9e-2` of coverage wrong at AVX2, `3.5e-3`
+       at AVX-512. The literal fold above only covered a bend that was
+       zero *when the rule fired*. `monotone_root` now spells every root
+       `δ·(1/d)`: the reciprocal's class holds the exact quotient, which
+       the latency prior prices below `Recip`, so what is computed once is
+       exact — and an all-literal `1/d` is folded by `ConstantFold`, which
+       subsumes the literal fold (deleted). Cost: one product per root,
+       four per piece per sample (76 → 80 operations for a uniform piece).
+       The root cause is the algebra's: `Canonicalize::<MulRecip>` puts an
+       estimate in a quotient's class with nothing exact beside it. Adding
+       `1/b` to `recip(b)`'s class there would let this revert to `δ/d`,
+       and would change every kernel that divides by an invariant today —
+       glyphs included — so it is JP's call, not this step's.
+     - **A subnormal floor.** `RootFloor` admitted `(0, 2⁻¹⁰⁰]`. A
+       subnormal is zero under denormals-are-zero, and its reciprocal
+       overflows, so over literal columns the root divided by a literal
+       whose `recip` extracted: a vertical line starting on a pixel edge
+       read `1` for `0`. The floor must now be normal.
+
+     Measured over both ISA tiers, all within `16·2⁻²⁴·(1 + extent)` per
+     texel for exact columns, whatever `|X|, |Y|` (max ratio 0.25: 600-px
+     pieces at `±1000`, all four directions, hooks, flat steps over
+     uniforms, and a table of contours as one fold). Not a bug, but not
+     free: over *literal* columns the algebra distributes a literal
+     reciprocal over `(Y + origin) − y₀` and folds the constant part, so
+     the error there grows as `|X| + |Y|` — `2.2e-5` at `1000`, inside the
+     oracle's tolerance, which carries those terms for this reason.
    - **Not built here:** the host's split at extrema and its `MonotoneQuad`
      (step 6, with critique 0's non-terminating split), the
      `surviving_intervals` telemetry field, and `glyph_is_closed`.

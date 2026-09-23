@@ -167,8 +167,9 @@ pub struct ClampMoment;
 ///   `T < 1` in any of `≤ <` and `≥ >` spellings — strictness moves a
 ///   point, which has no length — over one class `T`.
 /// - `T` holds `D / max(b + √max(b·b + a·D, 0), k)`, operands of `+`, `·`
-///   and `max` in either order, `k` a literal in `(0, 2⁻¹⁰⁰]`
-///   (`RootFloor`): a larger floor moves the root over a visible height.
+///   and `max` in either order, `k` a normal literal no larger than
+///   `2⁻¹⁰⁰` (`RootFloor`): a larger floor moves the root over a visible
+///   height, and a subnormal one is zero under denormals-are-zero.
 ///   The radicand's floor is the literal `0`, and nothing else.
 /// - `D = u + D₀`, affine in the variable with the literal slope `1`.
 /// - `b` and `a` are certified: `b` holds `max(z, k)` with a literal
@@ -606,8 +607,9 @@ fn spelled_from(egraph: &EGraph, binder: Binder, class: EClassId) -> Vec<EClassI
 /// A bend whose two steps are both literals is their difference, as a
 /// literal — what `ConstantFold` makes of the class a round later, read now:
 /// the rule fires in the same round the steps' certificates fold, and
-/// `monotone_root` folds a root whose bend is a literal zero (a line with
-/// constant columns) into a product rather than a quotient.
+/// `monotone_root` drops `bend·δ` for a literal zero bend, so a line with
+/// constant columns has an all-literal denominator whose reciprocal folds
+/// in the closing phase.
 fn certified_rise(
     egraph: &EGraph,
     binder: Binder,
@@ -1737,12 +1739,13 @@ mod tests {
     }
 
     /// **The floor is pinned.** A floor above `2⁻¹⁰⁰` moves the root over a
-    /// height the formula does not account for, and a zero floor divides by
-    /// zero where the rise is flat: both decline. A smaller positive floor
-    /// is exact too, and closes.
+    /// height the formula does not account for, a zero floor divides by
+    /// zero where the rise is flat, and a subnormal one is zero under
+    /// denormals-are-zero: all decline. A smaller normal floor is exact too,
+    /// and closes.
     #[test]
     fn an_arc_under_the_wrong_floor_keeps_its_integral() {
-        for floor in [2.0 * ROOT_FLOOR, 0.0] {
+        for floor in [2.0 * ROOT_FLOOR, 0.0, f32::MIN_POSITIVE / 1024.0] {
             let area = arc_term(CURVE, uniform, Spelling::Author, floor);
             assert_eq!(unclosed(&area), Some(1), "floor {floor:e}");
         }
