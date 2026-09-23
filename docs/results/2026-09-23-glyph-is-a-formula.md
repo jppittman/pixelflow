@@ -115,6 +115,23 @@ body and a run is one integral: `HELLO` inserts 158 classes (4 rounds,
 94-glyph run 1404, both closed. A single glyph's texels are bit-identical;
 `HELLO`'s differ in 55 of 1200 texels by at most `6·10⁻⁸`.
 
+Timed as §5 was, AVX-512, three binaries alternated over three rounds
+(`0df10f6` before step 6, `5dcc785` with the offset in the body, and the
+fix), median point estimate and range:
+
+| bench | before | offset in the body | one body |
+|---|---|---|---|
+| single glyph `A` | 87.3 µs (85.4–88.9) | 58.7 µs (56.0–71.5) | 56.6 µs (56.3–57.5) |
+| `uncached_HELLO` | 27.24 ms (27.05–28.10) | 5.72 ms (5.59–5.79) | 5.00 ms (5.00–5.02) |
+| `cached_HELLO` | 8.17 µs (8.11–8.46) | 8.25 µs (8.04–8.34) | 8.00 µs (7.96–8.05) |
+| `text_sizes/sum/50`, 50 glyphs | 31.93 ms (31.43–32.24) | 0.765 ms (0.750–0.769) | 1.065 ms (1.055–1.104) |
+
+The 50-glyph run is 39% dearer than with the offset in the body, and that
+is the fix: a third of that run's integrals were point samples, which cost
+less than the area they stood in for. It is still thirty times under the
+ramp. `HELLO`, which closed either way, is 13% cheaper; it builds one
+body where it built five, and the breakdown was not measured.
+
 ## 4. What a glyph costs
 
 | | before | after |
