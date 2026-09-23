@@ -87,7 +87,7 @@ pub use graph::{
 #[cfg(feature = "saturation-telemetry")]
 pub use growth::{GrowthTelemetry, RuleGrowth};
 pub use insert::{Declined, insert, reachable_count};
-pub use integral::{ClampMoment, NarrowInterval, integral_rules};
+pub use integral::{ArcMoment, ClampMoment, NarrowInterval, integral_rules};
 #[cfg(feature = "provenance-journal")]
 pub use labeler::{EpisodeLabels, EpisodeResult, Label, RuleStats, run_episode};
 pub use node::{EClassId, ENode};

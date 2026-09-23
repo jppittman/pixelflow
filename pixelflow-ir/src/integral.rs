@@ -10,19 +10,22 @@
 //! metavariables.
 //!
 //! Every formula is an identity over ℝ. What each one does in `f32` is on
-//! its own doc, and no formula divides where a saturated or degenerate case
-//! could reach the quotient: those cases are decided by a comparison first,
-//! and a `Select` discards whatever the quotient computed there. Nor does
-//! any divide by a value that can be zero, even in a discarded arm — the
-//! e-graph would prove it zero, and then prove false equalities of the
-//! quotient ([`mean_of_clamp`], "The divisor").
+//! its own doc. No formula divides by a value that can be zero, even in an
+//! arm a `Select` discards — the e-graph would prove it zero, and then prove
+//! false equalities of the quotient ([`mean_of_clamp`], "The divisor") —
+//! and none lets a quotient decide a saturated or degenerate case: the mean
+//! of a clamp decides those by comparison first, and a monotone root
+//! divides only by a denominator floored at a positive literal, so its
+//! degenerate cases are quotients far outside `[0, 1]` that a clamp then
+//! saturates ([`IntervalFold::arc_moment`]).
 //!
-//! [`mean_of_clamp`] is written once, here. A caller that needs the mean of a
-//! clamp over a span — [`IntervalFold::clamp_moment`] today, a glyph's
-//! pixel/half-plane coverage tomorrow — calls it rather than restating it
-//! (CLAUDE.md, "one definition, imported, not restated").
+//! [`mean_of_clamp`] and [`monotone_root`] are written once, here. A caller
+//! that needs the mean of a clamp over a span — [`IntervalFold::clamp_moment`]
+//! today, a glyph's pixel/half-plane coverage tomorrow — or the parameter at
+//! which a monotone arc reaches a height calls them rather than restating
+//! them (CLAUDE.md, "one definition, imported, not restated").
 
-use crate::arena::{ExprArena, ExprId};
+use crate::arena::{ExprArena, ExprId, ExprNode};
 use crate::fold::IntervalFold;
 use crate::kind::OpKind;
 
@@ -100,6 +103,90 @@ pub struct Sweep {
     pub to: ExprId,
     /// The argument at the interval's midpoint.
     pub centre: ExprId,
+}
+
+/// What a certificate floors a control polygon's step at: `max(step,
+/// STEP_FLOOR)` is a step no smaller than this whatever the table holds,
+/// which is what makes a [`Rise`] rise ([`IntervalFold::arc_moment`],
+/// "Certificates").
+pub const STEP_FLOOR: f32 = 0.0;
+
+/// What [`monotone_root`] floors its radicand at: `√max(r, RADICAND_FLOOR)`.
+///
+/// Part of the root's definition, not a tunable: below zero `√` is NaN, and
+/// above it the floor would move the root wherever the radicand is small
+/// but real.
+pub const RADICAND_FLOOR: f32 = 0.0;
+
+/// `2⁻¹⁰⁰`: the floor an author writes under a [`monotone_root`]'s
+/// denominator, and the largest one [`RootFloor`] admits.
+///
+/// Where the floor is active the root is not the rise's inverse, and the
+/// heights that happens at are at most `floor` from the arc's start; so an
+/// integral over the root is exact up to a height of `2⁻¹⁰⁰`, far below
+/// anything an `f32` pixel resolves. A larger floor would make that a
+/// visible band — the rule that integrates it would then be false.
+pub const ROOT_FLOOR: f32 = 1.0 / 1_267_650_600_228_229_401_496_703_205_376.0;
+
+/// A floor for a [`monotone_root`]'s denominator: a literal in
+/// `(0, ROOT_FLOOR]`.
+///
+/// Positive, so the quotient never divides by zero — not even where the
+/// e-graph could prove the rest of the denominator is (see
+/// [`mean_of_clamp`], "The divisor"); at most [`ROOT_FLOOR`], so the root it
+/// floors is the rise's inverse everywhere but a height of `2⁻¹⁰⁰`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RootFloor(f32);
+
+impl RootFloor {
+    /// The floor `value`, or `None` outside `(0, ROOT_FLOOR]`.
+    #[must_use]
+    pub fn new(value: f32) -> Option<Self> {
+        (value > 0.0 && value <= ROOT_FLOOR).then_some(Self(value))
+    }
+
+    /// The literal.
+    #[must_use]
+    pub fn get(self) -> f32 {
+        self.0
+    }
+}
+
+/// `q(t) = t·(step + step + bend·t)`: one coordinate of a quadratic Bézier
+/// arc, measured from its start.
+///
+/// With control points `p₀, p₁, p₂`, `step = p₁ − p₀` and
+/// `bend = (p₂ − p₁) − step`, so `q(1) = p₂ − p₀` and
+/// `q′(t) = 2·((1 − t)·step + t·(step + bend))` — the two steps of the
+/// control polygon, blended. **Certified** when `step ≥ 0` and
+/// `step + bend ≥ 0`: then `q′ ≥ 0` on `[0, 1]`, and the coordinate rises
+/// along the whole arc.
+#[derive(Clone, Copy, Debug)]
+pub struct Rise {
+    /// `p₁ − p₀`, the first step.
+    pub step: ExprId,
+    /// `(p₂ − p₁) − (p₁ − p₀)`, the second step less the first.
+    pub bend: ExprId,
+}
+
+/// A monotone arc crossing an integral's variable: the integrand
+/// [`IntervalFold::arc_moment`] closes.
+///
+/// The variable `u` is a height `δ = u + height` above the arc's start; the
+/// arc reaches it at the parameter `T = τ_y(δ)` ([`monotone_root`]), and the
+/// integrand reads the arc's other coordinate there, `offset + x(T)`.
+#[derive(Clone, Copy, Debug)]
+pub struct MonotoneArc {
+    /// `D₀`: the height at the variable's zero, `δ = u + D₀`.
+    pub height: ExprId,
+    /// The rising coordinate the variable is a height of.
+    pub y: Rise,
+    /// `c₀`: what the clamp adds to `x(T)`.
+    pub offset: ExprId,
+    /// The rising coordinate the clamp reads.
+    pub x: Rise,
+    /// The floor both roots are taken under.
+    pub floor: RootFloor,
 }
 
 /// `(1/(z₁ − z₀)) ∫_{z₀}^{z₁} clamp(z, P, Q) dz` — the mean of a clamp over
@@ -209,6 +296,68 @@ pub fn mean_of_clamp(arena: &mut ExprArena, sweep: Sweep, band: Band) -> ExprId 
     let lowest = arena.push_binary(OpKind::Min, from, to);
     let over = arena.push_binary(OpKind::Ge, lowest, q);
     arena.push_ternary(OpKind::Select, over, q, at_most_p)
+}
+
+/// `τ(δ) = δ / max(step + √max(step² + bend·δ, 0), floor)`: the parameter at
+/// which a certified [`Rise`] reaches `δ` — the one definition, which an
+/// author's integrand spells and [`IntervalFold::arc_moment`] evaluates at
+/// its ends.
+///
+/// **Law.** `q(t) = δ` is `bend·t² + 2·step·t − δ = 0`, whose increasing
+/// root `(√(step² + bend·δ) − step)/bend` is, rationalized, `τ(δ)` — a form
+/// that holds at `bend = 0` too, and loses nothing to cancellation. For a
+/// certified rise, and up to the floor below:
+/// - on `[0, q(1)]`, `τ` is `q`'s inverse, so `τ(q(t)) = t`;
+/// - below it `τ < 0` (a negative numerator over a positive denominator),
+///   and above it `τ > 1` — past the arc's end the increasing root is past
+///   `1`, and past the height a falling parabola (`bend < 0`) peaks at, the
+///   radicand's floor leaves `δ/step`, which is past `1` there because the
+///   peak, at `t = −step/bend ≥ 1`, is at least `step` high;
+/// - so `[0 ≤ τ(δ) < 1]` is `[0 ≤ δ < q(1)]`: the arc's band.
+///
+/// **The floors.** The radicand's ([`RADICAND_FLOOR`]) is active only off
+/// the band, where no real root exists. The denominator's, `floor`, is
+/// active only where `step + √(step² + bend·δ) < floor`; inside the band the
+/// true root `t*` is then at least `δ/floor`, so `δ ≤ floor·t* ≤ floor`.
+/// The root is exact at every height the band holds but a sliver of
+/// `floor ≤ 2⁻¹⁰⁰` at its start, and never divides by zero.
+///
+/// **Floating point.** The product, the sum, the square root and the
+/// quotient each round once, so `τ` is good to a few ulps of itself away
+/// from the band's start; the parameter's absolute resolution is `2⁻²⁴`
+/// near `1`, which is what an arc's length multiplies
+/// ([`IntervalFold::arc_moment`]).
+///
+/// A denominator that is all literals — a literal step over a literal zero
+/// bend: a line whose columns are constants — is folded here, and `τ`
+/// emitted as `δ` times its literal reciprocal, rounded once. A `Div` by a
+/// value that does not vary is what the e-graph's `MulRecip`
+/// canonicalization turns into `δ·recip(d)`, the `recip` computed once and
+/// the product cheaper than the quotient — and `recip` is an *estimate*
+/// that no rule may fold (CLAUDE.md, "Floating point at the edges").
+/// Measured: a literal line's area extracted one per rise. The fold is the
+/// one `ConstantFold` would make: a product, a sum, a square root and a
+/// `max` of finite values, each correctly rounded on every target.
+#[must_use]
+pub fn monotone_root(arena: &mut ExprArena, delta: ExprId, rise: Rise, floor: RootFloor) -> ExprId {
+    if let (Some(step), Some(0.0)) = (literal(arena, rise.step), literal(arena, rise.bend)) {
+        let denominator = (step + (step * step).max(RADICAND_FLOOR).sqrt()).max(floor.get());
+        let reciprocal = 1.0 / denominator;
+        if denominator.is_finite() && reciprocal.is_finite() {
+            let reciprocal = arena.push_const(reciprocal);
+            return arena.push_binary(OpKind::Mul, delta, reciprocal);
+        }
+    }
+    let square = arena.push_binary(OpKind::Mul, rise.step, rise.step);
+    let reach = arena.push_binary(OpKind::Mul, rise.bend, delta);
+    let radicand = arena.push_binary(OpKind::Add, square, reach);
+    let real = arena.push_const(RADICAND_FLOOR);
+    let radicand = arena.push_binary(OpKind::Max, radicand, real);
+    let root = arena.push_unary(OpKind::Sqrt, radicand);
+    let denominator = arena.push_binary(OpKind::Add, rise.step, root);
+    let floor = arena.push_const(floor.get());
+    let denominator = arena.push_binary(OpKind::Max, denominator, floor);
+    arena.push_binary(OpKind::Div, delta, denominator)
 }
 
 /// One end of a cut inside the interval: a value the arena computes, or an
@@ -345,6 +494,164 @@ impl IntervalFold {
         let mean = mean_of_clamp(arena, sweep, band);
         scaled(arena, mean, self.length())
     }
+
+    /// `∫_lo^hi [0 ≤ T < 1]·clamp(c₀ + x(T), P, Q) du`, `T = τ_y(u + D₀)`:
+    /// the area a monotone arc bounds, integrated along the height it
+    /// rises through.
+    ///
+    /// `τ_y` and `τ_x` are [`monotone_root`] over `arc.y` and `arc.x`, `x`
+    /// and `y` their [`Rise`]s, `D₀`, `c₀` the arc's `height` and `offset`,
+    /// and `[P, Q]` the band. With `b, a` the `y` rise's step and bend and
+    /// `β, α` the `x` rise's, the integral is
+    ///
+    /// ```text
+    /// P·Δ(t_a, p) + ½(x̂(p) + x̂(q))·Δ(p, q) + K·(q − p)³ + Q·Δ(q, t_b)
+    ///
+    /// t_a = clamp(τ_y(D₀ + lo), 0, 1)      t_b = clamp(τ_y(D₀ + hi), 0, 1)
+    /// p   = clamp(τ_x(P − c₀), t_a, t_b)   q   = clamp(τ_x(Q − c₀), t_a, t_b)
+    /// x̂(t) = c₀ + x(t)    Δ(s, t) = y(t) − y(s) = (t − s)·(2b + a·(s + t))
+    /// K   = (β·a − b·α)/3
+    /// ```
+    ///
+    /// **Law.** Where the band holds, `τ_y` is `y`'s inverse, so substitute
+    /// `u + D₀ = y(t)`, `du = y′(t) dt`: the interval and the band leave
+    /// `t ∈ [t_a, t_b]`. `x̂` rises, so the clamp is `P` before `p`, `x̂`
+    /// between `p` and `q` — which `τ_x` finds, `x̂` being `c₀` plus a rise —
+    /// and `Q` after `q`: three pieces, `P·∫y′`, `∫x̂·y′` and `Q·∫y′`. The
+    /// outer two are the heights `Δ`; the middle is `∫x̂ dy` along the sub-arc
+    /// from `p` to `q`, which is its chord's trapezoid plus the area between
+    /// the sub-arc and its chord — `K·(q − p)³` for any sub-arc of a
+    /// quadratic, whose second derivative is the same everywhere. No case
+    /// split: an arc wholly left of the band (`p = q = t_b`), wholly right
+    /// of it (`p = q = t_a`), a horizontal arc (`b = a = 0`, every `Δ`
+    /// zero), a vertical one (`β = α = 0`, whose roots divide by the floor
+    /// and saturate to `t_a` or `t_b`) and a band that misses the interval
+    /// (`t_a = t_b`) each land on the formula through a clamp.
+    ///
+    /// **Certificates.** The caller's side conditions: both rises certified
+    /// (`b ≥ 0`, `b + a ≥ 0`, and the same of `β, α`), and `u` free in `D₀`,
+    /// `c₀` and every step and bend. A rise that falls somewhere makes `τ`
+    /// the wrong root and `x̂` a clamp that is not three pieces, so an
+    /// integrand whose steps are not certified — floored at [`STEP_FLOOR`]
+    /// where the e-graph can see it — has another integral, not this one.
+    /// Under them the formula is exact over ℝ but for a height of at most
+    /// `floor ≤ 2⁻¹⁰⁰` at the arc's start, where [`monotone_root`] is not
+    /// the inverse.
+    ///
+    /// **Floating point.** Every divisor is a root's `max(·, floor)`, so
+    /// nothing divides by zero — or by anything a rule could prove zero —
+    /// and `/3` is a product by the literal `⅓`. What rounds is where the
+    /// parameters land: `t_a, t_b, p, q` resolve to about `2⁻²⁴` near `1`,
+    /// and a shift of a parameter by `ε` moves a height by up to `ε·y′`, at
+    /// most twice the arc's extent — so the error grows with the arc's
+    /// length, and a pixel wholly inside a region no longer sums to exactly
+    /// `1` the way a chord's clamp moment does. `c₀` carries the rounding of
+    /// the coordinates it was computed from. Measured against exact
+    /// clipping: `2⁻²²·(1 + |X| + |Y| + 2·extent)` bounds it
+    /// (`pixelflow-core/tests/arc_oracle.rs`).
+    ///
+    /// `P·Δ(t_a, p)` is not emitted for `P = 0`, nor the product by `Q` for
+    /// `Q = 1` (`x·1 = x` exactly), and `P − c₀` is `−c₀` for `P = 0`.
+    #[must_use]
+    pub fn arc_moment(self, arena: &mut ExprArena, arc: MonotoneArc, band: Band) -> ExprId {
+        let MonotoneArc {
+            height,
+            y,
+            offset,
+            x,
+            floor,
+        } = arc;
+        let (zero, one) = (arena.push_const(0.0), arena.push_const(1.0));
+        let from = shifted(arena, height, self.lo());
+        let to = shifted(arena, height, self.hi());
+        let t_a = monotone_root(arena, from, y, floor);
+        let t_a = clamp(arena, t_a, [zero, one]);
+        let t_b = monotone_root(arena, to, y, floor);
+        let t_b = clamp(arena, t_b, [zero, one]);
+
+        let enter = less(arena, band.lower, offset);
+        let leave = less(arena, band.upper, offset);
+        let p = monotone_root(arena, enter, x, floor);
+        let p = clamp(arena, p, [t_a, t_b]);
+        let q = monotone_root(arena, leave, x, floor);
+        let q = clamp(arena, q, [t_a, t_b]);
+
+        let (x_p, x_q) = (along(arena, offset, x, p), along(arena, offset, x, q));
+        let ends = arena.push_binary(OpKind::Add, x_p, x_q);
+        let half = arena.push_const(0.5);
+        let mean = arena.push_binary(OpKind::Mul, half, ends);
+        let rise = climb(arena, y, [p, q]);
+        let trapezoid = arena.push_binary(OpKind::Mul, mean, rise);
+
+        let x_over_y = arena.push_binary(OpKind::Mul, x.step, y.bend);
+        let y_over_x = arena.push_binary(OpKind::Mul, y.step, x.bend);
+        let twist = arena.push_binary(OpKind::Sub, x_over_y, y_over_x);
+        let third = arena.push_const(1.0 / 3.0);
+        let k = arena.push_binary(OpKind::Mul, third, twist);
+        let width = arena.push_binary(OpKind::Sub, q, p);
+        let square = arena.push_binary(OpKind::Mul, width, width);
+        let cube = arena.push_binary(OpKind::Mul, square, width);
+        let bow = arena.push_binary(OpKind::Mul, k, cube);
+        let inside = arena.push_binary(OpKind::Add, trapezoid, bow);
+
+        let past = climb(arena, y, [q, t_b]);
+        let past = scaled(arena, past, band.upper);
+        let mut total = arena.push_binary(OpKind::Add, inside, past);
+        if band.lower != 0.0 {
+            let before = climb(arena, y, [t_a, p]);
+            let before = scaled(arena, before, band.lower);
+            total = arena.push_binary(OpKind::Add, total, before);
+        }
+        total
+    }
+}
+
+/// The value of `id` when it is a literal in `arena`.
+fn literal(arena: &ExprArena, id: ExprId) -> Option<f32> {
+    match arena.node(id) {
+        ExprNode::Const(value) => Some(value),
+        _ => None,
+    }
+}
+
+/// `x + shift`, or `x` itself when the shift is 0.
+fn shifted(arena: &mut ExprArena, x: ExprId, shift: f32) -> ExprId {
+    if shift == 0.0 {
+        return x;
+    }
+    let shift = arena.push_const(shift);
+    arena.push_binary(OpKind::Add, x, shift)
+}
+
+/// `level − x`, or `−x` when the level is 0.
+fn less(arena: &mut ExprArena, level: f32, x: ExprId) -> ExprId {
+    if level == 0.0 {
+        return arena.push_unary(OpKind::Neg, x);
+    }
+    let level = arena.push_const(level);
+    arena.push_binary(OpKind::Sub, level, x)
+}
+
+/// `offset + t·(step + step + bend·t)`: a rise at `t`, from `offset` — the
+/// same composition an author's arc is spelled in.
+fn along(arena: &mut ExprArena, offset: ExprId, rise: Rise, t: ExprId) -> ExprId {
+    let twice = arena.push_binary(OpKind::Add, rise.step, rise.step);
+    let bent = arena.push_binary(OpKind::Mul, rise.bend, t);
+    let slope = arena.push_binary(OpKind::Add, twice, bent);
+    let reach = arena.push_binary(OpKind::Mul, t, slope);
+    arena.push_binary(OpKind::Add, offset, reach)
+}
+
+/// `Δ(s, t) = q(t) − q(s) = (t − s)·(2·step + bend·(s + t))`: how far a rise
+/// climbs between two parameters, as one product, so a zero-length span is
+/// exactly zero.
+fn climb(arena: &mut ExprArena, rise: Rise, [s, t]: [ExprId; 2]) -> ExprId {
+    let width = arena.push_binary(OpKind::Sub, t, s);
+    let twice = arena.push_binary(OpKind::Add, rise.step, rise.step);
+    let span = arena.push_binary(OpKind::Add, s, t);
+    let bent = arena.push_binary(OpKind::Mul, rise.bend, span);
+    let slope = arena.push_binary(OpKind::Add, twice, bent);
+    arena.push_binary(OpKind::Mul, width, slope)
 }
 
 /// `min(max(z, lower), upper)` — the composition `Kernel::clamp` builds, so a
@@ -403,4 +710,25 @@ fn affine_at(arena: &mut ExprArena, affine: Affine, at: f32) -> ExprId {
     let at = arena.push_const(at);
     let term = arena.push_binary(OpKind::Mul, affine.slope, at);
     arena.push_binary(OpKind::Add, term, affine.offset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The floor is `2⁻¹⁰⁰`, and nothing above it is one.** A floor must
+    /// be positive — the root divides by it — and at most `2⁻¹⁰⁰`, the
+    /// height below which the root may not be the rise's inverse.
+    #[test]
+    fn a_root_floor_is_positive_and_at_most_two_to_the_minus_100() {
+        assert_eq!(ROOT_FLOOR, 2.0f32.powi(-100));
+        assert_eq!(
+            RootFloor::new(ROOT_FLOOR).map(RootFloor::get),
+            Some(ROOT_FLOOR)
+        );
+        assert!(RootFloor::new(ROOT_FLOOR / 8.0).is_some());
+        for refused in [2.0 * ROOT_FLOOR, 0.0, -0.0, -ROOT_FLOOR, f32::NAN] {
+            assert_eq!(RootFloor::new(refused), None, "{refused:e}");
+        }
+    }
 }

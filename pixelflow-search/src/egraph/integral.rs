@@ -11,13 +11,16 @@
 //! ```text
 //! ∫_lo^hi C·Π[Aᵢ ⋈ Bᵢ]·R du = C·s·∫_lo^hi R(m + s(u − c)) du    (narrow)
 //! ∫_lo^hi clamp(k·u + c, P, Q) du = (hi − lo)·mean_{z₀..z₁} clamp  (clamp moment)
+//! ∫_lo^hi [0 ≤ T < 1]·clamp(x(T) + c, P, Q) du = arc_moment      (arc moment)
 //! ```
 //!
-//! and, from `fold_rules`, the one rule both domains share:
-//! `∫ c·f = c·∫ f` (`FactorFold`). Nothing else is here yet: the constant,
-//! linearity, select, interchange and power-moment rules of the plan's table
-//! close no integral the chord needs, so each waits for the kernel that
-//! does (CLAUDE.md, "subtract before you add").
+//! `T` in the last a monotone quadratic arc's parameter at the height
+//! `u + D₀` — the curved piece of a glyph, and its straight one — and, from
+//! `fold_rules`, the one rule both domains share: `∫ c·f = c·∫ f`
+//! (`FactorFold`). Nothing else is here yet: the constant, linearity,
+//! select, interchange and power-moment rules of the plan's table close no
+//! integral a chord or an arc needs, so each waits for the kernel that does
+//! (CLAUDE.md, "subtract before you add").
 //!
 //! **The formulas are not written here.** An interval keeps its ends to
 //! itself, so what an integral closes *to* lives beside it in
@@ -36,24 +39,29 @@
 //!
 //! **Closing comes first.** Every rule here is in
 //! [`RuleSet::runtime`](super::RuleSet::runtime), and the graph runs the
-//! integration family — [`FactorFold`](super::FactorFold), these two, and
+//! integration family — [`FactorFold`](super::FactorFold), these three, and
 //! `ConstantFold` — to a fixpoint on the freshly inserted graph before the
 //! full rule set sees it, counted against the same application budget
-//! (`EGraph::saturate_bounded`). The derivation takes three rounds of that
-//! family and nothing else; interleaved with the algebra, the class cap a
-//! glyph already reaches in its first round would stop it half-closed. A
-//! graph with no integral skips the phase, so no other kernel's saturation
-//! changes.
+//! (`EGraph::saturate_bounded`). A chord's derivation takes three rounds of
+//! that family and nothing else, an arc's one and a confirming one;
+//! interleaved with the algebra, the class cap a glyph already reaches in
+//! its first round would stop it half-closed. A graph with no integral
+//! skips the phase, so no other kernel's saturation changes.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
-use pixelflow_ir::integral::{Affine as IrAffine, Band, Cut};
+use pixelflow_ir::integral::{
+    Affine as IrAffine, Band, Cut, MonotoneArc, RADICAND_FLOOR, Rise as IrRise, RootFloor,
+    STEP_FLOOR,
+};
 use pixelflow_ir::{Binder, ExprArena, ExprId, Fold, OpKind};
 
-use super::fold_rules::{Copying, FactorFold, Factors, HeadRef, PlanBuilder, Substitution};
+use super::fold_rules::{
+    Copying, FactorFold, Factors, HeadRef, PlanBuilder, Substitution, is_integral,
+};
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
 use super::ops;
@@ -133,6 +141,63 @@ pub struct NarrowInterval;
 /// mean over the rounded sweep (of `max(|P|, |Q|)`, for a band reaching
 /// below zero).
 pub struct ClampMoment;
+
+/// `∫_lo^hi C·[0 ≤ T]·[T < 1]·clamp(s·R + c, P, Q) du = C·arc_moment`, with
+/// `T = τ_y(u + D₀)` a monotone arc's parameter and `R = x(T)` its other
+/// coordinate — the area left of the arc, integrated along the height it
+/// rises through (`pixelflow_ir::IntervalFold::arc_moment`, the one
+/// definition).
+///
+/// **Where it comes from.** An author writes a glyph piece's crossing as a
+/// graph over `y` through the arc's own parameter:
+/// `T = τ_y(y − y₀)` (`pixelflow_ir::integral::monotone_root`) is where the
+/// arc reaches height `y`, `[0 ≤ T < 1]` its band, and `[x < x₀ + x(T)]` the
+/// crossing. Over the pixel, [`FactorFold`] takes the band out of the inner
+/// integral and [`NarrowInterval`] closes what is left to
+/// `clamp(x₀ + x(T) − X + ½, 0, 1)` — the length of the pixel's row left of
+/// the arc, which is Green's step — and leaves this rule the outer integral:
+/// the substitution `y = y(t)` and a cubic moment. A line is the arc whose
+/// bend is zero, so one integrand, and this one rule, serve every piece
+/// (docs/plans/2026-09-23-an-integral-is-a-fold.md §8 step 5).
+///
+/// **Side conditions**, each read off the classes, every node of each
+/// tried:
+/// - The body's factors the variable reaches are exactly two indicators
+///   and a clamp. The indicators are `Select(m, 1, 0)` of `0 ≤ T` and
+///   `T < 1` in any of `≤ <` and `≥ >` spellings — strictness moves a
+///   point, which has no length — over one class `T`.
+/// - `T` holds `D / max(b + √max(b·b + a·D, 0), k)`, operands of `+`, `·`
+///   and `max` in either order, `k` a literal in `(0, 2⁻¹⁰⁰]`
+///   (`RootFloor`): a larger floor moves the root over a visible height.
+///   The radicand's floor is the literal `0`, and nothing else.
+/// - `D = u + D₀`, affine in the variable with the literal slope `1`.
+/// - `b` and `a` are certified: `b` holds `max(z, k)` with a literal
+///   `k ≥ STEP_FLOOR` (or is such a literal), and `a` holds `e − b` with `e`
+///   certified — the control polygon's steps, floored where the e-graph can
+///   see it, which is what makes `T` the rise's inverse for every value a
+///   table can hold rather than for the ones a host happened to write.
+/// - The clamp is one [`ClampMoment`] reads, with literal band `[P, Q]`,
+///   and its argument is affine in a class `R` with a positive literal
+///   slope `s`: `R` holds `T·(β + β + α·T)`, `β` and `α` certified like `b`
+///   and `a`. `R` is found among the classes the argument is spelled from,
+///   and the argument is then read with `R` standing for the variable — so
+///   `R + c` with `c = x₀ − X + ½` is recognized however narrowing spelled
+///   it.
+/// - `u` reaches none of `D₀`, `c`, `b`, `a`, `β`, `α`: the recognizer
+///   admits a term only when the class variance fact clears it.
+/// - Factors the variable does not reach multiply the result, as
+///   [`NarrowInterval`] keeps them.
+///
+/// Anything else declines — a rule may miss an integral, never close one
+/// wrongly — and so does a fold whose class already holds a member that is
+/// not an integral: a rule has closed it already (or factored it, and the
+/// factored integral closes where it is), and firing again on a spelling
+/// the algebra added later would only add nodes.
+///
+/// **Floating point.** See `arc_moment`: no case split, no divisor that can
+/// be zero, and an error that grows with the arc's length —
+/// `2⁻²²·(1 + |X| + |Y| + 2·extent)` measured.
+pub struct ArcMoment;
 
 impl Rewrite for NarrowInterval {
     fn name(&self) -> &str {
@@ -232,19 +297,66 @@ impl Rewrite for ClampMoment {
     }
 }
 
-/// The integration rules: [`NarrowInterval`] and [`ClampMoment`]. Inert for
-/// a kernel with no integral in it — each matches an interval fold and
-/// nothing else.
+impl Rewrite for ArcMoment {
+    fn name(&self) -> &str {
+        "arc-moment"
+    }
+
+    fn apply(&self, egraph: &EGraph, id: EClassId, node: &ENode) -> Option<RewriteAction> {
+        let ENode::Reduce { fold, body } = node else {
+            return None;
+        };
+        let Fold::Interval(interval) = *fold else {
+            return None;
+        };
+        if egraph.nodes(id).iter().any(|member| !is_integral(member)) {
+            return None;
+        }
+        let binder = fold.binder();
+        let (arc, outside) = egraph.nodes(*body).iter().find_map(|spelling| {
+            let factors = Factors::of(egraph, spelling, &ops::Mul, binder)?;
+            let arc = arc_integrand(egraph, binder, &factors.variant)?;
+            Some((arc, factors.invariant))
+        })?;
+
+        let mut template = Template::default();
+        let rise = |template: &mut Template, [step, bend]: &[Rc<Term>; 2]| {
+            Some(IrRise {
+                step: template.emit(step)?,
+                bend: template.emit(bend)?,
+            })
+        };
+        let integrand = MonotoneArc {
+            height: template.emit(&arc.root.height)?,
+            y: rise(&mut template, &arc.root.rise)?,
+            offset: template.emit(&arc.offset)?,
+            x: rise(&mut template, &arc.x)?,
+            floor: arc.root.floor,
+        };
+        let moment = interval.arc_moment(&mut template.arena, integrand, arc.band);
+        let mut plan = PlanBuilder::default();
+        let [moment] = template.splice_into(&mut plan, [moment])?;
+        let mut product: Vec<HeadRef> = outside.iter().map(|&c| HeadRef::Class(c)).collect();
+        product.push(moment);
+        let root = plan.chain(&ops::Mul, &product)?;
+        Some(RewriteAction::Plan(plan.finish(root)))
+    }
+}
+
+/// The integration rules: [`NarrowInterval`], [`ClampMoment`] and
+/// [`ArcMoment`]. Inert for a kernel with no integral in it — each matches
+/// an interval fold and nothing else.
 #[must_use]
 pub fn integral_rules() -> Vec<Box<dyn Rewrite>> {
     alloc::vec![
         Box::new(NarrowInterval) as Box<dyn Rewrite>,
         Box::new(ClampMoment),
+        Box::new(ArcMoment),
     ]
 }
 
 /// Whether `rule` belongs to the family the graph runs to a fixpoint before
-/// anything else when it holds an integral: the two rules here,
+/// anything else when it holds an integral: the three rules here,
 /// [`FactorFold`] — `∫ c·f = c·∫ f` — and `ConstantFold`, which tidies the
 /// literal arithmetic a closed form leaves.
 pub(crate) fn closes_integrals(rule: RuleId) -> bool {
@@ -252,9 +364,330 @@ pub(crate) fn closes_integrals(rule: RuleId) -> bool {
         RuleId::of(&FactorFold),
         RuleId::of(&NarrowInterval),
         RuleId::of(&ClampMoment),
+        RuleId::of(&ArcMoment),
         RuleId::of(&crate::math::algebra::ConstantFold),
     ]
     .contains(&rule)
+}
+
+/// A monotone arc's root, as [`ArcMoment`] reads it off a class `T`.
+#[derive(Clone)]
+struct Root {
+    /// `D₀` in `D = u + D₀`.
+    height: Rc<Term>,
+    /// The `y` rise's `[step, bend]`, `[b, a]`.
+    rise: [Rc<Term>; 2],
+    /// The floor under the root's denominator.
+    floor: RootFloor,
+}
+
+/// An integrand [`ArcMoment`] closes: the root the band is of, the clamp's
+/// band, and what the clamp reads — `offset + x(T)`, `x` the rise
+/// `[β, α]` (already scaled by the argument's slope).
+struct ArcIntegrand {
+    root: Root,
+    offset: Rc<Term>,
+    x: [Rc<Term>; 2],
+    band: Band,
+}
+
+/// Which edge of a band an indicator is: `0 ≤ T` or `T < 1`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Edge {
+    Start,
+    End,
+}
+
+/// The factors the variable reaches, read as `[0 ≤ T]·[T < 1]·clamp(…)`:
+/// which factor is the clamp is tried every way round, since a product's
+/// order is the author's (or the algebra's).
+fn arc_integrand(egraph: &EGraph, binder: Binder, factors: &[EClassId]) -> Option<ArcIntegrand> {
+    let &[f0, f1, f2] = factors else {
+        return None;
+    };
+    [[f0, f1, f2], [f1, f2, f0], [f2, f0, f1]]
+        .into_iter()
+        .find_map(|[first, second, clamp_factor]| {
+            let parameter = band_of(egraph, first, second)?;
+            let root = monotone_root(egraph, binder, parameter)?;
+            clamps(egraph, clamp_factor)
+                .into_iter()
+                .find_map(|(argument, band)| {
+                    let (offset, x) = arc_reading(egraph, binder, argument, parameter)?;
+                    Some(ArcIntegrand {
+                        root: root.clone(),
+                        offset,
+                        x,
+                        band,
+                    })
+                })
+        })
+}
+
+/// The class `T` two indicators are the band `[0 ≤ T < 1]` of — one each
+/// edge, in either order — or `None`.
+fn band_of(egraph: &EGraph, a: EClassId, b: EClassId) -> Option<EClassId> {
+    let (a, b) = (edges(egraph, a), edges(egraph, b));
+    a.iter().find_map(|&(edge, t)| {
+        b.iter()
+            .any(|&(other, u)| other != edge && u == t)
+            .then_some(t)
+    })
+}
+
+/// Which band edges `factor` is an indicator of: `(Start, T)` for
+/// `Select(m, 1, 0)` with `m` one of `0 ≤ T`, `0 < T`, `T ≥ 0`, `T > 0`, and
+/// `(End, T)` for `T < 1`, `T ≤ 1`, `1 > T`, `1 ≥ T` — the literal read off
+/// the class constant fact, `T` canonical.
+fn edges(egraph: &EGraph, factor: EClassId) -> Vec<(Edge, EClassId)> {
+    let is = |class, value: f32| egraph.constant(class) == Some(value);
+    let mut found = Vec::new();
+    for node in egraph.nodes(factor) {
+        let Some([mask, one, zero]) = operands(node, OpKind::Select) else {
+            continue;
+        };
+        if !is(one, 1.0) || !is(zero, 0.0) {
+            continue;
+        }
+        for test in egraph.nodes(mask) {
+            let ENode::Op { op, children } = test else {
+                continue;
+            };
+            let &[p, q] = children.as_slice() else {
+                continue;
+            };
+            // `p ⋈ q` read as `low < high`: which side is the literal.
+            let (low, high) = match op.kind() {
+                OpKind::Lt | OpKind::Le => (p, q),
+                OpKind::Gt | OpKind::Ge => (q, p),
+                _ => continue,
+            };
+            if is(low, 0.0) {
+                found.push((Edge::Start, egraph.find(high)));
+            }
+            if is(high, 1.0) {
+                found.push((Edge::End, egraph.find(low)));
+            }
+        }
+    }
+    found
+}
+
+/// `T` as a monotone root: `D / max(b + √max(b·b + a·D, 0), k)` with
+/// `D = u + D₀`, the rise `[b, a]` certified and the variable reaching
+/// neither, and `k` a [`RootFloor`]. See [`ArcMoment`].
+fn monotone_root(egraph: &EGraph, binder: Binder, parameter: EClassId) -> Option<Root> {
+    binary_in(egraph, parameter, OpKind::Div).find_map(|[delta, denominator]| {
+        let delta = egraph.find(delta);
+        either_order(egraph, denominator, OpKind::Max).find_map(|[sum, floor]| {
+            let floor = RootFloor::new(egraph.constant(floor)?)?;
+            either_order(egraph, sum, OpKind::Add).find_map(|[step, root]| {
+                let step = egraph.find(step);
+                unary_in(egraph, root, OpKind::Sqrt).find_map(|radicand| {
+                    let bend = floored_radicand(egraph, radicand, step, delta)?;
+                    let rise = certified_rise(egraph, binder, step, bend)?;
+                    let height = Recognizer::new(egraph, binder).affine(delta)?;
+                    (literal_of(&height.slope) == Some(1.0)).then(|| Root {
+                        height: height.offset,
+                        rise,
+                        floor,
+                    })
+                })
+            })
+        })
+    })
+}
+
+/// The bend `a` of `max(b·b + a·D, 0)` in `class`, operands in either order,
+/// given `b` and `D`.
+fn floored_radicand(
+    egraph: &EGraph,
+    class: EClassId,
+    step: EClassId,
+    delta: EClassId,
+) -> Option<EClassId> {
+    either_order(egraph, class, OpKind::Max).find_map(|[radicand, floor]| {
+        if egraph.constant(floor) != Some(RADICAND_FLOOR) {
+            return None;
+        }
+        either_order(egraph, radicand, OpKind::Add).find_map(|[square, reach]| {
+            let squares = binary_in(egraph, square, OpKind::Mul)
+                .any(|[p, q]| egraph.find(p) == step && egraph.find(q) == step);
+            if !squares {
+                return None;
+            }
+            either_order(egraph, reach, OpKind::Mul)
+                .find_map(|[bend, d]| (egraph.find(d) == delta).then(|| egraph.find(bend)))
+        })
+    })
+}
+
+/// `R`'s rise `[β, α]` when `R` holds `T·(β + β + α·T)`, operands of `·`
+/// and the outer `+` in either order, the rise certified.
+fn monotone_quadratic(
+    egraph: &EGraph,
+    binder: Binder,
+    rise: EClassId,
+    parameter: EClassId,
+) -> Option<[Rc<Term>; 2]> {
+    let is_parameter = |class| egraph.find(class) == parameter;
+    either_order(egraph, rise, OpKind::Mul).find_map(|[t, slope]| {
+        if !is_parameter(t) {
+            return None;
+        }
+        either_order(egraph, slope, OpKind::Add).find_map(|[twice, bent]| {
+            let step = binary_in(egraph, twice, OpKind::Add).find_map(|[p, q]| {
+                let p = egraph.find(p);
+                (p == egraph.find(q)).then_some(p)
+            })?;
+            either_order(egraph, bent, OpKind::Mul).find_map(|[bend, t]| {
+                if !is_parameter(t) {
+                    return None;
+                }
+                certified_rise(egraph, binder, step, egraph.find(bend))
+            })
+        })
+    })
+}
+
+/// What a clamp's argument reads off the arc: `offset + x(T)` for an
+/// argument `s·R + c` with `R = x(T)` a [`monotone_quadratic`] of the root
+/// and `s` a positive literal, returned as `(c, [s·β, s·α])`.
+fn arc_reading(
+    egraph: &EGraph,
+    binder: Binder,
+    argument: EClassId,
+    parameter: EClassId,
+) -> Option<(Rc<Term>, [Rc<Term>; 2])> {
+    spelled_from(egraph, binder, argument)
+        .into_iter()
+        .find_map(|rise| {
+            let [step, bend] = monotone_quadratic(egraph, binder, rise, parameter)?;
+            let form = Recognizer::in_terms_of(egraph, binder, rise).affine(argument)?;
+            let scale = literal_of(&form.slope).filter(|s| *s > 0.0 && s.is_finite())?;
+            let scale = Rc::new(Term::Literal(scale));
+            let x = [product(Rc::clone(&scale), step), product(scale, bend)];
+            Some((form.offset, x))
+        })
+}
+
+/// The classes the variable reaches that `class` is spelled from through
+/// `+`, `−`, negation, `·` and fused multiply-add — the candidates for what
+/// an affine form of it is in terms of — `class` first.
+fn spelled_from(egraph: &EGraph, binder: Binder, class: EClassId) -> Vec<EClassId> {
+    let varies = |class| egraph.variance(class).depends_on(binder.var());
+    let mut seen = BTreeSet::new();
+    let mut order = Vec::new();
+    let mut stack = alloc::vec![egraph.find(class)];
+    while let Some(class) = stack.pop() {
+        if !varies(class) || !seen.insert(class) {
+            continue;
+        }
+        order.push(class);
+        for node in egraph.nodes(class) {
+            let ENode::Op { op, children } = node else {
+                continue;
+            };
+            if matches!(
+                op.kind(),
+                OpKind::Add | OpKind::Sub | OpKind::Neg | OpKind::Mul | OpKind::MulAdd
+            ) {
+                stack.extend(children.iter().map(|&child| egraph.find(child)));
+            }
+        }
+    }
+    order
+}
+
+/// `[step, bend]` as terms, when they are a certified rise the variable does
+/// not reach: `step` [`certified`], and `bend` holding `e − step` with `e`
+/// certified, so both control-polygon steps are.
+///
+/// A bend whose two steps are both literals is their difference, as a
+/// literal — what `ConstantFold` makes of the class a round later, read now:
+/// the rule fires in the same round the steps' certificates fold, and
+/// `monotone_root` folds a root whose bend is a literal zero (a line with
+/// constant columns) into a product rather than a quotient.
+fn certified_rise(
+    egraph: &EGraph,
+    binder: Binder,
+    step: EClassId,
+    bend: EClassId,
+) -> Option<[Rc<Term>; 2]> {
+    let varies = |class| egraph.variance(class).depends_on(binder.var());
+    if varies(step) || varies(bend) || !certified(egraph, step) {
+        return None;
+    }
+    let second = binary_in(egraph, bend, OpKind::Sub).find_map(|[second, first]| {
+        (egraph.find(first) == step && certified(egraph, second)).then_some(second)
+    })?;
+    let literal_bend = egraph
+        .constant(second)
+        .zip(egraph.constant(step))
+        .and_then(|(second, first)| folded(second - first));
+    Some([
+        value(egraph, step),
+        literal_bend.unwrap_or_else(|| value(egraph, bend)),
+    ])
+}
+
+/// Whether `class` is certified at least [`STEP_FLOOR`]: it is a literal
+/// that is, or holds `max(z, k)` (either order) with such a literal `k`.
+/// Any node will do — every node of a class denotes the same value.
+fn certified(egraph: &EGraph, class: EClassId) -> bool {
+    let at_least = |class| egraph.constant(class).is_some_and(|v| v >= STEP_FLOOR);
+    at_least(class)
+        || binary_in(egraph, class, OpKind::Max).any(|[p, q]| at_least(p) || at_least(q))
+}
+
+/// A class as a term: its literal when it is a finite constant, else the
+/// class.
+fn value(egraph: &EGraph, class: EClassId) -> Rc<Term> {
+    egraph
+        .constant(class)
+        .and_then(folded)
+        .unwrap_or_else(|| Rc::new(Term::Class(egraph.find(class))))
+}
+
+/// `node`'s operands, when it is a `kind` with `N` of them.
+fn operands<const N: usize>(node: &ENode, kind: OpKind) -> Option<[EClassId; N]> {
+    let ENode::Op { op, children } = node else {
+        return None;
+    };
+    if op.kind() != kind {
+        return None;
+    }
+    children.as_slice().try_into().ok()
+}
+
+/// The operand of every unary `kind` node in `class`.
+fn unary_in(egraph: &EGraph, class: EClassId, kind: OpKind) -> impl Iterator<Item = EClassId> + '_ {
+    egraph
+        .nodes(class)
+        .iter()
+        .filter_map(move |node| operands::<1>(node, kind).map(|[x]| x))
+}
+
+/// The operands of every binary `kind` node in `class`, as spelled.
+fn binary_in(
+    egraph: &EGraph,
+    class: EClassId,
+    kind: OpKind,
+) -> impl Iterator<Item = [EClassId; 2]> + '_ {
+    egraph
+        .nodes(class)
+        .iter()
+        .filter_map(move |node| operands::<2>(node, kind))
+}
+
+/// [`binary_in`] for an operator that commutes: each node's operands in
+/// both orders.
+fn either_order(
+    egraph: &EGraph,
+    class: EClassId,
+    kind: OpKind,
+) -> impl Iterator<Item = [EClassId; 2]> + '_ {
+    binary_in(egraph, class, kind).flat_map(|[p, q]| [[p, q], [q, p]])
 }
 
 /// A term a rule will write: a literal, a class the graph holds, or
@@ -409,12 +842,28 @@ enum Bound {
     Upper(Rc<Term>),
 }
 
-/// Reads classes as functions of one integration variable — affine forms,
-/// and the bounds indicators put on it — memoised per class, every node of
-/// a class tried.
+/// What a [`Recognizer`] reads classes as functions of.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Variable {
+    /// The integration variable: its binder's leaf.
+    Binder,
+    /// A class the binder reaches, standing for the variable — a monotone
+    /// arc's coordinate, which a clamp's argument is affine in although the
+    /// argument is no affine function of the binder (see [`ArcMoment`]).
+    /// The binder's own leaf is then just another class that varies.
+    Class(EClassId),
+}
+
+/// Reads classes as functions of one variable — affine forms, and the
+/// bounds indicators put on it — memoised per class, every node of a class
+/// tried. The variable is the integration variable, or a class that
+/// depends on it ([`Variable`]); either way a term is admitted into an
+/// affine form's slope or offset only when the class variance fact clears
+/// it of the integration variable.
 struct Recognizer<'g> {
     egraph: &'g EGraph,
     binder: Binder,
+    variable: Variable,
     /// Each class's affine form, once asked — `None` when it has none.
     memo: BTreeMap<EClassId, Option<Affine>>,
     /// Classes whose form is being computed: re-entering one is a merged
@@ -426,9 +875,20 @@ struct Recognizer<'g> {
 
 impl<'g> Recognizer<'g> {
     fn new(egraph: &'g EGraph, binder: Binder) -> Self {
+        Self::reading(egraph, binder, Variable::Binder)
+    }
+
+    /// A recognizer whose variable is `class`, standing for a function of
+    /// `binder`'s variable.
+    fn in_terms_of(egraph: &'g EGraph, binder: Binder, class: EClassId) -> Self {
+        Self::reading(egraph, binder, Variable::Class(egraph.find(class)))
+    }
+
+    fn reading(egraph: &'g EGraph, binder: Binder, variable: Variable) -> Self {
         Self {
             egraph,
             binder,
+            variable,
             memo: BTreeMap::new(),
             open: BTreeSet::new(),
             leaf: None,
@@ -443,16 +903,17 @@ impl<'g> Recognizer<'g> {
     /// class is a finite constant (a mask's all-ones pattern is not), else
     /// the class.
     fn value(&self, class: EClassId) -> Rc<Term> {
-        self.egraph
-            .constant(class)
-            .and_then(folded)
-            .unwrap_or_else(|| Rc::new(Term::Class(self.egraph.find(class))))
+        value(self.egraph, class)
     }
 
-    /// `class` as `slope·u + offset`, or `None` when no node of it is
-    /// affine in the variable.
+    /// `class` as `slope·v + offset`, `v` the variable, or `None` when no
+    /// node of it is affine in the variable.
     fn affine(&mut self, class: EClassId) -> Option<Affine> {
         let class = self.egraph.find(class);
+        if self.variable == Variable::Class(class) {
+            self.leaf = Some(class);
+            return Some(Affine::variable());
+        }
         if !self.varies(class) {
             return Some(Affine::invariant(self.value(class)));
         }
@@ -477,7 +938,7 @@ impl<'g> Recognizer<'g> {
     /// fused multiply-add) with one operand the variable does not reach.
     fn spelled(&mut self, class: EClassId, node: &ENode) -> Option<Affine> {
         match node {
-            ENode::Var(v) if *v == self.binder.var() => {
+            ENode::Var(v) if self.variable == Variable::Binder && *v == self.binder.var() => {
                 self.leaf = Some(class);
                 Some(Affine::variable())
             }
@@ -723,6 +1184,7 @@ impl Template {
 mod tests {
     use super::*;
     use crate::runtime::unclosed_integrals;
+    use pixelflow_ir::integral::ROOT_FLOOR;
     use pixelflow_ir::{Kernel, LatticeShape, Monoid};
 
     /// The lattice every closure pin extracts at.
@@ -1039,7 +1501,7 @@ mod tests {
     /// **The closing phase is inert without an integral.** Over the runtime
     /// rule set, a graph holding none runs no closing phase at all — so it
     /// saturates exactly as before the phase existed — and a graph holding
-    /// one runs exactly the family: `FactorFold`, both rules here and
+    /// one runs exactly the family: `FactorFold`, the three rules here and
     /// `ConstantFold`, in the rule set's order.
     #[test]
     fn the_closing_phase_runs_only_on_a_graph_with_an_integral() {
@@ -1069,6 +1531,7 @@ mod tests {
             RuleId::of(&FactorFold),
             RuleId::of(&NarrowInterval),
             RuleId::of(&ClampMoment),
+            RuleId::of(&ArcMoment),
         ];
         expected.sort_by_key(|id| set.index_of(*id));
         assert_eq!(family, expected);
@@ -1105,10 +1568,298 @@ mod tests {
     #[test]
     fn the_integration_rules_are_in_the_runtime_set_only() {
         use crate::egraph::RuleSet;
-        for id in [RuleId::of(&NarrowInterval), RuleId::of(&ClampMoment)] {
+        for id in [
+            RuleId::of(&NarrowInterval),
+            RuleId::of(&ClampMoment),
+            RuleId::of(&ArcMoment),
+        ] {
             assert!(RuleSet::runtime().index_of(id).is_some());
             assert!(RuleSet::production().index_of(id).is_none());
             assert!(closes_integrals(id));
         }
+    }
+
+    /// A monotone arc's columns, as the author's integrand reads them: the
+    /// start, the control polygon's two steps (`p₁ − p₀` and `p₂ − p₁`), the
+    /// orientation `σ` and the reflection `S`.
+    #[derive(Clone, Copy)]
+    struct Piece {
+        start: [f32; 2],
+        first: [f32; 2],
+        second: [f32; 2],
+        sigma: f32,
+        reflect: f32,
+    }
+
+    /// A curved piece: both coordinates rise, and bend.
+    const CURVE: Piece = Piece {
+        start: [1.25, 2.5],
+        first: [3.0, 0.5],
+        second: [0.75, 2.0],
+        sigma: 1.0,
+        reflect: 1.0,
+    };
+
+    /// How an arc's integrand is spelled: the author's, and the ways a
+    /// rewrite or another author could write the same terms.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Spelling {
+        /// The plan's §8 step 5, as written.
+        Author,
+        /// Every commutative operand the recognizers read swapped, and the
+        /// band's comparisons spelled `T ≥ 0` and `1 > T`.
+        Commuted,
+        /// The first `y` step read raw, with no certificate.
+        Uncertified,
+    }
+
+    /// The author's integrand for `piece`:
+    /// `σ·area([0 ≤ T]·[T < 1]·[x < x₀ + x(T)]).at(X, S·Y)`, `T` the arc's
+    /// parameter at height `y`, each value read through `column`, the root
+    /// taken under `floor`.
+    fn arc_term(
+        piece: Piece,
+        column: impl Fn(f32) -> Kernel,
+        spelling: Spelling,
+        floor: f32,
+    ) -> Kernel {
+        let (zero, one) = (Kernel::constant(0.0), Kernel::constant(1.0));
+        let certify = |step: f32| match spelling {
+            Spelling::Commuted => zero.max(&column(step)),
+            _ => column(step).max(&zero),
+        };
+        let b = match spelling {
+            Spelling::Uncertified => column(piece.first[1]),
+            _ => certify(piece.first[1]),
+        };
+        let bx = certify(piece.first[0]);
+        let a = certify(piece.second[1]).sub(&b);
+        let ax = certify(piece.second[0]).sub(&bx);
+        let d = Kernel::y().sub(&column(piece.start[1]));
+        let (square, reach) = (b.mul(&b), a.mul(&d));
+        let radicand = match spelling {
+            Spelling::Commuted => reach.add(&square).max(&zero),
+            _ => square.add(&reach).max(&zero),
+        };
+        let denominator = match spelling {
+            Spelling::Commuted => radicand.sqrt().add(&b),
+            _ => b.add(&radicand.sqrt()),
+        };
+        let t = d.div(&denominator.max(&Kernel::constant(floor)));
+        let slope = bx.add(&bx).add(&ax.mul(&t));
+        let rise = match spelling {
+            Spelling::Commuted => slope.mul(&t),
+            _ => t.mul(&slope),
+        };
+        let xt = column(piece.start[0]).add(&rise);
+        let band = match spelling {
+            Spelling::Commuted => indicator_of(&t.ge(&zero)).mul(&indicator_of(&one.gt(&t))),
+            _ => indicator_of(&zero.le(&t)).mul(&indicator_of(&t.lt(&one))),
+        };
+        let chi = band.mul(&indicator_of(&Kernel::x().lt(&xt)));
+        let screen_y = column(piece.reflect).mul(&Kernel::y());
+        column(piece.sigma).mul(&chi.area().at(&Kernel::x(), &screen_y))
+    }
+
+    fn literal(v: f32) -> Kernel {
+        Kernel::constant(v)
+    }
+
+    fn uniform(v: f32) -> Kernel {
+        pixelflow_ir::Uniform::new(v).kernel()
+    }
+
+    /// **(c) An arc's area closes.** `FactorFold`, `NarrowInterval` and
+    /// `ArcMoment` leave no integral for quadrature — for a curve, a line
+    /// written the same way (`second = first`, so the bend is zero), a
+    /// vertical and a horizontal piece and a reflected one, each over
+    /// literal columns and over uniforms. One integrand and one rule for
+    /// every piece is what lets a glyph be one fold with one body.
+    #[test]
+    fn the_area_left_of_an_arc_closes() {
+        let line = Piece {
+            second: CURVE.first,
+            ..CURVE
+        };
+        let vertical = Piece {
+            first: [0.0, 1.0],
+            second: [0.0, 2.0],
+            ..CURVE
+        };
+        let horizontal = Piece {
+            first: [1.0, 0.0],
+            second: [2.0, 0.0],
+            ..CURVE
+        };
+        let reflected = Piece {
+            start: [1.25, -2.5],
+            sigma: -1.0,
+            reflect: -1.0,
+            ..CURVE
+        };
+        let pieces = [
+            ("curve", CURVE),
+            ("line", line),
+            ("vertical", vertical),
+            ("horizontal", horizontal),
+            ("reflected", reflected),
+        ];
+        let columns: [(&str, fn(f32) -> Kernel); 2] = [("literal", literal), ("uniform", uniform)];
+        for (piece_name, piece) in pieces {
+            for (column_name, column) in columns {
+                let area = arc_term(piece, column, Spelling::Author, ROOT_FLOOR);
+                assert_eq!(
+                    unclosed(&area),
+                    Some(0),
+                    "{piece_name} over {column_name} columns"
+                );
+            }
+        }
+    }
+
+    /// **Every spelling the recognizers promise.** Operands of `max`, `+`
+    /// and `·` swapped, and the band read through `T ≥ 0` and `1 > T`: the
+    /// same integrand, closed the same way.
+    #[test]
+    fn a_commuted_arc_closes() {
+        let area = arc_term(CURVE, uniform, Spelling::Commuted, ROOT_FLOOR);
+        assert_eq!(unclosed(&area), Some(0));
+    }
+
+    /// **An uncertified step declines.** With the first `y` step read raw,
+    /// `T` is the rise's inverse only for the values a host happened to
+    /// write, which the rule cannot see: it leaves the outer integral for
+    /// quadrature (the inner one still narrows to its clamp).
+    #[test]
+    fn an_arc_without_its_certificate_keeps_its_integral() {
+        let area = arc_term(CURVE, uniform, Spelling::Uncertified, ROOT_FLOOR);
+        assert_eq!(unclosed(&area), Some(1));
+    }
+
+    /// **The floor is pinned.** A floor above `2⁻¹⁰⁰` moves the root over a
+    /// height the formula does not account for, and a zero floor divides by
+    /// zero where the rise is flat: both decline. A smaller positive floor
+    /// is exact too, and closes.
+    #[test]
+    fn an_arc_under_the_wrong_floor_keeps_its_integral() {
+        for floor in [2.0 * ROOT_FLOOR, 0.0] {
+            let area = arc_term(CURVE, uniform, Spelling::Author, floor);
+            assert_eq!(unclosed(&area), Some(1), "floor {floor:e}");
+        }
+        let area = arc_term(CURVE, uniform, Spelling::Author, ROOT_FLOOR / 4.0);
+        assert_eq!(unclosed(&area), Some(0));
+    }
+
+    /// **A class can stand for the variable.** `(x₀ + R − X) − (−½)` —
+    /// narrowing's spelling of a clamp's argument — is read in terms of
+    /// `R`, a class the binder reaches through a sine, as
+    /// `1·R + ((x₀ − X) − (−½))`, the difference of nearly equal
+    /// coordinates first. The binder used bare beside `R` is not affine in
+    /// `R`, and neither is `R·R`.
+    #[test]
+    fn a_class_can_stand_for_the_variable() {
+        let mut eg = EGraph::with_rules(Vec::new());
+        let u = eg.add(ENode::Var(slot(0).var()));
+        let (x, x0) = (eg.add(ENode::Var(0)), eg.add(ENode::Var(1)));
+        let r = eg.add(op1(&ops::Sin, u));
+        let minus_half = eg.add(ENode::constant(-0.5));
+        let xt = eg.add(op2(&ops::Add, x0, r));
+        let reach = eg.add(op2(&ops::Sub, xt, x));
+        let z = eg.add(op2(&ops::Sub, reach, minus_half));
+        let read = |eg: &EGraph, class| Recognizer::in_terms_of(eg, slot(0), r).affine(class);
+
+        let form = read(&eg, z).expect("affine in R");
+        assert_eq!(literal_of(&form.slope), Some(1.0));
+        let Term::Difference(coordinates, half) = &*form.offset else {
+            panic!("offset {:?}", form.offset);
+        };
+        assert_eq!(literal_of(half), Some(-0.5));
+        assert!(
+            matches!(&**coordinates, Term::Difference(..)),
+            "{coordinates:?}"
+        );
+        assert!(spelled_from(&eg, slot(0), z).contains(&eg.find(r)));
+
+        let beside = eg.add(op2(&ops::Add, z, u));
+        let square = eg.add(op2(&ops::Mul, r, r));
+        assert!(read(&eg, beside).is_none());
+        assert!(read(&eg, square).is_none());
+    }
+
+    /// **An arc closes in one round.** Within the closing phase's first
+    /// round each rule sees the ones before it: `NarrowInterval` closes the
+    /// inner integral to its clamp, and `ArcMoment`, after it in the rule
+    /// set, closes the outer one — so after a single round every class
+    /// holding an integral also holds a member that is not one.
+    #[test]
+    fn an_arc_closes_in_one_round() {
+        use crate::egraph::{RuleSet, Vocabulary, insert};
+        let (rules, ids) = RuleSet::runtime().shared();
+        let mut eg = EGraph::with_shared_rules(rules, ids);
+        let area = arc_term(CURVE, uniform, Spelling::Author, ROOT_FLOOR);
+        let (arena, root) = area.parts();
+        insert(arena, root, &mut eg, Vocabulary::Runtime).expect("inserts");
+        let stats = eg.saturate_budgeted(1, 50_000, None);
+        assert_eq!(stats.iterations, 1);
+        let open: Vec<EClassId> = eg
+            .canonical_class_ids()
+            .into_iter()
+            .filter(|&class| {
+                let nodes = eg.nodes(class);
+                nodes.iter().any(is_integral) && nodes.iter().all(is_integral)
+            })
+            .collect();
+        assert!(open.is_empty(), "open after one round: {open:?}");
+    }
+
+    /// **A closed integral is closed.** Once `ArcMoment` has written its
+    /// right-hand side beside the fold, it declines that fold: a spelling
+    /// the algebra adds later would otherwise make it write another.
+    #[test]
+    fn the_arc_rule_declines_a_closed_integral() {
+        use crate::egraph::{Vocabulary, insert};
+        const CAP: usize = 50_000;
+        const ARC_MOMENT: usize = 2;
+        let mut eg = EGraph::with_rules(alloc::vec![
+            Box::new(FactorFold) as Box<dyn Rewrite>,
+            Box::new(NarrowInterval),
+            Box::new(ArcMoment),
+        ]);
+        let area = arc_term(CURVE, uniform, Spelling::Author, ROOT_FLOOR);
+        let (arena, root) = area.parts();
+        insert(arena, root, &mut eg, Vocabulary::Runtime).expect("inserts");
+        let integrals = |eg: &EGraph| -> Vec<(EClassId, ENode)> {
+            eg.canonical_class_ids()
+                .into_iter()
+                .flat_map(|class| {
+                    eg.nodes(class)
+                        .iter()
+                        .filter(|node| is_integral(node))
+                        .map(move |node| (class, node.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let fires = |eg: &EGraph| {
+            integrals(eg)
+                .iter()
+                .filter(|(class, node)| ArcMoment.apply(eg, *class, node).is_some())
+                .count()
+        };
+        assert_eq!(fires(&eg), 0, "the inner integral is not narrowed yet");
+        // Factoring and narrowing, to a fixpoint: the inner integral closes
+        // to its clamp, which is what the arc rule reads.
+        for _ in 0..8 {
+            let changes =
+                eg.apply_rule_at_index(0, CAP).changes + eg.apply_rule_at_index(1, CAP).changes;
+            eg.rebuild();
+            if changes == 0 {
+                break;
+            }
+        }
+        assert_eq!(fires(&eg), 1, "the outer integral, before it closes");
+        eg.apply_rule_at_index(ARC_MOMENT, CAP);
+        eg.rebuild();
+        assert_eq!(fires(&eg), 0, "the outer integral, closed");
     }
 }
