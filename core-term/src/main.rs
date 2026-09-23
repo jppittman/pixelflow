@@ -80,6 +80,17 @@ fn get_secure_log_path() -> std::path::PathBuf {
     std::path::PathBuf::from(format!("/tmp/core-term-{}.log", std::process::id()))
 }
 
+/// The shell to run: the configured program, else `$SHELL`, else `/bin/bash`.
+fn configured_shell() -> String {
+    if let Some(program) = &CONFIG.shell.program {
+        return program.to_string_lossy().into_owned();
+    }
+    std::env::var("SHELL").unwrap_or_else(|_| {
+        warn!("SHELL environment variable not set, defaulting to /bin/bash");
+        "/bin/bash".to_string()
+    })
+}
+
 /// Main entry point for the `myterm` application.
 fn main() -> anyhow::Result<()> {
     // Install panic hook FIRST - any panic in any thread kills the whole process
@@ -138,12 +149,9 @@ fn main() -> anyhow::Result<()> {
     info!("CPU profiling enabled - flamegraph.svg will be written on exit");
 
     // Determine command to execute based on -c flag
+    let shell = configured_shell();
     let (shell_command, shell_args) = if let Some(command) = args.command {
         // Execute command with -c flag
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| {
-            warn!("SHELL environment variable not set, defaulting to /bin/bash");
-            "/bin/bash".to_string()
-        });
 
         // Use shell to execute the command string
         let mut cmd_args = vec!["-c".to_string(), command];
@@ -158,13 +166,8 @@ fn main() -> anyhow::Result<()> {
         info!("Executing command with -c flag: {} {:?}", shell, cmd_args);
         (shell, cmd_args)
     } else {
-        // Launch interactive shell
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| {
-            warn!("SHELL environment variable not set, defaulting to /bin/bash");
-            "/bin/bash".to_string()
-        });
         info!("Launching interactive shell: {}", shell);
-        (shell, Vec::new())
+        (shell, CONFIG.shell.args.clone())
     };
 
     info!("Shell command: '{}', args: {:?}", shell_command, shell_args);
@@ -211,6 +214,7 @@ fn main() -> anyhow::Result<()> {
             args: &shell_args_refs,
             initial_cols: CONFIG.appearance.columns,
             initial_rows: CONFIG.appearance.rows,
+            working_directory: CONFIG.shell.working_directory.as_deref(),
         };
         let pty = NixPty::spawn_with_config(&pty_config).context("Failed to create NixPty")?;
         info!("Spawned PTY");
@@ -224,7 +228,7 @@ fn main() -> anyhow::Result<()> {
         let params = TerminalAppParams {
             emulator: term_emulator,
             pty_writer: pty_troupe.writer_handle(),
-            config: core_term::config::Config::default(),
+            config: CONFIG.clone(),
             unregistered_engine: unregistered_handle,
             window_config: engine_config.window.clone(),
         };

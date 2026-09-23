@@ -29,6 +29,7 @@ fn clear_command_emits_an_erase_sequence_when_parent_term_is_dumb() {
         args: &[],
         initial_cols: 80,
         initial_rows: 24,
+        working_directory: None,
     };
     let mut pty =
         NixPty::spawn_with_config(&config).expect("failed to spawn clear in CoreTerm PTY");
