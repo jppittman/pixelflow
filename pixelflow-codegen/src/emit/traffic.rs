@@ -52,9 +52,10 @@ pub struct ScopeTraffic {
     /// always did — an `InstructionPlan`'s reloads serve one instruction by
     /// definition.
     pub loads_kept: u32,
-    /// Constants re-emitted instead of loaded. Not a memory operation on x86,
-    /// where the immediate is inline; on aarch64 it may reach the constant
-    /// pool, which is why it is counted apart from both.
+    /// Constants brought into a register from the kernel's constant pool (or
+    /// an immediate, where the ISA encodes one) rather than from the frame:
+    /// a load, but not of a slot this kernel wrote, which is why it is
+    /// counted apart from both the loads and the stores.
     pub remats: u32,
     /// Stack stores emitted: spills, parks, a fold's slot-held roots.
     pub stores: u32,
@@ -92,11 +93,11 @@ pub struct EmitTraffic {
     /// allocations — recorded separately rather than folded into a scope so
     /// that stays visible.
     pub scaffold: ScopeTraffic,
-    /// Bytes after the return: aarch64's constant pool and the padding that
-    /// aligns it, nothing on x86. The pool is the kernel's; the padding
-    /// follows the code's length, so this is the one count that can differ
-    /// between two allocations of a kernel with no instruction differing, by
-    /// less than [`CONST_POOL_ALIGN`](super::aarch64::CONST_POOL_ALIGN).
+    /// Bytes after the return: the constant pool and the padding that aligns
+    /// it. The pool is the kernel's; the padding follows the code's length,
+    /// so this is the one count that can differ between two allocations of a
+    /// kernel with no instruction differing, by less than
+    /// [`CONST_POOL_ALIGN`](super::CONST_POOL_ALIGN).
     pub trailing: u32,
     /// Bytes one spilled register occupies: the backend's vector width.
     pub vector_bytes: u32,
@@ -824,15 +825,16 @@ mod tests {
     /// difference between two allocations must not be able to hide there.
     ///
     /// Every backend, from this host, since each emits its own frame. What
-    /// trails the return is counted apart again: aarch64's constant pool is
-    /// the kernel's, but the padding that aligns it follows the code's
-    /// length, so that count may move with the budget by less than one
-    /// alignment — and it is the only count that may.
+    /// trails the return is counted apart again: the constant pool is the
+    /// kernel's, but the padding that aligns it follows the code's length, so
+    /// that count may move with the budget by less than one alignment — and
+    /// it is the only count that may.
     #[test]
     fn the_scaffolds_traffic_does_not_move_with_the_pool() {
         use crate::emit::tests::schedule_for;
         use crate::emit::{
-            BYTES_PER_LANE, IsaBackend, aarch64, avx2, avx512, compile_via_backend, x86_64,
+            BYTES_PER_LANE, CONST_POOL_ALIGN, IsaBackend, aarch64, avx2, avx512,
+            compile_via_backend, x86_64,
         };
 
         fn traffic<B: IsaBackend>(mut backend: B, arena: &ExprArena, root: ExprId) -> EmitTraffic {
@@ -873,7 +875,7 @@ mod tests {
                 "{name}: the scaffold changed with the register budget"
             );
             assert!(
-                t.trailing.abs_diff(l.trailing) < aarch64::CONST_POOL_ALIGN as u32,
+                t.trailing.abs_diff(l.trailing) < CONST_POOL_ALIGN as u32,
                 "{name}: what trails the return changed with the register budget by more \
                  than the pool's alignment: {} vs {} bytes",
                 t.trailing,

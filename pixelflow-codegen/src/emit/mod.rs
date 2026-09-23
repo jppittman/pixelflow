@@ -423,6 +423,23 @@ impl Assembly {
     }
 }
 
+/// What the constant pool is called.
+///
+/// One name per emitted function, because there is one pool per emitted
+/// function: the anchor names it before a single constant is known, and the
+/// pool is written where it lands, after the return. Nothing is carried
+/// between the two — they agree because they spell the same thing. Every
+/// backend uses it: aarch64 anchors `X17` to it and x86 anchors `r8`, and a
+/// kernel's constant loads are then one instruction each, base-relative.
+pub const CONST_POOL: &str = "const_pool";
+
+/// The constant pool's alignment: one NEON pool entry, so every `LDR Qt` from
+/// it is an aligned vector load. x86's four-byte entries need no alignment and
+/// take this one for the cache line. The padding that reaches it from the
+/// last instruction follows the code's length, which is why a kernel's
+/// trailing bytes can differ between two allocations of it by less than this.
+pub const CONST_POOL_ALIGN: usize = 16;
+
 /// Physical vector register index (v0..v31 on AArch64, xmm/ymm/zmm0..zmm31 on x86).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Reg(pub u8);
@@ -826,6 +843,17 @@ impl FrameLayout {
         }
         self.slot[idx] = Some(slot);
     }
+}
+
+/// One unary instruction as a backend's `emit_unary` takes it: the op, its
+/// two registers, and the allocator's temp for the instruction, which the ops
+/// that build a mask or a correction term write and the rest ignore.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Unary {
+    pub op: OpKind,
+    pub dst: Reg,
+    pub src: Reg,
+    pub temp: Option<Reg>,
 }
 
 /// A concrete instruction to emit, with all registers resolved.
@@ -1281,17 +1309,17 @@ trait IsaBackend {
     fn frame_free(&mut self, code: &mut Vec<u8>, bytes: u32);
 
     /// Anchor whatever the body's constant loads are relative to, once the
-    /// frame exists. Default: nothing to anchor (x86 const loads are
-    /// self-contained).
+    /// frame exists: the register that holds the constant pool's address for
+    /// the rest of the function.
     ///
-    /// Takes the whole [`Assembly`], not just its `code`, because aarch64's
-    /// anchor names a [`Label`] — the constant pool's not-yet-known position —
-    /// rather than a `code.len()` read off and carried by hand.
-    fn anchor(&mut self, _asm: &mut Assembly) {}
+    /// Takes the whole [`Assembly`], not just its `code`, because the anchor
+    /// names a [`Label`] — the constant pool's not-yet-known position — rather
+    /// than a `code.len()` read off and carried by hand.
+    fn anchor(&mut self, asm: &mut Assembly);
 
-    /// Append whatever must trail the emitted function — a constant pool and
-    /// the label that names it. Default: nothing trails.
-    fn finish(&mut self, _asm: &mut Assembly) {}
+    /// Append whatever must trail the emitted function — the constant pool
+    /// and the label that names it.
+    fn finish(&mut self, asm: &mut Assembly);
 
     /// Save / restore a value in a slot outside any scope's own spill frame:
     /// a fold's binder or accumulator, a root parked for the scopes inside.
@@ -2299,9 +2327,9 @@ fn emit_scope<B: IsaBackend>(
             backend.emit_store(&mut asm.code, dst_loc.reg(), offset)?;
         }
 
-        // Resident by construction: a root is a computed value, not a leaf
-        // (`place_roots` never parks one), so its own definition — the
-        // instruction just emitted — wrote it into a register.
+        // Resident by construction: the hand-off is a read at the definition
+        // (`regalloc::Pass::new`), so the allocator gave it a register — a
+        // constant's definition included, which otherwise emits nothing.
         if parked.contains_key(vid) {
             hand_off(backend, &mut asm.code, *vid, dst_loc.reg())?;
         }
@@ -2875,19 +2903,20 @@ fn cluster_pending(fold: PendingFold) -> PendingFold {
     }
 }
 
-/// Whether a def is one the placement never parks: a leaf that is cheaper
-/// rebuilt than reloaded (a constant rematerializes in one instruction), a
-/// binder's placeholder (found where its fold keeps it), or a `Reduce` that
-/// is not this scope's own (a placeholder already, read from its
-/// accumulator slot).
+/// Whether a def is a placeholder already, and so not the placement's to
+/// park: a binder's `Var` (found where its fold keeps it), a `Reduce` that
+/// is not this scope's own (read from its accumulator slot), or a `Guard`
+/// (its own `ValueId` forced to a slot, mirroring that accumulator).
+///
+/// A `Const` used to be here too, as "cheaper rebuilt than reloaded". It is
+/// not: rebuilding one is two instructions on x86, and a value parked for the
+/// scopes inside is carried in a register when one is free, which is zero.
+/// Whether a constant is worth a register is the allocator's question, priced
+/// like every other root's, so nothing here answers it.
 fn stays_put(op: &ScheduledOp) -> bool {
     matches!(
         op,
-        ScheduledOp::Const(_)
-            | ScheduledOp::Var(_)
-            | ScheduledOp::Lanes(_)
-            | ScheduledOp::Reduce(..)
-            | ScheduledOp::Guard(..)
+        ScheduledOp::Var(_) | ScheduledOp::Reduce(..) | ScheduledOp::Guard(..)
     )
 }
 
@@ -2908,16 +2937,22 @@ fn place_roots(
     use pixelflow_ir::variance::Variance;
     use regalloc::Scope;
 
-    // What each scope binds, read off before any def is edited: a fold's
-    // own binder, plus the lane binder of any store it holds (the lane fold
-    // is inlined into the scope that stores — see `extract_folds_bound_by`).
-    // The same index answers for a fold as a scope and as an ancestor.
-    let body_binds = lane_binders(&scoped.body.schedule);
+    // What each scope binds, read off before any def is edited: a fold's own
+    // binder. The same index answers for a fold as a scope and as an
+    // ancestor.
+    //
+    // Not the lane binder of a store the scope holds. The lane fold is
+    // inlined into the storing scope, so nothing *deeper* may compute a
+    // lane-varying value (`extract_folds_bound_by` keeps them out of the
+    // folds within) — but the lanes themselves are the same vector in every
+    // batch, so a value that varies by lane and by nothing else is invariant
+    // over the whole call and belongs to the body, like any other invariant.
+    // Counting the lane as bound here made the storing scope keep its own
+    // copy of the iota while the body parked another for the scopes inside,
+    // and one scope then held the same value as a def and as a live-in.
+    let body_binds = Variance::CONST;
     let binds: Vec<Variance> = (0..scoped.folds.len())
-        .map(|j| {
-            Variance::from_var(binder_of_fold(scoped, j))
-                .union(lane_binders(&scoped.folds[j].schedule))
-        })
+        .map(|j| Variance::from_var(binder_of_fold(scoped, j)))
         .collect();
     for j in 0..scoped.folds.len() {
         let own = binds[j];
@@ -3053,9 +3088,8 @@ fn extract_folds(
 /// (a shared invariant leaf, or one that varies only with an enclosing
 /// binder) is not dropped: it stays here too, and stays in the fold's own
 /// schedule as well — where [`place_roots`] turns it into a placeholder read
-/// from the enclosing scope's park, unless it is a leaf cheaper to rebuild.
-/// Getting this backwards — removing the whole closure — would orphan
-/// exactly that shared leaf's other consumer.
+/// from the enclosing scope's park. Getting this backwards — removing the
+/// whole closure — would orphan exactly that shared leaf's other consumer.
 ///
 /// The one thing that is *not* recomputed inside a fold is another fold
 /// that does not depend on its binder: a whole loop per iteration is the
@@ -4966,46 +5000,52 @@ mod tests {
     // What the nest does and does not partition
     // =========================================================================
 
-    /// A leaf shared between a lattice-invariant expression and a varying one
-    /// lands in **both** scopes' schedules, with a location chosen
-    /// independently in each.
+    /// A constant shared between a lattice-invariant expression and a varying
+    /// one is computed by the outer scope and parked for the inner one, like
+    /// any other value the inner scope reads but does not vary.
     ///
-    /// It is tempting to assume the nest partitions `ValueId`s —
-    /// `arena_to_schedule` numbers them sequentially, and every non-leaf is
-    /// either parked by an enclosing scope or left behind. Leaves are the
-    /// exception: `place_roots` leaves one where it is (there is nothing to
-    /// save by parking a value one instruction rebuilds), so a `Const` feeding
-    /// both sides is simply computed twice. A nest-wide placement map that
-    /// assumed one answer per value would have to pick one of the two, and the
-    /// emitter would then read a register the other scope never wrote.
+    /// It used to be computed in both: `place_roots` left a leaf where it was,
+    /// on the theory that nothing is saved by parking a value one instruction
+    /// rebuilds. Two instructions on x86, per read, per trip — and a parked
+    /// root is carried in a register when one is free, which is none.
     #[test]
-    fn a_leaf_feeding_both_scopes_is_scheduled_in_both() {
+    fn a_leaf_feeding_both_scopes_is_parked_by_the_outer_one() {
         let (a, root) = shared_leaf_kernel();
         let schedule = native_schedule(&a, root, BATCH);
         let variance = schedule_variance(&schedule);
         let scoped = scope_schedule(schedule, &variance);
 
-        let outer: alloc::vec::Vec<regalloc::ValueId> =
-            scoped.body.schedule.iter().map(|d| d.value).collect();
-        let parked = |v: &regalloc::ValueId| {
-            scoped.body.roots.contains(v) || scoped.folds.iter().any(|f| f.roots.contains(v))
-        };
-        let shared: alloc::vec::Vec<regalloc::ValueId> = scoped
+        let k = scoped
+            .body
+            .schedule
+            .iter()
+            .find(|d| matches!(d.op, ScheduledOp::Const(v) if v == 3.5))
+            .map(|d| d.value)
+            .expect("the body computes the constant");
+        assert!(
+            scoped.body.roots.contains(&k),
+            "the body parks it for the fold: roots {:?}",
+            scoped.body.roots
+        );
+        let inner: alloc::vec::Vec<&ScheduledOp> = scoped
             .folds
             .iter()
-            .flat_map(|f| f.schedule.iter().map(|d| d.value))
-            .filter(|v| outer.contains(v) && !parked(v))
+            .flat_map(|f| f.schedule.iter())
+            .filter(|d| d.value == k)
+            .map(|d| &d.op)
             .collect();
-
         assert!(
-            !shared.is_empty(),
-            "no value is scheduled in two scopes, so nothing here is testing \
-             what a nest-wide placement map has to survive"
+            !inner.is_empty()
+                && inner
+                    .iter()
+                    .all(|op| matches!(op, ScheduledOp::Const(v) if *v == 0.0)),
+            "the fold reads it through a placeholder, never its own copy: {inner:?}"
         );
     }
 
-    /// The consequence for the allocator: a value in two scopes gets a range
-    /// per scope, and each range is that scope's own answer.
+    /// The placement is total over every scope's schedule, a parked
+    /// placeholder's entry included — which reads the park, the enclosing
+    /// scope's answer, rather than a range of this scope's own.
     #[test]
     fn a_shared_leaf_is_placed_once_per_scope() {
         let (a, root) = shared_leaf_kernel();
@@ -5039,7 +5079,8 @@ mod tests {
     }
 
     /// `y·k + x·k`: one constant, read by a row-invariant term and a
-    /// column-varying one, so both scopes need it.
+    /// column-varying one, so the inner scope needs a value the outer one
+    /// computes.
     fn shared_leaf_kernel() -> (ExprArena, ExprId) {
         let mut a = ExprArena::new();
         let x = a.push_var(0);
@@ -7566,10 +7607,13 @@ mod tests {
                 .expect("AVX2 emit");
             let code = result.code.as_bytes();
             // vfmadd231ps: VEX.256.66.0F38 B8 — the opcode byte after the
-            // 3-byte prefix. Nothing else this kernel emits uses it.
+            // 3-byte prefix, whose second byte carries the map (`0F38` is
+            // `00010`) under three register-extension bits the allocator's
+            // choice of registers decides. Nothing else this kernel emits
+            // uses the opcode.
             assert!(
                 code.windows(4)
-                    .any(|w| w[0] == 0xc4 && w[1] == 0xe2 && w[3] == 0xb8),
+                    .any(|w| w[0] == 0xc4 && w[1] & 0x1f == 0x02 && w[3] == 0xb8),
                 "a MulAdd DAG did not reach the AVX2 backend as FusedMulAdd \
                  (no VEX.0F38 B8 in {code:02x?})"
             );

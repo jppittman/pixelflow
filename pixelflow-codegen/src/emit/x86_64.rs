@@ -10,9 +10,10 @@
 //! 3-operand form which avoids extra MOV instructions in multi-step sequences.
 
 use super::{
-    AsmInsn, AsmProgram, EncodedInst, Gpr, Label, LabelRef, PtrReg, Reg, SourceOperand, assemble,
-    unimplemented_op,
+    AsmInsn, AsmProgram, Assembly, CONST_POOL, CONST_POOL_ALIGN, EncodedInst, Gpr, Label, LabelRef,
+    PtrReg, Reg, SourceOperand, Unary, assemble, unimplemented_op,
 };
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use pixelflow_ir::kind::OpKind;
 
@@ -400,62 +401,127 @@ const CMP_NLE: u8 = 6; // Not less-or-equal, i.e. greater than (unordered)
 // Constants
 // =============================================================================
 
-/// Load a splat f32 constant into an XMM register via RIP-relative load.
-///
-/// Strategy: emit a JMP over 16 bytes of inline constant data, then load
-/// with MOVAPS [RIP + disp]. This avoids needing GP scratch registers.
-///
-/// Layout in code stream:
-/// ```text
-///   JMP +16          ; 2 bytes (EB 10)
-///   <16 bytes data>  ; 4x f32 splatted
-///   MOVAPS dst, [RIP + disp32]  ; RIP-relative load
-/// ```
-fn emit_f32_const(code: &mut Vec<u8>, dst: Reg, val: f32) {
-    let bits = val.to_bits();
+/// The register that holds the constant pool's address for the whole kernel:
+/// `r8`, SysV's fifth integer argument, which the collapse ABI does not pass,
+/// and caller-saved, so nothing preserves it. The x86 counterpart of
+/// aarch64's `X17`. A pointer register because that is what it holds; the
+/// register file's GPR roles (`driver::SSE2_FILE`) stay clear of it the way
+/// they stay clear of the three arguments.
+pub const POOL_BASE: PtrReg = PtrReg(8);
 
-    // Fast path: zero constant
+/// A kernel's constants, deduplicated, laid out after its `ret`.
+///
+/// One per emitted function, shared by every scope of the nest: a compile
+/// emits every scope through one backend, so the offsets an outer scope baked
+/// in stay valid as inner scopes append. Entry `k` is at `[POOL_BASE + 4k]`;
+/// [`anchor`] materializes `POOL_BASE` once, after the frame, and
+/// [`ConstPool::finish`] writes the entries after the return, binding the
+/// label the anchor names.
+///
+/// Four bytes per constant, not a register's worth: every tier loads a
+/// constant with `vbroadcastss` from a 32-bit source, so the splat is the
+/// instruction's business and the pool holds the scalar. This replaced two
+/// idioms that were each two instructions per read: a `jmp` over sixteen
+/// bytes of inline data followed by a RIP-relative load on the 128-bit tier,
+/// and a store to the red zone followed by a broadcast from it on the wide
+/// ones — a store-forward on the critical path of every constant read.
+#[derive(Default)]
+pub struct ConstPool {
+    /// The entries, in pool order.
+    entries: Vec<u32>,
+    /// Each entry's byte offset, by its bits.
+    index: BTreeMap<u32, u32>,
+}
+
+impl ConstPool {
+    /// The memory operand of the constant with these bits: `[POOL_BASE +
+    /// offset]`, entering it into the pool on first use.
+    ///
+    /// Always a `disp32`, never a `disp8`: EVEX scales a `disp8` by the
+    /// operand's tuple size, VEX does not, and one form for both is worth
+    /// three bytes per load.
+    pub fn operand(&mut self, bits: u32) -> Mem<Imm32> {
+        let offset = *self.index.entry(bits).or_insert_with(|| {
+            let offset = (self.entries.len() * 4) as u32;
+            self.entries.push(bits);
+            offset
+        });
+        Mem {
+            base: POOL_BASE,
+            disp: Imm32(offset as i32),
+        }
+    }
+
+    /// Append the pool after the return and bind [`CONST_POOL`] where it
+    /// lands.
+    ///
+    /// The label is written whether or not there is anything to append: the
+    /// anchor names it unconditionally, and `Assembly::finish` panics on a
+    /// name nobody wrote.
+    pub fn finish(&self, asm: &mut Assembly) {
+        if !self.entries.is_empty() {
+            while !asm.code.len().is_multiple_of(CONST_POOL_ALIGN) {
+                asm.code.push(0);
+            }
+        }
+        asm.bind(CONST_POOL);
+        for &bits in &self.entries {
+            asm.code.extend_from_slice(&bits.to_le_bytes());
+        }
+    }
+}
+
+/// `lea dst, [rip + target]` — a position's address, in one instruction.
+///
+/// `REX.W 8D /r` with the RIP-relative ModRM, the displacement patched once
+/// the label lands. What every x86 tier's [`anchor`] is made of.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LeaRip {
+    /// Where the address is materialized.
+    pub dst: PtrReg,
+    /// The position it is the address of.
+    pub target: Label,
+}
+
+/// Bytes from a `LeaRip`'s start to its displacement field: REX, opcode,
+/// ModRM.
+const LEA_RIP_DISP: usize = 3;
+
+impl AsmInsn for LeaRip {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        code.push(0x48 | (((self.dst.0 >> 3) & 1) << 2));
+        code.push(0x8D);
+        code.push(((self.dst.0 & 7) << 3) | RM_RIP_AT_MOD0);
+        code.extend_from_slice(&[0, 0, 0, 0]);
+    }
+
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        Some(LabelRef {
+            label: self.target,
+            patch: |code, at, target| patch_rel32(code, at + LEA_RIP_DISP, target),
+        })
+    }
+}
+
+/// Every x86 tier's anchor: `POOL_BASE = &pool`, once, after the frame.
+pub fn anchor(asm: &mut Assembly) {
+    asm.push(LeaRip {
+        dst: POOL_BASE,
+        target: Label::new(CONST_POOL),
+    });
+}
+
+/// `dst = splat(val)`: `vbroadcastss xmm, [pool]` (VEX.128.66.0F38.W0 18 /r),
+/// one instruction from the kernel's constant pool. Zero is `vxorps`.
+pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut ConstPool) {
+    let bits = val.to_bits();
     if bits == 0 {
         emit_vxorps(code, dst, dst, dst);
         return;
     }
-
-    // JMP rel8 over 16 bytes of constant data
-    code.push(0xEB);
-    code.push(0x10); // jump +16
-
-    // Emit 16 bytes: 4 copies of the f32
-    for _ in 0..4 {
-        code.extend_from_slice(&bits.to_le_bytes());
-    }
-
-    // MOVUPS dst, [RIP + disp32]
-    // The displacement is relative to the end of this instruction.
-    // MOVUPS (unaligned load) is required here: the constant is embedded inline
-    // in the code stream at an arbitrary byte offset, so its address is not
-    // guaranteed 16-byte aligned. MOVAPS would #GP-fault on a misaligned load.
-    // Opcode 0F 10, ModRM = 0x05 | (dst.0 << 3), then disp32.
-    // Total instruction length = (optional REX) + 2(opcode) + 1(ModRM) + 4(disp32) = 7 or 8 bytes.
-    // RIP points to end of instruction, so disp32 = -(16 + instruction_length).
-
-    let needs_rex = dst.0 >= 8;
-    let inst_len: i32 = if needs_rex { 8 } else { 7 };
-    let disp: i32 = -(16 + inst_len);
-
-    if needs_rex {
-        code.push(0x44); // REX.R
-    }
-    code.push(0x0F);
-    code.push(0x10);
-    code.push(0x05 | ((dst.0 & 7) << 3)); // ModRM: mod=00, rm=101 (RIP-relative)
-    code.extend_from_slice(&disp.to_le_bytes());
-}
-
-/// Load constant into register (placeholder for the high-level emit dispatch).
-///
-/// Uses RIP-relative constant embedding for non-zero values, VXORPS for zero.
-pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32) {
-    emit_f32_const(code, dst, val);
+    assemble(code, [Vex::m0f38_66(0x18).rm(dst, pool.operand(bits))]);
 }
 
 // =============================================================================
@@ -770,9 +836,11 @@ pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
 
 /// `dst = op(src)`.
 ///
-/// `temp` is the allocator's temp for this instruction; only `Neg` and `Abs`
-/// use it, to hold the sign mask they XOR or AND with.
-pub fn emit_unary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, temp: Option<Reg>) {
+/// The temp is the allocator's for this instruction; only `Neg` and `Abs`
+/// use it, to hold the sign mask they XOR or AND with, which comes from the
+/// kernel's constant pool like any other constant.
+pub fn emit_unary(code: &mut Vec<u8>, unary: Unary, pool: &mut ConstPool) {
+    let Unary { op, dst, src, temp } = unary;
     match op {
         OpKind::Sqrt => emit_sqrtps(code, dst, src),
         OpKind::Rsqrt => {
@@ -784,14 +852,14 @@ pub fn emit_unary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, temp: Opti
         // Negation: flip the sign bit (dst = src XOR 0x80000000).
         OpKind::Neg => {
             let mask = super::declared_temp(temp);
-            emit_f32_const(code, mask, f32::from_bits(0x8000_0000));
+            emit_const(code, mask, f32::from_bits(0x8000_0000), pool);
             emit_vxorps(code, dst, src, mask);
         }
 
         // Absolute value: clear the sign bit (dst = src AND 0x7FFFFFFF).
         OpKind::Abs => {
             let mask = super::declared_temp(temp);
-            emit_f32_const(code, mask, f32::from_bits(0x7FFF_FFFF));
+            emit_const(code, mask, f32::from_bits(0x7FFF_FFFF), pool);
             emit_vandps(code, dst, src, mask);
         }
 
@@ -1324,12 +1392,14 @@ pub(crate) mod driver {
 
     /// x86-64 implementation of the shared driver's leaf operations.
     pub(crate) struct X86Backend {
+        consts: super::ConstPool,
         file: regalloc::RegisterFile,
     }
 
     impl X86Backend {
         pub(crate) fn new(ctx: EmitCtx) -> Self {
             Self {
+                consts: super::ConstPool::default(),
                 file: SSE2_FILE.capped(ctx.max_regs),
             }
         }
@@ -1400,8 +1470,10 @@ pub(crate) mod driver {
             self.file
         }
 
+        /// Nothing to seed: the pool fills as constants are emitted, each at
+        /// the offset its first use is given.
         fn begin(&mut self, _schedule: &[regalloc::Def]) -> Result<(), CompileError> {
-            Ok(()) // x86 const loads are self-contained; no pool.
+            Ok(())
         }
 
         fn emit_plan(
@@ -1416,7 +1488,7 @@ pub(crate) mod driver {
                         Self::spill_load(code, *target, slot.offset());
                     }
                     Reload::Const { target, val_bits } => {
-                        emit_const(code, *target, f32::from_bits(*val_bits));
+                        emit_const(code, *target, f32::from_bits(*val_bits), &mut self.consts);
                     }
                 }
             }
@@ -1426,7 +1498,7 @@ pub(crate) mod driver {
             match &plan.op {
                 ResolvedOp::Nop => {}
                 ResolvedOp::LoadConst { dst, val_bits } => {
-                    emit_const(code, *dst, f32::from_bits(*val_bits));
+                    emit_const(code, *dst, f32::from_bits(*val_bits), &mut self.consts);
                 }
                 // The iota, two lane pairs at a time: no SSE2 instruction
                 // builds four distinct lanes from nothing, and the tier has
@@ -1440,7 +1512,13 @@ pub(crate) mod driver {
                     AsmProgram::from([movq_xmm_r64(hi, gpr), movlhps(*dst, hi)]).assemble(code);
                 }
                 ResolvedOp::Unary { op, dst, src } => {
-                    emit_unary(code, *op, *dst, *src, plan.scratch.temp(0));
+                    let unary = Unary {
+                        op: *op,
+                        dst: *dst,
+                        src: *src,
+                        temp: plan.scratch.temp(0),
+                    };
+                    emit_unary(code, unary, &mut self.consts);
                 }
                 ResolvedOp::ShiftImm {
                     op,
@@ -1529,7 +1607,7 @@ pub(crate) mod driver {
                             Self::spill_load(code, *c, slot.offset());
                         }
                         Some(DeferredReload::Const(bits)) => {
-                            emit_const(code, *c, f32::from_bits(*bits));
+                            emit_const(code, *c, f32::from_bits(*bits), &mut self.consts);
                         }
                         None => {}
                     }
@@ -1563,7 +1641,7 @@ pub(crate) mod driver {
             match location_of(locs, vid) {
                 Binding::Loc(Loc::Reg(reg)) => reg,
                 Binding::Remat(bits) => {
-                    super::emit_const(code, target, f32::from_bits(bits));
+                    super::emit_const(code, target, f32::from_bits(bits), &mut self.consts);
                     target
                 }
                 Binding::Loc(Loc::Slot(slot)) => {
@@ -1588,8 +1666,17 @@ pub(crate) mod driver {
         }
 
         // SysV: rdi = ctx (read-only in the body's gathers and uniform
-        // loads), rsi = out, rdx = pitch; the body's scratch GPRs are rax/rcx
-        // (gather, store address, movmskps) — disjoint, and `checked` says so.
+        // loads), rsi = out, rdx = pitch, r8 = the constant pool; the body's
+        // scratch GPRs are rax/rcx (gather, store address, movmskps) —
+        // disjoint, and `checked` says so.
+
+        fn anchor(&mut self, asm: &mut Assembly) {
+            super::anchor(asm);
+        }
+
+        fn finish(&mut self, asm: &mut Assembly) {
+            self.consts.finish(asm);
+        }
 
         fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {
             AsmProgram::from([Inst::SubImm32 {
@@ -1616,12 +1703,12 @@ pub(crate) mod driver {
         }
 
         fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
-            super::emit_const(code, scratch, scalar);
+            super::emit_const(code, scratch, scalar, &mut self.consts);
             super::emit_binary(code, OpKind::Add, dst, dst, scratch);
         }
 
         fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
-            super::emit_const(code, dst, val);
+            super::emit_const(code, dst, val, &mut self.consts);
         }
 
         fn alu(&mut self, code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2]) {

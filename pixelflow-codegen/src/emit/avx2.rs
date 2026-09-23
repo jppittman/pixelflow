@@ -26,7 +26,7 @@
 //! with `vinsertf128`.
 
 use super::x86_64;
-use super::x86_64::{Disp, Imm8, Imm32, Mem, MovLoadPtr, NoDisp, ptr};
+use super::x86_64::{Disp, Imm32, Mem, MovLoadPtr, NoDisp, ptr};
 use super::{AsmProgram, EncodedInst, Gpr, PtrReg, Reg, SourceOperand, assemble, unimplemented_op};
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
@@ -359,27 +359,15 @@ const fn frame_slot(offset: u32) -> Mem<Imm32> {
     }
 }
 
-/// Where [`emit_const`] stages an f32 before broadcasting it: four bytes of
-/// red zone below `rsp`, never touched by a spill frame (which lives at
-/// `[rsp .. rsp+N)`).
-const RED_ZONE_CONST: Mem<Imm8> = Mem {
-    base: ptr::RSP,
-    disp: Imm8(-4),
-};
-
-/// Broadcast an f32 constant to all 8 lanes of `dst` via the stack (red zone,
-/// `[rsp-4]`; never affected by a spill frame, which lives at `[rsp..rsp+N)`).
-pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32) {
+/// `dst = splat(val)`: `vbroadcastss ymm, [pool]` (VEX.256.66.0F38.W0 18 /r),
+/// one instruction from the kernel's constant pool. Zero is `vxorps`.
+pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::ConstPool) {
     let bits = val.to_bits();
     if bits == 0 {
         vxorps(code, dst.0, dst.0, dst.0);
         return;
     }
-    // mov dword [rsp-4], imm32
-    code.extend_from_slice(&[0xC7, 0x44, 0x24, 0xFC]);
-    code.extend_from_slice(&bits.to_le_bytes());
-    // vbroadcastss ymm, [rsp-4]  (VEX.256.66.0F38.W0 18 /r)
-    assemble(code, [Vex::m0f38_66(0x18).rm(dst.0, RED_ZONE_CONST)]);
+    assemble(code, [Vex::m0f38_66(0x18).rm(dst.0, pool.operand(bits))]);
 }
 
 /// `dst = splat(block[offset])` at 256 bits: `mov base, [ctx + ctx_slot*8]`
@@ -443,21 +431,23 @@ pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Re
 
 /// `dst = op(src)`.
 ///
-/// `temp` is the allocator's temp for this instruction; only `Neg` and `Abs`
-/// use it, to hold the sign mask they XOR or AND with.
-pub fn emit_unary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, temp: Option<Reg>) {
+/// The temp is the allocator's for this instruction; only `Neg` and `Abs`
+/// use it, to hold the sign mask they XOR or AND with, which comes from the
+/// kernel's constant pool like any other constant.
+pub fn emit_unary(code: &mut Vec<u8>, unary: super::Unary, pool: &mut x86_64::ConstPool) {
+    let super::Unary { op, dst, src, temp } = unary;
     match op {
         OpKind::Sqrt => vsqrtps(code, dst.0, src.0),
         OpKind::Rsqrt => vrsqrtps(code, dst.0, src.0),
         OpKind::Recip => vrcpps(code, dst.0, src.0),
         OpKind::Neg => {
             let mask = super::declared_temp(temp);
-            emit_const(code, mask, f32::from_bits(0x8000_0000));
+            emit_const(code, mask, f32::from_bits(0x8000_0000), pool);
             vxorps(code, dst.0, src.0, mask.0);
         }
         OpKind::Abs => {
             let mask = super::declared_temp(temp);
-            emit_const(code, mask, f32::from_bits(0x7FFF_FFFF));
+            emit_const(code, mask, f32::from_bits(0x7FFF_FFFF), pool);
             vandps(code, dst.0, src.0, mask.0);
         }
         // imm8: bits[3:0] = rounding mode (0=nearest, 1=floor, 2=ceil).
@@ -696,7 +686,29 @@ mod tests {
         fn run(body: &[u8], xs: [f32; 8], ys: [f32; 8], zs: [f32; 8]) -> [f32; 8] {
             let mut code = body.to_vec();
             crate::emit::x86_64::ret(&mut code);
-            let exec = unsafe { ExecutableCode::from_code(&code).expect("mmap") };
+            run_code(&code, xs, ys, zs)
+        }
+
+        /// `run`, for a body that read constants from `pool`: the anchor
+        /// ahead of it and the pool behind its `ret`, as the driver lays a
+        /// kernel out.
+        fn run_pooled(
+            body: &[u8],
+            pool: &x86_64::ConstPool,
+            xs: [f32; 8],
+            ys: [f32; 8],
+            zs: [f32; 8],
+        ) -> [f32; 8] {
+            let mut asm = crate::emit::Assembly::default();
+            x86_64::anchor(&mut asm);
+            asm.code.extend_from_slice(body);
+            crate::emit::x86_64::ret(&mut asm.code);
+            pool.finish(&mut asm);
+            run_code(&asm.finish(), xs, ys, zs)
+        }
+
+        fn run_code(code: &[u8], xs: [f32; 8], ys: [f32; 8], zs: [f32; 8]) -> [f32; 8] {
+            let exec = unsafe { ExecutableCode::from_code(code).expect("mmap") };
             unsafe {
                 let f: K = exec.as_fn();
                 let r = f(
@@ -821,17 +833,26 @@ mod tests {
         #[test]
         fn emit_unary_computes_sqrt_neg_and_abs_per_lane() {
             let (xs, ys, zs) = lanes();
+            let unary = |op, src, temp| crate::emit::Unary {
+                op,
+                dst: X,
+                src,
+                temp,
+            };
+            let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
-            emit_unary(&mut c, OpKind::Sqrt, X, Y, None);
-            check(run(&c, xs, ys, zs), |i| ys[i].sqrt(), "sqrt");
+            emit_unary(&mut c, unary(OpKind::Sqrt, Y, None), &mut pool);
+            check(run_pooled(&c, &pool, xs, ys, zs), |i| ys[i].sqrt(), "sqrt");
 
+            let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
-            emit_unary(&mut c, OpKind::Neg, X, X, Some(TEMP));
-            check(run(&c, xs, ys, zs), |i| -xs[i], "neg");
+            emit_unary(&mut c, unary(OpKind::Neg, X, Some(TEMP)), &mut pool);
+            check(run_pooled(&c, &pool, xs, ys, zs), |i| -xs[i], "neg");
 
+            let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
-            emit_unary(&mut c, OpKind::Abs, X, X, Some(TEMP));
-            check(run(&c, xs, ys, zs), |i| xs[i].abs(), "abs");
+            emit_unary(&mut c, unary(OpKind::Abs, X, Some(TEMP)), &mut pool);
+            check(run_pooled(&c, &pool, xs, ys, zs), |i| xs[i].abs(), "abs");
         }
 
         #[test]
@@ -849,13 +870,24 @@ mod tests {
             );
         }
 
+        /// Two constants, the first read twice: the pool holds each once, and
+        /// every read is one broadcast from it.
         #[test]
         fn emit_const_broadcasts_and_adds_to_every_lane() {
             let (xs, ys, zs) = lanes();
+            let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
-            emit_const(&mut c, Reg(5), 2.5);
+            emit_const(&mut c, Reg(5), 2.5, &mut pool);
             emit_binary(&mut c, OpKind::Add, X, X, Reg(5));
-            check(run(&c, xs, ys, zs), |i| xs[i] + 2.5, "const+add");
+            emit_const(&mut c, Reg(6), -1.0, &mut pool);
+            emit_binary(&mut c, OpKind::Add, X, X, Reg(6));
+            emit_const(&mut c, Reg(5), 2.5, &mut pool);
+            emit_binary(&mut c, OpKind::Add, X, X, Reg(5));
+            check(
+                run_pooled(&c, &pool, xs, ys, zs),
+                |i| xs[i] + 4.0,
+                "const+add",
+            );
         }
 
         #[test]
@@ -1038,24 +1070,26 @@ pub(crate) mod driver {
 
     /// AVX2 implementation of the shared driver's leaf operations.
     pub(crate) struct Avx2Backend {
+        consts: x86::ConstPool,
         file: regalloc::RegisterFile,
     }
 
     impl Avx2Backend {
         pub(crate) fn new(ctx: EmitCtx) -> Self {
             Self {
+                consts: x86::ConstPool::default(),
                 file: AVX2_FILE.capped(ctx.max_regs),
             }
         }
 
-        fn reload(code: &mut Vec<u8>, reload: &Reload) {
+        fn reload(&mut self, code: &mut Vec<u8>, reload: &Reload) {
             match reload {
                 Reload::FromStack { target, slot } => {
                     AsmProgram::from([Vex::m0f(0x10).rm(target.0, frame_slot(slot.offset()))])
                         .assemble(code);
                 }
                 Reload::Const { target, val_bits } => {
-                    super::emit_const(code, *target, f32::from_bits(*val_bits));
+                    super::emit_const(code, *target, f32::from_bits(*val_bits), &mut self.consts);
                 }
             }
         }
@@ -1070,8 +1104,9 @@ pub(crate) mod driver {
             self.file
         }
 
+        /// Nothing to seed: the pool fills as constants are emitted.
         fn begin(&mut self, _schedule: &[regalloc::Def]) -> Result<(), CompileError> {
-            Ok(()) // const broadcast is self-contained; no pool.
+            Ok(())
         }
 
         fn emit_plan(
@@ -1080,7 +1115,7 @@ pub(crate) mod driver {
             plan: &InstructionPlan,
         ) -> Result<(), CompileError> {
             for r in &plan.reloads {
-                Self::reload(code, r);
+                self.reload(code, r);
             }
             if let Some((dst, src)) = plan.setup_mov
                 && dst != src
@@ -1090,7 +1125,7 @@ pub(crate) mod driver {
             match &plan.op {
                 ResolvedOp::Nop => {}
                 ResolvedOp::LoadConst { dst, val_bits } => {
-                    super::emit_const(code, *dst, f32::from_bits(*val_bits));
+                    super::emit_const(code, *dst, f32::from_bits(*val_bits), &mut self.consts);
                 }
                 // The iota: the bytes `0..8` in through a GPR, widened to
                 // dwords, converted. No vector temp — `dst` is every stage's.
@@ -1105,7 +1140,13 @@ pub(crate) mod driver {
                     .assemble(code);
                 }
                 ResolvedOp::Unary { op, dst, src } => {
-                    super::emit_unary(code, *op, *dst, *src, plan.scratch.temp(0));
+                    let unary = Unary {
+                        op: *op,
+                        dst: *dst,
+                        src: *src,
+                        temp: plan.scratch.temp(0),
+                    };
+                    super::emit_unary(code, unary, &mut self.consts);
                 }
                 ResolvedOp::ShiftImm {
                     op,
@@ -1183,7 +1224,7 @@ pub(crate) mod driver {
                                 .assemble(code);
                         }
                         Some(DeferredReload::Const(bits)) => {
-                            super::emit_const(code, *c, f32::from_bits(*bits));
+                            super::emit_const(code, *c, f32::from_bits(*bits), &mut self.consts);
                         }
                         None => {}
                     }
@@ -1227,7 +1268,7 @@ pub(crate) mod driver {
             match location_of(locs, vid) {
                 Binding::Loc(Loc::Reg(reg)) => reg,
                 Binding::Remat(bits) => {
-                    super::emit_const(code, target, f32::from_bits(bits));
+                    super::emit_const(code, target, f32::from_bits(bits), &mut self.consts);
                     target
                 }
                 Binding::Loc(Loc::Slot(slot)) => {
@@ -1236,6 +1277,14 @@ pub(crate) mod driver {
                     target
                 }
             }
+        }
+
+        fn anchor(&mut self, asm: &mut Assembly) {
+            x86::anchor(asm);
+        }
+
+        fn finish(&mut self, asm: &mut Assembly) {
+            self.consts.finish(asm);
         }
 
         // Select short-circuit guards: vmovmskps -> eax[7:0], same shape as
@@ -1281,12 +1330,12 @@ pub(crate) mod driver {
         }
 
         fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
-            super::emit_const(code, scratch, scalar);
+            super::emit_const(code, scratch, scalar, &mut self.consts);
             super::emit_binary(code, OpKind::Add, dst, dst, scratch);
         }
 
         fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
-            super::emit_const(code, dst, val);
+            super::emit_const(code, dst, val, &mut self.consts);
         }
 
         fn alu(&mut self, code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2]) {
