@@ -108,8 +108,10 @@ fn regular_polygon(n: usize) -> Outline {
     polygon(&points)
 }
 
-/// Square roots a row may keep: a budget per piece, not a count of the
-/// body. See the test below.
+/// The closed body's square roots: one per root of the arc's rise the
+/// closed form evaluates — where the pixel's band starts and ends on the
+/// arc, and where the arc enters and leaves the pixel's column
+/// (`pixelflow_ir::IntervalFold::arc_moment`).
 const SQRT_PER_PIECE: usize = 4;
 
 /// **A glyph is one body, and the fold says how many times it runs.**
@@ -117,16 +119,20 @@ const SQRT_PER_PIECE: usize = 4;
 /// - The arena a glyph **builds** is the same size whatever the outline is
 ///   — one body, not one fragment per edge, so construction stops being a
 ///   function of the piece count.
-/// - The optimizer's output stays **linear** in the fold's trip count with
-///   a fixed budget of [`SQRT_PER_PIECE`] per row, so a rewrite that
-///   multiplied work per pixel still shows up as a hard number. The trip
-///   count is the piece count rounded up to a bucket
-///   (`docs/plans/2026-09-09-glyph-as-a-fold-execution.md` §S3), so a
-///   `5`-gon budgets against `8` rows and an `11`-gon against `16` — the
-///   padding rows are exact identities of the fold (their gate is
-///   `loop_blinn::tests::a_padding_row_is_an_exact_identity_of_the_fold`)
-///   but they are still rows the fold runs and this budget still counts;
-/// - and no `Dwrt` reaches the emitter.
+/// - The arena the optimizer **hands the emitter** is one closed body too:
+///   the fold stays a loop to the assembler, so its body is counted once,
+///   and a rewrite that multiplied work per pixel shows up as a hard
+///   number. [`SQRT_PER_PIECE`] square roots and not one more; no `Dwrt`
+///   (a glyph writes none any more); and no `Recip` — the closed form's
+///   quotients are exact divides, and an estimate would cost `2⁻¹²` of the
+///   area.
+///
+/// The trip count is the piece count rounded up to a bucket
+/// (`docs/plans/2026-09-09-glyph-as-a-fold-execution.md` §S3), so a `5`-gon
+/// and an `11`-gon run `8` and `16` rows — the padding rows are exact
+/// identities of the fold (their gate is
+/// `loop_blinn::tests::a_padding_row_is_an_exact_identity_of_the_fold`), and
+/// neither the count nor the body depends on it.
 #[test]
 fn a_glyph_is_one_body_and_a_fixed_budget_per_piece() {
     let (small, large) = (5usize, 11usize);
@@ -144,12 +150,10 @@ fn a_glyph_is_one_body_and_a_fixed_budget_per_piece() {
         (
             total_reachable(&few, few_root),
             count_op(&few, few_root, OpKind::Sqrt),
-            count_op(&few, few_root, OpKind::Dwrt),
         ),
         (
             total_reachable(&many, many_root),
             count_op(&many, many_root, OpKind::Sqrt),
-            count_op(&many, many_root, OpKind::Dwrt),
         ),
         "a {small}-gon and a {large}-gon must build the same arena: the piece \
          count is data in a table, not structure in the graph"
@@ -158,25 +162,28 @@ fn a_glyph_is_one_body_and_a_fixed_budget_per_piece() {
     for (n, arena, root) in [(small, &few, few_root), (large, &many, many_root)] {
         let (opt, opt_root) = bake_pipeline(arena, root, [32, 32]);
         let opt_sqrt = count_op(&opt, opt_root, OpKind::Sqrt);
-        let opt_dwrt = count_op(&opt, opt_root, OpKind::Dwrt);
         eprintln!(
-            "{n}-gon: raw total={} sqrt={} -> optimized total={} sqrt={opt_sqrt} \
-             dwrt={opt_dwrt}",
+            "{n}-gon: raw total={} sqrt={} -> optimized total={} sqrt={opt_sqrt}",
             total_reachable(arena, root),
             count_op(arena, root, OpKind::Sqrt),
             total_reachable(&opt, opt_root),
         );
-        assert_eq!(opt_dwrt, 0, "Dwrt must be fully resolved by bake time");
-        // The fold's trip count is `n` rounded up to a bucket
-        // (`loop_blinn::bucketed_trip_count`, mirrored here rather than
-        // exposed: it is `u32::next_power_of_two`, not a bespoke rule), not
-        // `n` itself — see the budget's own doc above.
-        let bucketed_rows = (n as u32).next_power_of_two() as usize;
-        assert!(
-            opt_sqrt <= SQRT_PER_PIECE * bucketed_rows,
-            "a {n}-gon's kernel (bucketed to {bucketed_rows} rows) may keep \
-             {SQRT_PER_PIECE} sqrt per row; {opt_sqrt} survived, so something \
-             is computing a root per pixel that the one body does not ask for"
+        assert_eq!(
+            count_op(&opt, opt_root, OpKind::Dwrt),
+            0,
+            "{n}-gon: a Dwrt reached the emitter"
+        );
+        for estimate in [OpKind::Recip, OpKind::Rsqrt] {
+            assert_eq!(
+                count_op(&opt, opt_root, estimate),
+                0,
+                "{n}-gon: the closed body holds a {estimate:?} estimate"
+            );
+        }
+        assert_eq!(
+            opt_sqrt, SQRT_PER_PIECE,
+            "a {n}-gon's closed body keeps {SQRT_PER_PIECE} sqrt — the four \
+             roots of the arc's closed form; {opt_sqrt} survived"
         );
     }
 }

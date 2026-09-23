@@ -56,22 +56,34 @@ const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf"
 /// pieces unroll as 16 and `O`'s 28 as 32; `8`'s piece count in this font
 /// is already a power of two, so it pays nothing and its ceiling is
 /// untouched. The padding rows are exact identities of both folds (pinned
-/// by `loop_blinn::tests::a_padding_row_is_an_exact_identity_of_both_folds`
+/// by the padding-row test in `loop_blinn::tests`
 /// and every coverage golden), so this is evaluated cost, not a coverage
 /// change — measured, ~10% headroom, same ratchet as above.
 ///
-/// One line-segment glyph, one all-quadratic, and the one whose waist
-/// tangency is the knife edge the class-cap sweep is blocked on
-/// (`egraph::saturate::CLASSICAL_CLASS_CEILING`) — so if that unblocks and
-/// the cap rises, this notices.
-const CEILINGS: [(char, usize, usize); 3] = [('A', 16, 2300), ('O', 16, 4500), ('8', 32, 9100)];
+/// Lowered 2026-09-23 to the measured count plus ~10% (142 → 156), when a
+/// glyph became one fold whose body is an integral the e-graph closes
+/// (`fonts/loop_blinn.rs`). The fold stays a loop to the assembler, so the
+/// emitted program is the closed body once, whatever the piece count: all
+/// three glyphs emit the same 142 nodes. The ceilings had not moved since
+/// the legalizer stopped unrolling the fold before saturation — the glyphs
+/// already emitted 155 nodes each against 2300, 4500 and 9100, a ratchet
+/// nobody had turned.
+///
+/// One line-segment glyph, one all-quadratic, and the one with the most
+/// pieces — so a body that came to depend on the piece count again would
+/// split them.
+const CEILINGS: [(char, usize, usize); 3] = [('A', 16, 156), ('O', 16, 156), ('8', 32, 156)];
 
-/// `(character, piece count)` — 11, 28 and 34 pieces, a 3× spread.
+/// Three glyphs with a 3× spread in piece count.
 const SPREAD: [char; 3] = ['A', 'O', '8'];
 
 /// The program the e-graph is handed must not grow with the glyph's piece
 /// count. Ten pieces and forty are the same program over a different table.
-const EGRAPH_INPUT_CEILING: usize = 3200;
+///
+/// Measured 100 nodes when the glyph became one fold of an integral, plus
+/// ~10% (it was 165 with the winding and distance folds, against a ceiling
+/// of 3200 set when the e-graph was handed the unrolled program).
+const EGRAPH_INPUT_CEILING: usize = 110;
 
 fn reachable(arena: &ExprArena, root: ExprId) -> usize {
     let mut seen = vec![false; arena.len()];
@@ -131,7 +143,7 @@ fn a_glyph_costs_no_more_than_it_did() {
 
 /// **The gate that matters.** Saturation must be handed the glyph as
 /// written — folds folded — so the program it reasons about is the same
-/// size for a 34-piece glyph as for an 11-piece one.
+/// size for `8` as for `A`, three times its piece count.
 ///
 /// What this catches is any expansion creeping back in front of the e-graph:
 /// unroll the fold first and this count becomes a multiple of the piece
@@ -181,8 +193,8 @@ fn the_egraph_is_fed_a_program_it_can_reason_about() {
     );
     assert_eq!(
         min, max,
-        "a glyph's program must not depend on its piece count — 11, 28 and 34 \
-         pieces must present the same graph over a different table:\n{report}"
+        "a glyph's program must not depend on its piece count — A, O and 8 \
+         must present the same graph over different tables:\n{report}"
     );
     println!("{report}");
 }

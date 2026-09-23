@@ -26,10 +26,15 @@ fn bench_pixelflow_single_char(c: &mut Criterion) {
     let mut group = c.benchmark_group("pixelflow_single_char");
     let font = Font::parse(FONT_DATA).unwrap();
 
-    // Different characters exercise linear vs quadratic curve solvers. The
+    // Straight pieces, curved ones, and the two with the most pieces. The
     // glyph is one fused kernel; the JIT compile is cached, so iterations
     // measure the tabulation (the per-frame cost).
-    for (label, ch) in [("A_linear", 'A'), ("O_quadratic", 'O'), ("S_complex", 'S')] {
+    for (label, ch) in [
+        ("A_linear", 'A'),
+        ("O_quadratic", 'O'),
+        ("S_complex", 'S'),
+        ("8_complex", '8'),
+    ] {
         group.bench_function(label, |b| {
             let glyph = text(&font, &ch.to_string(), 32.0);
             let kernel = pixel_centered(&glyph.kernel());
