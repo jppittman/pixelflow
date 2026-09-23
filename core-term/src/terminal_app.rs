@@ -1209,7 +1209,7 @@ mod tests {
                 if !key_sent && Instant::now() >= key_at {
                     key_tx
                         .send(Message::Management(EngineEventManagement::KeyDown {
-                            key: pixelflow_runtime::input::KeySymbol::Char('\u{3}'),
+                            key: pixelflow_runtime::input::KeySymbol::Char('c'),
                             mods: pixelflow_runtime::input::Modifiers::CONTROL,
                             text: Some("\u{3}".to_string()),
                         }))
@@ -1438,9 +1438,9 @@ mod tests {
         use pixelflow_runtime::input::{KeySymbol, Modifiers};
         let (mut app, _writer_rx, _tx, mut engine) = create_test_app();
 
-        // As X11 reports Ctrl+Shift+V: the control character it types.
+        // As X11 reports Ctrl+Shift+V: the shifted keysym, and what it typed.
         app.handle_management(EngineEventManagement::KeyDown {
-            key: KeySymbol::Char('\u{16}'),
+            key: KeySymbol::Char('V'),
             mods: Modifiers::CONTROL | Modifiers::SHIFT,
             text: Some("\u{16}".to_string()),
         })

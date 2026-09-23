@@ -5,25 +5,18 @@ use crate::term::action::UserInputAction;
 use log::debug;
 pub use pixelflow_runtime::input::{KeySymbol, Modifiers};
 
-/// The key a chord names, independent of how a platform reports it.
+/// The chord a binding names: the key and the modifiers the user held.
 ///
-/// Platforms disagree about what a chord *is*: X11 reports Ctrl+Shift+C as
-/// the control character it types (U+0003), macOS as the key `c`, and either
-/// may add Caps Lock or Num Lock to the modifiers. A binding means the key and
-/// the modifiers the user held, so both sides of a lookup are folded to that:
-/// lock states dropped, a control character under Ctrl named by its letter,
-/// and letters lowercase.
+/// Lock states are not part of a chord, and a letter is the same key whether
+/// Shift or Caps Lock made the platform report it uppercase, so both sides of
+/// a lookup are folded: lock states dropped, letters lowercase.
 #[must_use]
 pub fn chord(key_symbol: KeySymbol, modifiers: Modifiers) -> (KeySymbol, Modifiers) {
     let modifiers = modifiers - (Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK);
-    let KeySymbol::Char(c) = key_symbol else {
-        return (key_symbol, modifiers);
-    };
-    let c = match (modifiers.contains(Modifiers::CONTROL), c) {
-        (true, '\u{1}'..='\u{1a}') => char::from(b'a' + (c as u8 - 1)),
-        _ => c.to_ascii_lowercase(),
-    };
-    (KeySymbol::Char(c), modifiers)
+    match key_symbol {
+        KeySymbol::Char(c) => (KeySymbol::Char(c.to_ascii_lowercase()), modifiers),
+        _ => (key_symbol, modifiers),
+    }
 }
 
 /// Maps a given key symbol and modifiers to a `UserInputAction` based on the provided configuration.
@@ -132,33 +125,26 @@ mod tests {
     }
 
     #[test]
-    fn default_copy_binding_matches_how_every_platform_reports_ctrl_shift_c() {
+    fn default_copy_binding_matches_ctrl_shift_c_however_it_is_reported() {
         let config = Config::default();
         let ctrl_shift = Modifiers::CONTROL | Modifiers::SHIFT;
         let copy = Some(UserInputAction::InitiateCopy);
 
-        // X11 reports the control character the chord types.
-        assert_eq!(
-            map_key_event_to_action(KeySymbol::Char('\u{3}'), ctrl_shift, &config),
-            copy
-        );
-        // macOS reports the key.
-        assert_eq!(
-            map_key_event_to_action(KeySymbol::Char('c'), ctrl_shift, &config),
-            copy
-        );
-        // Either may add a lock state, or report the shifted letter.
-        assert_eq!(
-            map_key_event_to_action(
+        // X11 reports the shifted keysym, macOS the unshifted key; either may
+        // add a lock state.
+        for (key, mods) in [
+            (KeySymbol::Char('C'), ctrl_shift),
+            (KeySymbol::Char('c'), ctrl_shift),
+            (
                 KeySymbol::Char('C'),
                 ctrl_shift | Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK,
-                &config
             ),
-            copy
-        );
+        ] {
+            assert_eq!(map_key_event_to_action(key, mods, &config), copy);
+        }
         // Plain Ctrl+C is the shell's interrupt, not a binding.
         assert_eq!(
-            map_key_event_to_action(KeySymbol::Char('\u{3}'), Modifiers::CONTROL, &config),
+            map_key_event_to_action(KeySymbol::Char('c'), Modifiers::CONTROL, &config),
             None
         );
     }

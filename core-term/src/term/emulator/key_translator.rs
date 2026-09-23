@@ -60,10 +60,12 @@ pub(super) fn translate_key_input(
         }
     }
 
-    // If text is provided, and we haven't already handled a Ctrl combination, use it.
-    // However, ignore macOS private use area characters (U+F700-U+F8FF) which are
-    // placeholders for special keys like arrow keys - we need to use KeySymbol instead.
-    if let Some(txt_val) = &text {
+    // Text is what a character key typed (a layout, a dead key, an input
+    // method); a named key's bytes are the terminal's to choose, whatever text
+    // the platform attached to it. macOS private use area characters
+    // (U+F700-U+F8FF) are placeholders for special keys, never typed text.
+    let typed_text = matches!(symbol, KeySymbol::Char(_) | KeySymbol::Unknown);
+    if let Some(txt_val) = text.as_ref().filter(|_| typed_text) {
         if !txt_val.is_empty() {
             // Check if the text contains private use area characters
             let has_private_use = txt_val.chars().any(|c| {
@@ -80,7 +82,9 @@ pub(super) fn translate_key_input(
     // If no text or empty text, generate sequence from KeySymbol
     match symbol {
         KeySymbol::Enter | KeySymbol::KeypadEnter => bytes_to_send.push(b'\r'),
-        KeySymbol::Backspace => bytes_to_send.push(0x08),
+        // DEL: the line discipline's default erase character, which the PTY
+        // leaves as it is.
+        KeySymbol::Backspace => bytes_to_send.push(0x7f),
         KeySymbol::Tab => {
             if modifiers.contains(Modifiers::SHIFT) {
                 bytes_to_send.extend_from_slice(b"\x1b[Z");
@@ -180,6 +184,27 @@ mod tests {
     }
 
     #[test]
+    fn named_keys_send_their_sequence_whatever_text_the_platform_attached() {
+        let modes = DecPrivateModes::default();
+        let with_text = |symbol, text: &'static str| {
+            translate_key_input(
+                symbol,
+                Modifiers::empty(),
+                Some(std::borrow::Cow::Borrowed(text)),
+                &modes,
+            )
+        };
+        // X11 attaches DEL to Delete and BS to Backspace.
+        assert_eq!(with_text(KeySymbol::Delete, "\u{7f}"), b"\x1b[3~".to_vec());
+        assert_eq!(with_text(KeySymbol::Backspace, "\u{8}"), vec![0x7f]);
+        // A character key still sends what it typed, e.g. a layout's letter.
+        assert_eq!(
+            with_text(KeySymbol::Char('q'), "é"),
+            "é".as_bytes().to_vec()
+        );
+    }
+
+    #[test]
     fn it_should_map_ctrl_plus_char_to_its_control_code() {
         let modes = DecPrivateModes::default();
         // Test Ctrl+c
@@ -227,7 +252,7 @@ mod tests {
     fn it_should_translate_editing_and_navigation_keys_to_their_own_escape_sequences() {
         let modes = DecPrivateModes::default();
         let cases: [(KeySymbol, &[u8]); 8] = [
-            (KeySymbol::Backspace, &[0x08]),
+            (KeySymbol::Backspace, &[0x7f]),
             (KeySymbol::Escape, &[0x1B]),
             (KeySymbol::Home, b"\x1b[1~"),
             (KeySymbol::End, b"\x1b[4~"),
