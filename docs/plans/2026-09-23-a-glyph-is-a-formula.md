@@ -200,6 +200,19 @@ Four capabilities, each a denotation the language nearly has.
 
 ### 4.1 `area` — the definite integral over the pixel
 
+> **Partly withdrawn by [an-integral-is-a-fold](2026-09-23-an-integral-is-a-fold.md) §2.**
+> Three things below no longer hold, and this section is kept as written
+> rather than rewritten. The node shape: an integral is not
+> `Area { integrand, form }` but a fold over an interval
+> (`Fold::Interval`), whose binder is what the form operands were trying to
+> be. The rule that "`at` never substitutes the measure": the integral binds
+> at construction like every fold, and `at` is plain precomposition —
+> `area(k.at(σ))` is the screen pixel under the warped shape, `area(k).at(σ)`
+> the warped pixel. And the corner cell `[x₀, x₀+1)`: the pixel is centred,
+> `[−½, ½)` about the sample, which is what this section's own formulas
+> already assumed. The rules, the integrands and the build order stand, as
+> rules over interval folds.
+
 The sampling adjoint the lattice has been missing: `area(k)` is the
 box-filtered sample, `∫∫_pixel k`. It is the antialiasing primitive for
 everything, not only glyphs, and it is where the author stops doing

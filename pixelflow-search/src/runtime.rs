@@ -40,7 +40,7 @@ use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, ExprNode, UniformDecl};
 use pixelflow_ir::key::{Canonical, canonical};
 use pixelflow_ir::optimize::{Identity, Optimize};
-use pixelflow_ir::passes::{ExpandRefs, LowerDwrt};
+use pixelflow_ir::passes::{ExpandRefs, Resolve};
 use pixelflow_ir::pipeline;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -153,7 +153,7 @@ fn optimize_runtime_arena_uncached(
 /// of docs/plans/2026-09-06-egraph-at-production-scale.md §7, measured by
 /// docs/results/2026-09-07-egraph-off-vs-on-real-shaders.md.
 fn without_saturation(arena: &ExprArena, root: ExprId) -> Option<(ExprArena, ExprId)> {
-    pipeline![ExpandRefs, Identity, LowerDwrt]
+    pipeline![ExpandRefs, Identity, Resolve]
         .optimize(arena, root)
         .into_changed()
 }
@@ -196,16 +196,20 @@ fn extract_for(
         .relink(extracted_root, arena.buffers(), arena.uniforms());
     let _ = root;
 
-    // `LowerDwrt` last, and that is the whole point: legalization is the
-    // *fallback*, taking whatever illegal shape survived saturation — a
-    // `Dwrt` the chain rule did not reach — and making it emittable. It owns
-    // nothing the graph does not also know, so running it first only takes
-    // choices away. A `Reduce` is not illegal, nested or not: codegen emits
-    // a surviving fold as a loop, and a fold inside a fold as a loop inside
-    // a loop, so every fold stays folded all the way to the assembler.
-    // Mirrors `pixelflow-ir::passes::legalize`, which says the same thing at
-    // the other compile entry.
-    pixelflow_ir::passes::lower_dwrt_owned(&in_callers_order, extracted_root).ok()
+    // `resolve` last, and that is the whole point: legalization is the
+    // *fallback*, taking whatever illegal shape survived saturation — an
+    // integral no rule closed, a `Dwrt` the chain rule did not reach — and
+    // making it emittable. It owns nothing the graph does not also know, so
+    // running it first only takes choices away. `resolve` and not
+    // `lower_dwrt` alone: a `Dwrt` over an integral survives saturation (the
+    // chain rule does not pass through a fold), and `lower_dwrt` refuses a
+    // `Reduce`, so lowering it without quadrature first would decline and
+    // throw the whole saturation away. A *range* `Reduce` is not illegal,
+    // nested or not: codegen emits a surviving fold as a loop, and a fold
+    // inside a fold as a loop inside a loop, so every range stays folded all
+    // the way to the assembler. `pixelflow-ir::passes::legalize` calls the
+    // same `resolve` at the other compile entry.
+    pixelflow_ir::passes::resolve(&in_callers_order, extracted_root).ok()
 }
 
 /// How many terms this process has saturated.

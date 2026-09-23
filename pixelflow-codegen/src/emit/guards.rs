@@ -1329,8 +1329,8 @@ mod tests {
     /// A four-trip fold; the scope its body was carved into is not what
     /// these tests look at, so the body names a hole.
     fn reduce() -> ScheduledOp {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
-        let fold = Fold::new(
+        use pixelflow_ir::fold::{Binder, Monoid, RangeFold};
+        let fold = RangeFold::new(
             Monoid::SUM,
             Binder::from_slot(0).expect("slot 0 exists"),
             0..4,

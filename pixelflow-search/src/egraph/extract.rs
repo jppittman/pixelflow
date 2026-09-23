@@ -2186,7 +2186,9 @@ fn weighted_own<C: CostFunction>(costs: &C, node: &ENode, weight: u64) -> usize 
 ///
 /// One, for everything except a fold: `⊕_{[lo,hi)} f` evaluates `f` once per
 /// index, and codegen emits a surviving fold as a loop that runs its body
-/// exactly that many times (`pixelflow_ir::passes::legalize`). Pricing the
+/// exactly that many times (`pixelflow_ir::passes::legalize`); an integral
+/// no rule closed evaluates `f` once per node of the quadrature rule
+/// legalization replaces it by. Both are `Fold::evaluations`. Pricing the
 /// body once would tell the extractor a 34-piece fold costs what one piece
 /// costs, which is how an unpriced fold turns the e-graph's unrolling
 /// (`PeelFold`, `HalveFold`) off — it would keep every fold, unconditionally,
@@ -2204,7 +2206,7 @@ fn weighted_own<C: CostFunction>(costs: &C, node: &ENode, weight: u64) -> usize 
 /// for it.
 fn fold_body_multiple(node: &ENode) -> u64 {
     match node {
-        ENode::Reduce { fold, .. } => u64::from(fold.len()),
+        ENode::Reduce { fold, .. } => fold.evaluations(),
         _ => 1,
     }
 }

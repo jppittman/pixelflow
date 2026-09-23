@@ -38,8 +38,8 @@ pub enum ExprData {
     /// Operator node. Arity (unary, binary, ternary, nary) is a property of the
     /// DAG edge count (`node.child_count()`).
     Op(OpKind),
-    /// A bounded fold. Its one child is the body; everything else about it —
-    /// monoid, binder, range — is [`Fold`], and lives here rather than in
+    /// A fold. Its one child is the body; everything else about it —
+    /// monoid, binder, domain — is [`Fold`], and lives here rather than in
     /// `Const` children.
     ///
     /// The alternative encoding is `Op(OpKind::Reduce)` over

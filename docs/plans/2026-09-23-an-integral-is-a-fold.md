@@ -124,11 +124,17 @@ monoid `Σ` already lists integration among its uses (`fold.rs:46`). The
 integral is that fold with a different measure:
 
 ```text
-Fold { monoid, binder, domain }    domain = Range { lo, hi, stride }    integers, counting measure    today's Fold
-                                          | Interval { lo, hi }         reals, length measure         new
+enum Fold = Range(RangeFold { monoid, binder, lo, hi, stride })    integers, counting measure    runs as a loop
+          | Interval(IntervalFold { binder, lo, hi })              reals, length measure         closed or legalized
 
-⟦Reduce { Fold { SUM, u, Interval[lo, hi) }, body }⟧ = ∫_lo^hi ⟦body⟧[u := s] ds
+⟦Reduce { Fold::Interval({ u, [lo, hi) }), body }⟧ = ∫_lo^hi ⟦body⟧[u := s] ds
 ```
+
+An enum rather than one struct with a domain field, because that is where
+the difference can be refused instead of checked: a range accessor
+(`len`, `stride`, `peel`) on an interval is a compile error, since a caller
+must match `Fold::Range` to reach one, and a non-`Σ` integral is
+unrepresentable, since `IntervalFold` has no monoid to hold one.
 
 The binder is the same kind of thing in both: a fresh index the body reads
 (`Binder`, `fold.rs:96-112`). The two domains differ in one respect only, the

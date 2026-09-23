@@ -323,9 +323,11 @@ pub enum ExprNode {
     /// N-ary node. Its children's location is private storage detail — see
     /// [`NaryChildren`] — and comes back through [`ExprArena::children`].
     Nary(OpKind, NaryChildren),
-    /// A bounded fold: `⊕_{k} body[fold.binder() := k]`, `k` ranging over
-    /// `fold`'s own visited indices (see [`Fold`]'s doc — `lo`, `lo+stride`,
-    /// …, [`Fold::len`] of them).
+    /// A fold: `⊕_{k} body[fold.binder() := k]` over a range's visited
+    /// indices (`lo`, `lo+stride`, …, [`RangeFold::len`] of them), or
+    /// `∫ body[fold.binder() := u] du` over an interval — see [`Fold`].
+    ///
+    /// [`RangeFold::len`]: crate::fold::RangeFold::len
     ///
     /// The only node that *binds* — the binder is not free in the result — and
     /// the only one whose metadata is part of its identity rather than a
@@ -793,10 +795,11 @@ impl ExprArena {
         self.push_ternary(OpKind::Gather, buf, x, y)
     }
 
-    /// Push the bounded fold `⊕_{k ∈ fold.range()} body[fold.binder() := k]`.
+    /// Push the fold `fold` performs over `body` — a `⊕` over a range, or an
+    /// `∫` over an interval.
     ///
     /// Two arguments, because [`Fold`] is the metadata: which algebra, which
-    /// index, which range. Every one of those was an assertion here — a
+    /// index, which domain. Every one of those was an assertion here — a
     /// combiner that is a monoid, a var index inside the binder space, a trip
     /// count that fits — and each is now a thing the type will not build.
     /// `expand_reduce` lowers a survivor to an unrolled accumulation.
@@ -1886,29 +1889,7 @@ impl ExprArena {
                     ExprNode::Reduce { fold, body } => {
                         stack.push(Task::WriteStr(")"));
                         stack.push(Task::Visit(*body));
-                        // The step is worth stating once it is not 1 — the
-                        // shape `Fold::halve` leaves behind — since `range()`
-                        // alone would then read as "every index" and isn't.
-                        if fold.stride() == 1 {
-                            write!(
-                                f,
-                                "{}_{}over({}..{})(",
-                                OpKind::Reduce.name(),
-                                fold.binder().var(),
-                                fold.range().start,
-                                fold.range().end
-                            )?;
-                        } else {
-                            write!(
-                                f,
-                                "{}_{}over({}..{} step {})(",
-                                OpKind::Reduce.name(),
-                                fold.binder().var(),
-                                fold.range().start,
-                                fold.range().end,
-                                fold.stride()
-                            )?;
-                        }
+                        write!(f, "{}[{fold}](", OpKind::Reduce.name())?;
                     }
                     ExprNode::Guard { mask, on, off } => {
                         stack.push(Task::WriteStr(")"));

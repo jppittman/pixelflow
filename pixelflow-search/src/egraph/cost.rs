@@ -15,8 +15,27 @@
 //! - Custom domain-specific cost models
 
 use super::node::ENode;
-use pixelflow_ir::OpKind;
 use pixelflow_ir::kind::OpMap;
+use pixelflow_ir::{Fold, OpKind};
+
+/// The price of a node only legalization can remove: a `Dwrt` the chain rule
+/// did not reach, and an integral no rule closed. One number for both,
+/// because they are the same situation — the term is correct, the calculus
+/// left it symbolic, and `pixelflow_ir::passes::resolve` will lower it after
+/// extraction by a fixed rule.
+///
+/// **A legalization price, never an accuracy knob.** It decides one thing:
+/// that extraction takes any right-hand side a rule derived — a chain rule's
+/// derivative, an integral's closed form — over the symbolic node, which it
+/// must be dear enough to do. It does not choose how an unclosed integral is
+/// approximated; that is `IntervalFold::quadrature`'s, and changing this
+/// number changes no emitted sample.
+///
+/// Finite rather than a sentinel, for the reason [`CostModel::node_op_cost`]
+/// gives at its `Dwrt` arm: extraction must be able to *keep* the node and
+/// hand it on, and a saturating price makes the DP's claim disagree with the
+/// recomputed price of the term it names.
+pub(crate) const LEGALIZATION_PRICE: usize = 1000;
 
 // ============================================================================
 // Latency Prior — single source of truth
@@ -132,7 +151,7 @@ pub fn latency_prior_cycles() -> OpMap<usize> {
         OpKind::Shr => 1,
         OpKind::BitAnd => 1,
         OpKind::BitOr => 1,
-        OpKind::Dwrt => 1000,
+        OpKind::Dwrt => LEGALIZATION_PRICE,
         OpKind::Buffer => 0,     // leaf, free
         OpKind::Gather => 10,    // memory read
         OpKind::RawGather => 10, // primitive memory read
@@ -356,10 +375,23 @@ impl CostModel {
             //
             // An unpriceable monoid keeps the sentinel: extraction must not
             // choose a fold whose combiner has no operation to emit.
-            ENode::Reduce { fold, .. } => match super::fold_rules::combiner_op(fold.monoid()) {
-                Some(op) => (fold.len() as usize).saturating_sub(1) * self.cost(op.kind()),
+            ENode::Reduce {
+                fold: Fold::Range(range),
+                ..
+            } => match super::fold_rules::combiner_op(range.monoid()) {
+                Some(op) => (range.len() as usize).saturating_sub(1) * self.cost(op.kind()),
                 None => usize::MAX / 4,
             },
+            // **An integral no rule closed costs what a surviving `Dwrt`
+            // does**, for the same reason: legalization lowers it after
+            // extraction (quadrature), so it must be keepable, and it must
+            // lose to every closed form a rule derived. The quadrature's own
+            // samples are the body's price, multiplied in by
+            // `fold_body_multiple` like a range's trip count.
+            ENode::Reduce {
+                fold: Fold::Interval(_),
+                ..
+            } => LEGALIZATION_PRICE,
         }
     }
 

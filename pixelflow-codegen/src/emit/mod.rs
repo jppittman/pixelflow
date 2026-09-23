@@ -78,7 +78,7 @@ pub mod x86_64;
 pub use encoded::EncodedInst;
 pub use storage::{Slot, SourceOperand, StackFrame, Storage, StoreTarget};
 
-use pixelflow_ir::fold::Fold;
+use pixelflow_ir::fold::{Fold, RangeFold};
 use pixelflow_ir::kind::OpKind;
 
 pub use guards::SelectArm;
@@ -2381,7 +2381,11 @@ pub enum ScheduledOp {
     /// the loop's result comes from [`regalloc::Allocation::opens_at`]
     /// naming the [`regalloc::Scope::Fold`] this def opens, not from this
     /// `ValueId`.
-    Reduce(Fold, regalloc::ValueId),
+    ///
+    /// A [`RangeFold`], by type: a loop is what this becomes, and only a
+    /// range is one. An interval cannot reach a schedule —
+    /// `arena_to_schedule` refuses it — so nothing downstream asks.
+    Reduce(RangeFold, regalloc::ValueId),
     /// A surviving `Guard`: the mask, and its two arms' names. `mask` is a
     /// real value in *this* schedule (`arena_to_schedule` maps it like any
     /// other child); the two `KernelKey`s are not — they name kernels whose
@@ -2659,7 +2663,10 @@ fn arena_to_schedule_from(
             ExprNode::Nary(_, _) => panic!("Nary not supported in JIT arena compilation"),
             // The lane fold, executed by lanes: its body is the store, and
             // the store is this def, with the fold's trip count as its width.
-            ExprNode::Reduce { fold, body } if matches!(arena.node(body), ExprNode::Write { lane, .. } if lane == fold.binder()) =>
+            ExprNode::Reduce {
+                fold: Fold::Range(fold),
+                body,
+            } if matches!(arena.node(body), ExprNode::Write { lane, .. } if lane == fold.binder()) =>
             {
                 let ExprNode::Write {
                     row, col, value, ..
@@ -2681,7 +2688,25 @@ fn arena_to_schedule_from(
             // value's `ValueId` in *this* numbering. `extract_folds` reads
             // it back out into the fold's own `ScopeFold`; nothing after
             // that resolves it as an operand (see `ScheduledOp::Reduce`).
-            ExprNode::Reduce { fold, body } => ScheduledOp::Reduce(fold, map_child(body)),
+            ExprNode::Reduce {
+                fold: Fold::Range(fold),
+                body,
+            } => ScheduledOp::Reduce(fold, map_child(body)),
+            // Unreachable precondition, like `Dwrt` above: every compile
+            // entry point runs `passes::resolve`, which replaces an integral
+            // no rule closed by its quadrature. An interval is not a loop, so
+            // there is nothing here to schedule; a survivor means this
+            // schedule was built without the lowering pipeline.
+            ExprNode::Reduce {
+                fold: fold @ Fold::Interval(_),
+                ..
+            } => panic!(
+                "arena_to_schedule: an interval fold ({fold}) reached the JIT \
+                 emitter. An integral is not a loop; passes::resolve replaces \
+                 every one by its quadrature in every compile entry point, so \
+                 a survivor means this schedule was built without the \
+                 lowering pipeline."
+            ),
             // G2: a `Guard` is not lowered away like `Reduce`/`Ref` above —
             // it is meant to be *emitted*, not expanded. Its mask is the one
             // real child in this arena, mapped like any other operand; its
@@ -3763,7 +3788,7 @@ fn schedule_guard_arm(
     });
     let (arena, root) = kernel.parts();
     let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
-    let (arena, root) = pixelflow_ir::passes::lower_dwrt_owned(&arena, root).unwrap_or_else(|e| {
+    let (arena, root) = pixelflow_ir::passes::resolve(&arena, root).unwrap_or_else(|e| {
         panic!("schedule_guard_arm: {key:?}'s arm has no derivative rule: {e}")
     });
     let schedule = arena_to_schedule_from(&arena, root, GUARD_ARM_NO_ORIGIN, starting_id);
@@ -4123,6 +4148,18 @@ mod tests {
         let two = a.push_const(2.0);
         let root = a.push_binary(OpKind::Mul, x, two);
         let _ = arena_to_schedule(&a, root, RAW_ORIGIN);
+    }
+
+    /// And the same for an integral: an interval fold is not a loop, and
+    /// `passes::resolve` replaces every one by its quadrature before a
+    /// schedule is built. A constant integrand, so no coordinate reaches the
+    /// scheduler ahead of the fold and trips its own panic first.
+    #[test]
+    #[should_panic(expected = "an interval fold")]
+    fn a_surviving_interval_fails_loudly() {
+        let area = pixelflow_ir::Kernel::constant(1.0).area();
+        let (arena, root) = area.parts();
+        let _ = arena_to_schedule(arena, root, RAW_ORIGIN);
     }
 
     /// And the same for a `Ref`: its body is not in this arena at all, so a

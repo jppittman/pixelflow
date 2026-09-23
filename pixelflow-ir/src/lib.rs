@@ -32,10 +32,10 @@ extern crate alloc;
 pub mod dyadic;
 
 /// What a bounded reduction *is*: the algebra it folds under, the index it
-/// binds, and the range that index runs over. See the module docs for why
+/// binds, and the domain that index runs over. See the module docs for why
 /// those are a type rather than three `Const` children.
 pub mod fold;
-pub use fold::{Binder, Fold, Monoid};
+pub use fold::{Binder, Fold, IntervalFold, Monoid, RangeFold};
 
 pub mod kind;
 pub mod traits;

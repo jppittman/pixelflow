@@ -195,7 +195,13 @@ impl Rewrite for PeelFold {
     }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
-        let ENode::Reduce { fold, body } = node else {
+        // A range only: peeling takes one index off a count, and an interval
+        // has neither indices nor a count.
+        let ENode::Reduce {
+            fold: Fold::Range(fold),
+            body,
+        } = node
+        else {
             return None;
         };
         // `HalveFold`'s epilogue only (see this rule's doc): while the fold
@@ -213,7 +219,7 @@ impl Rewrite for PeelFold {
         Some(RewriteAction::PeelFold {
             head,
             head_root,
-            rest,
+            rest: Fold::Range(rest),
             body: *body,
         })
     }
@@ -225,7 +231,12 @@ impl Rewrite for HalveFold {
     }
 
     fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
-        let ENode::Reduce { fold, body } = node else {
+        // A range only, like `PeelFold`: a stride is a range's.
+        let ENode::Reduce {
+            fold: Fold::Range(fold),
+            body,
+        } = node
+        else {
             return None;
         };
         let halved = fold.halve()?;
@@ -237,7 +248,7 @@ impl Rewrite for HalveFold {
         Some(RewriteAction::HalveFold {
             shift,
             shift_root,
-            halved,
+            halved: Fold::Range(halved),
             body: *body,
         })
     }
@@ -522,9 +533,13 @@ fn named(class: EClassId) -> Done {
 /// One plan node, over already-planned children.
 fn rebuild(node: &ENode, kids: &[Done]) -> Option<HeadNode> {
     match node {
-        // A nested fold binds a slot of its own — `lowest_free_binder` never
-        // reissues a live one — so the outer substitution passes through its
-        // body without capture.
+        // A nested fold reached here binds a slot other than the one being
+        // substituted, so the substitution passes through its body. One
+        // that rebinds the substituted slot is never reached: it shadows the
+        // slot, so its class's variance excludes it and `rebuild_body` names
+        // the class before descending. "`lowest_free_binder` never reissues
+        // a live slot" is not what makes that safe — it is false across a
+        // `Ref`, which `Kernel::over` does not see through.
         ENode::Reduce { fold, .. } => Some(HeadNode::Reduce {
             fold: *fold,
             body: kids.first()?.at,
@@ -609,7 +624,7 @@ mod tests {
         );
         let rest_class = eg.find(sum[0]);
         match eg.nodes(rest_class).iter().find_map(ENode::fold) {
-            Some(rest) => {
+            Some(Fold::Range(rest)) => {
                 assert_eq!(rest.range(), 0..2, "the rest is the shorter range");
                 assert_eq!(
                     eg.find(match eg.nodes(rest_class).first() {
@@ -620,7 +635,7 @@ mod tests {
                     "and it folds the same body class, unchanged"
                 );
             }
-            None => panic!("the rest must be a fold"),
+            other => panic!("the rest must be a range fold, got {other:?}"),
         }
     }
 
@@ -705,7 +720,10 @@ mod tests {
             .nodes(class)
             .iter()
             .find_map(|n| match n {
-                ENode::Reduce { fold, body } if fold.stride() > 1 => Some((*fold, eg.find(*body))),
+                ENode::Reduce {
+                    fold: Fold::Range(fold),
+                    body,
+                } if fold.stride() > 1 => Some((*fold, eg.find(*body))),
                 _ => None,
             })
             .expect("the class must now also hold the halved fold");
@@ -1020,6 +1038,210 @@ mod tests {
             }
             other => panic!("expected a peel, got {other:?}"),
         }
+    }
+
+    /// `∫_lo^hi` over `slot`, through the one public door an interval has
+    /// outside `pixelflow-ir` besides `Kernel::area`: `Fold::from_bits`, with
+    /// the layout its doc gives (tag 1 at bit 112, slot at 64, endpoint bits
+    /// at 32 and 0).
+    fn interval(slot: u8, lo: f32, hi: f32) -> Fold {
+        let bits = 1u128 << 112
+            | u128::from(slot) << 64
+            | u128::from(lo.to_bits()) << 32
+            | u128::from(hi.to_bits());
+        Fold::from_bits(bits).expect("a finite, nonempty interval")
+    }
+
+    /// `(Y·X).area()` in an e-graph: its root class and both folds, outer
+    /// (`u_y`) first.
+    fn area_of_y_times_x(rules: Vec<Box<dyn Rewrite>>) -> (EGraph, [(EClassId, ENode); 2]) {
+        let kernel = pixelflow_ir::Kernel::y()
+            .mul(&pixelflow_ir::Kernel::x())
+            .area();
+        let (arena, root) = kernel.parts();
+        let mut eg = EGraph::with_rules(rules);
+        let outer_class = insert(arena, root, &mut eg, Vocabulary::Runtime).expect("inserts");
+        let outer = eg.nodes(outer_class).first().expect("a class").clone();
+        let ENode::Reduce {
+            body: inner_class, ..
+        } = outer
+        else {
+            panic!("area's root is a fold, got {outer:?}")
+        };
+        let inner_class = eg.find(inner_class);
+        let inner = eg.nodes(inner_class).first().expect("a class").clone();
+        (eg, [(outer_class, outer), (inner_class, inner)])
+    }
+
+    /// **(d) The range rules decline an integral.** Peeling takes an index
+    /// off a count, halving doubles a stride, and an empty domain is an
+    /// identity — an interval has no index, no stride, and is never empty —
+    /// so all three decline on both of `area`'s folds, by pattern: they
+    /// match `Fold::Range` and nothing else.
+    #[test]
+    fn the_range_rules_decline_an_interval() {
+        let (eg, folds) = area_of_y_times_x(fold_rules());
+        for (class, node) in &folds {
+            assert!(
+                matches!(
+                    node,
+                    ENode::Reduce {
+                        fold: Fold::Interval(_),
+                        ..
+                    }
+                ),
+                "area builds intervals: {node:?}"
+            );
+            assert!(
+                PeelFold.apply(&eg, *class, node).is_none(),
+                "peel: {node:?}"
+            );
+            assert!(
+                HalveFold.apply(&eg, *class, node).is_none(),
+                "halve: {node:?}"
+            );
+            assert!(
+                EmptyFold.apply(&eg, *class, node).is_none(),
+                "empty: {node:?}"
+            );
+        }
+    }
+
+    /// **(d) Factoring is the one fold rule that holds for both domains.**
+    /// `(Y·X).area()`'s inner fold is `∫_{u_x} (Y + u_y)·(X + u_x)`: the left
+    /// factor does not read `u_x`, so `∫ c·f = c·∫ f` fires, with `c` the
+    /// class of `Y + u_y` — read off the class variance fact, like a range's.
+    #[test]
+    fn factor_fold_factors_an_integral() {
+        let (eg, [(_, outer), (inner_class, inner)]) = area_of_y_times_x(factor_only());
+        let (
+            ENode::Reduce {
+                fold: outer_fold, ..
+            },
+            ENode::Reduce {
+                fold: inner_fold,
+                body,
+            },
+        ) = (&outer, &inner)
+        else {
+            panic!("two folds")
+        };
+        let fired = match FactorFold.apply(&eg, inner_class, &inner) {
+            Some(RewriteAction::FactorFold(factoring)) => factoring,
+            other => panic!("expected a factoring, got {other:?}"),
+        };
+        assert_eq!(fired.distributor.kind(), OpKind::Mul);
+        assert_eq!(fired.fold, *inner_fold, "the integral is unchanged");
+        let factor_variance = eg.variance(fired.factor);
+        assert!(
+            !factor_variance.depends_on(inner_fold.binder().var()),
+            "the factor must not read the integral's own binder"
+        );
+        assert!(
+            factor_variance.depends_on(1) && factor_variance.depends_on(outer_fold.binder().var()),
+            "and it is the `Y + u_y` operand, which reads Y and the outer binder"
+        );
+        assert!(
+            eg.nodes(*body).iter().any(|n| matches!(n,
+                ENode::Op { op, children } if op.kind() == OpKind::Mul
+                    && children.contains(&fired.factor) && children.contains(&fired.rest))),
+            "factor and rest are the operands of the integrand's product"
+        );
+    }
+
+    /// **A peel stops at a fold that rebinds its slot.** `Σ_{i<3} (∫_{i ∈
+    /// [-½,½)} i·X + i)`: the integral rebinds slot 0 inside a sum over slot
+    /// 0 — the shape `expand_refs` produces when a sum is built over an
+    /// integral named by reference, since `Kernel::over` chooses a slot
+    /// without seeing through a `Ref`. The inner binder shadows: the
+    /// integral does not read the sum's index, so peeling names its class
+    /// and copies nothing of it. Rebuilding it would substitute the peeled
+    /// index for the integral's own variable — plausible, wrong pixels.
+    #[test]
+    fn a_peel_stops_at_a_fold_that_rebinds_its_slot() {
+        let mut integral = None;
+        let f = folded(fold_rules(), over(Monoid::SUM, 0..3), |eg, i| {
+            let x = eg.add(ENode::Var(0));
+            let ix = eg.add(op2(&ops::Mul, i, x));
+            let shadowing = eg.add(ENode::Reduce {
+                fold: interval(0, -0.5, 0.5),
+                body: ix,
+            });
+            integral = Some(shadowing);
+            eg.add(op2(&ops::Add, shadowing, i))
+        });
+        let integral = f.eg.find(integral.expect("built"));
+        match PeelFold.apply(&f.eg, f.class, &f.node) {
+            Some(RewriteAction::PeelFold { head, .. }) => {
+                assert!(
+                    !head.iter().any(|n| matches!(n, HeadNode::Reduce { .. })),
+                    "the integral must be named, not rebuilt: {head:?}"
+                );
+                assert!(
+                    head.iter()
+                        .any(|n| matches!(n, HeadNode::Op { children, .. }
+                        if children.contains(&HeadRef::Class(integral)))),
+                    "the peeled term reads the integral's own class: {head:?}"
+                );
+            }
+            other => panic!("expected a peel, got {other:?}"),
+        }
+    }
+
+    /// **An integral no rule closed loses to a closed form.** A surviving
+    /// interval is priced like a surviving `Dwrt` — keepable, so extraction
+    /// can hand it to legalization, and dearer than any right-hand side a
+    /// rule derives. Union it with a constant, as a closing rule would, and
+    /// extraction takes the constant.
+    #[test]
+    fn a_closed_form_beats_a_surviving_integral() {
+        let mut eg = EGraph::with_rules(Vec::new());
+        let x = eg.add(ENode::Var(0));
+        let u = eg.add(ENode::Var(binder(0).var()));
+        let body = eg.add(op2(&ops::Add, x, u));
+        let integral = eg.add(ENode::Reduce {
+            fold: interval(0, -0.5, 0.5),
+            body,
+        });
+        let (kept, kept_root, _) = extract(&eg, integral, &CostModel::latency_prior());
+        assert!(
+            matches!(
+                kept.node(kept_root),
+                ExprNode::Reduce {
+                    fold: Fold::Interval(_),
+                    ..
+                }
+            ),
+            "alone, the integral is kept for legalization"
+        );
+
+        let closed = eg.add(ENode::constant(7.0));
+        eg.union(integral, closed);
+        eg.rebuild();
+        let (out, out_root, _) = extract(&eg, integral, &CostModel::latency_prior());
+        assert!(
+            matches!(out.node(out_root), ExprNode::Const(v) if v == 7.0),
+            "a closed form must win: got {:?}",
+            out.node(out_root)
+        );
+    }
+
+    /// A range and an interval over the same binder and body are different
+    /// folds — `[0,1)` summed and `[0,1)` integrated agree on nothing in
+    /// general — so hash-consing keeps them apart.
+    #[test]
+    fn a_range_and_an_interval_are_different_nodes() {
+        let mut eg = EGraph::with_rules(Vec::new());
+        let u = eg.add(ENode::Var(binder(0).var()));
+        let sum = eg.add(ENode::Reduce {
+            fold: Fold::new(Monoid::SUM, binder(0), 0..1),
+            body: u,
+        });
+        let integral = eg.add(ENode::Reduce {
+            fold: interval(0, 0.0, 1.0),
+            body: u,
+        });
+        assert_ne!(eg.find(sum), eg.find(integral));
     }
 
     /// `FactorFold` is the runtime tier's and only the runtime tier's.
