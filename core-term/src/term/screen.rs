@@ -719,6 +719,39 @@ impl Screen {
         self.mark_line_dirty(y);
     }
 
+    /// Writes `ascii` — printable ASCII, one cell per byte — into row `y` from
+    /// column `x`, exactly as one `set_glyph` per byte would.
+    pub(in crate::term) fn write_ascii(
+        &mut self,
+        x: usize,
+        y: usize,
+        ascii: &str,
+        attr: Attributes,
+    ) {
+        let end = x + ascii.len();
+        if y >= self.height || end > self.width || end > self.active_grid()[y].len() {
+            warn!(
+                "write_ascii: cells {}..{} of row {} out of screen bounds ({}x{})",
+                x, end, y, self.width, self.height
+            );
+            return;
+        }
+        let row = Arc::make_mut(&mut self.active_grid_mut()[y]);
+        // Overwriting a wide character's primary cell orphans its spacer; every
+        // spacer but the last one's is overwritten by the run itself.
+        if end < row.len() && matches!(row[end - 1], Glyph::WidePrimary(_)) {
+            row[end] = Glyph::Single(ContentCell::default_space());
+        }
+        for (cell, byte) in row[x..end].iter_mut().zip(ascii.bytes()) {
+            *cell = Glyph::Single(ContentCell {
+                c: char::from(byte),
+                attr,
+                combining: None,
+            });
+        }
+        self.mark_line_dirty(y);
+    }
+
     pub fn clear_line_segment(&mut self, y: usize, x_start: usize, x_end: usize) {
         let fill_glyph = self.get_default_fill_glyph();
         self.fill_region_with_glyph(y, x_start..x_end, fill_glyph);

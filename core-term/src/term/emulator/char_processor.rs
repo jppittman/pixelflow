@@ -10,6 +10,11 @@ use crate::{
 };
 use log::{trace, warn};
 
+/// A byte that is one whole, one-cell-wide character: printable ASCII.
+fn is_printable_ascii(byte: u8) -> bool {
+    (b' '..=b'~').contains(&byte)
+}
+
 impl TerminalEmulator {
     /// Attaches a combining (zero-width) character to the most recently written cell.
     ///
@@ -82,6 +87,58 @@ impl TerminalEmulator {
                 }
             }
             CharacterSet::DecLineDrawing => map_to_dec_line_drawing(ch),
+        }
+    }
+
+    /// Prints `run` exactly as one `print_char` per character would, writing
+    /// printable ASCII a line segment at a time when the active charset maps
+    /// it to itself.
+    pub(super) fn print_str(&mut self, mut run: &str) {
+        while let Some(&first) = run.as_bytes().first() {
+            let ascii_len = match self.active_charset_is_identity() && is_printable_ascii(first) {
+                true => run
+                    .bytes()
+                    .position(|b| !is_printable_ascii(b))
+                    .unwrap_or(run.len()),
+                false => 0,
+            };
+            if ascii_len > 0 {
+                let (ascii, rest) = run.split_at(ascii_len);
+                self.print_ascii(ascii);
+                run = rest;
+                continue;
+            }
+            let ch = run.chars().next().expect("run is non-empty");
+            self.print_char(ch);
+            run = &run[ch.len_utf8()..];
+        }
+    }
+
+    fn active_charset_is_identity(&self) -> bool {
+        self.active_charsets[self.active_charset_g_level] == CharacterSet::Ascii
+    }
+
+    /// Printable ASCII under an identity charset: every character is one cell
+    /// wide and maps to itself, so the part of the run that fits on the line
+    /// is one row write and one cursor move.
+    fn print_ascii(&mut self, mut ascii: &str) {
+        while !ascii.is_empty() {
+            let screen_ctx = self.current_screen_context();
+            let (x, y) = self.cursor_controller.physical_screen_pos(&screen_ctx);
+            // A pending wrap, or a row off the screen, is print_char's to resolve.
+            if self.cursor_wrap_next || y >= self.screen.height {
+                self.print_char(char::from(ascii.as_bytes()[0]));
+                ascii = &ascii[1..];
+                continue;
+            }
+            let fits = ascii.len().min(screen_ctx.width - x);
+            let (segment, rest) = ascii.split_at(fits);
+            self.screen
+                .write_ascii(x, y, segment, self.cursor_controller.attributes());
+            self.cursor_controller.move_right(fits, &screen_ctx);
+            let (logical_x, _) = self.cursor_controller.logical_pos();
+            self.cursor_wrap_next = logical_x >= screen_ctx.width && self.dec_modes.autowrap_mode;
+            ascii = rest;
         }
     }
 
