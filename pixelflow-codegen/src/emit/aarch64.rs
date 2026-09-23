@@ -477,19 +477,10 @@ pub fn try_encode_fmov_imm8(val: f32) -> Option<u8> {
 // Constant Pool Support
 // =============================================================================
 
-/// What the constant pool is called.
-///
-/// One name per emitted function, because there is one pool per emitted
-/// function: the anchor branches to it before a single constant is known, and
-/// the pool is written where it lands. Nothing is carried between the two —
-/// they agree because they spell the same thing.
-pub const CONST_POOL: &str = "const_pool";
-
-/// The constant pool's alignment: one [`PoolEntry`], so every `LDR Qt` from
-/// it is an aligned vector load. The padding that reaches it from the last
-/// instruction follows the code's length, which is why a kernel's trailing
-/// bytes can differ between two allocations of it by less than this.
-pub const CONST_POOL_ALIGN: usize = 16;
+/// The pool's name and alignment are every backend's, not this one's: x86
+/// anchors `r8` to a pool of the same name the same way `X17` is anchored
+/// here.
+pub use super::{CONST_POOL, CONST_POOL_ALIGN};
 
 /// Returns true if the given f32 needs a constant pool entry (not zero, not FMOV-encodable).
 #[must_use]
@@ -751,9 +742,10 @@ pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 /// `dst = op(src)`.
 ///
-/// `temp` is the allocator's temp for this instruction; only the reciprocal
+/// The temp is the allocator's for this instruction; only the reciprocal
 /// estimates use it, to hold the Newton-Raphson correction.
-pub(crate) fn emit_unary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, temp: Option<Reg>) {
+pub(crate) fn emit_unary(code: &mut Vec<u8>, unary: super::Unary) {
+    let super::Unary { op, dst, src, temp } = unary;
     match op {
         OpKind::Neg => AsmProgram::from([Inst::Fneg(dst, src)]).assemble(code),
         OpKind::Abs => AsmProgram::from([Inst::Fabs(dst, src)]).assemble(code),
@@ -2324,7 +2316,17 @@ pub(crate) mod driver {
                 .assemble(code);
             }
             ResolvedOp::Unary { op, dst, src } => {
-                emit_unary(code, *op, *dst, *src, plan.scratch.temp(0));
+                // The shared driver's `Unary`, not `table::Unary` (an
+                // encoding row), which this module also sees.
+                emit_unary(
+                    code,
+                    crate::emit::Unary {
+                        op: *op,
+                        dst: *dst,
+                        src: *src,
+                        temp: plan.scratch.temp(0),
+                    },
+                );
             }
             ResolvedOp::ShiftImm {
                 op,
