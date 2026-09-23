@@ -468,9 +468,11 @@ fn def_cycles(def: &Def, folds: &FoldReads, cycles: &CostModel) -> usize {
         ScheduledOp::Unary(op, _) | ScheduledOp::Binary(op, _, _) => cycles.cost(*op),
         ScheduledOp::ShiftImm(op, _, _) => cycles.cost(*op),
         ScheduledOp::Ternary(op, _, _, _) => cycles.cost(*op),
-        ScheduledOp::Gather(_, _) => cycles.cost(OpKind::RawGather),
-        // One scalar load broadcast, which is what a uniform read is too.
-        ScheduledOp::Broadcast(_, _) => cycles.cost(OpKind::Uniform),
+        // A broadcast is the arena's `RawGather` with a lane-uniform index,
+        // and the extractor priced it as that read. It is not a uniform's
+        // prologue leaf: it runs where its address varies, which in a fold's
+        // body is every trip.
+        ScheduledOp::Gather(_, _) | ScheduledOp::Broadcast(_, _) => cycles.cost(OpKind::RawGather),
         ScheduledOp::Reduce(..) => folds.cycles(def.value),
         // A hard branch whose arms are scopes of their own, which no walk of
         // this schedule reaches (G2,
@@ -1572,6 +1574,53 @@ mod tests {
         assert_eq!(guards.len(), 1);
         assert_eq!(guards[0].true_range(), (3, 4), "the loop is skipped whole");
         assert!(analyze_select_guards(&schedule, &[], &FoldReads::default()).is_empty());
+    }
+
+    /// A table read whose address the lane binder does not reach is a
+    /// `Broadcast`, and in a fold's body it runs every trip: `Σ_j |x − t[j]|`
+    /// is priced `n` reads, as the extractor priced the arena's `RawGather`,
+    /// not `n` of a uniform's prologue leaf (0). Its base pointer is the
+    /// scope's root and read by the loop, so the arm is the loop alone.
+    #[test]
+    fn price_a_table_read_per_trip_as_the_read_it_is() {
+        let cycles = CostModel::latency_prior();
+        let fold = sum_over(0, ARM_TRIPS);
+        let (x, ctx, j, t, diff, abs) = (0, 8, 10, 11, 12, 13);
+        let schedule = alloc::vec![
+            def(x, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Const(20.0)),
+            def(2, ScheduledOp::Binary(OpKind::Lt, ValueId(x), ValueId(1))),
+            def(ctx, ScheduledOp::Context(0)),
+            def(3, ScheduledOp::Reduce(fold, ValueId(abs))),
+            def(4, ScheduledOp::Const(0.0)),
+            def(
+                5,
+                ScheduledOp::Ternary(OpKind::Select, ValueId(2), ValueId(3), ValueId(4)),
+            ),
+            def(6, ScheduledOp::Var(1)),
+            def(7, ScheduledOp::Binary(OpKind::Add, ValueId(5), ValueId(6))),
+        ];
+        let body = [
+            def(x, ScheduledOp::Var(0)),
+            def(ctx, ScheduledOp::Context(0)),
+            def(j, ScheduledOp::Var(fold.binder().var())),
+            def(t, ScheduledOp::Broadcast(ValueId(j), ValueId(ctx))),
+            def(
+                diff,
+                ScheduledOp::Binary(OpKind::Sub, ValueId(x), ValueId(t)),
+            ),
+            def(abs, ScheduledOp::Unary(OpKind::Abs, ValueId(diff))),
+        ];
+        let folds = FoldReads::new(&schedule, [(ValueId(3), &body[..], &FoldReads::default())]);
+        let roots = [ValueId(ctx)];
+
+        let k =
+            cycles.cost(OpKind::RawGather) + cycles.cost(OpKind::Sub) + cycles.cost(OpKind::Abs);
+        let arms = select_arms(&schedule, &roots, &folds);
+        assert_eq!(arms[0].cycles.true_arm, cycles.fold_cost(fold, k));
+
+        let guards = analyze_select_guards(&schedule, &roots, &folds);
+        assert_eq!(guards[0].true_range(), (4, 5), "the loop, not its pointer");
     }
 
     /// A fold nested in the arm's fold is priced by its own trips inside

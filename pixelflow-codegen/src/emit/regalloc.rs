@@ -2726,16 +2726,13 @@ impl Boundary<'_> {
     };
 }
 
-/// What a pass reads about a scope beyond its schedule: the parks it enters
-/// with, the roots it hands off, and its guards' mask reads and arms. The
-/// same for both classes' passes over one scope.
+/// What a pass reads about a scope beyond its schedule: its [`Boundary`],
+/// and its guards' mask reads and arms. The same for both classes' passes
+/// over one scope.
 #[derive(Clone, Copy)]
 struct Reads<'a> {
-    /// Where each value an enclosing scope parked lives for the whole of
-    /// this one.
-    live_in: &'a BTreeMap<ValueId, Where>,
-    /// The values this scope computes for the scopes inside it.
-    roots: &'a [ValueId],
+    /// The parks it enters with and the roots it hands off.
+    boundary: Boundary<'a>,
     /// Per instruction, every mask a guard emitted before it reads
     /// ([`guard_sites`]).
     sites: &'a [Vec<ValueId>],
@@ -2757,8 +2754,7 @@ impl Pass {
     /// definition otherwise emits nothing and leaves the park unwritten.
     fn new(dag: &[Def], file: &RegisterFile, reads: Reads<'_>, class: Class) -> Self {
         let Reads {
-            live_in,
-            roots,
+            boundary: Boundary { live_in, roots },
             sites,
             arms: _,
         } = reads;
@@ -3145,10 +3141,8 @@ impl LinearScan {
         // path reaching any of its readers ran.
         let arms = guarded_arms(&guards, dag.len());
         let sites = guard_sites(&guards, dag.len());
-        let Boundary { live_in, roots } = boundary;
         let reads = Reads {
-            live_in,
-            roots,
+            boundary,
             sites: &sites,
             arms: &arms,
         };
@@ -3996,10 +3990,8 @@ mod tests {
     /// A scope that enters with nothing parked, hands nothing off and holds
     /// no guard: `sites` is per instruction, so it is the caller's.
     fn no_reads(sites: &[Vec<ValueId>]) -> Reads<'_> {
-        static NO_PARKS: BTreeMap<ValueId, Where> = BTreeMap::new();
         Reads {
-            live_in: &NO_PARKS,
-            roots: &[],
+            boundary: Boundary::CLOSED,
             sites,
             arms: &[],
         }
