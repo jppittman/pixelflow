@@ -3,8 +3,8 @@
 ## Metadata
 - **Author**: JP (direction), Claude (draft)
 - **Status**: `Draft`. The denotation was proposed 2026-09-23 and nothing is
-  built. §2's node shape, a `Cell` domain on `Fold`, was decided by JP the same
-  day.
+  built. §2's node shape was decided by JP the same day: an integral is a
+  fold whose domain is continuous, with no cell and no axis.
 - **Created**: 2026-09-23
 - **Verified against**: `d2a42c9`. Every `file:line` below was re-read there,
   by two independent maps and three fact-checks.
@@ -24,9 +24,13 @@
 > *"Demand is for the register allocator and variance is for the
 > factorization? These are somehow related."*
 >
-> Offered either an opcode per axis or a typed node, JP chose the typed node,
-> `Area{axis, body}`. Offered that node beside `Reduce` or as a domain of
-> `Fold`: *"I want integrals built on fold."*
+> *"I want integrals built on fold."*
+>
+> *"We shouldn't really have cell(axis)? … I think explicit mention of axes is
+> like idk, unnecessary specificity."* And: *"I think I did the X Y Z W thing
+> way before the jit and now, they're little more than conveniences."*
+>
+> On §2 as it now reads: *"yes, drop cell."*
 
 ---
 
@@ -113,109 +117,141 @@ The e-graph needs variance; codegen needs both.
 ## 2. An integral is a fold
 
 `⟦Reduce { fold, body }⟧ = ⊕_{k ∈ D} ⟦body⟧[i := k]` (`fold.rs:153`). The
-monoid `Σ` already lists integration among its uses (`fold.rs:46`). The pixel
-integral is that fold over a different domain: length measure on a cell, where
-`Σ` uses counting measure on a range.
+monoid `Σ` already lists integration among its uses (`fold.rs:46`). The
+integral is that fold with a different measure:
 
 ```text
-Fold { monoid, index }         index = Range { binder, lo, hi, stride }     today's Fold
-                                      | Cell(axis)                          the pixel along one lattice axis
+Fold { monoid, binder, domain }    domain = Range { lo, hi, stride }    integers, counting measure    today's Fold
+                                          | Interval { lo, hi }         reals, length measure         new
 
-⟦Reduce { Fold { SUM, Cell(a) }, body }⟧(ℓ) = ∫_{ℓ_a − ½}^{ℓ_a + ½} ⟦body⟧(ℓ[a := s]) ds
+⟦Reduce { Fold { SUM, u, Interval[lo, hi) }, body }⟧ = ∫_lo^hi ⟦body⟧[u := s] ds
 ```
 
-This is JP's `Area{axis, body}` given `Reduce`'s own type rather than a sibling
-node. As a sibling it would be a second implementation of "a fold over an
-index" (CLAUDE.md, "trait first"). It would also force every rule of §3 to be
-written twice or put behind a trait, when the only difference is the index's
-domain.
+The binder is the same kind of thing in both: a fresh index the body reads
+(`Binder`, `fold.rs:96-112`). The two domains differ in one respect only, the
+measure, and that has one consequence. A range can run as a loop, and an
+interval cannot. A continuous fold is either closed by a rule (§3) or
+approximated by quadrature, meaning a discrete fold standing in for it.
 
-`area[dX ∧ dY](k)` is two folds, `Cell(X)` around `Cell(Y)`. That is Fubini on
-the square, the same way `Σ_{i,j}` is two sums. `Kernel::area()` is the sugar
-for it. Nothing needs a 2-form node.
+The interval's bounds are `f32`. They are data-plane values: quadrature
+substitutes them into the body as constants.
 
-### The index is the lattice axis, bound after composition
+### The pixel is two intervals
 
-A `Range` fold binds a fresh index (`Binder`, `fold.rs:96-112`). A `Cell` fold
-binds the lattice axis itself, and it binds it **after** `Kernel::at` has
-substituted into the body. That is what makes the measure the *screen* pixel,
-as a-glyph-is-a-formula §4.1 requires:
+```text
+Kernel::area(k) = ∫_{u_y ∈ [−½, ½)} ∫_{u_x ∈ [−½, ½)} k.at(X + u_x, Y + u_y)
+```
 
-- `(area k).at(σ)` is `area (k.at(σ))`. This is the area of the screen pixel
-  under the warped shape.
-- It is **not** `∫_{cell(σ(ℓ))} k`, the area of the warped pixel.
+`X` and `Y` appear in this constructor and nowhere else. The IR sees two
+ordinary folds, each binding a fresh index. Which coordinate an interval
+perturbs is a fact about its body, not a field of the fold.
 
-Binding at construction, with the body's `X` replaced by a fresh binder at
-`Kernel::area()` time, would give the second meaning. `at` would then reach
-only the cell's centre.
+The lattice's coordinates are conveniences for naming the lattice's binders:
+`collapse` rebinds them to `x₀ + col + lane` and `y₀ + row`
+(`passes/lattice.rs:108-118`). The integral does not need them named.
 
-`Dwrt` already works this way (CLAUDE.md, "The macro tier does not resolve
-`Dwrt`"). Its consequence should be stated rather than left in a comment:
+Fubini needs no node of its own. The pixel is *built* as two folds, and
+swapping them is interchange (§3), the same rule that swaps two sums.
 
-- A kernel carrying a `Dwrt` or a `Cell` fold denotes `Warp → (Ω → V)`, not
-  `Ω → V`.
-- A rule that is **natural in the warp** holds before composition. Linearity,
-  interchange and Fubini are examples.
-- A rule that holds **only at the identity warp** is sound only after
-  composition. Factoring by `X ∉ var(c)` and the basis integrals are examples:
-  `X`-invariance is not stable under `at`.
-- So `Cell` folds resolve only in the runtime tier. The macro tier declines
-  them by vocabulary (`insert.rs:124-127`, `ops.rs:356-386`), not by a second
-  `DwrtFree` walk.
+### Bound at construction; `at` is precomposition
 
-### The cell is centred
+Like every other fold, the integral binds when it is built. `Kernel::at` then
+substitutes the coordinates of the result. The order of composition says which
+integral the author means:
+
+- `area(k.at(σ))` is the screen pixel under the warped shape. This is what the
+  glyph wants: `area` is the last thing before `collapse`.
+- `area(k).at(σ)` is the warped pixel, the unit cell of `k`'s own space around
+  `σ(ℓ)`.
+
+Both are sayable, and neither is a special case. They agree for a translation,
+such as the atlas's `.at(X+½, Y+½)` (`fonts/atlas.rs:181-187`). They differ
+once `σ` scales or bends.
+
+This replaces a-glyph-is-a-formula §4.1's rule that "`at` never substitutes the
+measure". That rule would have made the integral late-bound like `Dwrt`, with
+two costs:
+
+- A kernel carrying an integral would denote `Warp → (Ω → V)`.
+- Every rule whose side condition is an invariance would be sound only after
+  composition, in the runtime tier.
+
+Bound at construction, every side condition in §3 is about the bound index
+`u`, and `at` never touches a bound index. `σ` is built from `X` and `Y`, so
+`u ∉ var(c)` survives any warp. The integral's rules hold in both tiers.
+
+### The pixel is centred
 
 The lattice samples at `X = x₀ + col + lane` (`passes/lattice.rs:116`). The
-atlas samples texel centres with `.at(X+½, Y+½)` (`fonts/atlas.rs:181-187`).
-The cell is therefore `[X − ½, X + ½)`, and three things follow:
+interval is `[−½, ½)` about that sample, and three things follow:
 
-- The midpoint of the cell is the point sample every kernel computes today.
-- `LowerArea`, the fallback for a `Cell` fold no rule resolved, is the deletion
-  of the fold. It is bit-exact against the status quo.
+- The midpoint of the pixel is the point sample every kernel computes today.
+- The one-point quadrature, `u := 0`, is the fallback for an integral no rule
+  closed. It is bit-exact against the status quo.
 - a-glyph-is-a-formula §1 and §4.1 write `[x₀, x₀+1)`, but their own formulas
   are centred: `((Z+½)³ − (Z−½)³)/3`, and "midpoint = point sample". The
   corner cell is the typo.
 
-### Variance of a `Cell` fold
+More quadrature points, midpoint or Gauss–Legendre, would be a `Range` fold
+with weights. That is an accuracy budget, chosen in one place.
 
-- A `Range` fold removes its binder: `var(body) ∖ {b}`.
-- A `Cell(a)` fold keeps `var(body)`. The cell moves with `a`, so the result
-  varies along `a` exactly when the body does. When `a ∉ var(body)`, the
-  integral equals the body, which is the constant rule of §3.
+### Variance
+
+An interval fold removes its binder exactly as a range does: `var(body) ∖ {u}`.
+The pixel integral of `k.at(X + u_x, Y + u_y)` varies along `X` exactly when
+`k` does, because the body reads `X + u_x`.
+
+### Legalization is quadrature
+
+Codegen executes loops, and a continuous fold is not a loop.
+
+- `legalize` replaces a surviving interval fold by its quadrature before
+  `collapse`. Today that is the one-point rule: substitute the interval's
+  midpoint for the binder, and multiply by the interval's length, which is 1
+  for the pixel.
+- `collapse` panics on a reachable interval fold, as it does on a `Dwrt`.
+- Extraction prices a surviving interval fold above every rule's right-hand
+  side, so a closed form wins whenever one was derived. That price is a
+  legalization price and never an accuracy knob.
 
 ### Why not `Area { integrand, form: [ValueId; k] }`
 
-This is a-glyph-is-a-formula §4.1's shape. It contradicts that section's own
-semantics in three ways:
+That is a-glyph-is-a-formula §4.1's shape. Its form operands are the binder
+spelled as a value, and a value is the wrong thing to spell it as:
 
-1. `Kernel::at` substitutes every `Var` leaf (`expr.rs:236-275`), so a form
-   operand is pulled back. That is exactly what §4.1 says `at` must not do.
-2. A `Var(0)` operand makes every `Area` vary along `X` (`variance.rs:367-371`).
-3. `Var(i)` inside a rule template is a metavariable (`rewrite.rs:36-40`).
+- `Kernel::at` substitutes every coordinate leaf (`expr.rs:236-275`), so the
+  form is pulled back.
+- A `Var(0)` operand makes every integral vary along `X`
+  (`variance.rs:367-371`).
+- `Var(i)` inside a rule template is a metavariable (`rewrite.rs:36-40`).
 
-The `Const(f32)` axis that `Dwrt` uses avoids all three, but only by encoding a
-type as a float. That is decoded `as u8` at three sites (`derivative.rs:56`,
-`passes.rs:709-712`, `graph.rs:3019`), which is the smell `Fold` was created to
-remove (`fold.rs:1-14`). `Dwrt` should get the same typed axis in its own CL.
-That change touches the public `Kernel::dwrt(u8)`, so it needs JP's permission.
+A binder has none of these problems: it is what the form was trying to be.
+
+`Dwrt` spells its axis as a `Const(f32)`, decoded `as u8` at three sites
+(`derivative.rs:56`, `passes.rs:709-712`, `graph.rs:3019`). That is the smell
+`Fold` was created to remove (`fold.rs:1-14`). Whether `Dwrt` should take a
+binder the same way is its own question. It touches the public
+`Kernel::dwrt(u8)`, so it needs JP's permission.
 
 ## 3. The rules are loop transformations
 
 Every rule `area` needs is a rule `Σ` has always needed. Each is one statement
-over `Reduce`, whatever its index's domain.
+over `Reduce`, whatever its domain.
 
-| rule | over a fold `⊕_{i∈D}` | `Σ` over a range | `∫` over `Cell(a)` | side condition |
+| rule | over a fold `⊕_{i∈D}` | `Σ` over a range | `∫` over an interval | side condition |
 |---|---|---|---|---|
-| factoring | `⊕_i (c ⊗ f) = c ⊗ ⊕_i f` | `Σ(c·f) = c·Σf`; `min(c+f) = c + min f` | `∫ c·f = c·∫ f` | `i ∉ var(c)`, and `⊗` distributes over `⊕` |
-| constant | `⊕_i c = c^{⊕|D|}` | `len·c` | `c`, since the cell has length 1 | `i ∉ var(c)` |
+| factoring | `⊕_i (c ⊗ f) = c ⊗ ⊕_i f` | `Σ(c·f) = c·Σf`; `min(c+f) = c + min f` | `∫ c·f = c·∫ f`: the glyph's `Y`-only band factor leaves the inner `u_x` integral | `i ∉ var(c)`, and `⊗` distributes over `⊕` |
+| constant | `⊕_i c = c^{⊕|D|}` | `len·c` | `(hi − lo)·c`, which is `c` for the pixel | `i ∉ var(c)` |
 | linearity | `⊕_i (f ⊕ g) = ⊕f ⊕ ⊕g` | yes | yes | `⊕` commutative |
-| interchange | `⊕_i ⊕_j f = ⊕_j ⊕_i f` | yes | `∫ Σ_p = Σ_p ∫`: the glyph's sum over pieces | neither domain depends on the other's index |
-| select | `⊕_i select(m, u, w) = select(m, ⊕u, ⊕w)` | yes | yes: the glyph's band factor is a mask | `i ∉ var(m)` |
-| narrowing | an indicator in `i` restricts `D` | only for constant bounds; a data bound is a dynamic trip count, which is refused and becomes a recompile | the clipped interval is two clamps, closed by an antiderivative, so no clipped-cell node exists | the bounds satisfy `i ∉ var` |
-| basis | — | — | `∫ a = a`; `∫ a² = a² + 1/12`; `∫ clamp(k·a + c, 0, 1)` through `G` of §1 | `k, c` satisfy `a ∉ var` |
+| interchange | `⊕_i ⊕_j f = ⊕_j ⊕_i f` | yes | `∫ Σ_p = Σ_p ∫`, the glyph's sum over pieces; and `∫_{u_y} ∫_{u_x} = ∫_{u_x} ∫_{u_y}` | neither domain depends on the other's index |
+| select | `⊕_i select(m, a, b) = select(m, ⊕a, ⊕b)` | yes | yes: the glyph's band factor is a mask | `i ∉ var(m)` |
+| narrowing | an indicator in `i` restricts `D` | only for constant bounds; a data bound is a dynamic trip count, which is refused and becomes a recompile | an interval has no trip count, so its bounds may be values. The clipped length is two clamps, closed by an antiderivative, so no clipped node survives | the indicator's bounds satisfy `i ∉ var` |
+| moments | — | — | `∫_lo^hi u^n du = (hi^{n+1} − lo^{n+1})/(n+1)`; over the pixel, `∫1 = 1`, `∫u = 0`, `∫u² = 1/12`. Also `∫ clamp(k·u + c, 0, 1)` through `G` of a-glyph-is-a-formula §1 | `k, c` satisfy `u ∉ var` |
 
-The half-plane, conic and Taylor rules of a-glyph-is-a-formula §4.1 carry over
-unchanged, now over a `Cell` fold.
+No rule mentions a coordinate. `∫_u (X + u)² = X² + 1/12` falls out of
+expansion, linearity, factoring and the moments. The half-plane, conic and
+Taylor rules of a-glyph-is-a-formula §4.1 carry over as rules over interval
+folds.
 
 **The one analysis they all need** is `i ∉ var(C)` for an e-class `C`. It is a
 per-class fact, `var(C) = ⋂ var(n)`:
@@ -238,9 +274,9 @@ rules are Peel, Halve and Empty (`egraph/rules.rs:189-191`).
 
 The payoff differs by domain:
 
-- **For `∫`, the payoff is reachability.** An unfactored `Cell` fold over a
-  per-piece body has no closed form. It lowers to its midpoint, which is a
-  point-sampled, aliased edge.
+- **For `∫`, the payoff is reachability.** An unfactored interval fold over a
+  per-piece body has no closed form. It lowers to its one-point quadrature,
+  which is a point-sampled, aliased edge.
 - **For `Σ`, the payoff waits on pricing.** The DAG objective, which decides,
   adds each class's own cost once, with no trip count (`extract.rs:1890`;
   `SharedPricer` at `:2784-2791`). So `Σ(c·f)` and `c·Σf` each cost one `Mul`
@@ -347,9 +383,9 @@ with the `OUTSIDE` sentinel (`guards.rs:562-569`) and a price:
      hand it to `LowerDwrt` (`cost.rs:316-333`).
    - The "`Dwrt` survived extraction" assertion is inside a `#[cfg(test)]`
      module (`runtime.rs:1653, :1804`).
-   - A `Cell` fold takes the same kind of price: finite, strictly above every
-     rule's right-hand side, and pinned per rule. It is a legalization price
-     and never an accuracy knob.
+   - A surviving interval fold takes the same kind of price: finite, strictly
+     above every rule's right-hand side, and pinned per rule. It is a
+     legalization price and never an accuracy knob.
 2. **"The latency prior prices a node the same wherever it is placed" is false
    of extraction.**
    - `evals` weights every node by its variance (`extract.rs:1869-1873`).
@@ -359,8 +395,9 @@ with the `OUTSIDE` sentinel (`guards.rs:562-569`) and a price:
    - CLAUDE.md keeps it as a seam for the schedule cost model, and it stays.
    - Build step 4 becomes: price the nest, when fission gives the extractor a
      choice of nest.
-3. **The node shape** is §2's `Cell` fold, not `Area { integrand, form }`.
-4. **The cell is centred** (§2).
+3. **The node shape** is §2's interval fold, not `Area { integrand, form }`.
+   The form is the binder.
+4. **The pixel is centred** (§2).
 5. **"Its polynomial arm is demanded under `0 < u < 1`" (§4.1) and "per batch
    to the right of a piece, the constant arm" (§6) do not exist.**
    - `clamp` is `max` then `min` (`kernel.rs:651-653`); it has no arm and should
@@ -373,6 +410,12 @@ with the `OUTSIDE` sentinel (`guards.rs:562-569`) and a price:
      still needed, but it is not what blocks today.
    - Even with folds priced, exclusivity cannot own the winding, because two
      selects share its mask. Demand can (§4).
+
+7. **"`at` never substitutes the measure" is withdrawn** (§2).
+   - The integral binds at construction, and `at` is plain precomposition.
+   - `area(k.at(σ))` is the screen pixel under the warped shape;
+     `area(k).at(σ)` is the warped pixel.
+   - The integral's rules then hold in both tiers.
 
 ## 7. Subtract first
 
@@ -407,14 +450,18 @@ Not on this list:
      `f64` Rust closure, compared texel by texel. No pixelflow evaluator
      judges pixelflow (CLAUDE.md, "a same-form check cannot see a
      shared-definition bug").
-3. **The `Cell` index**.
-   - `Fold` gains the domain; `Kernel::area()` is the only public addition.
-   - `LowerArea` deletes a surviving `Cell` fold, in `legalize` before
-     `lower_dwrt_owned`.
-   - `collapse` panics on a reachable `Cell` fold, as it does on `Dwrt`.
-   - `Cell` resolves only under `Vocabulary::Runtime`.
-   - Gate: a twin of `derivative_under_warp.rs`, where the integrand is warped
-     and the measure is not.
+3. **The interval domain.**
+   - `Fold` gains `Interval`, and `Kernel::area()` is the only public addition.
+   - `legalize` replaces a surviving interval fold by its one-point quadrature
+     before `collapse`, and `collapse` panics on a reachable one.
+   - `PeelFold`, `HalveFold` and `EmptyFold` decompose ranges, so they decline
+     an interval. `FactorFold` applies to both domains.
+   - Gate:
+     - An unclosed `area(k)` collapses to `k` at the pixel centre, checked
+       against an `f64` closure.
+     - `area(k.at(σ))` and `area(k).at(σ)` stay distinct under a scaling `σ`.
+       Step 3 alone pins that they are distinct terms. Step 4's moments pin
+       that they integrate different pixels.
 4. **Basis, select and narrowing rules**, which give `A_p` exact.
    - Gate: a quadrature oracle in scalar `f64`.
    - The tolerance is relative to the terms' magnitude, not `f32` rounding
@@ -434,10 +481,11 @@ Not on this list:
 
 ## 9. Open questions
 
-- ~~`Cell` on `Fold`, or a sibling `Area` node.~~ **Decided (JP): on `Fold`.**
-  About 39 files match a `Reduce`-shaped node. Most read `fold.binder()`,
-  `len()` or `range()`, and must never see a `Cell`: it is resolved before
-  codegen, so the range-specific sites refuse it.
+- ~~A cell on `Fold`, or a sibling `Area` node.~~ **Decided (JP): an integral
+  is a fold over a continuous domain, with no cell and no axis.** About 39
+  files match a `Reduce`-shaped node. Most read `len()`, `range()` or
+  `stride()`, which have no meaning on an interval. Those sites must refuse an
+  interval, or never see one, since quadrature removes it before codegen.
 - **A binder's trip count in pricing.** After `PeelFold`, one body class sits
   under folds of different lengths (`extract.rs:2200-2210`), so the DAG
   objective cannot carry one count per class. The candidates:
