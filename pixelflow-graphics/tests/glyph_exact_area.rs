@@ -61,6 +61,11 @@
 //! [`PLATFORM_NOISE`]. Getting better passes silently; a change that improves
 //! the model re-pins the rows it moved, with its reasons, in its own commit.
 //!
+//! The ratchet's rows and slack are both the snap's width, so it cannot see
+//! an error smaller than that. [`between_the_snaps_every_texel_is_its_area`]
+//! can: every texel between the snaps within the closed form's own error
+//! bound, and every texel clear of them exactly `0` or `1`.
+//!
 //! ## One pixel, on both sides
 //!
 //! Texel `(i, j)` integrates `[i, i+1) × [j, j+1)` in the frame the atlas
@@ -112,6 +117,21 @@ const INKED: f64 = 1e-8;
 /// name moves a row by far more.
 const PLATFORM_NOISE: f64 = 1e-3;
 
+/// `2⁻²²`: the unit of the closed form's own error bound,
+/// `2⁻²²·(1 + |X| + |Y| + 2·extent)` per texel — the parameter an arc is
+/// read at resolves to `2⁻²⁴`, which the arc's extent multiplies, and the
+/// coordinates carry their rounding into the clamp
+/// (`pixelflow_ir::IntervalFold::arc_moment`, "Floating point", pinned per
+/// arc by `pixelflow-core/tests/arc_oracle.rs`).
+const ARC_TOLERANCE_UNIT: f64 = 1.0 / 4_194_304.0;
+
+/// The closed form's bound at texel `(i, j)` of a `size`-px tile: the arc
+/// bound at the texel's centre, with no arc longer than the tile.
+fn arithmetic_bound(i: usize, j: usize, size: usize) -> f64 {
+    let (x, y) = (i as f64 + 0.5, j as f64 + 0.5);
+    ARC_TOLERANCE_UNIT * (1.0 + x + y + 2.0 * size as f64)
+}
+
 /// A ratchet row: `(glyph, size, E_max, E_mean, N₀.₁)`.
 type Row = (char, usize, f64, f64, u32);
 
@@ -130,6 +150,13 @@ struct Stat {
     inked: u32,
     /// `ours − exact` of the ink-weighted centroid, `[x, y]`, in texels.
     centroid_shift: [f64; 2],
+    /// The worst `|Δ|` between the snaps, as a multiple of
+    /// [`arithmetic_bound`].
+    between_snaps: f64,
+    /// Texels whose exact area lies within `2⁻¹⁰` of `0` or `1`, and more
+    /// than the bound from that snap's threshold, that do not read exactly
+    /// `0` or `1`.
+    unsnapped_ends: u32,
 }
 
 /// `ours` against `exact`, both row-major over a `width`-wide tile.
@@ -155,6 +182,17 @@ fn measure(ours: &[f64], exact: &[f64], width: usize) -> Stat {
         stat.e_max = stat.e_max.max(d);
         stat.n_bad += u32::from(d > BAD_TEXEL);
         stat.n_bad_beyond_noise += u32::from(d > BAD_TEXEL + PLATFORM_NOISE);
+        let bound = arithmetic_bound(k % width, k / width, width);
+        let snap = f64::from(loop_blinn::COVERAGE_SNAP);
+        match e {
+            e if e <= snap - bound => stat.unsnapped_ends += u32::from(o != 0.0),
+            e if e >= 1.0 - snap + bound => stat.unsnapped_ends += u32::from(o != 1.0),
+            e if (snap + bound..=1.0 - snap - bound).contains(&e) => {
+                stat.between_snaps = stat.between_snaps.max(d / bound);
+            }
+            // Within the bound of a threshold, either side of it is right.
+            _ => {}
+        }
     }
     stat.e_mean = sum / f64::from(stat.inked.max(1));
     let [ours_m, exact_m] = moments;
@@ -474,6 +512,52 @@ fn the_renderer_and_the_reference_share_a_pixel() {
             k / width
         );
     }
+}
+
+/// **Between the snaps, every texel is its area** to the closed form's own
+/// error bound ([`arithmetic_bound`]), and outside them it is exactly `0` or
+/// `1`.
+///
+/// The ratchet cannot see this. Its rows sit at the snap's width (`E_max`
+/// ≤ 0.00095) and its slack is that width again, so a change that moved
+/// every texel of every glyph by up to `9·10⁻⁴` — a reciprocal estimate in
+/// the closed form (`2⁻¹²` relative), a divisor re-derived apart from its
+/// numerator (`mean_of_clamp`, "Floating point") — would pass it
+/// (measured: scaling coverage by `0.9998` fails only this test in the
+/// file). This bound is per texel, derived rather than measured, and the
+/// renderer sits well inside it: on the AVX-512 and AVX2 tiers alike, the
+/// worst texel between the snaps uses 10% of it at 7 px, 11% at 16 px and
+/// 12% at 32 px, and no texel outside them misses its end.
+#[test]
+fn between_the_snaps_every_texel_is_its_area() {
+    let mut failures = Vec::new();
+    let mut worst = SIZES.map(|size| (0.0f64, ' ', size));
+    for &(ch, size, stat) in measurements() {
+        let at_size = worst
+            .iter_mut()
+            .find(|w| w.2 == size)
+            .expect("every measured size is one of SIZES");
+        if stat.between_snaps > at_size.0 {
+            *at_size = (stat.between_snaps, ch, size);
+        }
+        if stat.between_snaps > 1.0 {
+            failures.push(format!(
+                "{ch:?}@{size}: a texel between the snaps is off by {:.2}× the \
+                 closed form's bound",
+                stat.between_snaps
+            ));
+        }
+        if stat.unsnapped_ends > 0 {
+            failures.push(format!(
+                "{ch:?}@{size}: {} texel(s) clear of a snap read neither 0 nor 1",
+                stat.unsnapped_ends
+            ));
+        }
+    }
+    for (ratio, ch, size) in worst {
+        eprintln!("{size} px: worst texel between the snaps {ratio:.3}× the bound ({ch:?})");
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// The ratchet. See the module docs.

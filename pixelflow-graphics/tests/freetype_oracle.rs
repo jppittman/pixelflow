@@ -97,9 +97,10 @@ const SIZES_FAST: [u32; 3] = [7, 19, 32];
 /// How far the total ink we lay down may stray from the reference's.
 /// Measured at 0.02% over the full corpus and 0.15% over the presubmit
 /// subset (both below FreeType's ink), where the distance-ramp renderer read
-/// 0.20% and 0.41% above it — so this is ten times the worst of them: loose
-/// enough never to fire on an antialiasing difference, tight enough that
-/// dropping or duplicating whole strokes cannot hide behind it.
+/// 0.20% and 0.41% above it — so this is thirteen times the larger of the
+/// two today and five times the ramp's worst: loose enough never to fire on
+/// an antialiasing difference, tight enough that dropping or duplicating
+/// whole strokes cannot hide behind it.
 const INK_RATIO_TOLERANCE: f64 = 0.02;
 /// Texels we ink where FreeType finds none, over the corpus below. **Zero**,
 /// and asserted as zero.

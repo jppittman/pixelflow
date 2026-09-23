@@ -69,12 +69,14 @@ const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf"
 /// already emitted 155 nodes each against 2300, 4500 and 9100, a ratchet
 /// nobody had turned.
 ///
-/// One line-segment glyph, one all-quadratic, and the one with the most
-/// pieces — so a body that came to depend on the piece count again would
-/// split them.
+/// One line-segment glyph, one all-quadratic, and one with many pieces
+/// (6, 16 and 32 once horizontal pieces are dropped; `%` has the most in
+/// ASCII, 40) — so a body that came to depend on the piece count again
+/// would split them.
 const CEILINGS: [(char, usize, usize); 3] = [('A', 16, 156), ('O', 16, 156), ('8', 32, 156)];
 
-/// Three glyphs with a 3× spread in piece count.
+/// Three glyphs with a fivefold spread in piece count: 6, 16 and 32, three
+/// trip-count buckets.
 const SPREAD: [char; 3] = ['A', 'O', '8'];
 
 /// The program the e-graph is handed must not grow with the glyph's piece
@@ -143,7 +145,7 @@ fn a_glyph_costs_no_more_than_it_did() {
 
 /// **The gate that matters.** Saturation must be handed the glyph as
 /// written — folds folded — so the program it reasons about is the same
-/// size for `8` as for `A`, three times its piece count.
+/// size for `8` as for `A`, five times its piece count.
 ///
 /// What this catches is any expansion creeping back in front of the e-graph:
 /// unroll the fold first and this count becomes a multiple of the piece

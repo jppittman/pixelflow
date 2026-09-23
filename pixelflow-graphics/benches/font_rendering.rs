@@ -26,7 +26,8 @@ fn bench_pixelflow_single_char(c: &mut Criterion) {
     let mut group = c.benchmark_group("pixelflow_single_char");
     let font = Font::parse(FONT_DATA).unwrap();
 
-    // Straight pieces, curved ones, and the two with the most pieces. The
+    // Straight pieces (`A`, 6), curved ones (`O`, 16), and two with many
+    // (`S` 28, `8` 32; `%` has the most in ASCII, 40). The
     // glyph is one fused kernel; the JIT compile is cached, so iterations
     // measure the tabulation (the per-frame cost).
     for (label, ch) in [
