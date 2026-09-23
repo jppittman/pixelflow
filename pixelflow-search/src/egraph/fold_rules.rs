@@ -16,12 +16,14 @@
 //!
 //! **Peeling is O(n) applications to unroll a length-n fold; halving is
 //! O(log n).** Each `HalveFold` firing doubles the body and halves the trip
-//! count, and [`Fold::halve`] declines on an odd count — `PeelFold` is that
-//! remainder's epilogue, run once per odd level the recursion hits (`log n`
-//! of them at most), not a fallback that reverts to unrolling one term at a
-//! time. `passes::expand_reduce` prefers the same decomposition, through the
-//! same two [`Fold`] methods, so a surviving fold it unrolls takes the
-//! identical shape saturation would have reached inside the graph. It is on
+//! count, and [`RangeFold::halve`](pixelflow_ir::RangeFold::halve) declines
+//! on an odd count — `PeelFold` is that remainder's epilogue, run once per
+//! odd level the recursion hits (`log n` of them at most), not a fallback
+//! that reverts to unrolling one term at a time. `passes::expand_reduce`
+//! prefers the same decomposition, through the same two
+//! [`RangeFold`](pixelflow_ir::RangeFold) methods, so a surviving fold it
+//! unrolls takes the identical shape saturation would have reached inside
+//! the graph. It is on
 //! no production path: codegen emits a fold that survives extraction as a
 //! loop (`pixelflow_ir::passes::legalize`), and `expand_reduce` unrolls one
 //! only for a caller that asks.
@@ -111,9 +113,10 @@ pub enum HeadNode {
 ///
 /// [`HalveFold`]'s epilogue for an odd trip count, at whatever level of the
 /// halving recursion it arises — declines outright on a fold
-/// [`Fold::halve`] can still shrink (see its `apply`). Saturation has no
-/// notion of "the cheaper rule tries first": every matching rule fires every
-/// round, so without that guard this rule would peel a fold one term per
+/// [`RangeFold::halve`](pixelflow_ir::RangeFold::halve) can still shrink
+/// (see its `apply`). Saturation has no notion of "the cheaper rule tries
+/// first": every matching rule fires every round, so without that guard
+/// this rule would peel a fold one term per
 /// application in parallel with `HalveFold` halving the same fold — an `n`
 /// applications-worth of independent unrolling that the extractor's cost
 /// model would then have to notice and discard, right back to the O(n)
@@ -338,7 +341,8 @@ fn distributor(monoid: Monoid) -> Option<&'static dyn ops::Op> {
 }
 
 /// The fold rules: [`HalveFold`] for the bulk of a trip count, [`PeelFold`]
-/// as its odd-remainder epilogue (and a fold [`Fold::halve`] declines on
+/// as its odd-remainder epilogue (and a fold
+/// [`RangeFold::halve`](pixelflow_ir::RangeFold::halve) declines on
 /// outright), [`EmptyFold`] to close out, and [`FactorFold`] to move an
 /// invariant factor out of the body. Inert for a kernel with no folds in it.
 #[must_use]
@@ -644,7 +648,7 @@ mod tests {
     /// would independently unroll an even fold one term per application in
     /// parallel with `HalveFold`'s halving, right back to the `n`
     /// applications `HalveFold` exists to avoid (see `PeelFold`'s doc). A
-    /// fold `Fold::halve` still shrinks must get *no* `PeelFold` action; one
+    /// fold `RangeFold::halve` still shrinks must get *no* `PeelFold` action; one
     /// it declines outright on (odd, or the one-term base case) must still
     /// get its usual peel.
     #[test]
@@ -686,7 +690,7 @@ mod tests {
                     }
                 )
                 .is_some(),
-            "7 is odd — Fold::halve declines, so PeelFold is the epilogue"
+            "7 is odd — RangeFold::halve declines, so PeelFold is the epilogue"
         );
     }
 

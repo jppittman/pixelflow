@@ -19,6 +19,14 @@
 //! - under composition, where a nested fold rebinding a slot must not
 //!   capture it.
 //!
+//! Two routes to machine code, and each value is checked through both where
+//! the route matters: [`Lattice::bake`] — saturation, extraction, then
+//! `passes::resolve` — and `emit::compile` alone, which legalizes the arena
+//! as it was built. The second is what the jit cache compiles when the
+//! e-graph declines a term — any kernel holding a `Guard`, for one — and it
+//! is the only route on which quadrature can meet a fold the e-graph would
+//! otherwise have rewritten first.
+//!
 //! The judge is never a pixelflow evaluator: every expected value is an
 //! `f64` closure over `(x, y)` or a literal (CLAUDE.md, "a same-form check
 //! cannot see a shared-definition bug").
@@ -28,8 +36,9 @@
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
+use pixelflow_codegen::emit::compile;
 use pixelflow_core::{Kernel, Lattice};
-use pixelflow_ir::{ExprArena, ExprId, ExprNode, Fold, LatticeShape, OpKind};
+use pixelflow_ir::{Binder, ExprArena, ExprId, ExprNode, Fold, LatticeShape, OpKind};
 use pixelflow_search::runtime::optimize_runtime_arena;
 
 /// Columns of the test lattice.
@@ -53,11 +62,36 @@ fn k_f64(x: f64, y: f64) -> f64 {
     x * y + 3.0 * x - 2.0 * y + 5.0
 }
 
-/// Bake `kernel` over the test lattice and require every texel to equal
-/// `reference(x, y)` exactly, `x` the column and `y` the row.
+/// Bake `kernel` over the test lattice — the production route, through
+/// saturation — and require every texel to equal `reference(x, y)` exactly,
+/// `x` the column and `y` the row.
 fn assert_exact(name: &str, kernel: &Kernel, reference: impl Fn(f64, f64) -> f64) {
     let baked = Lattice::frame(WIDTH, HEIGHT).bake(kernel);
-    let texels = baked.buffer();
+    assert_texels(name, baked.buffer(), reference);
+}
+
+/// [`assert_exact`] through the other route: `emit::compile` on the arena as
+/// built, which legalizes it — `resolve` included — with no saturation
+/// before it. What the jit cache compiles when the e-graph declines a term.
+fn assert_exact_legalized(name: &str, kernel: &Kernel, reference: impl Fn(f64, f64) -> f64) {
+    let (arena, root) = kernel.parts();
+    let shape = LatticeShape::new([WIDTH as u32, HEIGHT as u32]);
+    let compiled = compile(arena, root, shape).expect("legalize and compile");
+    let mut texels = vec![f32::NAN; WIDTH * HEIGHT];
+    let origin = [0.0f32, 0.0];
+    // SAFETY: none of these kernels declares a buffer or a uniform, so the
+    // context is the uniform block's slot (never read, hence null) and the
+    // origin block; `texels` holds `HEIGHT` rows of `WIDTH` samples, and the
+    // pitch is `WIDTH`.
+    let ctx: [*const f32; 2] = [core::ptr::null(), origin.as_ptr()];
+    unsafe {
+        compiled.code.call(ctx.as_ptr(), texels.as_mut_ptr(), WIDTH);
+    }
+    assert_texels(name, &texels, reference);
+}
+
+/// Require every texel to equal `reference(x, y)` exactly.
+fn assert_texels(name: &str, texels: &[f32], reference: impl Fn(f64, f64) -> f64) {
     assert_eq!(texels.len(), WIDTH * HEIGHT, "{name}: one texel per sample");
     for row in 0..HEIGHT {
         for col in 0..WIDTH {
@@ -78,6 +112,7 @@ fn assert_exact(name: &str, kernel: &Kernel, reference: impl Fn(f64, f64) -> f64
 #[test]
 fn the_area_of_a_multi_affine_kernel_is_its_centre_value() {
     assert_exact("area(k)", &k().area(), k_f64);
+    assert_exact_legalized("area(k), legalized", &k().area(), k_f64);
 }
 
 /// **(a′) A derivative of an area.** `∂/∂X ∫∫ k = ∫∫ ∂k/∂X = Y + 3`.
@@ -99,7 +134,9 @@ fn the_derivative_of_an_area_is_the_area_of_the_derivative() {
         optimize_runtime_arena(arena, root, shape).is_some(),
         "the runtime tier must lower a Dwrt over an integral, not decline it"
     );
-    assert_exact("area(k).dx()", &slope, |_x, y| y + 3.0);
+    let expected = |_x: f64, y: f64| y + 3.0;
+    assert_exact("area(k).dx()", &slope, expected);
+    assert_exact_legalized("area(k).dx(), legalized", &slope, expected);
 }
 
 /// Every node reachable from `root`.
@@ -175,10 +212,10 @@ fn interval(slot: u8, lo: f32, hi: f32) -> Fold {
     Fold::from_bits(bits).expect("a finite, nonempty interval over a live slot")
 }
 
-/// The first binder slot's `Var` index — slot 0 of the reduction space.
-const SLOT_0_VAR: u8 = 4;
-/// Slot 1's.
-const SLOT_1_VAR: u8 = 5;
+/// The `Var` index the body reads binder `slot` through.
+fn slot_var(slot: u8) -> u8 {
+    Binder::from_slot(slot).expect("a live slot").var()
+}
 
 /// **(c) Off the pixel, where its identities hide nothing.**
 ///
@@ -195,7 +232,7 @@ const SLOT_1_VAR: u8 = 5;
 fn an_asymmetric_integral_is_its_length_times_its_midpoint_value() {
     let mut a = ExprArena::new();
     let (x, y) = (a.push_var(0), a.push_var(1));
-    let (u_x, u_y) = (a.push_var(SLOT_0_VAR), a.push_var(SLOT_1_VAR));
+    let (u_x, u_y) = (a.push_var(slot_var(0)), a.push_var(slot_var(1)));
     let ux_x = a.push_binary(OpKind::Mul, u_x, x);
     let uy_y = a.push_binary(OpKind::Mul, u_y, y);
     let body = a.push_binary(OpKind::Add, ux_x, uy_y);
@@ -203,9 +240,9 @@ fn an_asymmetric_integral_is_its_length_times_its_midpoint_value() {
     let root = a.push_reduce(interval(1, 10.0, 11.0), inner);
     let kernel = Kernel::from_parts(a, root);
 
-    assert_exact("∫∫ (u_x·X + u_y·Y)", &kernel, |x, y| {
-        4.0 * x + 21.0 * y
-    });
+    let expected = |x: f64, y: f64| 4.0 * x + 21.0 * y;
+    assert_exact("∫∫ (u_x·X + u_y·Y)", &kernel, expected);
+    assert_exact_legalized("∫∫ (u_x·X + u_y·Y), legalized", &kernel, expected);
 }
 
 /// **(f) A warp holding a fold that rebinds the integral's slot.**
@@ -216,13 +253,17 @@ fn an_asymmetric_integral_is_its_length_times_its_midpoint_value() {
 /// *inside* a fold over the same slot. The inner binder shadows: quadrature
 /// substituting the integral's midpoint must stop at the sum, whose `j` is
 /// its own. Expected `k(2x + 1, y)`; captured, `k(2x, y)`.
+///
+/// The legalized route is the one that can capture. The baked route passes
+/// even with quadrature made to capture — measured — because the two-term
+/// sum does not survive saturation to meet it.
 #[test]
 fn a_warp_whose_fold_rebinds_the_integrals_slot_is_not_captured() {
     let x_plus_j = Kernel::sum_over(2, |j| Kernel::x().add(j));
     let warped = k().area().at(&x_plus_j, &Kernel::y());
-    assert_exact("area(k).at(Σ_j (X + j), Y)", &warped, |x, y| {
-        k_f64(2.0 * x + 1.0, y)
-    });
+    let expected = |x: f64, y: f64| k_f64(2.0 * x + 1.0, y);
+    assert_exact("area(k).at(Σ_j (X + j), Y)", &warped, expected);
+    assert_exact_legalized("area(k).at(Σ_j (X + j), Y), legalized", &warped, expected);
 }
 
 /// **(f) A fold that rebinds the slot of an integral it reads by name.**
@@ -232,11 +273,17 @@ fn a_warp_whose_fold_rebinds_the_integrals_slot_is_not_captured() {
 /// `expand_refs` then splices the integral inside the sum. Peeling or
 /// halving the sum substitutes its index into its body; reaching into the
 /// integral would give `Σ_i k(x + i, y) + i` instead of `3·k(x, y) + 3`.
+///
+/// End to end this checks the value and does not detect that capture: with
+/// `PeelFold` made to descend into the integral, both routes still pass —
+/// the legalized one never peels, and extraction does not choose the
+/// capturing peel. `fold_rules`' `a_peel_stops_at_a_fold_that_rebinds_its_slot`
+/// is the test that fails when the peel descends.
 #[test]
 fn a_fold_over_a_named_integral_does_not_capture_its_binder() {
     let area = k().area().by_ref();
     let summed = Kernel::sum_over(3, |i| area.add(i));
-    assert_exact("Σ_i (area(k) + i)", &summed, |x, y| {
-        3.0 * k_f64(x, y) + 3.0
-    });
+    let expected = |x: f64, y: f64| 3.0 * k_f64(x, y) + 3.0;
+    assert_exact("Σ_i (area(k) + i)", &summed, expected);
+    assert_exact_legalized("Σ_i (area(k) + i), legalized", &summed, expected);
 }

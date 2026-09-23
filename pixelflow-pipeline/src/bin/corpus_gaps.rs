@@ -762,9 +762,9 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
     )
     .expect("fmt");
 
-    // ---- production saturation (runtime.rs: LowerDwrt, ExpandReduce, Saturate::runtime) ----
-    let (lowered, lowered_root) = pixelflow_ir::passes::lower_dwrt_owned(&k.arena, k.root)
-        .unwrap_or_else(|e| panic!("{}: lower_dwrt failed: {e}", k.name));
+    // ---- production saturation (runtime.rs: Resolve, ExpandReduce, Saturate::runtime) ----
+    let (lowered, lowered_root) = pixelflow_ir::passes::resolve(&k.arena, k.root)
+        .unwrap_or_else(|e| panic!("{}: resolve failed: {e}", k.name));
     let (lowered, lowered_root) = pixelflow_ir::passes::expand_reduce_owned(&lowered, lowered_root);
     let node_count = reachable_count(&lowered, lowered_root);
     // Costs are priced on the LOWERED term — what the e-graph is handed —

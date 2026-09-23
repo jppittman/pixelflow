@@ -935,10 +935,10 @@ mod tests {
     }
 
     /// **The load-bearing property.** Halving to exhaustion (falling back to
-    /// [`Fold::peel_back`] for the odd remainder, the preference
+    /// [`RangeFold::peel_back`] for the odd remainder, the preference
     /// `passes::expand_reduce` and `egraph::fold_rules::HalveFold` both give
     /// it) must visit the same terms, in the same left-to-right order, as
-    /// [`Fold::peel`] does one at a time — for an even trip count (pure
+    /// [`RangeFold::peel`] does one at a time — for an even trip count (pure
     /// halving, no remainder ever arises) and an odd one (forces the
     /// peel-back epilogue at more than one level of the recursion).
     ///
