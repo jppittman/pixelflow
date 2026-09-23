@@ -206,6 +206,16 @@ pub enum RewriteAction {
         body: EClassId,
     },
 
+    /// Move an invariant factor out of a fold:
+    /// `⊕_i (c ⊗ f)  ->  c ⊗ ⊕_i f`.
+    ///
+    /// Two nodes over classes the graph already holds — the narrower fold
+    /// and the `⊗` combining it with the factor — so, unlike `PeelFold` and
+    /// `HalveFold`, nothing is copied and no plan travels with it. The side
+    /// condition was checked by the rule; see
+    /// [`FactorFold`](super::fold_rules::FactorFold).
+    FactorFold(super::fold_rules::Factoring),
+
     /// Differentiate: expand `Dwrt(inner, var)` one chain-rule step.
     ///
     /// `inner` is a representative node of the expression being differentiated;

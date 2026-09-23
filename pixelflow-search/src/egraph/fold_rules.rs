@@ -1,9 +1,10 @@
-//! The decompositions of a bounded fold, as e-graph rewrites.
+//! The decompositions of a bounded fold, and factoring, as e-graph rewrites.
 //!
 //! ```text
 //! ⊕_{[lo,hi) step s} f  =  f(lo) ⊕ ⊕_{[lo+s,hi) step s} f              (peel)
 //! ⊕_{[lo,hi) step s} f  =  ⊕_{[lo,hi) step 2s} (f ⊕ f[binder:=binder+s]) (halve)
 //! ⊕_{[lo,lo) step s} f  =  identity(⊕)                                  (empty)
+//! ⊕_i (c ⊗ f)           =  c ⊗ ⊕_i f,   i ∉ var(c)                      (factor)
 //! ```
 //!
 //! Peel and empty are the rules the encoding used to make unstatable. While a
@@ -39,10 +40,14 @@
 //!   It is less *complete* — nodes added to the class later get no substituted
 //!   twin — never wrong. `ChainRule` differentiates a representative for the
 //!   same reason.
-//! - **Hash-consing is the invariance test.** A subtree that does not mention
-//!   the binder rebuilds to the identical node, which `EGraph::add` returns the
-//!   existing class for. The rule short-circuits those into metavariables
-//!   anyway, so the template it emits is only the binder-dependent spine.
+//! - **The class fact is the invariance test.** A class whose variance fact
+//!   (`EGraph::variance`) lacks the binder denotes a function the binder does
+//!   not reach, so substituting into it is the identity: the walk names the
+//!   class instead of entering it, whatever its first representative spells
+//!   (`i − i`, once merged with `0`, is named rather than rebuilt). A class
+//!   the fact cannot clear is walked, and a subtree under it that turns out
+//!   not to mention the binder is still named rather than copied, so the plan
+//!   the rule emits is only the binder-dependent spine.
 //!
 //! A class can reach itself (`neg(neg(x)) = x`, merged), and a substitution
 //! through a cycle does not terminate. The walk detects re-entry and declines
@@ -136,6 +141,54 @@ pub struct HalveFold;
 /// `⊕_{[lo,lo)} f = identity(⊕)` — whatever the body says.
 pub struct EmptyFold;
 
+/// `⊕_i (c ⊗ f) = c ⊗ ⊕_i f`, when `i ∉ var(c)` and `⊗` distributes over `⊕`.
+///
+/// **Factoring**, the loop transformation that moves an *operation* out of a
+/// fold, not only the evaluation of its operand (which hoisting already
+/// does): one `⊗` replaces `len` of them. The pairs it knows:
+///
+/// | fold `⊕` | `⊗` | law |
+/// |---|---|---|
+/// | [`Monoid::SUM`] | `Mul` | `Σ_i (c·f) = c·Σ_i f` |
+/// | [`Monoid::MIN`] | `Add` | `min_i (c+f) = c + min_i f` |
+/// | [`Monoid::MAX`] | `Add` | `max_i (c+f) = c + max_i f` |
+///
+/// **Side condition:** the factor's class does not depend on the fold's
+/// binder, read off the class variance fact (`EGraph::variance`) rather
+/// than off one representative — so `(i − i)·f`, merged with `0·f`, is
+/// factorable as soon as the graph knows it. The fact over-approximates, so
+/// the rule can miss a factor but cannot take a binder-dependent one.
+/// Either operand may be the factor: both `c ⊗ f` and `f ⊗ c` match, and the
+/// result is always spelled `c ⊗ ⊕f`, since `Mul` and `Add` are commutative.
+/// One firing names one factoring — the first distributing node in the
+/// body's class — which is the same representative-walk incompleteness every
+/// rule here accepts, and never a soundness question.
+///
+/// **An empty fold declines.** `Σ_∅ (c·f) = 0` but `c·Σ_∅ f = c·0`, which is
+/// NaN for an infinite `c`; `min_∅ (c+f) = +∞ = c + ∞` holds for every `c`
+/// but `−∞`, and the rule does not need the case — [`EmptyFold`] closes an
+/// empty fold outright.
+///
+/// **Floating point.** Min and max with `Add` are exact: `fl(c + f)` is
+/// monotone in `f`, so `min_i fl(c + f_i) = fl(c + min_i f_i)` bit for bit,
+/// except where a NaN is involved or a zero's sign is chosen — both already
+/// left to the target by `Min`/`Max` themselves (CLAUDE.md, "Floating point
+/// at the edges"). Sum with `Mul` is not exact: `Σ fl(c·f_i)` rounds `len`
+/// products and `fl(c·Σ f_i)` rounds one, and `c = ∞` against a zero term
+/// can give NaN on one side only. That is a reassociation-class difference —
+/// last-bit rounding plus non-finite edge cases — inside the contract
+/// CLAUDE.md sets for every algebraic rule here, the same one `Associative`
+/// and `FmaFusion` already rely on.
+///
+/// **Match depth 2**, inside `DIRTY_TRACKING_MAX_DEPTH`: the rule reads the
+/// fold's body class (depth 1) and its operands' facts (depth 2). A fact
+/// only changes when its own class is unioned, which is a content change to
+/// that class — exactly what the dirty tracker watches.
+///
+/// Runtime tier only, through [`fold_rules`]: `kernel!` has no syntax that
+/// builds a fold, so the macro tier's production set never holds this rule.
+pub struct FactorFold;
+
 impl Rewrite for PeelFold {
     fn name(&self) -> &str {
         "peel-fold"
@@ -204,16 +257,86 @@ impl Rewrite for EmptyFold {
     }
 }
 
-/// The fold decompositions: [`HalveFold`] for the bulk of a trip count,
-/// [`PeelFold`] as its odd-remainder epilogue (and a fold [`Fold::halve`]
-/// declines on outright), [`EmptyFold`] to close out. Inert for a kernel
-/// with no folds in it.
+impl Rewrite for FactorFold {
+    fn name(&self) -> &str {
+        "factor-fold"
+    }
+
+    fn apply(&self, egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
+        let ENode::Reduce { fold, body } = node else {
+            return None;
+        };
+        if fold.is_empty() {
+            return None;
+        }
+        let distributor = distributor(fold.monoid())?;
+        let binder = fold.binder().var();
+        let invariant = |class: EClassId| !egraph.variance(class).depends_on(binder);
+        egraph.nodes(*body).iter().find_map(|term| {
+            let ENode::Op { op, children } = term else {
+                return None;
+            };
+            if op.kind() != distributor.kind() {
+                return None;
+            }
+            let [left, right] = children.as_slice() else {
+                return None;
+            };
+            let (factor, rest) = match (invariant(*left), invariant(*right)) {
+                (true, _) => (*left, *right),
+                (false, true) => (*right, *left),
+                (false, false) => return None,
+            };
+            Some(RewriteAction::FactorFold(Factoring {
+                distributor,
+                factor,
+                fold: *fold,
+                rest,
+            }))
+        })
+    }
+}
+
+/// One [`FactorFold`] firing: `⊕_{fold} (factor ⊗ rest) = factor ⊗ ⊕_{fold} rest`,
+/// with the side condition — `fold`'s binder is not in `factor`'s class
+/// variance — already checked.
+#[derive(Clone, Copy, Debug)]
+pub struct Factoring {
+    /// `⊗`, the operator that distributes over `fold`'s combiner.
+    pub(crate) distributor: &'static dyn ops::Op,
+    /// `c`, the operand the fold's binder does not reach.
+    pub(crate) factor: EClassId,
+    /// The fold being factored, unchanged: same algebra, binder, range.
+    pub(crate) fold: Fold,
+    /// `f`, the operand that stays inside the fold.
+    pub(crate) rest: EClassId,
+}
+
+/// The operator that distributes over a fold's combiner — `⊗` in
+/// `⊕_i (c ⊗ f) = c ⊗ ⊕_i f` — for the algebras [`FactorFold`] knows.
+///
+/// `PRODUCT` has no distributor that holds everywhere (`Π_i f^c = (Π_i f)^c`
+/// fails for a negative base). The mask quantifiers have theirs — `BitAnd`
+/// over `ANY`, `BitOr` over `ALL` — and wait on a kernel that needs them.
+fn distributor(monoid: Monoid) -> Option<&'static dyn ops::Op> {
+    match monoid {
+        Monoid::SUM => Some(&ops::Mul),
+        Monoid::MIN | Monoid::MAX => Some(&ops::Add),
+        _ => None,
+    }
+}
+
+/// The fold rules: [`HalveFold`] for the bulk of a trip count, [`PeelFold`]
+/// as its odd-remainder epilogue (and a fold [`Fold::halve`] declines on
+/// outright), [`EmptyFold`] to close out, and [`FactorFold`] to move an
+/// invariant factor out of the body. Inert for a kernel with no folds in it.
 #[must_use]
 pub fn fold_rules() -> Vec<Box<dyn Rewrite>> {
     alloc::vec![
         Box::new(HalveFold) as Box<dyn Rewrite>,
         Box::new(PeelFold) as Box<dyn Rewrite>,
         Box::new(EmptyFold),
+        Box::new(FactorFold),
     ]
 }
 
@@ -245,7 +368,8 @@ struct Done {
 }
 
 /// Build `body` with every leaf occurrence of `binder` rebuilt by `leaf`,
-/// walking one representative per e-class.
+/// walking one representative per e-class and naming, unwalked, every class
+/// whose variance fact clears the binder.
 ///
 /// Shared by [`substituted_body`] (`binder := value`, a literal — `PeelFold`)
 /// and [`shifted_body`] (`binder := binder + stride`, an expression —
@@ -280,6 +404,15 @@ fn rebuild_body(
             Task::Visit(class) => {
                 let class = egraph.find(class);
                 if let Some(&done) = memo.get(&class) {
+                    built.push(done);
+                    continue;
+                }
+                // The binder provably does not reach this class, so the
+                // substitution is the identity on it — and on every member,
+                // not only the representative the walk below would read.
+                if !egraph.variance(class).depends_on(binder.var()) {
+                    let done = named(class);
+                    memo.insert(class, done);
                     built.push(done);
                     continue;
                 }
@@ -623,6 +756,279 @@ mod tests {
         ] {
             assert!(combiner_op(m).is_some(), "{m:?} has no combiner");
         }
+    }
+
+    /// The pieces of a factoring test, built directly as e-nodes so the
+    /// body's shape is exactly the one written.
+    struct Factorable {
+        eg: EGraph,
+        /// The fold's class.
+        class: EClassId,
+        /// The fold node itself, as a rule is handed it.
+        node: ENode,
+    }
+
+    fn op1(op: &'static dyn ops::Op, a: EClassId) -> ENode {
+        ENode::Op {
+            op,
+            children: alloc::vec![a],
+        }
+    }
+
+    fn op2(op: &'static dyn ops::Op, a: EClassId, b: EClassId) -> ENode {
+        ENode::Op {
+            op,
+            children: alloc::vec![a, b],
+        }
+    }
+
+    /// `sin(X·0.1 + i)`: reads both the lattice and the binder.
+    fn wave(eg: &mut EGraph, i: EClassId) -> EClassId {
+        let x = eg.add(ENode::Var(0));
+        let tenth = eg.add(ENode::constant(0.1));
+        let x_scaled = eg.add(op2(&ops::Mul, x, tenth));
+        let phase = eg.add(op2(&ops::Add, x_scaled, i));
+        eg.add(op1(&ops::Sin, phase))
+    }
+
+    /// A fold over slot 0.
+    fn over(monoid: Monoid, range: core::ops::Range<u32>) -> Fold {
+        Fold::new(monoid, binder(0), range)
+    }
+
+    /// `fold` over `body(i)`, with `rules` installed.
+    fn folded(
+        rules: Vec<Box<dyn Rewrite>>,
+        fold: Fold,
+        body: impl FnOnce(&mut EGraph, EClassId) -> EClassId,
+    ) -> Factorable {
+        let mut eg = EGraph::with_rules(rules);
+        let i = eg.add(ENode::Var(fold.binder().var()));
+        let body = body(&mut eg, i);
+        let node = ENode::Reduce { fold, body };
+        let class = eg.add(node.clone());
+        Factorable { eg, class, node }
+    }
+
+    fn factor_only() -> Vec<Box<dyn Rewrite>> {
+        alloc::vec![Box::new(FactorFold) as Box<dyn Rewrite>]
+    }
+
+    /// What a [`FactorFold`] firing on the fold asserts, or `None` if it
+    /// declines.
+    fn factoring(f: &Factorable) -> Option<Factoring> {
+        match FactorFold.apply(&f.eg, f.class, &f.node)? {
+            RewriteAction::FactorFold(factoring) => Some(factoring),
+            other => panic!("FactorFold emitted {other:?}"),
+        }
+    }
+
+    /// The firing's `(factor, rest)`, canonical.
+    fn operands(f: &Factorable) -> Option<(EClassId, EClassId)> {
+        factoring(f).map(|g| (f.eg.find(g.factor), f.eg.find(g.rest)))
+    }
+
+    /// Whether `class` holds `factoring`'s right-hand side,
+    /// `factor ⊗ ⊕_{fold} rest`.
+    fn holds(eg: &EGraph, class: EClassId, factoring: Factoring) -> bool {
+        let folds_rest = |c: EClassId| {
+            eg.nodes(c).iter().any(|n| {
+                matches!(n, ENode::Reduce { fold, body }
+                    if *fold == factoring.fold && eg.find(*body) == eg.find(factoring.rest))
+            })
+        };
+        eg.nodes(class).iter().any(|n| match n {
+            ENode::Op { op, children } if op.kind() == factoring.distributor.kind() => {
+                let [factor, folded] = children.as_slice() else {
+                    return false;
+                };
+                eg.find(*factor) == eg.find(factoring.factor) && folds_rest(*folded)
+            }
+            _ => false,
+        })
+    }
+
+    /// **`Σ_i (Y · sin(X·0.1 + i)) = Y · Σ_i sin(X·0.1 + i)`.** `Y` is
+    /// outside the binder's reach, so the fold's class gains the factored
+    /// form — one `Mul` outside a fold over the narrowed body — and the fold
+    /// keeps its algebra, binder and range.
+    #[test]
+    fn factor_fold_moves_an_invariant_factor_out_of_a_sum() {
+        let mut built = None;
+        let mut f = folded(factor_only(), over(Monoid::SUM, 0..8), |eg, i| {
+            let y = eg.add(ENode::Var(1));
+            let w = wave(eg, i);
+            built = Some((y, w));
+            eg.add(op2(&ops::Mul, y, w))
+        });
+        assert_eq!(operands(&f), built);
+
+        let fired = factoring(&f).expect("Y is invariant");
+        assert_eq!(fired.distributor.kind(), OpKind::Mul);
+        assert_eq!(Some(fired.fold), f.node.fold(), "the fold is unchanged");
+        let growth = f.eg.predicted_growth(&RewriteAction::FactorFold(fired));
+        let before = f.eg.num_classes();
+        SaturationConfig::compatibility(1).run(&mut f.eg);
+        assert_eq!(
+            (growth, f.eg.num_classes() - before),
+            (2, 2),
+            "a narrowed fold and one Mul, predicted exactly"
+        );
+        assert!(
+            holds(&f.eg, f.class, fired),
+            "the fold's class must hold Y · Σ_i sin(X·0.1 + i)"
+        );
+    }
+
+    /// Either operand may be the factor: `Σ_i (f(i) · Y)` factors `Y` just
+    /// as `Σ_i (Y · f(i))` does.
+    #[test]
+    fn factor_fold_finds_the_factor_on_either_side() {
+        let mut built = None;
+        let f = folded(factor_only(), over(Monoid::SUM, 0..8), |eg, i| {
+            let y = eg.add(ENode::Var(1));
+            let w = wave(eg, i);
+            built = Some((y, w));
+            eg.add(op2(&ops::Mul, w, y))
+        });
+        assert_eq!(operands(&f), built);
+    }
+
+    /// `min_i (Y·0.5 + cos(X + i)) = Y·0.5 + min_i cos(X + i)`, and the same
+    /// for `max`: `Add` distributes over both.
+    #[test]
+    fn factor_fold_moves_an_invariant_offset_out_of_min_and_max() {
+        for monoid in [Monoid::MIN, Monoid::MAX] {
+            let mut built = None;
+            let mut f = folded(factor_only(), over(monoid, 0..5), |eg, i| {
+                let y = eg.add(ENode::Var(1));
+                let half = eg.add(ENode::constant(0.5));
+                let offset = eg.add(op2(&ops::Mul, y, half));
+                let x = eg.add(ENode::Var(0));
+                let phase = eg.add(op2(&ops::Add, x, i));
+                let cos = eg.add(op1(&ops::Cos, phase));
+                built = Some((offset, cos));
+                eg.add(op2(&ops::Add, offset, cos))
+            });
+            assert_eq!(operands(&f), built, "{monoid:?}");
+            let fired = factoring(&f).expect("Y·0.5 is invariant");
+            assert_eq!(fired.distributor.kind(), OpKind::Add, "{monoid:?}");
+            SaturationConfig::compatibility(1).run(&mut f.eg);
+            assert!(
+                holds(&f.eg, f.class, fired),
+                "{monoid:?}: the fold's class must hold Y·0.5 + ⊕_i cos(X + i)"
+            );
+        }
+    }
+
+    /// **The side condition declines.** `Σ_i (i · sin(X·0.1 + i))`: both
+    /// operands read the binder, so neither is a factor.
+    #[test]
+    fn factor_fold_declines_when_both_operands_read_the_binder() {
+        let f = folded(factor_only(), over(Monoid::SUM, 0..8), |eg, i| {
+            let w = wave(eg, i);
+            eg.add(op2(&ops::Mul, i, w))
+        });
+        assert_eq!(operands(&f), None);
+    }
+
+    /// **An empty fold declines.** `Σ_∅ (Y·f) = 0`, while `Y · Σ_∅ f = Y·0`
+    /// is NaN at an infinite `Y`; `EmptyFold` closes it instead.
+    #[test]
+    fn factor_fold_declines_an_empty_fold() {
+        let empty = over(Monoid::SUM, 3..3);
+        assert!(empty.is_empty(), "precondition");
+        let f = folded(factor_only(), empty, |eg, i| {
+            let y = eg.add(ENode::Var(1));
+            let w = wave(eg, i);
+            eg.add(op2(&ops::Mul, y, w))
+        });
+        assert_eq!(operands(&f), None);
+    }
+
+    /// **Only a distributing pair.** `Π_i (Y · f)` is not `Y · Π_i f` (it is
+    /// `Y^len · Π_i f`), and `Σ_i (Y + f)` is not `Y + Σ_i f`.
+    #[test]
+    fn factor_fold_declines_an_operator_that_does_not_distribute() {
+        let product = folded(factor_only(), over(Monoid::PRODUCT, 0..8), |eg, i| {
+            let y = eg.add(ENode::Var(1));
+            let w = wave(eg, i);
+            eg.add(op2(&ops::Mul, y, w))
+        });
+        assert_eq!(operands(&product), None, "Mul does not distribute over Π");
+
+        let sum_of_sums = folded(factor_only(), over(Monoid::SUM, 0..8), |eg, i| {
+            let y = eg.add(ENode::Var(1));
+            let w = wave(eg, i);
+            eg.add(op2(&ops::Add, y, w))
+        });
+        assert_eq!(
+            operands(&sum_of_sums),
+            None,
+            "Add does not distribute over Σ"
+        );
+    }
+
+    /// **The class, not a representative.** `(i − i) · f(i)` reads the binder
+    /// in every node it was built from, but once the graph knows `i − i = 0`
+    /// the operand's class is constant, and the rule reads the class.
+    #[test]
+    fn factor_fold_reads_the_class_fact_not_the_representative() {
+        let mut zeroish = None;
+        let mut f = folded(factor_only(), over(Monoid::SUM, 0..8), |eg, i| {
+            let i_minus_i = eg.add(op2(&ops::Sub, i, i));
+            let w = wave(eg, i);
+            zeroish = Some(i_minus_i);
+            eg.add(op2(&ops::Mul, i_minus_i, w))
+        });
+        assert_eq!(operands(&f), None, "before the graph knows, it declines");
+
+        let zero = f.eg.add(ENode::constant(0.0));
+        f.eg.union(zeroish.expect("built"), zero);
+        f.eg.rebuild();
+        let (factor, _rest) = operands(&f).expect("after, the class is invariant");
+        assert_eq!(factor, f.eg.find(zero));
+    }
+
+    /// **`rebuild_body` names what the fact clears.** Peeling
+    /// `Σ_{[0,3)} ((i − i) + X)` once the graph knows `i − i = 0`: the body's
+    /// first representative still spells the binder, but its class does not
+    /// depend on it, so the substitution is the identity and the peeled head
+    /// is the body's own class — nothing copied, nothing planned.
+    #[test]
+    fn a_peel_names_a_class_the_fact_clears() {
+        let mut zeroish = None;
+        let mut f = folded(fold_rules(), over(Monoid::SUM, 0..3), |eg, i| {
+            let i_minus_i = eg.add(op2(&ops::Sub, i, i));
+            let x = eg.add(ENode::Var(0));
+            zeroish = Some(i_minus_i);
+            eg.add(op2(&ops::Add, i_minus_i, x))
+        });
+        let zero = f.eg.add(ENode::constant(0.0));
+        f.eg.union(zeroish.expect("built"), zero);
+        f.eg.rebuild();
+
+        let ENode::Reduce { body, .. } = f.node else {
+            panic!("a fold")
+        };
+        match PeelFold.apply(&f.eg, f.class, &f.node) {
+            Some(RewriteAction::PeelFold {
+                head, head_root, ..
+            }) => {
+                assert!(head.is_empty(), "nothing to copy: {head:?}");
+                assert_eq!(head_root, HeadRef::Class(f.eg.find(body)));
+            }
+            other => panic!("expected a peel, got {other:?}"),
+        }
+    }
+
+    /// `FactorFold` is the runtime tier's and only the runtime tier's.
+    #[test]
+    fn factor_fold_is_in_the_runtime_set_only() {
+        use crate::egraph::{RuleId, RuleSet};
+        let id = RuleId::of(&FactorFold);
+        assert!(RuleSet::runtime().index_of(id).is_some());
+        assert!(RuleSet::production().index_of(id).is_none());
     }
 }
 

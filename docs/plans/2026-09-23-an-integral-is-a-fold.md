@@ -264,7 +264,7 @@ per-class fact, `var(C) = ⋂ var(n)`:
 A stale parent fact over-approximates. Without upward repair, a rule can miss
 an opportunity but can never fire wrongly. This one fact replaces two things:
 
-- `DepsAnalysis` (`egraph/deps.rs`, 532 lines, no callers). Its
+- `DepsAnalysis` (`egraph/deps.rs`, 532 lines, no callers; deleted in step 2). Its
   `Variance::meet` is a popcount minimum, not `⋂`: `X.meet(Y) = X`, where `⋂`
   gives `∅` (`variance.rs:151-169`).
 - `rebuild_body`'s per-firing walk, which reads the first representative only.
@@ -361,7 +361,7 @@ a-glyph-is-a-formula §4.3.
    only on `Guard`, which `collapse` refuses anyway (`passes/lattice.rs:156`).
 4. `rebuild_body`'s `varies` flag (`fold_rules.rs:288-327`).
 5. `Substitution` in `unroll_reduce` (`passes.rs:510-525`). Research-only.
-6. `DepsAnalysis` (`egraph/deps.rs`). Dead.
+6. `DepsAnalysis` (`egraph/deps.rs`). Dead, and deleted in step 2.
 7. `compute_dag_variance` (`variance.rs:432`). Dead.
 
 **Exclusivity and the jump.** Jumps are decided by `closed_exclusive` together

@@ -5,7 +5,6 @@
 //! [`pixelflow_ir::ExprArena`].
 
 use super::cost::{CostFunction, CostModel};
-use super::deps::var_variance;
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
 use alloc::collections::BinaryHeap;
@@ -133,14 +132,14 @@ impl<'g> Extraction<'g> {
     }
 
     /// Variance histogram (fraction const / frame-uniform / scanline-uniform
-    /// / pixel-varying) of the CHOSEN nodes, not the class-wide meet
-    /// [`super::DepsAnalysis`] would compute over the whole e-graph.
+    /// / pixel-varying) of the CHOSEN nodes, not the class-wide fact
+    /// (`EGraph::variance`, an intersection over every member).
     ///
     /// Materialises the choice function once via [`choices_to_arena`] and
     /// classifies that arena — P1(c) of
     /// docs/plans/2026-08-17-cost-model-domain.md: once a rewrite merges a
     /// pixel-varying node into a class alongside a constant one, the
-    /// class-wide meet reports CONST regardless of which node the
+    /// class-wide fact reports CONST regardless of which node the
     /// extraction actually chose, so only the materialised DAG describes
     /// what was picked.
     #[must_use]
@@ -1722,40 +1721,29 @@ impl ExtractedDAG {
 /// - Shared e-classes (for let-binding)
 /// - Topological order for emission
 /// The variance of one e-node, given the variance already chosen for the
-/// classes below it: the union of its children's, with leaves naming their
-/// own. A child whose form is not settled yet (a cycle under repair) counts
-/// as fully varying — the conservative direction, since it can only make a
-/// form look more expensive, never less.
+/// classes below it — [`ENode::variance`], the transfer function the
+/// e-graph's class fact is seeded by, fed the chosen forms instead. A fold's
+/// bound index drops out, which is what makes `Σ_i f(i)` frame-uniform when
+/// `f` reads nothing but the index, and therefore hoistable out of the pixel
+/// loop.
+///
+/// A node reading its own class (a cycle under repair) counts as fully
+/// varying — the conservative direction, since it can only make a form look
+/// more expensive, never less.
 fn node_variance(
     egraph: &EGraph,
     node: &ENode,
     best_var: &[Variance],
     canonical: EClassId,
 ) -> Variance {
-    match node {
-        ENode::Var(v) => var_variance(*v),
-        // A buffer's contents are fixed for the kernel's lifetime; a read of
-        // one varies with its index, which is the `Gather`'s other child.
-        ENode::Const(_) | ENode::Buffer(_) | ENode::Uniform(_) | ENode::Param(_) => Variance::CONST,
-        ENode::Op { children, .. } => children.iter().fold(Variance::CONST, |acc, &child| {
-            let c = egraph.find(child);
-            if c == canonical {
-                return Variance::ALL;
-            }
-            acc.union(best_var[c.0 as usize])
-        }),
-        // The one node that *shrinks* the set. Its index is bound, so it is
-        // not free in the result — which is what makes `Σ_i f(i)` frame-
-        // uniform when `f` reads nothing but the index, and therefore
-        // hoistable out of the pixel loop.
-        ENode::Reduce { fold, body } => {
-            let c = egraph.find(*body);
-            if c == canonical {
-                return Variance::ALL;
-            }
-            best_var[c.0 as usize].without(Variance::from_var(fold.binder().var()))
-        }
+    if node
+        .children_slice()
+        .iter()
+        .any(|&child| egraph.find(child) == canonical)
+    {
+        return Variance::ALL;
     }
+    node.variance(|child| best_var[egraph.find(child).index()])
 }
 
 /// The cost of one *settled* extraction, in both of the shapes that matter.

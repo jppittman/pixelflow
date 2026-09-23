@@ -21,3 +21,6 @@ pixelflow-codegen = { path = "../pixelflow-codegen" }
 
 [dev-dependencies]
 pixelflow-ir = { path = "../pixelflow-ir" }
+# tests/fold_factoring.rs reads the runtime tier's extraction for the kernels
+# it bakes, so it can pin that the texels it judges are the factored form.
+pixelflow-search = { path = "../pixelflow-search" }

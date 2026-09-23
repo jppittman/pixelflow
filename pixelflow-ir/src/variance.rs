@@ -40,7 +40,8 @@
 /// Coordinates X=bit0, Y=bit1; reduction index slots in bits `4..64`.
 /// Bits 2 and 3 are the retired Z and W axes and are never set. Operations:
 /// - `union`: bitwise OR (join — a binary op depends on both operands' vars)
-/// - `meet`: minimum across e-class representatives (pick lowest-deps form)
+/// - `intersection`: bitwise AND (meet — what every one of several equal
+///   terms is free of, the whole term is free of)
 /// - `without`: set difference — what a binder does to its own index
 ///
 /// This type is `no_std` compatible and zero-cost (single `u64`). It was a
@@ -148,25 +149,23 @@ impl Variance {
         Self(self.0 & !other.0)
     }
 
-    /// Meet: the minimum-variance representative.
-    /// Used ACROSS e-nodes in the same e-class (pick the cheapest representation).
+    /// Intersection (meet): the variables both operands depend on.
     ///
-    /// Compares by popcount first (fewer deps = better), then by raw value for
-    /// determinism.
+    /// Used ACROSS terms known to be equal. Each term's variance is an
+    /// over-approximation of the one function they all denote, so a variable
+    /// absent from *any* of them is absent from the function:
+    ///
+    /// ```text
+    /// var(C) = ⋂_{n ∈ C} var(n)
+    /// ```
+    ///
+    /// This is the lattice meet, not a choice of representative: `X ∩ Y` is
+    /// `CONST`, because a function that is constant along `Y` (the first
+    /// term says so) and constant along `X` (the second does) is constant.
     #[inline]
     #[must_use]
-    pub const fn meet(self, other: Self) -> Self {
-        let a_pop = self.0.count_ones();
-        let b_pop = other.0.count_ones();
-        if a_pop < b_pop {
-            self
-        } else if b_pop < a_pop {
-            other
-        } else if self.0 <= other.0 {
-            self
-        } else {
-            other
-        }
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
     }
 
     // --- Queries ---
@@ -334,9 +333,10 @@ fn referent_variance(_key: crate::key::KernelKey) -> Variance {
 ///
 /// Public because `pixelflow-search` calls it from outside this crate: its
 /// `nnue::factored::variance_histogram`, the classification behind
-/// `Extraction::chosen_variance`, reads the whole per-node table. In this
-/// crate `passes::unroll_reduce` and `passes::lower_dwrt`'s tabulation rule
-/// read it the same way.
+/// `Extraction::chosen_variance`, reads the whole per-node table (the e-graph
+/// keeps the same fact per class, as `EGraph::variance`). In this crate
+/// `passes::unroll_reduce` and `passes::lower_dwrt`'s tabulation rule read it
+/// the same way.
 #[must_use]
 pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> {
     use crate::arena::{ExprId, ExprNode};
@@ -583,18 +583,21 @@ mod tests {
     }
 
     #[test]
-    fn verify_meet() {
-        // Fewer deps wins
-        assert_eq!(Variance::CONST.meet(Variance::X), Variance::CONST);
-        assert_eq!(Variance::X.meet(Variance::CONST), Variance::CONST);
+    fn verify_intersection() {
+        assert_eq!(Variance::CONST.intersection(Variance::X), Variance::CONST);
+        assert_eq!(Variance::X.intersection(Variance::CONST), Variance::CONST);
 
-        // Same popcount: lower raw value wins (deterministic)
-        assert_eq!(Variance::X.meet(Variance::Y), Variance::X); // 0b0001 < 0b0010
-        assert_eq!(Variance::Y.meet(Variance::X), Variance::X);
+        // Two single, different variables share nothing: a function constant
+        // along each is constant. A popcount minimum would have answered `X`.
+        assert_eq!(Variance::X.intersection(Variance::Y), Variance::CONST);
+        assert_eq!(Variance::Y.intersection(Variance::X), Variance::CONST);
 
-        // 2-bit vs 1-bit: 1-bit wins
         let xy = Variance::X.union(Variance::Y);
-        assert_eq!(xy.meet(Variance::from_var(4)), Variance::from_var(4));
+        let slot = Variance::from_var(4);
+        assert_eq!(xy.intersection(slot), Variance::CONST);
+        assert_eq!(xy.intersection(Variance::Y), Variance::Y);
+        assert_eq!(xy.union(slot).intersection(slot), slot);
+        assert_eq!(Variance::ALL.intersection(xy), xy);
     }
 
     #[test]
