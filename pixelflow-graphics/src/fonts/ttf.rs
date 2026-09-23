@@ -522,6 +522,21 @@ impl<'a> Font<'a> {
     }
 
     /// Decode a compound glyph: every component's outline, transformed.
+    ///
+    /// **A mirrored component is reversed.** A component placed by a
+    /// reflection (a 2×2 transform with negative determinant) comes out
+    /// inside out: its contours wind −1 around ink where the rest of the
+    /// glyph winds +1. The non-zero rule does not mind, since `|w|` is the
+    /// same. Coverage does mind, because it adds signed area. Where a
+    /// mirrored half abuts its original, as the two halves of a symmetric
+    /// glyph built from one component do, a pixel straddling the join sums
+    /// `+a − (1 − a)`, and the join shows as a seam. Reversing the mirrored
+    /// component's contours restores the orientation the font drew it with.
+    /// The whole-glyph screen flip (`Font::to_screen`) mirrors every contour
+    /// at once and so changes no relative orientation; it is left alone.
+    ///
+    /// Where two components genuinely overlap, coverage still reads `|Σ|`
+    /// clamped to 1. That is FreeType's approximation, and it is accepted.
     fn compound(&self, r: &mut R) -> Option<Outline> {
         let mut outline = Outline::default();
         loop {
@@ -556,7 +571,12 @@ impl<'a> Font<'a> {
                 m[3] = r.i16()? as f32 / F2DOT14;
             }
             if let Some(component) = self.outline(id) {
-                outline.append(component.transformed(Affine(m)));
+                let placement = Affine(m);
+                let placed = component.transformed(placement);
+                outline.append(match placement.mirrors() {
+                    true => placed.reversed(),
+                    false => placed,
+                });
             }
             if fl & COMPONENT_MORE_COMPONENTS == 0 {
                 break;
