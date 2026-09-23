@@ -557,8 +557,10 @@ Not on this list:
      constants (`STEP_FLOOR`, `RADICAND_FLOOR`, `ROOT_FLOOR = 2⁻¹⁰⁰`); the
      interval's ends stay `pub(crate)`. The rule, in
      `pixelflow-search/src/egraph/integral.rs`, only decides when: it reads
-     `T` (`monotone_root`), the clamp's arc (`monotone_quadratic`) and the
-     certificates (`certified`) off every node of every class, operands of
+     `T` (`monotone_root`, as the author's quotient `D/d` or as the
+     `D·(1/d)` the definition writes), the clamp's arc
+     (`monotone_quadratic`) and the certificates (`certified`) off every
+     node of every class, operands of
      `+`, `·` and `max` in either order and the band's comparisons in any of
      `≤ < ≥ >`; it reads the clamp's argument through `Recognizer::affine`,
      generalized so that a class — the arc's rise `R` — can stand for the
@@ -643,6 +645,33 @@ Not on this list:
      reciprocal over `(Y + origin) − y₀` and folds the constant part, so
      the error there grows as `|X| + |Y|` — `2.2e-5` at `1000`, inside the
      oracle's tolerance, which carries those terms for this reason.
+   - **Code review**, one fix and two measurements:
+     - **The definition and the rule had drifted apart.** Once the
+       adversarial review spelled every root `δ·(1/d)`, the recognizer still
+       read only `δ/d`, so an integrand built by `monotone_root` itself —
+       the one definition an author is told to spell — kept its integral
+       (a curve over literal columns: `1` unclosed). Every pin passed,
+       because each writes `T` out by hand as a quotient. The recognizer
+       now reads both, and `an_arc_built_by_the_definition_closes` builds
+       `T` with `monotone_root` (curve and line, literal and uniform
+       columns) and fails with the `δ·(1/d)` reading removed.
+     - **The closing phase is under the class cap, and an arc's right-hand
+       side is about 80 classes.** Each arc its own integral over uniforms,
+       summed in one kernel: 38 close, and 40 leave 3 to quadrature — the
+       phase stops on `class_cap` in its first round, at 4,893 classes.
+       Nothing written today reaches it, and a glyph as one fold with one
+       body fires once per outline span; a kernel written as many separate
+       integrals is where the cap would decide coverage, and
+       `surviving_intervals` is the instrument that would show it.
+     - **Inert, re-measured.** The glyph bakes of `glyph_atlas_golden` and
+       `font_rasterization_regression`, and the chord kernels of
+       `area_oracle` and `area_adversarial`, write saturation telemetry
+       identical record for record at `36c8206` and after this step. With
+       `ArcMoment` made to decline at once, five search pins and every test
+       of both arc oracles but the reference checks and the uncertified
+       fallback fail. Re-reading an integral it cannot close, every round of
+       the main phase, costs 2–7% of the saturation against declining at
+       once (median of five, one to twenty unclosable arcs, release).
    - **Not built here:** the host's split at extrema and its `MonotoneQuad`
      (step 6, with critique 0's non-terminating split), the
      `surviving_intervals` telemetry field, and `glyph_is_closed`.

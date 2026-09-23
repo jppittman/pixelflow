@@ -166,11 +166,14 @@ pub struct ClampMoment;
 ///   and a clamp. The indicators are `Select(m, 1, 0)` of `0 ≤ T` and
 ///   `T < 1` in any of `≤ <` and `≥ >` spellings — strictness moves a
 ///   point, which has no length — over one class `T`.
-/// - `T` holds `D / max(b + √max(b·b + a·D, 0), k)`, operands of `+`, `·`
-///   and `max` in either order, `k` a normal literal no larger than
-///   `2⁻¹⁰⁰` (`RootFloor`): a larger floor moves the root over a visible
-///   height, and a subnormal one is zero under denormals-are-zero.
-///   The radicand's floor is the literal `0`, and nothing else.
+/// - `T` holds `D / d` or `D·(1/d)` — the author's quotient, or the
+///   spelling `monotone_root` writes, so an integrand built by the one
+///   definition is read back by this rule — with
+///   `d = max(b + √max(b·b + a·D, 0), k)`, operands of `+`, `·` and `max`
+///   in either order, `k` a normal literal no larger than `2⁻¹⁰⁰`
+///   (`RootFloor`): a larger floor moves the root over a visible height,
+///   and a subnormal one is zero under denormals-are-zero. The radicand's
+///   floor is the literal `0`, and nothing else.
 /// - `D = u + D₀`, affine in the variable with the literal slope `1`.
 /// - `b` and `a` are certified: `b` holds `max(z, k)` with a literal
 ///   `k ≥ STEP_FLOOR` (or is such a literal), and `a` holds `e − b` with `e`
@@ -316,7 +319,7 @@ impl Rewrite for ArcMoment {
         let binder = fold.binder();
         let (arc, outside) = egraph.nodes(*body).iter().find_map(|spelling| {
             let factors = Factors::of(egraph, spelling, &ops::Mul, binder)?;
-            let arc = arc_integrand(egraph, binder, &factors.variant)?;
+            let arc = ArcReader { egraph, binder }.integrand(&factors.variant)?;
             Some((arc, factors.invariant))
         })?;
 
@@ -399,32 +402,6 @@ enum Edge {
     End,
 }
 
-/// The factors the variable reaches, read as `[0 ≤ T]·[T < 1]·clamp(…)`:
-/// which factor is the clamp is tried every way round, since a product's
-/// order is the author's (or the algebra's).
-fn arc_integrand(egraph: &EGraph, binder: Binder, factors: &[EClassId]) -> Option<ArcIntegrand> {
-    let &[f0, f1, f2] = factors else {
-        return None;
-    };
-    [[f0, f1, f2], [f1, f2, f0], [f2, f0, f1]]
-        .into_iter()
-        .find_map(|[first, second, clamp_factor]| {
-            let parameter = band_of(egraph, first, second)?;
-            let root = monotone_root(egraph, binder, parameter)?;
-            clamps(egraph, clamp_factor)
-                .into_iter()
-                .find_map(|(argument, band)| {
-                    let (offset, x) = arc_reading(egraph, binder, argument, parameter)?;
-                    Some(ArcIntegrand {
-                        root: root.clone(),
-                        offset,
-                        x,
-                        band,
-                    })
-                })
-        })
-}
-
 /// The class `T` two indicators are the band `[0 ≤ T < 1]` of — one each
 /// edge, in either order — or `None`.
 fn band_of(egraph: &EGraph, a: EClassId, b: EClassId) -> Option<EClassId> {
@@ -474,163 +451,205 @@ fn edges(egraph: &EGraph, factor: EClassId) -> Vec<(Edge, EClassId)> {
     found
 }
 
-/// `T` as a monotone root: `D / max(b + √max(b·b + a·D, 0), k)` with
-/// `D = u + D₀`, the rise `[b, a]` certified and the variable reaching
-/// neither, and `k` a [`RootFloor`]. See [`ArcMoment`].
-fn monotone_root(egraph: &EGraph, binder: Binder, parameter: EClassId) -> Option<Root> {
-    binary_in(egraph, parameter, OpKind::Div).find_map(|[delta, denominator]| {
-        let delta = egraph.find(delta);
-        either_order(egraph, denominator, OpKind::Max).find_map(|[sum, floor]| {
-            let floor = RootFloor::new(egraph.constant(floor)?)?;
-            either_order(egraph, sum, OpKind::Add).find_map(|[step, root]| {
-                let step = egraph.find(step);
-                unary_in(egraph, root, OpKind::Sqrt).find_map(|radicand| {
-                    let bend = floored_radicand(egraph, radicand, step, delta)?;
-                    let rise = certified_rise(egraph, binder, step, bend)?;
-                    let height = Recognizer::new(egraph, binder).affine(delta)?;
-                    (literal_of(&height.slope) == Some(1.0)).then(|| Root {
-                        height: height.offset,
-                        rise,
-                        floor,
+/// The context [`ArcMoment`]'s recognizers read in: the graph, and the
+/// integration variable that nothing they admit into a term may reach.
+#[derive(Clone, Copy)]
+struct ArcReader<'g> {
+    egraph: &'g EGraph,
+    binder: Binder,
+}
+
+impl ArcReader<'_> {
+    /// Whether the variable reaches `class`, by the class variance fact.
+    fn varies(self, class: EClassId) -> bool {
+        self.egraph.variance(class).depends_on(self.binder.var())
+    }
+
+    /// The factors the variable reaches, read as `[0 ≤ T]·[T < 1]·clamp(…)`:
+    /// which factor is the clamp is tried every way round, since a product's
+    /// order is the author's (or the algebra's).
+    fn integrand(self, factors: &[EClassId]) -> Option<ArcIntegrand> {
+        let &[f0, f1, f2] = factors else {
+            return None;
+        };
+        [[f0, f1, f2], [f1, f2, f0], [f2, f0, f1]]
+            .into_iter()
+            .find_map(|[first, second, clamp_factor]| {
+                let parameter = band_of(self.egraph, first, second)?;
+                let root = self.monotone_root(parameter)?;
+                clamps(self.egraph, clamp_factor)
+                    .into_iter()
+                    .find_map(|(argument, band)| {
+                        let (offset, x) = self.reading(argument, parameter)?;
+                        Some(ArcIntegrand {
+                            root: root.clone(),
+                            offset,
+                            x,
+                            band,
+                        })
+                    })
+            })
+    }
+
+    /// `T` as a monotone root: `D / d` or `D·(1/d)`, with
+    /// `d = max(b + √max(b·b + a·D, 0), k)`, `D = u + D₀`, the rise `[b, a]`
+    /// certified and the variable reaching neither, and `k` a [`RootFloor`].
+    /// See [`ArcMoment`].
+    fn monotone_root(self, parameter: EClassId) -> Option<Root> {
+        let egraph = self.egraph;
+        quotients(egraph, parameter).find_map(|[delta, denominator]| {
+            let delta = egraph.find(delta);
+            either_order(egraph, denominator, OpKind::Max).find_map(|[sum, floor]| {
+                let floor = RootFloor::new(egraph.constant(floor)?)?;
+                either_order(egraph, sum, OpKind::Add).find_map(|[step, root]| {
+                    let step = egraph.find(step);
+                    unary_in(egraph, root, OpKind::Sqrt).find_map(|radicand| {
+                        let bend = self.floored_radicand(radicand, step, delta)?;
+                        let rise = self.certified_rise(step, bend)?;
+                        let height = Recognizer::new(egraph, self.binder).affine(delta)?;
+                        (literal_of(&height.slope) == Some(1.0)).then(|| Root {
+                            height: height.offset,
+                            rise,
+                            floor,
+                        })
                     })
                 })
             })
         })
-    })
-}
+    }
 
-/// The bend `a` of `max(b·b + a·D, 0)` in `class`, operands in either order,
-/// given `b` and `D`.
-fn floored_radicand(
-    egraph: &EGraph,
-    class: EClassId,
-    step: EClassId,
-    delta: EClassId,
-) -> Option<EClassId> {
-    either_order(egraph, class, OpKind::Max).find_map(|[radicand, floor]| {
-        if egraph.constant(floor) != Some(RADICAND_FLOOR) {
-            return None;
-        }
-        either_order(egraph, radicand, OpKind::Add).find_map(|[square, reach]| {
-            let squares = binary_in(egraph, square, OpKind::Mul)
-                .any(|[p, q]| egraph.find(p) == step && egraph.find(q) == step);
-            if !squares {
+    /// The bend `a` of `max(b·b + a·D, 0)` in `class`, operands in either
+    /// order, given `b` and `D`.
+    fn floored_radicand(
+        self,
+        class: EClassId,
+        step: EClassId,
+        delta: EClassId,
+    ) -> Option<EClassId> {
+        let egraph = self.egraph;
+        either_order(egraph, class, OpKind::Max).find_map(|[radicand, floor]| {
+            if egraph.constant(floor) != Some(RADICAND_FLOOR) {
                 return None;
             }
-            either_order(egraph, reach, OpKind::Mul)
-                .find_map(|[bend, d]| (egraph.find(d) == delta).then(|| egraph.find(bend)))
-        })
-    })
-}
-
-/// `R`'s rise `[β, α]` when `R` holds `T·(β + β + α·T)`, operands of `·`
-/// and the outer `+` in either order, the rise certified.
-fn monotone_quadratic(
-    egraph: &EGraph,
-    binder: Binder,
-    rise: EClassId,
-    parameter: EClassId,
-) -> Option<[Rc<Term>; 2]> {
-    let is_parameter = |class| egraph.find(class) == parameter;
-    either_order(egraph, rise, OpKind::Mul).find_map(|[t, slope]| {
-        if !is_parameter(t) {
-            return None;
-        }
-        either_order(egraph, slope, OpKind::Add).find_map(|[twice, bent]| {
-            let step = binary_in(egraph, twice, OpKind::Add).find_map(|[p, q]| {
-                let p = egraph.find(p);
-                (p == egraph.find(q)).then_some(p)
-            })?;
-            either_order(egraph, bent, OpKind::Mul).find_map(|[bend, t]| {
-                if !is_parameter(t) {
+            either_order(egraph, radicand, OpKind::Add).find_map(|[square, reach]| {
+                let squares = binary_in(egraph, square, OpKind::Mul)
+                    .any(|[p, q]| egraph.find(p) == step && egraph.find(q) == step);
+                if !squares {
                     return None;
                 }
-                certified_rise(egraph, binder, step, egraph.find(bend))
+                either_order(egraph, reach, OpKind::Mul)
+                    .find_map(|[bend, d]| (egraph.find(d) == delta).then(|| egraph.find(bend)))
             })
         })
-    })
-}
+    }
 
-/// What a clamp's argument reads off the arc: `offset + x(T)` for an
-/// argument `s·R + c` with `R = x(T)` a [`monotone_quadratic`] of the root
-/// and `s` a positive literal, returned as `(c, [s·β, s·α])`.
-fn arc_reading(
-    egraph: &EGraph,
-    binder: Binder,
-    argument: EClassId,
-    parameter: EClassId,
-) -> Option<(Rc<Term>, [Rc<Term>; 2])> {
-    spelled_from(egraph, binder, argument)
-        .into_iter()
-        .find_map(|rise| {
-            let [step, bend] = monotone_quadratic(egraph, binder, rise, parameter)?;
-            let form = Recognizer::in_terms_of(egraph, binder, rise).affine(argument)?;
+    /// `R`'s rise `[β, α]` when `R` holds `T·(β + β + α·T)`, operands of `·`
+    /// and the outer `+` in either order, the rise certified.
+    fn monotone_quadratic(self, rise: EClassId, parameter: EClassId) -> Option<[Rc<Term>; 2]> {
+        let egraph = self.egraph;
+        let is_parameter = |class| egraph.find(class) == parameter;
+        either_order(egraph, rise, OpKind::Mul).find_map(|[t, slope]| {
+            if !is_parameter(t) {
+                return None;
+            }
+            either_order(egraph, slope, OpKind::Add).find_map(|[twice, bent]| {
+                let step = binary_in(egraph, twice, OpKind::Add).find_map(|[p, q]| {
+                    let p = egraph.find(p);
+                    (p == egraph.find(q)).then_some(p)
+                })?;
+                either_order(egraph, bent, OpKind::Mul).find_map(|[bend, t]| {
+                    if !is_parameter(t) {
+                        return None;
+                    }
+                    self.certified_rise(step, egraph.find(bend))
+                })
+            })
+        })
+    }
+
+    /// What a clamp's argument reads off the arc: `offset + x(T)` for an
+    /// argument `s·R + c` with `R = x(T)` a
+    /// [`monotone_quadratic`](Self::monotone_quadratic) of the root and `s` a
+    /// positive literal, returned as `(c, [s·β, s·α])`.
+    fn reading(self, argument: EClassId, parameter: EClassId) -> Option<(Rc<Term>, [Rc<Term>; 2])> {
+        self.spelled_from(argument).into_iter().find_map(|rise| {
+            let [step, bend] = self.monotone_quadratic(rise, parameter)?;
+            let form = Recognizer::in_terms_of(self.egraph, self.binder, rise).affine(argument)?;
             let scale = literal_of(&form.slope).filter(|s| *s > 0.0 && s.is_finite())?;
             let scale = Rc::new(Term::Literal(scale));
             let x = [product(Rc::clone(&scale), step), product(scale, bend)];
             Some((form.offset, x))
         })
-}
+    }
 
-/// The classes the variable reaches that `class` is spelled from through
-/// `+`, `−`, negation, `·` and fused multiply-add — the candidates for what
-/// an affine form of it is in terms of — `class` first.
-fn spelled_from(egraph: &EGraph, binder: Binder, class: EClassId) -> Vec<EClassId> {
-    let varies = |class| egraph.variance(class).depends_on(binder.var());
-    let mut seen = BTreeSet::new();
-    let mut order = Vec::new();
-    let mut stack = alloc::vec![egraph.find(class)];
-    while let Some(class) = stack.pop() {
-        if !varies(class) || !seen.insert(class) {
-            continue;
-        }
-        order.push(class);
-        for node in egraph.nodes(class) {
-            let ENode::Op { op, children } = node else {
+    /// The classes the variable reaches that `class` is spelled from through
+    /// `+`, `−`, negation, `·` and fused multiply-add — the candidates for
+    /// what an affine form of it is in terms of — `class` first.
+    fn spelled_from(self, class: EClassId) -> Vec<EClassId> {
+        let egraph = self.egraph;
+        let mut seen = BTreeSet::new();
+        let mut order = Vec::new();
+        let mut stack = alloc::vec![egraph.find(class)];
+        while let Some(class) = stack.pop() {
+            if !self.varies(class) || !seen.insert(class) {
                 continue;
-            };
-            if matches!(
-                op.kind(),
-                OpKind::Add | OpKind::Sub | OpKind::Neg | OpKind::Mul | OpKind::MulAdd
-            ) {
-                stack.extend(children.iter().map(|&child| egraph.find(child)));
+            }
+            order.push(class);
+            for node in egraph.nodes(class) {
+                let ENode::Op { op, children } = node else {
+                    continue;
+                };
+                if matches!(
+                    op.kind(),
+                    OpKind::Add | OpKind::Sub | OpKind::Neg | OpKind::Mul | OpKind::MulAdd
+                ) {
+                    stack.extend(children.iter().map(|&child| egraph.find(child)));
+                }
             }
         }
+        order
     }
-    order
+
+    /// `[step, bend]` as terms, when they are a certified rise the variable
+    /// does not reach: `step` [`certified`], and `bend` holding `e − step`
+    /// with `e` certified, so both control-polygon steps are.
+    ///
+    /// A bend whose two steps are both literals is their difference, as a
+    /// literal — what `ConstantFold` makes of the class a round later, read
+    /// now: the rule fires in the same round the steps' certificates fold,
+    /// and `monotone_root` drops `bend·δ` for a literal zero bend, so a line
+    /// with constant columns has an all-literal denominator whose reciprocal
+    /// folds in the closing phase.
+    fn certified_rise(self, step: EClassId, bend: EClassId) -> Option<[Rc<Term>; 2]> {
+        let egraph = self.egraph;
+        if self.varies(step) || self.varies(bend) || !certified(egraph, step) {
+            return None;
+        }
+        let second = binary_in(egraph, bend, OpKind::Sub).find_map(|[second, first]| {
+            (egraph.find(first) == step && certified(egraph, second)).then_some(second)
+        })?;
+        let literal_bend = egraph
+            .constant(second)
+            .zip(egraph.constant(step))
+            .and_then(|(second, first)| folded(second - first));
+        Some([
+            value(egraph, step),
+            literal_bend.unwrap_or_else(|| value(egraph, bend)),
+        ])
+    }
 }
 
-/// `[step, bend]` as terms, when they are a certified rise the variable does
-/// not reach: `step` [`certified`], and `bend` holding `e − step` with `e`
-/// certified, so both control-polygon steps are.
-///
-/// A bend whose two steps are both literals is their difference, as a
-/// literal — what `ConstantFold` makes of the class a round later, read now:
-/// the rule fires in the same round the steps' certificates fold, and
-/// `monotone_root` drops `bend·δ` for a literal zero bend, so a line with
-/// constant columns has an all-literal denominator whose reciprocal folds
-/// in the closing phase.
-fn certified_rise(
-    egraph: &EGraph,
-    binder: Binder,
-    step: EClassId,
-    bend: EClassId,
-) -> Option<[Rc<Term>; 2]> {
-    let varies = |class| egraph.variance(class).depends_on(binder.var());
-    if varies(step) || varies(bend) || !certified(egraph, step) {
-        return None;
-    }
-    let second = binary_in(egraph, bend, OpKind::Sub).find_map(|[second, first]| {
-        (egraph.find(first) == step && certified(egraph, second)).then_some(second)
-    })?;
-    let literal_bend = egraph
-        .constant(second)
-        .zip(egraph.constant(step))
-        .and_then(|(second, first)| folded(second - first));
-    Some([
-        value(egraph, step),
-        literal_bend.unwrap_or_else(|| value(egraph, bend)),
-    ])
+/// The quotients `[D, d]` `class` holds: `D / d`, and `D·(1/d)` — how
+/// `pixelflow_ir::integral::monotone_root` spells one — operands of `·` in
+/// either order. The same value over ℝ, so either is the root's.
+fn quotients(egraph: &EGraph, class: EClassId) -> impl Iterator<Item = [EClassId; 2]> + '_ {
+    let divided = binary_in(egraph, class, OpKind::Div);
+    let scaled = either_order(egraph, class, OpKind::Mul).flat_map(move |[delta, reciprocal]| {
+        binary_in(egraph, reciprocal, OpKind::Div)
+            .filter(move |&[one, _]| egraph.constant(one) == Some(1.0))
+            .map(move |[_, denominator]| [delta, denominator])
+    });
+    divided.chain(scaled)
 }
 
 /// Whether `class` is certified at least [`STEP_FLOOR`]: it is a literal
@@ -1187,7 +1206,7 @@ mod tests {
     use super::*;
     use crate::runtime::unclosed_integrals;
     use pixelflow_ir::integral::ROOT_FLOOR;
-    use pixelflow_ir::{Kernel, LatticeShape, Monoid};
+    use pixelflow_ir::{ExprNode, Kernel, LatticeShape, Monoid};
 
     /// The lattice every closure pin extracts at.
     const SHAPE: LatticeShape = LatticeShape::new([8, 8]);
@@ -1613,6 +1632,9 @@ mod tests {
         Commuted,
         /// The first `y` step read raw, with no certificate.
         Uncertified,
+        /// `T` built by `pixelflow_ir::integral::monotone_root` itself — the
+        /// one definition, `D·(1/d)` — rather than written out.
+        Definition,
     }
 
     /// The author's integrand for `piece`:
@@ -1647,7 +1669,10 @@ mod tests {
             Spelling::Commuted => radicand.sqrt().add(&b),
             _ => b.add(&radicand.sqrt()),
         };
-        let t = d.div(&denominator.max(&Kernel::constant(floor)));
+        let t = match spelling {
+            Spelling::Definition => by_definition(&d, [&b, &a], floor),
+            _ => d.div(&denominator.max(&Kernel::constant(floor))),
+        };
         let slope = bx.add(&bx).add(&ax.mul(&t));
         let rise = match spelling {
             Spelling::Commuted => slope.mul(&t),
@@ -1661,6 +1686,25 @@ mod tests {
         let chi = band.mul(&indicator_of(&Kernel::x().lt(&xt)));
         let screen_y = column(piece.reflect).mul(&Kernel::y());
         column(piece.sigma).mul(&chi.area().at(&Kernel::x(), &screen_y))
+    }
+
+    /// `T = τ(delta)` as `pixelflow_ir::integral::monotone_root` writes it
+    /// for the rise `[step, bend]`, built into the arena that holds the
+    /// operands.
+    fn by_definition(delta: &Kernel, [step, bend]: [&Kernel; 2], floor: f32) -> Kernel {
+        let operands = delta.add(step).add(bend);
+        let (arena, root) = operands.parts();
+        let mut arena = arena.clone();
+        let ExprNode::Binary(OpKind::Add, pair, bend) = arena.node(root) else {
+            panic!("operands {:?}", arena.node(root));
+        };
+        let ExprNode::Binary(OpKind::Add, delta, step) = arena.node(pair) else {
+            panic!("operands {:?}", arena.node(pair));
+        };
+        let floor = RootFloor::new(floor).expect("a root floor");
+        let rise = IrRise { step, bend };
+        let t = pixelflow_ir::integral::monotone_root(&mut arena, delta, rise, floor);
+        Kernel::from_parts(arena, t)
     }
 
     fn literal(v: f32) -> Kernel {
@@ -1710,6 +1754,31 @@ mod tests {
         for (piece_name, piece) in pieces {
             for (column_name, column) in columns {
                 let area = arc_term(piece, column, Spelling::Author, ROOT_FLOOR);
+                assert_eq!(
+                    unclosed(&area),
+                    Some(0),
+                    "{piece_name} over {column_name} columns"
+                );
+            }
+        }
+    }
+
+    /// **The one definition is read back.** `T` built by
+    /// `pixelflow_ir::integral::monotone_root` — `D·(1/d)`, the spelling the
+    /// right-hand side's own roots take — closes as the author's quotient
+    /// `D/d` does, for a curve and a line, over literal columns and uniforms.
+    /// Read only as `D/d`, it kept its integral: the definition and the
+    /// recognizer had drifted apart, and nothing failed.
+    #[test]
+    fn an_arc_built_by_the_definition_closes() {
+        let line = Piece {
+            second: CURVE.first,
+            ..CURVE
+        };
+        let columns: [(&str, fn(f32) -> Kernel); 2] = [("literal", literal), ("uniform", uniform)];
+        for (piece_name, piece) in [("curve", CURVE), ("line", line)] {
+            for (column_name, column) in columns {
+                let area = arc_term(piece, column, Spelling::Definition, ROOT_FLOOR);
                 assert_eq!(
                     unclosed(&area),
                     Some(0),
@@ -1781,7 +1850,11 @@ mod tests {
             matches!(&**coordinates, Term::Difference(..)),
             "{coordinates:?}"
         );
-        assert!(spelled_from(&eg, slot(0), z).contains(&eg.find(r)));
+        let reader = ArcReader {
+            egraph: &eg,
+            binder: slot(0),
+        };
+        assert!(reader.spelled_from(z).contains(&eg.find(r)));
 
         let beside = eg.add(op2(&ops::Add, z, u));
         let square = eg.add(op2(&ops::Mul, r, r));

@@ -138,11 +138,12 @@ pub const ROOT_FLOOR: f32 = 1.0 / 1_267_650_600_228_229_401_496_703_205_376.0;
 ///
 /// **Normal**, not merely positive. A subnormal floor is zero wherever a
 /// kernel runs with denormals-are-zero — which the renderer's workers do
-/// (`FastMathGuard`) — and there `δ/max(0, floor)` is `0/0`. Its reciprocal
-/// also overflows `f32`, so the exact `1/floor` the root multiplies by
-/// cannot be a finite literal. Measured before the bound: a vertical line of
-/// literal columns under the subnormal floor `2⁻¹³⁶` read `1` for `0` along
-/// the pixel edge it starts on (`pixelflow-core/tests/arc_adversarial.rs`).
+/// (`FastMathGuard`) — and there `δ/max(0, floor)` is `0/0`. From `2⁻¹²⁸`
+/// down its reciprocal also overflows `f32`, so the exact `1/floor` the root
+/// multiplies by cannot be a finite literal. Measured before the bound: a
+/// vertical line of literal columns under the subnormal floor `2⁻¹³⁶` read
+/// `1` for `0` along the pixel edge it starts on
+/// (`pixelflow-core/tests/arc_adversarial.rs`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RootFloor(f32);
 
@@ -311,7 +312,9 @@ pub fn mean_of_clamp(arena: &mut ExprArena, sweep: Sweep, band: Band) -> ExprId 
 /// `τ(δ) = δ / max(step + √max(step² + bend·δ, 0), floor)`: the parameter at
 /// which a certified [`Rise`] reaches `δ` — the one definition, which an
 /// author's integrand spells and [`IntervalFold::arc_moment`] evaluates at
-/// its ends.
+/// its ends. The rule that closes the integral reads back what this writes
+/// as well as an author's quotient `δ/d`, and a pin builds its integrand
+/// here (`ArcMoment`, `an_arc_built_by_the_definition_closes`).
 ///
 /// **Law.** `q(t) = δ` is `bend·t² + 2·step·t − δ = 0`, whose increasing
 /// root `(√(step² + bend·δ) − step)/bend` is, rationalized, `τ(δ)` — a form
