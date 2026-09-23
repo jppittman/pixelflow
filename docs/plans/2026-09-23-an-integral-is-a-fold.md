@@ -471,11 +471,19 @@ Not on this list:
 
 **The demand track** runs in parallel and does not gate the build order above:
 
-- **D0.** A test that a guarded arm holding a fold `W` cannot leave a sibling
-  fold reading `W`'s accumulator stale. `select_arms` builds consumers from
-  `operands`, which treats `Reduce` as a leaf (`regalloc.rs:3239-3262`), so a
-  fold body's read of `W` is invisible to the arm analysis. This is inferred,
-  and a reproduction is running.
+- **D0. Reproduced and fixed** (`fix(codegen): a fold is a consumer of what
+  its body reads`). `select_arms` built consumers from `operands`, which treats
+  a `Reduce` as a leaf (`regalloc.rs:3239-3262`), so a fold body's reads were
+  invisible to the guard analysis. That caused two miscompiles:
+  - A guard skipped a fold whose accumulator a sibling fold still read. 176 of
+    256 texels were wrong.
+  - Clustering moved a fold's input to after the fold. 76 of 256 texels were
+    wrong, even when no guard fired.
+
+  Each fold now carries edges to the parent-scope values its body reads
+  (`FoldReads`). `pixelflow-core/tests/guard_sibling_fold.rs` pins the fix with
+  16 kernels checked against `f64` references. Glyph output is bit-identical
+  before and after.
 - **D1.** Regions of equal demand replace `closed_exclusive` and `OUTSIDE`.
 - **D2.** A fold is priced in `arm_cycles` with the extractor's fold price.
 
