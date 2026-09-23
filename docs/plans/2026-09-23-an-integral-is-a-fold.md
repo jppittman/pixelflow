@@ -395,7 +395,10 @@ with the `OUTSIDE` sentinel (`guards.rs:562-569`) and a price:
   `Reduce => 0` (`egraph/cost.rs:144`).
 - The extractor's tree objective prices the same fold at `len · body`
   (`cost.rs:356-359`).
-- One fact, two answers.
+- One fact, two answers. **Resolved by D2:** there is now one formula,
+  `CostModel::fold_cost` (`len · body + (len − 1) · combine`). The extractor's
+  node price is `fold_cost(fold, 0)`, and the guard analysis prices an arm's
+  loop with the same function.
 
 ## 6. Corrections to a-glyph-is-a-formula
 
@@ -507,7 +510,14 @@ Not on this list:
   16 kernels checked against `f64` references. Glyph output is bit-identical
   before and after.
 - **D1.** Regions of equal demand replace `closed_exclusive` and `OUTSIDE`.
-- **D2.** A fold is priced in `arm_cycles` with the extractor's fold price.
+- **D2. Done** (`perf(codegen): a fold in a guarded arm is priced by its
+  trips`).
+  - On HELLO at 20 px, each glyph's distance select is now guarded. It skips
+    its 8–32-trip loop on every batch outside the glyph's box. `uncached_HELLO`
+    ran 12–19% faster, and glyph output is bit-identical.
+  - The winding selects are still not guarded, as predicted. Two selects read
+    the winding fold, so exclusivity cannot claim it. That is D1's job, or step
+    6's, since after step 6 a glyph has a single fold.
 
 ## 9. Open questions
 
