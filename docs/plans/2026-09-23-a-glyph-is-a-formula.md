@@ -320,6 +320,41 @@ along an axis: a factor with no `X` in its variance is a row value,
 placed once per row. Both are annotations of the DAG, read — not
 accounting done per pixel, by the author or by a rule of the integral.
 
+#### Build order and gate
+
+For the session that builds `area`, in the order the pieces depend on
+each other:
+
+1. **The node.** `OpKind::Area` in `pixelflow-ir`, the integrand plus one
+   or two form coordinates as operands (binary for `dZ`, ternary for
+   `dZ ∧ dW`), with `Kernel::area()` as the `dX ∧ dY` sugar. The lattice
+   axes are the coordinates that matter first; a general `Z` is §7's
+   question and the glyph does not need it. `Area` survives the macro
+   tier the way `Dwrt` does and reaches the runtime tier through
+   `Kernel::at` with its integrand warped and its measure untouched
+   (`pixelflow-compiler/tests/derivative_under_warp.rs` is the pattern).
+2. **The rules**, beside `pixelflow-search/src/egraph/derivative.rs` and
+   inert unless the arena holds an `Area`: factoring, linearity, the
+   indicator narrowing the range, the half-plane and conic closed forms,
+   the Taylor rule through `Dwrt`. `Area` takes `Dwrt`'s prohibitive price
+   so extraction never keeps one.
+3. **`LowerArea`** beside `LowerDwrt` in `pixelflow-ir`'s passes, in the
+   runtime pipeline after saturation: a survivor becomes its midpoint
+   sample.
+4. **Pricing by placement**: the extractor weights a factor by where it is
+   paid — once per row for a `Y`-only value, per batch otherwise — through
+   `Extraction::chosen_variance`. Without it, factoring is cost-neutral
+   and the extractor has no reason to choose the factored form.
+5. **The gate.** A quadrature oracle: random integrands built from the
+   rules' vocabulary (polynomials, clamps of linear forms, steps of
+   quadratics) over the unit pixel, the compiled `area` against
+   high-order numerical quadrature in scalar `f64`, tolerance by the
+   rule that fired — the closed forms at `f32` rounding, the Taylor rule
+   at its order's remainder, the midpoint fallback pinned as the point
+   sample. Plus: no `Area` survives extraction (the `Dwrt survived
+   extraction` assertion's twin), and the warp test above. The glyph
+   rewrite (§6) starts only when this gate is green.
+
 ### 4.2 A range is a value
 
 Today a reduction is `Reduce { fold: Fold { monoid, binder, lo..hi, stride }, body }`:
@@ -495,9 +530,14 @@ against FreeType's 8.4 µs) is under FreeType.
   sliver and costs four quadratics and a polynomial integral per curved
   piece, continuous in every input. Decide by the oracle's texel counts at
   7 and 16 px, where the implicit's distance was measured unsound.
-- **The form's arity.** `k ∈ {1, 2}` covers a line integral and coverage.
-  A third coordinate is a volume, which nothing here needs; leave the type
-  at two until something does.
+- **The form's arity, and a general coordinate.** `k ∈ {1, 2}` covers a
+  line integral and coverage; a third coordinate is a volume, which
+  nothing here needs. `area[dZ ∧ dW](k)` for *any* values `Z, W` is
+  well-defined on the pixel — `∫∫ k · |∂(Z,W)/∂(X,Y)| dX dY`, the Jacobian
+  through `Dwrt` — but `area[dZ](k)` for a `Z` that is not a lattice axis
+  needs a path across the pixel, and the syntax does not say which. Build
+  the axis forms first; decide the general 1-form when something needs
+  it, not before.
 - **Overlapping contours.** `|Σ|` clamped is FreeType's approximation and
   seam-free in the interior. A pixel where two edges of two contours cross
   is off by the overlap of two fractions. Acceptable; say so in the module
