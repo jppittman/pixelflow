@@ -136,12 +136,11 @@ pub enum EngineControl {
     /// The green host is up, hosting both vsync and the render coordinator. There is exactly
     /// one send site (`Troupe::with_config`) and one delivery (the shell intercept below), so a
     /// single message beats several that would otherwise need to race each other into place
-    /// first. Boxed: the bundle is far larger than every other variant, and `Quit`/`DriverAck`
-    /// are the hot ones.
+    /// first. Boxed: the bundle is far larger than every other variant, and `Quit` is the hot
+    /// one.
     GreenReady(Box<GreenReadyBundle>),
     #[default]
     Quit,
-    DriverAck,
 }
 
 // For now, let's assume channel.rs was supposed to define them but the refactor moved them here.

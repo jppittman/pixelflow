@@ -395,6 +395,8 @@ pub enum AppManagement {
     ResizeRequest(u32, u32),
     CopyToClipboard(String),
     RequestPaste,
+    /// Ring the bell: the platform's alert sound or equivalent.
+    Bell,
     SetCursorIcon(CursorIcon),
     Quit,
 }
@@ -413,6 +415,7 @@ impl std::fmt::Debug for AppManagement {
             }
             AppManagement::CopyToClipboard(s) => f.debug_tuple("CopyToClipboard").field(s).finish(),
             AppManagement::RequestPaste => f.write_str("RequestPaste"),
+            AppManagement::Bell => f.write_str("Bell"),
             AppManagement::SetCursorIcon(icon) => {
                 f.debug_tuple("SetCursorIcon").field(icon).finish()
             }
