@@ -2,7 +2,8 @@
 
 ## Metadata
 - **Author**: JP (direction), Claude (draft)
-- **Status**: `Draft` — denotation proposed 2026-09-23. Nothing built.
+- **Status**: `Draft` — denotation proposed 2026-09-23; the measure's
+  syntax and the definite-range rule added the same day. Nothing built.
 - **Created**: 2026-09-23
 - **Verified against**: `470e0e0e` (`claude/sse-deletion`: main with #1286,
   #1289, #1290, #1291, #1292), the tree
@@ -38,6 +39,16 @@
 > *"If you want the value of one pixel to depend on the value of another,
 > the way this is set up, you should use calculus."* And, on the winding
 > number: *"Don't write the winding number. Write the integral."*
+>
+> *"Your integrals are missing the wrt. I think this is worth syntax:
+> `area[Dwrt(Z)](Z²)`."* And: *"`Dwrt[W, Z]` sane defaults are fine."*
+>
+> *"Integrals must be definite, over constant ranges."*
+>
+> *"What does FreeType have that we don't? How can we not be better?
+> Everything is 100% vectorized. We run multi-threaded on the ALU. We can
+> do branch-free if we want (the integral will likely be) and we won't have
+> memory reads. We're basically all in registers."*
 
 ---
 
@@ -112,9 +123,12 @@ coverage by half a unit" — which was about a root solve at a tangency. There
 is no root solve here; the objection needs re-examining under Loop–Blinn,
 and `loop_blinn_winding` and `freetype_oracle` exist to do it.
 
-`Dwrt` stays for exactly one thing: under `Kernel::at` the pixel's footprint
-is the Jacobian, and that is what keeps `A_p` the area of one *screen*
-pixel at any warp.
+`Dwrt` stays, and `area` joins it as the second operator kept through
+`Kernel::at` and lowered after composition, so a warp reaches both
+operands. The measure is the lattice's — `dX ∧ dY`, the screen pixel — and
+`at` never substitutes it; it substitutes the integrand. Where a lowering
+rule needs a derivative it takes `Dwrt`, and the chain rule under the warp
+is what keeps `A_p` the area of one *screen* pixel at any warp (§4.1).
 
 ### The two structural facts
 
@@ -179,25 +193,93 @@ shape.
 
 Four capabilities, each a denotation the language nearly has.
 
-### 4.1 `area` — the integral over the pixel
+### 4.1 `area` — the definite integral over the pixel
 
-The sampling adjoint the lattice has been missing: `area(k)` is
-`∫∫_footprint k`, the box-filtered sample. It is the antialiasing primitive
-for everything, not only glyphs, and it is where the author stops doing
-calculus by hand. The compiler lowers it by three rules:
+The sampling adjoint the lattice has been missing: `area(k)` is the
+box-filtered sample, `∫∫_pixel k`. It is the antialiasing primitive for
+everything, not only glyphs, and it is where the author stops doing
+calculus by hand.
 
-- **Linearity.** `area(Σ) = Σ area`, `area(c·k) = c·area(k)`.
-- **A clamped linear form integrates exactly**, through `G` above. That is
-  `A_p` — the crossing indicator `[y ∈ band]·[x < X(y)]` is
-  `∫ clamp(X(t) − x₀, 0, 1) dt` over the band, and the compiler can derive
-  it from the indicator's structure (a product of half-planes in one
-  variable each).
-- **`area(step(f))` is `clamp(½ − f/‖∇f‖, 0, 1)` to first order**, through
-  `Dwrt`, when nothing better is known. That is `S_p` at first order, and it
-  is today's ramp, derived rather than written.
+**Every integral is definite, over a constant range.** The range is the
+pixel — `[x₀, x₀+1) × [y₀, y₀+1)` in lattice coordinates, the same cell at
+every sample — and nothing else: no indefinite integral, no bound that
+depends on data, no accumulation from one pixel into the next. The clipped
+band `[t₀, t₁]` in `A_p` is not a bound the author writes. It is the
+constant pixel range against an integrand that is zero outside the band,
+`clamp(X_p(t) − x₀, 0, 1)·[t ∈ band_p]`, and the compiler narrows the range
+by the indicator rule below, as an identity. A bound is a fact about the
+lattice; the author only ever supplies integrands.
 
-The footprint under `Kernel::at` is the Jacobian, and `Dwrt`'s chain rule
-already carries it.
+**The measure is a differential form, and it has syntax.** An integral
+without its `wrt` is not a value:
+
+```text
+area[dX ∧ dY](k)     ∫∫_pixel k dx dy         coverage: the lattice's own measure
+area[dZ](k)          ∫ k dz over the pixel     a line integral along one coordinate
+area[dZ ∧ dW](k)     the form pulled back      Z, W any values: the Jacobian appears
+area(k)              sugar: area[dX ∧ dY](k)   the sane default is the lattice's axes
+Dwrt[Z](k)           ∂k/∂Z for any value Z     today's Dwrt(k, axis) is the case Z ∈ {X, Y}
+```
+
+`Z` and `W` are values, not axes, so the form is a node's operands like
+any other: `Area { integrand, form: [ValueId; k] }`, `k ∈ {1, 2}`, and
+`Dwrt` generalizes the same way, its axis becoming a value with `X`/`Y` as
+its default. `area[dZ](Z²)` is then a thing the author can write, and it
+means what it says: the integral of `Z²` along `Z` across one pixel, which
+is `((Z+½)³ − (Z−½)³)/3` when `Z` is a lattice axis and, when `Z` is
+`X·s + c`, that times `s` — the pull-back, by the chain rule `Dwrt`
+already has. `area[dX ∧ dY]` under `Kernel::at` is *not* pulled back: the
+measure is the screen pixel by definition, the integrand is what is
+warped, and that is the difference between "the area of the warped shape"
+and "the area of the pixel under the warped shape". Both are sayable; the
+glyph wants the second.
+
+Like `Dwrt`, `Area` is kept through `Kernel::at` and lowered after
+composition (CLAUDE.md, "The macro tier does not resolve `Dwrt`"): the
+e-graph declines to tear it, and the runtime tier lowers it at bake time
+by these rules, in order of strength:
+
+- **Invariance.** An integrand constant along the form's coordinates
+  integrates to itself times the range's measure, which for the unit pixel
+  along lattice axes is `1`: `area[dX ∧ dY](k) = k` when `k` does not
+  depend on `X` or `Y`. A glyph's per-piece coefficients are this: read
+  once, not integrated.
+- **Linearity.** `area[ω](Σ) = Σ area[ω]`; `area[ω](c·k) = c·area[ω](k)`
+  for `c` invariant along `ω`. The glyph's sum over pieces passes straight
+  through, so `area(Σ_p t_p) = Σ_p area(t_p)`, and the integral is per
+  piece, inside the fold.
+- **An indicator in one coordinate narrows the range.**
+  `area[dZ]([lo ≤ Z ≤ hi]·k) = ∫_{[z₀, z₀+1] ∩ [lo, hi]} k dz`. This is the
+  band `[t₀, t₁]`, derived, and it is the only place a data value touches a
+  bound — as the intersection of a constant range with an interval, whose
+  endpoints are two `clamp`s.
+- **A half-plane over the clipped square is exact.**
+  `area[dX ∧ dY]([a·X + b·Y + c ≥ 0])` is the trapezoid, closed form through
+  `G` in §1. That is `A_p`, derived from the indicator's shape rather than
+  written: the crossing term `[y ∈ band]·[x < X_p(y)]` is the previous rule
+  along `Y` and this one along `X`.
+- **A conic over the clipped square is exact.** `area[dX ∧ dY]([q ≥ 0])`
+  for `q` of degree two: the parabola's crossings of the square's four edges
+  are the roots of four quadratics, and the area between them is a
+  polynomial integral (Green's theorem along the boundary). That is `S_p`
+  exact, since `u_p, v_p` are affine in `(x, y)` and `u_p² − v_p` is
+  exactly quadratic.
+- **The Taylor rule.** `area[ω](step(f)) = area[ω]([Taylor_n(f) ≥ 0])`,
+  the expansion about the pixel's centre through `Dwrt`, `n` an accuracy
+  budget. `n = 1` is a half-plane and lands on the rule above — for a chord
+  it is exact, because `f` was already affine; for the sliver it is today's
+  ramp, `clamp(½ − f/‖∇f‖, 0, 1)`, derived rather than written. `n = 2` is
+  a conic and lands on the rule above that — exact for the sliver, for the
+  same reason. Which `n` is §7's open question, and it is an accuracy
+  choice made in one place.
+- **The midpoint fallback.** `area[ω](k) = k(centre)` when no rule applies:
+  the point sample, which is what every kernel computes today. So `area` is
+  total, and never worse than the status quo.
+
+None of this is a search: each rule is a pattern on the integrand's shape,
+and the e-graph's job is the same as for `Dwrt` — keep the node whole
+until the lowering pass, then let algebraic simplification clean up what
+the rules emit.
 
 ### 4.2 A range is a value
 
@@ -302,12 +384,55 @@ argued, never renumbered. Restricting the sum to the pieces whose box
 contains the sample is an identity by §1's first structural fact, so from
 the second step on any changed texel is a bug in the tree, not a rounding.
 
+### What FreeType has, and the estimate at the end
+
+FreeType's rasterizer has one structural asset: its work scales with the
+**perimeter**. It walks each segment once, depositing area and cover into
+the cells the segment crosses, and sweeps the accumulated cells into rows.
+Its per-pixel work inside a run of solid ink is a memset. Against that, the
+formula above is **area-major**: every batch inside a box evaluates every
+piece at that leaf, and a solid-ink batch still pays for the pieces whose
+bands it sits inside. The tree makes that count small; it does not make it
+zero.
+
+What the formula has is everything else. Per piece per batch the integral
+form is ~16 vector ops with no branch, no root solve and no memory traffic
+beyond the piece's coefficients (a broadcast from L1, with the `Y`-only
+parts hoisted to the row); the descent is ~20 ops of uniform box tests
+lowered as jumps; and the whole thing runs 16 lanes wide with no
+accumulator, no cell buffer and no sweep. FreeType's inner loop is scalar
+and serial through its cell list.
+
+Estimated per glyph, one core, AVX-512, the tree at `log₂(pieces)`:
+
+| size | pixelflow, `A_p` exact + `S_p` first order + tree | FreeType |
+|---|---|---|
+| 8 px | ~0.2 µs | ~0.25 µs (raster alone, estimated) |
+| 32 px | ~0.85 µs | **4.9–7.8 µs measured** (`A`, `O`, `S`, whole `load_char(RENDER)`); the raster alone ~1–3 µs |
+| 128 px | ~6 µs | ~12 µs (estimated) |
+
+Only the 32 px FreeType column is measured. The estimates assume the body
+runs near one vector op per cycle, which is what the measurement says
+today's body achieves; interleaving independent pieces to reach two is the
+scheduler's business and would halve the left column. The two caveats
+that could move it: the per-piece coefficient reads (22 columns today, a
+dozen with §5) are L1 broadcasts, not registers, and the number of pieces
+per leaf is the tree's shape (§7), so a badly chosen leaf capacity puts
+the 32 px number at 2–3 µs rather than 1. Either way the 14–21× of the
+baseline becomes a factor under one, with the atlas gather
+(`cached_HELLO`, 16.7 µs for five glyphs) no longer the only path that
+beats FreeType.
+
 ## 7. Open questions
 
-- **`S_p` exact or first order.** First order is the code's ramp and costs
-  nothing new; exact is four quadratics and a polynomial integral per
-  curved piece, continuous in every input. Decide by the oracle's texel
-  counts at 7 and 16 px, where the implicit's distance was measured unsound.
+- **`S_p` exact or first order** — the Taylor rule's `n`. First order is
+  the code's ramp and costs nothing new; second order is exact for the
+  sliver and costs four quadratics and a polynomial integral per curved
+  piece, continuous in every input. Decide by the oracle's texel counts at
+  7 and 16 px, where the implicit's distance was measured unsound.
+- **The form's arity.** `k ∈ {1, 2}` covers a line integral and coverage.
+  A third coordinate is a volume, which nothing here needs; leave the type
+  at two until something does.
 - **Overlapping contours.** `|Σ|` clamped is FreeType's approximation and
   seam-free in the interior. A pixel where two edges of two contours cross
   is off by the overlap of two fractions. Acceptable; say so in the module
