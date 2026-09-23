@@ -4,8 +4,8 @@
 //! Converts a byte stream into `AnsiToken`s, processing byte by byte,
 //! handling UTF-8 decoding and state across calls.
 
-use log::{trace, warn};
-use std::{mem, str};
+use log::warn;
+use std::str;
 
 /// Unicode replacement character (U+FFFD).
 /// Used when encountering invalid UTF-8 sequences.
@@ -162,9 +162,11 @@ impl Utf8Decoder {
 }
 
 /// Lexer that processes a stream of bytes into `AnsiToken`s.
+///
+/// Tokens are handed to the caller's sink as they are recognized rather than
+/// buffered: the only state that outlives a byte is a pending UTF-8 sequence.
 #[derive(Debug, Clone, Default)]
 pub struct AnsiLexer {
-    tokens: Vec<AnsiToken>,
     utf8_decoder: Utf8Decoder,
 }
 
@@ -204,22 +206,28 @@ impl AnsiLexer {
         matches!(byte, 0x00..=0x1A | 0x1C..=0x1F | DEL_BYTE | ESC_BYTE)
     }
 
-    fn process_byte_as_new_token(&mut self, byte: u8) {
+    /// Whether no UTF-8 sequence is pending, so the next byte starts a token.
+    #[inline]
+    pub fn is_idle(&self) -> bool {
+        self.utf8_decoder.len == 0
+    }
+
+    fn process_byte_as_new_token(&mut self, byte: u8, emit: &mut impl FnMut(AnsiToken)) {
         // This function is called when utf8_decoder.len == 0.
         // It decides if 'byte' is a control code or starts a new UTF-8 sequence.
         if Self::is_control_code(byte) {
-            self.tokens.push(AnsiToken::C0Control(byte));
+            emit(AnsiToken::C0Control(byte));
             return;
         }
         // Not a control code, so attempt to process as UTF-8 start.
         // Utf8Decoder is fresh (len == 0).
         match self.utf8_decoder.decode(byte) {
-            Utf8DecodeResult::Decoded(c) => self.tokens.push(AnsiToken::Print(c)),
+            Utf8DecodeResult::Decoded(c) => emit(AnsiToken::Print(c)),
             Utf8DecodeResult::NeedsMoreBytes => { /* Byte buffered, wait for more */ }
             Utf8DecodeResult::InvalidSequence => {
                 // This means 'byte' itself was an invalid UTF-8 start (e.g., 0xC0, 0xF5).
                 warn!("invalid utf8 byte: {:X?}", byte);
-                self.tokens.push(AnsiToken::Print(REPLACEMENT_CHARACTER));
+                emit(AnsiToken::Print(REPLACEMENT_CHARACTER));
             }
         }
     }
@@ -228,15 +236,26 @@ impl AnsiLexer {
     ///
     /// # Parameters
     /// * `byte` - The byte to process.
-    pub fn process_byte(&mut self, byte: u8) {
+    /// * `emit` - Receives each token the byte completes (at most two: a
+    ///   replacement for an aborted UTF-8 sequence, then the byte's own).
+    #[inline]
+    pub fn process_byte(&mut self, byte: u8, emit: &mut impl FnMut(AnsiToken)) {
+        // An ASCII byte with nothing pending is a whole token by itself.
+        if self.is_idle() && byte.is_ascii() {
+            emit(match Self::is_control_code(byte) {
+                true => AnsiToken::C0Control(byte),
+                false => AnsiToken::Print(byte as char),
+            });
+            return;
+        }
         if self.utf8_decoder.len > 0 {
             // --- Currently building a multi-byte UTF-8 char ---
             // Check for unambiguous interruptions (ESC, most C0s)
             if Self::is_unambiguous_interrupting_control(byte) {
                 warn!("encountered control byte: {:X?} mid utf8 stream", byte);
-                self.tokens.push(AnsiToken::Print(REPLACEMENT_CHARACTER)); // For the aborted UTF-8
+                emit(AnsiToken::Print(REPLACEMENT_CHARACTER)); // For the aborted UTF-8
                 self.utf8_decoder.reset();
-                self.process_byte_as_new_token(byte); // Process the interrupting C0/ESC
+                self.process_byte_as_new_token(byte, emit); // Process the interrupting C0/ESC
                 return;
             }
 
@@ -244,17 +263,17 @@ impl AnsiLexer {
             // the current sequence, Utf8Decoder will return InvalidSequence.
             match self.utf8_decoder.decode(byte) {
                 Utf8DecodeResult::Decoded(c) => {
-                    self.tokens.push(AnsiToken::Print(c));
+                    emit(AnsiToken::Print(c));
                     // Decoder has reset.
                 }
                 Utf8DecodeResult::InvalidSequence => {
                     // `byte` (which could be a C1, or non-control like 'A')
                     // was not a valid continuation for what was in the buffer.
                     // Utf8Decoder has reset.
-                    self.tokens.push(AnsiToken::Print(REPLACEMENT_CHARACTER)); // For the broken sequence
-                                                                               // Now, reprocess `byte` from a ground state.
-                                                                               // process_byte_as_new_token will correctly identify it if it's C1, C0, ESC, or data.
-                    self.process_byte_as_new_token(byte);
+                    emit(AnsiToken::Print(REPLACEMENT_CHARACTER)); // For the broken sequence
+                                                                   // Now, reprocess `byte` from a ground state.
+                                                                   // process_byte_as_new_token will correctly identify it if it's C1, C0, ESC, or data.
+                    self.process_byte_as_new_token(byte, emit);
                 }
                 Utf8DecodeResult::NeedsMoreBytes => {
                     // Valid continuation, byte buffered. Wait for more.
@@ -262,21 +281,15 @@ impl AnsiLexer {
             }
         } else {
             // --- Not currently building a multi-byte char (utf8_decoder.len == 0) ---
-            self.process_byte_as_new_token(byte);
+            self.process_byte_as_new_token(byte, emit);
         }
-    }
-
-    /// Consumes and returns all accumulated tokens.
-    pub fn take_tokens(&mut self) -> Vec<AnsiToken> {
-        trace!("taking {:?} tokens from lexer", self.tokens);
-        mem::take(&mut self.tokens)
     }
 
     /// Finalizes any incomplete UTF-8 sequence, e.g., at end of stream.
     /// This is called by the AnsiProcessor after processing a chunk of bytes.
-    pub fn finalize(&mut self) {
+    pub fn finalize(&mut self, emit: &mut impl FnMut(AnsiToken)) {
         if self.utf8_decoder.len > 0 {
-            self.tokens.push(AnsiToken::Print(REPLACEMENT_CHARACTER));
+            emit(AnsiToken::Print(REPLACEMENT_CHARACTER));
             self.utf8_decoder.reset();
         }
     }

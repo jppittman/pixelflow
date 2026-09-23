@@ -141,6 +141,31 @@ impl AnsiParser {
         self.state = State::Ground;
     }
 
+    /// Whether the parser is between sequences, where a printable byte means
+    /// only "print this".
+    #[inline]
+    pub fn is_ground(&self) -> bool {
+        self.state == State::Ground
+    }
+
+    /// Reserves room for `additional` more commands.
+    pub fn reserve(&mut self, additional: usize) {
+        self.commands.reserve(additional);
+    }
+
+    /// Emits one `Print` per byte of a run of printable ASCII (0x20..=0x7E).
+    ///
+    /// Equivalent to feeding each byte as `AnsiToken::Print` in `Ground`: every
+    /// byte of the run keeps the parser in `Ground`, so the state machine has
+    /// nothing to decide and the run is a single `extend`.
+    pub fn print_ascii_run(&mut self, run: &[u8]) {
+        debug_assert!(self.is_ground());
+        debug_assert!(run.iter().all(|&b| is_printable_ascii(b)));
+        self.clear_esc_state();
+        self.commands
+            .extend(run.iter().map(|&b| AnsiCommand::Print(b as char)));
+    }
+
     fn dispatch_print(&mut self, c: char) {
         self.commands.push(AnsiCommand::Print(c));
         self.clear_esc_state();
@@ -156,15 +181,12 @@ impl AnsiParser {
             final_byte as char,
             final_byte
         );
-        // These are the actual parameters and intermediates collected by the parser state machine
-        let params_vec = mem::take(&mut self.params);
-        let intermediates_vec = mem::take(&mut self.intermediates);
-        let is_private_csi_flag = self.is_private_csi;
-
+        // Borrow, don't take: taking would leave zero-capacity vectors behind
+        // and every following CSI sequence would reallocate both.
         if let Some(command) = AnsiCommand::from_csi(
-            params_vec,
-            intermediates_vec,
-            is_private_csi_flag,
+            &self.params,
+            &self.intermediates,
+            self.is_private_csi,
             final_byte,
         ) {
             // Check if the command is the specific Unsupported variant we want to remap
@@ -502,6 +524,13 @@ impl AnsiParser {
             },
         }
     }
+}
+
+/// A byte that, in `Ground` with no UTF-8 sequence pending, is exactly
+/// `Print(byte as char)`: printable ASCII, excluding every C0 control and DEL.
+#[inline]
+pub(super) fn is_printable_ascii(byte: u8) -> bool {
+    (b' '..=b'~').contains(&byte)
 }
 
 impl Default for AnsiParser {
