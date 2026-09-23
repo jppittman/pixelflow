@@ -208,10 +208,24 @@ mod tests {
         })
     }
 
-    /// The distance from `p` to the arc `q`: dense samples, then a
-    /// golden-section search around *every* sampled local minimum. The arcs
-    /// under test retrace themselves (a hook, a cusp), so the nearest sample
-    /// can sit on the wrong branch a hair away from the right one.
+    /// The distance from `p` to the arc `q`: the least distance over a set of
+    /// candidate points *on the arc*. Every candidate is a point of the arc,
+    /// so the minimum can never undershoot the true distance. Including the
+    /// true nearest point is what makes it exact.
+    ///
+    /// The nearest point of a quadratic is at an end or at a real root of
+    /// the cubic `(B(t) − p)·B′(t) = 0`. So the candidates are:
+    /// - both ends;
+    /// - the cubic's roots in `[0, 1]`, solved in closed form and polished
+    ///   by Newton;
+    /// - dense samples, each refined by a golden-section search around it.
+    ///
+    /// The roots are what reach the right branch when the arc retraces
+    /// itself (a hook, a cusp). A near-cusp's hairpin tail can be shorter
+    /// than one sample interval, so the samples alone bracket both
+    /// branches. Golden-section search then settles on either one: CI
+    /// measured 2.7e-9 for a piece that lies within 3e-12 of the arc, which
+    /// is exactly the width of the hairpin between its branches.
     fn distance_to_arc(q: [P; 3], p: P) -> f64 {
         const SAMPLES: usize = 1024;
         let dist = |t: f64| {
@@ -221,7 +235,7 @@ mod tests {
         let at = |k: usize| k as f64 / SAMPLES as f64;
         let sampled: Vec<f64> = (0..=SAMPLES).map(|k| dist(at(k))).collect();
         let phi = 0.5 * (5f64.sqrt() - 1.0);
-        (0..=SAMPLES)
+        let refined = (0..=SAMPLES)
             .filter(|&k| {
                 (k == 0 || sampled[k] <= sampled[k - 1])
                     && (k == SAMPLES || sampled[k] <= sampled[k + 1])
@@ -237,7 +251,87 @@ mod tests {
                 }
                 dist(0.5 * (lo + hi)).min(sampled[k])
             })
-            .fold(f64::INFINITY, f64::min)
+            .fold(f64::INFINITY, f64::min);
+        nearest_parameters(q, p)
+            .into_iter()
+            .map(dist)
+            .fold(refined, f64::min)
+    }
+
+    /// The parameters in `[0, 1]` where `|B(t) − p|` can be least: both ends,
+    /// and every real root of `f(t) = (B(t) − p)·B′(t)`, a cubic. Each root is
+    /// found in closed form, then polished by Newton on `f`.
+    ///
+    /// With `B(t) = p0 + 2t·a + t²·c`, where `a = p1 − p0` and
+    /// `c = p2 − 2p1 + p0`, and `d = p0 − p`:
+    /// `f(t)/2 = (c·c)t³ + 3(a·c)t² + (2a·a + d·c)t + d·a`.
+    fn nearest_parameters([p0, p1, p2]: [P; 3], p: P) -> Vec<f64> {
+        let dot = |u: P, v: P| u[0] * v[0] + u[1] * v[1];
+        let a = [p1[0] - p0[0], p1[1] - p0[1]];
+        let c = [p2[0] - 2.0 * p1[0] + p0[0], p2[1] - 2.0 * p1[1] + p0[1]];
+        let d = [p0[0] - p[0], p0[1] - p[1]];
+        let coeffs = [
+            dot(c, c),
+            3.0 * dot(a, c),
+            2.0 * dot(a, a) + dot(d, c),
+            dot(d, a),
+        ];
+        let f = |t: f64| ((coeffs[0] * t + coeffs[1]) * t + coeffs[2]) * t + coeffs[3];
+        let df = |t: f64| (3.0 * coeffs[0] * t + 2.0 * coeffs[1]) * t + coeffs[2];
+        let polish = |mut t: f64| {
+            for _ in 0..8 {
+                let slope = df(t);
+                if slope == 0.0 {
+                    break;
+                }
+                t = (t - f(t) / slope).clamp(0.0, 1.0);
+            }
+            t
+        };
+        let mut ts = vec![0.0, 1.0];
+        ts.extend(
+            real_cubic_roots(coeffs)
+                .into_iter()
+                .map(|t| polish(t.clamp(0.0, 1.0))),
+        );
+        ts
+    }
+
+    /// The real roots of `k0·t³ + k1·t² + k2·t + k3`, in closed form:
+    /// Cardano when one root is real, the trigonometric form when three are.
+    /// It falls back to the quadratic (or linear) formula when the leading
+    /// coefficient vanishes, as it does for a straight arc.
+    fn real_cubic_roots([k0, k1, k2, k3]: [f64; 4]) -> Vec<f64> {
+        if k0 == 0.0 {
+            if k1 == 0.0 {
+                return if k2 == 0.0 { vec![] } else { vec![-k3 / k2] };
+            }
+            let disc = k2 * k2 - 4.0 * k1 * k3;
+            if disc < 0.0 {
+                return vec![];
+            }
+            let s = disc.sqrt();
+            return vec![(-k2 + s) / (2.0 * k1), (-k2 - s) / (2.0 * k1)];
+        }
+        let (b, c, e) = (k1 / k0, k2 / k0, k3 / k0);
+        // t = u − b/3 turns it into u³ + pu + q.
+        let shift = b / 3.0;
+        let p = c - b * b / 3.0;
+        let q = 2.0 * b * b * b / 27.0 - b * c / 3.0 + e;
+        let disc = (q / 2.0) * (q / 2.0) + (p / 3.0) * (p / 3.0) * (p / 3.0);
+        if disc > 0.0 {
+            let s = disc.sqrt();
+            let u = (-q / 2.0 + s).cbrt() + (-q / 2.0 - s).cbrt();
+            return vec![u - shift];
+        }
+        if p == 0.0 {
+            return vec![-shift];
+        }
+        let r = 2.0 * (-p / 3.0).sqrt();
+        let phi = (3.0 * q / (p * r)).clamp(-1.0, 1.0).acos() / 3.0;
+        (0..3)
+            .map(|k| r * (phi - 2.0 * std::f64::consts::PI * f64::from(k) / 3.0).cos() - shift)
+            .collect()
     }
 
     /// Every property the split promises: pieces in order, joined bit for
@@ -330,6 +424,24 @@ mod tests {
         );
         let pieces = assert_splits_faithfully(q, 1e-9);
         assert_eq!(pieces.len(), 2, "one cusp, one cut: {pieces:?}");
+    }
+
+    /// CI's proptest counterexample for `near_cusps_split_into_monotone_pieces_of_themselves`:
+    /// a collinear arc overshooting its end by 0.05%, with `f32`-rounded
+    /// points. The rounding leaves its hairpin tail about 3e-9 wide, and the
+    /// tail is shorter than one of the distance oracle's sample intervals.
+    /// The split is faithful: the last piece lies within 3e-12 of the arc.
+    /// The oracle, not the split, is what reported 2.7e-9, when it sampled
+    /// without the cubic's roots.
+    #[test]
+    fn a_hairpin_shorter_than_a_sample_is_measured_on_its_own_branch() {
+        let q = [
+            [f64::from(-39.539_246_f32), f64::from(52.064_91_f32)],
+            [f64::from(-38.004_406_f32), f64::from(52.515_488_f32)],
+            [f64::from(-38.005_245_f32), f64::from(52.515_24_f32)],
+        ];
+        let pieces = assert_splits_faithfully(q, 1e-9);
+        assert_eq!(pieces.len(), 3, "an x and a y turning point: {pieces:?}");
     }
 
     #[test]
