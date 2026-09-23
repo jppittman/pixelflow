@@ -127,6 +127,16 @@ pub enum MouseButton {
     Other(u8),
 }
 
+/// Which of the system's selections a paste reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Selection {
+    /// The clipboard: what an explicit copy put there.
+    Clipboard,
+    /// The primary selection: whatever text was last highlighted, anywhere
+    /// (X11). A platform without one reads its clipboard instead.
+    Primary,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorIcon {
     Default,

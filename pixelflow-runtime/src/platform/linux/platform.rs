@@ -93,12 +93,13 @@ impl PlatformOps for LinuxOps {
                 DisplayControl::SetSize { width, height, .. } => {
                     window.set_size(width, height);
                 }
-                DisplayControl::Copy { text } => {
-                    window.copy_to_clipboard(&text);
+                DisplayControl::Copy { selection, text } => {
+                    window.copy(selection, text);
                 }
-                DisplayControl::RequestPaste => {
-                    window.request_paste();
+                DisplayControl::RequestPaste { selection } => {
+                    window.request_paste(selection);
                 }
+                DisplayControl::ToggleFullscreen { .. } => window.toggle_fullscreen(),
                 DisplayControl::SetCursor { cursor, .. } => {
                     window.set_cursor(cursor);
                 }
