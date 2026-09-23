@@ -2,7 +2,8 @@
 //!
 //! Run with: cargo bench -p core-term
 
-use core_term::ansi::{AnsiParser, AnsiProcessor};
+use core_term::ansi::{AnsiCommand, AnsiParser, AnsiProcessor, AnsiSink};
+use core_term::term::{EmulatorInput, TerminalEmulator};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 /// Pure ASCII text - fast path
@@ -205,5 +206,53 @@ fn bench_vtebench_scenarios(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_parser_throughput, bench_vtebench_scenarios);
+/// Feeds a batch to the emulator the way the app does.
+struct Emulator<'a>(&'a mut TerminalEmulator);
+
+impl AnsiSink for Emulator<'_> {
+    fn text(&mut self, run: &str) {
+        self.0.print_text(run);
+    }
+
+    fn command(&mut self, command: AnsiCommand) {
+        drop(self.0.interpret_input(EmulatorInput::Ansi(command)));
+    }
+}
+
+/// Builds `size` bytes of one kind of PTY output.
+type Workload = fn(usize) -> Vec<u8>;
+
+/// Parse and apply: PTY bytes all the way into the emulator's grid.
+fn bench_end_to_end(c: &mut Criterion) {
+    let mut group = c.benchmark_group("end_to_end");
+    let size = 65536;
+    let cases: [(&str, Workload); 5] = [
+        ("ascii_text", ascii_text),
+        ("scrolling", scrolling),
+        ("csi_heavy", csi_heavy),
+        ("unicode_heavy", unicode_heavy),
+        ("alt_screen_random_write", vtebench_alt_screen),
+    ];
+    for (name, make) in cases {
+        let data = make(size);
+        group.throughput(Throughput::Bytes(data.len() as u64));
+        group.bench_function(name, |b| {
+            let mut parser = AnsiProcessor::new();
+            let mut emulator = TerminalEmulator::new(80, 24);
+            b.iter(|| {
+                parser
+                    .process_bytes(&data)
+                    .drain_into(&mut Emulator(&mut emulator));
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_parser_throughput,
+    bench_vtebench_scenarios,
+    bench_end_to_end
+);
 criterion_main!(benches);
