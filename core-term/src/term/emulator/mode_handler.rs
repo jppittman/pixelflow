@@ -104,8 +104,9 @@ impl TerminalEmulator {
                     Some(DecModeConstant::TextCursorEnable) => {
                         self.dec_modes.text_cursor_enable_mode = enable;
                         let visibility = CursorVisibility::from(enable);
+                        // The snapshot draws the cursor from this state; there is
+                        // nothing for anyone outside the emulator to do.
                         self.cursor_controller.set_visible(visibility);
-                        action_to_return = Some(EmulatorAction::SetCursorVisibility(visibility));
                     }
                     Some(DecModeConstant::AltScreenBufferClear)
                     | Some(DecModeConstant::AltScreenBufferSaveRestore) => {

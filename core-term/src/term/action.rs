@@ -31,7 +31,6 @@
 //! - **Invariants**: Constraints that must always hold
 
 use crate::keys::{KeySymbol, Modifiers};
-use crate::term::cursor_visibility::CursorVisibility;
 use serde::{Deserialize, Serialize};
 
 // --- User Input Actions ---
@@ -495,25 +494,6 @@ pub enum EmulatorAction {
     /// - PTY data changes cell contents → RequestRedraw
     /// - Selection is modified → RequestRedraw
     RequestRedraw,
-
-    /// Set the visibility of the cursor.
-    ///
-    /// # Contract
-    ///
-    /// **Emulator**: Generated in response to ANSI cursor visibility sequences.
-    ///
-    /// **Orchestrator**:
-    /// 1. Updates the cursor visibility state
-    /// 2. May control a native OS cursor or a rendered cursor
-    /// 3. Affects the next redraw
-    ///
-    /// **Postcondition**: Cursor visibility is updated
-    ///
-    /// # Examples
-    ///
-    /// - ANSI: `\x1b[?25h` (show cursor) → `SetCursorVisibility(Visible)`
-    /// - ANSI: `\x1b[?25l` (hide cursor) → `SetCursorVisibility(Hidden)`
-    SetCursorVisibility(CursorVisibility),
 
     /// Copy text to the system clipboard.
     ///

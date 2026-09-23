@@ -6,7 +6,7 @@ use crate::io::event_monitor_actor::{PtyWriterHandle, WriterControl};
 use crate::io::traits::PtySender;
 use crate::io::Resize;
 use crate::messages::TerminalData;
-use crate::term::{EmulatorInput, TerminalEmulator};
+use crate::term::{EmulatorAction, EmulatorInput, TerminalEmulator};
 use actor_scheduler::{
     Actor, ActorBuilder, ActorHandle, ActorStatus, HandlerError, HandlerResult, Message,
     SystemStatus,
@@ -28,16 +28,22 @@ impl TerminalAppSender {
     }
 }
 
-/// Feeds a PTY batch to the emulator: text as runs, commands one at a time.
-struct EmulatorSink<'a>(&'a mut TerminalEmulator);
+/// Feeds a PTY batch to the emulator: text as runs, commands one at a time,
+/// keeping every action the commands ask for so none is lost.
+struct EmulatorSink<'a> {
+    emulator: &'a mut TerminalEmulator,
+    actions: &'a mut Vec<EmulatorAction>,
+}
 
 impl AnsiSink for EmulatorSink<'_> {
     fn text(&mut self, run: &str) {
-        self.0.print_text(run);
+        self.emulator.print_text(run);
     }
 
     fn command(&mut self, command: AnsiCommand) {
-        self.0.interpret_input(EmulatorInput::Ansi(command));
+        if let Some(action) = self.emulator.interpret_input(EmulatorInput::Ansi(command)) {
+            self.actions.push(action);
+        }
     }
 }
 
@@ -58,8 +64,8 @@ impl PtySender for TerminalAppSender {
 use pixelflow_graphics::fonts::loader::{LoadedFont, MmapSource};
 use pixelflow_graphics::fonts::GlyphAtlas;
 use pixelflow_runtime::api::private::EngineData;
-use pixelflow_runtime::api::public::AppData;
 use pixelflow_runtime::api::public::EngineHandle;
+use pixelflow_runtime::api::public::{AppData, AppManagement};
 use pixelflow_runtime::{EngineEventControl, EngineEventData, EngineEventManagement};
 use std::sync::Arc;
 
@@ -142,6 +148,9 @@ pub struct TerminalApp {
     /// Currently pressed mouse button, tracked for motion reporting.
     /// Set on MouseClick, cleared on MouseRelease.
     pressed_mouse_button: Option<pixelflow_runtime::input::MouseButton>,
+    /// Actions a PTY batch asked for, performed once the batch is applied.
+    /// Kept between batches so a steady stream of replies allocates nothing.
+    pty_actions: Vec<EmulatorAction>,
     /// Device pixels per point of the current display (backing scale).
     /// The scene stays in point space; this is only a density hint for the
     /// glyph cache so bakes match the platform's sample lattice.
@@ -216,6 +225,40 @@ impl TerminalApp {
         }
     }
 
+    /// Carries out what the emulator asked of the world outside it.
+    fn perform(&mut self, action: EmulatorAction) {
+        match action {
+            EmulatorAction::WritePty(bytes) => self.write_pty(bytes),
+            EmulatorAction::ResizePty { cols, rows } => self.resize_pty(cols, rows),
+            EmulatorAction::RequestRedraw => self.send_frame(),
+            EmulatorAction::Quit => self.request_quit(),
+            EmulatorAction::SetTitle(title) => self.request_engine(AppManagement::SetTitle(title)),
+            EmulatorAction::RingBell => self.request_engine(AppManagement::Bell),
+            EmulatorAction::CopyToClipboard(text) => {
+                self.request_engine(AppManagement::CopyToClipboard(text))
+            }
+            // The text comes back as `EngineEventManagement::Paste`.
+            EmulatorAction::RequestClipboardContent => {
+                self.request_engine(AppManagement::RequestPaste)
+            }
+        }
+    }
+
+    /// Asks the engine for something the terminal cannot do itself.
+    fn request_engine(&self, request: AppManagement) {
+        if let Err(e) = self.engine_tx.send(Message::Management(request)) {
+            log::warn!("Failed to send request to engine: {}", e);
+        }
+    }
+
+    /// Shuts the application down. Without an engine there is no window to
+    /// keep alive, so a failure to ask is fatal.
+    fn request_quit(&self) {
+        self.engine_tx
+            .send(Message::Management(AppManagement::Quit))
+            .expect("Failed to send Quit to engine");
+    }
+
     /// Resize the PTY via the writer's control lane (preempts queued writes).
     fn resize_pty(&self, cols: u16, rows: u16) {
         if let Err(e) = self
@@ -231,8 +274,7 @@ impl TerminalApp {
 
     /// Creates a new terminal app (internal - use spawn_terminal_app instead).
     fn new_registered(params: TerminalAppParamsRegistered) -> Self {
-        // Memory-map the font file from the appropriate location
-        let font_path = find_font_path();
+        let font_path = params.font_path;
         let source = MmapSource::open(&font_path).unwrap_or_else(|e| {
             panic!("Failed to open font file at {}: {}", font_path.display(), e)
         });
@@ -280,6 +322,7 @@ impl TerminalApp {
             has_presented: false,
             frame_px: [0, 0],
             pressed_mouse_button: None,
+            pty_actions: Vec::new(),
             density: 1.0,
         }
     }
@@ -543,17 +586,21 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 self.send_frame();
             }
             TerminalData::Pty(mut batch) => {
-                batch.drain_into(&mut EmulatorSink(&mut self.emulator));
-                // We don't necessarily send a frame here anymore, relying on VSync (RequestFrame)
-                // or we could trigger a redraw if we want immediate feedback (but risk flooding)
-                // For now, let's just update state. The next RequestFrame will pick it up.
+                // Drawing is left to the next vsync frame request; only the
+                // actions (replies to the shell, title, bell, ...) run now.
+                let mut actions = std::mem::take(&mut self.pty_actions);
+                batch.drain_into(&mut EmulatorSink {
+                    emulator: &mut self.emulator,
+                    actions: &mut actions,
+                });
+                for action in actions.drain(..) {
+                    self.perform(action);
+                }
+                self.pty_actions = actions;
             }
             TerminalData::ChildExited => {
-                use pixelflow_runtime::api::public::AppManagement;
                 log::info!("PTY child exited, shutting down");
-                self.engine_tx
-                    .send(Message::Management(AppManagement::Quit))
-                    .expect("Failed to send Quit to engine");
+                self.request_quit();
             }
         }
         Ok(())
@@ -586,7 +633,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 height_px,
             } => {
                 self.frame_px = [width_px, height_px];
-                use crate::term::{ControlEvent, EmulatorAction, EmulatorInput};
+                use crate::term::{ControlEvent, EmulatorInput};
                 // Convert u32 pixels to u16 for ControlEvent
                 // Saturate at u16::MAX to prevent overflow panics
                 let width_u16 = width_px.min(u16::MAX as u32) as u16;
@@ -597,11 +644,8 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                     height_px: height_u16,
                 });
 
-                // Process the resize and handle the resulting action
-                if let Some(EmulatorAction::ResizePty { cols, rows }) =
-                    self.emulator.interpret_input(input)
-                {
-                    self.resize_pty(cols, rows);
+                if let Some(action) = self.emulator.interpret_input(input) {
+                    self.perform(action);
                 }
 
                 // Request a redraw after resize
@@ -633,7 +677,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
     fn handle_management(&mut self, mgmt: EngineEventManagement) -> HandlerResult {
         match mgmt {
             EngineEventManagement::KeyDown { key, mods, text } => {
-                use crate::term::{EmulatorAction, EmulatorInput, UserInputAction};
+                use crate::term::{EmulatorInput, UserInputAction};
 
                 let input = EmulatorInput::User(UserInputAction::KeyInput {
                     symbol: key,
@@ -642,39 +686,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 });
 
                 if let Some(action) = self.emulator.interpret_input(input) {
-                    match action {
-                        EmulatorAction::WritePty(bytes) => {
-                            self.write_pty(bytes);
-                        }
-                        EmulatorAction::Quit => {
-                            // Handle quit - send quit to engine
-                            use pixelflow_runtime::api::public::AppManagement;
-                            self.engine_tx
-                                .send(Message::Management(AppManagement::Quit))
-                                .expect("Failed to send Quit to engine");
-                        }
-                        EmulatorAction::SetTitle(_title) => {
-                            unimplemented!("EmulatorAction::SetTitle");
-                        }
-                        EmulatorAction::RingBell => {
-                            unimplemented!("EmulatorAction::RingBell");
-                        }
-                        EmulatorAction::RequestRedraw => {
-                            self.send_frame();
-                        }
-                        EmulatorAction::SetCursorVisibility(_visible) => {
-                            unimplemented!("EmulatorAction::SetCursorVisibility");
-                        }
-                        EmulatorAction::CopyToClipboard(_text) => {
-                            unimplemented!("EmulatorAction::CopyToClipboard");
-                        }
-                        EmulatorAction::RequestClipboardContent => {
-                            unimplemented!("EmulatorAction::RequestClipboardContent");
-                        }
-                        EmulatorAction::ResizePty { cols, rows } => {
-                            self.resize_pty(cols, rows);
-                        }
-                    }
+                    self.perform(action);
                 }
             }
             EngineEventManagement::MouseClick { button, x, y } => {
@@ -900,6 +912,7 @@ pub fn spawn_terminal_app(params: TerminalAppParams) -> std::io::Result<Terminal
         pty_writer: params.pty_writer,
         config: params.config,
         engine_tx,
+        font_path: find_font_path(),
     };
 
     let mut app = TerminalApp::new_registered(app_params_registered);
@@ -920,6 +933,8 @@ struct TerminalAppParamsRegistered {
     pty_writer: PtyWriterHandle,
     config: Config,
     engine_tx: EngineHandle,
+    /// The font file to memory-map.
+    font_path: std::path::PathBuf,
 }
 
 #[cfg(test)]
@@ -985,34 +1000,22 @@ mod tests {
         }
     }
 
+    /// The committed fallback font. The app's own font is LFS-tracked, and a
+    /// checkout without git-lfs holds a pointer there, not a font; the
+    /// fallback is exempt from LFS so these tests always run.
+    fn test_font_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../pixelflow-graphics/assets/DejaVuSansMono-Fallback.ttf")
+    }
+
     // Helper to create a test instance
     // Returns scheduler to keep doorbell channel alive during test
-    // Returns None if font is missing/invalid (e.g. LFS pointer), skipping the test.
-    fn create_test_app() -> Option<(
+    fn create_test_app() -> (
         TerminalApp,
         WriterScheduler,
         pixelflow_runtime::api::private::EngineActorHandle,
         pixelflow_runtime::api::private::EngineActorScheduler,
-    )> {
-        // Check font availability to avoid panic if LFS not present
-        let font_path = find_font_path();
-        if !font_path.exists() {
-            eprintln!(
-                "Test skipped: Font file not found at {}",
-                font_path.display()
-            );
-            return None;
-        }
-        if let Ok(metadata) = std::fs::metadata(&font_path) {
-            if metadata.len() < 1000 {
-                eprintln!(
-                    "Test skipped: Font file at {} appears to be an LFS pointer (size < 1000 bytes)",
-                    font_path.display()
-                );
-                return None;
-            }
-        }
-
+    ) {
         let emulator = TerminalEmulator::new(80, 24);
         let (pty_writer, writer_rx) =
             ActorScheduler::<Vec<u8>, WriterControl, WriterManagement>::new(64, 128);
@@ -1034,18 +1037,16 @@ mod tests {
             pty_writer,
             config,
             engine_tx: EngineHandle::new_for_test(engine_tx_for_test),
+            font_path: test_font_path(),
         };
         let app = TerminalApp::new_registered(params);
 
-        Some((app, writer_rx, engine_tx, engine_scheduler))
+        (app, writer_rx, engine_tx, engine_scheduler)
     }
 
     #[test]
     fn it_should_resize_the_emulator_and_forward_a_pty_resize_on_control_resize() {
-        let (mut app, mut writer_rx, _, _scheduler) = match create_test_app() {
-            Some(v) => v,
-            None => return,
-        };
+        let (mut app, mut writer_rx, _, _scheduler) = create_test_app();
 
         // Initial size is 80x24
         let snapshot_initial = app.emulator.get_render_snapshot().expect("Snapshot");
@@ -1128,19 +1129,6 @@ mod tests {
         use crate::io::pty::{NixPty, PtyChannel, PtyConfig};
         use std::time::{Duration, Instant};
 
-        let font_path = find_font_path();
-        if !font_path.exists()
-            || std::fs::metadata(&font_path)
-                .map(|m| m.len() < 1000)
-                .unwrap_or(true)
-        {
-            eprintln!(
-                "Test skipped: usable font not found at {}",
-                font_path.display()
-            );
-            return;
-        }
-
         let pty = NixPty::spawn_with_config(&PtyConfig {
             command_executable: "/bin/sh",
             args: &["-c", "yes"],
@@ -1179,6 +1167,7 @@ mod tests {
             pty_writer,
             config: Config::default(),
             engine_tx: EngineHandle::new_for_test(engine_tx),
+            font_path: test_font_path(),
         });
         let app_thread = std::thread::spawn(move || {
             app_rx.run(&mut app);
@@ -1266,10 +1255,7 @@ mod tests {
 
     #[test]
     fn it_should_write_the_typed_character_to_the_pty_on_keydown() {
-        let (mut app, mut writer_rx, _, _scheduler) = match create_test_app() {
-            Some(v) => v,
-            None => return,
-        };
+        let (mut app, mut writer_rx, _, _scheduler) = create_test_app();
 
         // Simulate KeyDown
         let key_event = EngineEventManagement::KeyDown {
@@ -1287,10 +1273,12 @@ mod tests {
         assert_eq!(probe.data, vec![vec![b'a']]);
     }
 
-    /// Test double for the engine actor: records the scenes the app renders.
+    /// Test double for the engine actor: records the scenes the app renders
+    /// and the requests it makes.
     #[derive(Default)]
     struct EngineProbe {
         scenes: Vec<Scene>,
+        requests: Vec<pixelflow_runtime::api::public::AppManagement>,
     }
 
     impl
@@ -1314,8 +1302,9 @@ mod tests {
         }
         fn handle_management(
             &mut self,
-            _msg: pixelflow_runtime::api::public::AppManagement,
+            msg: pixelflow_runtime::api::public::AppManagement,
         ) -> HandlerResult {
+            self.requests.push(msg);
             Ok(())
         }
         fn handle_os(&mut self, _status: SystemStatus) -> Result<ActorStatus, HandlerError> {
@@ -1352,10 +1341,7 @@ mod tests {
         use pixelflow_graphics::render::color::PlatformPixel;
         use pixelflow_graphics::render::frame::Frame;
 
-        let (mut app, _writer_rx, _tx, mut engine_scheduler) = match create_test_app() {
-            Some(v) => v,
-            None => return,
-        };
+        let (mut app, _writer_rx, _tx, mut engine_scheduler) = create_test_app();
         let (r, g, b, _) = app.config.colors.background.to_f32_rgba();
         let close = |got: u8, want: f32| (got as f32 - want * 255.0).abs() <= 2.0;
 
@@ -1400,5 +1386,51 @@ mod tests {
             "post-resize scene pixel {:?} != default background ({r}, {g}, {b})",
             (px.r(), px.g(), px.b()),
         );
+    }
+
+    /// PTY output, as the parser actor delivers it.
+    fn pty(bytes: &[u8]) -> TerminalData {
+        use crate::ansi::{AnsiParser, AnsiProcessor};
+        TerminalData::Pty(AnsiProcessor::new().process_bytes(bytes))
+    }
+
+    #[test]
+    fn a_device_status_request_from_the_shell_is_answered_on_the_pty() {
+        let (mut app, mut writer_rx, _tx, _engine) = create_test_app();
+
+        app.handle_data(pty(b"\x1b[6n")).expect("pty data");
+
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert_eq!(probe.data, vec![b"\x1b[1;1R".to_vec()]);
+    }
+
+    #[test]
+    fn a_bell_from_the_shell_rings_the_engine_bell() {
+        let (mut app, _writer_rx, _tx, mut engine) = create_test_app();
+
+        app.handle_data(pty(b"\x07")).expect("pty data");
+
+        let mut probe = EngineProbe::default();
+        drain_engine(&mut engine, &mut probe);
+        assert!(matches!(
+            probe.requests.as_slice(),
+            [pixelflow_runtime::api::public::AppManagement::Bell]
+        ));
+    }
+
+    #[test]
+    fn a_title_from_the_shell_sets_the_window_title() {
+        let (mut app, _writer_rx, _tx, mut engine) = create_test_app();
+
+        app.handle_data(pty(b"\x1b]2;build: ok\x07"))
+            .expect("pty data");
+
+        let mut probe = EngineProbe::default();
+        drain_engine(&mut engine, &mut probe);
+        assert!(matches!(
+            probe.requests.as_slice(),
+            [pixelflow_runtime::api::public::AppManagement::SetTitle(title)] if title == "build: ok"
+        ));
     }
 }

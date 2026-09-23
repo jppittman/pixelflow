@@ -6,8 +6,6 @@ use super::TerminalEmulator; // Bring the struct into scope from the parent modu
 use crate::{
     glyph::Attributes,
     term::{
-        action::EmulatorAction,
-        cursor_visibility::CursorVisibility,
         modes::{DecPrivateModes, EraseMode},
         screen::{ScrollHistory, TabClearMode},
         DEFAULT_TAB_INTERVAL,
@@ -25,7 +23,7 @@ impl TerminalEmulator {
         }
     }
 
-    pub(super) fn reset(&mut self) -> Option<EmulatorAction> {
+    pub(super) fn reset(&mut self) {
         if self.screen.alt_screen_active {
             self.screen.exit_alt_screen();
         }
@@ -45,12 +43,6 @@ impl TerminalEmulator {
             self.screen.set_tabstop(i);
         }
         self.cursor_wrap_next = false;
-        if self.dec_modes.text_cursor_enable_mode {
-            return Some(EmulatorAction::SetCursorVisibility(
-                CursorVisibility::Visible,
-            ));
-        }
-        None
     }
 
     pub(super) fn carriage_return(&mut self) {
