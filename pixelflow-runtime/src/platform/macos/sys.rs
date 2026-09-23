@@ -95,6 +95,9 @@ extern "C" {
     pub fn objc_allocateClassPair(superclass: Class, name: *const u8, extra_bytes: usize) -> Class;
     pub fn objc_registerClassPair(cls: Class);
     pub fn class_addMethod(cls: Class, name: Sel, imp: *const c_void, types: *const u8) -> BOOL;
+    /// AppKit's alert sound.
+    #[link_name = "NSBeep"]
+    pub fn ns_beep();
 }
 
 pub type DispatchQueue = *mut c_void;

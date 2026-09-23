@@ -290,6 +290,20 @@ impl X11Window {
         }
     }
 
+    pub fn show(&self) {
+        unsafe {
+            xlib::XMapRaised(self.display, self.window);
+            xlib::XFlush(self.display);
+        }
+    }
+
+    pub fn hide(&self) {
+        unsafe {
+            xlib::XUnmapWindow(self.display, self.window);
+            xlib::XFlush(self.display);
+        }
+    }
+
     pub fn bell(&self) {
         unsafe {
             xlib::XBell(self.display, 0);

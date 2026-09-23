@@ -76,7 +76,7 @@ impl PlatformOps for MetalOps {
         Ok(())
     }
 
-    fn handle_control(&mut self, msg: DisplayControl, _out: &mut DriverOut) -> HandlerResult {
+    fn handle_control(&mut self, msg: DisplayControl, out: &mut DriverOut) -> HandlerResult {
         match msg {
             DisplayControl::SetTitle { id, title } => {
                 if let Some(win) = self.windows.get_mut(&id) {
@@ -108,16 +108,16 @@ impl PlatformOps for MetalOps {
                     win.request_redraw();
                 }
             }
-            DisplayControl::Bell => {
-                // NSBeep()
-            }
+            DisplayControl::Bell => cocoa::beep(),
             DisplayControl::Copy { text } => {
                 let pb = NSPasteboard::general();
                 pb.clear_contents();
                 pb.set_string(&text);
             }
             DisplayControl::RequestPaste => {
-                // Implementation pending
+                if let Some(text) = NSPasteboard::general().string() {
+                    out.event(DisplayEvent::PasteData { text });
+                }
             }
         }
         Ok(())

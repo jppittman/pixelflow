@@ -433,8 +433,7 @@ pub enum DisplayMgmt {
     ///
     /// **Sender**: Specifies a window ID to close.
     ///
-    /// **Receiver**: Closes the window and emits a `DisplayEvent::WindowDestroyed` event.
-    /// After this event, any messages for that window ID are invalid.
+    /// **Receiver**: Closes the window. After this, any message for that window ID is invalid.
     ///
     /// # Arguments
     ///
@@ -450,7 +449,6 @@ pub enum DisplayMgmt {
     ///
     /// ```ignore
     /// tx.send(Message::Management(DisplayMgmt::Destroy { id: window_id }))?;
-    /// // ... wait for DisplayEvent::WindowDestroyed ...
     /// ```
     Destroy { id: WindowId },
 }
@@ -465,9 +463,6 @@ pub enum DisplayEvent {
     /// event always actually was — the platform reporting the size it chose.
     WindowCreated {
         surface: Surface,
-    },
-    WindowDestroyed {
-        id: WindowId,
     },
     /// Window was resized (by user or programmatically).
     ///
@@ -524,7 +519,6 @@ pub enum DisplayEvent {
     PasteData {
         text: String,
     },
-    ClipboardDataRequested,
     CloseRequested {
         id: WindowId,
     },

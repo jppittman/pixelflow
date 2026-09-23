@@ -105,11 +105,11 @@ impl PlatformOps for LinuxOps {
                 DisplayControl::Bell => {
                     window.bell();
                 }
-                DisplayControl::ShowWindow { .. }
-                | DisplayControl::HideWindow { .. }
-                | DisplayControl::RequestRedraw { .. } => {
-                    // Not implemented for Linux yet
-                }
+                DisplayControl::ShowWindow { .. } => window.show(),
+                DisplayControl::HideWindow { .. } => window.hide(),
+                // X11 retains nothing to repaint: every present uploads a whole frame, so
+                // the next present is the redraw.
+                DisplayControl::RequestRedraw { .. } => {}
             }
         }
         Ok(())

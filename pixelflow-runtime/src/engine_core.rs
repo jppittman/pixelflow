@@ -187,12 +187,6 @@ impl EngineCore {
                     scale,
                 }));
             }
-            DisplayEvent::ClipboardDataRequested => {
-                unimplemented!("Clipboard data requested")
-            }
-            DisplayEvent::WindowDestroyed { .. } => {
-                unimplemented!("window destroyed, forward to app unimplemented");
-            }
         }
     }
 }
@@ -244,9 +238,6 @@ impl Transducer for EngineCore {
             EngineControl::GreenReady(..) => {
                 unreachable!("handled by the engine shell")
             }
-            EngineControl::DriverAck => {
-                unimplemented!("DriverAck not yet implemented");
-            }
         }
         Ok(out)
     }
@@ -282,6 +273,9 @@ impl Transducer for EngineCore {
             }
             AppManagement::RequestPaste => {
                 out.driver_control = Some(DisplayControl::RequestPaste);
+            }
+            AppManagement::Bell => {
+                out.driver_control = Some(DisplayControl::Bell);
             }
             AppManagement::SetCursorIcon(icon) => {
                 out.driver_control = Some(DisplayControl::SetCursor {
@@ -407,6 +401,14 @@ mod tests {
             matches!(out.coordinator, Some(CoordinatorData::Submit(_))),
             "a new scene must be forwarded to the coordinator"
         );
+    }
+
+    #[test]
+    fn an_app_bell_rings_the_driver_bell() {
+        let mut core = EngineCore::new();
+        let out = core.step_management(AppManagement::Bell).unwrap();
+
+        assert!(matches!(out.driver_control, Some(DisplayControl::Bell)));
     }
 
     #[test]
