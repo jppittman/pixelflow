@@ -517,8 +517,25 @@ Not on this list:
      the closure pin passed. The `Select` around the quotient cannot prevent
      that, because the e-graph reasons about the quotient's class whatever
      consumes it; the divisor is now `select(narrow, 1, d)`, which no rule
-     can prove zero. A literal `k = 0` then leaves `h·∫ 1` — the constant
+     can prove zero. A literal `k = 0` then left `h·∫ 1` — the constant
      rule, not built — which quadrature computes exactly.
+   - **Adversarially reviewed**, with three changes:
+     - `NarrowInterval` keeps the factors its variable does not reach
+       *outside* the integral it builds. Read at the reparametrized point,
+       they were the whole integrand whenever the product held nothing
+       else, and `∫ C` is the constant rule's. That was the literal-`k = 0`
+       chord's `h·∫ 1`; it now closes, and its pin says so.
+     - The closing phase spends the run's rounds rather than a round cap of
+       its own. A caller that allowed `n` rounds was told of up to `2n`,
+       which `run_anytime_curve`'s per-call subtraction would underflow on.
+     - `FactorFold`'s floating-point note: several `Add` factors out of a
+       `min`/`max` re-associate, so only one comes out bit for bit.
+
+     Inert without an integral, measured: the glyph bakes of
+     `glyph_atlas_golden` and `font_rasterization_regression` write
+     saturation telemetry (rounds, applications, unions, classes, stop,
+     extracted cost) identical record for record at `df2907f` and after
+     this step — the n-ary `FactorFold` included.
 5. **Half-plane, conic and Taylor** (a-glyph-is-a-formula §4.1, §7).
 6. **The glyph** (a-glyph-is-a-formula §6).
 

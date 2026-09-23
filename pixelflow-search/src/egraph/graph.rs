@@ -452,10 +452,13 @@ pub enum SaturationStop {
     ApplicationBudget,
 }
 
-/// The limits every phase of one saturation run shares: rounds per phase,
-/// classes, and the wall-clock ceiling measured from the run's start. The
-/// application budget is the graph's own (`EGraph::application_cap`), so it
-/// is shared by construction.
+/// The limits every phase of one saturation run shares: rounds, classes,
+/// and the wall-clock ceiling measured from the run's start. A later phase
+/// gets the rounds an earlier one left (`EGraph::saturate_bounded`), so a
+/// run never reports more rounds than its caller allowed. The application
+/// budget is the graph's own (`EGraph::application_cap`), so it is shared by
+/// construction.
+#[derive(Clone, Copy)]
 struct RoundLimits {
     max_iters: usize,
     max_classes: usize,
@@ -1382,15 +1385,18 @@ impl EGraph {
     ///
     /// **Integrals close first.** When the graph holds an integral, the
     /// integration family (`integral::closes_integrals`) runs to a fixpoint
-    /// before the whole rule set does, under the same limits and the same
-    /// application budget — the derivation of a closed form is three rounds
+    /// before the whole rule set does, under the same limits — rounds, classes,
+    /// applications, clock — the derivation of a closed form is three rounds
     /// of that family and nothing else, and a graph that reaches its class
     /// cap in the first round of the full set would otherwise stop it
     /// half-closed. The phase is decided by the graph and the rule set alone,
     /// so it is as deterministic as the rest of the run; a graph with no
     /// integral skips it, and saturates exactly as it did before it existed.
     /// Its rounds and unions are reported with the run's, and a budget it
-    /// exhausts ends the run there.
+    /// exhausts ends the run there. The rounds it takes come out of
+    /// `max_iters`, as its applications come out of `max_applications`: a
+    /// caller that asked for `n` rounds is told of at most `n`, which is what
+    /// an accountant of rounds across calls (`run_anytime_curve`) subtracts.
     fn saturate_bounded(
         &mut self,
         max_iters: usize,
@@ -1432,7 +1438,12 @@ impl EGraph {
             }
             _ => {
                 let every: Vec<usize> = (0..self.rules.len()).collect();
-                let main = self.rounds(&every, &limits);
+                let spent = closed.map_or(0, |closed| closed.iterations);
+                let left = RoundLimits {
+                    max_iters: limits.max_iters.saturating_sub(spent),
+                    ..limits
+                };
+                let main = self.rounds(&every, &left);
                 match closed {
                     Some(closed) => SaturationStats {
                         iterations: closed.iterations + main.iterations,

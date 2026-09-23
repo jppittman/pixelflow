@@ -463,11 +463,14 @@ pub struct EmptyFold;
 /// but `−∞`, and the rule does not need the case — [`EmptyFold`] closes an
 /// empty fold outright.
 ///
-/// **Floating point.** Min and max with `Add` are exact: `fl(c + f)` is
-/// monotone in `f`, so `min_i fl(c + f_i) = fl(c + min_i f_i)` bit for bit,
-/// except where a NaN is involved or a zero's sign is chosen — both already
-/// left to the target by `Min`/`Max` themselves (CLAUDE.md, "Floating point
-/// at the edges"). Sum with `Mul` is not exact: `Σ fl(c·f_i)` rounds `len`
+/// **Floating point.** Min and max with `Add` are exact for one factor:
+/// `fl(c + f)` is monotone in `f`, so `min_i fl(c + f_i) = fl(c + min_i f_i)`
+/// bit for bit, except where a NaN is involved or a zero's sign is chosen —
+/// both already left to the target by `Min`/`Max` themselves (CLAUDE.md,
+/// "Floating point at the edges"). Several come out as one sum, which
+/// re-associates them (`fl(c₁ + fl(c₂ + f))` against `fl(fl(c₁ + c₂) + f)`)
+/// and so rounds the way the sum's case below does. Sum with `Mul` is not
+/// exact: `Σ fl(c·f_i)` rounds `len`
 /// products and `fl(c·Σ f_i)` rounds one, re-associating the factors rounds
 /// differently again, and `c = ∞` against a zero term can give NaN on one
 /// side only. That is a reassociation-class difference — last-bit rounding

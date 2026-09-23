@@ -9,7 +9,7 @@
 //! test pins that none reaches the emitter.
 //!
 //! ```text
-//! ∫_lo^hi Π[Aᵢ ⋈ Bᵢ]·R du = s·∫_lo^hi R(m + s(u − c)) du        (narrow)
+//! ∫_lo^hi C·Π[Aᵢ ⋈ Bᵢ]·R du = C·s·∫_lo^hi R(m + s(u − c)) du    (narrow)
 //! ∫_lo^hi clamp(k·u + c, P, Q) du = (hi − lo)·mean_{z₀..z₁} clamp  (clamp moment)
 //! ```
 //!
@@ -60,8 +60,9 @@ use super::ops;
 use super::rewrite::{Rewrite, RewriteAction};
 use super::rules::RuleId;
 
-/// `∫_lo^hi Π[Aᵢ ⋈ Bᵢ]·R(u) du = s·∫_lo^hi R(m + s·(u − c)) du` — narrow an
-/// integral to where its indicators hold.
+/// `∫_lo^hi C·Π[Aᵢ ⋈ Bᵢ]·R(u) du = C·s·∫_lo^hi R(m + s·(u − c)) du` —
+/// narrow an integral to where its indicators hold, `C` the factors the
+/// variable does not reach.
 ///
 /// **Law.** Each indicator `[A ⋈ B]` — `Select(A ⋈ B, 1, 0)`, `⋈` one of
 /// `<`, `≤`, `>`, `≥` — whose difference is affine in the variable,
@@ -86,6 +87,10 @@ use super::rules::RuleId;
 ///   because the set they disagree on is one point, and a point has no
 ///   length. Over a range the same point is a whole term, so no range fold
 ///   is ever narrowed this way.
+/// - `C` stays outside the integral rather than being read at the point,
+///   which would leave `∫ C` for the constant rule — not built — wherever
+///   the product holds nothing else. [`FactorFold`] takes `C` out too, but
+///   only of the integral it matched, never of the one this builds.
 /// - The rest `R` is copied through a representative with no integral in it
 ///   where the class has one ([`Copying::Anything`] otherwise): an inner
 ///   integral already closed is copied closed.
@@ -153,16 +158,25 @@ impl Rewrite for NarrowInterval {
             invariant: Vec::new(),
             variant: alloc::vec![egraph.find(*body)],
         });
-        let (bounds, rest) = spellings
+        let Split {
+            bounds,
+            outside,
+            rest,
+        } = spellings
             .into_iter()
             .find_map(|factors| recognizer.bounds_of(factors))?;
 
         let mut template = Template::default();
         let cut = template.cut(&bounds)?;
         let mut plan = PlanBuilder::default();
+        // What the variable does not reach multiplies the result, never the
+        // integrand: `∫ c` is the constant rule, which nothing here closes.
+        let mut product: Vec<HeadRef> = outside.iter().map(|&c| HeadRef::Class(c)).collect();
         if rest.is_empty() {
             let measure = interval.measure(&mut template.arena, cut);
-            let [root] = template.splice_into(&mut plan, [measure])?;
+            let [measure] = template.splice_into(&mut plan, [measure])?;
+            product.push(measure);
+            let root = plan.chain(&ops::Mul, &product)?;
             return Some(RewriteAction::Plan(plan.finish(root)));
         }
 
@@ -182,7 +196,9 @@ impl Rewrite for NarrowInterval {
             .collect::<Option<Vec<HeadRef>>>()?;
         let narrowed = plan.chain(&ops::Mul, &factors)?;
         let integral = plan.reduce(*fold, narrowed);
-        let root = plan.op(&ops::Mul, alloc::vec![scale, integral]);
+        let narrowed = plan.op(&ops::Mul, alloc::vec![scale, integral]);
+        product.push(narrowed);
+        let root = plan.chain(&ops::Mul, &product)?;
         Some(RewriteAction::Plan(plan.finish(root)))
     }
 }
@@ -547,18 +563,33 @@ impl<'g> Recognizer<'g> {
     }
 
     /// Split a product's factors into the bounds its indicators put on the
-    /// variable and everything else, or `None` when no factor bounds it.
-    fn bounds_of(&mut self, factors: Factors) -> Option<(Vec<Bound>, Vec<EClassId>)> {
+    /// variable, the factors it does not reach, and the rest, or `None` when
+    /// no factor bounds it.
+    fn bounds_of(&mut self, factors: Factors) -> Option<Split> {
         let mut bounds = Vec::new();
-        let mut rest = factors.invariant;
+        let mut rest = Vec::new();
         for factor in factors.variant {
             match self.bound(factor) {
                 Some(bound) => bounds.push(bound),
                 None => rest.push(factor),
             }
         }
-        (!bounds.is_empty()).then_some((bounds, rest))
+        (!bounds.is_empty()).then_some(Split {
+            bounds,
+            outside: factors.invariant,
+            rest,
+        })
     }
+}
+
+/// An integrand's product, as [`NarrowInterval`] reads it.
+struct Split {
+    /// What its indicators say about the variable.
+    bounds: Vec<Bound>,
+    /// The factors the variable does not reach, which stay outside.
+    outside: Vec<EClassId>,
+    /// Every other factor, read at the reparametrized point.
+    rest: Vec<EClassId>,
 }
 
 /// The clamps a class holds: `(argument, band)` for each node that is
@@ -936,25 +967,23 @@ mod tests {
     /// uniforms, with each rule's own integrand and one no rule closes, and
     /// judges the values.
     ///
-    /// A *literal* zero slope is the exception, and a benign one. The closing
-    /// phase narrows the band while `(y − 2.25)·0` still varies in the
-    /// variable (only the main phase's `Annihilator` makes it `0`), and what
-    /// that leaves after factoring is `h·∫ 1` — a constant integrand, the
-    /// plan's constant rule, which this change does not add. Quadrature is
-    /// exact on it. (Until the zero-divisor fix in `mean_of_clamp`, this case
-    /// "closed" because saturation had collapsed the whole area to the
-    /// constant `0`; see `a_zero_sweep_never_makes_an_area_constant`.)
+    /// A *literal* zero slope is in the list on purpose. The closing phase
+    /// narrows the band while `(y − 2.25)·0` still varies in the variable
+    /// (only the main phase's `Annihilator` makes it `0`), and the factors
+    /// the variable does not reach — the literal `σ` among them — once went
+    /// *inside* the narrowed integral, which left `h·∫ 1`: the constant
+    /// rule's integrand, which nothing closes.
+    /// `NarrowInterval` keeps them outside. (Before the zero-divisor fix in
+    /// `mean_of_clamp`, this case "closed" because saturation had collapsed
+    /// the whole area to the constant `0`; see
+    /// `a_zero_sweep_never_makes_an_area_constant`, which is what judges
+    /// that it is not closed that way now.)
     #[test]
     fn the_area_of_a_chord_closes() {
-        for k in [0.4, -1.0e6] {
+        for k in [0.4, -1.0e6, 0.0] {
             let area = chord(k).area();
             assert_eq!(unclosed(&area), Some(0), "k = {k}");
         }
-        assert_eq!(
-            unclosed(&chord(0.0).area()),
-            Some(1),
-            "k = 0 leaves only ∫ 1"
-        );
     }
 
     /// **A provably zero sweep proves nothing false.** A literal slope of
@@ -1043,6 +1072,31 @@ mod tests {
         ];
         expected.sort_by_key(|id| set.index_of(*id));
         assert_eq!(family, expected);
+    }
+
+    /// **The closing phase spends the run's rounds, not rounds of its own.**
+    /// A caller that allows `n` rounds is told of at most `n` however they
+    /// divide between the phases: `run_anytime_curve` subtracts each call's
+    /// rounds from what it has left, and a run that reported more than it
+    /// was allowed would underflow that. The chord takes three rounds of the
+    /// family to close, so every allowance here ends inside or just after
+    /// the closing phase.
+    #[test]
+    fn the_closing_phase_spends_the_runs_rounds() {
+        use crate::egraph::{RuleSet, Vocabulary, insert};
+        let area = chord(0.4).area();
+        let (arena, root) = area.parts();
+        for allowed in 1..=4 {
+            let (rules, ids) = RuleSet::runtime().shared();
+            let mut eg = EGraph::with_shared_rules(rules, ids);
+            insert(arena, root, &mut eg, Vocabulary::Runtime).expect("inserts");
+            assert!(!eg.integral_closure_rules().is_empty());
+            let stats = eg.saturate_budgeted(allowed, 50_000, None);
+            assert!(
+                stats.iterations <= allowed,
+                "allowed {allowed} rounds, ran {stats:?}"
+            );
+        }
     }
 
     /// The integration rules are the runtime tier's, and only the runtime
