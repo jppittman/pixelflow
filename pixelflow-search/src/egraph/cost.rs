@@ -16,7 +16,7 @@
 
 use super::node::ENode;
 use pixelflow_ir::kind::OpMap;
-use pixelflow_ir::{Fold, OpKind};
+use pixelflow_ir::{Fold, OpKind, RangeFold};
 
 /// The price of a node only legalization can remove: a `Dwrt` the chain rule
 /// did not reach, and an integral no rule closed. One number for both,
@@ -155,12 +155,14 @@ pub fn latency_prior_cycles() -> OpMap<usize> {
         OpKind::Buffer => 0,     // leaf, free
         OpKind::Gather => 10,    // memory read
         OpKind::RawGather => 10, // primitive memory read
-        // A fold's cost depends on its range and its monoid, and an `OpKind`
-        // carries neither; `node_op_cost`'s `ENode::Reduce` arm is where it is
-        // priced. Zero here so a caller reaching this table for a fold adds
-        // nothing rather than a wrong number. (It said "lowered (unrolled)
-        // before costing" while `ExpandReduce` ran first. No production path
-        // runs it now: codegen emits a surviving fold as a loop.)
+        // A fold's cost depends on its trip count, its monoid and its body,
+        // and an `OpKind` carries none of them; `CostModel::fold_cost` is
+        // where it is priced. Zero here is not a price, only the absence of
+        // one: codegen's guard analysis once read it as the price of a whole
+        // loop, and refused a branch over a 64-trip fold as too cheap to be
+        // worth one. (It said "lowered (unrolled) before costing" while
+        // `ExpandReduce` ran first. No production path runs it now: codegen
+        // emits a surviving fold as a loop.)
         OpKind::Reduce => 0,
         // A leaf like Buffer: its one broadcast load lands in the per-call
         // prologue, which the per-sample cost model does not see.
@@ -373,13 +375,15 @@ impl CostModel {
             // claim/price audit catches outright. Nothing unrolls a surviving
             // fold afterwards now: codegen emits it as a loop.
             //
+            // So the node's own share is `fold_cost` with the body free.
+            //
             // An unpriceable monoid keeps the sentinel: extraction must not
             // choose a fold whose combiner has no operation to emit.
             ENode::Reduce {
                 fold: Fold::Range(range),
                 ..
             } => match super::fold_rules::combiner_op(range.monoid()) {
-                Some(op) => (range.len() as usize).saturating_sub(1) * self.cost(op.kind()),
+                Some(_) => self.fold_cost(*range, 0),
                 None => usize::MAX / 4,
             },
             // **An integral no rule closed costs what a surviving `Dwrt`
@@ -393,6 +397,31 @@ impl CostModel {
                 ..
             } => LEGALIZATION_PRICE,
         }
+    }
+
+    /// **What one evaluation of `fold` costs**, when one evaluation of its
+    /// body costs `body`: the body once per trip, and the combiner between
+    /// consecutive trips — `len · body + (len − 1) · combine`.
+    ///
+    /// The one formula for a fold's price. The extractor reaches it in two
+    /// halves, because a node's own cost cannot see its children's:
+    /// [`node_op_cost`](Self::node_op_cost) is `fold_cost(fold, 0)`, the
+    /// combiner chain, and the DP multiplies the body's price by the trip
+    /// count where it has that price in hand (`extract.rs`'s
+    /// `fold_body_multiple`). Codegen's guard analysis prices a loop a
+    /// `Select` arm owns with it whole, the body priced over the loop's own
+    /// schedule (`pixelflow-codegen`'s `emit::guards::FoldReads`) — an arm is
+    /// worth a branch by what running it costs, and a loop costs its trips.
+    ///
+    /// Saturating: a nest of long folds over an expensive body is a price
+    /// past any budget, not an overflow.
+    #[must_use]
+    pub fn fold_cost(&self, fold: RangeFold, body: usize) -> usize {
+        let trips = fold.len() as usize;
+        let combines = trips.saturating_sub(1);
+        trips
+            .saturating_mul(body)
+            .saturating_add(combines.saturating_mul(self.cost(fold.combine_op())))
     }
 
     /// Get cost by operation name (for backward compatibility).
@@ -694,6 +723,43 @@ mod cost_model_accessors {
             children: vec![lhs, rhs],
         };
         assert_eq!(model.node_op_cost(&node), model.cost(OpKind::Add));
+    }
+
+    /// A fold has one price, [`CostModel::fold_cost`], whichever side asks.
+    /// The extractor's DP reaches it in two halves — `node_op_cost` is the
+    /// combiner chain, and the DP adds the body once per trip — while
+    /// codegen's guard analysis calls it whole for a loop an arm owns. Pinned
+    /// from the extractor's side: with no rewrite rule to choose another
+    /// form, `Σ_{j<40} |X − j|` is priced exactly `fold_cost(fold, − + |·|)`.
+    #[test]
+    fn the_extractor_prices_a_fold_at_fold_cost() {
+        use crate::egraph::extract::extract;
+        use crate::egraph::{Vocabulary, insert};
+        use pixelflow_ir::ExprArena;
+        use pixelflow_ir::fold::{Binder, Fold, Monoid, RangeFold};
+
+        let binder = Binder::from_slot(0).expect("a live binder");
+        let range = RangeFold::new(Monoid::SUM, binder, 0..40);
+        let fold = Fold::Range(range);
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let j = a.push_var(binder.var());
+        let diff = a.push_binary(OpKind::Sub, x, j);
+        let body = a.push_unary(OpKind::Abs, diff);
+        let root = a.push_reduce(fold, body);
+
+        let mut egraph = EGraph::new();
+        let class = insert(&a, root, &mut egraph, Vocabulary::Runtime).expect("a fold inserts");
+        let model = CostModel::latency_prior();
+        let (_, _, cost) = extract(&egraph, class, &model);
+
+        let body_cost = model.cost(OpKind::Sub) + model.cost(OpKind::Abs);
+        assert_eq!(cost, model.fold_cost(range, body_cost));
+        assert_eq!(
+            model.node_op_cost(&ENode::Reduce { fold, body: class }),
+            model.fold_cost(range, 0),
+            "the node's own share is the fold with its body free"
+        );
     }
 
     /// The `CostFunction` trait impl for `CostModel` is a thin delegation

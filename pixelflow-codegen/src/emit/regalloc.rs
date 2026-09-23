@@ -2004,31 +2004,51 @@ impl RegisterAllocator for LinearScan {
         };
 
         // Every scope's `Select` guards, before any scan: what an arm may own
-        // depends on what the loops the scope opens read from it
-        // (`FoldReads`), which takes those loops' schedules — and the loop
-        // below reaches a fold only after the scope it opens in.
-        let guards_in = |scope: Scope, schedule: &[Def], roots: &[ValueId]| {
-            let reads = FoldReads::new(
+        // depends on what the loops the scope opens read from it, and what
+        // it is worth depends on what they cost (`FoldReads`), which takes
+        // those loops' schedules — and the loop below reaches a fold only
+        // after the scope it opens in. Innermost first: a fold's price is
+        // made of the folds inside it, and a child's index is always above
+        // its parent's.
+        let schedule_of = |scope: Scope| match scope {
+            Scope::Body => nest.body.schedule.as_slice(),
+            Scope::Fold(j) => nest.folds[j].schedule.as_slice(),
+            Scope::GuardArm(_) => unreachable!("a fold never opens in a guard arm"),
+        };
+        let mut reads: Vec<FoldReads> = (0..=nest.folds.len())
+            .map(|_| FoldReads::default())
+            .collect();
+        for scope in (0..nest.folds.len())
+            .rev()
+            .map(Scope::Fold)
+            .chain(core::iter::once(Scope::Body))
+        {
+            let schedule = schedule_of(scope);
+            let opened = FoldReads::new(
                 schedule,
                 nest.folds
                     .iter()
-                    .filter(|fold| fold.parent == scope)
-                    .map(|fold| (schedule[fold.at].value, fold.schedule.as_slice())),
+                    .enumerate()
+                    .filter(|(_, fold)| fold.parent == scope)
+                    .map(|(k, fold)| {
+                        let inner = &reads[scope_ix(Scope::Fold(k))];
+                        (schedule[fold.at].value, fold.schedule.as_slice(), inner)
+                    }),
             );
-            analyze_select_guards(schedule, roots, &reads)
+            reads[scope_ix(scope)] = opened;
+        }
+        let guards_in = |scope: Scope, roots: &[ValueId]| {
+            analyze_select_guards(schedule_of(scope), roots, &reads[scope_ix(scope)])
         };
-        let mut guards: Vec<Vec<SelectGuard>> = core::iter::once(guards_in(
-            Scope::Body,
-            &nest.body.schedule,
-            &nest.body.roots,
-        ))
-        .chain(
-            nest.folds
-                .iter()
-                .enumerate()
-                .map(|(j, fold)| guards_in(Scope::Fold(j), &fold.schedule, &fold.roots)),
-        )
-        .collect();
+        let mut guards: Vec<Vec<SelectGuard>> =
+            core::iter::once(guards_in(Scope::Body, &nest.body.roots))
+                .chain(
+                    nest.folds
+                        .iter()
+                        .enumerate()
+                        .map(|(j, fold)| guards_in(Scope::Fold(j), &fold.roots)),
+                )
+                .collect();
 
         let body_scan = self.scan(
             nest.body.schedule,

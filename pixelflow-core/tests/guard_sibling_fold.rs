@@ -17,9 +17,9 @@
 //!    `D = Σ_k |W − 40k|`. `D`'s body reads `W`'s accumulator through a
 //!    placeholder, so `W`'s only consumer in the batch scope was the arm's
 //!    `Mul`; `W`'s `Reduce` is never a scope root (`stays_put`), so the
-//!    `OUTSIDE` pin did not cover it either. The arm is priced at `sin`'s
-//!    expansion (a fold costs 0), clears the 16-cycle bound, and was guarded —
-//!    `W`'s whole loop inside the skipped range. On a batch whose mask is
+//!    `OUTSIDE` pin did not cover it either. `sin`'s expansion alone prices
+//!    the arm past the 16-cycle bound, and it was guarded — `W`'s whole loop
+//!    inside the skipped range. On a batch whose mask is
 //!    uniformly false, `D` read `W`'s slot as the last batch that ran the arm
 //!    left it (or as the frame's initial garbage).
 //!
@@ -39,8 +39,8 @@
 //! (the edges are transitive, and every scope has them), not new mechanisms.
 //!
 //! The controls at the bottom compile the same folds without the select, with
-//! an arm too cheap to guard or cluster, and with the sibling reading `W`
-//! through an ordinary batch-scope value — all correct.
+//! an arm that owns nothing to guard or cluster, and with the sibling reading
+//! `W` through an ordinary batch-scope value — all correct.
 //!
 //! The errors were stale accumulators — a whole batch's `W` in place of
 //! another — not rounding; the tolerance is sized for `f32` accumulation over
@@ -431,16 +431,17 @@ fn control_both_folds_without_the_select() {
     });
 }
 
-/// `select(X < T, W, 0) + D`: the arm is the fold and nothing else, priced
-/// at 0 — never guarded, never clustered — so nothing moves or is skipped.
+/// `select(X < T, W, 0) + D`: the arm is the fold and nothing else, and `D`
+/// reads the fold too, so the arm owns nothing — never guarded, never
+/// clustered, however its loop is priced — and nothing moves or is skipped.
 #[test]
-fn control_an_arm_too_cheap_to_guard() {
+fn control_an_arm_that_owns_nothing() {
     let w = w_of_x_plus_y();
     let k = x()
         .lt(&c(THRESHOLD))
         .select(&w, &c(0.0))
         .add(&sibling_of(&w));
-    check("cheap arm", &k, |x, y| {
+    check("arm owning nothing", &k, |x, y| {
         let w = w_ref(x + y);
         let arm = if x < THRESHOLD { w } else { 0.0 };
         arm + sibling_ref(w)

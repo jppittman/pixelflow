@@ -35,6 +35,7 @@ use alloc::vec::Vec;
 
 use pixelflow_ir::kind::OpKind;
 use pixelflow_ir::passes::demand::{Demand, Literal, demand_of};
+use pixelflow_search::egraph::CostModel;
 
 use super::ScheduledOp;
 use super::regalloc::{Def, ValueId};
@@ -351,37 +352,77 @@ impl IndexSet {
 /// itself included: that over-approximates (such a leaf is kept out of an arm
 /// the fold does not run in), and asks nothing of which values `place_roots`
 /// later parks and which it leaves to be rebuilt.
+///
+/// **And what each loop costs.** To the latency table a `Reduce` costs 0 — a
+/// fold's price depends on its trip count and its body, and an `OpKind`
+/// carries neither — so the def, which is all this scope's schedule holds of
+/// the loop, priced an arm owning a 64-trip fold at nothing, and the arm was
+/// refused a branch as too cheap to pay for one. The price is the extractor's
+/// own formula, [`CostModel::fold_cost`], with the body priced over the ids
+/// the two schedules do *not* share — what the fold computes on each trip —
+/// each def as an arm's entries are ([`def_cycles`]), and a fold nested in it
+/// by that fold's own `FoldReads`. That is why each construction site builds
+/// the innermost scope's first.
 #[derive(Default)]
-pub(crate) struct FoldReads(BTreeMap<ValueId, Vec<ValueId>>);
+pub(crate) struct FoldReads(BTreeMap<ValueId, OpenedFold>);
+
+/// One loop a scope opens, as that scope sees it.
+struct OpenedFold {
+    /// This scope's values the loop reads ([`FoldReads`]).
+    reads: Vec<ValueId>,
+    /// One run of the whole loop, in latency-prior cycles.
+    cycles: usize,
+}
 
 impl FoldReads {
-    /// The reads of the folds opened in `scope`, each fold given as its
-    /// `Reduce` def's `ValueId` and the fold's own schedule.
+    /// The folds opened in `scope`, each given as its `Reduce` def's
+    /// `ValueId`, the fold's own schedule, and the `FoldReads` of that
+    /// schedule — the folds opened inside it, which the fold's price is made
+    /// of too.
+    ///
+    /// # Panics
+    ///
+    /// If a fold's `ValueId` is not a `Reduce` def of `scope`: a loop opens
+    /// where its def is, and nowhere else.
     pub(crate) fn new<'a>(
         scope: &[Def],
-        folds: impl IntoIterator<Item = (ValueId, &'a [Def])>,
+        folds: impl IntoIterator<Item = (ValueId, &'a [Def], &'a FoldReads)>,
     ) -> Self {
+        let cycles = CostModel::latency_prior();
         let capacity = scope
             .iter()
             .map(|def| def.value.0 as usize + 1)
             .max()
             .unwrap_or(0);
         let mut here = IndexSet::empty(capacity);
+        let mut opens = BTreeMap::new();
         for def in scope {
             here.insert(def.value.0 as usize);
+            if let ScheduledOp::Reduce(fold, _) = def.op {
+                opens.insert(def.value, fold);
+            }
         }
-        let reads = folds
+        let opened = folds
             .into_iter()
-            .map(|(reduce, body)| {
-                let shared = body
+            .map(|(reduce, body, inner)| {
+                let fold = *opens.get(&reduce).unwrap_or_else(|| {
+                    panic!("{reduce:?} opens a fold but is not a Reduce def of its scope")
+                });
+                let (shared, per_trip): (Vec<&Def>, Vec<&Def>) = body
                     .iter()
-                    .map(|def| def.value)
-                    .filter(|v| here.contains(v.0 as usize))
-                    .collect();
-                (reduce, shared)
+                    .partition(|def| here.contains(def.value.0 as usize));
+                let body_cycles = per_trip
+                    .into_iter()
+                    .map(|def| def_cycles(def, inner, &cycles))
+                    .fold(0, usize::saturating_add);
+                let opened = OpenedFold {
+                    reads: shared.into_iter().map(|def| def.value).collect(),
+                    cycles: cycles.fold_cost(fold, body_cycles),
+                };
+                (reduce, opened)
             })
             .collect();
-        Self(reads)
+        Self(opened)
     }
 
     /// Everything the def of `value` by `op` reads in this scope: its
@@ -393,10 +434,47 @@ impl FoldReads {
         op: &'a ScheduledOp,
     ) -> impl Iterator<Item = ValueId> + 'a {
         let fold: &[ValueId] = match op {
-            ScheduledOp::Reduce(..) => self.0.get(&value).map_or(&[], Vec::as_slice),
+            ScheduledOp::Reduce(..) => self.0.get(&value).map_or(&[], |f| f.reads.as_slice()),
             _ => &[],
         };
         super::regalloc::operands(op).chain(fold.iter().copied())
+    }
+
+    /// One run of the loop the `Reduce` def of `value` opens here, or
+    /// nothing for a def that opens none: a fold hoisted out of this scope,
+    /// read from the accumulator slot its own scope's loop left it in.
+    fn cycles(&self, value: ValueId) -> usize {
+        self.0.get(&value).map_or(0, |f| f.cycles)
+    }
+}
+
+/// What executing `def` once costs where it is scheduled, in latency-prior
+/// cycles — the table's price for its op, and for a `Reduce` the price of the
+/// loop it opens here ([`FoldReads`]). The summand of a `Select` arm's price
+/// and of a fold body's, which are one question: what running these entries
+/// costs.
+fn def_cycles(def: &Def, folds: &FoldReads, cycles: &CostModel) -> usize {
+    match &def.op {
+        ScheduledOp::Var(_)
+        | ScheduledOp::Lanes(_)
+        | ScheduledOp::Const(_)
+        | ScheduledOp::Seq(..) => 0,
+        // One store, priced as the load a gather is.
+        ScheduledOp::Write { .. } => cycles.cost(OpKind::RawGather),
+        // One broadcast load; priced as the leaf it is in the prologue, where
+        // it lands.
+        ScheduledOp::Uniform(_) => cycles.cost(OpKind::Uniform),
+        ScheduledOp::Unary(op, _) | ScheduledOp::Binary(op, _, _) => cycles.cost(*op),
+        ScheduledOp::ShiftImm(op, _, _) => cycles.cost(*op),
+        ScheduledOp::Ternary(op, _, _, _) => cycles.cost(*op),
+        ScheduledOp::Gather(_, _) => cycles.cost(OpKind::RawGather),
+        ScheduledOp::Reduce(..) => folds.cycles(def.value),
+        // A hard branch whose arms are scopes of their own, which no walk of
+        // this schedule reaches (G2,
+        // docs/plans/2026-09-12-emit-should-just-emit.md): unpriced rather
+        // than guessed at, so an arm holding one is priced by what else it
+        // owns.
+        ScheduledOp::Guard(..) => 0,
     }
 }
 
@@ -608,7 +686,7 @@ fn select_arms(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Vec
     // The extraction cost model's table, which is the workspace's one answer
     // to "what does this op cost" — the guard's bound is denominated in the
     // same cycles the optimizer chose the expression with.
-    let cycles = pixelflow_search::egraph::CostModel::latency_prior();
+    let cycles = CostModel::latency_prior();
 
     // Build dense lookup: schedule_ops[vid.0] = Some(&ScheduledOp) for O(1) child traversal.
     // ValueIds are sequential starting from 0 (guaranteed by arena_to_schedule).
@@ -746,44 +824,8 @@ fn select_arms(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Vec
             let arm_cycles = |indices: &IndexSet| -> usize {
                 indices
                     .iter()
-                    .map(|idx| match &schedule[idx].op {
-                        ScheduledOp::Var(_)
-                        | ScheduledOp::Lanes(_)
-                        | ScheduledOp::Const(_)
-                        | ScheduledOp::Seq(..) => 0,
-                        // One store, priced as the load a gather is.
-                        ScheduledOp::Write { .. } => cycles.cost(OpKind::RawGather),
-                        // One broadcast load; priced as the leaf it is
-                        // in the prologue, where it lands.
-                        ScheduledOp::Uniform(_) => cycles.cost(OpKind::Uniform),
-                        ScheduledOp::Unary(op, _) | ScheduledOp::Binary(op, _, _) => {
-                            cycles.cost(*op)
-                        }
-                        ScheduledOp::ShiftImm(op, _, _) => cycles.cost(*op),
-                        ScheduledOp::Ternary(op, _, _, _) => cycles.cost(*op),
-                        ScheduledOp::Gather(_, _) => cycles.cost(OpKind::RawGather),
-                        // A whole loop, not one instruction — this heuristic
-                        // is a cluster-ordering cost estimate (docs/BACKLOG.md
-                        // X1), not a correctness question, and a surviving
-                        // fold reaching a select's mask/arm cone is rare
-                        // enough that a coarse estimate costs nothing to be
-                        // conservative about.
-                        ScheduledOp::Reduce(fold, _) => {
-                            cycles.cost(OpKind::Reduce) * fold.len() as usize
-                        }
-                        // A hard branch, not a select arm of this cost
-                        // estimate's own concern (G2,
-                        // docs/plans/2026-09-12-emit-should-just-emit.md) —
-                        // its own arms are separately scheduled scopes this
-                        // walk never reaches. Priced the same coarse way as
-                        // a surviving `Reduce` above: this is a cluster-
-                        // ordering heuristic (docs/BACKLOG.md X1), not a
-                        // correctness question, so a `Guard` landing in a
-                        // `Select`'s cone (its result feeding an unrelated
-                        // select) costs nothing to be conservative about.
-                        ScheduledOp::Guard(..) => cycles.cost(OpKind::Reduce),
-                    })
-                    .sum()
+                    .map(|idx| def_cycles(&schedule[idx], folds, &cycles))
+                    .fold(0, usize::saturating_add)
             };
             let (true_cycles, false_cycles) =
                 (arm_cycles(&true_indices), arm_cycles(&false_indices));
@@ -1359,7 +1401,10 @@ mod tests {
         // The sibling's body holds `W`'s id, as a placeholder read from its
         // accumulator slot.
         let sibling = [def(1, reduce())];
-        let folds = FoldReads::new(&schedule, [(ValueId(5), &sibling[..])]);
+        let folds = FoldReads::new(
+            &schedule,
+            [(ValueId(5), &sibling[..], &FoldReads::default())],
+        );
 
         let blind = analyze_select_guards(&schedule, &[], &FoldReads::default());
         assert_eq!(blind[0].true_range(), (1, 4), "the arm owned `W` unseen");
@@ -1388,7 +1433,7 @@ mod tests {
             def(7, ScheduledOp::Binary(OpKind::Add, ValueId(6), ValueId(1))),
         ];
         let body = [def(3, ScheduledOp::Const(0.0))];
-        let folds = FoldReads::new(&schedule, [(ValueId(4), &body[..])]);
+        let folds = FoldReads::new(&schedule, [(ValueId(4), &body[..], &FoldReads::default())]);
         let at = |order: &[Def], v: u32| {
             order
                 .iter()
@@ -1405,5 +1450,125 @@ mod tests {
         let clustered = cluster_select_arms(schedule, &folds);
         assert!(at(&clustered, 3) < at(&clustered, 4));
         assert!(is_topological(&clustered, &folds));
+    }
+
+    /// The arm fold's trip count below: long enough that pricing the loop
+    /// as one instruction, or as nothing, is off by a factor this large.
+    const ARM_TRIPS: u32 = 64;
+
+    /// A sum of `trips` terms binding `slot`.
+    fn sum_over(slot: u8, trips: u32) -> pixelflow_ir::fold::RangeFold {
+        use pixelflow_ir::fold::{Binder, Monoid, RangeFold};
+        let binder = Binder::from_slot(slot).expect("a live binder slot");
+        RangeFold::new(Monoid::SUM, binder, 0..trips)
+    }
+
+    /// `select(X < 20, F, 0) + Y`, with `F` the `Reduce` def `fold` opening
+    /// at position 3 — the true arm's only entry of its own.
+    fn select_over_a_fold(fold: pixelflow_ir::fold::RangeFold, body_root: u32) -> Vec<Def> {
+        alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Const(20.0)),
+            def(2, ScheduledOp::Binary(OpKind::Lt, ValueId(0), ValueId(1))),
+            def(3, ScheduledOp::Reduce(fold, ValueId(body_root))),
+            def(4, ScheduledOp::Const(0.0)),
+            def(
+                5,
+                ScheduledOp::Ternary(OpKind::Select, ValueId(2), ValueId(3), ValueId(4)),
+            ),
+            def(6, ScheduledOp::Var(1)),
+            def(7, ScheduledOp::Binary(OpKind::Add, ValueId(5), ValueId(6))),
+        ]
+    }
+
+    /// `|x − j|` per trip, `j` the binder of `fold` and `x` read from the
+    /// enclosing scope as `ValueId(0)`; the ids from `first` up are the
+    /// body's own.
+    fn distance_body(fold: pixelflow_ir::fold::RangeFold, first: u32) -> Vec<Def> {
+        let (j, diff, abs) = (first, first + 1, first + 2);
+        alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(j, ScheduledOp::Var(fold.binder().var())),
+            def(
+                diff,
+                ScheduledOp::Binary(OpKind::Sub, ValueId(0), ValueId(j))
+            ),
+            def(abs, ScheduledOp::Unary(OpKind::Abs, ValueId(diff))),
+        ]
+    }
+
+    /// An arm that owns a fold is priced by the loop: `n` trips of a `k`-cycle
+    /// body are `n·k`, plus the `n − 1` combines — not the `Reduce` def's
+    /// table price of 0, which refused the arm a branch however long the
+    /// loop. With the price, the arm clears the mispredict bound and is
+    /// guarded.
+    #[test]
+    fn price_an_arm_that_owns_a_fold_by_its_trips() {
+        let cycles = CostModel::latency_prior();
+        let fold = sum_over(0, ARM_TRIPS);
+        let body = distance_body(fold, 10);
+        let schedule = select_over_a_fold(fold, 12);
+        let folds = FoldReads::new(&schedule, [(ValueId(3), &body[..], &FoldReads::default())]);
+
+        let n = ARM_TRIPS as usize;
+        let k = cycles.cost(OpKind::Sub) + cycles.cost(OpKind::Abs);
+        let combine = cycles.cost(OpKind::Add);
+        let arms = select_arms(&schedule, &[], &folds);
+        assert_eq!(arms.len(), 1);
+        assert_eq!(
+            arms[0].cycles.true_arm,
+            n * k + (n - 1) * combine,
+            "the arm is its loop: {n} trips of a {k}-cycle body, and a combine between each"
+        );
+        assert_eq!(arms[0].cycles.true_arm, cycles.fold_cost(fold, k));
+
+        let blind = select_arms(&schedule, &[], &FoldReads::default());
+        assert_eq!(
+            blind[0].cycles.true_arm, 0,
+            "a Reduce def that opens no loop here is a slot read, and the table prices it 0"
+        );
+
+        let guards = analyze_select_guards(&schedule, &[], &folds);
+        assert_eq!(guards.len(), 1);
+        assert_eq!(guards[0].true_range(), (3, 4), "the loop is skipped whole");
+        assert!(analyze_select_guards(&schedule, &[], &FoldReads::default()).is_empty());
+    }
+
+    /// A fold nested in the arm's fold is priced by its own trips inside
+    /// every trip of the outer one: `m · (n·k + …)`, recursively — the inner
+    /// loop's price comes from the outer body's own `FoldReads`.
+    #[test]
+    fn price_a_nested_fold_by_the_product_of_its_trips() {
+        const OUTER_TRIPS: u32 = 4;
+        let cycles = CostModel::latency_prior();
+        let (outer, inner) = (sum_over(0, OUTER_TRIPS), sum_over(1, ARM_TRIPS));
+        // Outer body: `|I − i|`, `I` the inner fold, `i` the outer binder.
+        let outer_body = alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(20, ScheduledOp::Var(outer.binder().var())),
+            def(21, ScheduledOp::Reduce(inner, ValueId(32))),
+            def(
+                22,
+                ScheduledOp::Binary(OpKind::Sub, ValueId(21), ValueId(20))
+            ),
+            def(23, ScheduledOp::Unary(OpKind::Abs, ValueId(22))),
+        ];
+        let inner_body = distance_body(inner, 30);
+        let inside = FoldReads::new(
+            &outer_body,
+            [(ValueId(21), &inner_body[..], &FoldReads::default())],
+        );
+        let schedule = select_over_a_fold(outer, 23);
+        let folds = FoldReads::new(&schedule, [(ValueId(3), &outer_body[..], &inside)]);
+
+        let k = cycles.cost(OpKind::Sub) + cycles.cost(OpKind::Abs);
+        let inner_loop = cycles.fold_cost(inner, k);
+        let outer_loop = cycles.fold_cost(outer, inner_loop + k);
+        let arms = select_arms(&schedule, &[], &folds);
+        assert_eq!(arms[0].cycles.true_arm, outer_loop);
+        assert!(
+            outer_loop >= (OUTER_TRIPS * ARM_TRIPS) as usize * k,
+            "every trip of the outer loop runs the whole inner one"
+        );
     }
 }

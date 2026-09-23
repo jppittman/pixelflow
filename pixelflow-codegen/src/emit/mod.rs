@@ -2846,10 +2846,12 @@ fn scope_schedule(
     // where an arm's entries are worth gathering into one run. A no-op
     // unless it buys a branch. Before `attach_folds`, because it is a
     // permutation and a fold's position is a fact about its parent's final
-    // order.
-    let reads = pending_reads(&body, &pending);
+    // order. The folds first: what a fold costs, which decides whether an
+    // arm owning it pays for a branch, is made of the folds inside it.
+    let (pending, inner): (Vec<PendingFold>, Vec<guards::FoldReads>) =
+        pending.into_iter().map(cluster_pending).unzip();
+    let reads = pending_reads(&body, &pending, &inner);
     let body = guards::cluster_select_arms(body, &reads);
-    let pending = pending.into_iter().map(cluster_pending).collect();
     let mut scoped = regalloc::ScopedSchedule {
         body: regalloc::ScopeRegion {
             roots: Vec::new(),
@@ -2868,23 +2870,34 @@ fn scope_schedule(
 }
 
 /// [`guards::cluster_select_arms`] over a pending fold's schedule and, one
-/// level down, each of its children's.
-fn cluster_pending(fold: PendingFold) -> PendingFold {
-    let reads = pending_reads(&fold.schedule, &fold.children);
-    PendingFold {
+/// level down, each of its children's — innermost first, and handing back
+/// the folds the fold's own schedule opens, which the scope it opens in
+/// prices it by.
+fn cluster_pending(fold: PendingFold) -> (PendingFold, guards::FoldReads) {
+    let (children, inner): (Vec<PendingFold>, Vec<guards::FoldReads>) =
+        fold.children.into_iter().map(cluster_pending).unzip();
+    let reads = pending_reads(&fold.schedule, &children, &inner);
+    let clustered = PendingFold {
         reduce_vid: fold.reduce_vid,
         schedule: guards::cluster_select_arms(fold.schedule, &reads),
-        children: fold.children.into_iter().map(cluster_pending).collect(),
-    }
+        children,
+    };
+    (clustered, reads)
 }
 
-/// What each of `folds`, opened in `scope`, reads from it.
-fn pending_reads(scope: &[regalloc::Def], folds: &[PendingFold]) -> guards::FoldReads {
+/// What each of `folds`, opened in `scope`, reads from it and costs, `inner`
+/// being what each fold's own schedule opens, in the same order.
+fn pending_reads(
+    scope: &[regalloc::Def],
+    folds: &[PendingFold],
+    inner: &[guards::FoldReads],
+) -> guards::FoldReads {
     guards::FoldReads::new(
         scope,
         folds
             .iter()
-            .map(|fold| (fold.reduce_vid, fold.schedule.as_slice())),
+            .zip(inner)
+            .map(|(fold, inner)| (fold.reduce_vid, fold.schedule.as_slice(), inner)),
     )
 }
 
@@ -5874,6 +5887,48 @@ mod tests {
                 .iter()
                 .map(|g| g.total_guarded_entries())
                 .collect()
+        }
+
+        /// Trip count of [`a_fold_owned_by_an_arm_is_guarded`]'s fold.
+        const ARM_FOLD_TRIPS: u32 = 64;
+
+        /// `(X > 0) ? Σ_{j<64} |X − j| : 0`, plus a value carried across: an
+        /// arm that is a loop and nothing else. All the scope holds of the
+        /// loop is its `Reduce` def, which the latency table prices 0; the
+        /// arm is priced as the loop it opens (`guards::FoldReads`), clears
+        /// the mispredict bound, and is guarded — and the answer on the
+        /// batch that skips the loop is the false arm's.
+        #[test]
+        fn a_fold_owned_by_an_arm_is_guarded() {
+            use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let zero = a.push_const(0.0);
+            let cond = a.push_binary(OpKind::Gt, x, zero);
+            let binder = Binder::from_slot(0).expect("slot 0 exists");
+            let j = a.push_var(binder.var());
+            let diff = a.push_binary(OpKind::Sub, x, j);
+            let term = a.push_unary(OpKind::Abs, diff);
+            let fold = a.push_reduce(Fold::new(Monoid::SUM, binder, 0..ARM_FOLD_TRIPS), term);
+            let sel = a.push_ternary(OpKind::Select, cond, fold, zero);
+            let carried = a.push_binary(OpKind::Sub, x, y);
+            let root = a.push_binary(OpKind::Add, sel, carried);
+
+            assert_guard_forms(&a, root);
+
+            let point = compile(&a, root, POINT).expect("a guarded fold compiles");
+            for &(px, py) in &[(3.0f32, 4.0f32), (-3.0, 4.0), (40.5, -2.0), (-0.5, 0.0)] {
+                let arm = if px > 0.0 {
+                    (0..ARM_FOLD_TRIPS).map(|j| (px - j as f32).abs()).sum()
+                } else {
+                    0.0
+                };
+                let want = arm + (px - py);
+                let got = eval_point(&point.code, px, py);
+                assert_eq!(got, want, "at ({px}, {py})");
+            }
         }
 
         /// Both levels of a nested select are guarded once the schedule is

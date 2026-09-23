@@ -2196,7 +2196,8 @@ fn weighted_own<C: CostFunction>(costs: &C, node: &ENode, weight: u64) -> usize 
 ///
 /// This is the multiplier the fold's own [`CostModel::node_op_cost`] arm
 /// deliberately leaves out: a node's cost cannot see its children's, and this
-/// is the one place that number is in hand.
+/// is the one place that number is in hand. The two halves sum to
+/// [`CostModel::fold_cost`], the one formula for a fold's price.
 ///
 /// The trip count is *local to the fold node*, which is what makes it exact.
 /// A per-binder-slot table would not work: `PeelFold` rewrites
