@@ -7,7 +7,7 @@ use actor_scheduler::{
     Actor, ActorScheduler, ActorStatus, HandlerError, HandlerResult, Message, SystemStatus,
 };
 use core_term::ansi::commands::CsiCommand;
-use core_term::ansi::{AnsiCommand, AnsiParser, AnsiProcessor};
+use core_term::ansi::{AnsiCommand, AnsiParser, AnsiProcessor, AnsiSink};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -25,11 +25,27 @@ struct RealParserActor {
     bytes_processed: Arc<AtomicUsize>,
 }
 
+/// Reads a batch the way the app does, each text character recorded as the
+/// `Print` it stands for.
+struct Commands(Vec<AnsiCommand>);
+
+impl AnsiSink for Commands {
+    fn text(&mut self, run: &str) {
+        self.0.extend(run.chars().map(AnsiCommand::Print));
+    }
+
+    fn command(&mut self, command: AnsiCommand) {
+        self.0.push(command);
+    }
+}
+
 impl Actor<Vec<u8>, (), ()> for RealParserActor {
     fn handle_data(&mut self, data: Vec<u8>) -> HandlerResult {
         self.bytes_processed.fetch_add(data.len(), Ordering::SeqCst);
 
-        let commands = self.parser.process_bytes(&data);
+        let mut commands = Commands(Vec::new());
+        self.parser.process_bytes(&data).drain_into(&mut commands);
+        let Commands(commands) = commands;
         if !commands.is_empty() {
             self.cmd_tx.send(commands).ok();
         }

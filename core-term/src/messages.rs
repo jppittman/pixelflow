@@ -14,7 +14,7 @@
 //!  [Render] ← Proxy ← [Snapshot] ← Worker
 //! ```
 
-use crate::ansi::commands::AnsiCommand;
+use crate::ansi::AnsiBatch;
 use pixelflow_runtime::{EngineEvent, EngineEventData};
 
 /// Messages sent from proxy (engine thread) to worker (app thread).
@@ -133,8 +133,8 @@ pub struct RenderRequest {
 pub enum TerminalData {
     /// Data event from the engine (frame request).
     Engine(EngineEventData),
-    /// Data from the PTY (ANSI commands).
-    Pty(Vec<AnsiCommand>),
+    /// Data from the PTY (text runs and ANSI commands).
+    Pty(AnsiBatch),
     /// The PTY child process exited (EOF on the master FD).
     ChildExited,
 }

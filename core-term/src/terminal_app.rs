@@ -1,4 +1,4 @@
-use crate::ansi::commands::AnsiCommand;
+use crate::ansi::{AnsiBatch, AnsiCommand, AnsiSink};
 use crate::color::Color;
 use crate::config::Config;
 use crate::glyph::Glyph;
@@ -6,7 +6,7 @@ use crate::io::event_monitor_actor::{PtyWriterHandle, WriterControl};
 use crate::io::traits::PtySender;
 use crate::io::Resize;
 use crate::messages::TerminalData;
-use crate::term::TerminalEmulator;
+use crate::term::{EmulatorInput, TerminalEmulator};
 use actor_scheduler::{
     Actor, ActorBuilder, ActorHandle, ActorStatus, HandlerError, HandlerResult, Message,
     SystemStatus,
@@ -28,10 +28,23 @@ impl TerminalAppSender {
     }
 }
 
+/// Feeds a PTY batch to the emulator: text as runs, commands one at a time.
+struct EmulatorSink<'a>(&'a mut TerminalEmulator);
+
+impl AnsiSink for EmulatorSink<'_> {
+    fn text(&mut self, run: &str) {
+        self.0.print_text(run);
+    }
+
+    fn command(&mut self, command: AnsiCommand) {
+        self.0.interpret_input(EmulatorInput::Ansi(command));
+    }
+}
+
 impl PtySender for TerminalAppSender {
-    fn send(&self, cmds: Vec<AnsiCommand>) -> Result<(), anyhow::Error> {
+    fn send(&self, batch: AnsiBatch) -> Result<(), anyhow::Error> {
         self.handle
-            .send(Message::Data(TerminalData::Pty(cmds)))
+            .send(Message::Data(TerminalData::Pty(batch)))
             .map_err(|e| anyhow::anyhow!("Failed to send PTY data to app: {}", e))
     }
 
@@ -529,12 +542,8 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 // Engine is requesting a frame - build and send it
                 self.send_frame();
             }
-            TerminalData::Pty(commands) => {
-                use crate::term::EmulatorInput;
-                // Process incoming ANSI commands
-                for cmd in commands {
-                    self.emulator.interpret_input(EmulatorInput::Ansi(cmd));
-                }
+            TerminalData::Pty(mut batch) => {
+                batch.drain_into(&mut EmulatorSink(&mut self.emulator));
                 // We don't necessarily send a frame here anymore, relying on VSync (RequestFrame)
                 // or we could trigger a redraw if we want immediate feedback (but risk flooding)
                 // For now, let's just update state. The next RequestFrame will pick it up.
