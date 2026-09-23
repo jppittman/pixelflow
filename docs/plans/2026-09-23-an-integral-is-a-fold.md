@@ -2,9 +2,13 @@
 
 ## Metadata
 - **Author**: JP (direction), Claude (draft)
-- **Status**: `Draft`. The denotation was proposed 2026-09-23 and nothing is
-  built. §2's node shape was decided by JP the same day: an integral is a
-  fold whose domain is continuous, with no cell and no axis.
+- **Status**: `Built through step 6` (§8). The denotation was proposed
+  2026-09-23; §2's node shape was decided by JP the same day: an integral
+  is a fold whose domain is continuous, with no cell and no axis. Steps 1–6
+  are built — a glyph's coverage is now the exact area of each pixel under
+  ink, closed in the e-graph with no integral left to quadrature
+  ([results](../results/2026-09-23-glyph-is-a-formula.md)). The demand
+  track's D1, and §9's questions, are open.
 - **Created**: 2026-09-23
 - **Verified against**: `d2a42c9`. Every `file:line` below was re-read there,
   by two independent maps and three fact-checks.
@@ -676,6 +680,42 @@ Not on this list:
      (step 6, with critique 0's non-terminating split), the
      `surviving_intervals` telemetry field, and `glyph_is_closed`.
 6. **The glyph** (a-glyph-is-a-formula §6).
+   - **Built** as step 5 left it to be: `fonts/loop_blinn.rs` writes each
+     piece's term as `σ·area(χ).at(X, S·Y)` with `T` from
+     `monotone_root` (spliced from the one definition, not restated), every
+     step certified, and a glyph is one fold with one body over a table of
+     10 columns (22 before). Every segment goes through
+     `MonotoneQuad::split` — a line as the quadratic whose control is its
+     midpoint — and each arc is oriented so both coordinates rise
+     (`ρ`, `S`, `σ = ρ·S`); horizontal arcs are dropped; the body is cut to
+     the rows the arc's band reaches (`ROWS_LO/ROWS_HI`, screen `y`, dilated
+     by ½ and rounded outward). Coverage is `box ? snap(min(|F|, 1)) : 0`,
+     the snap `2⁻¹⁰`. The distance fold, the winding, the capsule, the
+     sliver and the deviation split went with it (1573 lines → 854).
+   - **Gate:** `pixelflow-graphics/tests/glyph_is_closed.rs` — every
+     printable glyph at 7, 16 and 32 px and `HELLO` at 16, at the atlas's
+     shape, optimizes, leaves `unclosed_integrals` at 0, and extracts no
+     `Recip`, `Rsqrt`, `Dwrt` or interval fold. The class cap does not
+     decide closure for a glyph: each of the seven saturations those 286
+     kernels are (six trip-count buckets, and `HELLO`'s five folds in one
+     graph) stops on the cap only after the closing phase has closed every
+     integral. `kernel_glyph_optimize` no longer falls back to the
+     unoptimized arena when the tier declines.
+   - **Measured** ([results](../results/2026-09-23-glyph-is-a-formula.md)):
+     against the exact area, max `E_max` 0.357 / 0.424 / 0.427 → 0.0009 /
+     0.0010 / 0.0010 and `Σ N₀.₁` 405 / 308 / 370 → 0 at 7 / 16 / 32 px, on
+     both ISA tiers; `loop_blinn_winding` 13/13 unmodified; FreeType's
+     texels-we-miss 3 → 2, orphans 0. A 32 px glyph's collapse is 13–34%
+     cheaper at AVX-512 and 31–39% at AVX2; `uncached_HELLO` 5× and the
+     atlas warm-up 4× faster. Every pin that moved is argued in `594ab82`.
+   - **Also:** the compound 2×2 was read transposed (`0df10f6`, found by
+     step 6's preparation review) — output-neutral for this font, pinned by
+     a quarter-turned component judged by the exact-area oracle.
+   - **Not built:** the per-piece row cut is not yet a jump — the guard
+     analysis owns its 109 entries but 21 others sit inside their run — so
+     a glyph pays every piece's closed form at every batch in its box. The
+     per-glyph box *is* guarded now: one fold, one select. The box tree
+     (a-glyph-is-a-formula §4.3–§4.4) and `surviving_intervals` remain.
 
 **The demand track** runs in parallel and does not gate the build order above:
 
