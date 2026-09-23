@@ -153,6 +153,38 @@ impl Default for KeybindingsConfig {
                     mods: Modifiers::CONTROL | Modifiers::SHIFT,
                     action: UserInputAction::RequestClipboardPaste,
                 },
+                // Zoom. X11 reports the shifted keysym and macOS the key, so
+                // each chord is listed in both forms (US layout).
+                Keybinding {
+                    key: KeySymbol::Char('+'),
+                    mods: Modifiers::CONTROL | Modifiers::SHIFT,
+                    action: UserInputAction::RequestZoomIn,
+                },
+                Keybinding {
+                    key: KeySymbol::Char('='),
+                    mods: Modifiers::CONTROL | Modifiers::SHIFT,
+                    action: UserInputAction::RequestZoomIn,
+                },
+                Keybinding {
+                    key: KeySymbol::Char('_'),
+                    mods: Modifiers::CONTROL | Modifiers::SHIFT,
+                    action: UserInputAction::RequestZoomOut,
+                },
+                Keybinding {
+                    key: KeySymbol::Char('-'),
+                    mods: Modifiers::CONTROL | Modifiers::SHIFT,
+                    action: UserInputAction::RequestZoomOut,
+                },
+                Keybinding {
+                    key: KeySymbol::Char(')'),
+                    mods: Modifiers::CONTROL | Modifiers::SHIFT,
+                    action: UserInputAction::RequestZoomReset,
+                },
+                Keybinding {
+                    key: KeySymbol::Char('0'),
+                    mods: Modifiers::CONTROL | Modifiers::SHIFT,
+                    action: UserInputAction::RequestZoomReset,
+                },
             ],
         };
         KeybindingsConfig::from(raw)

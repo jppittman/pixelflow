@@ -321,6 +321,17 @@ impl TerminalEmulator {
         })
     }
 
+    /// The cell under a point in the window, in logical points. The cell size
+    /// is the emulator's — zoom changes it — so hit-testing asks here.
+    #[must_use]
+    pub fn cell_at(&self, x_px: u32, y_px: u32) -> (usize, usize) {
+        let cell_px = |size: usize| u32::try_from(size.max(1)).unwrap_or(u32::MAX);
+        (
+            (x_px / cell_px(self.layout.cell_width_px)) as usize,
+            (y_px / cell_px(self.layout.cell_height_px)) as usize,
+        )
+    }
+
     // --- Scrollback Navigation Methods ---
 
     /// Scroll the viewport by the given number of lines.

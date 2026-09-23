@@ -695,8 +695,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 self.interpret_user_input(input);
             }
             EngineEventManagement::MouseClick { button, x, y } => {
-                let col = (x / self.config.appearance.cell_width_px as u32) as usize;
-                let row = (y / self.config.appearance.cell_height_px as u32) as usize;
+                let (col, row) = self.emulator.cell_at(x, y);
                 log::trace!(
                     "Mouse click: button={:?} at cell ({}, {})",
                     button,
@@ -717,8 +716,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 }
             }
             EngineEventManagement::MouseRelease { button, x, y } => {
-                let col = (x / self.config.appearance.cell_width_px as u32) as usize;
-                let row = (y / self.config.appearance.cell_height_px as u32) as usize;
+                let (col, row) = self.emulator.cell_at(x, y);
                 log::trace!(
                     "Mouse release: button={:?} at cell ({}, {})",
                     button,
@@ -739,8 +737,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 }
             }
             EngineEventManagement::MouseMove { x, y, mods: _ } => {
-                let col = (x / self.config.appearance.cell_width_px as u32) as usize;
-                let row = (y / self.config.appearance.cell_height_px as u32) as usize;
+                let (col, row) = self.emulator.cell_at(x, y);
                 log::trace!("Mouse move: cell ({}, {})", col, row);
                 // any-event mode (1003) reports all motion;
                 // button-event mode (1002) only reports motion while a button is held
@@ -787,8 +784,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 // When mouse tracking is active, report scroll as button press events
                 if self.emulator.is_mouse_tracking_active() && dy != 0.0 {
                     use pixelflow_runtime::input::MouseButton;
-                    let col = (x / self.config.appearance.cell_width_px as u32) as usize;
-                    let row = (y / self.config.appearance.cell_height_px as u32) as usize;
+                    let (col, row) = self.emulator.cell_at(x, y);
                     let button = if dy < 0.0 {
                         MouseButton::ScrollUp
                     } else {
@@ -1480,5 +1476,42 @@ mod tests {
         let mut probe = WriterProbe::default();
         drain_writer(&mut writer_rx, &mut probe);
         assert_eq!(probe.data, vec![b"\x1b[I".to_vec()]);
+    }
+
+    #[test]
+    fn the_zoom_binding_resizes_the_pty_and_the_next_frame_draws_at_the_new_size() {
+        use pixelflow_runtime::input::{KeySymbol, Modifiers};
+        let (mut app, mut writer_rx, _tx, mut engine) = create_test_app();
+        app.handle_control(EngineEventControl::Resized {
+            id: WindowId(0),
+            width_px: 800,
+            height_px: 480,
+        })
+        .expect("resize");
+
+        // As X11 reports Ctrl+Shift+=: the shifted keysym.
+        app.handle_management(EngineEventManagement::KeyDown {
+            key: KeySymbol::Char('+'),
+            mods: Modifiers::CONTROL | Modifiers::SHIFT,
+            text: None,
+        })
+        .expect("key down");
+
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        let [initial, zoomed] = probe.resizes.as_slice() else {
+            panic!(
+                "expected the window resize and the zoom, got {:?}",
+                probe.resizes
+            );
+        };
+        assert!(zoomed.cols < initial.cols && zoomed.rows < initial.rows);
+
+        // The cell buffer is sized to the zoomed grid; a program still
+        // compiled for the old one would panic binding it.
+        app.handle_data(request_frame()).expect("frame after zoom");
+        let mut engine_probe = EngineProbe::default();
+        drain_engine(&mut engine, &mut engine_probe);
+        assert!(!engine_probe.scenes.is_empty(), "a zoomed frame was drawn");
     }
 }

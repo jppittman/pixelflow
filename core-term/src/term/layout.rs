@@ -8,6 +8,21 @@
 
 use crate::config::CONFIG;
 
+/// How much one zoom step scales a cell.
+const ZOOM_STEP_FACTOR: f64 = 1.1;
+/// The smallest cell height zooming out will reach; below it glyphs are noise.
+const MIN_ZOOMED_CELL_HEIGHT_PX: usize = 6;
+/// The largest cell height zooming in will reach.
+const MAX_ZOOMED_CELL_HEIGHT_PX: usize = 128;
+
+/// A change to the zoom level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Zoom {
+    In,
+    Out,
+    Reset,
+}
+
 /// Manages the geometric layout of the terminal grid.
 ///
 /// The Layout is responsible for:
@@ -36,6 +51,15 @@ pub struct Layout {
 
     /// Vertical padding/border in pixels (future use)
     pub padding_y: u16,
+
+    /// The configured cell size, which zoom scales.
+    base_cell_px: (usize, usize),
+
+    /// Zoom steps from the configured size; positive is larger.
+    zoom_steps: i32,
+
+    /// The window's size in logical points, once one has been reported.
+    window_px: Option<(u16, u16)>,
 }
 
 impl Layout {
@@ -51,7 +75,56 @@ impl Layout {
             cell_height_px: CONFIG.appearance.cell_height_px,
             padding_x: 0, // No padding yet, but ready for future use
             padding_y: 0,
+            base_cell_px: (
+                CONFIG.appearance.cell_width_px,
+                CONFIG.appearance.cell_height_px,
+            ),
+            zoom_steps: 0,
+            window_px: None,
         }
+    }
+
+    /// Remembers the window's size, so a zoom can refit the grid to it.
+    pub fn set_window_px(&mut self, width_px: u16, height_px: u16) {
+        self.window_px = Some((width_px, height_px));
+    }
+
+    /// The window's size in logical points, once one has been reported.
+    #[must_use]
+    pub fn window_px(&self) -> Option<(u16, u16)> {
+        self.window_px
+    }
+
+    /// The grid that fits a window of the given size at the current cell size.
+    #[must_use]
+    pub fn grid_for_window(&self, width_px: u16, height_px: u16) -> (usize, usize) {
+        (
+            usize::from(width_px) / self.cell_width_px.max(1),
+            usize::from(height_px) / self.cell_height_px.max(1),
+        )
+    }
+
+    /// Applies a zoom change to the cell size. Returns whether the cell size
+    /// changed: a step past the size limits changes nothing.
+    pub fn zoom(&mut self, change: Zoom) -> bool {
+        let steps = match change {
+            Zoom::In => self.zoom_steps.saturating_add(1),
+            Zoom::Out => self.zoom_steps.saturating_sub(1),
+            Zoom::Reset => 0,
+        };
+        let scale = ZOOM_STEP_FACTOR.powi(steps);
+        let scaled = |base: usize| ((base as f64 * scale).round() as usize).max(1);
+        let (width, height) = (scaled(self.base_cell_px.0), scaled(self.base_cell_px.1));
+        let unchanged = (width, height) == (self.cell_width_px, self.cell_height_px);
+        let out_of_range =
+            !(MIN_ZOOMED_CELL_HEIGHT_PX..=MAX_ZOOMED_CELL_HEIGHT_PX).contains(&height);
+        if unchanged || (out_of_range && change != Zoom::Reset) {
+            return false;
+        }
+        self.zoom_steps = steps;
+        self.cell_width_px = width;
+        self.cell_height_px = height;
+        true
     }
 
     /// The core "unrender" function.
@@ -137,6 +210,7 @@ mod tests {
             cell_height_px: 20,
             padding_x: 0,
             padding_y: 0,
+            ..Layout::new(0, 0)
         };
 
         // Top-left cell
@@ -162,6 +236,7 @@ mod tests {
             cell_height_px: 20,
             padding_x: 5,
             padding_y: 10,
+            ..Layout::new(0, 0)
         };
 
         // Click in padding
@@ -184,6 +259,7 @@ mod tests {
             cell_height_px: 20,
             padding_x: 5,
             padding_y: 10,
+            ..Layout::new(0, 0)
         };
 
         // Both coordinates inside the padding is the easy case; each axis must also
@@ -212,6 +288,7 @@ mod tests {
             cell_height_px: 20,
             padding_x: 0,
             padding_y: 0,
+            ..Layout::new(0, 0)
         };
 
         // Beyond right edge (col 80 doesn't exist)
@@ -233,6 +310,7 @@ mod tests {
             cell_height_px: 20,
             padding_x: 0,
             padding_y: 0,
+            ..Layout::new(0, 0)
         };
 
         assert_eq!(layout.cells_to_pixels(0, 0), (0, 0));
@@ -250,6 +328,7 @@ mod tests {
             cell_height_px: 20,
             padding_x: 5,
             padding_y: 10,
+            ..Layout::new(0, 0)
         };
 
         // 80 * 10 + 5 * 2 = 810
