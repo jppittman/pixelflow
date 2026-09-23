@@ -140,7 +140,8 @@ pub fn latency_prior_cycles() -> OpMap<usize> {
         // carries neither; `node_op_cost`'s `ENode::Reduce` arm is where it is
         // priced. Zero here so a caller reaching this table for a fold adds
         // nothing rather than a wrong number. (It said "lowered (unrolled)
-        // before costing" while `ExpandReduce` ran first. It runs last now.)
+        // before costing" while `ExpandReduce` ran first. No production path
+        // runs it now: codegen emits a surviving fold as a loop.)
         OpKind::Reduce => 0,
         // A leaf like Buffer: its one broadcast load lands in the per-call
         // prologue, which the per-sample cost model does not see.
@@ -339,17 +340,19 @@ impl CostModel {
             // which is the one place that number exists. See
             // `extract.rs`'s `fold_body_multiple`.
             //
-            // This was `usize::MAX / 4`, the prohibitive sentinel `Dwrt`
-            // carries, on the reasoning that a surviving fold is unrolled
-            // afterwards past everything that could fold across the copies,
-            // so any decomposition in the e-class was strictly better. That
-            // held only while the legalizer ran *before* saturation. With it
-            // last (`pixelflow_search::runtime`), an unpriced fold is what
-            // forces the graph to unroll internally to escape the sentinel —
-            // four nodes reaching the 500-class cap through `PeelFold` — and,
+            // This was `usize::MAX / 4`, the prohibitive sentinel `Dwrt` also
+            // carried then (it costs its table entry now, above), on the
+            // reasoning that a surviving fold was unrolled afterwards past
+            // everything that could fold across the copies, so any
+            // decomposition in the e-class was strictly better. That held
+            // only while the legalizer ran *before* saturation. With it last
+            // (`pixelflow_search::runtime`), an unpriced fold is what forces
+            // the graph to unroll internally to escape the sentinel — four
+            // nodes reaching the 500-class cap through `PeelFold` — and,
             // because the sentinel saturates, a DP claim that no longer
             // equals the price of the term it names, which `extract.rs`'s
-            // claim/price audit catches outright.
+            // claim/price audit catches outright. Nothing unrolls a surviving
+            // fold afterwards now: codegen emits it as a loop.
             //
             // An unpriceable monoid keeps the sentinel: extraction must not
             // choose a fold whose combiner has no operation to emit.

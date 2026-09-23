@@ -2,9 +2,10 @@
 //!
 //! `collapse(extent)` wraps a kernel in the row/column/lane folds a
 //! collapse *is*; `pack(lanes)` strip-mines the column fold to a target's
-//! lane width. Both are arena-level transforms a caller runs directly — see
-//! [`super`]'s module doc for where they sit in the full pass order and why
-//! [`legalize`](super::legalize) does not call them yet.
+//! lane width. Both are arena-level transforms, and
+//! [`legalize`](super::legalize) runs them between `lower_dwrt` and
+//! `expand_gather` — see [`super`]'s module doc for why they sit there in the
+//! full pass order.
 //!
 //! ```text
 //! collapse(f) = fold_{j∈[0,h)} fold_{i∈[0,w)} fold_{l∈[0,1)}

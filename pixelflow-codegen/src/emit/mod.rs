@@ -2098,23 +2098,13 @@ fn emit_scope<B: IsaBackend>(
 
             // The result is read from the accumulator's slot — where this
             // scope's placement of the def says it is — so a carried
-            // accumulator lands there once, on the way out.
+            // accumulator lands there once, on the way out. A scope inside
+            // reads it there too: a `Reduce` is never a root (`stays_put`),
+            // so nothing hands it over or carries it.
             if let Some(a) = acc_reg
                 && accumulates
             {
                 backend.slot_store(&mut asm.code, a, acc_slot);
-            }
-
-            // A fold this scope parks for the scopes inside is a root like
-            // any other, handed over right here. They read it from the
-            // accumulator's slot, pinned for them as its park — unless the
-            // allocator carries it, and then the carry is loaded once, here,
-            // from the slot the loop just left it in.
-            if parked.contains_key(vid)
-                && let Some(inner) = allocation.within().next()
-                && let regalloc::Where::Reg(carry) = inner.at_head(*vid)
-            {
-                backend.slot_load(&mut asm.code, carry, acc_slot);
             }
             continue;
         }
@@ -2207,23 +2197,9 @@ fn emit_scope<B: IsaBackend>(
                 guard_slot,
             );
 
+            // Every reader finds the result in `guard_slot`: a `Guard` is
+            // never a root (`stays_put`), so nothing hands it over.
             asm.bind(join);
-
-            // A guard whose result some scope inside this one reads as a
-            // park, the same idea as a fold's accumulator a few lines above
-            // — though in practice `place_roots` never promotes one this way
-            // today (`schedule_variance`'s answer for a `Guard` is its
-            // mask's, and a mask reaching a fold's own closure at all is
-            // already inside that fold's own binder-dependent territory more
-            // often than not); kept for the same reason the fold case states
-            // its own explicitly, rather than relying on that never changing
-            // silently.
-            if parked.contains_key(vid)
-                && let Some(inner) = allocation.within().next()
-                && let regalloc::Where::Reg(carry) = inner.at_head(*vid)
-            {
-                backend.slot_load(&mut asm.code, carry, guard_slot);
-            }
             continue;
         }
 
@@ -3129,9 +3105,10 @@ fn extract_folds_bound_by(
         // A nested `Reduce` that depends on a binder bound here is followed
         // *into*: its body is not an operand (`regalloc::operands` says so —
         // the def's own emission never reads it), but it is this closure's
-        // to carry, so the recursion below can carve it out again one level
-        // down. One that does not is a placeholder (see the fn doc): its def
-        // is kept, nothing behind it is.
+        // to carry — `regalloc::structural_children`, which the walk below
+        // follows, yields it — so the recursion below can carve it out again
+        // one level down. One that does not is a placeholder (see the fn
+        // doc): its def is kept, nothing behind it is.
         let mut mark = alloc::vec![false; n];
         let mut placeholder_here = alloc::vec![false; n];
         let is_fold = |v: regalloc::ValueId| {
@@ -3155,14 +3132,10 @@ fn extract_folds_bound_by(
                 )
             });
             let op = &schedule[at].op;
-            let nested_body = match op {
-                ScheduledOp::Reduce(..) => {
-                    claimed[v.0 as usize] = true;
-                    None
-                }
-                _ => None,
-            };
-            for operand in regalloc::structural_children(op).chain(nested_body) {
+            if matches!(op, ScheduledOp::Reduce(..)) {
+                claimed[v.0 as usize] = true;
+            }
+            for operand in regalloc::structural_children(op) {
                 if mark[operand.0 as usize] {
                     continue;
                 }
@@ -3890,9 +3863,9 @@ fn compile_via_backend<B: IsaBackend>(
     let guard_map: alloc::collections::BTreeMap<regalloc::ValueId, u32> = (0..nest.guard_count())
         .map(|k| (nest.guard_reduce_vid(k), guard_slot(k)))
         .collect();
-    // Every root of every scope, parked above the fold and guard slots. A
-    // root that is a fold's own result is parked where the loop already
-    // leaves it — its accumulator slot — rather than copied. A value two
+    // Every root of every scope, parked above the fold and guard slots. No
+    // root is a fold's or a guard's own result — `stays_put` keeps both out
+    // of `roots` — so each one takes a park slot of its own. A value two
     // sibling scopes both compute (a row's main batches and its remainder
     // share their closures) is one root with one slot: the two never run at
     // once, and each writes it before its own scopes read it.
@@ -3903,18 +3876,23 @@ fn compile_via_backend<B: IsaBackend>(
         .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
     for scope in scopes {
         for &root in nest.scope(scope).roots() {
+            // Loud, because the other outcome is silent: `emit_scope`'s
+            // `Reduce` and `Guard` arms end their def before the hand-off, so
+            // a park for either would never be written and every scope
+            // inside would read whatever the slot held.
+            assert!(
+                !fold_map.contains_key(&root) && !guard_map.contains_key(&root),
+                "{root:?} is a fold's or a guard's result, which `stays_put` \
+                 keeps out of every scope's roots"
+            );
             if parks.contains_key(&root) {
                 continue;
             }
-            let slot = match fold_map.get(&root) {
-                Some(&acc) => acc,
-                None => park_base + parks.len() as u32 * vector_bytes,
-            };
+            let slot = park_base + parks.len() as u32 * vector_bytes;
             parks.insert(root, slot);
         }
     }
-    let park_slots = parks.values().filter(|&&slot| slot >= park_base).count() as u32;
-    let total = park_base + park_slots * vector_bytes;
+    let total = park_base + parks.len() as u32 * vector_bytes;
 
     let (body, _, _, spill_count) = emit_scope(
         body_alloc,
@@ -4565,7 +4543,9 @@ mod tests {
     ///
     /// The `Reduce` arm ends its def early, past the hand-off, so a carried
     /// fold result used to reach the scopes inside in a register nothing had
-    /// loaded. `X + Σ_{i<3} 2i = X + 6`.
+    /// loaded. A fold result is never a root now (`stays_put`), so nothing
+    /// carries one: the scopes inside read it from its accumulator slot.
+    /// `X + Σ_{i<3} 2i = X + 6`.
     #[test]
     fn a_lattice_invariant_fold_is_the_bodys_own() {
         use pixelflow_ir::fold::{Binder, Fold, Monoid};

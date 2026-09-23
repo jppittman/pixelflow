@@ -41,7 +41,7 @@ pub mod kind;
 pub mod traits;
 pub mod variance;
 
-pub use variance::{LatticeShape, Variance, compute_dag_variance};
+pub use variance::{LatticeShape, Variance};
 
 pub mod arena;
 

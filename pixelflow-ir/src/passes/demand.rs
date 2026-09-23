@@ -136,9 +136,13 @@ type Clause<K> = BTreeSet<Literal<K>>;
 /// The condition under which a value is observed, in disjunctive normal
 /// form: a disjunction of conjunctions.
 ///
-/// Kept canonical — the clause set is subsumption-reduced, so no clause is
-/// a superset of another — which makes equal predicates structurally equal
-/// and lets `Ord` group a schedule by demand.
+/// Kept subsumption-reduced — no clause is a superset of another — and `==`
+/// compares those reduced forms. They are not canonical: `m ∨ ¬m` is true
+/// but is not [`Demand::always`], since only consensus would see it (a test
+/// below pins that), so two equal predicates can compare unequal. Not `Ord`:
+/// nothing orders a `Demand`, and the one use an order had, a schedule
+/// sorted by demand, is refuted in the module doc's "The sort this does not
+/// give you".
 ///
 /// `pub`: this is [`demand_of`]'s return value's value type, and every
 /// caller of `demand_of` — in this crate or across the boundary in
@@ -146,7 +150,7 @@ type Clause<K> = BTreeSet<Literal<K>>;
 /// fields stay private; the algebra below (`is_never`, `implies`,
 /// `and_literal`, …) is the whole interface, so a caller cannot build one
 /// that violates the subsumption-reduced invariant.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Demand<K> {
     /// The disjunction. Empty means *never*; containing the empty clause
     /// means *always*.

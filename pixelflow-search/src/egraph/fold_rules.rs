@@ -18,11 +18,12 @@
 //! count, and [`Fold::halve`] declines on an odd count — `PeelFold` is that
 //! remainder's epilogue, run once per odd level the recursion hits (`log n`
 //! of them at most), not a fallback that reverts to unrolling one term at a
-//! time. `passes::expand_reduce` — the legalizer that runs when a fold
-//! survives extraction, because codegen has no iteration binder — prefers the
-//! same decomposition, through the same two [`Fold`] methods, so a fold that
-//! survives saturation unrolls into the identical shape one that didn't have
-//! to would have reached inside the graph.
+//! time. `passes::expand_reduce` prefers the same decomposition, through the
+//! same two [`Fold`] methods, so a surviving fold it unrolls takes the
+//! identical shape saturation would have reached inside the graph. It is on
+//! no production path: codegen emits a fold that survives extraction as a
+//! loop (`pixelflow_ir::passes::legalize`), and `expand_reduce` unrolls one
+//! only for a caller that asks.
 //!
 //! ## Substituting under a binder, in an e-graph
 //!

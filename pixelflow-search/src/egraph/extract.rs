@@ -938,11 +938,11 @@ pub fn extract<C: CostFunction>(
                             let op_cost = costs.node_cost(node, None);
                             // Saturating fold, not `.sum()`: a child's own
                             // `best_cost` can already sit at a prohibitive
-                            // sentinel (`Dwrt`'s `usize::MAX / 4` from
-                            // `CostModel::node_op_cost`, or this function's
-                            // own `CYCLE_COST`), so a node with several such
-                            // children overflows a plain `usize` sum. A real
-                            // `Dwrt`-bearing e-graph reaches that here.
+                            // sentinel (the `usize::MAX / 4`
+                            // `CostModel::node_op_cost` gives a fold whose
+                            // monoid has no combiner, or this function's own
+                            // `CYCLE_COST`), so a node with several such
+                            // children overflows a plain `usize` sum.
                             let per_child = fold_body_multiple(node);
                             let children_cost: usize = children
                                 .iter()
@@ -1791,10 +1791,11 @@ pub struct ChoiceCost {
 ///
 /// Weighting matches [`extract_dag_scoped`]: a node's op cost is multiplied
 /// by [`LatticeShape::evals`] of the variance of the *chosen* form below it,
-/// so a Z-only subexpression is priced once per frame and an X-dependent one
-/// once per sample. Leaves are free ([`CostModel::node_op_cost`]), so under
-/// [`LatticeShape::POINT`] `ChoiceCost::dag` equals the latency-prior cost of
-/// the arena `choices_to_arena` builds from the same map.
+/// so a subexpression that depends on nothing is priced once per call and an
+/// X-dependent one once per sample. Leaves are free
+/// ([`CostModel::node_op_cost`]), so under [`LatticeShape::POINT`]
+/// `ChoiceCost::dag` equals the latency-prior cost of the arena
+/// `choices_to_arena` builds from the same map.
 ///
 /// # Panics
 ///
@@ -1869,9 +1870,10 @@ pub fn cost_of_choices<C: CostFunction>(
         let node = chosen(canonical);
         let node_var = node_variance(egraph, node, &var, canonical);
         let weight = shape.evals(node_var);
-        // Saturating throughout: `Dwrt` is priced `usize::MAX / 4` and a tree
-        // cost is exponential in the sharing it refuses to price, so both
-        // sums reach the ceiling on real inputs.
+        // Saturating throughout: a tree cost is exponential in the sharing it
+        // refuses to price, so it reaches the ceiling on real inputs, and a
+        // fold whose monoid has no combiner is priced `usize::MAX / 4`
+        // (`CostModel::node_op_cost`).
         let own = usize::try_from((costs.node_cost(node, None) as u64).saturating_mul(weight))
             .unwrap_or(usize::MAX);
         // A fold evaluates its body once per index — see `fold_body_multiple`.
@@ -1905,16 +1907,19 @@ pub fn extract_dag<C: CostFunction>(egraph: &EGraph, root: EClassId, costs: &C) 
 ///
 /// The cost of a program is not the cost of its text but of its execution:
 /// a node's op cost is multiplied by [`LatticeShape::evals`] of the variance
-/// of the form chosen for it, so a subexpression that depends only on Z is
-/// priced once per frame while one that touches X is priced once per sample.
-/// Every extent is known at compile time, so this is the exact instruction
-/// count of the unrolled program rather than an ordinal preference.
+/// of the form chosen for it, so a subexpression that depends on nothing (a
+/// uniform's arithmetic) is priced once per call, one that depends only on Y
+/// once per row, and one that touches X once per sample. Every extent is
+/// known at compile time, so the weight is a count rather than an ordinal
+/// preference — except inside a surviving fold, where `evals` prices a node
+/// that reads the binder as per-sample and without the fold's trip count.
 ///
 /// That single change is what makes extraction the thing that *decides* the
-/// factorization: given `(X + Z) + Z` and its reassociation `X + (Z + Z)`,
-/// both two adds, the second leaves one of them outside the pixel loop and
-/// is therefore cheaper by a factor of the frame — which loop-invariant code
-/// motion after the fact can only discover, never choose between.
+/// factorization: given `(X + u) + u` for a uniform `u`, and its
+/// reassociation `X + (u + u)`, both two adds, the second leaves one of them
+/// outside the pixel loop and is therefore cheaper by a factor of the frame —
+/// which loop-invariant code motion after the fact can only discover, never
+/// choose between.
 ///
 /// [`LatticeShape::POINT`] weights everything by one, so `extract_dag`'s
 /// behavior is unchanged.
@@ -2192,11 +2197,12 @@ fn weighted_own<C: CostFunction>(costs: &C, node: &ENode, weight: u64) -> usize 
 /// **How many times `node`'s children are evaluated per evaluation of `node`.**
 ///
 /// One, for everything except a fold: `⊕_{[lo,hi)} f` evaluates `f` once per
-/// index, and **codegen has no iteration binder**, so `ExpandReduce` emits
-/// exactly that many copies of the body. Pricing the body once would tell the
-/// extractor a 34-piece fold costs what one piece costs, which is how an
-/// unpriced fold turns the loop unroller off — it would keep every fold,
-/// unconditionally, because folding would always look free.
+/// index, and codegen emits a surviving fold as a loop that runs its body
+/// exactly that many times (`pixelflow_ir::passes::legalize`). Pricing the
+/// body once would tell the extractor a 34-piece fold costs what one piece
+/// costs, which is how an unpriced fold turns the e-graph's unrolling
+/// (`PeelFold`, `HalveFold`) off — it would keep every fold, unconditionally,
+/// because folding would always look free.
 ///
 /// This is the multiplier the fold's own [`CostModel::node_op_cost`] arm
 /// deliberately leaves out: a node's cost cannot see its children's, and this
@@ -2618,9 +2624,10 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for TreePricer<'_,
             | ENode::Uniform(_)
             | ENode::Param(_) => own,
             // Saturating fold, not `.sum()`: a child's own cost can already
-            // sit at a prohibitive sentinel (`Dwrt`'s `usize::MAX / 4` from
-            // `CostModel::node_op_cost`), so a node with several such
-            // children overflows a plain `usize` sum.
+            // sit at a prohibitive sentinel (the `usize::MAX / 4`
+            // `CostModel::node_op_cost` gives a fold whose monoid has no
+            // combiner), so a node with several such children overflows a
+            // plain `usize` sum.
             ENode::Op { .. } | ENode::Reduce { .. } => {
                 let per_child = fold_body_multiple(node);
                 own.saturating_add(
