@@ -6,7 +6,7 @@ use crate::io::event_monitor_actor::{PtyWriterHandle, WriterControl};
 use crate::io::traits::PtySender;
 use crate::io::Resize;
 use crate::messages::TerminalData;
-use crate::term::{EmulatorAction, EmulatorInput, TerminalEmulator};
+use crate::term::{EmulatorAction, EmulatorInput, TerminalEmulator, UserInputAction};
 use actor_scheduler::{
     Actor, ActorBuilder, ActorHandle, ActorStatus, HandlerError, HandlerResult, Message,
     SystemStatus,
@@ -222,6 +222,13 @@ impl TerminalApp {
     fn write_pty(&self, bytes: Vec<u8>) {
         if let Err(e) = self.pty_writer.send(Message::Data(bytes)) {
             log::warn!("Failed to send input to PTY writer: {}", e);
+        }
+    }
+
+    /// Hands a user action to the emulator and carries out what it asks for.
+    fn interpret_user_input(&mut self, input: UserInputAction) {
+        if let Some(action) = self.emulator.interpret_input(EmulatorInput::User(input)) {
+            self.perform(action);
         }
     }
 
@@ -677,17 +684,15 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
     fn handle_management(&mut self, mgmt: EngineEventManagement) -> HandlerResult {
         match mgmt {
             EngineEventManagement::KeyDown { key, mods, text } => {
-                use crate::term::{EmulatorInput, UserInputAction};
-
-                let input = EmulatorInput::User(UserInputAction::KeyInput {
-                    symbol: key,
-                    modifiers: mods,
-                    text: text.map(std::borrow::Cow::Owned),
-                });
-
-                if let Some(action) = self.emulator.interpret_input(input) {
-                    self.perform(action);
-                }
+                // A bound chord is the terminal's own command; anything else
+                // is typing for the program.
+                let input = crate::keys::map_key_event_to_action(key, mods, &self.config)
+                    .unwrap_or(UserInputAction::KeyInput {
+                        symbol: key,
+                        modifiers: mods,
+                        text: text.map(std::borrow::Cow::Owned),
+                    });
+                self.interpret_user_input(input);
             }
             EngineEventManagement::MouseClick { button, x, y } => {
                 let col = (x / self.config.appearance.cell_width_px as u32) as usize;
@@ -811,19 +816,13 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 }
             }
             EngineEventManagement::FocusGained => {
-                log::trace!("Focus gained");
-                // Some applications care about focus for bracketed paste mode
-                // Could send \x1b[I if bracketed paste is enabled
+                self.interpret_user_input(UserInputAction::FocusGained);
             }
             EngineEventManagement::FocusLost => {
-                log::trace!("Focus lost");
-                // Some applications care about focus for bracketed paste mode
-                // Could send \x1b[O if bracketed paste is enabled
+                self.interpret_user_input(UserInputAction::FocusLost);
             }
             EngineEventManagement::Paste(text) => {
-                log::trace!("Paste: {} bytes", text.len());
-                // Send pasted text to PTY
-                self.write_pty(text.into_bytes());
+                self.interpret_user_input(UserInputAction::PasteText(text));
             }
         }
         Ok(())
@@ -1432,5 +1431,54 @@ mod tests {
             probe.requests.as_slice(),
             [pixelflow_runtime::api::public::AppManagement::SetTitle(title)] if title == "build: ok"
         ));
+    }
+
+    #[test]
+    fn the_paste_binding_asks_the_engine_for_the_clipboard() {
+        use pixelflow_runtime::input::{KeySymbol, Modifiers};
+        let (mut app, _writer_rx, _tx, mut engine) = create_test_app();
+
+        // As X11 reports Ctrl+Shift+V: the control character it types.
+        app.handle_management(EngineEventManagement::KeyDown {
+            key: KeySymbol::Char('\u{16}'),
+            mods: Modifiers::CONTROL | Modifiers::SHIFT,
+            text: Some("\u{16}".to_string()),
+        })
+        .expect("key down");
+
+        let mut probe = EngineProbe::default();
+        drain_engine(&mut engine, &mut probe);
+        assert!(matches!(
+            probe.requests.as_slice(),
+            [pixelflow_runtime::api::public::AppManagement::RequestPaste]
+        ));
+    }
+
+    #[test]
+    fn pasted_text_reaches_the_shell_bracketed_when_it_asked() {
+        let (mut app, mut writer_rx, _tx, _engine) = create_test_app();
+
+        app.handle_data(pty(b"\x1b[?2004h")).expect("pty data");
+        app.handle_management(EngineEventManagement::Paste("ls\n".to_string()))
+            .expect("paste");
+
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert_eq!(probe.data, vec![b"\x1b[200~ls\n\x1b[201~".to_vec()]);
+    }
+
+    #[test]
+    fn focus_changes_reach_the_shell_once_it_asks_for_them() {
+        let (mut app, mut writer_rx, _tx, _engine) = create_test_app();
+
+        app.handle_management(EngineEventManagement::FocusLost)
+            .expect("focus lost");
+        app.handle_data(pty(b"\x1b[?1004h")).expect("pty data");
+        app.handle_management(EngineEventManagement::FocusGained)
+            .expect("focus gained");
+
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert_eq!(probe.data, vec![b"\x1b[I".to_vec()]);
     }
 }

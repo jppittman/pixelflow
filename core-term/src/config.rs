@@ -121,7 +121,7 @@ impl From<RawKeybindingsConfig> for KeybindingsConfig {
         for binding in &raw.bindings {
             // First match wins, so we use entry(...).or_insert(...) to only insert if not present
             lookup
-                .entry((binding.key, binding.mods))
+                .entry(crate::keys::chord(binding.key, binding.mods))
                 .or_insert_with(|| binding.action.clone());
         }
         KeybindingsConfig {
@@ -144,12 +144,12 @@ impl Default for KeybindingsConfig {
         let raw = RawKeybindingsConfig {
             bindings: vec![
                 Keybinding {
-                    key: KeySymbol::Char('\u{3}'),
+                    key: KeySymbol::Char('c'),
                     mods: Modifiers::CONTROL | Modifiers::SHIFT,
                     action: UserInputAction::InitiateCopy,
                 },
                 Keybinding {
-                    key: KeySymbol::Char('\u{16}'),
+                    key: KeySymbol::Char('v'),
                     mods: Modifiers::CONTROL | Modifiers::SHIFT,
                     action: UserInputAction::RequestClipboardPaste,
                 },

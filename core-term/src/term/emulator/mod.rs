@@ -330,14 +330,16 @@ impl TerminalEmulator {
         let old_offset = self.viewport_offset;
         let max_offset = self.screen.scrollback.len();
 
-        if lines > 0 {
+        let distance = lines.unsigned_abs() as usize;
+        self.viewport_offset = match lines > 0 {
             // Scroll up into history
-            self.viewport_offset = (self.viewport_offset + lines as usize).min(max_offset);
-        } else if lines < 0 {
+            true => self
+                .viewport_offset
+                .saturating_add(distance)
+                .min(max_offset),
             // Scroll down toward live screen
-            let abs_lines = (-lines) as usize;
-            self.viewport_offset = self.viewport_offset.saturating_sub(abs_lines);
-        }
+            false => self.viewport_offset.saturating_sub(distance),
+        };
 
         // Mark all lines dirty if viewport changed
         if self.viewport_offset != old_offset {
@@ -450,22 +452,5 @@ impl TerminalEmulator {
     #[must_use]
     pub fn reports_button_motion(&self) -> bool {
         self.dec_modes.mouse_button_event_mode || self.dec_modes.mouse_any_event_mode
-    }
-
-    pub fn paste_text(&mut self, text: String) {
-        if self.dec_modes.bracketed_paste_mode {
-            log::warn!("TerminalEmulator::paste_text called with bracketed paste mode ON. This mode should be handled by the caller (input_handler) by wrapping the text and sending it as WritePty. Processing char by char as fallback.");
-            for ch in text.chars() {
-                self.print_char(ch);
-            }
-        } else {
-            log::debug!(
-                "TerminalEmulator::paste_text - Bracketed Paste Mode OFF. Processing {} chars.",
-                text.len()
-            );
-            for ch in text.chars() {
-                self.print_char(ch);
-            }
-        }
     }
 }
