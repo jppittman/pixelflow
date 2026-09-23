@@ -319,32 +319,21 @@ impl<'a> Font<'a> {
         self.cmap.lookup(ch as u32)
     }
 
-    /// The glyph for `ch` in font units, as a [`Glyph`]: a coverage
-    /// `Kernel` whose winding sum reads a piece table at a
-    /// `Kernel::sum_over` binder — the table travels with the kernel itself
-    /// (`Kernel::with_buffer_data`), so baking or collapsing it needs no
-    /// separate bind; antialiasing resolves from `Dwrt` at bake.
-    #[must_use]
-    pub fn glyph_kernel(&self, ch: char) -> Option<Glyph> {
-        self.glyph_kernel_by_id(self.cmap.lookup(ch as u32)?)
-    }
-
-    /// [`Font::glyph_kernel`] by pre-looked-up glyph ID.
-    ///
-    /// Built in font units, so its antialiasing ramp is one *font unit* wide
-    /// and its support is bounded at one font unit past the outline. For a
-    /// ramp that is one screen pixel wide, scale the outline before the
-    /// kernel exists — [`Font::glyph_scaled_by_id`] — rather than the kernel
-    /// after.
-    #[must_use]
-    pub fn glyph_kernel_by_id(&self, id: u16) -> Option<Glyph> {
-        Some(loop_blinn::glyph(&self.outline_by_id(id)?))
-    }
-
     /// The `size`-scaled glyph for `ch` as a [`Glyph`]: the ascent line sits
     /// at screen y=0 (top) and the descent at y=`size`, with screen Y
-    /// increasing downward. See [`Font::glyph_kernel`] for the binding this
-    /// carries alongside the kernel.
+    /// increasing downward.
+    ///
+    /// Its coverage `Kernel` reads a piece table at a `Kernel::sum_over`
+    /// binder, and the table travels with the kernel itself
+    /// (`Kernel::with_buffer_data`), so baking or collapsing it needs no
+    /// separate bind.
+    ///
+    /// **Only in the frame it is drawn in.** The outline is scaled before
+    /// the kernel exists, not the kernel after. A glyph built in font units
+    /// would bound its support one *font unit* past the outline and ramp its
+    /// antialiasing over one font unit, so there is deliberately no such
+    /// glyph. Callers that want the geometry in font units take
+    /// [`Font::outline_by_id`].
     #[must_use]
     pub fn glyph_kernel_scaled(&self, ch: char, size: f32) -> Option<Glyph> {
         let id = self.cmap.lookup(ch as u32)?;

@@ -45,7 +45,7 @@ fn all_printable_ascii_glyphs_exist() {
     let font = Font::parse(FONT_BYTES).expect("Failed to parse font");
 
     for ch in ' '..='~' {
-        let glyph = font.glyph_kernel(ch);
+        let glyph = font.glyph_kernel_scaled(ch, 16.0);
         assert!(
             glyph.is_some(),
             "Printable ASCII character '{}' (0x{:02X}) should exist",
