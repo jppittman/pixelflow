@@ -2846,7 +2846,8 @@ fn scope_schedule(
     // unless it buys a branch. Before `attach_folds`, because it is a
     // permutation and a fold's position is a fact about its parent's final
     // order.
-    let body = guards::cluster_select_arms(body);
+    let reads = pending_reads(&body, &pending);
+    let body = guards::cluster_select_arms(body, &reads);
     let pending = pending.into_iter().map(cluster_pending).collect();
     let mut scoped = regalloc::ScopedSchedule {
         body: regalloc::ScopeRegion {
@@ -2868,11 +2869,22 @@ fn scope_schedule(
 /// [`guards::cluster_select_arms`] over a pending fold's schedule and, one
 /// level down, each of its children's.
 fn cluster_pending(fold: PendingFold) -> PendingFold {
+    let reads = pending_reads(&fold.schedule, &fold.children);
     PendingFold {
         reduce_vid: fold.reduce_vid,
-        schedule: guards::cluster_select_arms(fold.schedule),
+        schedule: guards::cluster_select_arms(fold.schedule, &reads),
         children: fold.children.into_iter().map(cluster_pending).collect(),
     }
+}
+
+/// What each of `folds`, opened in `scope`, reads from it.
+fn pending_reads(scope: &[regalloc::Def], folds: &[PendingFold]) -> guards::FoldReads {
+    guards::FoldReads::new(
+        scope,
+        folds
+            .iter()
+            .map(|fold| (fold.reduce_vid, fold.schedule.as_slice())),
+    )
 }
 
 /// Whether a def is one the placement never parks: a leaf that is cheaper
@@ -5746,10 +5758,10 @@ mod tests {
             let scopes = core::iter::once(regalloc::Scope::Body)
                 .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
             scopes.map(|s| nest.scope(s)).find_map(|view| {
-                analyze_select_guards(view.schedule(), view.roots())
-                    .into_iter()
+                view.select_guards()
+                    .iter()
                     .find(|g| g.has_guarded_arm())
-                    .map(|g| (view, g))
+                    .map(|g| (view, g.clone()))
             })
         }
 
@@ -5834,12 +5846,14 @@ mod tests {
         /// position, for a schedule built the way `compile` builds it.
         fn guarded_entries(a: &ExprArena, root: ExprId, cluster: bool) -> alloc::vec::Vec<usize> {
             let schedule = native_schedule(a, root, POINT);
+            // Flat, not scoped: no fold is carved out, so none reads anything.
+            let folds = guards::FoldReads::default();
             let schedule = if cluster {
-                guards::cluster_select_arms(schedule)
+                guards::cluster_select_arms(schedule, &folds)
             } else {
                 schedule
             };
-            analyze_select_guards(&schedule, &[])
+            analyze_select_guards(&schedule, &[], &folds)
                 .iter()
                 .map(|g| g.total_guarded_entries())
                 .collect()
@@ -6073,11 +6087,11 @@ mod tests {
                 .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
             let (scope, guard) = scopes
                 .find_map(|s| {
-                    let view = nest.scope(s);
-                    analyze_select_guards(view.schedule(), view.roots())
-                        .into_iter()
+                    nest.scope(s)
+                        .select_guards()
+                        .iter()
                         .find(|g| g.is_guarded(SelectArm::True))
-                        .map(|g| (s, g))
+                        .map(|g| (s, g.clone()))
                 })
                 .expect("the true arm is exclusive and contiguous, so it is guarded");
 

@@ -12,7 +12,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::guards::{SelectArm, SelectGuard, analyze_select_guards};
+use super::guards::{FoldReads, SelectArm, SelectGuard, analyze_select_guards};
 use super::{Gpr, KReg, OperandSource, Reg, ScheduledOp, operand_sources, reloads_wanted};
 
 /// A value in the program (SSA-style).
@@ -2003,7 +2003,39 @@ impl RegisterAllocator for LinearScan {
             own
         };
 
-        let body_scan = self.scan(nest.body.schedule, file, &BTreeMap::new(), &nest.body.roots);
+        // Every scope's `Select` guards, before any scan: what an arm may own
+        // depends on what the loops the scope opens read from it
+        // (`FoldReads`), which takes those loops' schedules — and the loop
+        // below reaches a fold only after the scope it opens in.
+        let guards_in = |scope: Scope, schedule: &[Def], roots: &[ValueId]| {
+            let reads = FoldReads::new(
+                schedule,
+                nest.folds
+                    .iter()
+                    .filter(|fold| fold.parent == scope)
+                    .map(|fold| (schedule[fold.at].value, fold.schedule.as_slice())),
+            );
+            analyze_select_guards(schedule, roots, &reads)
+        };
+        let mut guards: Vec<Vec<SelectGuard>> = core::iter::once(guards_in(
+            Scope::Body,
+            &nest.body.schedule,
+            &nest.body.roots,
+        ))
+        .chain(
+            nest.folds
+                .iter()
+                .enumerate()
+                .map(|(j, fold)| guards_in(Scope::Fold(j), &fold.schedule, &fold.roots)),
+        )
+        .collect();
+
+        let body_scan = self.scan(
+            nest.body.schedule,
+            file,
+            &BTreeMap::new(),
+            core::mem::take(&mut guards[scope_ix(Scope::Body)]),
+        );
         let mut body_parked: BTreeMap<ValueId, Where> = BTreeMap::new();
         let body_carries = park_roots(
             &body_scan,
@@ -2126,7 +2158,7 @@ impl RegisterAllocator for LinearScan {
                 fold.schedule,
                 &file.inside(carried_in),
                 &fold_parked,
-                &fold.roots,
+                core::mem::take(&mut guards[scope_ix(Scope::Fold(index))]),
             );
             // This fold's own roots, for the folds inside it: carried from
             // what its own code leaves free, or parked.
@@ -2195,7 +2227,10 @@ impl RegisterAllocator for LinearScan {
             taken_at_def.extend(parent_scratch.guard_temp);
             taken_at_def.extend(parent_scratch.result);
             let inside = file.inside(carried_into_parent.union(RegSet::of(&taken_at_def)));
-            let scan = self.scan(arm.schedule, &inside, &BTreeMap::new(), &[]);
+            // An arm parks nothing and opens no fold: its schedule is a
+            // separate arena's, which `extract_guards` carves nothing out of.
+            let arm_guards = analyze_select_guards(&arm.schedule, &[], &FoldReads::default());
+            let scan = self.scan(arm.schedule, &inside, &BTreeMap::new(), arm_guards);
             guard_arms.push(GuardArmScope {
                 parent: arm.parent,
                 at: arm.at,
@@ -2713,15 +2748,17 @@ impl LinearScan {
     /// whole of this one — the answer this scan must read rather than choose,
     /// because that scope already chose it.
     ///
-    /// `roots` are the values this scope computes for the scopes inside it:
-    /// read outside this schedule, so no `Select` arm may own one (a skipped
-    /// arm would leave the park unwritten for a loop that runs regardless).
+    /// `guards` are this schedule's `Select` guards: [`analyze_select_guards`]
+    /// over it, told what the scopes inside it read — its roots, which no arm
+    /// may own (a skipped arm would leave the park unwritten for a loop that
+    /// runs regardless), and what each loop it opens reads, which no arm may
+    /// own unless the loop is skipped with it.
     fn scan(
         &self,
         dag: Vec<Def>,
         file: &RegisterFile,
         live_in: &BTreeMap<ValueId, Where>,
-        roots: &[ValueId],
+        guards: Vec<SelectGuard>,
     ) -> Scan {
         let vec_len = dag
             .iter()
@@ -2735,7 +2772,7 @@ impl LinearScan {
                 schedule: dag,
                 ranges: Vec::new(),
                 scratch: scratch_for,
-                guards: Vec::new(),
+                guards,
             };
         }
 
@@ -2745,7 +2782,6 @@ impl LinearScan {
         // skipped path never ran the load. Eviction inside an arm needs no such
         // rule — the value's slot was written at its definition, which every
         // path reaching any of its readers ran.
-        let guards = analyze_select_guards(&dag, roots);
         let arms = guarded_arms(&guards, dag.len());
         let sites = guard_sites(&guards, dag.len());
 
@@ -3232,7 +3268,9 @@ pub fn no_temps(_op: &ScheduledOp) -> u8 {
 /// body out into its own `ScopeFold`; the `ValueId` `ScheduledOp::Reduce`
 /// still carries is `schedule_variance`'s and `extract_folds`'s own concern
 /// (they run before extraction, and after respectively, over different
-/// schedules), never an operand this scope's allocation resolves. A `Seq`
+/// schedules), never an operand this scope's allocation resolves. What the
+/// loop it opens reads from this scope is a dependency all the same, and the
+/// guard analysis has it as one: [`FoldReads`]. A `Seq`
 /// sequences two effects and reads no register; a `Write` reads the one
 /// value it stores — its row and column are binders, found where their
 /// folds keep them, not operands.
@@ -4704,7 +4742,7 @@ mod tests {
     /// reserve" — the failure this test turns into a named assertion.
     fn assert_reservations_match_residency(a: &Allocation<'_>, file: &RegisterFile) {
         let schedule = a.schedule();
-        let sites = guard_sites(&analyze_select_guards(schedule, a.roots()), schedule.len());
+        let sites = guard_sites(a.select_guards(), schedule.len());
         for (i, d) in schedule.iter().enumerate() {
             if matches!(d.op, ScheduledOp::Reduce(..)) {
                 continue; // Its own trip test reserves through the guard gate.
