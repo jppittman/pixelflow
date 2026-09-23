@@ -45,6 +45,10 @@
 >
 > *"Integrals must be definite, over constant ranges."*
 >
+> *"Per pixel accounting sounds wrong. What we want is an e-graph that can
+> factor an integral. This should be using demand. Same with the variable
+> hoisting."*
+>
 > *"What does FreeType have that we don't? How can we not be better?
 > Everything is 100% vectorized. We run multi-threaded on the ALU. We can
 > do branch-free if we want (the integral will likely be) and we won't have
@@ -235,20 +239,26 @@ warped, and that is the difference between "the area of the warped shape"
 and "the area of the pixel under the warped shape". Both are sayable; the
 glyph wants the second.
 
-Like `Dwrt`, `Area` is kept through `Kernel::at` and lowered after
-composition (CLAUDE.md, "The macro tier does not resolve `Dwrt`"): the
-e-graph declines to tear it, and the runtime tier lowers it at bake time
-by these rules, in order of strength:
+`Area` is an operator of the language, and its algebra lives where the
+language's algebra lives: in the e-graph, as rewrite rules, exactly as
+`Dwrt` does (`pixelflow-search/src/egraph/derivative.rs`: one chain-rule
+rewrite, a prohibitive price so the extractor never keeps a `Dwrt`, and
+`LowerDwrt` for what the rules did not reach). Like `Dwrt` it is kept
+through `Kernel::at` and reaches the e-graph after composition (CLAUDE.md,
+"The macro tier does not resolve `Dwrt`"). The e-graph **factors the
+integral**; `area` is not lowered by a pass that pattern-matches shapes.
+The rules, each an identity of the integral:
 
-- **Invariance.** An integrand constant along the form's coordinates
-  integrates to itself times the range's measure, which for the unit pixel
-  along lattice axes is `1`: `area[dX ∧ dY](k) = k` when `k` does not
-  depend on `X` or `Y`. A glyph's per-piece coefficients are this: read
-  once, not integrated.
-- **Linearity.** `area[ω](Σ) = Σ area[ω]`; `area[ω](c·k) = c·area[ω](k)`
-  for `c` invariant along `ω`. The glyph's sum over pieces passes straight
-  through, so `area(Σ_p t_p) = Σ_p area(t_p)`, and the integral is per
-  piece, inside the fold.
+- **Factoring.** `area[ω](f · g) = f · area[ω](g)` when `f` is invariant
+  along `ω`'s coordinates, and `area[ω](c) = c · |range|`, which is `c`
+  for the unit pixel along lattice axes. This is the rule that does the
+  work: it pulls every factor with no `X` in it out of the `dX` integral,
+  so what remains under the integral is exactly the part that varies
+  along the axis being integrated. A glyph's per-piece coefficients are
+  read once, not integrated, by this rule and no other mechanism.
+- **Linearity.** `area[ω](Σ) = Σ area[ω]`. The glyph's sum over pieces
+  passes straight through, so `area(Σ_p t_p) = Σ_p area(t_p)`, and the
+  integral is per piece, inside the fold.
 - **An indicator in one coordinate narrows the range.**
   `area[dZ]([lo ≤ Z ≤ hi]·k) = ∫_{[z₀, z₀+1] ∩ [lo, hi]} k dz`. This is the
   band `[t₀, t₁]`, derived, and it is the only place a data value touches a
@@ -273,26 +283,42 @@ by these rules, in order of strength:
   a conic and lands on the rule above that — exact for the sliver, for the
   same reason. Which `n` is §7's open question, and it is an accuracy
   choice made in one place.
-- **The midpoint fallback.** `area[ω](k) = k(centre)` when no rule applies:
-  the point sample, which is what every kernel computes today. So `area` is
+- **The midpoint fallback** is legalization, not a rule: `Area` is priced
+  prohibitively like `Dwrt`, so extraction never keeps one, and a
+  `LowerArea` pass beside `LowerDwrt` replaces a survivor by
+  `k(centre)` — the point sample every kernel computes today. So `area` is
   total, and never worse than the status quo.
 
-One more rule is worth stating for what it buys. **Saturation under a
-uniform guard.** A clamped linear form whose argument is `≥ 1` (or `≤ 0`)
-over a whole batch is a constant there, and its integral is the invariance
-rule's answer: the range's measure times a value with no `X` in it. For
-`A_p` that is a batch entirely to the right of the chord — every interior
-pixel of a stem — where the integral is the band height clipped to the
-row, a `Y`-only value placement already hoists. The saturation test is
-uniform over the batch, so under 4.3 it is a jump, and the arm is a
-handful of ops in place of sixteen. This is the rule that makes the
-interior cheap (§6): it is Green's theorem's "the interior is free"
-recovered without a dependency between pixels.
+For the glyph, saturation does the calculus:
 
-None of this is a search: each rule is a pattern on the integrand's shape,
-and the e-graph's job is the same as for `Dwrt` — keep the node whole
-until the lowering pass, then let algebraic simplification clean up what
-the rules emit.
+```text
+area[dX ∧ dY]( Σ_p σ_p · [Y ∈ band_p] · [X < X_p(Y)] )
+  = Σ_p σ_p · area[dY]( [Y ∈ band_p] · area[dX]([X < X_p(Y)]) )       linearity; factoring (no X in the rest)
+  = Σ_p σ_p · ∫_{[y₀, y₀+1] ∩ band_p} clamp(X_p(t) − x₀, 0, 1) dt      half-plane along X; the indicator narrows dY
+  = Σ_p σ_p · (t₁ − t₀) · mean_p                                       the antiderivative G
+```
+
+and what the extractor sees is a product of a `Y`-only factor,
+`(t₁ − t₀)`, and one `X`-varying factor. For it to *choose* that form the
+cost model must price a factor by where it is paid — a `Y`-only value
+once per row, an `X`-varying one per batch. `Extraction::chosen_variance`
+is the seam; the latency prior today prices a node the same wherever it
+is placed, and that is the one thing factoring needs from the extractor.
+
+**Where each factor is evaluated is demand, not a rule of `area`.** The
+`X`-varying factor is a clamp — two selects — and its polynomial arm is
+demanded under `0 < u < 1`, the chord's `X`-range within the band. Demand
+is a property of the DAG
+([demand-is-a-dag-property](2026-09-07-demand-is-a-dag-property.md)
+§1–§2, carried into
+[one-conditional-three-lowerings](2026-09-08-one-conditional-three-lowerings.md)):
+a batch where that predicate is uniformly false skips the arm by the
+existing lowering of a demand region as a jump, and a batch entirely to
+the right of the chord observes only the constant arm. Nothing in `area`
+knows about a batch, a lane or a row. Hoisting is the same property read
+along an axis: a factor with no `X` in its variance is a row value,
+placed once per row. Both are annotations of the DAG, read — not
+accounting done per pixel, by the author or by a rule of the integral.
 
 ### 4.2 A range is a value
 
@@ -409,19 +435,20 @@ sum, one add per cell. We apply it analytically, per piece per pixel,
 sixteen ops each. Both have an area term; the difference is its constant,
 and the theorem is not what decides it.
 
-Two things bring ours to FreeType's. **Lanes absorb the row**: at 32 px `8`
-is 16 px wide, a row is one or two batches, and "per pixel" is one
-instruction per row per piece — the per-pixel and the per-perimeter
-accountings coincide until a glyph is wider than a batch. **The saturation
-rule** (§4.1): a batch entirely to the right of a chord evaluates a
-`Y`-only constant under a uniform jump, a handful of ops per piece rather
-than sixteen. With those the shape is FreeType's. Fractional terms cost
-sixteen ops per crossing per batch, against FreeType's ~20 scalar ops per
-cell a segment crosses (an estimate). Interior batches cost a handful of
-ops per piece to their left, which for four crossings per row is about one
-op per pixel — FreeType's scan, in instruction count. No dependency
-between pixels is needed for it: the per-row constant a scan would carry
-is a value the compiler already hoists.
+What brings ours to FreeType's shape is not a rule of the integral and
+not an accounting: it is the factoring of §4.1, and demand. Factored,
+`A_p` is a `Y`-only band height times one `X`-varying factor whose
+polynomial arm is demanded only across the chord's `X`-range. So the work
+is what the DAG says it is: per row, per piece in the band, the band
+height once; per batch, per piece whose `X`-range meets the batch, the
+sixteen-op factor; per batch to the right of a piece, the constant arm;
+and the descent. That is FreeType's shape — perimeter work for the
+fractional part, near nothing for the interior — reached by the e-graph
+factoring an integral and the scheduler reading demand, with no
+dependency between pixels, and at 32 px a row is one or two batches
+anyway. The instruction counts in the estimate below are a consequence
+of that structure, stated for the measurement; they are not what the
+design is organized around.
 
 What the formula has is everything else. Per piece per batch the integral
 form is ~16 vector ops with no branch, no root solve and no memory traffic
