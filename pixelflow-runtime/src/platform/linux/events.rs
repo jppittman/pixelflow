@@ -101,7 +101,11 @@ unsafe fn handle_selection_request(event: &xlib::XEvent, window: &mut super::win
     response.time = req.time;
     response.property = req.property;
 
+    let offered = window.selection_data(req.selection);
     match req.target {
+        _ if offered.is_none() => {
+            response.property = 0; // Not a selection this window owns
+        }
         t if t == window.atoms.targets => {
             let targets = [
                 window.atoms.targets,
@@ -124,7 +128,7 @@ unsafe fn handle_selection_request(event: &xlib::XEvent, window: &mut super::win
             || t == window.atoms.text
             || t == window.atoms.xa_string =>
         {
-            let data = window.clipboard_data.as_bytes();
+            let data = offered.unwrap_or_default().as_bytes();
             xlib::XChangeProperty(
                 window.display,
                 req.requestor,

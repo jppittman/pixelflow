@@ -377,8 +377,11 @@ fn app_management_resize_request() {
 
 #[test]
 fn app_management_clipboard() {
-    let cmd = AppManagement::CopyToClipboard("test text".to_string());
-    if let AppManagement::CopyToClipboard(text) = cmd {
+    let cmd = AppManagement::Copy {
+        selection: pixelflow_runtime::input::Selection::Clipboard,
+        text: "test text".to_string(),
+    };
+    if let AppManagement::Copy { text, .. } = cmd {
         assert_eq!(text, "test text");
     } else {
         panic!("Wrong variant");

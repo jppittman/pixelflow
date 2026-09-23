@@ -4,6 +4,7 @@
 
 use crate::api::public::{CursorIcon, WindowDescriptor};
 use crate::error::RuntimeError;
+use crate::input::Selection;
 use crate::platform::waker::X11Waker;
 use log::info;
 use pixelflow_graphics::render::color::Bgra8;
@@ -58,7 +59,10 @@ pub struct X11Window {
     pub width: u32,
     pub height: u32,
     pub scale_factor: f64,
+    /// What this window offers as CLIPBOARD, while it owns it.
     pub clipboard_data: String,
+    /// What this window offers as PRIMARY, while it owns it.
+    pub primary_data: String,
 }
 
 // SAFETY: X11 pointers are safe to share across threads if XInitThreads() is called.
@@ -151,6 +155,7 @@ impl X11Window {
                 height,
                 scale_factor: 1.0,
                 clipboard_data: String::new(),
+                primary_data: String::new(),
             };
 
             win.scale_factor = win.query_scale_factor();
@@ -263,12 +268,48 @@ impl X11Window {
         }
     }
 
-    pub fn copy_to_clipboard(&mut self, text: &str) {
-        self.clipboard_data = text.to_string();
+    /// Takes ownership of a selection, offering `text` to whoever asks.
+    pub fn copy(&mut self, selection: Selection, text: String) {
+        let atom = match selection {
+            Selection::Clipboard => {
+                self.clipboard_data = text;
+                self.atoms.clipboard
+            }
+            Selection::Primary => {
+                self.primary_data = text;
+                xlib::XA_PRIMARY
+            }
+        };
         unsafe {
-            xlib::XSetSelectionOwner(
+            xlib::XSetSelectionOwner(self.display, atom, self.window, xlib::CurrentTime);
+            xlib::XFlush(self.display);
+        }
+    }
+
+    /// The text this window offers for a selection atom, if it is one it
+    /// can own.
+    #[must_use]
+    pub fn selection_data(&self, selection_atom: xlib::Atom) -> Option<&str> {
+        match selection_atom {
+            atom if atom == self.atoms.clipboard => Some(&self.clipboard_data),
+            xlib::XA_PRIMARY => Some(&self.primary_data),
+            _ => None,
+        }
+    }
+
+    pub fn request_paste(&self, selection: Selection) {
+        let selection_atom = match selection {
+            Selection::Clipboard => self.atoms.clipboard,
+            Selection::Primary => xlib::XA_PRIMARY,
+        };
+        unsafe {
+            // The converted text lands in a property of the same name, which
+            // is what the SelectionNotify handler reads back.
+            xlib::XConvertSelection(
                 self.display,
-                self.atoms.clipboard,
+                selection_atom,
+                self.atoms.utf8_string,
+                selection_atom,
                 self.window,
                 xlib::CurrentTime,
             );
@@ -276,15 +317,37 @@ impl X11Window {
         }
     }
 
-    pub fn request_paste(&self) {
+    /// Asks the window manager to toggle full screen (EWMH `_NET_WM_STATE`).
+    pub fn toggle_fullscreen(&self) {
+        /// `_NET_WM_STATE_TOGGLE`, the EWMH action.
+        const NET_WM_STATE_TOGGLE: std::os::raw::c_long = 2;
+        /// The request's source indication: a normal application.
+        const SOURCE_APPLICATION: std::os::raw::c_long = 1;
         unsafe {
-            xlib::XConvertSelection(
+            let intern = |name: &[u8]| {
+                xlib::XInternAtom(self.display, name.as_ptr() as *const c_char, xlib::False)
+            };
+            let wm_state = intern(b"_NET_WM_STATE\0");
+            let fullscreen = intern(b"_NET_WM_STATE_FULLSCREEN\0");
+
+            let mut message: xlib::XClientMessageEvent = mem::zeroed();
+            message.type_ = xlib::ClientMessage;
+            message.window = self.window;
+            message.message_type = wm_state;
+            message.format = 32;
+            message.data.set_long(0, NET_WM_STATE_TOGGLE);
+            message.data.set_long(1, fullscreen as std::os::raw::c_long);
+            message.data.set_long(3, SOURCE_APPLICATION);
+
+            let mut event = xlib::XEvent {
+                client_message: message,
+            };
+            xlib::XSendEvent(
                 self.display,
-                self.atoms.clipboard,
-                self.atoms.utf8_string,
-                self.atoms.clipboard,
-                self.window,
-                xlib::CurrentTime,
+                xlib::XDefaultRootWindow(self.display),
+                xlib::False,
+                xlib::SubstructureRedirectMask | xlib::SubstructureNotifyMask,
+                &mut event,
             );
             xlib::XFlush(self.display);
         }

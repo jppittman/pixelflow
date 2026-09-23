@@ -268,11 +268,16 @@ impl Transducer for EngineCore {
                     height,
                 });
             }
-            AppManagement::CopyToClipboard(text) => {
-                out.driver_control = Some(DisplayControl::Copy { text });
+            AppManagement::Copy { selection, text } => {
+                out.driver_control = Some(DisplayControl::Copy { selection, text });
             }
-            AppManagement::RequestPaste => {
-                out.driver_control = Some(DisplayControl::RequestPaste);
+            AppManagement::RequestPaste(selection) => {
+                out.driver_control = Some(DisplayControl::RequestPaste { selection });
+            }
+            AppManagement::ToggleFullscreen => {
+                out.driver_control = Some(DisplayControl::ToggleFullscreen {
+                    id: WindowId::PRIMARY,
+                });
             }
             AppManagement::Bell => {
                 out.driver_control = Some(DisplayControl::Bell);
@@ -401,6 +406,38 @@ mod tests {
             matches!(out.coordinator, Some(CoordinatorData::Submit(_))),
             "a new scene must be forwarded to the coordinator"
         );
+    }
+
+    #[test]
+    fn a_paste_request_names_its_selection_to_the_driver() {
+        let mut core = EngineCore::new();
+        let out = core
+            .step_management(AppManagement::RequestPaste(
+                crate::input::Selection::Primary,
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            out.driver_control,
+            Some(DisplayControl::RequestPaste {
+                selection: crate::input::Selection::Primary
+            })
+        ));
+    }
+
+    #[test]
+    fn a_fullscreen_request_toggles_the_primary_window() {
+        let mut core = EngineCore::new();
+        let out = core
+            .step_management(AppManagement::ToggleFullscreen)
+            .unwrap();
+
+        assert!(matches!(
+            out.driver_control,
+            Some(DisplayControl::ToggleFullscreen {
+                id: WindowId::PRIMARY
+            })
+        ));
     }
 
     #[test]
