@@ -3,6 +3,7 @@
 use super::{key_translator, FocusState, TerminalEmulator};
 use crate::term::{
     action::{EmulatorAction, UserInputAction},
+    layout::Zoom,
     snapshot::{Point, SelectionMode},
     ControlEvent, MIN_GRID_DIMENSION,
 };
@@ -70,6 +71,9 @@ pub(super) fn process_user_input_action(
         UserInputAction::InitiateCopy => handle_initiate_copy(emulator),
         UserInputAction::PasteText(text_to_paste) => handle_paste_text(emulator, &text_to_paste),
         UserInputAction::RequestQuit => Some(EmulatorAction::Quit),
+        UserInputAction::RequestZoomIn => zoom(emulator, Zoom::In),
+        UserInputAction::RequestZoomOut => zoom(emulator, Zoom::Out),
+        UserInputAction::RequestZoomReset => zoom(emulator, Zoom::Reset),
         UserInputAction::RequestScrollLineUp => scroll(emulator, 1),
         UserInputAction::RequestScrollLineDown => scroll(emulator, -1),
         UserInputAction::RequestScrollPageUp => scroll(emulator, page(emulator)),
@@ -84,6 +88,38 @@ pub(super) fn process_user_input_action(
             );
             None
         }
+    }
+}
+
+/// Resizes the grid to fill a window of the given logical size at the
+/// current cell size, and has the PTY follow so the program hears SIGWINCH.
+fn fit_to_window(emulator: &mut TerminalEmulator, width_px: u16, height_px: u16) -> EmulatorAction {
+    let (cols, rows) = emulator.layout.grid_for_window(width_px, height_px);
+    let cols = cols.max(MIN_GRID_DIMENSION);
+    let rows = rows.max(MIN_GRID_DIMENSION);
+    trace!(
+        "TerminalEmulator: fitting {}x{} cells to {}x{} logical px",
+        cols,
+        rows,
+        width_px,
+        height_px
+    );
+    emulator.resize(cols, rows);
+    EmulatorAction::ResizePty {
+        cols: cols as u16,
+        rows: rows as u16,
+    }
+}
+
+/// Changes the cell size and refits the grid to the window at the new size.
+fn zoom(emulator: &mut TerminalEmulator, change: Zoom) -> Option<EmulatorAction> {
+    if !emulator.layout.zoom(change) {
+        return None;
+    }
+    match emulator.layout.window_px() {
+        Some((width_px, height_px)) => Some(fit_to_window(emulator, width_px, height_px)),
+        // No window yet: nothing to refit; the first resize will use the new size.
+        None => Some(EmulatorAction::RequestRedraw),
     }
 }
 
@@ -192,26 +228,8 @@ pub(super) fn process_control_event(
             height_px,
         } => {
             // width_px and height_px are in logical pixels (engine handles scaling)
-            // Calculate cols/rows using the emulator's Layout
-            let cols = ((width_px as f64 / emulator.layout.cell_width_px.max(1) as f64) as usize)
-                .max(MIN_GRID_DIMENSION);
-            let rows = ((height_px as f64 / emulator.layout.cell_height_px.max(1) as f64) as usize)
-                .max(MIN_GRID_DIMENSION);
-
-            trace!(
-                "TerminalEmulator: ControlEvent::Resize to {}x{} cells ({}x{} logical px)",
-                cols,
-                rows,
-                width_px,
-                height_px
-            );
-            emulator.resize(cols, rows);
-
-            // Signal orchestrator to resize the PTY so shell receives SIGWINCH
-            Some(EmulatorAction::ResizePty {
-                cols: cols as u16,
-                rows: rows as u16,
-            })
+            emulator.layout.set_window_px(width_px, height_px);
+            Some(fit_to_window(emulator, width_px, height_px))
         }
         ControlEvent::PtyDataReady => {
             // Orchestrator wake-up signal, ignored by emulator
@@ -400,6 +418,49 @@ mod tests {
             scroll(&mut emu, UserInputAction::RequestScrollLineDown),
             None
         );
+    }
+
+    #[test]
+    fn zoom_scales_the_cells_and_refits_the_grid_to_the_window() {
+        let mut emu = create_test_emu_for_input();
+        let resize = EmulatorInput::Control(ControlEvent::Resize {
+            width_px: 800,
+            height_px: 480,
+        });
+        let before = emu.interpret_input(resize);
+        let cell = |emu: &mut TerminalEmulator| {
+            let snapshot = emu.get_render_snapshot().expect("snapshot");
+            (snapshot.cell_width_px, snapshot.cell_height_px)
+        };
+        let base = cell(&mut emu);
+
+        let zoomed = emu.interpret_input(EmulatorInput::User(UserInputAction::RequestZoomIn));
+        let (width, height) = cell(&mut emu);
+        assert!(width > base.0 && height > base.1, "zoom in grows the cell");
+        assert_eq!(
+            zoomed,
+            Some(EmulatorAction::ResizePty {
+                cols: (800 / width) as u16,
+                rows: (480 / height) as u16,
+            }),
+            "the grid refits the same window at the new size"
+        );
+
+        let reset = emu.interpret_input(EmulatorInput::User(UserInputAction::RequestZoomReset));
+        assert_eq!(cell(&mut emu), base);
+        assert_eq!(reset, before, "reset is the grid the window had before");
+    }
+
+    #[test]
+    fn zoom_stops_at_its_limits() {
+        let mut emu = create_test_emu_for_input();
+        let zoom_out = || EmulatorInput::User(UserInputAction::RequestZoomOut);
+        let steps = std::iter::repeat_with(|| emu.interpret_input(zoom_out()))
+            .take(100)
+            .take_while(Option::is_some)
+            .count();
+        assert!(steps < 100, "zooming out stops changing the cell size");
+        assert_eq!(emu.interpret_input(zoom_out()), None);
     }
 
     #[test]
