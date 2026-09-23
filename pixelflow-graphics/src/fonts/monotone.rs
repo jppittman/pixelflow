@@ -16,19 +16,15 @@
 //! be built by [`MonotoneQuad::split`], which cuts any quadratic at its
 //! interior extrema.
 //!
-//! ## Not wired yet
+//! ## Who cuts
 //!
-//! Today's pieces (`loop_blinn::Pieces::of`) do not go through this split,
-//! and wiring it in would not be output-neutral. The crate's own font has
-//! 995 quadratics with an interior extremum (1022 turning points), in 252
-//! simple glyphs (`ƕ`, `ȡ`, `ʓ`, …). Compound glyphs reuse them, so 512 of
-//! the glyphs its `cmap` reaches would change. None is in ASCII or Latin-1.
-//! Cutting those changes their pieces, and so their antialiasing ramp. The
-//! split goes in with the piece rows that read the certificate. When it
-//! does, a quadratic whose ends coincide must still be dropped *before* the
-//! split, as `Piece::quad` drops it today. Such a quadratic has a cusp at
-//! `t = ½` on both axes, and its two halves retrace each other, cancelling
-//! only to rounding.
+//! `loop_blinn`'s host turns every segment into pieces through this split
+//! — a line too, as the quadratic whose control point is its midpoint,
+//! which nothing cuts. The crate's own font has 995 quadratics with an
+//! interior extremum (1022 turning points), in 252 simple glyphs (`ƕ`, `ȡ`,
+//! `ʓ`, …), none in ASCII or Latin-1. A quadratic whose ends coincide is
+//! dropped *before* the split: it has a cusp at `t = ½` on both axes, and
+//! its two halves would retrace each other, cancelling only to rounding.
 
 /// A point, `[x, y]`.
 type P = [f64; 2];
@@ -378,10 +374,10 @@ mod tests {
         assert_eq!(pieces, vec![MonotoneQuad(q)], "cut or moved, bit for bit");
     }
 
-    /// The hook `Piece::quad`'s own tests use: it runs 50 units left before
-    /// returning, and rises by a quarter of 0.005 on the way. One turning
-    /// point per axis, so three pieces, cut at `x = −10000/201` and at
-    /// `y = 0.0025`.
+    /// The hook the glyph's old midpoint split was tested on: it runs 50
+    /// units left before returning, and rises by a quarter of 0.005 on the
+    /// way. One turning point per axis, so three pieces, cut at
+    /// `x = −10000/201` and at `y = 0.0025`.
     #[test]
     fn the_hook_is_cut_where_it_turns_on_each_axis() {
         let q = [[0.0, 0.0], [-100.0, 0.005], [1.0, 0.0]];

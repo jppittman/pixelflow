@@ -323,17 +323,17 @@ impl<'a> Font<'a> {
     /// at screen y=0 (top) and the descent at y=`size`, with screen Y
     /// increasing downward.
     ///
-    /// Its coverage `Kernel` reads a piece table at a `Kernel::sum_over`
-    /// binder, and the table travels with the kernel itself
+    /// Its coverage `Kernel` is the area of each pixel under ink, one fold
+    /// over a piece table, and the table travels with the kernel itself
     /// (`Kernel::with_buffer_data`), so baking or collapsing it needs no
     /// separate bind.
     ///
     /// **Only in the frame it is drawn in.** The outline is scaled before
-    /// the kernel exists, not the kernel after. A glyph built in font units
-    /// would bound its support one *font unit* past the outline and ramp its
-    /// antialiasing over one font unit, so there is deliberately no such
-    /// glyph. Callers that want the geometry in font units take
-    /// [`Font::outline_by_id`].
+    /// the kernel exists, not the kernel after. The pixel a glyph integrates
+    /// over is its own frame's unit square, so a glyph built in font units
+    /// would antialias over one *font unit* and bound its support one font
+    /// unit past the outline; there is deliberately no such glyph. Callers
+    /// that want the geometry in font units take [`Font::outline_by_id`].
     #[must_use]
     pub fn glyph_kernel_scaled(&self, ch: char, size: f32) -> Option<Glyph> {
         let id = self.cmap.lookup(ch as u32)?;

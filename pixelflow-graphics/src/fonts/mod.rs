@@ -16,7 +16,7 @@
 //!      │
 //! Coverage Layer (loop_blinn)
 //!      ↓
-//!      │  An outline's winding number, as one Kernel
+//!      │  An outline's area under each pixel, as one Kernel
 //!      │
 //! Font Layer (Font, outline)
 //!      ↓
@@ -27,27 +27,23 @@
 //! In-Memory Font Data
 //! ```
 //!
-//! ## Coverage semantics: an exact winding, an antialiased distance
+//! ## Coverage semantics: the exact area under ink
 //!
-//! A glyph's coverage is `min(|w|, 1)` for the winding number `w` under the
-//! non-zero rule, and [`loop_blinn`] computes `w` **exactly**: hard masks
-//! selecting signed constants, relative to a reference point, with
-//! Loop–Blinn's implicit `u² − v` for the sliver each quadratic bulges past
-//! its chord. What is antialiased is a separate number — the distance to
-//! the nearest piece of outline — ramped as
-//! `inside ? min(1, ½ + d) : max(0, ½ − d)`.
+//! A glyph's coverage of a pixel is `min(|F|, 1)`, where `F` is the pixel's
+//! signed area under ink — the non-zero rule's winding number integrated
+//! over the pixel. [`loop_blinn`] writes `F` as a formula, one term per
+//! monotone arc of the outline, each the area of the pixel to the arc's
+//! left within its band, and the e-graph closes every term's integral
+//! exactly (docs/plans/2026-09-23-a-glyph-is-a-formula.md). A pixel on an
+//! edge reads the fraction of it the ink covers; a corner and a thin stem
+//! read their areas, not a ramp on one distance. Where two contours overlap
+//! inside a pixel, `|F|` clamped reads their union as FreeType's rasterizer
+//! does, off by the overlap of two fractions.
 //!
-//! `d` is gradient-normalized: divided by `‖∇d‖` with the `DX`/`DY` as
-//! symbolic `Dwrt` derivatives resolved when the kernel compiles, so the
-//! chain rule carries the scale through every coordinate warp
-//! (`Kernel::at`) and the ramp is ~1 *screen* pixel wide at any glyph
-//! scale. There is no separate hard/AA mode and no jet domain — coverage is
-//! antialiased by construction.
-//!
-//! Keeping the winding and the ramp apart is what makes a mis-decided
-//! comparison cost a rounding rather than half a unit of coverage. The
-//! formulation this replaced made a crossing's existence *be* its coverage
-//! (see docs/plans/2026-09-08-loop-blinn-glyph.md).
+//! The pixel is the frame's unit square about the sample, so the glyph is
+//! built in the frame it is drawn in (every scale is applied to control
+//! points on the host) and a caller places it with a translation. There is
+//! no separate hard/AA mode — coverage is antialiased by construction.
 //!
 //! ## Layer 1: Font Loading (`loader` module)
 //!
@@ -112,17 +108,6 @@ pub mod atlas;
 pub mod cache;
 pub mod loader;
 pub mod loop_blinn;
-// The split the glyph-as-formula piece rows will read the certificate of;
-// `monotone`'s module docs say why it is not wired into today's pieces.
-// `expect`, not `allow`: wiring it in fulfils nothing, and fails the build
-// until this attribute goes.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "not wired into loop_blinn's pieces until the formula's rows need it"
-    )
-)]
 mod monotone;
 pub mod outline;
 pub mod text;
