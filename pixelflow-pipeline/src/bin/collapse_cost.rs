@@ -244,13 +244,13 @@ fn bench(corpus_dir: &std::path::Path, out: &std::path::Path, build: &Build, pas
     );
     let usable: Vec<CollapseKernel> = kernels
         .into_iter()
-        .filter(|k| k.extent[0] >= collapse_bench::LANES as u32)
+        .filter(|k| k.extent[0] >= collapse_bench::lanes() as u32)
         .collect();
     eprintln!(
         "benching {} kernels on {} ({} lanes), {passes} pass(es)",
         usable.len(),
         collapse_bench::tier(),
-        collapse_bench::LANES
+        collapse_bench::lanes()
     );
     let rows = collapse_bench::run_corpus(&usable, passes);
     if let Some(parent) = out.parent() {

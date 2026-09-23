@@ -35,7 +35,7 @@ use pixelflow_ir::arena::{
 };
 use pixelflow_ir::variance::LatticeShape;
 use pixelflow_ir::{ExprArena, ExprId, OpKind};
-use pixelflow_pipeline::collapse_bench::{self, LANES};
+use pixelflow_pipeline::collapse_bench::{self, lanes};
 use pixelflow_pipeline::shader_bench::{NAMED_KERNEL_NAMES, SHADERTOY_KERNEL_NAMES, named_kernel};
 use pixelflow_pipeline::training::{bezier_family, sh_family};
 use pixelflow_search::egraph::{
@@ -388,7 +388,7 @@ fn synthetic_kernels(n: usize, seed: u64) -> Vec<Kernel> {
     }
     // collapse_cost's synthetic allocation-pressure corpus, at its own extents.
     for k in collapse_bench::corpus::synthetic() {
-        if k.extent[0] < LANES as u32 {
+        if k.extent[0] < lanes() as u32 {
             continue;
         }
         out.push(synth(

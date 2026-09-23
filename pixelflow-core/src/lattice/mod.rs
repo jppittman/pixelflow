@@ -232,8 +232,7 @@ impl Lattice {
     /// [`Lattice::bake`]'s panics for the distinction) — compile and bind it
     /// yourself, then call
     /// [`BoundManifold::eval_at`](crate::BoundManifold::eval_at). Also
-    /// panics if this build's `Field` width is not the JIT's, or if
-    /// compilation fails.
+    /// panics if compilation fails.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[must_use]
     pub fn eval_at(kernel: &pixelflow_ir::Kernel, x: f32, y: f32) -> f32 {
@@ -343,8 +342,7 @@ impl Lattice {
     /// own data and bakes here just fine; one built from
     /// `DiscreteManifold::kernel_for` alone (a shape with no data seeded
     /// yet) does not — compile such a kernel yourself and bind its memory.
-    /// Also panics if this build's `Field` width is not the JIT's, or if
-    /// compilation fails.
+    /// Also panics if compilation fails.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[must_use]
     pub fn bake(&self, kernel: &pixelflow_ir::Kernel) -> DiscreteManifold {

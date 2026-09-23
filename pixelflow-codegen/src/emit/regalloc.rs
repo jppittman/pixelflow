@@ -13,11 +13,29 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::guards::{FoldReads, SelectArm, SelectGuard, analyze_select_guards};
-use super::{Gpr, KReg, OperandSource, Reg, ScheduledOp, operand_sources, reloads_wanted};
+use super::{Gpr, KReg, OperandSource, PtrReg, Reg, ScheduledOp, operand_sources, reloads_wanted};
 
 /// A value in the program (SSA-style).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ValueId(pub u32);
+
+/// Which register file a value lives in: a vector of `f32` lanes, or an
+/// address.
+///
+/// A function of the defining op ([`ScheduledOp::class`]), and every
+/// consumer knows by position which it reads — a `Gather`'s index is a
+/// vector and its base is a pointer. The two classes never compete for a
+/// register, so allocation runs once per class over one schedule
+/// ([`LinearScan`]), each pass blind to the other's values, and the assembler
+/// gets a [`PtrReg`] where it demands one because the allocator never held
+/// the address anywhere else (docs/plans/2026-09-22-a-pointer-is-a-value.md).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// One SIMD batch of `f32`, in a [`Reg`].
+    Vector,
+    /// An address, in a [`PtrReg`].
+    Pointer,
+}
 
 /// One step of a schedule: a value, and the operation that defines it.
 ///
@@ -187,6 +205,18 @@ impl GprSet {
         r.0 < 32 && self.0 & (1 << r.0) != 0
     }
 
+    /// This set plus every member of `other`.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// This set minus every member of `other`.
+    #[must_use]
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
     /// How many registers the set holds.
     #[must_use]
     pub const fn len(self) -> u8 {
@@ -279,8 +309,8 @@ pub struct RegisterFile {
     pub guard_temps: u8,
 
     /// Registers the backend's own instruction emission clobbers, outside the
-    /// allocator's knowledge: an ISA-level temp for a two-operand form, a
-    /// gather's index register, and the like.
+    /// allocator's knowledge: a guard's reduction register, a gather's index
+    /// register, and the like.
     ///
     /// The allocator never hands these out; declaring them is what lets
     /// [`RegisterFile::checked`] prove they miss the pool, the inputs and the
@@ -290,8 +320,8 @@ pub struct RegisterFile {
     /// How many registers this backend's encoding of `op` needs beyond the
     /// operands and destination — the instruction temps.
     ///
-    /// A two-operand ISA needs one to break a destructive hazard; a sign-flip
-    /// needs one to hold the mask. Those used to be `const`s outside the pool,
+    /// A sign-flip needs one to hold its mask; a gather needs one for its
+    /// truncated indices. Those used to be `const`s outside the pool,
     /// reserved for the whole kernel because one instruction in it might want
     /// one. Declaring the demand here instead makes the temp an *allocated*
     /// value with a live range of exactly one instruction, so the register is
@@ -305,7 +335,7 @@ pub struct RegisterFile {
 
     /// Bytes one register occupies when spilled — the backend's vector width.
     ///
-    /// 16 for SSE2 and NEON, 32 for AVX2, 64 for AVX-512. This is the stride
+    /// 16 for NEON, 32 for AVX2, 64 for AVX-512. This is the stride
     /// [`FrameLayout`](super::FrameLayout) lays spill slots out at, so every
     /// offset the emitter sees is already a real byte displacement. It was
     /// once a universal 16 that each wide backend divided back out at its
@@ -349,6 +379,19 @@ pub struct RegisterFile {
     /// [`RegisterFile::gpr_ctx`] — the GPR-class
     /// [`RegisterFile::temps_for`].
     pub gpr_temps_for: fn(&ScheduledOp) -> u8,
+
+    /// The pool for [`Class::Pointer`] values: the registers a buffer base or
+    /// a uniform block's address may be *carried* in across instructions, and
+    /// across the loops inside the scope that loads it.
+    ///
+    /// The general registers the ABI and the backend's own encodings leave
+    /// free — never one of the three pinned inputs, never one of
+    /// [`RegisterFile::gpr_scratch`], which [`RegisterFile::checked`] proves.
+    /// Allocated exactly as [`RegisterFile::scratch`] is, by the same pass
+    /// with the same eviction, splitting and carrying; only the encodings
+    /// that read and write it differ. Empty on a file whose schedules hold no
+    /// pointer at all, which every unit-test file is.
+    pub pointers: GprSet,
 
     /// AVX-512 mask registers (`k0..k7`) the allocator may hand out as
     /// instruction-scoped scratch: a compare's `vcmpps` destination before it
@@ -406,8 +449,8 @@ impl RegisterFile {
         }
 
         // The GPR-class mirror of the vector checks above: the three ABI
-        // pointers are pinned, so each must miss the pool the allocator hands
-        // out from, and no two may share a register.
+        // pointers are pinned, so each must miss both pools the allocator
+        // hands out from, and no two may share a register.
         let pinned = [self.gpr_ctx, self.gpr_out, self.gpr_pitch];
         let mut i = 0;
         while i < pinned.len() {
@@ -415,6 +458,10 @@ impl RegisterFile {
                 assert!(
                     !self.gpr_scratch.contains(reg),
                     "an ABI GPR input is inside the allocatable GPR pool"
+                );
+                assert!(
+                    !self.pointers.contains(reg),
+                    "an ABI GPR input is inside the pointer pool"
                 );
                 let mut k = i + 1;
                 while k < pinned.len() {
@@ -426,6 +473,14 @@ impl RegisterFile {
             }
             i += 1;
         }
+
+        // Instruction scratch is destroyed mid-instruction while a carried
+        // pointer is live across it, so the two GPR pools may not overlap.
+        assert!(
+            self.gpr_scratch.without(self.pointers).len() == self.gpr_scratch.len(),
+            "a GPR is both instruction scratch and in the pointer pool: \
+             emitting an instruction would clobber a carried pointer"
+        );
 
         assert!(
             self.mask_guard_temps as usize <= 1,
@@ -464,10 +519,9 @@ impl RegisterFile {
     ///
     /// | worst instruction | temps | operands | guard | result | dst | total |
     /// |---|---|---|---|---|---|---|
-    /// | AVX2 gather at a guarded arm's head | 4 | 1 | 1 | 0 | 1 | **7** |
-    /// | AVX2 gather anywhere else | 4 | 1 | 0 | 0 | 1 | 6 |
-    /// | aarch64 `Select` at a guarded arm's head | 0 | 3 | 2 | 0 | 1 | 6 |
-    /// | SSE2 `Select` at a guarded arm's head | 1 | 3 | 1 | 0 | 1 | 6 |
+    /// | aarch64 `Select` at a guarded arm's head | 0 | 3 | 2 | 0 | 1 | **6** |
+    /// | AVX2 `Select` at a guarded arm's head | 1 | 3 | 1 | 0 | 1 | **6** |
+    /// | AVX2 gather at a guarded arm's head | 2 | 1 | 1 | 0 | 1 | 5 |
     ///
     /// The `result` column is 0 everywhere because it is reserved only for a
     /// body whose root was hoisted out entirely — a placeholder that emits
@@ -477,7 +531,21 @@ impl RegisterFile {
     /// producing an instruction with nowhere to put its scratch: every *value*
     /// survives a small pool by going to memory, and scratch the encoder
     /// destroys mid-instruction has no such escape.
+    ///
+    /// The floor is stated through [`Scratch::MAX_TEMPS`], which was sized
+    /// for the AVX2 gather when it was two scalar-insert halves and asked
+    /// for four; `vgatherdps` asks for two, so the table's worst case is now
+    /// one below the floor. Lowering `MAX_TEMPS` to two moves every carry
+    /// budget, so it is a change to measure on its own rather than fold in
+    /// here.
     pub const MIN_SCRATCH: u8 = Scratch::MAX_TEMPS as u8 + 3;
+
+    /// The smallest pointer pool a schedule holding a pointer can be
+    /// allocated against: one. No instruction both defines an address and
+    /// reads one, and none reads two, so one register always serves — as a
+    /// `Context` def's destination, or as the reload of a base in a slot.
+    /// A file whose schedules hold no pointer at all may declare none.
+    pub const MIN_POINTERS: u8 = 1;
 
     /// Cap the scratch pool at a smaller budget, leaving every other region
     /// where it is.
@@ -503,8 +571,8 @@ impl RegisterFile {
         }
     }
 
-    /// This file as a scope *inside* a loop sees it: the pool minus every
-    /// register carrying a value across that loop.
+    /// This file as a scope *inside* a loop sees it: each pool minus every
+    /// register carrying a value of its class across that loop.
     ///
     /// Carried registers are not `fixed` — `fixed` is what a backend holds for
     /// its own encodings, and nothing does any more. These are ordinary
@@ -512,16 +580,48 @@ impl RegisterFile {
     /// which is exactly what the nest's liveness says and what allocating each
     /// region against the full pool used to ignore.
     #[must_use]
-    pub const fn inside(self, carried: RegSet) -> Self {
+    pub const fn inside(self, carried: Carried) -> Self {
         Self {
-            scratch: self.scratch.without(carried),
+            scratch: self.scratch.without(carried.vectors),
+            pointers: self.pointers.without(carried.pointers),
             ..self
         }
     }
 
-    /// The allocatable scratch registers, low to high.
-    fn scratch(&self) -> impl Iterator<Item = Reg> + use<> {
-        self.scratch.iter()
+    /// The register numbers of `class`'s pool, low to high.
+    fn pool(&self, class: Class) -> Vec<u8> {
+        match class {
+            Class::Vector => self.scratch.iter().map(|r| r.0).collect(),
+            Class::Pointer => self.pointers.iter().map(|r| r.0).collect(),
+        }
+    }
+}
+
+/// The registers carried across a scope, one set per class.
+///
+/// What [`RegisterFile::inside`] subtracts and [`LinearScan::allocate_nest`]
+/// accumulates: a carry of either class takes a register from that class's
+/// pool in every scope it spans, and the two classes never trade.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Carried {
+    pub vectors: RegSet,
+    pub pointers: GprSet,
+}
+
+impl Carried {
+    /// Nothing carried.
+    pub const NONE: Self = Self {
+        vectors: RegSet::EMPTY,
+        pointers: GprSet::EMPTY,
+    };
+
+    /// Both classes' sets, unioned.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self {
+            vectors: self.vectors.union(other.vectors),
+            pointers: self.pointers.union(other.pointers),
+        }
     }
 }
 
@@ -604,13 +704,19 @@ impl Point {
 /// The emitter reads the composition of the two as [`Loc`](super::Loc).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Where {
-    /// In this register.
+    /// In this vector register.
     Reg(Reg),
+    /// In this pointer register — a [`Class::Pointer`] value's only kind of
+    /// register, so a vector can never be handed to a memory operand and an
+    /// address can never be fed to an ALU: the class is in the placement.
+    Ptr(PtrReg),
     /// Evicted to a stack slot.
     Spilled,
-    /// Evicted, but it is a constant (these are the `f32` bits): it lives
-    /// nowhere and is re-emitted at each use, which beats a store plus a
-    /// reload.
+    /// Evicted, but it is a constant (these are the `f32` bits): its slot is
+    /// the instruction stream, which needs no store, and a read comes back
+    /// from there instead of the frame. How the emitter spells that reload is
+    /// its business; to the allocator this is `Spilled` with the store already
+    /// paid.
     Remat(u32),
 }
 
@@ -717,11 +823,19 @@ impl Placement {
         self.locations().any(|at| at == Where::Spilled)
     }
 
-    /// Every register this value occupies over its life.
+    /// Every vector register this value occupies over its life.
     pub fn registers(&self) -> impl Iterator<Item = Reg> + use<'_> {
         self.locations().filter_map(|at| match at {
             Where::Reg(r) => Some(r),
-            Where::Spilled | Where::Remat(_) => None,
+            Where::Ptr(_) | Where::Spilled | Where::Remat(_) => None,
+        })
+    }
+
+    /// Every pointer register this value occupies over its life.
+    pub fn pointers(&self) -> impl Iterator<Item = PtrReg> + use<'_> {
+        self.locations().filter_map(|at| match at {
+            Where::Ptr(p) => Some(p),
+            Where::Reg(_) | Where::Spilled | Where::Remat(_) => None,
         })
     }
 }
@@ -824,6 +938,12 @@ pub struct Scratch {
     /// [`RegisterFile::mask_temps_for`]. Read through [`Scratch::mask_temp`].
     mask_temps: [Option<KReg>; Scratch::MAX_MASK_TEMPS],
 
+    /// The register this instruction's pointer operand is reloaded into,
+    /// when it is not in one at this point — the [`Class::Pointer`] mirror of
+    /// `reloads`, and one rather than an array because no instruction reads
+    /// more than one address.
+    pub ptr_reload: Option<PtrReg>,
+
     /// A mask register the guard's mask reduction destroys — the mask-class
     /// [`Scratch::guard_temp`]. `None` on every backend but AVX-512, whose
     /// guard reduces the mask into a `k`-register (`vptestmd`) before
@@ -834,9 +954,12 @@ pub struct Scratch {
 impl Scratch {
     /// The most scratch registers any one encoding asks for.
     ///
-    /// Four: AVX2 assembles a 256-bit gather from two 128-bit halves, which
-    /// costs the half-sequence's own index and value registers plus one of
-    /// each to carry the high half while the low one is built.
+    /// Four, sized for the AVX2 gather when it was two scalar-insert halves
+    /// (each half's index and value registers, plus one of each to carry
+    /// the high half). No encoding asks for more than two now — a gather's
+    /// truncated indices and mask, a fold's trip test — but this is also
+    /// what [`RegisterFile::MIN_SCRATCH`] is stated through, so lowering it
+    /// moves every carry budget and is measured on its own.
     pub const MAX_TEMPS: usize = 4;
 
     /// The temps a surviving `Reduce` def reserves: two, both transient —
@@ -852,10 +975,9 @@ impl Scratch {
 
     /// The most reload targets any one instruction asks for.
     ///
-    /// Two. Three operands is the widest op, and the one that must reach the
-    /// destination anyway — a `Select`'s mask, an FMA's addend, a two-operand
-    /// binary's left — is reloaded straight into it rather than into a
-    /// reservation.
+    /// Two. Three operands is the widest op, and one of them — a `Select`'s
+    /// mask, an FMA's addend, a binary's left — is reloaded straight into
+    /// the destination rather than into a reservation.
     pub const MAX_RELOADS: usize = 2;
 
     /// The most GPR-class temps any one encoding asks for.
@@ -914,6 +1036,7 @@ impl Scratch {
             gpr_temps,
             mask_temps: [mask_temp],
             mask_guard_temp: mask_temp,
+            ptr_reload: None,
         }
     }
 
@@ -964,10 +1087,10 @@ impl Scratch {
 /// one life. A ranged [`Placement`] says that directly, so there is one map
 /// here and nothing beside it.
 ///
-/// `ValueId`s are *not* partitioned by the nest — a `Var` or `Const` leaf
-/// feeding both an invariant expression and a varying one appears in both
-/// scopes' schedules, with an independently chosen location in each. That is
-/// why a placement belongs to a [`ScopeCode`] rather than to the nest: the two
+/// `ValueId`s are *not* partitioned by the nest — two sibling folds binding
+/// the same slot share one binder `Var`, and each fold's schedule holds it
+/// with the location *that* loop keeps its counter in. That is why a
+/// placement belongs to a [`ScopeCode`] rather than to the nest: the two
 /// answers are both true, of different scopes, and a nest-wide map has room
 /// for only one of them.
 #[derive(Debug)]
@@ -1232,7 +1355,7 @@ impl NestAllocation {
             .find_map(|inner| inner.placement_of(root).map(|p| p.at(Point::HEAD)))
             .and_then(|at| match at {
                 Where::Reg(r) => Some(r),
-                Where::Spilled | Where::Remat(_) => None,
+                Where::Ptr(_) | Where::Spilled | Where::Remat(_) => None,
             })
     }
 
@@ -1478,9 +1601,9 @@ impl<'a> Allocation<'a> {
     ///
     /// Such a value's entry in this schedule is a placeholder, and its address
     /// is a park slot that outlives every scope's own frame — so it is not
-    /// this frame's to place. Narrower than "defined elsewhere": a `Const`
-    /// leaf shared with an enclosing scope is genuinely computed here too,
-    /// and does need a location of its own.
+    /// this frame's to place. Narrower than "defined elsewhere": a binder's
+    /// `Var` and an enclosing scope's `Reduce` are placeholders too, but
+    /// they are found where the loop keeps them, not in a park.
     ///
     /// Walks up [`NestAllocation::parent_of`]: a scope's ancestors are the
     /// scopes that actually run it.
@@ -1639,10 +1762,17 @@ pub struct ScopeGuardArm {
 /// 4. gives the destination a free register, or evicts.
 ///
 /// Eviction **splits**: the loser keeps the register it held up to that point
-/// and its life continues in its slot, or — for a constant — nowhere at all,
-/// since re-emitting the load beats a store plus a reload. A single location
-/// per value made a value's whole life pay for the moment of pressure that
-/// evicted it.
+/// and its life continues in its slot — for a constant, its bits, a slot that
+/// was valid from birth and cost no store. A single location per value made a
+/// value's whole life pay for the moment of pressure that evicted it.
+///
+/// A constant is not otherwise special. It is evicted when it is the farthest
+/// read among the values whose slot is valid, and brought back and kept when
+/// it is read again soon, like any other value out of a register. Three rules
+/// used to say otherwise — cheapest to evict regardless of distance, never
+/// re-kept, and never parked for the scopes inside — each written to hide the
+/// thrash the one before it caused, and all three resting on "rebuilt in one
+/// instruction", which is one instruction on aarch64 and two on x86.
 ///
 /// The evaluation order it returns is the one it was given: the arena's
 /// append-only structure already guarantees a topological order, so there is
@@ -1672,11 +1802,13 @@ pub struct LinearScan;
 /// Every trip count is static now that the lattice's rows and columns are
 /// folds like any other, so there is one scale and no tier.
 ///
-/// Greedy, under one constraint: a carry is live across every scope inside
-/// the one that computes it, and no scope may have more registers carried
-/// across it than the pool has above the floor. That is what keeps every
-/// scope's own allocation possible at any depth, and it is the whole of what
-/// used to be a per-scope budget.
+/// Greedy, under one constraint per class: a carry is live across every
+/// scope inside the one that computes it, and no scope may have more
+/// registers of a class carried across it than that class's pool has above
+/// its floor. That is what keeps every scope's own allocation possible at
+/// any depth, and it is the whole of what used to be a per-scope budget. A
+/// pointer root and a vector root are ranked in one list by the same weight,
+/// and each is counted against its own pool.
 struct CarryPlan {
     /// Per scope (the body, then the folds), the roots to carry, hottest
     /// first.
@@ -1717,7 +1849,21 @@ fn scope_ix(scope: Scope) -> usize {
     }
 }
 
-fn plan_carries(nest: &ScopedSchedule, above_floor: usize) -> CarryPlan {
+/// The two per-class budgets [`plan_carries`] fills, indexed by
+/// [`Budget::of`].
+type Budget = [usize; 2];
+
+impl Class {
+    /// This class's index into a per-class array.
+    const fn ix(self) -> usize {
+        match self {
+            Class::Vector => 0,
+            Class::Pointer => 1,
+        }
+    }
+}
+
+fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
     let folds = nest.folds.len();
     for (index, fold) in nest.folds.iter().enumerate() {
         assert!(
@@ -1831,6 +1977,14 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: usize) -> CarryPlan {
             })
             .sum()
     };
+    // A root's class, read off its def in the scope that computes it.
+    let class_of = |scope: Scope, v: ValueId| -> Class {
+        schedule_of(scope)
+            .iter()
+            .find(|d| d.value == v)
+            .map(|d| d.op.class())
+            .unwrap_or_else(|| panic!("{v:?} is a root of {scope:?} but not in its schedule"))
+    };
 
     enum Root {
         Scope(Scope, ValueId),
@@ -1839,6 +1993,7 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: usize) -> CarryPlan {
     }
     struct Candidate {
         weight: usize,
+        class: Class,
         live_across: Vec<usize>,
         root: Root,
     }
@@ -1846,7 +2001,8 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: usize) -> CarryPlan {
 
     // A scope's root is read by the scopes inside it, each read costing a
     // reload every time that scope runs; the carry is live across all of
-    // them.
+    // them. Reads of either class count: a base pointer read by every trip
+    // of a fold is exactly the root a carry is for.
     for scope in scopes() {
         let within: Vec<Scope> = scopes()
             .filter(|s| *s != scope && inside(scope, *s))
@@ -1862,7 +2018,7 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: usize) -> CarryPlan {
                 .map(|s| {
                     schedule_of(*s)
                         .iter()
-                        .flat_map(|d| operands(&d.op))
+                        .flat_map(|d| all_operands(&d.op))
                         .filter(|o| *o == v)
                         .count()
                         * trips_of(*s)
@@ -1873,6 +2029,7 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: usize) -> CarryPlan {
             }
             candidates.push(Candidate {
                 weight,
+                class: class_of(scope, v),
                 live_across: live_across.clone(),
                 root: Root::Scope(scope, v),
             });
@@ -1890,12 +2047,14 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: usize) -> CarryPlan {
         let accumulates = meta_of(j).monoid() != pixelflow_ir::fold::Monoid::SEQ;
         candidates.push(Candidate {
             weight: 2 * trips_j + binder_reads(j),
+            class: Class::Vector,
             live_across: live_across.clone(),
             root: Root::Binder(j),
         });
         if accumulates {
             candidates.push(Candidate {
                 weight: 2 * trips_j,
+                class: Class::Vector,
                 live_across,
                 root: Root::Accumulator(j),
             });
@@ -1905,22 +2064,23 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: usize) -> CarryPlan {
     // inner, a binder before its accumulator, lower ids first.
     candidates.sort_by_key(|c| core::cmp::Reverse(c.weight));
 
-    let mut count = vec![0usize; 1 + folds];
+    let mut count: Vec<Budget> = vec![[0; 2]; 1 + folds];
     let mut plan = CarryPlan {
         scope_roots: vec![Vec::new(); 1 + folds],
         fold_binder: vec![false; folds],
         fold_accumulator: vec![false; folds],
     };
     for candidate in candidates {
+        let class = candidate.class.ix();
         if candidate
             .live_across
             .iter()
-            .any(|&s| count[s] >= above_floor)
+            .any(|&s| count[s][class] >= above_floor[class])
         {
             continue;
         }
         for &s in &candidate.live_across {
-            count[s] += 1;
+            count[s][class] += 1;
         }
         match candidate.root {
             Root::Scope(scope, v) => plan.scope_roots[scope_ix(scope)].push(v),
@@ -1931,11 +2091,11 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: usize) -> CarryPlan {
     plan
 }
 
-/// Every register a scan's own code touches: placed values AND
+/// Every register a scan's own code touches, per class: placed values AND
 /// per-instruction scratch. A temp is a pool register that no placement
 /// records, so taking the complement of the locations alone would hand out a
 /// register the scope destroys.
-fn registers_used(scan: &Scan) -> RegSet {
+fn registers_used(scan: &Scan) -> Carried {
     let mut used: Vec<Reg> = scan.registers().collect();
     for scratch in &scan.scratch {
         used.extend(scratch.temps.iter().flatten().copied());
@@ -1944,14 +2104,31 @@ fn registers_used(scan: &Scan) -> RegSet {
         used.extend(scratch.guard_temp);
         used.extend(scratch.result);
     }
-    RegSet::of(&used)
+    let mut pointers: Vec<Gpr> = scan.pointers().map(PtrReg::as_gpr).collect();
+    pointers.extend(
+        scan.scratch
+            .iter()
+            .filter_map(|s| s.ptr_reload)
+            .map(PtrReg::as_gpr),
+    );
+    Carried {
+        vectors: RegSet::of(&used),
+        pointers: GprSet::of(&pointers),
+    }
 }
 
 impl RegisterAllocator for LinearScan {
     fn allocate_nest(&self, nest: ScopedSchedule, file: &RegisterFile) -> NestAllocation {
         // Which roots are carried, decided once over the whole nest; each
-        // scope below picks the registers.
-        let above_floor = file.scratch.len().saturating_sub(RegisterFile::MIN_SCRATCH) as usize;
+        // scope below picks the registers. The pointer pool's floor is one:
+        // the widest pointer demand any instruction makes is a single
+        // operand reload, or a single destination, never both.
+        let above_floor: Budget = [
+            file.scratch.len().saturating_sub(RegisterFile::MIN_SCRATCH) as usize,
+            file.pointers
+                .len()
+                .saturating_sub(RegisterFile::MIN_POINTERS) as usize,
+        ];
         let plan = plan_carries(&nest, above_floor);
 
         // Outermost first, because that is the direction liveness flows: a
@@ -1967,40 +2144,69 @@ impl RegisterAllocator for LinearScan {
         // this rather than choosing, which is what lets it tell a resident
         // operand from one it has to reload, and it is that scope's whole
         // answer for the value, since nothing inside may move it.
-        let mut carried_into: Vec<RegSet> = Vec::with_capacity(1 + nest.folds.len());
+        let mut carried_into: Vec<Carried> = Vec::with_capacity(1 + nest.folds.len());
         let mut parked_by: Vec<BTreeMap<ValueId, Where>> = Vec::with_capacity(1 + nest.folds.len());
 
         // Carry the roots the plan chose, hottest first, from the registers
-        // the scope's own code leaves free, and record where each root lives
-        // for the scopes inside.
+        // of each class the scope's own code leaves free, and record where
+        // each root lives for the scopes inside.
         let park_roots = |scan: &Scan,
                           roots: &[ValueId],
                           chosen: &[ValueId],
-                          free: RegSet,
+                          free: Carried,
                           parked: &mut BTreeMap<ValueId, Where>|
-         -> RegSet {
-            let mut available = free.iter();
-            let mut own = RegSet::EMPTY;
-            let mut carries: BTreeMap<ValueId, Reg> = BTreeMap::new();
+         -> Carried {
+            let mut vectors = free.vectors.iter();
+            let mut pointers = free.pointers.iter();
+            let mut own = Carried::NONE;
+            let mut carries: BTreeMap<ValueId, Where> = BTreeMap::new();
             for &vid in chosen {
-                let Some(reg) = available.next() else { break };
-                own = own.union(RegSet::of(&[reg]));
-                carries.insert(vid, reg);
+                let class = scan
+                    .schedule
+                    .iter()
+                    .find(|d| d.value == vid)
+                    .map(|d| d.op.class())
+                    .unwrap_or_else(|| {
+                        panic!("{vid:?} is carried by a scope that does not compute it")
+                    });
+                match class {
+                    Class::Vector => {
+                        let Some(reg) = vectors.next() else { continue };
+                        own.vectors = own.vectors.union(RegSet::of(&[reg]));
+                        carries.insert(vid, Where::Reg(reg));
+                    }
+                    Class::Pointer => {
+                        let Some(reg) = pointers.next() else { continue };
+                        own.pointers = own.pointers.union(GprSet::of(&[reg]));
+                        carries.insert(vid, Where::Ptr(PtrReg(reg.0)));
+                    }
+                }
             }
             for root in roots {
-                let at = match carries.get(root) {
-                    Some(reg) => Where::Reg(*reg),
-                    None => Where::Spilled,
-                };
+                let at = carries.get(root).copied().unwrap_or(Where::Spilled);
                 assert!(
                     scan.ranges
                         .get(root.0 as usize)
                         .is_some_and(|r| !r.is_empty()),
-                    "a scope computes its own roots, but {root:?} is not in it"
+                    "a scope computes its own roots, but {root:?} is not in it: {:?}",
+                    scan.schedule
+                        .iter()
+                        .map(|d| (d.value, &d.op))
+                        .collect::<Vec<_>>()
                 );
                 parked.insert(*root, at);
             }
             own
+        };
+        let free_after = |file: &RegisterFile, carried: Carried, scan: &Scan| -> Carried {
+            let used = registers_used(scan);
+            Carried {
+                vectors: file.scratch.without(carried.vectors).without(used.vectors),
+                pointers: file
+                    .pointers
+                    .without(carried.pointers)
+                    .without(used.pointers),
+            }
         };
 
         // Every scope's `Select` guards, before any scan: what an arm may own
@@ -2053,7 +2259,10 @@ impl RegisterAllocator for LinearScan {
         let body_scan = self.scan(
             nest.body.schedule,
             file,
-            &BTreeMap::new(),
+            Boundary {
+                live_in: &BTreeMap::new(),
+                roots: &nest.body.roots,
+            },
             core::mem::take(&mut guards[scope_ix(Scope::Body)]),
         );
         let mut body_parked: BTreeMap<ValueId, Where> = BTreeMap::new();
@@ -2061,7 +2270,7 @@ impl RegisterAllocator for LinearScan {
             &body_scan,
             &nest.body.roots,
             &plan.scope_roots[scope_ix(Scope::Body)],
-            file.scratch.without(registers_used(&body_scan)),
+            free_after(file, Carried::NONE, &body_scan),
             &mut body_parked,
         );
         let body_code = ScopeCode {
@@ -2130,7 +2339,7 @@ impl RegisterAllocator for LinearScan {
             taken_at_def.extend(parent_scratch.result);
             let free = file
                 .scratch
-                .without(carried_into_parent)
+                .without(carried_into_parent.vectors)
                 .without(RegSet::of(&taken_at_def));
             let mut available = free.iter();
             let mut own = RegSet::EMPTY;
@@ -2146,7 +2355,10 @@ impl RegisterAllocator for LinearScan {
                 own = own.union(RegSet::of(&[reg]));
                 *at = Where::Reg(reg);
             }
-            let carried_in = carried_into_parent.union(own);
+            let carried_in = carried_into_parent.union(Carried {
+                vectors: own,
+                pointers: GprSet::EMPTY,
+            });
 
             // What the body finds parked: the ancestors' roots, a `Reduce`
             // it reads but does not open (an enclosing scope's fold, in its
@@ -2177,7 +2389,10 @@ impl RegisterAllocator for LinearScan {
             let scan = self.scan(
                 fold.schedule,
                 &file.inside(carried_in),
-                &fold_parked,
+                Boundary {
+                    live_in: &fold_parked,
+                    roots: &fold.roots,
+                },
                 core::mem::take(&mut guards[scope_ix(Scope::Fold(index))]),
             );
             // This fold's own roots, for the folds inside it: carried from
@@ -2186,9 +2401,7 @@ impl RegisterAllocator for LinearScan {
                 &scan,
                 &fold.roots,
                 &plan.scope_roots[scope_ix(Scope::Fold(index))],
-                file.scratch
-                    .without(carried_in)
-                    .without(registers_used(&scan)),
+                free_after(file, carried_in, &scan),
                 &mut fold_parked,
             );
             carried_into.push(carried_in.union(root_carries));
@@ -2246,11 +2459,14 @@ impl RegisterAllocator for LinearScan {
             taken_at_def.extend(parent_scratch.guard_mask);
             taken_at_def.extend(parent_scratch.guard_temp);
             taken_at_def.extend(parent_scratch.result);
-            let inside = file.inside(carried_into_parent.union(RegSet::of(&taken_at_def)));
+            let inside = file.inside(carried_into_parent.union(Carried {
+                vectors: RegSet::of(&taken_at_def),
+                pointers: GprSet::EMPTY,
+            }));
             // An arm parks nothing and opens no fold: its schedule is a
             // separate arena's, which `extract_guards` carves nothing out of.
             let arm_guards = analyze_select_guards(&arm.schedule, &[], &FoldReads::default());
-            let scan = self.scan(arm.schedule, &inside, &BTreeMap::new(), arm_guards);
+            let scan = self.scan(arm.schedule, &inside, Boundary::CLOSED, arm_guards);
             guard_arms.push(GuardArmScope {
                 parent: arm.parent,
                 at: arm.at,
@@ -2279,9 +2495,7 @@ impl RegisterAllocator for LinearScan {
 /// this schedule is a placeholder the emitter never emits, and the region that
 /// computes it already said where this scope finds it — at the head, and for
 /// the whole of it, since nothing here may move a value the loops outside are
-/// holding. Everything else gets its own ranges, including a `Var`/`Const`
-/// leaf an enclosing scope also computes, which is genuinely rebuilt here and
-/// genuinely may land somewhere else.
+/// holding. Everything else gets its own ranges.
 fn record(scan: &Scan, parked: &BTreeMap<ValueId, Where>) -> Vec<Option<Placement>> {
     let mut placements: Vec<Option<Placement>> = alloc::vec![None; scan.ranges.len()];
     for (key, ranges) in scan.ranges.iter().enumerate() {
@@ -2336,22 +2550,23 @@ struct Scan {
 }
 
 impl Scan {
-    /// Every register any value occupies at any point of this scope.
+    /// Every vector register any value occupies at any point of this scope.
     fn registers(&self) -> impl Iterator<Item = Reg> + use<'_> {
         self.ranges.iter().flatten().filter_map(|(_, at)| match at {
             Where::Reg(r) => Some(*r),
-            Where::Spilled | Where::Remat(_) => None,
+            Where::Ptr(_) | Where::Spilled | Where::Remat(_) => None,
+        })
+    }
+
+    /// Every pointer register any value occupies at any point of this scope.
+    fn pointers(&self) -> impl Iterator<Item = PtrReg> + use<'_> {
+        self.ranges.iter().flatten().filter_map(|(_, at)| match at {
+            Where::Ptr(p) => Some(*p),
+            Where::Reg(_) | Where::Spilled | Where::Remat(_) => None,
         })
     }
 }
 
-/// What giving up a register costs, cheapest first — the order eviction picks
-/// its loser in.
-///
-/// A constant is recomputed and touches no memory at all; a value already in
-/// its slot needs no store; anything else has to be written out. Belady's
-/// distance breaks ties *within* a tier and only within one: the traffic an
-/// eviction causes outweighs how long it waits to cause it.
 /// What it costs the instruction being placed to lose one of its own reads —
 /// the tier that outranks every kind of deferred traffic, and the reason an
 /// operand's register is a *priced* choice rather than a forbidden one.
@@ -2375,13 +2590,19 @@ enum ReadHere {
     NeedsRegister,
 }
 
+/// What giving up a register costs, cheapest first — the order eviction picks
+/// its loser in.
+///
+/// A value whose slot already holds it needs no store; anything else has to be
+/// written out. Belady's distance breaks ties *within* a tier and only within
+/// one: the traffic an eviction causes outweighs how long it waits to cause it.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct EvictionRank {
     /// Read by the instruction being placed — see [`ReadHere`].
     ///
-    /// The tiers below price the traffic an eviction *defers*; for a value read
-    /// right here there is nothing to defer, so taking its register buys a
-    /// reload inside this very instruction. Without this, a value already in
+    /// The fields below price the traffic an eviction *defers*; for a value
+    /// read right here there is nothing to defer, so taking its register buys
+    /// a reload inside this very instruction. Without this, a value already in
     /// its slot is the standing favourite — and at a read, the standing
     /// favourite is whichever value the instruction is reading.
     ///
@@ -2390,8 +2611,9 @@ struct EvictionRank {
     /// (`next_read(operand, i + 1)`), so by the time the destination is
     /// contested a just-kept operand would read as "not needed now".
     read_here: ReadHere,
-    /// 0 = rematerialized, 1 = slot already valid, 2 = needs a store.
-    traffic: u8,
+    /// Whether losing the register costs a store: false once the slot holds
+    /// the value, which for a constant is from birth.
+    store: bool,
     /// Nearest next read *last*, so the cheapest loser is the one used
     /// farthest out.
     nearest: core::cmp::Reverse<usize>,
@@ -2439,20 +2661,31 @@ impl Reservations {
 /// One struct rather than nine locals threaded through five helpers — the
 /// eviction rule reads four of them at once.
 struct Pass {
-    /// The pool, low to high. `owner` is indexed the same way.
-    pool: Vec<Reg>,
+    /// Which class this pass places: its pool, its defs, its operands. The
+    /// other class's values are invisible to it, except that a def of
+    /// either class is a program point every value's ranges are cut at.
+    class: Class,
+    /// The pool, low to high, as register numbers of `class`'s file.
+    /// `owner` is indexed the same way.
+    pool: Vec<u8>,
     /// The value currently held in each pool register.
     owner: Vec<Option<ValueId>>,
+    /// Dense by `ValueId.0`: whether the value is of this pass's class —
+    /// defined here by an op of that class, or parked by an enclosing scope
+    /// as one. Only these get a destination, ranges, or a reload.
+    mine: Vec<bool>,
     /// Where each value is at the point the pass has reached.
     at: Vec<Option<Where>>,
     /// The ranges settled so far, per value, in increasing index order.
     ranges: Vec<Vec<(usize, Where)>>,
-    /// The `f32` bits of every value that is a constant — the ones that come
-    /// back by being recomputed rather than reloaded.
+    /// The `f32` bits of every value that is a constant: what
+    /// [`Pass::out_of_register`] names for it, so the emitter reloads it from
+    /// the instruction stream rather than a frame slot it was never given.
     const_bits: Vec<Option<u32>>,
-    /// Whether the value's slot already holds it, so losing a register again
-    /// costs no store. True from the first range that puts it in memory,
-    /// because a value in memory anywhere is stored right after its definition.
+    /// Whether the value's slot already holds it, so losing a register costs
+    /// no store. True from the first range that puts it in memory, because a
+    /// value in memory anywhere is stored right after its definition — and
+    /// true from birth for a constant, whose slot is its bits.
     in_slot: Vec<bool>,
     /// Where each value is defined, or `usize::MAX` for one this scope reads
     /// without computing.
@@ -2471,36 +2704,115 @@ struct Pass {
     cursor: Vec<usize>,
 }
 
+/// What crosses a scope's edges: the values an enclosing scope parked for it,
+/// which it reads and never computes, and the values it computes for the
+/// scopes inside it, which it hands off. What a scan is told beside its
+/// schedule and its guards.
+#[derive(Clone, Copy)]
+struct Boundary<'a> {
+    /// Where each value an enclosing scope parked lives for the whole of
+    /// this one.
+    live_in: &'a BTreeMap<ValueId, Where>,
+    /// The values this scope computes for the scopes inside it.
+    roots: &'a [ValueId],
+}
+
+impl Boundary<'_> {
+    /// A scope nothing crosses into or out of: a guard arm, whose schedule is
+    /// a separate arena's and which opens no fold.
+    const CLOSED: Boundary<'static> = Boundary {
+        live_in: &BTreeMap::new(),
+        roots: &[],
+    };
+}
+
+/// What a pass reads about a scope beyond its schedule: the parks it enters
+/// with, the roots it hands off, and its guards' mask reads and arms. The
+/// same for both classes' passes over one scope.
+#[derive(Clone, Copy)]
+struct Reads<'a> {
+    /// Where each value an enclosing scope parked lives for the whole of
+    /// this one.
+    live_in: &'a BTreeMap<ValueId, Where>,
+    /// The values this scope computes for the scopes inside it.
+    roots: &'a [ValueId],
+    /// Per instruction, every mask a guard emitted before it reads
+    /// ([`guard_sites`]).
+    sites: &'a [Vec<ValueId>],
+    /// Per instruction, the guard arm it sits in ([`guarded_arms`]).
+    arms: &'a [Option<(usize, usize)>],
+}
+
 impl Pass {
     /// `sites[i]` is every mask a guard emitted *before* instruction `i` reads
     /// ([`guard_sites`]). A guard's read is a read: it decides `expire`, the
     /// Belady distance and the read-here tier exactly as an operand's does,
     /// and leaving it out made a mask read only by a branch the preferred
     /// eviction at the very index the branch tests it.
-    fn new(
-        dag: &[Def],
-        file: &RegisterFile,
-        vec_len: usize,
-        live_in: &BTreeMap<ValueId, Where>,
-        sites: &[Vec<ValueId>],
-    ) -> Self {
+    ///
+    /// `roots` are the values this scope hands to the scopes inside it, right
+    /// after their definition. That hand-off is a read too, at the def's own
+    /// index: it is what makes a root's definition materialize even when
+    /// nothing in this schedule reads it — a constant's included, whose
+    /// definition otherwise emits nothing and leaves the park unwritten.
+    fn new(dag: &[Def], file: &RegisterFile, reads: Reads<'_>, class: Class) -> Self {
+        let Reads {
+            live_in,
+            roots,
+            sites,
+            arms: _,
+        } = reads;
+        // Dense by `ValueId`, which the nest does not partition: a fold's
+        // schedule keeps its parent's ids, so this is the largest id here
+        // rather than the schedule's length.
+        let vec_len = dag
+            .iter()
+            .map(|def| def.value.0 as usize + 1)
+            .max()
+            .unwrap_or(0);
         let mut reads: Vec<Vec<usize>> = vec![Vec::new(); vec_len];
         let mut const_bits: Vec<Option<u32>> = vec![None; vec_len];
         let mut defined_at: Vec<usize> = vec![usize::MAX; vec_len];
+        let mut mine: Vec<bool> = vec![false; vec_len];
         for (i, def) in dag.iter().enumerate() {
-            defined_at[def.value.0 as usize] = i;
+            let k = def.value.0 as usize;
+            mine[k] = def.op.class() == class;
+            if !mine[k] {
+                // The other class's def: a program point, never a value
+                // here. Its reads of this class are still reads.
+                for read in operands_of(&def.op, class) {
+                    let r = &mut reads[read.0 as usize];
+                    if r.last() != Some(&i) {
+                        r.push(i);
+                    }
+                }
+                continue;
+            }
+            defined_at[k] = i;
             if let ScheduledOp::Const(val) = def.op {
-                const_bits[def.value.0 as usize] = Some(val.to_bits());
+                const_bits[k] = Some(val.to_bits());
+            }
+            // The hand-off first: a definition precedes every read of its
+            // value, so the list stays ascending.
+            if roots.contains(&def.value) {
+                reads[k].push(i);
             }
             // Operands and guard masks together, so each value's read list
-            // stays ascending with one entry per index.
-            for read in operands(&def.op).chain(sites[i].iter().copied()) {
+            // stays ascending with one entry per index. A guard's mask is a
+            // vector, so only the vector pass has sites.
+            let masks = match class {
+                Class::Vector => sites[i].as_slice(),
+                Class::Pointer => &[],
+            };
+            for read in operands_of(&def.op, class).chain(masks.iter().copied()) {
                 let r = &mut reads[read.0 as usize];
                 if r.last() != Some(&i) {
                     r.push(i);
                 }
             }
         }
+        // A constant's slot is its bits: valid before anything is emitted.
+        let in_slot: Vec<bool> = const_bits.iter().map(Option::is_some).collect();
         let mut at: Vec<Option<Where>> = vec![None; vec_len];
         let mut is_live_in = vec![false; vec_len];
         for (v, park) in live_in {
@@ -2508,20 +2820,31 @@ impl Pass {
             if k >= vec_len {
                 continue; // Parked by an enclosing scope; not read here.
             }
+            // A park of either class marks its placeholder as not a
+            // definition here: it emits nothing, and a `Reduce` placeholder
+            // opens no loop for either pass to evict around. Its location is
+            // this pass's answer only for a value of this pass's class — a
+            // vector's `Const(0.0)` placeholder is not the value, and a
+            // pointer's placeholder is its own op, both of which say the
+            // class.
+            is_live_in[k] = true;
+            if !mine[k] {
+                continue;
+            }
             // The enclosing scope's answer, from the first point of this one.
-            // Its placeholder is neither a definition (it emits nothing) nor a
-            // constant (its op says `Const(0.0)`, which is not the value).
             at[k] = Some(*park);
             const_bits[k] = None;
-            is_live_in[k] = true;
         }
+        let pool = file.pool(class);
         Self {
-            pool: file.scratch().collect(),
-            owner: vec![None; file.scratch.len() as usize],
+            class,
+            owner: vec![None; pool.len()],
+            pool,
+            mine,
             at,
             ranges: vec![Vec::new(); vec_len],
             const_bits,
-            in_slot: vec![false; vec_len],
+            in_slot,
             defined_at,
             live_in: is_live_in,
             reads,
@@ -2529,22 +2852,40 @@ impl Pass {
         }
     }
 
-    /// Whether `v` is in a register at the point this pass has reached.
-    fn is_resident(&self, v: ValueId) -> bool {
-        matches!(self.at[v.0 as usize], Some(Where::Reg(_)))
+    /// Pool slot `slot` as a location of this pass's class.
+    fn location(&self, slot: usize) -> Where {
+        match self.class {
+            Class::Vector => Where::Reg(Reg(self.pool[slot])),
+            Class::Pointer => Where::Ptr(PtrReg(self.pool[slot])),
+        }
     }
 
-    /// Claim one more pool register for this instruction's own use.
+    /// Whether `v` is in a register at the point this pass has reached.
+    fn is_resident(&self, v: ValueId) -> bool {
+        matches!(
+            self.at[v.0 as usize],
+            Some(Where::Reg(_)) | Some(Where::Ptr(_))
+        )
+    }
+
+    /// Claim one more pool register for this instruction's own use, as a
+    /// register number of this pass's class.
     ///
     /// Disjoint from every register the instruction reads (`live`, its
     /// operands and its guards' masks) and from every role it has already
     /// filled — the destination included, once it has been claimed, because
     /// it is pushed into `taken` like any other role.
-    fn reserve(&mut self, index: usize, taken: &mut Reservations, live: &[ValueId]) -> Reg {
+    fn reserve(&mut self, index: usize, taken: &mut Reservations, live: &[ValueId]) -> u8 {
         let open = self.without_operands(taken, live);
         let slot = self.claim(index, &open);
         taken.push(slot);
         self.pool[slot]
+    }
+
+    /// Whether `v` is read at exactly `at` — by an operand, a guard, or the
+    /// hand-off of a root at its own definition.
+    fn read_at(&self, v: ValueId, at: usize) -> bool {
+        self.reads[v.0 as usize].binary_search(&at).is_ok()
     }
 
     /// The next read of `v` at or after `from`.
@@ -2563,20 +2904,13 @@ impl Pass {
     /// candidates already exclude everything the instruction reads.
     fn rank(&mut self, v: ValueId, from: usize, read_here: &[(ValueId, ReadHere)]) -> EvictionRank {
         let k = v.0 as usize;
-        let traffic = if self.const_bits[k].is_some() {
-            0
-        } else if self.in_slot[k] {
-            1
-        } else {
-            2
-        };
         let distance = self.next_read(v, from).map_or(usize::MAX, |r| r - from);
         EvictionRank {
             read_here: read_here
                 .iter()
                 .find(|(r, _)| *r == v)
                 .map_or(ReadHere::No, |(_, tier)| *tier),
-            traffic,
+            store: !self.in_slot[k],
             nearest: core::cmp::Reverse(distance),
         }
     }
@@ -2594,7 +2928,7 @@ impl Pass {
         }
     }
 
-    /// Where `v` goes when it loses its register: nowhere at all if it is a
+    /// Where `v` goes when it loses its register: its bits if it is a
     /// constant, and its slot otherwise.
     fn out_of_register(&self, v: ValueId) -> Where {
         match self.const_bits[v.0 as usize] {
@@ -2615,7 +2949,7 @@ impl Pass {
     /// Put `v` in pool slot `slot` from `index` on.
     fn occupy(&mut self, v: ValueId, slot: usize, index: usize) {
         self.owner[slot] = Some(v);
-        self.place(v, index, Where::Reg(self.pool[slot]));
+        self.place(v, index, self.location(slot));
     }
 
     /// Free every register whose owner is not read again.
@@ -2639,10 +2973,11 @@ impl Pass {
     /// definition wrote — into `dst` for the operand the encoding consumes
     /// there, into a reserved reload register otherwise. That is the whole
     /// of what the encoders tolerate: no encoder reads every source before
-    /// writing `dst` (SSE2's `movaps dst, src1` prelude; `setup_mov` ahead of
-    /// a `Select` or FMA on every ISA), so a *resident* operand in `dst`'s
-    /// register would be corrupted. A displaced one is not resident, which is
-    /// why the split is recorded at this index and not the next.
+    /// writing `dst` (`setup_mov` ahead of a `Select` or FMA on every ISA;
+    /// the decomposed `MulAdd`'s multiply before its add), so a *resident*
+    /// operand in `dst`'s register would be corrupted. A displaced one is
+    /// not resident, which is why the split is recorded at this index and
+    /// not the next.
     /// [`EvictionRank`] prices it so it stays a last resort.
     fn open(&self, taken: &Reservations) -> Vec<usize> {
         (0..self.owner.len()).filter(|k| !taken.holds(*k)).collect()
@@ -2694,9 +3029,13 @@ impl Pass {
         }
         let slot = self.loser(open, index, &[]).unwrap_or_else(|| {
             unreachable!(
-                "every pool register is already one of this instruction's roles \
-                 or a value it reads, against a floor of {}",
-                RegisterFile::MIN_SCRATCH
+                "every {:?} pool register is already one of this instruction's \
+                 roles or a value it reads, against a floor of {}",
+                self.class,
+                match self.class {
+                    Class::Vector => RegisterFile::MIN_SCRATCH,
+                    Class::Pointer => RegisterFile::MIN_POINTERS,
+                }
             )
         });
         self.split_out(slot, index);
@@ -2762,36 +3101,38 @@ fn guard_sites(guards: &[SelectGuard], len: usize) -> Vec<Vec<ValueId>> {
 }
 
 impl LinearScan {
-    /// One region, scanned straight through.
+    /// One region, scanned straight through — once per register class.
     ///
     /// `live_in` is where each value an enclosing scope parked lives for the
     /// whole of this one — the answer this scan must read rather than choose,
     /// because that scope already chose it.
+    ///
+    /// `boundary` is what crosses this scope's edges: the parks it enters
+    /// with and the roots it hands to the scopes inside it ([`Boundary`]).
     ///
     /// `guards` are this schedule's `Select` guards: [`analyze_select_guards`]
     /// over it, told what the scopes inside it read — its roots, which no arm
     /// may own (a skipped arm would leave the park unwritten for a loop that
     /// runs regardless), and what each loop it opens reads, which no arm may
     /// own unless the loop is skipped with it.
+    ///
+    /// The vector pass and the pointer pass see the same schedule, the same
+    /// guard arms and the same parks; each places its own class's values in
+    /// its own pool and is blind to the other's. Their ranges are disjoint
+    /// by construction (a value has one class), so the two answers are one
+    /// [`Scan`].
     fn scan(
         &self,
         dag: Vec<Def>,
         file: &RegisterFile,
-        live_in: &BTreeMap<ValueId, Where>,
+        boundary: Boundary<'_>,
         guards: Vec<SelectGuard>,
     ) -> Scan {
-        let vec_len = dag
-            .iter()
-            .map(|def| def.value.0 as usize + 1)
-            .max()
-            .unwrap_or(0);
-        let mut scratch_for: Vec<Scratch> = vec![Scratch::default(); dag.len()];
-
         if dag.is_empty() {
             return Scan {
                 schedule: dag,
                 ranges: Vec::new(),
-                scratch: scratch_for,
+                scratch: vec![],
                 guards,
             };
         }
@@ -2804,10 +3145,53 @@ impl LinearScan {
         // path reaching any of its readers ran.
         let arms = guarded_arms(&guards, dag.len());
         let sites = guard_sites(&guards, dag.len());
+        let Boundary { live_in, roots } = boundary;
+        let reads = Reads {
+            live_in,
+            roots,
+            sites: &sites,
+            arms: &arms,
+        };
+
+        let (vectors, mut scratch) = self.pass(&dag, file, reads, Class::Vector);
+        let (pointers, ptr_scratch) = self.pass(&dag, file, reads, Class::Pointer);
+        let mut ranges = vectors;
+        for (k, mine) in pointers.into_iter().enumerate() {
+            if !mine.is_empty() {
+                debug_assert!(ranges[k].is_empty(), "a value placed in both classes");
+                ranges[k] = mine;
+            }
+        }
+        for (mine, theirs) in scratch.iter_mut().zip(ptr_scratch) {
+            mine.ptr_reload = theirs.ptr_reload;
+        }
+
+        Scan {
+            schedule: dag,
+            ranges,
+            scratch,
+            guards,
+        }
+    }
+
+    /// The forward pass for one class: the ranges each value of that class
+    /// is cut into, and the registers of that class each instruction may
+    /// destroy.
+    fn pass(
+        &self,
+        dag: &[Def],
+        file: &RegisterFile,
+        reads: Reads<'_>,
+        class: Class,
+    ) -> (Vec<Vec<(usize, Where)>>, Vec<Scratch>) {
+        let Reads { sites, arms, .. } = reads;
+        let mut scratch_for: Vec<Scratch> = vec![Scratch::default(); dag.len()];
+        let vector = class == Class::Vector;
 
         // After `sites`: a guard's read of its mask is a read the pass has to
-        // know about from the start (see `Pass::new`).
-        let mut pass = Pass::new(&dag, file, vec_len, live_in, &sites);
+        // know about from the start (see `Pass::new`), and so is the hand-off
+        // of a root.
+        let mut pass = Pass::new(dag, file, reads, class);
         let mut reverts: Vec<Vec<(ValueId, Where, usize)>> =
             (0..dag.len()).map(|_| Vec::new()).collect();
         // Pool slots a definition held for its own instruction and no longer:
@@ -2816,6 +3200,7 @@ impl LinearScan {
             (0..dag.len()).map(|_| Vec::new()).collect();
 
         for (i, def) in dag.iter().enumerate() {
+            let mine = pass.mine[def.value.0 as usize];
             for (v, slot) in core::mem::take(&mut demotions[i]) {
                 if pass.owner[slot] == Some(v) {
                     pass.owner[slot] = None;
@@ -2846,13 +3231,12 @@ impl LinearScan {
             // through (constants remat instead of spilling); the only
             // difference is that here it runs for every occupant at once,
             // pre-emptively, rather than one at a time as something else
-            // claims the slot. Without this, `extract_folds`'s "a shared
-            // invariant leaf stays in both places, recomputed" is only
-            // true of the arena -- the register that held the outer
-            // copy's result can be clobbered by the fold's own recompute
-            // of the identical value, and whichever one the loop's last
-            // iteration leaves behind is read back instead of the outer
-            // scope's own answer.
+            // claims the slot. Without this, a register holding one of
+            // this scope's values across the loop is reused by the body
+            // for a value of its own, and whichever one the loop's last
+            // iteration leaves behind is read back instead of this
+            // scope's own answer. Both classes: the body's pointer pool is
+            // as fresh as its vector pool.
             //
             // Not for a live-in `Reduce`: that is a placeholder for a loop an
             // enclosing scope already ran, and nothing runs here.
@@ -2874,7 +3258,7 @@ impl LinearScan {
             }
 
             let mut reads: Vec<ValueId> = Vec::new();
-            for operand in operands(&def.op) {
+            for operand in operands_of(&def.op, class) {
                 if !reads.contains(&operand) {
                     reads.push(operand);
                 }
@@ -2882,77 +3266,84 @@ impl LinearScan {
             // What this instruction reads, its guards included. A guard runs
             // *before* the instruction and reads a mask that is nobody's
             // operand there, so without this a temp could take the register
-            // the branch is about to test.
+            // the branch is about to test. A mask is a vector.
             let mut live_here = reads.clone();
-            for mask in &sites[i] {
-                if !live_here.contains(mask) {
-                    live_here.push(*mask);
+            if vector {
+                for mask in &sites[i] {
+                    if !live_here.contains(mask) {
+                        live_here.push(*mask);
+                    }
                 }
             }
 
             // Scratch, reserved before anything else this instruction wants:
             // the encoder writes it while every operand is still live and
             // before the destination is written, so it may share a register
-            // with neither.
+            // with neither. Every encoding's scratch is a vector or an
+            // instruction-scoped GPR/mask — nothing asks for pointer-pool
+            // scratch — so this is the vector pass's alone.
             let mut taken = Reservations::new();
 
-            // A live-in def emits nothing, so its encoding wants nothing —
-            // a placeholder for an enclosing scope's fold would otherwise
-            // reserve a loop's three temps for a loop that does not run here.
-            let wanted = if pass.live_in[def.value.0 as usize] {
-                0
-            } else {
-                (file.temps_for)(&def.op) as usize
-            };
-            assert!(
-                wanted <= Scratch::MAX_TEMPS,
-                "a backend asked for {wanted} scratch registers for one \
-                 instruction; `Scratch::MAX_TEMPS` is {}",
-                Scratch::MAX_TEMPS
-            );
-            for role in 0..wanted {
-                scratch_for[i].temps[role] = Some(pass.reserve(i, &mut taken, &live_here));
-            }
+            if vector {
+                // A live-in def emits nothing, so its encoding wants nothing —
+                // a placeholder for an enclosing scope's fold would otherwise
+                // reserve a loop's three temps for a loop that does not run here.
+                let wanted = if pass.live_in[def.value.0 as usize] {
+                    0
+                } else {
+                    (file.temps_for)(&def.op) as usize
+                };
+                assert!(
+                    wanted <= Scratch::MAX_TEMPS,
+                    "a backend asked for {wanted} scratch registers for one \
+                     instruction; `Scratch::MAX_TEMPS` is {}",
+                    Scratch::MAX_TEMPS
+                );
+                for role in 0..wanted {
+                    scratch_for[i].temps[role] = Some(Reg(pass.reserve(i, &mut taken, &live_here)));
+                }
 
-            // GPR- and mask-class scratch, reserved the same way but against
-            // their own pools: nothing else in the schedule ever asks for a
-            // GPR or a mask register, so there is no interference to track and
-            // no eviction to perform — each instruction simply takes the low
-            // members of the class pool it needs.
-            let gpr_wanted = (file.gpr_temps_for)(&def.op) as usize;
-            assert!(
-                gpr_wanted <= Scratch::MAX_GPR_TEMPS,
-                "a backend asked for {gpr_wanted} GPR scratch registers for \
-                 one instruction; `Scratch::MAX_GPR_TEMPS` is {}",
-                Scratch::MAX_GPR_TEMPS
-            );
-            assert!(
-                file.gpr_scratch.len() as usize >= gpr_wanted,
-                "{:?} needs {gpr_wanted} GPRs but `RegisterFile::gpr_scratch` \
-                 holds only {}",
-                def.op,
-                file.gpr_scratch.len()
-            );
-            for (role, reg) in file.gpr_scratch.iter().take(gpr_wanted).enumerate() {
-                scratch_for[i].gpr_temps[role] = Some(reg);
-            }
+                // GPR- and mask-class scratch, reserved the same way but
+                // against their own pools: nothing else in the schedule ever
+                // asks for an instruction-scoped GPR or a mask register, so
+                // there is no interference to track and no eviction to
+                // perform — each instruction simply takes the low members of
+                // the class pool it needs.
+                let gpr_wanted = (file.gpr_temps_for)(&def.op) as usize;
+                assert!(
+                    gpr_wanted <= Scratch::MAX_GPR_TEMPS,
+                    "a backend asked for {gpr_wanted} GPR scratch registers for \
+                     one instruction; `Scratch::MAX_GPR_TEMPS` is {}",
+                    Scratch::MAX_GPR_TEMPS
+                );
+                assert!(
+                    file.gpr_scratch.len() as usize >= gpr_wanted,
+                    "{:?} needs {gpr_wanted} GPRs but `RegisterFile::gpr_scratch` \
+                     holds only {}",
+                    def.op,
+                    file.gpr_scratch.len()
+                );
+                for (role, reg) in file.gpr_scratch.iter().take(gpr_wanted).enumerate() {
+                    scratch_for[i].gpr_temps[role] = Some(reg);
+                }
 
-            let mask_wanted = (file.mask_temps_for)(&def.op) as usize;
-            assert!(
-                mask_wanted <= Scratch::MAX_MASK_TEMPS,
-                "a backend asked for {mask_wanted} mask scratch registers for \
-                 one instruction; `Scratch::MAX_MASK_TEMPS` is {}",
-                Scratch::MAX_MASK_TEMPS
-            );
-            assert!(
-                file.mask_scratch.len() as usize >= mask_wanted,
-                "{:?} needs {mask_wanted} mask registers but \
-                 `RegisterFile::mask_scratch` holds only {}",
-                def.op,
-                file.mask_scratch.len()
-            );
-            for (role, reg) in file.mask_scratch.iter().take(mask_wanted).enumerate() {
-                scratch_for[i].mask_temps[role] = Some(reg);
+                let mask_wanted = (file.mask_temps_for)(&def.op) as usize;
+                assert!(
+                    mask_wanted <= Scratch::MAX_MASK_TEMPS,
+                    "a backend asked for {mask_wanted} mask scratch registers for \
+                     one instruction; `Scratch::MAX_MASK_TEMPS` is {}",
+                    Scratch::MAX_MASK_TEMPS
+                );
+                assert!(
+                    file.mask_scratch.len() as usize >= mask_wanted,
+                    "{:?} needs {mask_wanted} mask registers but \
+                     `RegisterFile::mask_scratch` holds only {}",
+                    def.op,
+                    file.mask_scratch.len()
+                );
+                for (role, reg) in file.mask_scratch.iter().take(mask_wanted).enumerate() {
+                    scratch_for[i].mask_temps[role] = Some(reg);
+                }
             }
 
             // A read of a value that is not in a register: bring it back into
@@ -2961,14 +3352,14 @@ impl LinearScan {
             // pressured stretch in memory and the rest in a register, instead
             // of one or the other for the whole of its life.
             for operand in reads.clone() {
-                // Only a value whose return costs memory traffic is worth a
-                // register. A constant lives nowhere and is rebuilt in one
-                // instruction, which is the same instruction a reload would
-                // be — and eviction ranks constants cheapest to give up, so
-                // keeping one buys a register the very next definition takes
-                // back. The two rules would otherwise fight, and a constant
-                // would spend the kernel bouncing in and out of the pool.
-                if !matches!(pass.at[operand.0 as usize], Some(Where::Spilled)) {
+                // A value out of a register — in its slot, or a constant
+                // read back from its bits — costs the same reload instruction
+                // here whether it is kept afterwards or not, so keeping it is
+                // free until something evicts it, and an eviction emits
+                // nothing. Constants used to be excluded here to stop them
+                // thrashing against an eviction rule that always chose them
+                // first; that rule is gone, and this exclusion went with it.
+                if pass.is_resident(operand) {
                     continue;
                 }
                 // A parked root's location belongs to the scope that computed
@@ -3033,22 +3424,24 @@ impl LinearScan {
             // `Where(v, def(v)) == Reg(_)`, which is what dissolves the fixed
             // destination register.
             //
-            // Three definitions write nothing here and take no pool register:
-            // a placeholder for a value an enclosing scope parked (its location
-            // is that scope's answer — a fold's binder `Var` is one, and a
-            // `Var` that is not parked names a binder no enclosing fold
-            // binds, which no legal schedule has), a surviving `Reduce`'s
-            // result (its accumulator's slot, where the loop leaves it
-            // whether or not `allocate_nest` carried the accumulator across
-            // the iterations — docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md,
+            // Four definitions write nothing here and take no pool register:
+            // a def of the other class (that pass's concern), a placeholder
+            // for a value an enclosing scope parked (its location is that
+            // scope's answer — a fold's binder `Var` is one, and a `Var`
+            // that is not parked names a binder no enclosing fold binds,
+            // which no legal schedule has), a surviving `Reduce`'s result
+            // (its accumulator's slot, where the loop leaves it whether or
+            // not `allocate_nest` carried the accumulator across the
+            // iterations — docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md,
             // "the design decision that makes this tractable"; the driver
             // pins the real address afterward through
             // `FrameLayout::pin_slot`), and the two unit-typed effects, a
-            // `Write` and a `Seq`, which define no value at all. A
-            // rematerialized constant that loses the contest is the fourth:
-            // its definition emits no instruction, so it needs nothing to
-            // write to.
-            let destination: Option<usize> = if pass.live_in[def.value.0 as usize] {
+            // `Write` and a `Seq`, which define no value at all. A constant
+            // that loses the contest is the fifth: its slot is already
+            // valid, so its definition emits no instruction and needs nothing
+            // to write to — unless the value is read right here, which a
+            // root's hand-off is (see `Pass::new`), and then it wins.
+            let destination: Option<usize> = if !mine || pass.live_in[def.value.0 as usize] {
                 None
             } else if let ScheduledOp::Var(k) = def.op {
                 panic!(
@@ -3078,34 +3471,36 @@ impl LinearScan {
                 // same pool then has to find. A value read twice by one
                 // instruction takes the harsher of its two tiers. A guard's
                 // mask read before the instruction needs `guard_mask`, so it
-                // is never the cheap kind.
-                let ops: Vec<ValueId> = operands(&def.op).collect();
-                let mut resident = [true; 3];
-                for (k, operand) in ops.iter().enumerate() {
-                    resident[k] = pass.is_resident(*operand);
-                }
+                // is never the cheap kind. A pointer def reads nothing.
                 let mut read_here: Vec<(ValueId, ReadHere)> = Vec::new();
-                let mut note = |v: ValueId, tier: ReadHere| match read_here
-                    .iter_mut()
-                    .find(|(r, _)| *r == v)
-                {
-                    Some((_, held)) => *held = (*held).max(tier),
-                    None => read_here.push((v, tier)),
-                };
-                for (k, operand) in ops.iter().enumerate() {
-                    let mut without = resident;
-                    without[k] = false;
-                    let tier = match operand_sources(&def.op, without)[k] {
-                        OperandSource::Destination => ReadHere::FromDst,
-                        OperandSource::Reload(_) => ReadHere::NeedsRegister,
-                        OperandSource::Resident => {
-                            unreachable!("an operand forced non-resident is not Resident")
-                        }
+                if vector {
+                    let ops: Vec<ValueId> = operands(&def.op).collect();
+                    let mut resident = [true; 3];
+                    for (k, operand) in ops.iter().enumerate() {
+                        resident[k] = pass.is_resident(*operand);
+                    }
+                    let mut note = |v: ValueId, tier: ReadHere| match read_here
+                        .iter_mut()
+                        .find(|(r, _)| *r == v)
+                    {
+                        Some((_, held)) => *held = (*held).max(tier),
+                        None => read_here.push((v, tier)),
                     };
-                    note(*operand, tier);
-                }
-                for mask in &sites[i] {
-                    note(*mask, ReadHere::NeedsRegister);
+                    for (k, operand) in ops.iter().enumerate() {
+                        let mut without = resident;
+                        without[k] = false;
+                        let tier = match operand_sources(&def.op, without)[k] {
+                            OperandSource::Destination => ReadHere::FromDst,
+                            OperandSource::Reload(_) => ReadHere::NeedsRegister,
+                            OperandSource::Resident => {
+                                unreachable!("an operand forced non-resident is not Resident")
+                            }
+                        };
+                        note(*operand, tier);
+                    }
+                    for mask in &sites[i] {
+                        note(*mask, ReadHere::NeedsRegister);
+                    }
                 }
 
                 let open = pass.open(&taken);
@@ -3115,9 +3510,8 @@ impl LinearScan {
                 } else {
                     let slot = pass.loser(&open, i, &read_here).unwrap_or_else(|| {
                         unreachable!(
-                            "the pool is at most this instruction's temps against a \
-                             floor of {}, so some register is open and held",
-                            RegisterFile::MIN_SCRATCH
+                            "the {class:?} pool is at most this instruction's temps \
+                             against its floor, so some register is open and held"
                         )
                     });
                     let occupant =
@@ -3125,23 +3519,28 @@ impl LinearScan {
                     // Whether the new value keeps the register past this
                     // instruction, by the rule that chose the slot: its own
                     // rank against the occupant's. A definition has written
-                    // nothing yet, so its slot is never the cheap kind.
+                    // nothing yet, so its slot is valid only if it is a
+                    // constant's.
                     let new_rank = EvictionRank {
-                        // A definition is a write; nothing reads it here.
-                        read_here: ReadHere::No,
-                        traffic: if pass.const_bits[def.value.0 as usize].is_some() {
-                            0
+                        // A definition is a write; nothing reads it here as
+                        // an operand. A root's hand-off does read it here,
+                        // from the register it is written into, and that is
+                        // the one read a definition cannot serve from a slot.
+                        read_here: if pass.read_at(def.value, i) {
+                            ReadHere::NeedsRegister
                         } else {
-                            2
+                            ReadHere::No
                         },
+                        store: !pass.in_slot[def.value.0 as usize],
                         nearest: core::cmp::Reverse(
                             pass.next_read(def.value, i).map_or(usize::MAX, |r| r - i),
                         ),
                     };
                     let keeps = new_rank > pass.rank(occupant, i, &read_here);
-                    if !keeps && pass.const_bits[def.value.0 as usize].is_some() {
-                        // Nothing to write: the definition of a rematerialized
-                        // constant emits no instruction, so it takes no
+                    if !keeps && pass.in_slot[def.value.0 as usize] {
+                        // Nothing to write: a value whose slot is valid before
+                        // its definition runs is a constant, and a constant
+                        // not kept emits no instruction, so it takes no
                         // register and evicts no one. Reserving one for it
                         // would cost a live value its register to hold a value
                         // the emitter never computes.
@@ -3171,6 +3570,19 @@ impl LinearScan {
             // registers may not land on it.
             if let Some(slot) = destination {
                 taken.push(slot);
+            }
+
+            if !vector {
+                // The pointer pass's one reservation: the base this
+                // instruction reads, when it is not in a register here. The
+                // destination was chosen above, so residency is final.
+                if let Some(base) = pointer_operand(&def.op)
+                    && !pass.is_resident(base)
+                {
+                    scratch_for[i].ptr_reload =
+                        Some(PtrReg(pass.reserve(i, &mut taken, &live_here)));
+                }
+                continue;
             }
 
             // A guard's own two registers, on the instruction it is emitted
@@ -3205,10 +3617,10 @@ impl LinearScan {
                 if sites[i].iter().any(|m| !pass.is_resident(*m))
                     || guard_op_mask.is_some_and(|m| !pass.is_resident(m))
                 {
-                    scratch_for[i].guard_mask = Some(pass.reserve(i, &mut taken, &live_here));
+                    scratch_for[i].guard_mask = Some(Reg(pass.reserve(i, &mut taken, &live_here)));
                 }
                 for _ in 0..file.guard_temps {
-                    scratch_for[i].guard_temp = Some(pass.reserve(i, &mut taken, &live_here));
+                    scratch_for[i].guard_temp = Some(Reg(pass.reserve(i, &mut taken, &live_here)));
                 }
                 // The mask-class mirror: AVX-512's guard reduces the mask
                 // with `vptestmd` into a `k`-register the vector pool cannot
@@ -3234,7 +3646,7 @@ impl LinearScan {
             }
             let sources = operand_sources(&def.op, resident);
             for role in 0..reloads_wanted(sources) {
-                scratch_for[i].reloads[role] = Some(pass.reserve(i, &mut taken, &live_here));
+                scratch_for[i].reloads[role] = Some(Reg(pass.reserve(i, &mut taken, &live_here)));
             }
 
             // The scope's result is materialized after its last instruction,
@@ -3259,16 +3671,11 @@ impl LinearScan {
                 && (pass.live_in[def.value.0 as usize]
                     || matches!(def.op, ScheduledOp::Reduce(..) | ScheduledOp::Guard(..)))
             {
-                scratch_for[i].result = Some(pass.reserve(i, &mut taken, &live_here));
+                scratch_for[i].result = Some(Reg(pass.reserve(i, &mut taken, &live_here)));
             }
         }
 
-        Scan {
-            schedule: dag,
-            ranges: pass.ranges,
-            scratch: scratch_for,
-            guards,
-        }
+        (pass.ranges, scratch_for)
     }
 }
 
@@ -3299,12 +3706,16 @@ pub(crate) fn operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use
         ScheduledOp::Var(_)
         | ScheduledOp::Lanes(_)
         | ScheduledOp::Const(_)
-        | ScheduledOp::Uniform(_)
+        | ScheduledOp::Context(_)
+        | ScheduledOp::Uniform(..)
         | ScheduledOp::Reduce(..)
         | ScheduledOp::Seq(..) => (None, None, None),
-        ScheduledOp::Unary(_, a) | ScheduledOp::ShiftImm(_, a, _) | ScheduledOp::Gather(a, _) => {
-            (Some(*a), None, None)
-        }
+        // A gather's base is a pointer, read through `pointer_operand`; the
+        // index is its one vector operand.
+        ScheduledOp::Unary(_, a)
+        | ScheduledOp::ShiftImm(_, a, _)
+        | ScheduledOp::Gather(a, _)
+        | ScheduledOp::Broadcast(a, _) => (Some(*a), None, None),
         ScheduledOp::Write { value, .. } => (Some(*value), None, None),
         // A `Guard`'s mask is the one register operand its own def reads —
         // its two arms are names into a wholly separate arena, not values in
@@ -3319,17 +3730,46 @@ pub(crate) fn operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use
     [a, b, c].into_iter().flatten()
 }
 
-/// Every value an operation is *built from*: its register operands, plus the
-/// body a `Reduce` folds and the two effects a `Seq` orders — the children a
-/// walk of the DAG's structure follows, as opposed to the registers an
-/// instruction reads ([`operands`]).
+/// The address an operation reads, if it reads one: a gather's, a
+/// broadcast's or a uniform load's base, always a [`Class::Pointer`] value.
+/// One at most, which is what lets [`Scratch::ptr_reload`] be a single
+/// register.
+pub(crate) fn pointer_operand(sop: &ScheduledOp) -> Option<ValueId> {
+    match sop {
+        ScheduledOp::Gather(_, base) | ScheduledOp::Broadcast(_, base) => Some(*base),
+        ScheduledOp::Uniform(base, _) => Some(*base),
+        _ => None,
+    }
+}
+
+/// Every value an operation reads, of either class: [`operands`] then
+/// [`pointer_operand`]. What a liveness question that does not care which
+/// file a value lives in asks — how many times a root is read, whether a
+/// schedule is topological.
+pub(crate) fn all_operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use<'_> {
+    operands(sop).chain(pointer_operand(sop))
+}
+
+/// The values an operation reads from `class`'s file.
+fn operands_of(sop: &ScheduledOp, class: Class) -> impl Iterator<Item = ValueId> + use<'_> {
+    let (vectors, pointer) = match class {
+        Class::Vector => (Some(operands(sop)), None),
+        Class::Pointer => (None, pointer_operand(sop)),
+    };
+    vectors.into_iter().flatten().chain(pointer)
+}
+
+/// Every value an operation is *built from*: its operands of both classes,
+/// plus the body a `Reduce` folds and the two effects a `Seq` orders — the
+/// children a walk of the DAG's structure follows, as opposed to the
+/// registers an instruction reads ([`operands`]).
 pub(crate) fn structural_children(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use<'_> {
     let extra = match sop {
         ScheduledOp::Reduce(_, body) => [Some(*body), None],
         ScheduledOp::Seq(a, b) => [Some(*a), Some(*b)],
         _ => [None, None],
     };
-    operands(sop).chain(extra.into_iter().flatten())
+    all_operands(sop).chain(extra.into_iter().flatten())
 }
 
 #[cfg(test)]
@@ -3490,6 +3930,7 @@ mod tests {
         gpr_pitch: None,
         gpr_scratch: GprSet::EMPTY,
         gpr_temps_for: no_temps,
+        pointers: GprSet::EMPTY,
         mask_scratch: MaskSet::EMPTY,
         mask_temps_for: no_temps,
         mask_guard_temps: 0,
@@ -3507,8 +3948,8 @@ mod tests {
     ///
     /// The nest tests need a pool that can spare a register to carry, and the
     /// minimum-sized file by construction cannot: the carry budget is
-    /// `pool - MIN_SCRATCH`, which is zero there. Ten registers mirrors the
-    /// SSE2 tier, whose budget is four.
+    /// `pool - MIN_SCRATCH`, which is zero there. Ten registers leaves a
+    /// budget of three.
     const NEST_FILE: RegisterFile = RegisterFile {
         scratch: RegSet::range(4, 7).union(RegSet::of(&[Reg(13), Reg(14), Reg(15)])),
         ..TEMP_FILE
@@ -3532,24 +3973,36 @@ mod tests {
         }
     }
 
-    /// A leaf every schedule here starts from.
+    /// A leaf every schedule here starts from: an operand-free vector
+    /// definition that is not a constant.
     ///
-    /// It used to be `Var(0)`, a coordinate pinned to an input register. The
+    /// It used to be `Var(0)`, a coordinate pinned to an input register (the
     /// collapse ABI passes no vectors, so a `Var` reaching an allocation names
-    /// a fold binder and nothing else; a uniform's broadcast load is what a
-    /// loop-free schedule's leaf is.
+    /// a fold binder and nothing else), then a uniform's broadcast load — but
+    /// a uniform reads its block's address, a pointer operand these schedules
+    /// would each have to define first. The lane iota is the one leaf left
+    /// that reads nothing and is built into a register.
     fn leaf(value: u32) -> Def {
         def(
             value,
-            ScheduledOp::Uniform(crate::emit::UniformLoad {
-                ctx_slot: 0,
-                offset: value as u16,
-            }),
+            ScheduledOp::Lanes(pixelflow_ir::fold::Binder::from_slot(0).expect("slot 0")),
         )
     }
 
     fn alloc(schedule: Vec<Def>) -> NestAllocation {
         LinearScan.allocate(schedule, &TEST_FILE)
+    }
+
+    /// A scope that enters with nothing parked, hands nothing off and holds
+    /// no guard: `sites` is per instruction, so it is the caller's.
+    fn no_reads(sites: &[Vec<ValueId>]) -> Reads<'_> {
+        static NO_PARKS: BTreeMap<ValueId, Where> = BTreeMap::new();
+        Reads {
+            live_in: &NO_PARKS,
+            roots: &[],
+            sites,
+            arms: &[],
+        }
     }
 
     /// How many of a loop-free allocation's values are in a stack slot.
@@ -3758,7 +4211,7 @@ mod tests {
             def(3, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
         ];
         let sites = vec![Vec::new(); dag.len()];
-        let mut pass = Pass::new(&dag, &TEST_FILE, dag.len(), &BTreeMap::new(), &sites);
+        let mut pass = Pass::new(&dag, &TEST_FILE, no_reads(&sites), Class::Vector);
         let rank = pass.rank(ValueId(0), 1, &[]);
         assert_eq!(
             rank.nearest.0, 2,
@@ -3772,7 +4225,7 @@ mod tests {
     fn place_overwrites_a_range_recorded_at_the_same_index() {
         let dag = vec![leaf(0)];
         let sites = vec![Vec::new(); 1];
-        let mut pass = Pass::new(&dag, &TEST_FILE, 1, &BTreeMap::new(), &sites);
+        let mut pass = Pass::new(&dag, &TEST_FILE, no_reads(&sites), Class::Vector);
         pass.place(ValueId(0), 3, Where::Reg(Reg(4)));
         pass.place(ValueId(0), 3, Where::Spilled);
         assert_eq!(
@@ -3789,7 +4242,7 @@ mod tests {
     fn place_marks_in_slot_only_when_placing_spilled() {
         let dag = vec![leaf(0), leaf(1)];
         let sites = vec![Vec::new(); 2];
-        let mut pass = Pass::new(&dag, &TEST_FILE, 2, &BTreeMap::new(), &sites);
+        let mut pass = Pass::new(&dag, &TEST_FILE, no_reads(&sites), Class::Vector);
         pass.place(ValueId(0), 0, Where::Reg(Reg(4)));
         assert!(
             !pass.in_slot[0],
@@ -4321,8 +4774,8 @@ mod tests {
         );
     }
 
-    /// A constant under pressure is rematerialized, never spilled: re-emitting
-    /// the load beats a store plus a reload.
+    /// A constant under pressure is rematerialized, never spilled: its slot is
+    /// its bits, so there is nothing to store and no frame slot to give it.
     #[test]
     fn constants_are_rematerialized_rather_than_spilled() {
         let width = u32::from(RegisterFile::MIN_SCRATCH) + 1;
@@ -4359,6 +4812,211 @@ mod tests {
                 "{vid:?} rematerializes the wrong constant"
             );
         }
+    }
+
+    /// Two constants under pressure: the one read farther out is the one
+    /// evicted. Their slots are equally valid, so Belady's distance decides
+    /// between them, as it does between two values already in memory.
+    ///
+    /// This used to be false: a constant was a tier below every other value,
+    /// and within that tier the distance never came into play against the
+    /// values it competed with, because they were all constants too.
+    #[test]
+    fn a_constant_is_evicted_by_distance_among_slot_valid_values() {
+        let (soon, late) = (ValueId(1), ValueId(2));
+        let mut schedule = vec![
+            leaf(0),
+            def(soon.0, ScheduledOp::Const(1.0)),
+            def(late.0, ScheduledOp::Const(2.0)),
+        ];
+        // The leaf and both constants hold three registers; enough fresh
+        // values to fill the rest and force exactly one eviction.
+        let negs = u32::from(RegisterFile::MIN_SCRATCH) - 2;
+        for i in 0..negs {
+            schedule.push(def(10 + i, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        schedule.push(def(100, ScheduledOp::Binary(OpKind::Add, soon, ValueId(0))));
+        let mut acc = ValueId(100);
+        for i in 0..negs {
+            schedule.push(def(
+                101 + i,
+                ScheduledOp::Binary(OpKind::Add, acc, ValueId(10 + i)),
+            ));
+            acc = ValueId(101 + i);
+        }
+        schedule.push(def(200, ScheduledOp::Binary(OpKind::Add, acc, late)));
+        let a = alloc(schedule);
+
+        assert!(
+            ever(&a, late).contains(&Where::Remat(2.0f32.to_bits())),
+            "the constant read last is the one to give up its register"
+        );
+        assert!(
+            ever(&a, soon).iter().all(|w| matches!(w, Where::Reg(_))),
+            "the constant read next keeps its register: {:?}",
+            ever(&a, soon)
+        );
+    }
+
+    /// A constant out of a register is brought back and kept when it is read
+    /// again soon, exactly as a spilled value is. The reload at the first read
+    /// is emitted either way; keeping it afterwards costs nothing until an
+    /// eviction, which emits nothing.
+    #[test]
+    fn a_constant_read_again_is_kept_like_any_reload() {
+        let c = ValueId(1);
+        let mut schedule = vec![leaf(0), def(c.0, ScheduledOp::Const(1.5))];
+        // Fill the pool past the leaf and the constant: one eviction, and
+        // the constant is the only value whose slot is already valid.
+        let negs = u32::from(RegisterFile::MIN_SCRATCH) - 1;
+        for i in 0..negs {
+            schedule.push(def(10 + i, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        let first = schedule.len();
+        schedule.push(def(100, ScheduledOp::Binary(OpKind::Add, c, ValueId(0))));
+        let second = schedule.len();
+        schedule.push(def(101, ScheduledOp::Binary(OpKind::Add, c, ValueId(100))));
+        let mut acc = ValueId(101);
+        for i in 0..negs {
+            schedule.push(def(
+                102 + i,
+                ScheduledOp::Binary(OpKind::Add, acc, ValueId(10 + i)),
+            ));
+            acc = ValueId(102 + i);
+        }
+        let a = alloc(schedule);
+        let body = a.body();
+
+        assert_eq!(
+            body.where_at(c, first - 1),
+            Where::Remat(1.5f32.to_bits()),
+            "the constant lost its register while the pool filled"
+        );
+        assert!(
+            matches!(body.where_at(c, first), Where::Reg(_)),
+            "the first read brings it back and keeps it: {:?}",
+            body.where_at(c, first)
+        );
+        assert!(
+            matches!(body.where_at(c, second), Where::Reg(_)),
+            "so the second read finds it resident: {:?}",
+            body.where_at(c, second)
+        );
+    }
+
+    /// A constant this scope parks for the scopes inside is materialized at
+    /// its definition even under pressure, because the hand-off reads it
+    /// there. A constant nobody reads here loses the same contest and emits
+    /// nothing, as before.
+    #[test]
+    fn a_constant_root_materializes_for_its_hand_off() {
+        let (unread, root) = (ValueId(1), ValueId(2));
+        let mut body = vec![leaf(0)];
+        // Fill the pool with fresh values that stay live to the end, so both
+        // constants are defined against a full pool.
+        let negs = u32::from(RegisterFile::MIN_SCRATCH) - 1;
+        for i in 0..negs {
+            body.push(def(10 + i, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
+        }
+        body.push(def(unread.0, ScheduledOp::Const(4.0)));
+        body.push(def(root.0, ScheduledOp::Const(3.0)));
+        let reduce_at = body.len();
+        body.push(def(3, ScheduledOp::Reduce(fold_meta(), root)));
+        body.push(def(
+            100,
+            ScheduledOp::Binary(OpKind::Add, ValueId(3), unread),
+        ));
+        let mut acc = ValueId(100);
+        for i in 0..negs {
+            body.push(def(
+                101 + i,
+                ScheduledOp::Binary(OpKind::Add, acc, ValueId(10 + i)),
+            ));
+            acc = ValueId(101 + i);
+        }
+        // The leaf too, so its register is not free when the constants are
+        // defined.
+        body.push(def(200, ScheduledOp::Binary(OpKind::Add, acc, ValueId(0))));
+        let alloc = LinearScan.allocate_nest(
+            ScopedSchedule {
+                body: ScopeRegion {
+                    roots: vec![root],
+                    schedule: body,
+                },
+                folds: vec![ScopeFold {
+                    parent: Scope::Body,
+                    at: reduce_at,
+                    roots: Vec::new(),
+                    schedule: vec![
+                        def(50, ScheduledOp::Var(fold_meta().binder().var())),
+                        def(51, ScheduledOp::Binary(OpKind::Add, ValueId(50), root)),
+                    ],
+                }],
+                guard_arms: Vec::new(),
+            },
+            &TEST_FILE,
+        );
+        let body = alloc.body();
+
+        assert_eq!(
+            at_def(&body, unread),
+            Where::Remat(4.0f32.to_bits()),
+            "a constant nothing reads here takes no register at its definition"
+        );
+        assert!(
+            matches!(at_def(&body, root), Where::Reg(_)),
+            "a constant handed to the fold is written into a register first: {:?}",
+            at_def(&body, root)
+        );
+    }
+
+    /// A constant a fold reads every trip is a root of the scope around it,
+    /// and with a register to spare it is carried across the loop: no
+    /// instruction per trip, where rebuilding it cost one or two.
+    #[test]
+    fn a_constant_read_by_a_fold_is_carried_across_it() {
+        let c = ValueId(1);
+        let alloc = LinearScan.allocate_nest(
+            ScopedSchedule {
+                body: ScopeRegion {
+                    roots: vec![c],
+                    schedule: vec![
+                        leaf(0),
+                        def(c.0, ScheduledOp::Const(3.0)),
+                        def(2, ScheduledOp::Reduce(fold_meta(), c)),
+                        def(3, ScheduledOp::Binary(OpKind::Add, ValueId(2), ValueId(0))),
+                    ],
+                },
+                folds: vec![ScopeFold {
+                    parent: Scope::Body,
+                    at: 2,
+                    roots: Vec::new(),
+                    schedule: vec![
+                        def(50, ScheduledOp::Var(fold_meta().binder().var())),
+                        def(51, ScheduledOp::Binary(OpKind::Add, ValueId(50), c)),
+                    ],
+                }],
+                guard_arms: Vec::new(),
+            },
+            &NEST_FILE,
+        );
+        let carry = alloc
+            .body()
+            .carried(c)
+            .expect("a register above the floor carries the constant");
+        let inside = alloc.scope(Scope::Fold(0));
+        assert_eq!(
+            inside.at_head(c),
+            Where::Reg(carry),
+            "the fold reads the constant from the carried register"
+        );
+        assert!(
+            inside
+                .placement(c)
+                .locations()
+                .all(|at| at == Where::Reg(carry)),
+            "and never moves it"
+        );
     }
 
     /// A constant that loses its own keep contest never touches a register at
@@ -4674,10 +5332,11 @@ mod tests {
 
     /// A destination never lands in a register one of its own operands is
     /// still living in — the invariant `resolve_operands` reads back off the
-    /// allocation, and the reason SSE2 can write its two-operand form
-    /// directly.
+    /// allocation, and what lets one operand be reloaded into `dst`.
     ///
-    /// `dst op= right` corrupts `right` when `dst == right` and `dst != left`.
+    /// The encoders write `dst` before their last read — `setup_mov` ahead
+    /// of a `Select` or FMA, the decomposed `MulAdd`'s multiply before its
+    /// add — so a *resident* operand in `dst`'s register would be corrupted.
     /// The destination *may* take an operand's register — it is a priced
     /// candidate, not an excluded one — but when it does, the eviction is
     /// recorded at this very index, so that operand is no longer *resident*
@@ -4685,9 +5344,9 @@ mod tests {
     /// the encoding consumes there and into a reserved register otherwise.
     /// What this asserts is the residency view, which is what the encoders
     /// see: at the instruction's own point, no operand still in a register is
-    /// in `dst`'s. The backend needs no stashing temp to route around a case
-    /// that cannot arise, which is what `emit_binary_safe` used to be and what
-    /// held xmm10 out of every kernel's pool.
+    /// in `dst`'s. No backend needs a stashing temp to route around a case
+    /// that cannot arise; the SSE2 tier once held one out of every kernel's
+    /// pool for it.
     #[test]
     fn a_destination_never_lands_on_a_resident_operand() {
         // Wide enough to evict: `width` values all live at once over a pool of
@@ -4715,8 +5374,8 @@ mod tests {
                 spill_count(&a) > 0,
                 "the schedule has to reach eviction for this to test anything"
             );
-            // Pairs where both ends are the pool's — the case the two-operand
-            // form would corrupt.
+            // Pairs where both ends are the pool's — the case a destination
+            // could collide in.
             let mut contested = 0;
             let body = a.body();
             for (i, d) in body.schedule().iter().enumerate() {
@@ -5046,6 +5705,163 @@ mod tests {
             "budget is available (the control above proves it), so only the \
              zero-use filter can be refusing this"
         );
+    }
+
+    /// The glyph's shape, one buffer wide: a `Context` def the body computes
+    /// and a fold reads through a `Gather` every trip.
+    ///
+    /// The pointer is a root like any other — carried in a pointer register
+    /// while the pointer pool has one above its floor, parked in a slot when
+    /// it does not, and then reloaded into the gather's own pointer
+    /// reservation at each read. The base used to be loaded from the context
+    /// block inside every gather's encoding, seventy-five times per batch of
+    /// a glyph; now the load is the def's, once per call.
+    #[test]
+    fn a_pointer_root_is_carried_while_the_pointer_pool_has_headroom() {
+        let base = ValueId(1);
+        let gather_at = 2;
+        for (pointers, carried) in [
+            (GprSet::of(&[Gpr(9)]), false),
+            (GprSet::of(&[Gpr(9), Gpr(10)]), true),
+        ] {
+            assert_eq!(
+                pointers.len() as usize - RegisterFile::MIN_POINTERS as usize,
+                usize::from(carried),
+                "the fixture's budget is what decides the carry"
+            );
+            let file = RegisterFile {
+                pointers,
+                ..NEST_FILE
+            }
+            .checked();
+            let alloc = LinearScan.allocate_nest(
+                ScopedSchedule {
+                    body: ScopeRegion {
+                        roots: vec![base],
+                        schedule: vec![
+                            leaf(0),
+                            def(1, ScheduledOp::Context(0)),
+                            def(2, ScheduledOp::Reduce(fold_meta(), ValueId(0))),
+                        ],
+                    },
+                    folds: vec![ScopeFold {
+                        parent: Scope::Body,
+                        at: 2,
+                        roots: Vec::new(),
+                        schedule: vec![
+                            // The enclosing park's placeholder: a pointer's
+                            // stays its own op, so the scope inside reads the
+                            // class off it.
+                            def(1, ScheduledOp::Context(0)),
+                            def(50, ScheduledOp::Var(fold_meta().binder().var())),
+                            def(51, ScheduledOp::Gather(ValueId(50), base)),
+                        ],
+                    }],
+                    guard_arms: Vec::new(),
+                },
+                &file,
+            );
+            let body = alloc.body();
+            assert!(
+                matches!(body.placement(base).at(Point::TAIL), Where::Ptr(_)),
+                "the body computes the pointer into a pointer register"
+            );
+            let inside = alloc.scope(Scope::Fold(0));
+            let at_head = inside.at_head(base);
+            let reload = inside.scratch(gather_at).ptr_reload;
+            if carried {
+                assert!(
+                    matches!(at_head, Where::Ptr(_)),
+                    "one above the floor: carried, but the fold finds it at {at_head:?}"
+                );
+                assert_eq!(reload, None, "resident, so the gather reloads nothing");
+            } else {
+                assert_eq!(at_head, Where::Spilled, "at the floor: parked in a slot");
+                // The one pointer register the floor keeps free is what the
+                // reload lands in.
+                assert_eq!(
+                    reload,
+                    Some(PtrReg(9)),
+                    "parked, so the gather reserves the pool's one pointer register to \
+                     reload the base into"
+                );
+            }
+        }
+    }
+
+    /// The two classes are one ranking with two budgets: a hot vector root
+    /// and a hot pointer root are each carried from their own pool's
+    /// headroom, and neither can spend the other's.
+    ///
+    /// The vector pool is held at its floor while the pointer pool has one
+    /// above it, then the reverse. The ranking is by reads per call: the
+    /// fold's binder first (read every trip), then the vector root (twice a
+    /// trip), then the pointer (once) — so two vector registers above the
+    /// floor carry the binder and the vector root, and one pointer register
+    /// carries the pointer. If the budgets were pooled, the first
+    /// configuration's one register would go to the binder and the pointer
+    /// would be parked; the second's would be spent on vectors alone.
+    #[test]
+    fn each_class_is_carried_from_its_own_budget() {
+        let (vector, pointer) = (ValueId(5), ValueId(6));
+        let floor = RegisterFile::MIN_SCRATCH;
+        for (vector_headroom, pointer_headroom) in [(0u8, 1u8), (2, 0)] {
+            let pointers = match pointer_headroom {
+                0 => GprSet::of(&[Gpr(9)]),
+                _ => GprSet::of(&[Gpr(9), Gpr(10)]),
+            };
+            assert_eq!(
+                pointers.len(),
+                RegisterFile::MIN_POINTERS + pointer_headroom,
+                "the pointer pool is the floor plus the headroom"
+            );
+            let file = RegisterFile {
+                scratch: RegSet::range(4, floor + vector_headroom),
+                pointers,
+                ..TEMP_FILE
+            }
+            .checked();
+            let alloc = LinearScan.allocate_nest(
+                ScopedSchedule {
+                    body: ScopeRegion {
+                        roots: vec![vector, pointer],
+                        schedule: vec![
+                            leaf(0),
+                            def(5, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
+                            def(6, ScheduledOp::Context(0)),
+                            def(1, ScheduledOp::Reduce(fold_meta(), ValueId(0))),
+                        ],
+                    },
+                    folds: vec![ScopeFold {
+                        parent: Scope::Body,
+                        at: 3,
+                        roots: Vec::new(),
+                        schedule: vec![
+                            def(6, ScheduledOp::Context(0)),
+                            def(50, ScheduledOp::Var(fold_meta().binder().var())),
+                            def(51, ScheduledOp::Binary(OpKind::Add, ValueId(50), vector)),
+                            def(52, ScheduledOp::Binary(OpKind::Add, ValueId(51), vector)),
+                            def(53, ScheduledOp::Gather(ValueId(52), pointer)),
+                        ],
+                    }],
+                    guard_arms: Vec::new(),
+                },
+                &file,
+            );
+            let inside = alloc.scope(Scope::Fold(0));
+            assert_eq!(
+                matches!(inside.at_head(vector), Where::Reg(_)),
+                vector_headroom > 0,
+                "vector headroom {vector_headroom}: the vector root is at {:?}",
+                inside.at_head(vector)
+            );
+            assert_eq!(
+                matches!(inside.at_head(pointer), Where::Ptr(_)),
+                pointer_headroom > 0,
+                "pointer headroom {pointer_headroom}: the pointer root is at {:?}",
+                inside.at_head(pointer)
+            );
+        }
     }
 
     /// `within` is a subtree, not a suffix of a chain.

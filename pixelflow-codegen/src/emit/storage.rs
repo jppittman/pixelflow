@@ -9,7 +9,7 @@
 //! capability traits for writing ([`StoreTarget`]) and reading ([`SourceOperand`])
 //! across registers and memory, along with a recycling [`StackFrame`] slot allocator.
 
-use super::Reg;
+use super::{PtrReg, Reg};
 use alloc::vec::Vec;
 
 /// An aligned slot in the stack frame.
@@ -37,7 +37,7 @@ impl Slot {
         self.offset
     }
 
-    /// Size of the vector slot in bytes (16 for SSE/NEON, 32 for AVX2, 64 for AVX-512).
+    /// Size of the vector slot in bytes (16 for NEON, 32 for AVX2, 64 for AVX-512).
     #[inline]
     #[must_use]
     pub const fn bytes(self) -> u32 {
@@ -45,11 +45,14 @@ impl Slot {
     }
 }
 
-/// A physical location where a vector value can reside: in a register or on the stack.
+/// A physical location where a value can reside: in a register of either
+/// class or on the stack.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Storage {
     /// A hardware vector register.
     Reg(Reg),
+    /// A pointer register, holding an address.
+    Ptr(PtrReg),
     /// A stack frame slot.
     Slot(Slot),
 }
@@ -119,13 +122,13 @@ impl StoreTarget for Storage {
     fn target_reg(self) -> Option<Reg> {
         match self {
             Storage::Reg(r) => Some(r),
-            Storage::Slot(_) => None,
+            Storage::Ptr(_) | Storage::Slot(_) => None,
         }
     }
     #[inline]
     fn target_slot(self) -> Option<Slot> {
         match self {
-            Storage::Reg(_) => None,
+            Storage::Reg(_) | Storage::Ptr(_) => None,
             Storage::Slot(s) => Some(s),
         }
     }
@@ -193,13 +196,13 @@ impl SourceOperand for Storage {
     fn source_reg(self) -> Option<Reg> {
         match self {
             Storage::Reg(r) => Some(r),
-            Storage::Slot(_) => None,
+            Storage::Ptr(_) | Storage::Slot(_) => None,
         }
     }
     #[inline]
     fn source_slot(self) -> Option<Slot> {
         match self {
-            Storage::Reg(_) => None,
+            Storage::Reg(_) | Storage::Ptr(_) => None,
             Storage::Slot(s) => Some(s),
         }
     }

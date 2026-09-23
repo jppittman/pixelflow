@@ -1820,10 +1820,11 @@ fn expand_sin_phase(arena: &mut ExprArena, x: ExprId, phase: f32) -> ExprId {
 /// This is the tier divergence the previous form existed to avoid, so it is
 /// stated rather than discovered. Unfused mul+add rounds twice everywhere, so
 /// the `eval_scalar` oracle and every backend agreed bit-for-bit. `MulAdd`
-/// rounds **once** where an FMA instruction exists (x86 with `+fma`, aarch64
-/// `FMLA`) and **twice** where it does not (SSE2 baseline: `mulps` + `addps`)
-/// — CLAUDE.md, "Floating point at the edges". So the SSE2 tier now differs
-/// from the FMA tiers by up to a rounding per Horner step.
+/// rounds **once** where an FMA instruction exists (every selectable tier:
+/// `vfmadd231ps`, `FMLA`) and **twice** where the emitter decomposes it
+/// under register pressure (`ResolvedOp::DecomposedMulAdd`) — CLAUDE.md,
+/// "Floating point at the edges". So a decomposed step differs from a fused
+/// one by up to a rounding per Horner step.
 ///
 /// That is a *precision* difference, which the codebase's own rule puts on the
 /// table; it is not a range difference, which is not. One rounding is never

@@ -281,7 +281,7 @@ impl OpKind {
     ///   `FRECPE` + one `FRECPS` refinement. The exact `1.0 / x` the folder
     ///   computes is not any of those answers.
     /// - `MulAdd` where one rounding differs from two: `vfmadd`/`FMLA` round
-    ///   the product and sum together, SSE2's `mulps`+`addps` rounds twice.
+    ///   the product and sum together, a decomposed `mul`+`add` rounds twice.
     ///   `mul_add(1.0000001, 4097.0, 4097.0)` is `8194.001` fused, `8194.0`
     ///   split.
     ///
@@ -317,7 +317,7 @@ impl OpKind {
                 (a - libm::truncf(*a)).abs() == 0.5 || (a.is_sign_negative() && *a > -0.5)
             }),
             // Reciprocal ESTIMATES, and every target estimates differently:
-            // SSE2/AVX2 `rcpps`/`vrcpps` give ~12 bits, AVX-512 `vrcp14ps`
+            // AVX2 `vrcpps` gives ~12 bits, AVX-512 `vrcp14ps`
             // ~14, and aarch64 emits `FRECPE` plus one `FRECPS` Newton step.
             // `eval_unary`'s exact `1.0 / x` matches none of them, so there is
             // no host whose answer is worth baking. Unconditional: an estimate
@@ -888,7 +888,7 @@ impl OpKind {
     ///
     /// This is not a stylistic choice about how to spell a boolean — it is the
     /// only representation the consumers accept. `Select` is a *bitwise* blend
-    /// on every backend (`andps`/`andnps`/`orps` on SSE2 and AVX2, one
+    /// on every backend (`vandps`/`vandnps`/`vorps` on AVX2, one
     /// `vpternlogd 0xCA` on AVX-512, `BSL` on aarch64), and `BitAnd`/`BitOr`
     /// are literal bitwise ops, so a mask lane's job is to be a per-bit
     /// stencil. `1.0` is not one: `0xFFFFFFFF & 0x3f800000` is `0x3f800000`,
@@ -997,16 +997,16 @@ impl OpKind {
         match self {
             // One rounding, always. `MulAdd` denotes `x*y + z`; whether a
             // target spells it as one instruction (`vfmadd`, `FMLA`) or as a
-            // multiply and an add (SSE2, or any backend under register
-            // pressure — see `ResolvedOp::DecomposedMulAdd`) is a last-bit
+            // multiply and an add (any backend under register pressure —
+            // see `ResolvedOp::DecomposedMulAdd`) is a last-bit
             // precision difference inside the contract, not a divergence, so
             // it folds unconditionally. `libm::fmaf` rather than `x * y + z`
             // because the latter is whatever the compiler that built THIS
             // crate chose to contract it into: under `-fp-contract=fast` a
             // fold's answer must not depend on the folder's build profile.
             Self::MulAdd => Some(libm::fmaf(x, y, z)),
-            // The bitwise blend every backend emits — `andps`/`andnps`/`orps`
-            // on SSE2 and AVX2, one `vpternlogd 0xCA` on AVX-512, `BSL` on
+            // The bitwise blend every backend emits — `vandps`/`vandnps`/`vorps`
+            // on AVX2, one `vpternlogd 0xCA` on AVX-512, `BSL` on
             // aarch64. Spelling it `if x != 0.0` would be right only for a
             // canonical [`Self::mask`] and silently wrong for anything else.
             Self::Select => Some(f32::from_bits(

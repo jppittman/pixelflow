@@ -790,6 +790,17 @@ impl Ldr {
             addr: Addr::Indexed(addr),
         }
     }
+
+    /// `ldr s<dst>, [base, w<index>, uxtw #2]` — one element of a plane of
+    /// `f32`s straight into lane 0, where a `dup` can spread it.
+    #[must_use]
+    #[inline]
+    pub const fn s_indexed(dst: Reg, addr: MemIndexed) -> Self {
+        Self {
+            dst: LdrReg::S(dst),
+            addr: Addr::Indexed(addr),
+        }
+    }
 }
 
 impl AsmInsn for Ldr {
@@ -852,6 +863,15 @@ impl AsmInsn for Ldr {
                     | (dst.0 as u32);
                 code.extend_from_slice(&w.to_le_bytes());
             }
+            // The same register-offset form with the SIMD&FP bit (bit 26)
+            // set: `LDR St, [Xn, Wm, UXTW #2]`.
+            (LdrReg::S(dst), Addr::Indexed(addr)) => {
+                let w = 0xBC60_5800
+                    | ((addr.index.0 as u32) << 16)
+                    | ((addr.base.0 as u32) << 5)
+                    | (dst.0 as u32);
+                code.extend_from_slice(&w.to_le_bytes());
+            }
             _ => panic!("unsupported Ldr combination: {:?}", (self.dst, self.addr)),
         }
     }
@@ -882,6 +902,65 @@ impl UmovW {
 }
 
 impl AsmInsn for UmovW {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        code.extend_from_slice(&self.encode().to_le_bytes());
+    }
+}
+
+/// MOV Xd, Xm — `ORR Xd, XZR, Xm`: an address between pointer registers.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MovX {
+    pub dst: PtrReg,
+    pub src: PtrReg,
+}
+
+impl MovX {
+    #[must_use]
+    #[inline]
+    pub const fn new(dst: PtrReg, src: PtrReg) -> Self {
+        Self { dst, src }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn encode(self) -> u32 {
+        0xAA00_03E0 | ((self.src.0 as u32) << 16) | (self.dst.0 as u32)
+    }
+}
+
+impl AsmInsn for MovX {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        code.extend_from_slice(&self.encode().to_le_bytes());
+    }
+}
+
+/// FCVTZS Xd, Sn — truncate the scalar float in lane 0 to a signed 64-bit
+/// integer in a GP register: how a fold's binder, or a broadcast load's
+/// index, becomes an address. The scalar form of [`Fcvtzs`], whose `.4S`
+/// result stays in the vector file.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FcvtzsX {
+    pub dst: Gpr,
+    pub src: Reg,
+}
+
+impl FcvtzsX {
+    #[must_use]
+    #[inline]
+    pub const fn new(dst: Gpr, src: Reg) -> Self {
+        Self { dst, src }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn encode(self) -> u32 {
+        0x9E38_0000 | ((self.src.0 as u32) << 5) | (self.dst.0 as u32)
+    }
+}
+
+impl AsmInsn for FcvtzsX {
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
         code.extend_from_slice(&self.encode().to_le_bytes());

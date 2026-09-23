@@ -64,7 +64,7 @@ execute(&color_manifold, &mut framebuffer, TensorShape::new(800, 600));
 
 The rasterizer:
 1. Samples manifold at pixel centers
-2. Uses SIMD batches (PARALLELISM pixels per iteration)
+2. Uses SIMD batches (`pixelflow_codegen::jit_vector_bytes() / 4` pixels per iteration, the tier's)
 3. Handles edge pixels with scalar fallback
 
 ## Key Files
@@ -103,7 +103,7 @@ The rasterizer:
 1. **Manifold-based** — No immediate-mode drawing
 2. **Platform-agnostic** — Pixel format conversion at boundaries
 3. **Cache correctness** — Glyph cache keyed properly
-4. **SIMD alignment** — Buffer sizes respect PARALLELISM
+4. **No width of its own** — the batch is the JIT's; a compiled kernel handles its own remainder
 
 ## Common Tasks
 

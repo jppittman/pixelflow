@@ -426,8 +426,9 @@ impl FoldReads {
     }
 
     /// Everything the def of `value` by `op` reads in this scope: its
-    /// register operands and, for a `Reduce` that opens a fold here, what the
-    /// fold reads.
+    /// operands of both register classes — a gather's base pointer is a read
+    /// as much as its index is — and, for a `Reduce` that opens a fold here,
+    /// what the fold reads.
     fn reads<'a>(
         &'a self,
         value: ValueId,
@@ -437,7 +438,7 @@ impl FoldReads {
             ScheduledOp::Reduce(..) => self.0.get(&value).map_or(&[], |f| f.reads.as_slice()),
             _ => &[],
         };
-        super::regalloc::operands(op).chain(fold.iter().copied())
+        super::regalloc::all_operands(op).chain(fold.iter().copied())
     }
 
     /// One run of the loop the `Reduce` def of `value` opens here, or
@@ -462,12 +463,14 @@ fn def_cycles(def: &Def, folds: &FoldReads, cycles: &CostModel) -> usize {
         // One store, priced as the load a gather is.
         ScheduledOp::Write { .. } => cycles.cost(OpKind::RawGather),
         // One broadcast load; priced as the leaf it is in the prologue, where
-        // it lands.
-        ScheduledOp::Uniform(_) => cycles.cost(OpKind::Uniform),
+        // it lands. A context pointer's one load lands there too.
+        ScheduledOp::Uniform(..) | ScheduledOp::Context(_) => cycles.cost(OpKind::Uniform),
         ScheduledOp::Unary(op, _) | ScheduledOp::Binary(op, _, _) => cycles.cost(*op),
         ScheduledOp::ShiftImm(op, _, _) => cycles.cost(*op),
         ScheduledOp::Ternary(op, _, _, _) => cycles.cost(*op),
         ScheduledOp::Gather(_, _) => cycles.cost(OpKind::RawGather),
+        // One scalar load broadcast, which is what a uniform read is too.
+        ScheduledOp::Broadcast(_, _) => cycles.cost(OpKind::Uniform),
         ScheduledOp::Reduce(..) => folds.cycles(def.value),
         // A hard branch whose arms are scopes of their own, which no walk of
         // this schedule reaches (G2,
@@ -1449,6 +1452,43 @@ mod tests {
 
         let clustered = cluster_select_arms(schedule, &folds);
         assert!(at(&clustered, 3) < at(&clustered, 4));
+        assert!(is_topological(&clustered, &folds));
+    }
+
+    /// A gather's base is a pointer operand, not a vector one, and it is a
+    /// read all the same: the `Context` the arm's `Broadcast` addresses
+    /// through is in the select's cone, not a stranger to be sunk past the
+    /// select — which would put the pointer's definition after its reader.
+    /// `Y + Y` sits between the arm's entries and is read by the root, so the
+    /// arm is refused for order and clustering runs.
+    #[test]
+    fn cluster_keeps_a_pointer_ahead_of_its_reader() {
+        let schedule = alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Var(1)),
+            def(2, ScheduledOp::Unary(OpKind::Rsqrt, ValueId(1))),
+            def(3, ScheduledOp::Binary(OpKind::Add, ValueId(1), ValueId(1))),
+            def(4, ScheduledOp::Context(0)),
+            def(5, ScheduledOp::Broadcast(ValueId(2), ValueId(4))),
+            def(
+                6,
+                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(5), ValueId(0)),
+            ),
+            def(7, ScheduledOp::Binary(OpKind::Add, ValueId(6), ValueId(3))),
+        ];
+        let folds = FoldReads::default();
+        let at = |order: &[Def], v: u32| {
+            order
+                .iter()
+                .position(|d| d.value == ValueId(v))
+                .expect("a permutation keeps every def")
+        };
+
+        let clustered = cluster_select_arms(schedule, &folds);
+        assert!(
+            at(&clustered, 4) < at(&clustered, 5),
+            "the pointer sank past the broadcast that reads it: {clustered:?}"
+        );
         assert!(is_topological(&clustered, &folds));
     }
 
