@@ -12,7 +12,10 @@
 //! Every formula is an identity over ℝ. What each one does in `f32` is on
 //! its own doc, and no formula divides where a saturated or degenerate case
 //! could reach the quotient: those cases are decided by a comparison first,
-//! and a `Select` discards whatever the quotient computed there.
+//! and a `Select` discards whatever the quotient computed there. Nor does
+//! any divide by a value that can be zero, even in a discarded arm — the
+//! e-graph would prove it zero, and then prove false equalities of the
+//! quotient ([`mean_of_clamp`], "The divisor").
 //!
 //! [`mean_of_clamp`] is written once, here. A caller that needs the mean of a
 //! clamp over a span — [`IntervalFold::clamp_moment`] today, a glyph's
@@ -114,10 +117,27 @@ pub struct Sweep {
 /// (the `−Q` and `−P` of `G` cancel in the difference). Emitted as
 ///
 /// ```text
+/// narrow = |d| ≤ DEGENERATE_SPAN·(Q − P)
 /// select(min(z₀,z₁) ≥ Q, Q,
 ///   select(max(z₀,z₁) ≤ P, P,
-///     select(|d| ≤ DEGENERATE_SPAN·(Q − P), clamp(centre, P, Q), N/d)))
+///     select(narrow, clamp(centre, P, Q), N / select(narrow, 1, d))))
 /// ```
+///
+/// **The divisor.** The quotient's arm is discarded wherever `narrow`
+/// holds, so what it divides by there is free — and it must not be `d`.
+/// An integrand whose slope the e-graph can prove zero (a literal `0`, an
+/// argument the variable does not reach, a band of provably zero height)
+/// makes `d` provably `0`, and the algebra's `x·recip(x) = 1` and
+/// `(x·a)/a = x` hold for every `x` but zero: applied to a zero divisor
+/// they merge the quotient's class with `1` and with every `x` whose
+/// product with zero the graph holds, and what is built from those classes
+/// collapses — a whole chord's area extracted as the constant `0`, measured
+/// (`a_literal_slope_is_its_exact_area` in
+/// `pixelflow-core/tests/area_adversarial.rs`). A `Select` guarding
+/// the *result* does not help, because the e-graph reasons about the
+/// quotient's class whatever consumes it; the divisor itself has to be one
+/// no rule can prove zero. `select(narrow, 1, d)` is `1` wherever `d` is
+/// small, and `d` wherever the quotient is read.
 ///
 /// **Floating point.**
 /// - A span wholly above the band gives exactly `Q`, and wholly below it
@@ -127,15 +147,20 @@ pub struct Sweep {
 ///   not preserve.
 /// - A span no wider than [`DEGENERATE_SPAN`] of the band takes the clamp at
 ///   its centre, off by at most an eighth of the span.
-/// - Otherwise `N/d`. Each term of `N` is a difference of one monotone image
-///   of `z₀` and `z₁`, so each has the sign of `d` and the three do not
-///   cancel; each difference is exact (Sterbenz) or rounds once relative to
-///   itself. The quotient is therefore the mean over the *rounded* span to a
-///   few ulps, and the span's own rounding moves it by at most the larger
-///   endpoint error, `clamp` being 1-Lipschitz. The one condition is that
-///   `N` and `d` are formed from the same `z₀` and `z₁`; an optimizer that
-///   re-derived `d` independently would add a relative error of
-///   `ulp(z)/|d|`, which is what the degenerate arm's width bounds.
+/// - Otherwise `N/d`. Each term of `N` is a monotone image of `z₁` less
+///   the same image of `z₀`, times a factor (`½(b + a)`, `Q` or `P`) at most
+///   `max(|P|, |Q|)` in magnitude; each difference is exact (Sterbenz) or
+///   rounds once relative to itself. For a band with `0 ≤ P` every factor is
+///   non-negative, so the three terms share the sign of `d`, do not cancel,
+///   and the quotient is the mean over the *rounded* span to a few ulps of
+///   itself. A band reaching below zero can make them cancel, and the
+///   quotient is then good to a few ulps of `max(|P|, |Q|)` instead — each
+///   term's rounding is at most that times `|d|`. Either way the span's own
+///   rounding moves the mean by at most the larger endpoint error, `clamp`
+///   being 1-Lipschitz. The one condition is that `N` and `d` are formed
+///   from the same `z₀` and `z₁`; an optimizer that re-derived `d`
+///   independently would add a relative error of `ulp(z)/|d|`, which is
+///   what the degenerate arm's width bounds.
 /// - `Q·(…)` is emitted bare when `Q` is 1, and the `P` term not at all when
 ///   `P` is 0: `x·1 = x` exactly, and `0·(min(z₁,0) − min(z₀,0))` is `0` for
 ///   every finite argument.
@@ -166,11 +191,15 @@ pub fn mean_of_clamp(arena: &mut ExprArena, sweep: Sweep, band: Band) -> ExprId 
     }
 
     let d = arena.push_binary(OpKind::Sub, to, from);
-    let general = arena.push_binary(OpKind::Div, numerator, d);
-    let degenerate = clamp(arena, centre, [p, q]);
     let magnitude = arena.push_unary(OpKind::Abs, d);
     let threshold = arena.push_const(DEGENERATE_SPAN * (band.upper - band.lower));
     let narrow = arena.push_binary(OpKind::Le, magnitude, threshold);
+    // Never `d` itself where `d` may be zero, not even in the arm `narrow`
+    // discards: see "The divisor" in the doc above.
+    let one = arena.push_const(1.0);
+    let divisor = arena.push_ternary(OpKind::Select, narrow, one, d);
+    let general = arena.push_binary(OpKind::Div, numerator, divisor);
+    let degenerate = clamp(arena, centre, [p, q]);
     let inside = arena.push_ternary(OpKind::Select, narrow, degenerate, general);
 
     let highest = arena.push_binary(OpKind::Max, from, to);

@@ -504,6 +504,21 @@ Not on this list:
      closed. The oracle is `pixelflow-core/tests/area_oracle.rs`: polygon
      clipping in `f64` against the compiled closed form, and a count of
      the integrals extraction left unclosed.
+   - **Reviewed** against a second, unrelated `f64` reference
+     (`pixelflow-core/tests/area_adversarial.rs`: the chord's row coverage
+     integrated piecewise-exactly; literal slopes; coefficients `3`, `−0.1`,
+     `−3`; one-sided and redundant cuts; bands `[P, Q]` other than `[0, 1]`;
+     whole-row collapses with lane-varying arms; an interval far from zero).
+     It found one miscompile. A slope the e-graph can prove zero — a literal
+     `k = 0`, or `[x < a]` — makes `ClampMoment`'s sweep `d` provably zero,
+     and the algebra's `x·recip(x) = 1` and `(x·a)/a = x`, sound for every
+     `x` but zero, then merged the quotient `N/d` with arbitrary classes: the
+     chord's area extracted as the constant `0`, with no integral left, so
+     the closure pin passed. The `Select` around the quotient cannot prevent
+     that, because the e-graph reasons about the quotient's class whatever
+     consumes it; the divisor is now `select(narrow, 1, d)`, which no rule
+     can prove zero. A literal `k = 0` then leaves `h·∫ 1` — the constant
+     rule, not built — which quadrature computes exactly.
 5. **Half-plane, conic and Taylor** (a-glyph-is-a-formula §4.1, §7).
 6. **The glyph** (a-glyph-is-a-formula §6).
 
@@ -533,6 +548,13 @@ Not on this list:
     6's, since after step 6 a glyph has a single fold.
 
 ## 9. Open questions
+
+- **Algebra rules that are unsound at zero.** `InverseAnnihilation::<MulRecip>`
+  (`x·recip(x) = 1`) and `Cancellation::<MulRecip>` (`(x·a)/a = x`) carry no
+  `x ≠ 0` side condition. No kernel divided by a provably zero class before
+  closed forms did; `mean_of_clamp` now never does. Whether the rules should
+  instead refuse a divisor whose class holds, or may come to hold, zero is
+  open — a const fact can say "is zero" but not "is never zero".
 
 - ~~A cell on `Fold`, or a sibling `Area` node.~~ **Decided (JP): an integral
   is a fold over a continuous domain, with no cell and no axis.** About 39

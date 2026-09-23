@@ -113,11 +113,20 @@ pub struct NarrowInterval;
 /// `min(max(z, P), Q)` (what `Kernel::clamp` builds) or `max(min(z, Q), P)`,
 /// which are equal when `P < Q`, with either operand order.
 ///
+/// `k` may be zero, and provably so — an argument the variable does not
+/// reach is `0·u + c` — which makes the sweep `z₁ − z₀` provably zero too.
+/// So the closed form never divides by the sweep where it can be zero, not
+/// even in an arm a `Select` discards: an e-graph that proves a divisor zero
+/// goes on to apply `x·recip(x) = 1` and `(x·a)/a = x` to it, which merge
+/// the quotient with classes it is not equal to (`mean_of_clamp`, "The
+/// divisor").
+///
 /// **Floating point.** See `mean_of_clamp`: a sweep wholly outside the band
 /// is exactly `P` or `Q`, decided by comparison before any division; a
 /// sweep narrower than `DEGENERATE_SPAN` of the band takes the midpoint; any
 /// other is the antiderivative's difference quotient, a few ulps from the
-/// mean over the rounded sweep.
+/// mean over the rounded sweep (of `max(|P|, |Q|)`, for a band reaching
+/// below zero).
 pub struct ClampMoment;
 
 impl Rewrite for NarrowInterval {
@@ -926,11 +935,75 @@ mod tests {
     /// recognizers fold; `pixelflow-core`'s `area_oracle` pins the same over
     /// uniforms, with each rule's own integrand and one no rule closes, and
     /// judges the values.
+    ///
+    /// A *literal* zero slope is the exception, and a benign one. The closing
+    /// phase narrows the band while `(y − 2.25)·0` still varies in the
+    /// variable (only the main phase's `Annihilator` makes it `0`), and what
+    /// that leaves after factoring is `h·∫ 1` — a constant integrand, the
+    /// plan's constant rule, which this change does not add. Quadrature is
+    /// exact on it. (Until the zero-divisor fix in `mean_of_clamp`, this case
+    /// "closed" because saturation had collapsed the whole area to the
+    /// constant `0`; see `a_zero_sweep_never_makes_an_area_constant`.)
     #[test]
     fn the_area_of_a_chord_closes() {
-        for k in [0.4, 0.0, -1.0e6] {
+        for k in [0.4, -1.0e6] {
             let area = chord(k).area();
             assert_eq!(unclosed(&area), Some(0), "k = {k}");
+        }
+        assert_eq!(
+            unclosed(&chord(0.0).area()),
+            Some(1),
+            "k = 0 leaves only ∫ 1"
+        );
+    }
+
+    /// **A provably zero sweep proves nothing false.** A literal slope of
+    /// `0` — a vertical edge, or a crossing the variable does not reach —
+    /// makes the clamp moment's sweep `z₁ − z₀` provably zero. Divided by
+    /// that, the algebra's `x·recip(x) = 1` and `(x·a)/a = x` (sound for
+    /// every `x` but zero) merged the quotient's class with whatever `x`
+    /// they were handed, and saturation went on from there to a root class
+    /// holding a constant: the chord's area extracted as
+    /// `σ·½·max(1 − 1, 0) = 0` at every pixel, with no integral left — so
+    /// the closure pin above passed. The area of each kernel here depends on
+    /// `X` and on `Y`, so after the runtime tier's whole saturation its root
+    /// class must still vary along both: a class merged with a constant
+    /// varies along nothing.
+    #[test]
+    fn a_zero_sweep_never_makes_an_area_constant() {
+        use crate::egraph::RuleSet;
+        use crate::egraph::optimizer::Optimizer;
+        use crate::egraph::{Vocabulary, insert};
+        let vertical = |crossing: Kernel| {
+            let (x, y, c) = (Kernel::x(), Kernel::y(), Kernel::constant);
+            indicator_of(&y.ge(&c(2.25)))
+                .mul(&indicator_of(&y.lt(&c(5.5))))
+                .mul(&indicator_of(&x.lt(&crossing)))
+                .area()
+        };
+        let kernels = [
+            ("k = 0", chord(0.0).area()),
+            ("[x < a]", vertical(Kernel::constant(3.5))),
+            (
+                "[x < a] over a uniform",
+                vertical(pixelflow_ir::Uniform::new(3.5).kernel()),
+            ),
+        ];
+        for (name, kernel) in kernels {
+            let mut optimizer = Optimizer::production()
+                .rules(RuleSet::runtime())
+                .for_lattice(SHAPE);
+            let mut eg = optimizer.egraph();
+            let (arena, root) = kernel.parts();
+            let root = insert(arena, root, &mut eg, Vocabulary::Runtime).expect("inserts");
+            let stats = optimizer.saturate_term(&mut eg, arena.len());
+            for axis in [0, 1] {
+                assert!(
+                    eg.variance(root).depends_on(axis),
+                    "{name}: after saturation the area no longer varies along axis {axis} \
+                     ({stats:?})"
+                );
+            }
         }
     }
 
