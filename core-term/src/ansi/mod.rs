@@ -185,7 +185,7 @@ mod parser;
 
 pub use commands::AnsiCommand;
 use lexer::AnsiLexer;
-use parser::AnsiParser as ParserImpl;
+use parser::{is_printable_ascii, AnsiParser as ParserImpl};
 
 /// Trait for stateful ANSI escape sequence parsers.
 ///
@@ -313,18 +313,31 @@ impl AnsiProcessor {
 
 impl AnsiParser for AnsiProcessor {
     fn process_bytes(&mut self, bytes: &[u8]) -> Vec<AnsiCommand> {
-        for byte in bytes {
-            self.lexer.process_byte(*byte);
+        let Self { lexer, parser } = self;
+        // One command per input byte is the common upper bound (printable
+        // text); sizing once keeps the hot loop free of reallocation.
+        parser.reserve(bytes.len());
+
+        let mut rest = bytes;
+        while let Some((&byte, tail)) = rest.split_first() {
+            // Printable ASCII between sequences needs neither the UTF-8
+            // decoder nor the state machine: take the whole run at once.
+            if is_printable_ascii(byte) && lexer.is_idle() && parser.is_ground() {
+                let run_len = rest
+                    .iter()
+                    .position(|&b| !is_printable_ascii(b))
+                    .unwrap_or(rest.len());
+                let (run, after) = rest.split_at(run_len);
+                parser.print_ascii_run(run);
+                rest = after;
+                continue;
+            }
+            lexer.process_byte(byte, &mut |token| parser.process_token(token));
+            rest = tail;
         }
         // Finalize any pending UTF-8 sequence in the lexer.
-        self.lexer.finalize();
-
-        // Now take all tokens, including any finalization token.
-        let tokens = self.lexer.take_tokens();
-        for token in tokens {
-            self.parser.process_token(token);
-        }
-        self.parser.take_commands()
+        lexer.finalize(&mut |token| parser.process_token(token));
+        parser.take_commands()
     }
 }
 

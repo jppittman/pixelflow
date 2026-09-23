@@ -447,8 +447,9 @@ impl AnsiCommand {
     }
 
     /// Parses SGR parameters into a list of `Attribute`s.
-    fn parse_sgr(params: Vec<u16>) -> Vec<Attribute> {
-        let mut attrs = Vec::new();
+    fn parse_sgr(params: &[u16]) -> Vec<Attribute> {
+        // Most SGR params map to one attribute; size once instead of growing.
+        let mut attrs = Vec::with_capacity(params.len().max(1));
         if params.is_empty() {
             attrs.push(Attribute::Reset);
             return attrs;
@@ -600,15 +601,15 @@ impl AnsiCommand {
     }
 
     pub(crate) fn from_csi(
-        params: Vec<u16>,
-        intermediates: Vec<u8>,
+        params: &[u16],
+        intermediates: &[u8],
         is_private: bool,
         final_byte: u8,
     ) -> Option<Self> {
         let param_or = |idx: usize, default: u16| params.get(idx).copied().unwrap_or(default);
         let param_or_1 = |idx: usize| param_or(idx, 1).max(1);
 
-        match (is_private, intermediates.as_slice(), final_byte) {
+        match (is_private, intermediates, final_byte) {
             (false, b" ", b'q') => Some(AnsiCommand::Csi(CsiCommand::SetCursorStyle {
                 // DECSCUSR
                 shape: param_or(0, 1), // Default shape 1 (blinking block) or 0 (default)
@@ -675,7 +676,7 @@ impl AnsiCommand {
                 _ => {
                     warn!("Unsupported CTC parameter: {:?}", params.first());
                     Some(AnsiCommand::Csi(CsiCommand::Unsupported(
-                        intermediates,
+                        intermediates.to_vec(),
                         Some(final_byte),
                     )))
                 }
@@ -704,7 +705,7 @@ impl AnsiCommand {
                 );
                 // Return an error/unsupported command representation
                 Some(AnsiCommand::Csi(CsiCommand::Unsupported(
-                    intermediates,
+                    intermediates.to_vec(),
                     Some(final_byte),
                 )))
             }
