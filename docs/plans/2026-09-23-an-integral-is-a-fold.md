@@ -31,6 +31,9 @@
 > way before the jit and now, they're little more than conveniences."*
 >
 > On §2 as it now reads: *"yes, drop cell."*
+>
+> *"Do the integration like the derivatives. Put the rules in the egraph.
+> Then, ensure none hit the emitter in the legalize passes."*
 
 ---
 
@@ -234,6 +237,19 @@ binder the same way is its own question. It touches the public
 `Kernel::dwrt(u8)`, so it needs JP's permission.
 
 ## 3. The rules are loop transformations
+
+**Integration works the way differentiation does.**
+- The author writes the integral, `area(k)`, just as they write `k.dx()`.
+- Rewrite rules in the e-graph do the calculus, just as `ChainRule` does for
+  `Dwrt` (`pixelflow-search/src/egraph/derivative.rs`).
+  - The fold rules live in `fold_rules.rs`.
+  - The integral-specific rules will live in a new `integral` module beside
+    `derivative.rs` (not yet written).
+- Whatever the rules leave unclosed is lowered in `legalize`, before
+  `collapse`, by `passes::resolve`: quadrature first, then `lower_dwrt`.
+- No integral reaches the emitter. A panic in `collapse` and in
+  `arena_to_schedule` enforces that, and so does a test that every glyph's
+  extracted arena holds no interval fold.
 
 Every rule `area` needs is a rule `Σ` has always needed. Each is one statement
 over `Reduce`, whatever its domain.
