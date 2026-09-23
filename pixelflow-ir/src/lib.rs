@@ -37,6 +37,11 @@ pub mod dyadic;
 pub mod fold;
 pub use fold::{Binder, Fold, IntervalFold, Monoid, RangeFold};
 
+/// What an integral over an interval closes to: the closed forms the
+/// e-graph's integration rules write, beside the interval whose ends they
+/// read. See the module docs.
+pub mod integral;
+
 pub mod kind;
 pub mod traits;
 pub mod variance;

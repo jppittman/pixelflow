@@ -677,7 +677,36 @@ pub fn resolve(arena: &ExprArena, root: ExprId) -> Result<(ExprArena, ExprId), &
     }
     let mut owned = arena.clone();
     let root = expand_intervals(&mut owned, root);
-    lower_dwrt_owned(&owned, root)
+    let resolved = lower_dwrt_owned(&owned, root)?;
+    debug_assert!(
+        !reaches_interval(&resolved.0, resolved.1),
+        "resolve left an integral reachable: every interval fold must be closed by a rule \
+         or replaced by its quadrature before a backend sees the term"
+    );
+    Ok(resolved)
+}
+
+/// Whether an interval fold is reachable from `root` — [`resolve`]'s
+/// postcondition, asked of what it returns. Reachable, not merely present:
+/// `expand_intervals` rebuilds into the same arena, which still holds the
+/// folds it replaced.
+fn reaches_interval(arena: &ExprArena, root: ExprId) -> bool {
+    let mut seen = alloc::vec![false; arena.len()];
+    let mut stack = alloc::vec![root];
+    while let Some(id) = stack.pop() {
+        if core::mem::replace(&mut seen[id.0 as usize], true) {
+            continue;
+        }
+        if let ExprNode::Reduce {
+            fold: Fold::Interval(_),
+            ..
+        } = arena.node(id)
+        {
+            return true;
+        }
+        stack.extend(arena.children(id));
+    }
+    false
 }
 
 /// One unrolled term of a fold: the body with the bound index replaced by a

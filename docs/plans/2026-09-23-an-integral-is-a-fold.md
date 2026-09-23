@@ -249,8 +249,10 @@ binder the same way is its own question. It touches the public
 - Rewrite rules in the e-graph do the calculus, just as `ChainRule` does for
   `Dwrt` (`pixelflow-search/src/egraph/derivative.rs`).
   - The fold rules live in `fold_rules.rs`.
-  - The integral-specific rules will live in a new `integral` module beside
-    `derivative.rs` (not yet written).
+  - The integral-specific rules live in the `integral` module beside
+    `derivative.rs` (`pixelflow-search/src/egraph/integral.rs`). The closed
+    forms they write read an interval's ends, so they live beside the
+    interval, in `pixelflow-ir/src/integral.rs`, as its quadrature does.
 - Whatever the rules leave unclosed is lowered in `legalize`, before
   `collapse`, by `passes::resolve`: quadrature first, then `lower_dwrt`.
 - No integral reaches the emitter. A panic in `collapse` and in
@@ -491,6 +493,17 @@ Not on this list:
    - Gate: a quadrature oracle in scalar `f64`.
    - The tolerance is relative to the terms' magnitude, not `f32` rounding
      alone: at `X ≈ 1000`, `X² + 1/12` has already lost its twelfth.
+   - **Built** as the chord needs it and no further: `FactorFold` made n-ary,
+     `NarrowInterval` and `ClampMoment`, and a closing phase that runs that
+     family plus `ConstantFold` to a fixpoint before the full rule set, only
+     on a graph that holds an integral. The constant, linearity, select,
+     interchange and power-moment rules close nothing the chord needs and
+     wait for a kernel that does. Every fold and integration rule answers
+     with one `RewriteAction::Plan`, replacing the three fold-specific
+     actions. `PeelFold` and `HalveFold` decline to copy an integral no rule
+     closed. The oracle is `pixelflow-core/tests/area_oracle.rs`: polygon
+     clipping in `f64` against the compiled closed form, and a count of
+     the integrals extraction left unclosed.
 5. **Half-plane, conic and Taylor** (a-glyph-is-a-formula §4.1, §7).
 6. **The glyph** (a-glyph-is-a-formula §6).
 
