@@ -109,9 +109,9 @@
 //!
 //! → Lexer: [Print('h'), Print('e'), Print('l'), Print('l'), Print('o'),
 //!           C0Control(ESC), ...]
-//! → Parser: [Print('h'), Print('e'), Print('l'), Print('l'), Print('o'),
-//!            Csi(SetGraphicsRendition([Bold, Foreground(Red)])),
-//!            Csi(SetGraphicsRendition([Reset]))]
+//! → Parser: AnsiBatch { text: "hello(bold red)",
+//!                        commands: [(5, Csi(SetGraphicsRendition([Bold, Foreground(Red)]))),
+//!                                   (15, Csi(SetGraphicsRendition([Reset])))] }
 //! → App: Render "hello" in bold red, then reset
 //! ```
 //!
@@ -123,7 +123,7 @@
 //! - Order is preserved (bytes arrive in the order they were sent by PTY)
 //!
 //! ### Postcondition
-//! - `Vec<AnsiCommand>` contains all complete commands parsed from the bytes
+//! - The returned `AnsiBatch` holds all text and complete commands parsed from the bytes
 //! - Incomplete sequences (partial UTF-8, partial ESC sequences) are buffered internally
 //! - Next `process_bytes()` call will continue from where the previous call left off
 //!
@@ -134,7 +134,7 @@
 //!
 //! // First chunk: incomplete escape sequence
 //! let cmds1 = parser.process_bytes(b"hello\x1b");
-//! // Returns: [Print('h'), Print('e'), Print('l'), Print('l'), Print('o')]
+//! // Returns: text "hello", no commands
 //! // Buffers: ESC byte in state machine
 //!
 //! // Second chunk: completes the sequence
@@ -179,10 +179,12 @@
 //! - All CSI command variants
 //! - Edge cases (ESC followed by non-sequence, orphaned parameters)
 
+mod batch;
 pub mod commands;
 mod lexer;
 mod parser;
 
+pub use batch::{AnsiBatch, AnsiSink};
 pub use commands::AnsiCommand;
 use lexer::AnsiLexer;
 use parser::{is_printable_ascii, AnsiParser as ParserImpl};
@@ -200,7 +202,7 @@ use parser::{is_printable_ascii, AnsiParser as ParserImpl};
 /// **Precondition**: Parser is in a valid state (just created or from a prior call)
 ///
 /// **Postcondition**:
-/// - Returns a vector of all complete commands parsed from the bytes
+/// - Returns a batch of all text and complete commands parsed from the bytes
 /// - Incomplete sequences are buffered internally
 /// - Internal state is updated for next call
 ///
@@ -213,7 +215,7 @@ use parser::{is_printable_ascii, AnsiParser as ParserImpl};
 ///
 /// // Fragmentary input is supported
 /// let cmds1 = parser.process_bytes(b"hello\x1b");
-/// // Returns: [Print('h'), Print('e'), Print('l'), Print('l'), Print('o')]
+/// // Returns: text "hello", no commands
 /// // (ESC byte is buffered)
 ///
 /// let cmds2 = parser.process_bytes(b"[31m");
@@ -228,11 +230,11 @@ use parser::{is_printable_ascii, AnsiParser as ParserImpl};
 /// - **Statelessness of output**: Commands depend only on the byte stream, not on application state
 /// - **Streaming**: Parser uses bounded memory regardless of input size
 pub trait AnsiParser {
-    /// Processes a byte slice and returns all newly parsed commands.
+    /// Processes a byte slice and returns everything newly parsed.
     ///
     /// This method feeds the given bytes into the parser's state machine.
     /// Bytes are processed one at a time, updating internal state. When a complete
-    /// command sequence is recognized, it's added to the output vector.
+    /// command sequence is recognized, it's added to the output batch.
     ///
     /// # Arguments
     ///
@@ -240,14 +242,14 @@ pub trait AnsiParser {
     ///
     /// # Returns
     ///
-    /// Vector of `AnsiCommand`s that were completed during this call.
-    /// Empty vector if no complete sequences were found.
+    /// The text and commands completed during this call, in order.
+    /// Empty if nothing was completed.
     ///
     /// # Note
     ///
     /// The parser may buffer bytes if they form an incomplete sequence.
     /// Call `process_bytes` again with more data to complete the sequence.
-    fn process_bytes(&mut self, bytes: &[u8]) -> Vec<AnsiCommand>;
+    fn process_bytes(&mut self, bytes: &[u8]) -> AnsiBatch;
 }
 
 /// Stateful processor for ANSI escape sequence parsing.
@@ -284,10 +286,8 @@ pub trait AnsiParser {
 ///
 /// // Process data from PTY
 /// let data = b"hello world";
-/// let commands = parser.process_bytes(data);
-/// for cmd in commands {
-///     // Handle each command: Print, Csi, Osc, etc.
-/// }
+/// let mut batch = parser.process_bytes(data);
+/// batch.drain_into(&mut sink); // text runs and commands, in order
 /// ```
 #[derive(Debug, Default)]
 pub struct AnsiProcessor {
@@ -312,11 +312,11 @@ impl AnsiProcessor {
 }
 
 impl AnsiParser for AnsiProcessor {
-    fn process_bytes(&mut self, bytes: &[u8]) -> Vec<AnsiCommand> {
+    fn process_bytes(&mut self, bytes: &[u8]) -> AnsiBatch {
         let Self { lexer, parser } = self;
-        // One command per input byte is the common upper bound (printable
-        // text); sizing once keeps the hot loop free of reallocation.
-        parser.reserve(bytes.len());
+        // Printable text is at most one byte out per byte in, bar the rare
+        // replacement character; sizing once keeps the hot loop from growing.
+        parser.reserve_text(bytes.len());
 
         let mut rest = bytes;
         while let Some((&byte, tail)) = rest.split_first() {
@@ -337,7 +337,7 @@ impl AnsiParser for AnsiProcessor {
         }
         // Finalize any pending UTF-8 sequence in the lexer.
         lexer.finalize(&mut |token| parser.process_token(token));
-        parser.take_commands()
+        parser.take_batch()
     }
 }
 

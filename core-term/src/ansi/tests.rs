@@ -6,15 +6,35 @@
 // Corrected imports using commands submodule path
 use super::{
     commands::{AnsiCommand, Attribute, C0Control, CsiCommand, EscCommand},
-    AnsiParser, AnsiProcessor,
+    AnsiParser, AnsiProcessor, AnsiSink,
 };
 use crate::color::{Color, NamedColor};
 use test_log::test; // Ensure test_log is a dev-dependency for log capturing in tests
 
+/// Reads a batch the way the emulator does — through `AnsiSink` — recording
+/// each text character as the `Print` it stands for.
+struct Commands(Vec<AnsiCommand>);
+
+impl AnsiSink for Commands {
+    fn text(&mut self, run: &str) {
+        self.0.extend(run.chars().map(AnsiCommand::Print));
+    }
+
+    fn command(&mut self, command: AnsiCommand) {
+        self.0.push(command);
+    }
+}
+
+/// Feeds `bytes` to `processor` and returns what the emulator would receive.
+pub(super) fn parse(processor: &mut AnsiProcessor, bytes: &[u8]) -> Vec<AnsiCommand> {
+    let mut sink = Commands(Vec::new());
+    processor.process_bytes(bytes).drain_into(&mut sink);
+    sink.0
+}
+
 // Helper function to process bytes and get commands
 fn process_bytes(bytes: &[u8]) -> Vec<AnsiCommand> {
-    let mut processor = AnsiProcessor::new();
-    processor.process_bytes(bytes)
+    parse(&mut AnsiProcessor::new(), bytes)
 }
 
 #[test]
@@ -380,9 +400,9 @@ fn it_should_process_csi_clear_tab_stops_via_g() {
 #[test]
 fn it_should_process_csi_sequence_fragmented_across_param_bytes() {
     let mut processor = AnsiProcessor::new();
-    let commands_frag1 = processor.process_bytes(b"\x1B[1");
+    let commands_frag1 = parse(&mut processor, b"\x1B[1");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC [ 1)");
-    let commands_frag2 = processor.process_bytes(b";2H");
+    let commands_frag2 = parse(&mut processor, b";2H");
     assert_eq!(
         commands_frag2,
         vec![AnsiCommand::Csi(CsiCommand::CursorPosition(1, 2))],
@@ -393,9 +413,9 @@ fn it_should_process_csi_sequence_fragmented_across_param_bytes() {
 #[test]
 fn it_should_process_csi_sequence_fragmented_across_intermediate_bytes() {
     let mut processor = AnsiProcessor::new();
-    let commands_frag1 = processor.process_bytes(b"\x1B[?");
+    let commands_frag1 = parse(&mut processor, b"\x1B[?");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC [ ?)");
-    let commands_frag2 = processor.process_bytes(b"25h");
+    let commands_frag2 = parse(&mut processor, b"25h");
     assert_eq!(
         commands_frag2,
         vec![AnsiCommand::Csi(CsiCommand::SetModePrivate(25))],
@@ -406,9 +426,9 @@ fn it_should_process_csi_sequence_fragmented_across_intermediate_bytes() {
 #[test]
 fn it_should_process_csi_sequence_fragmented_after_esc() {
     let mut processor = AnsiProcessor::new();
-    let commands_frag1 = processor.process_bytes(b"\x1B");
+    let commands_frag1 = parse(&mut processor, b"\x1B");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC)");
-    let commands_frag2 = processor.process_bytes(b"[1A");
+    let commands_frag2 = parse(&mut processor, b"[1A");
     assert_eq!(
         commands_frag2,
         vec![AnsiCommand::Csi(CsiCommand::CursorUp(1))],
@@ -419,7 +439,7 @@ fn it_should_process_csi_sequence_fragmented_after_esc() {
 #[test]
 fn it_should_process_string_interspersed_with_fragmented_csi() {
     let mut processor = AnsiProcessor::new();
-    let commands_frag1 = processor.process_bytes(b"Hello ");
+    let commands_frag1 = parse(&mut processor, b"Hello ");
     assert_eq!(
         commands_frag1,
         vec![
@@ -432,9 +452,9 @@ fn it_should_process_string_interspersed_with_fragmented_csi() {
         ],
         "After fragment 1 (Hello )"
     );
-    let commands_frag2 = processor.process_bytes(b"\x1B[31");
+    let commands_frag2 = parse(&mut processor, b"\x1B[31");
     assert_eq!(commands_frag2, vec![], "After fragment 2 (ESC [ 31)");
-    let commands_frag3 = processor.process_bytes(b"m World");
+    let commands_frag3 = parse(&mut processor, b"m World");
     assert_eq!(
         commands_frag3,
         vec![
@@ -458,30 +478,30 @@ fn it_should_handle_fragmented_utf8_input_with_intermediate_finalization() {
     // within its process_bytes) handles UTF-8 fragments delivered in separate calls.
     let mut processor_refined = AnsiProcessor::new();
     assert_eq!(
-        processor_refined.process_bytes(b"A"),
+        parse(&mut processor_refined, b"A"),
         vec![AnsiCommand::Print('A')],
         "Refined Frag 0: Print 'A'"
     );
     // \xE4 is start of '你'. Since it's an incomplete sequence when process_bytes finishes, finalize() converts it.
     assert_eq!(
-        processor_refined.process_bytes(b"\xE4"),
+        parse(&mut processor_refined, b"\xE4"),
         vec![AnsiCommand::Print(char::REPLACEMENT_CHARACTER)],
         "Refined Frag 1: Incomplete UTF-8 (E4) yields replacement char"
     );
     // \xBD is now treated as a new byte. It's an invalid UTF-8 start. finalize() converts it.
     assert_eq!(
-        processor_refined.process_bytes(b"\xBD"),
+        parse(&mut processor_refined, b"\xBD"),
         vec![AnsiCommand::Print(char::REPLACEMENT_CHARACTER)],
         "Refined Frag 2: Invalid UTF-8 start (BD) yields replacement char"
     );
     // \xA0 is also an invalid UTF-8 start. finalize() converts it.
     assert_eq!(
-        processor_refined.process_bytes(b"\xA0"),
+        parse(&mut processor_refined, b"\xA0"),
         vec![AnsiCommand::Print(char::REPLACEMENT_CHARACTER)],
         "Refined Frag 3: Invalid UTF-8 start (A0) yields replacement char"
     );
     assert_eq!(
-        processor_refined.process_bytes(b"B"),
+        parse(&mut processor_refined, b"B"),
         vec![AnsiCommand::Print('B')],
         "Refined Frag 4: Print 'B'"
     );
@@ -489,7 +509,7 @@ fn it_should_handle_fragmented_utf8_input_with_intermediate_finalization() {
     // For contrast, show how a complete multi-byte char is processed in one call
     let mut processor_complete = AnsiProcessor::new();
     assert_eq!(
-        processor_complete.process_bytes(b"\xE4\xBD\xA0"),
+        parse(&mut processor_complete, b"\xE4\xBD\xA0"),
         vec![AnsiCommand::Print('你')],
         "Complete '你' in one call"
     );
@@ -498,15 +518,15 @@ fn it_should_handle_fragmented_utf8_input_with_intermediate_finalization() {
 #[test]
 fn it_should_complete_csi_if_final_byte_arrives_after_params() {
     let mut processor = AnsiProcessor::new();
-    let commands_frag1 = processor.process_bytes(b"\x1B[31");
+    let commands_frag1 = parse(&mut processor, b"\x1B[31");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC [ 31)");
-    let commands_frag2 = processor.process_bytes(b"A");
+    let commands_frag2 = parse(&mut processor, b"A");
     assert_eq!(
         commands_frag2,
         vec![AnsiCommand::Csi(CsiCommand::CursorUp(31))],
         "After fragment 2 (A)"
     );
-    let commands_frag3 = processor.process_bytes(b"BC");
+    let commands_frag3 = parse(&mut processor, b"BC");
     assert_eq!(
         commands_frag3,
         vec![AnsiCommand::Print('B'), AnsiCommand::Print('C')],
@@ -517,9 +537,9 @@ fn it_should_complete_csi_if_final_byte_arrives_after_params() {
 #[test]
 fn it_should_complete_osc_if_terminator_arrives_after_string_fragment() {
     let mut processor = AnsiProcessor::new();
-    let commands_frag1 = processor.process_bytes(b"\x1B]0;Ti");
+    let commands_frag1 = parse(&mut processor, b"\x1B]0;Ti");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC ] 0 ; Ti)");
-    let commands_frag2 = processor.process_bytes(b"tle\x07");
+    let commands_frag2 = parse(&mut processor, b"tle\x07");
     assert_eq!(
         commands_frag2,
         vec![AnsiCommand::Osc(b"0;Title".to_vec())],
@@ -530,9 +550,9 @@ fn it_should_complete_osc_if_terminator_arrives_after_string_fragment() {
 #[test]
 fn it_should_complete_dcs_if_terminator_arrives_after_string_fragment() {
     let mut processor = AnsiProcessor::new();
-    let commands_frag1 = processor.process_bytes(b"\x1BPSt");
+    let commands_frag1 = parse(&mut processor, b"\x1BPSt");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC P St)");
-    let commands_frag2 = processor.process_bytes(b"uff\x1B\\");
+    let commands_frag2 = parse(&mut processor, b"uff\x1B\\");
     assert_eq!(
         commands_frag2,
         vec![AnsiCommand::Dcs(b"Stuff".to_vec())],
@@ -879,7 +899,8 @@ fn it_should_dispatch_non_esc_c0_control_received_in_escape_state() {
 
 #[cfg(test)]
 mod unicode_wide_tests {
-    use crate::ansi::{AnsiCommand, AnsiParser as AnsiParserTrait, AnsiProcessor}; // Use AnsiParser trait if needed, AnsiProcessor for instantiation
+    use super::parse;
+    use crate::ansi::{AnsiCommand, AnsiProcessor};
     use std::char; // For char::REPLACEMENT_CHARACTER
 
     // Import C0Control and EscCommand if they are used in expected AnsiCommand variants
@@ -902,7 +923,7 @@ mod unicode_wide_tests {
     // Helper function, assuming AnsiProcessor is the public API to test
     fn process_bytes_unicode(bytes: &[u8]) -> Vec<AnsiCommand> {
         let mut processor = AnsiProcessor::new();
-        processor.process_bytes(bytes)
+        parse(&mut processor, bytes)
     }
 
     #[test]

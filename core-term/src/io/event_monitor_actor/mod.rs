@@ -293,6 +293,7 @@ impl Drop for PtyTroupeHandle {
 mod tests {
     use super::*;
     use crate::ansi::commands::AnsiCommand;
+    use crate::ansi::{AnsiBatch, AnsiSink};
     use crate::io::pty::PtyConfig;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
@@ -306,13 +307,27 @@ mod tests {
     }
 
     impl PtySender for CaptureSink {
-        fn send(&self, cmds: Vec<AnsiCommand>) -> Result<(), anyhow::Error> {
-            self.commands.lock().unwrap().extend(cmds);
+        fn send(&self, mut batch: AnsiBatch) -> Result<(), anyhow::Error> {
+            batch.drain_into(&mut Record(&mut self.commands.lock().unwrap()));
             Ok(())
         }
         fn send_child_exited(&self) -> Result<(), anyhow::Error> {
             self.child_exited.store(true, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    /// Reads a batch the way the app does, each text character recorded as
+    /// the `Print` it stands for.
+    struct Record<'a>(&'a mut Vec<AnsiCommand>);
+
+    impl AnsiSink for Record<'_> {
+        fn text(&mut self, run: &str) {
+            self.0.extend(run.chars().map(AnsiCommand::Print));
+        }
+
+        fn command(&mut self, command: AnsiCommand) {
+            self.0.push(command);
         }
     }
 

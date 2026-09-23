@@ -178,6 +178,16 @@ impl TerminalEmulator {
         }
     }
 
+    /// Prints a run of PTY text, exactly as one `AnsiCommand::Print` per
+    /// character would.
+    pub fn print_text(&mut self, run: &str) {
+        // Reset viewport to live screen when receiving PTY output
+        self.viewport_offset = 0;
+        for ch in run.chars() {
+            self.print_char(ch);
+        }
+    }
+
     /// Creates a fresh snapshot of the terminal's current visible state.
     /// Returns None if synchronized_output is active (skip frame).
     ///

@@ -12,7 +12,7 @@
 use super::pict::pairwise;
 use super::{
     commands::{AnsiCommand, Attribute, CsiCommand},
-    AnsiParser, AnsiProcessor,
+    AnsiProcessor,
 };
 use crate::color::{Color, NamedColor};
 use test_log::test;
@@ -95,7 +95,7 @@ fn sgr_factors() -> Vec<Vec<Level>> {
 }
 
 fn process(bytes: &[u8]) -> Vec<AnsiCommand> {
-    AnsiProcessor::new().process_bytes(bytes)
+    super::tests::parse(&mut AnsiProcessor::new(), bytes)
 }
 
 /// Build the `ESC[...m` byte sequence for a chosen row, and its oracle output.

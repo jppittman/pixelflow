@@ -3,6 +3,7 @@
 //! ANSI escape sequence parser.
 //! Takes individual `AnsiToken`s and accumulates `AnsiCommand`s internally.
 
+use super::batch::AnsiBatch;
 use super::commands::{AnsiCommand, C0Control};
 use super::lexer::AnsiToken;
 use log::{error, trace, warn};
@@ -42,7 +43,7 @@ enum State {
 #[derive(Debug)]
 pub struct AnsiParser {
     state: State,
-    commands: Vec<AnsiCommand>,
+    batch: AnsiBatch,
     params: Vec<u16>,
     intermediates: Vec<u8>,
     string_buffer: Vec<u8>,
@@ -58,7 +59,7 @@ impl AnsiParser {
     pub fn new() -> Self {
         AnsiParser {
             state: State::Ground,
-            commands: Vec::new(),
+            batch: AnsiBatch::default(),
             params: Vec::with_capacity(MAX_PARAMS),
             intermediates: Vec::with_capacity(MAX_INTERMEDIATES),
             string_buffer: Vec::with_capacity(MAX_OSC_LEN / 4),
@@ -70,9 +71,9 @@ impl AnsiParser {
         }
     }
 
-    /// Consumes and returns the list of fully parsed commands.
-    pub fn take_commands(&mut self) -> Vec<AnsiCommand> {
-        mem::take(&mut self.commands)
+    /// Consumes and returns everything parsed so far.
+    pub fn take_batch(&mut self) -> AnsiBatch {
+        mem::take(&mut self.batch)
     }
 
     fn clear_csi_state(&mut self) {
@@ -132,10 +133,10 @@ impl AnsiParser {
     fn dispatch_c0(&mut self, byte: u8) {
         trace!("Dispatching C0 Control: {}", byte);
         if let Some(command) = AnsiCommand::from_c0(byte) {
-            self.commands.push(command);
+            self.batch.push_command(command);
         } else {
             error!("Unhandled C0 control byte: {}", byte);
-            self.commands.push(AnsiCommand::Error(byte));
+            self.batch.push_command(AnsiCommand::Error(byte));
         }
         self.clear_esc_state();
         self.state = State::Ground;
@@ -148,26 +149,26 @@ impl AnsiParser {
         self.state == State::Ground
     }
 
-    /// Reserves room for `additional` more commands.
-    pub fn reserve(&mut self, additional: usize) {
-        self.commands.reserve(additional);
+    /// Reserves room for `additional` more bytes of printable text.
+    pub fn reserve_text(&mut self, additional: usize) {
+        self.batch.reserve_text(additional);
     }
 
-    /// Emits one `Print` per byte of a run of printable ASCII (0x20..=0x7E).
+    /// Appends a run of printable ASCII (0x20..=0x7E) to the batch's text.
     ///
     /// Equivalent to feeding each byte as `AnsiToken::Print` in `Ground`: every
     /// byte of the run keeps the parser in `Ground`, so the state machine has
-    /// nothing to decide and the run is a single `extend`.
+    /// nothing to decide and the run is a single copy.
     pub fn print_ascii_run(&mut self, run: &[u8]) {
         debug_assert!(self.is_ground());
         debug_assert!(run.iter().all(|&b| is_printable_ascii(b)));
         self.clear_esc_state();
-        self.commands
-            .extend(run.iter().map(|&b| AnsiCommand::Print(b as char)));
+        let run = std::str::from_utf8(run).expect("printable ASCII is UTF-8");
+        self.batch.push_str(run);
     }
 
     fn dispatch_print(&mut self, c: char) {
-        self.commands.push(AnsiCommand::Print(c));
+        self.batch.push_char(c);
         self.clear_esc_state();
         self.state = State::Ground;
     }
@@ -199,11 +200,11 @@ impl AnsiParser {
                     "Remapping CsiCommand::Unsupported with final byte {} to AnsiCommand::Error",
                     unsupported_final_byte
                 );
-                self.commands
-                    .push(AnsiCommand::Error(unsupported_final_byte));
+                self.batch
+                    .push_command(AnsiCommand::Error(unsupported_final_byte));
             } else {
                 // It's a different, valid CSI command
-                self.commands.push(command);
+                self.batch.push_command(command);
             }
         } else {
             // AnsiCommand::from_csi returned None, meaning it's not just unsupported but perhaps malformed.
@@ -211,7 +212,7 @@ impl AnsiParser {
                 "AnsiCommand::from_csi returned None for final_byte {}. Reporting as AnsiCommand::Error.",
                 final_byte
             );
-            self.commands.push(AnsiCommand::Error(final_byte));
+            self.batch.push_command(AnsiCommand::Error(final_byte));
         }
         self.clear_csi_state();
         self.state = State::Ground;
@@ -220,7 +221,7 @@ impl AnsiParser {
     fn dispatch_osc(&mut self) {
         let data = mem::take(&mut self.string_buffer);
         trace!("Dispatching OSC: Data length {}", data.len());
-        self.commands.push(AnsiCommand::Osc(data));
+        self.batch.push_command(AnsiCommand::Osc(data));
         self.clear_string_buffer();
         self.state = State::Ground;
     }
@@ -228,7 +229,7 @@ impl AnsiParser {
     fn dispatch_dcs(&mut self) {
         let data = mem::take(&mut self.string_buffer);
         trace!("Dispatching DCS: Data length {}", data.len());
-        self.commands.push(AnsiCommand::Dcs(data));
+        self.batch.push_command(AnsiCommand::Dcs(data));
         self.clear_string_buffer();
         self.state = State::Ground;
     }
@@ -236,7 +237,7 @@ impl AnsiParser {
     fn dispatch_pm(&mut self) {
         let data = mem::take(&mut self.string_buffer);
         trace!("Dispatching PM: Data length {}", data.len());
-        self.commands.push(AnsiCommand::Pm(data));
+        self.batch.push_command(AnsiCommand::Pm(data));
         self.clear_string_buffer();
         self.state = State::Ground;
     }
@@ -244,14 +245,14 @@ impl AnsiParser {
     fn dispatch_apc(&mut self) {
         let data = mem::take(&mut self.string_buffer);
         trace!("Dispatching APC: Data length {}", data.len());
-        self.commands.push(AnsiCommand::Apc(data));
+        self.batch.push_command(AnsiCommand::Apc(data));
         self.clear_string_buffer();
         self.state = State::Ground;
     }
 
     fn dispatch_st_standalone(&mut self) {
         trace!("Dispatching Standalone String Terminator (ST)");
-        self.commands.push(AnsiCommand::StringTerminator);
+        self.batch.push_command(AnsiCommand::StringTerminator);
         self.clear_string_buffer();
         self.clear_esc_state();
         self.state = State::Ground;
@@ -259,12 +260,12 @@ impl AnsiParser {
 
     fn dispatch_ignore(&mut self, byte: u8) {
         trace!("Dispatching Ignore: {}", byte);
-        self.commands.push(AnsiCommand::Ignore(byte));
+        self.batch.push_command(AnsiCommand::Ignore(byte));
     }
 
     fn dispatch_error(&mut self, byte: u8) {
         trace!("Dispatching Error: {}", byte);
-        self.commands.push(AnsiCommand::Error(byte));
+        self.batch.push_command(AnsiCommand::Error(byte));
         self.clear_esc_state();
         self.state = State::Ground;
     }
@@ -284,7 +285,7 @@ impl AnsiParser {
             "Malformed CSI sequence: unexpected byte {} ({})",
             byte, byte as char
         );
-        self.commands.push(AnsiCommand::Error(byte));
+        self.batch.push_command(AnsiCommand::Error(byte));
         self.clear_csi_state();
         self.state = State::CsiIgnore;
     }
@@ -333,10 +334,10 @@ impl AnsiParser {
                 AnsiToken::Print(c) => {
                     if let Some(command) = AnsiCommand::from_esc(c) {
                         // AnsiCommand::from_esc is from commands.rs
-                        self.commands.push(command);
+                        self.batch.push_command(command);
                     } else {
                         // If 'c' does not form a valid ESC sequence, treat 'c' as a printable character.
-                        self.commands.push(AnsiCommand::Print(c));
+                        self.batch.push_char(c);
                     }
                     self.state = State::Ground;
                 }
@@ -350,7 +351,7 @@ impl AnsiParser {
                             if let Some(command) =
                                 AnsiCommand::from_esc_intermediate(inter, final_char)
                             {
-                                self.commands.push(command);
+                                self.batch.push_command(command);
                             } else {
                                 self.dispatch_ignore(inter as u8);
                                 self.dispatch_ignore(final_char as u8);
@@ -517,7 +518,8 @@ impl AnsiParser {
                         token
                     );
                     self.clear_string_buffer();
-                    self.commands.push(AnsiCommand::C0Control(C0Control::ESC));
+                    self.batch
+                        .push_command(AnsiCommand::C0Control(C0Control::ESC));
                     self.state = State::Ground;
                     self.process_token(token);
                 }
