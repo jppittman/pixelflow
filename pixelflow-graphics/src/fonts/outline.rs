@@ -329,7 +329,11 @@ impl Outline {
 }
 
 /// The forward affine map `x' = a·x + b·y + tx, y' = c·x + d·y + ty`, stored
-/// as `[a, b, c, d, tx, ty]` — TrueType's component-transform layout.
+/// row-major as `[a, b, c, d, tx, ty]`.
+///
+/// Not TrueType's order: a component's 2×2 is stored `xscale, scale01,
+/// scale10, yscale`, and `scale01` multiplies `x` into `y'`, so it is this
+/// map's `c` and `scale10` its `b` (`Font::compound` swaps them as it reads).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Affine(pub [f32; 6]);
 

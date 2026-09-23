@@ -554,9 +554,14 @@ impl<'a> Font<'a> {
                 m[0] = r.i16()? as f32 / F2DOT14;
                 m[3] = r.i16()? as f32 / F2DOT14;
             } else if fl & COMPONENT_HAVE_A_TWO_BY_TWO != 0 {
+                // TrueType's order is `xscale, scale01, scale10, yscale`,
+                // and `scale01` is the one that carries `x` into `y′`:
+                // `x′ = xscale·x + scale10·y`, `y′ = scale01·x + yscale·y`
+                // (FreeType's `yx`, `xy`). `Affine` is row-major, so the
+                // middle two land in each other's slots.
                 m[0] = r.i16()? as f32 / F2DOT14;
-                m[1] = r.i16()? as f32 / F2DOT14;
                 m[2] = r.i16()? as f32 / F2DOT14;
+                m[1] = r.i16()? as f32 / F2DOT14;
                 m[3] = r.i16()? as f32 / F2DOT14;
             }
             if let Some(component) = self.outline(id) {

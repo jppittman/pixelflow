@@ -10,6 +10,11 @@
 //! here byte by byte, because the crate's own font has no mirrored
 //! components.
 //!
+//! The same font carries a component placed by a quarter-turn, which pins
+//! the order `ttf.rs` reads a component's 2×2 in: TrueType stores it
+//! `xscale, scale01, scale10, yscale`, with `scale01` carrying `x` into `y′`,
+//! and a reader that transposes it turns the component the wrong way.
+//!
 //! The judge is the exact-area reference (`common/exact_area.rs`), not the
 //! renderer. Today's renderer ramps coverage at every boundary it draws and
 //! softens this join either way; it is the formula glyph, which adds signed
@@ -45,12 +50,20 @@ const JOIN: i16 = 520;
 const HALF_ID: u16 = 1;
 const MIRRORED_ID: u16 = 2;
 const TURNED_ID: u16 = 3;
+/// `'D'`: the half alone, turned a quarter counter-clockwise by a 2×2 —
+/// `x′ = −y`, `y′ = x`, so `scale01 = +1` and `scale10 = −1` — and moved by
+/// [`QUARTER_OFFSET`]. Its straight side lies along font `y = 300` from
+/// `x = 150` to `850`, and it bulges up to `y = 500`.
+const QUARTER_TURNED_ID: u16 = 4;
+/// Where the quarter-turned half's corner `(0, 0)` lands.
+const QUARTER_OFFSET: (i16, i16) = (850, 300);
 
 const ON_CURVE: u8 = 0x01;
 const ARGS_ARE_WORDS: u16 = 0x0001;
 const ARGS_ARE_XY_VALUES: u16 = 0x0002;
 const MORE_COMPONENTS: u16 = 0x0020;
 const X_AND_Y_SCALE: u16 = 0x0040;
+const TWO_BY_TWO: u16 = 0x0080;
 /// ±1.0 in F2Dot14.
 const PLUS_ONE: i16 = 0x4000;
 const MINUS_ONE: i16 = -0x4000;
@@ -113,15 +126,38 @@ fn compound_glyph(scale: (i16, i16), offset: (i16, i16)) -> Vec<u8> {
     g
 }
 
+/// A compound glyph of one component, [`HALF_ID`], placed by the 2×2
+/// `[xscale, scale01, scale10, yscale]` — in the order the format stores
+/// it — and offset by `offset`.
+fn two_by_two_glyph(matrix: [i16; 4], offset: (i16, i16)) -> Vec<u8> {
+    let mut g = Vec::new();
+    be16(&mut g, -1); // compound
+    for bound in [0, 0, 0, 0] {
+        be16(&mut g, bound);
+    }
+    be16(
+        &mut g,
+        i32::from(ARGS_ARE_WORDS | ARGS_ARE_XY_VALUES | TWO_BY_TWO),
+    );
+    be16(&mut g, i32::from(HALF_ID));
+    be16(&mut g, i32::from(offset.0));
+    be16(&mut g, i32::from(offset.1));
+    for entry in matrix {
+        be16(&mut g, i32::from(entry));
+    }
+    g
+}
+
 /// A TrueType file holding exactly what `Font::parse` reads: `head`,
 /// `hhea`, `hmtx`, `loca` (long), `glyf`, and a format-4 `cmap` sending
-/// `'A'`, `'B'`, `'C'` to glyphs 1, 2, 3.
+/// `'A'`, `'B'`, `'C'`, `'D'` to glyphs 1, 2, 3, 4.
 fn font_bytes() -> Vec<u8> {
     let glyphs = [
         Vec::new(), // .notdef: empty
         simple_glyph(&HALF),
         compound_glyph((MINUS_ONE, PLUS_ONE), (JOIN, 0)),
         compound_glyph((MINUS_ONE, MINUS_ONE), (JOIN, 700)),
+        two_by_two_glyph([0, PLUS_ONE, MINUS_ONE, 0], QUARTER_OFFSET),
     ];
     let (mut glyf, mut loca) = (Vec::new(), Vec::new());
     for g in &glyphs {
@@ -152,7 +188,7 @@ fn font_bytes() -> Vec<u8> {
     be16(&mut cmap, 3); // Windows
     be16(&mut cmap, 1); // Unicode BMP
     be32(&mut cmap, 12); // its subtable follows
-    let segments: [(u16, u16, i16); 2] = [(0x41, 0x43, 1 - 0x41), (0xFFFF, 0xFFFF, 1)];
+    let segments: [(u16, u16, i16); 2] = [(0x41, 0x44, 1 - 0x41), (0xFFFF, 0xFFFF, 1)];
     be16(&mut cmap, 4); // format
     be16(&mut cmap, (16 + 8 * segments.len()) as i32); // length
     be16(&mut cmap, 0); // language
@@ -233,6 +269,7 @@ fn the_synthetic_font_parses_into_the_glyphs_it_describes() {
         ('A', HALF_ID, 1),
         ('B', MIRRORED_ID, 2),
         ('C', TURNED_ID, 2),
+        ('D', QUARTER_TURNED_ID, 1),
     ] {
         assert_eq!(font.cmap_lookup(ch), Some(id));
         let outline = font.outline_by_id(id).expect("an outline");
@@ -305,4 +342,71 @@ fn without_the_reversal_the_join_is_a_seam() {
             "texel ({JOIN_COLUMN}, {j}) reads {c}, not the seam's 0.2"
         );
     }
+}
+
+/// The half placed by `placement`, as the exact coverage of [`GRID`].
+fn exact_coverage_placed(font: &Font, placement: Affine) -> Vec<f64> {
+    let half = font.outline_by_id(HALF_ID).expect("the half");
+    let scale = SIZE / (f64::from(ASCENT) - f64::from(DESCENT));
+    let pieces = exact_area::pieces(&half.transformed(placement), |[x, y]| {
+        [
+            f64::from(x) * scale,
+            (f64::from(ASCENT) - f64::from(y)) * scale,
+        ]
+    });
+    signed_area(&pieces, GRID)
+        .into_iter()
+        .map(coverage)
+        .collect()
+}
+
+/// **A quarter-turn turns the way TrueType says.** The component's 2×2 is
+/// `[0, 1, −1, 0]` as stored — `scale01 = 1` carries `x` into `y′`,
+/// `scale10 = −1` carries `y` into `x′` — which is `x′ = −y`, `y′ = x`: a
+/// quarter-turn counter-clockwise. Read transposed, the same bytes are the
+/// clockwise quarter-turn, and the half lands 700 units to the right and
+/// bulges down instead of up.
+///
+/// Judged texel for texel against the half pushed through the map written
+/// out by hand, and against the ink that map must put under the lens's
+/// middle: font `x ∈ [450, 550]`, the half's own `y ∈ [300, 400]`, where it
+/// is at least 195.9 units — 3.9 px — wide, so screen rows 7–9 of columns 9
+/// and 10 are wholly inked. The clockwise reading leaves them empty.
+#[test]
+fn a_quarter_turned_component_turns_counter_clockwise() {
+    let bytes = font_bytes();
+    let font = Font::parse(&bytes).expect("the synthetic font parses");
+    let (dx, dy) = (f32::from(QUARTER_OFFSET.0), f32::from(QUARTER_OFFSET.1));
+    let turned = exact_coverage(&font, 'D');
+    let counter_clockwise = exact_coverage_placed(&font, Affine([0.0, -1.0, 1.0, 0.0, dx, dy]));
+    let clockwise = exact_coverage_placed(&font, Affine([0.0, 1.0, -1.0, 0.0, dx, dy]));
+    for (k, (got, want)) in turned.iter().zip(&counter_clockwise).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-9,
+            "texel ({}, {}): the component reads {got}, the quarter-turn {want}",
+            k % GRID.width,
+            k / GRID.width
+        );
+    }
+    for col in 9..=10 {
+        for row in 7..=9 {
+            let k = row * GRID.width + col;
+            assert!(
+                (turned[k] - 1.0).abs() < 1e-9,
+                "texel ({col}, {row}) under the lens reads {}",
+                turned[k]
+            );
+            assert!(
+                clockwise[k] < 1e-9,
+                "the clockwise reading inks texel ({col}, {row}): {}",
+                clockwise[k]
+            );
+        }
+    }
+    let ink: f64 = turned.iter().sum();
+    let want = 2.0 / 3.0 * (0.5 * 400.0 * 700.0) * 0.02 * 0.02;
+    assert!(
+        (ink - want).abs() < 1e-9,
+        "the turned half covers {ink}, not {want}: some of it left the grid"
+    );
 }
