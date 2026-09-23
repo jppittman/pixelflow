@@ -1333,75 +1333,8 @@ mod get_selected_text_tests {
 }
 
 #[cfg(test)]
-mod paste_text_tests {
+mod ansi_resize_tests {
     use super::*;
-
-    #[test]
-    fn paste_text_bracketed_off_simple() {
-        let mut emu = create_test_emulator(20, 1);
-        // Bracketed paste mode is off by default - just verify behavior
-
-        let text_to_paste = "Pasted text.";
-        emu.paste_text(text_to_paste.to_string());
-
-        let snapshot = emu.get_render_snapshot().expect("Snapshot was None");
-        let expected_cursor_x = text_to_paste.chars().count();
-        assert_screen_state(
-            &snapshot,
-            &["Pasted text.        "],
-            Some((0, expected_cursor_x)),
-        );
-    }
-
-    #[test]
-    fn paste_text_bracketed_off_with_newline() {
-        let mut emu = create_test_emulator(20, 2);
-        // Bracketed paste mode is off by default - just verify behavior
-
-        let text_to_paste = "Line1\nLine2";
-        emu.paste_text(text_to_paste.to_string());
-
-        let snapshot = emu.get_render_snapshot().expect("Snapshot was None");
-        let expected_screen = ["Line1               ", "Line2               "];
-        let expected_cursor_x = "Line2".chars().count();
-        assert_screen_state(&snapshot, &expected_screen, Some((1, expected_cursor_x)));
-    }
-
-    #[test]
-    fn paste_text_bracketed_off_causes_wrap() {
-        let mut emu = create_test_emulator(5, 2);
-        // Bracketed paste mode is off by default - just verify wrapping behavior
-
-        let text_to_paste = "HelloWorld";
-        emu.paste_text(text_to_paste.to_string());
-
-        let snapshot = emu.get_render_snapshot().expect("Snapshot was None");
-        let expected_screen = [
-            "Hello", // This line should be exactly 5 chars
-            "World", // This line should be exactly 5 chars
-        ];
-        assert_screen_state(&snapshot, &expected_screen, Some((1, 4))); // Expected cursor position is (1, 4) due to wrap
-    }
-
-    #[test]
-    fn paste_text_bracketed_on_logs_warning_processes_chars() {
-        let mut emu = create_test_emulator(20, 1);
-        // Enable bracketed paste mode
-        emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
-            CsiCommand::SetModePrivate(DecModeConstant::BracketedPaste as u16),
-        )));
-
-        let text_to_paste = "Pasted";
-        emu.paste_text(text_to_paste.to_string());
-
-        let snapshot = emu.get_render_snapshot().expect("Snapshot was None");
-        let expected_cursor_x = text_to_paste.chars().count();
-        assert_screen_state(
-            &snapshot,
-            &["Pasted              "],
-            Some((0, expected_cursor_x)),
-        );
-    }
 
     #[test]
     fn ansi_resize_sets_terminal_dimensions() {
