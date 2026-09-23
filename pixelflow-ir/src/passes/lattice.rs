@@ -131,6 +131,76 @@ pub fn collapse(arena: &mut ExprArena, root: ExprId, domain: Domain) -> ExprId {
 const PASS_ORDER: &str =
     "expand_refs -> lower_dwrt -> collapse -> pack -> expand_gather -> expand_transcendentals";
 
+/// Refuse a `Guard` whose arms are not **closed** (no coordinate `Var`, no
+/// `Uniform`, no `Buffer`) — allow it through otherwise.
+///
+/// The mask is a real child (`ExprNode::Guard`'s own doc): it is already
+/// visited and substituted the same as any other reachable node, by the
+/// generic child walk this function's caller falls through to. `on`/`off`
+/// are content-addressed names, not children, so `substitute_vars_with`'s
+/// coordinate warp cannot reach *into* them regardless — but that is only a
+/// problem when there is a coordinate in there to reach. A closed arm has
+/// none, by construction (extraction's finalization —
+/// `pixelflow-search::egraph::extract::choices_to_arena` — only ever names
+/// one when both arms pass exactly this check, for the identical reason:
+/// `emit::schedule_guard_arm` schedules an arm "short of the lattice",
+/// never wrapped in collapse's own row/column/lane folds, so a `Uniform`'s
+/// or a `Buffer`'s slot inside it is numbered from that arm's own,
+/// separately re-materialized table — nothing reconciles that against the
+/// outer kernel's calling convention, so it is refused the same as an open
+/// coordinate is). So this is not a new allowance beyond what G3 already
+/// guarantees; it is `collapse` catching up to a `Guard` it can actually
+/// receive.
+///
+/// # Panics
+///
+/// If `on` or `off` does not resolve (an arm must be interned before it can
+/// reach codegen — the same requirement `emit::schedule_guard_arm` states),
+/// or if either reads a coordinate `Var`, a `Uniform`, or a `Buffer`.
+fn guard_must_be_closed(on: crate::key::KernelKey, off: crate::key::KernelKey) {
+    #[cfg(feature = "std")]
+    {
+        for (which, key) in [("on", on), ("off", off)] {
+            let kernel = crate::store::KernelStore::resolve(key).unwrap_or_else(|| {
+                panic!(
+                    "collapse: a Guard's {which} arm ({key:?}) names no kernel in the \
+                     KernelStore — an arm must be interned (KernelStore::intern) before it \
+                     reaches codegen"
+                )
+            });
+            let (arm_arena, arm_root) = kernel.parts();
+            assert!(
+                arm_arena.coordinate_axis(arm_root).is_none(),
+                "collapse: a Guard's {which} arm ({key:?}) reads a coordinate — \
+                 substitute_vars_with's warp cannot reach a named kernel's contents \
+                 (same reason collapse refuses a reachable Ref), so a coordinate-dependent \
+                 arm cannot be named at all; extraction's finalization must not have named \
+                 one ({PASS_ORDER})"
+            );
+            assert!(
+                arm_arena.uniforms().is_empty() && arm_arena.buffers().is_empty(),
+                "collapse: a Guard's {which} arm ({key:?}) declares a Uniform or Buffer — \
+                 its arena is re-materialized and renumbered independently \
+                 (emit::schedule_guard_arm schedules it short of the lattice), so nothing \
+                 reconciles its slots against the outer kernel's calling convention; \
+                 extraction's finalization must not have named one"
+            );
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        // No store to resolve an arm against under no_std (this module's own
+        // doc on `KernelStore`/`Kernel::by_ref`), so a reachable Guard can
+        // never be verified closed here — refuse outright, the conservative
+        // half of the same check the `std` arm performs.
+        let _ = (on, off);
+        panic!(
+            "collapse: a Guard is reachable from root, and there is no KernelStore under \
+             no_std to verify its arms are closed ({PASS_ORDER})"
+        );
+    }
+}
+
 /// Which binder slots [`collapse`] must not choose — bound by a reachable
 /// `Reduce`, or read by a reachable `Var` in the binder range — found in one
 /// walk of `root`'s reachable subgraph that also refuses, by panicking and
@@ -153,11 +223,7 @@ fn reachable_taken_binders(arena: &ExprArena, root: ExprId) -> [bool; Binder::CO
                  would silently never reach it; run expand_refs first \
                  ({PASS_ORDER})"
             ),
-            ExprNode::Guard { .. } => panic!(
-                "collapse: a Guard is reachable from root — a name, for the \
-                 same reason as a Ref above; run expand_refs first \
-                 ({PASS_ORDER})"
-            ),
+            ExprNode::Guard { mask: _, on, off } => guard_must_be_closed(on, off),
             ExprNode::Unary(OpKind::Dwrt, _)
             | ExprNode::Binary(OpKind::Dwrt, _, _)
             | ExprNode::Ternary(OpKind::Dwrt, _, _, _)

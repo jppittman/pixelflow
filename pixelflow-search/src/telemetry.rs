@@ -45,7 +45,10 @@
 use std::io::Write as _;
 use std::time::Duration;
 
-use crate::egraph::{CostModel, ExtractionReport, OptimizerStats, SaturationStop};
+use crate::egraph::{
+    CostModel, ExtractionReport, GUARD_COHERENCE_PLACEHOLDER, GUARD_PROBABILITY_PLACEHOLDER,
+    GUARD_TEST_BRANCH_CYCLES, MISPREDICT_PENALTY_CYCLES, OptimizerStats, SaturationStop,
+};
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 
 pub use crate::tier::Tier;
@@ -248,15 +251,39 @@ fn latency_prior_cost(arena: &ExprArena, root: ExprId) -> usize {
             // Priced as the node it is, which is what `CostModel` says about
             // it — see `node_op_cost`'s note on why that is a sentinel.
             ExprNode::Reduce { .. } => Some(pixelflow_ir::OpKind::Reduce),
-            // Same reasoning as `Ref`: a `Guard` has no cost of its own to
-            // stand in for (it names two whole arms, not one operation), and
-            // `egraph::insert` declines a `Guard` exactly as it declines a
-            // `Ref` (G1 — extraction cannot choose one), so a saturated
-            // arena reaching telemetry cannot hold one either.
-            ExprNode::Guard { mask: _, on, off } => panic!(
-                "latency_prior_cost: Guard(on={on:?}, off={off:?}) — insert declines a \
-                 Guard, so one here means this arena never went through the pipeline"
-            ),
+            // A `Guard` reaching telemetry is no longer impossible as of G3
+            // (docs/plans/2026-09-12-emit-should-just-emit.md): extraction's
+            // finalization (`egraph::extract::choices_to_arena`) now names
+            // one when the DP settles on it, so a production saturation run
+            // can produce one and this measurement has to price it rather
+            // than panic. Priced the same way `egraph::cost`'s DP formula
+            // does — its own fixed overhead, plus each arm's own
+            // latency-prior cost (recursively; an arm is its own small
+            // arena, resolved via `KernelStore`), weighted by the same G3
+            // placeholders. Not `None`: pricing a `Guard` at zero would put
+            // a silently wrong (too-low) number in a measurement, the same
+            // concern `Ref` above states.
+            ExprNode::Guard { mask: _, on, off } => {
+                let arm_cost = |key: pixelflow_ir::key::KernelKey| -> usize {
+                    let kernel = pixelflow_ir::KernelStore::resolve(key).unwrap_or_else(|| {
+                        panic!(
+                            "latency_prior_cost: {key:?} names no kernel in the \
+                             KernelStore — a Guard's arm must be interned before it \
+                             reaches telemetry"
+                        )
+                    });
+                    let (arm_arena, arm_root) = kernel.parts();
+                    latency_prior_cost(arm_arena, arm_root)
+                };
+                let on_cost = arm_cost(on) as f64;
+                let off_cost = arm_cost(off) as f64;
+                let weighted_arms = GUARD_PROBABILITY_PLACEHOLDER * on_cost
+                    + (1.0 - GUARD_PROBABILITY_PLACEHOLDER) * off_cost;
+                let mispredict =
+                    (1.0 - GUARD_COHERENCE_PLACEHOLDER) * MISPREDICT_PENALTY_CYCLES as f64;
+                total += GUARD_TEST_BRANCH_CYCLES + (weighted_arms + mispredict).round() as usize;
+                None
+            }
             // Same again: `insert` declines a `Write`, which is built after
             // extraction in any case.
             ExprNode::Write { .. } => panic!(

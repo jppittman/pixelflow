@@ -910,7 +910,12 @@ fn greedy_trace(egraph: &EGraph, root: EClassId, costs: &CostModel) -> GreedyTra
                     | ENode::Buffer(_)
                     | ENode::Uniform(_)
                     | ENode::Param(_) => costs.node_op_cost(node),
-                    ENode::Op { .. } | ENode::Reduce { .. } => {
+                    // Full-weight, unweighted-arm treatment for `Guard`
+                    // here too — this module's own research DP, not
+                    // production's (`extract.rs`'s `TreePricer`/
+                    // `SharedPricer` carry the real `P`-weighted formula) —
+                    // conservative rather than wrong.
+                    ENode::Op { .. } | ENode::Reduce { .. } | ENode::Guard { .. } => {
                         let children = node.children_slice();
                         if children.iter().any(|&c| egraph.find(c) == canonical) {
                             saw_cycle = true;

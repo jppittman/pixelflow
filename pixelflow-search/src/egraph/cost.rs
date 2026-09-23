@@ -152,6 +152,78 @@ pub fn latency_prior_cycles() -> OpMap<usize> {
 }
 
 // ============================================================================
+// Guard vs Select — G3 (docs/plans/2026-09-12-emit-should-just-emit.md)
+// ============================================================================
+
+/// What a guard costs when it never fires: the uniformity test, plus a
+/// branch the hardware cannot predict because the mask is incoherent.
+///
+/// Taken as ~16 cycles, which is the mispredict penalty on the cores this
+/// compiler targets — 15–20 on Intel since Skylake and on AMD since Zen
+/// (Agner Fog, *The microarchitecture of Intel, AMD and VIA CPUs*, §"Branch
+/// prediction"), 13–16 on ARM's recent out-of-order cores (Cortex-A76 and
+/// Neoverse software optimization guides). It is an architectural figure, not
+/// a knob: **do not sweep it**, and do not move it to make a kernel faster.
+///
+/// It is used as a *bound*, which is why one number for two architectures is
+/// honest. A guard's upside depends on how often the mask is uniform, which
+/// is data and unknowable here; its downside does not. An arm whose work
+/// costs less than the penalty cannot pay for its own branch even if the
+/// branch always fires, so guarding it is a loss in every world — while an
+/// arm that costs far more is capped at this much loss and may save all of
+/// it. Measured, that is the whole difference between a glyph's coverage
+/// mask (a handful of ops per arm, varying per lane, 3.6x slower with a
+/// guard) and a sphere's silhouette (214 entries, uniformly false in 97% of
+/// batches, 3.2x faster with one).
+///
+/// Lives here rather than in `pixelflow-codegen::emit::guards` (where it was
+/// measured and first used, and still is): `pixelflow-codegen` depends on
+/// `pixelflow-search`, never the reverse, and extraction's own
+/// `ENode::Guard`-vs-`Select` pricing (`node_op_cost` below, and
+/// `extract.rs`'s pricers) needs this exact measured bound too, so this is
+/// the only direction the dependency can run. `guards.rs` imports it back —
+/// same number, same doc, its own use unchanged.
+pub const MISPREDICT_PENALTY_CYCLES: usize = 16;
+
+/// The always-paid overhead of a hard branch a `Guard` node costs, on top of
+/// [`MISPREDICT_PENALTY_CYCLES`]'s *mispredict* cost: a uniformity test (are
+/// all lanes' masks equal?) and a predicted-taken branch when they are.
+///
+/// Unlike `MISPREDICT_PENALTY_CYCLES`, this is a rough instruction-count
+/// estimate, not a measured architectural bound — a compare-and-branch is
+/// cheap and roughly this size on every target this compiler emits for, but
+/// nothing here claims a citation the way the mispredict figure has one.
+pub const GUARD_TEST_BRANCH_CYCLES: usize = 2;
+
+/// G3's placeholder for `P`, the probability a `Guard`'s mask takes the
+/// `on` arm — used to weight `on`'s and `off`'s settled costs in the DP's
+/// `Guard` pricing arm (`P·cost[on] + (1−P)·cost[off]`).
+///
+/// **A placeholder, not a bound.** Unlike [`MISPREDICT_PENALTY_CYCLES`], this
+/// number is not measured and is not conservative in either direction — a
+/// mask that is almost always true would make `0.5` an overestimate of the
+/// hot arm's contribution, and one that is almost always false the same in
+/// the other direction. `0.5` is simply the value that makes no per-mask
+/// claim at all, which is the honest answer while nothing here estimates one.
+/// A per-mask estimate (branch-history-shaped, or read off the mask's own
+/// structure) is future work (G4) — see
+/// docs/plans/2026-09-12-emit-should-just-emit.md.
+pub const GUARD_PROBABILITY_PLACEHOLDER: f64 = 0.5;
+
+/// G3's placeholder for `coherence`, how often a mask is uniform across a
+/// batch (and so the branch predicts) — used as `(1 − coherence) ·
+/// MISPREDICT_PENALTY_CYCLES` in the DP's `Guard` pricing arm.
+///
+/// **A placeholder, not a bound**, for the same reason as
+/// [`GUARD_PROBABILITY_PLACEHOLDER`]: `0.0` is the conservative worst case
+/// (every batch pays the full mispredict penalty), matching the stance
+/// `pixelflow-codegen::emit::guards`'s own `arm_cycles` already takes for
+/// `Reduce`/`Guard` cones it cannot see into — a coarse, conservative
+/// estimate costs nothing to be wrong about. A learned per-mask coherence
+/// estimate is G4, not this stage.
+pub const GUARD_COHERENCE_PLACEHOLDER: f64 = 0.0;
+
+// ============================================================================
 // Cost Function Trait
 // ============================================================================
 
@@ -357,6 +429,22 @@ impl CostModel {
                 Some(op) => (fold.len() as usize).saturating_sub(1) * self.cost(op.kind()),
                 None => usize::MAX / 4,
             },
+            // A `Guard`'s own cost is its two fixed overheads —
+            // `GUARD_TEST_BRANCH_CYCLES`, always paid, and
+            // `MISPREDICT_PENALTY_CYCLES` scaled by `(1 - coherence)`, which
+            // at G3's `GUARD_COHERENCE_PLACEHOLDER = 0.0` is the whole
+            // penalty, unconditionally. Neither term depends on `on`/`off`'s
+            // own costs, so both belong here, in the node-local "own" cost —
+            // exactly where `Reduce`'s combiner-chain cost lives above, for
+            // the same reason (a node's cost cannot see its children's). The
+            // `P`-weighted `on`/`off` combination is what extraction's DP
+            // pricers (`extract.rs`) add on top, the same way they multiply a
+            // fold's body by its trip count.
+            ENode::Guard { .. } => {
+                let mispredict =
+                    (1.0 - GUARD_COHERENCE_PLACEHOLDER) * MISPREDICT_PENALTY_CYCLES as f64;
+                GUARD_TEST_BRANCH_CYCLES + mispredict.round() as usize
+            }
         }
     }
 

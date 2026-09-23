@@ -1117,6 +1117,11 @@ impl EGraph {
             ENode::Param(_) => pixelflow_ir::OpKind::Param,
             ENode::Op { op, .. } => op.kind(),
             ENode::Reduce { .. } => pixelflow_ir::OpKind::Reduce,
+            // A `Guard` denotes the same value as `Select` — the op it is
+            // always unioned with — and is not itself an `OpKind` (a branch,
+            // not an operation; `pixelflow_ir::ExprArena::kind` panics on one
+            // for the same reason).
+            ENode::Guard { .. } => pixelflow_ir::OpKind::Select,
         }
     }
 
@@ -3014,6 +3019,21 @@ fn derivative_shape<S: NodeSink>(sink: &mut S, inner: &ENode, var: u8) -> EClass
         // so the `Dwrt` is reconstructed below and survives as the fallback,
         // exactly as `Gather` does.
         ENode::Reduce { .. } => {
+            let var_const = sink.make(ENode::constant(var as f32));
+            let inner = sink.make(inner.clone());
+            return sink.make(ENode::Op {
+                op: &ops::Dwrt,
+                children: vec![inner, var_const],
+            });
+        }
+        // Same fallback as `Reduce`, and for the same reason: this table has
+        // no rule for a branch (a `Guard` is not differentiated directly —
+        // `Select`'s own `Dwrt` rule, if this e-class ever gets one, applies
+        // to the `Select` representative the class is unioned with; the
+        // `Guard` representative reconstructs the `Dwrt` and survives
+        // saturation as the jet fallback, exactly as an unhandled `Op` does
+        // below).
+        ENode::Guard { .. } => {
             let var_const = sink.make(ENode::constant(var as f32));
             let inner = sink.make(inner.clone());
             return sink.make(ENode::Op {

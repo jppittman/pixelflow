@@ -216,6 +216,21 @@ impl DepsAnalysis {
                 let child_v = resolved.get(&child).copied().unwrap_or(Variance::ALL);
                 child_v.without(Variance::from_var(fold.binder().var()))
             }
+            // Same denotation as `Select` (`Op` with 3 children): the value
+            // varies with whatever the mask varies with (which arm runs) and
+            // with whatever either arm varies with.
+            ENode::Guard { children } => {
+                let mut v = Variance::CONST;
+                for &child in children {
+                    let child = egraph.find(child);
+                    if child == self_id {
+                        return Variance::ALL;
+                    }
+                    let child_v = resolved.get(&child).copied().unwrap_or(Variance::ALL);
+                    v = v.union(child_v);
+                }
+                v
+            }
         }
     }
 
@@ -229,6 +244,7 @@ impl DepsAnalysis {
             ENode::Var(v) => (Some(var_variance(*v)), vec![]),
             ENode::Op { children, .. } => (None, children.clone()),
             ENode::Reduce { body, .. } => (None, vec![*body]),
+            ENode::Guard { children } => (None, children.to_vec()),
         }
     }
 

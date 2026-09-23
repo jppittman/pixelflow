@@ -148,6 +148,54 @@ impl<T: InversePair> Rewrite for Canonicalize<T> {
     }
 }
 
+/// `Select(m, a, b) ≡ Guard(m, a, b)`: the hard-branch alternative to a
+/// `Select`, unioned into the same e-class it came from so the two compete
+/// as equals in extraction's cost model (G3,
+/// docs/plans/2026-09-12-emit-should-just-emit.md — `docs/BACKLOG.md`'s D7:
+/// "Denote `Select(m, a, b)` as `Guard(m, a) ⊕ Guard(¬m, b)`... let the cost
+/// decide").
+///
+/// Non-destructive and needs no reverse rule: `RewriteAction::Create`
+/// hash-conses the `Guard` node into `Select`'s own e-class (idempotent on a
+/// repeat, and it fires once per `Select` regardless of saturation order),
+/// exactly the pattern [`Canonicalize`] already uses to put `Sub(a,b)` and
+/// `Add(a, Neg(b))` in one class with no cost argument in the rule itself.
+///
+/// No `lhs_template`/`rhs_template`: those describe an arena-level rewrite
+/// (`ExprNode` patterns spliced through `insert.rs`), and a `Guard` is
+/// deliberately not reachable that way — it never exists as surface syntax,
+/// only as this rule's output inside the e-graph (see `insert.rs`'s
+/// `Shape::Guard` decline, and this module's own doc on why that stays
+/// correct). Leaving both `None` (the trait's default) keeps this rule out
+/// of the template-based soundness harness that arena patterns feed, which
+/// is the right scope for a rule whose RHS cannot be expressed as one.
+pub struct SelectToGuard;
+
+impl SelectToGuard {
+    pub fn new() -> Box<Self> {
+        Box::new(Self)
+    }
+}
+
+impl Rewrite for SelectToGuard {
+    fn name(&self) -> &str {
+        "select-to-guard"
+    }
+
+    fn apply(&self, _egraph: &EGraph, _id: EClassId, node: &ENode) -> Option<RewriteAction> {
+        if !node_matches_op(node, &ops::Select) {
+            return None;
+        }
+        let ENode::Op { children, .. } = node else {
+            return None;
+        };
+        let &[mask, on, off] = children.as_slice() else {
+            return None;
+        };
+        Some(RewriteAction::Create(ENode::make_guard(mask, on, off)))
+    }
+}
+
 /// Involution: inv(inv(x)) → x
 ///
 /// The unary inverse is its own inverse.
@@ -1197,6 +1245,85 @@ mod platform_specific_fold_tests {
         assert_eq!(
             folds(&ops::Select, &[f32::from_bits(f), 7.0, 9.0]),
             Some(9.0)
+        );
+    }
+}
+
+/// G3 (docs/plans/2026-09-12-emit-should-just-emit.md): `Select` and `Guard`
+/// compete as equals in one e-class.
+#[cfg(test)]
+mod select_to_guard_tests {
+    use super::*;
+    use crate::egraph::EGraph;
+
+    /// `SelectToGuard::apply` on a `Select` node returns
+    /// `Create(Guard{mask, on, off})` naming the exact same operands.
+    #[test]
+    fn apply_produces_a_guard_with_the_same_operands() {
+        let mut eg = EGraph::new();
+        let mask = eg.add(ENode::Var(0));
+        let on = eg.add(ENode::constant(1.0));
+        let off = eg.add(ENode::constant(2.0));
+        let sel = eg.add(ENode::Op {
+            op: &ops::Select,
+            children: vec![mask, on, off],
+        });
+        let node = eg.nodes(sel)[0].clone();
+
+        let action = SelectToGuard
+            .apply(&eg, sel, &node)
+            .expect("SelectToGuard must match a Select node");
+
+        match action {
+            RewriteAction::Create(ENode::Guard { children }) => {
+                assert_eq!(children, [mask, on, off]);
+            }
+            other => panic!("expected Create(Guard{{..}}), got {other:?}"),
+        }
+    }
+
+    /// A non-`Select` node is declined.
+    #[test]
+    fn apply_declines_a_non_select_node() {
+        let mut eg = EGraph::new();
+        let a = eg.add(ENode::Var(0));
+        let b = eg.add(ENode::Var(1));
+        let add = eg.add(ENode::Op {
+            op: &ops::Add,
+            children: vec![a, b],
+        });
+        let node = eg.nodes(add)[0].clone();
+        assert!(SelectToGuard.apply(&eg, add, &node).is_none());
+    }
+
+    /// After the rule fires through the real saturation driver, the
+    /// `Select`'s e-class also holds an equivalent `Guard` candidate — the
+    /// two live in one class, as the design requires (not a separate class
+    /// reached by a reverse rule).
+    #[test]
+    fn saturation_unions_a_guard_into_the_selects_own_class() {
+        let mut eg = EGraph::with_rules(vec![SelectToGuard::new()]);
+        let mask = eg.add(ENode::Var(0));
+        let on = eg.add(ENode::constant(1.0));
+        let off = eg.add(ENode::constant(2.0));
+        let sel = eg.add(ENode::Op {
+            op: &ops::Select,
+            children: vec![mask, on, off],
+        });
+
+        crate::egraph::saturate_with_budget(&mut eg, 10);
+
+        let class = eg.find(sel);
+        let nodes = eg.nodes(class);
+        assert!(
+            nodes
+                .iter()
+                .any(|n| matches!(n, ENode::Op { op, .. } if op.kind() == OpKind::Select)),
+            "the class must still hold the Select it started with: {nodes:?}"
+        );
+        assert!(
+            nodes.iter().any(|n| matches!(n, ENode::Guard { .. })),
+            "the class must also hold an equivalent Guard candidate: {nodes:?}"
         );
     }
 }

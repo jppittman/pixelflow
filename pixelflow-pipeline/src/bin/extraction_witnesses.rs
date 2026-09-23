@@ -446,6 +446,14 @@ fn node_label(egraph: &EGraph, class: EClassId, idx: usize) -> String {
             fold.stride(),
             egraph.find(*body).index()
         ),
+        ENode::Guard {
+            children: [mask, on, off],
+        } => format!(
+            "Guard(e{}, on=e{}, off=e{})",
+            egraph.find(*mask).index(),
+            egraph.find(*on).index(),
+            egraph.find(*off).index(),
+        ),
     }
 }
 

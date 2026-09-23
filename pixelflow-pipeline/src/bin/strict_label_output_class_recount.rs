@@ -167,6 +167,14 @@ fn render_chosen(eg: &EGraph, choices: &[Option<usize>], class: EClassId) -> Str
             fold.range().end,
             render_chosen(eg, choices, *body)
         ),
+        ENode::Guard {
+            children: [mask, on, off],
+        } => format!(
+            "Guard({}, on=e{}, off=e{})",
+            render_chosen(eg, choices, *mask),
+            eg.find(*on).index(),
+            eg.find(*off).index(),
+        ),
     }
 }
 

@@ -72,7 +72,10 @@ pub use candidate::{
     CandidateFeatures, CandidateKey, ClassContentKey, Firing,
     REGISTERED_PRIMARY_BUDGET_APPLICATIONS,
 };
-pub use cost::{CostFunction, CostModel};
+pub use cost::{
+    CostFunction, CostModel, GUARD_COHERENCE_PLACEHOLDER, GUARD_PROBABILITY_PLACEHOLDER,
+    GUARD_TEST_BRANCH_CYCLES, MISPREDICT_PENALTY_CYCLES,
+};
 pub use deps::{Deps, DepsAnalysis};
 pub use derivative::{ChainRule, derivative_rules};
 pub use extract::{
