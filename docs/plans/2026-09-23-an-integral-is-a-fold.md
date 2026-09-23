@@ -3,8 +3,8 @@
 ## Metadata
 - **Author**: JP (direction), Claude (draft)
 - **Status**: `Draft`. The denotation was proposed 2026-09-23 and nothing is
-  built. §2's node shape (a `Cell` domain on `Fold`) is Claude's refinement of
-  JP's choice of a typed node, and is open for JP to confirm (§9).
+  built. §2's node shape, a `Cell` domain on `Fold`, was decided by JP the same
+  day.
 - **Created**: 2026-09-23
 - **Verified against**: `d2a42c9`. Every `file:line` below was re-read there,
   by two independent maps and three fact-checks.
@@ -25,7 +25,8 @@
 > factorization? These are somehow related."*
 >
 > Offered either an opcode per axis or a typed node, JP chose the typed node,
-> `Area{axis, body}`.
+> `Area{axis, body}`. Offered that node beside `Reduce` or as a domain of
+> `Fold`: *"I want integrals built on fold."*
 
 ---
 
@@ -433,11 +434,10 @@ Not on this list:
 
 ## 9. Open questions
 
-- **`Cell` on `Fold`, or a sibling `Area` node** behind a shared binder trait.
-  Recommended: `Cell` on `Fold`, since every rule of §3 is then written once.
+- ~~`Cell` on `Fold`, or a sibling `Area` node.~~ **Decided (JP): on `Fold`.**
   About 39 files match a `Reduce`-shaped node. Most read `fold.binder()`,
-  `len()` or `range()` and must refuse a `Cell`; that is where it is resolved
-  before codegen. *For JP.*
+  `len()` or `range()`, and must never see a `Cell`: it is resolved before
+  codegen, so the range-specific sites refuse it.
 - **A binder's trip count in pricing.** After `PeelFold`, one body class sits
   under folds of different lengths (`extract.rs:2200-2210`), so the DAG
   objective cannot carry one count per class. The candidates:
