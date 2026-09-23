@@ -162,8 +162,9 @@ guard analysis behave. That is blaming the user. And it does not achieve
 what it is for: the measurement in
 [the FreeType comparison](../results/2026-09-23-freetype-comparison.md) §3–§4
 shows the per-glyph boxes prune nothing, so a 50-glyph run costs every
-glyph's folds at every pixel (230× FreeType), and a single glyph spends
-100–250 ns per ink pixel evaluating all 64 bucketed pieces twice (14–21×).
+glyph's folds at every pixel (510× FreeType unhinted), and a single glyph
+spends 100–250 ns per ink pixel evaluating all 64 bucketed pieces twice
+(24–49× FreeType's whole `load_char`, 35–55× its raster alone).
 
 ## 3. What the author should write
 
@@ -367,15 +368,16 @@ The piece row's chord and bulge columns stay: they are the formula.
 
 The baseline is [the FreeType comparison](../results/2026-09-23-freetype-comparison.md):
 `8`@32 collapse 153 µs (AVX-512), `A` 79 µs, a 50-glyph run 66 ms, FreeType
-4.9–7.8 µs per glyph, the per-pixel budget 20–40 lane-instructions. What to
-expect, in order:
+1.8–3.9 µs per glyph unhinted at the same size (its raster alone 1.5–4.3 µs,
+the rest is loading and the TrueType hint VM), the per-pixel budget 20–40
+lane-instructions. What to expect, in order:
 
 | step | what changes | expected on `8`@32 |
 |---|---|---|
 | §1 as written, flat (one fold, `A_p` exact, `S_p` first order) | 128 trips per batch → 64, and a dozen ops per trip instead of 49 + 116 | 153 µs → ~25–35 µs |
 | 4.3's ownership rule alone | a glyph's box skips its fold | text runs linear, not quadratic |
-| a two-level tree (root + bands of 4 rows) as data | 64 trips per batch → ~8–16 | → ~6–10 µs, at FreeType |
-| depth log₂(pieces) | trips per batch ≈ depth + leaf | under FreeType; the budget is in reach |
+| a two-level tree (root + bands of 4 rows) as data | 64 trips per batch → ~8–16 | → ~6–10 µs, at FreeType's hinted total |
+| depth log₂(pieces) | trips per batch ≈ depth + leaf | at FreeType's raster; the budget is in reach |
 
 Every step bit-exact against the goldens *after* the first, which changes
 the antialiasing model and re-baselines them against the oracle:
@@ -403,25 +405,34 @@ lowered as jumps; and the whole thing runs 16 lanes wide with no
 accumulator, no cell buffer and no sweep. FreeType's inner loop is scalar
 and serial through its cell list.
 
+Two things FreeType does that are *not* in the comparison: its default path
+runs the TrueType bytecode interpreter (1.5–1.8 µs per glyph of hinting,
+not rasterizing; pixelflow does not hint), and it does no gamma — normal
+mode writes linear coverage and leaves blending to the client, as pixelflow
+does. The results file's breakdown separates them; the like-for-like row is
+FreeType unhinted, and the like-for-like *work* is its raster alone.
+
 Estimated per glyph, one core, AVX-512, the tree at `log₂(pieces)`:
 
 | size | pixelflow, `A_p` exact + `S_p` first order + tree | FreeType |
 |---|---|---|
 | 8 px | ~0.2 µs | ~0.25 µs (raster alone, estimated) |
-| 32 px | ~0.85 µs | **4.9–7.8 µs measured** (`A`, `O`, `S`, whole `load_char(RENDER)`); the raster alone ~1–3 µs |
+| 32 px | ~0.85 µs at two vector ops per cycle, ~2 µs at today's one | **1.8–3.9 µs unhinted, 3.5–5.5 µs hinted, measured** (`A`, `O`, `S`, whole `load_char(RENDER)`); the raster alone 1.5–4.3 µs |
 | 128 px | ~6 µs | ~12 µs (estimated) |
 
-Only the 32 px FreeType column is measured. The estimates assume the body
-runs near one vector op per cycle, which is what the measurement says
-today's body achieves; interleaving independent pieces to reach two is the
-scheduler's business and would halve the left column. The two caveats
-that could move it: the per-piece coefficient reads (22 columns today, a
-dozen with §5) are L1 broadcasts, not registers, and the number of pieces
-per leaf is the tree's shape (§7), so a badly chosen leaf capacity puts
-the 32 px number at 2–3 µs rather than 1. Either way the 14–21× of the
-baseline becomes a factor under one, with the atlas gather
-(`cached_HELLO`, 16.7 µs for five glyphs) no longer the only path that
-beats FreeType.
+Only the 32 px FreeType column is measured. The estimate's two rows are
+the throughput question: today's body retires about one vector op per
+cycle, and interleaving independent pieces to reach two is the scheduler's
+business. The two caveats that could move it: the per-piece coefficient
+reads (22 columns today, a dozen with §5) are L1 broadcasts, not
+registers, and the number of pieces per leaf is the tree's shape (§7), so
+a badly chosen leaf capacity puts the 32 px number at 2–3 µs rather than
+1. So the honest claim is parity with FreeType's raster at one op per
+cycle and a factor of two under it at two — not the order of magnitude
+the lane count suggests, because FreeType's work scales with the perimeter
+and this formula's with the area of the leaves. The 24–49× of the baseline
+is the algorithm; today not even the atlas gather (`cached_HELLO`, 16.7 µs
+for five glyphs against FreeType's 8.4 µs) is under FreeType.
 
 ## 7. Open questions
 
