@@ -166,8 +166,8 @@ fn the_classical_cap_grows_with_the_inserted_input() {
     let mid = SaturationConfig::classical_for(inserted);
     assert_eq!(
         CLASSICAL_CLASS_CEILING, CLASSICAL_CLASS_FLOOR,
-        "the input-sized cap is un-pinned: lower the `'8'` orphan pin in \
-         freetype_oracle.rs's optimized arm first, then update this test"
+        "the input-sized cap is un-pinned: re-run the class-cap sweep on \
+         today's kernels first, then update this test"
     );
     assert_eq!(mid.max_classes, CLASSICAL_CLASS_FLOOR);
     assert!(
