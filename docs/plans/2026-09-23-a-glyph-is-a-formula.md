@@ -277,6 +277,18 @@ by these rules, in order of strength:
   the point sample, which is what every kernel computes today. So `area` is
   total, and never worse than the status quo.
 
+One more rule is worth stating for what it buys. **Saturation under a
+uniform guard.** A clamped linear form whose argument is `≥ 1` (or `≤ 0`)
+over a whole batch is a constant there, and its integral is the invariance
+rule's answer: the range's measure times a value with no `X` in it. For
+`A_p` that is a batch entirely to the right of the chord — every interior
+pixel of a stem — where the integral is the band height clipped to the
+row, a `Y`-only value placement already hoists. The saturation test is
+uniform over the batch, so under 4.3 it is a jump, and the arm is a
+handful of ops in place of sixteen. This is the rule that makes the
+interior cheap (§6): it is Green's theorem's "the interior is free"
+recovered without a dependency between pixels.
+
 None of this is a search: each rule is a pattern on the integrand's shape,
 and the e-graph's job is the same as for `Dwrt` — keep the node whole
 until the lowering pass, then let algebraic simplification clean up what
@@ -388,14 +400,28 @@ the second step on any changed texel is a bug in the tree, not a rounding.
 
 ### What FreeType has, and the estimate at the end
 
-FreeType's rasterizer has one structural asset: its work scales with the
-**perimeter**. It walks each segment once, depositing area and cover into
-the cells the segment crosses, and sweeps the accumulated cells into rows.
-Its per-pixel work inside a run of solid ink is a memset. Against that, the
-formula above is **area-major**: every batch inside a box evaluates every
-piece at that leaf, and a solid-ink batch still pays for the pieces whose
-bands it sits inside. The tree makes that count small; it does not make it
-zero.
+FreeType's rasterizer and this formula are one theorem applied two ways.
+`A_p` *is* Green's theorem for one piece: the row-wise antiderivative of
+the piece's crossing density, evaluated at the pixel. FreeType applies it
+numerically — deposit each segment's derivative into the one or two cells
+it crosses (perimeter work), then integrate along the row with a running
+sum, one add per cell. We apply it analytically, per piece per pixel,
+sixteen ops each. Both have an area term; the difference is its constant,
+and the theorem is not what decides it.
+
+Two things bring ours to FreeType's. **Lanes absorb the row**: at 32 px `8`
+is 16 px wide, a row is one or two batches, and "per pixel" is one
+instruction per row per piece — the per-pixel and the per-perimeter
+accountings coincide until a glyph is wider than a batch. **The saturation
+rule** (§4.1): a batch entirely to the right of a chord evaluates a
+`Y`-only constant under a uniform jump, a handful of ops per piece rather
+than sixteen. With those the shape is FreeType's. Fractional terms cost
+sixteen ops per crossing per batch, against FreeType's ~20 scalar ops per
+cell a segment crosses (an estimate). Interior batches cost a handful of
+ops per piece to their left, which for four crossings per row is about one
+op per pixel — FreeType's scan, in instruction count. No dependency
+between pixels is needed for it: the per-row constant a scan would carry
+is a value the compiler already hoists.
 
 What the formula has is everything else. Per piece per batch the integral
 form is ~16 vector ops with no branch, no root solve and no memory traffic
@@ -429,10 +455,11 @@ registers, and the number of pieces per leaf is the tree's shape (§7), so
 a badly chosen leaf capacity puts the 32 px number at 2–3 µs rather than
 1. So the honest claim is parity with FreeType's raster at one op per
 cycle and a factor of two under it at two — not the order of magnitude
-the lane count suggests, because FreeType's work scales with the perimeter
-and this formula's with the area of the leaves. The 24–49× of the baseline
-is the algorithm; today not even the atlas gather (`cached_HELLO`, 16.7 µs
-for five glyphs against FreeType's 8.4 µs) is under FreeType.
+the lane count suggests, because the two have the same shape and the lanes
+are spent on the fractional terms' sixteen ops, which FreeType's per-cell
+deposit matches in scalar. The 24–49× of the baseline is the algorithm;
+today not even the atlas gather (`cached_HELLO`, 16.7 µs for five glyphs
+against FreeType's 8.4 µs) is under FreeType.
 
 ## 7. Open questions
 
