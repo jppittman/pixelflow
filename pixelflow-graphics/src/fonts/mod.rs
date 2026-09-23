@@ -112,6 +112,18 @@ pub mod atlas;
 pub mod cache;
 pub mod loader;
 pub mod loop_blinn;
+// The split the glyph-as-formula piece rows will read the certificate of;
+// `monotone`'s module docs say why it is not wired into today's pieces.
+// `expect`, not `allow`: wiring it in fulfils nothing, and fails the build
+// until this attribute goes.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "not wired into loop_blinn's pieces until the formula's rows need it"
+    )
+)]
+mod monotone;
 pub mod outline;
 pub mod text;
 pub mod ttf;
