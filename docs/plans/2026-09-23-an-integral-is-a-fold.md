@@ -537,6 +537,76 @@ Not on this list:
      extracted cost) identical record for record at `df2907f` and after
      this step — the n-ary `FactorFold` included.
 5. **Half-plane, conic and Taylor** (a-glyph-is-a-formula §4.1, §7).
+   JP chose **exact** area for a curved piece.
+   - **Built** as one rule, `ArcMoment` (R11), the only new one. The author
+     writes a piece's crossing as a graph over `y` through the arc's own
+     parameter, `T = τ_y(y − y₀)`:
+     `σ·area([0 ≤ T]·[T < 1]·[x < x₀ + T·(2β + α·T)]).at(X, S·Y)`, every
+     control-polygon step floored at `0` — the certificate that makes the
+     arc rise for any value a table holds, so the rule is an identity
+     rather than a condition on data the e-graph cannot see. `FactorFold`
+     takes the band out of the inner integral, `NarrowInterval` closes that
+     to `clamp(x₀ + x(T) − X + ½, 0, 1)` (Green's step, unchanged from step
+     4), and `ArcMoment` closes the outer integral: the substitution
+     `y = y(t)` and a cubic moment, in the closing phase's first round. A
+     line is the arc whose bend is zero — the same integrand and the same
+     rule — so a glyph can be one fold with one body.
+   - **Where it lives.** The right-hand side is written once, beside the
+     interval, as `pixelflow_ir::IntervalFold::arc_moment`, with the root
+     `τ` as `pixelflow_ir::integral::monotone_root` and the floors as named
+     constants (`STEP_FLOOR`, `RADICAND_FLOOR`, `ROOT_FLOOR = 2⁻¹⁰⁰`); the
+     interval's ends stay `pub(crate)`. The rule, in
+     `pixelflow-search/src/egraph/integral.rs`, only decides when: it reads
+     `T` (`monotone_root`), the clamp's arc (`monotone_quadratic`) and the
+     certificates (`certified`) off every node of every class, operands of
+     `+`, `·` and `max` in either order and the band's comparisons in any of
+     `≤ < ≥ >`; it reads the clamp's argument through `Recognizer::affine`,
+     generalized so that a class — the arc's rise `R` — can stand for the
+     variable, which is how narrowing's own spelling
+     `(x₀ + R − X) − (−½)` is recognized. It is in `integral_rules()` and
+     the closing family, and declines on a fold whose class already holds a
+     member that is not an integral.
+   - **Changes from the design**, from its two critiques and from what the
+     oracle found:
+     - The clamp's band may be any literal `[P, Q]` (the extra terms are
+       `P·Δ(t_a, p)` and the `Q` scale), and the argument any positive
+       literal multiple of the rise — both a product or two, and `P = 0`,
+       `Q = 1` emit nothing extra.
+     - The floor is any literal in `(0, 2⁻¹⁰⁰]` (`RootFloor`), and the
+       right-hand side uses the author's: a larger floor is refused, since
+       the formula is then false over a visible height, and a zero one
+       divides by zero.
+     - `K`'s `/3` is a product by `⅓`.
+     - **A literal line extracted reciprocal estimates.** With constant
+       columns the bend is provably zero, each root's denominator is
+       loop-invariant, and the e-graph's `a/b = a·recip(b)` then extracts
+       `recip` — a 12–14-bit estimate — once per rise. A root whose
+       denominator is all literals is now folded into a product by the
+       literal reciprocal, and the recognizer reads a bend whose two steps
+       are literals as their literal difference (the rule fires in the
+       round the certificates fold). Denominators that vary — every column
+       a table or a uniform holds — keep the exact `Div`. The general
+       hazard, an estimate standing in for a division, is the algebra's and
+       not this rule's; the oracle's reciprocal pin is what caught it.
+   - **Gate:** `pixelflow-core/tests/arc_oracle.rs`, `f64` polygon clipping
+     against the compiled closed form, tolerance
+     `2⁻²²·(1 + |X| + |Y| + 2·extent)` per texel (critique 0, §2). Max
+     error/tolerance per category over `16 × 8` frames: curves 0.18,
+     straight lines 0.12, far (to `1000`) 0.005, near-flat (spans to `0`)
+     0.06, near-collinear and hooked 0.09, tiny 0.002, long (100–600 px)
+     0.33 at `1.0e-4` absolute, on the pixel grid 0.05; a closed contour of
+     lines and arcs as one `Σ_p` fold over a table 0.03; a literal line
+     0.03. The reference agrees with itself flattened four times finer to
+     `7e-10`. With one step's certificate removed the rule declines, and
+     the quadrature `resolve` leaves is the centre line's exact coverage
+     (0.009; 0.012 at AVX2, every other figure the same on both tiers).
+     `unclosed_integrals` is `0` for every closed kernel and `1`
+     for that one, no reciprocal estimate is extracted, and none reaches
+     the emitter. Glyph output is bit-identical: nothing a font builds
+     holds an integral yet.
+   - **Not built here:** the host's split at extrema and its `MonotoneQuad`
+     (step 6, with critique 0's non-terminating split), the
+     `surviving_intervals` telemetry field, and `glyph_is_closed`.
 6. **The glyph** (a-glyph-is-a-formula §6).
 
 **The demand track** runs in parallel and does not gate the build order above:
