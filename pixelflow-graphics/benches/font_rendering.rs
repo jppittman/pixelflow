@@ -137,21 +137,36 @@ fn bench_freetype_single_char(c: &mut Criterion) {
     let mut group = c.benchmark_group("freetype_single_char");
     let library = ft::Library::init().unwrap();
     let face = library.new_memory_face(FONT_DATA.to_vec(), 0).unwrap();
+    // 32 pixels per em: the size `text(.., 32.0)` renders above. In points at
+    // 96 dpi this was 42.7 px — a bigger glyph and a slower FreeType.
+    face.set_pixel_sizes(0, 32).unwrap();
 
     for (label, ch) in [("A_linear", 'A'), ("O_quadratic", 'O'), ("S_complex", 'S')] {
-        group.bench_function(label, |b| {
-            face.set_char_size(0, 32 * 64, 96, 96).unwrap();
-
-            b.iter(|| {
-                face.load_char(ch as usize, ft::face::LoadFlag::RENDER)
-                    .unwrap();
-                let glyph = face.glyph();
-                black_box(glyph.bitmap());
+        for (flags_label, flags) in freetype_hinting() {
+            group.bench_function(BenchmarkId::new(label, flags_label), |b| {
+                b.iter(|| {
+                    face.load_char(ch as usize, flags).unwrap();
+                    black_box(face.glyph().bitmap());
+                });
             });
-        });
+        }
     }
 
     group.finish();
+}
+
+/// pixelflow does not hint, so `unhinted` is the like-for-like row. The
+/// default flags also run the TrueType bytecode interpreter (the font carries
+/// `fpgm`, `prep` and `cvt`), and a grid-fitted outline then rasterizes
+/// cheaper than the raw one, so the two rows do not order the way "more work"
+/// suggests.
+#[cfg(feature = "freetype")]
+fn freetype_hinting() -> [(&'static str, freetype::face::LoadFlag); 2] {
+    use freetype::face::LoadFlag;
+    [
+        ("hinted", LoadFlag::RENDER),
+        ("unhinted", LoadFlag::RENDER | LoadFlag::NO_HINTING),
+    ]
 }
 
 #[cfg(feature = "freetype")]
@@ -161,21 +176,22 @@ fn bench_freetype_text(c: &mut Criterion) {
     let mut group = c.benchmark_group("freetype_text");
     let library = ft::Library::init().unwrap();
     let face = library.new_memory_face(FONT_DATA.to_vec(), 0).unwrap();
-    face.set_char_size(0, 16 * 64, 96, 96).unwrap();
+    // 16 pixels per em, as `text(.., 16.0)` above.
+    face.set_pixel_sizes(0, 16).unwrap();
 
     for length in [5, 10, 26, 50] {
         let text_str: String = SPECIMEN.chars().take(length).collect();
 
-        group.bench_with_input(BenchmarkId::from_parameter(length), &length, |b, _| {
-            b.iter(|| {
-                for ch in text_str.chars() {
-                    face.load_char(ch as usize, ft::face::LoadFlag::RENDER)
-                        .unwrap();
-                    let glyph = face.glyph();
-                    black_box(glyph.bitmap());
-                }
+        for (flags_label, flags) in freetype_hinting() {
+            group.bench_with_input(BenchmarkId::new(flags_label, length), &length, |b, _| {
+                b.iter(|| {
+                    for ch in text_str.chars() {
+                        face.load_char(ch as usize, flags).unwrap();
+                        black_box(face.glyph().bitmap());
+                    }
+                });
             });
-        });
+        }
     }
 
     group.finish();
