@@ -153,6 +153,17 @@ impl Default for KeybindingsConfig {
                     mods: Modifiers::CONTROL | Modifiers::SHIFT,
                     action: UserInputAction::RequestClipboardPaste,
                 },
+                // Paste the primary selection (xterm).
+                Keybinding {
+                    key: KeySymbol::Insert,
+                    mods: Modifiers::SHIFT,
+                    action: UserInputAction::RequestPrimaryPaste,
+                },
+                Keybinding {
+                    key: KeySymbol::F11,
+                    mods: Modifiers::empty(),
+                    action: UserInputAction::RequestToggleFullscreen,
+                },
                 // Zoom. X11 reports the shifted keysym and macOS the key, so
                 // each chord is listed in both forms (US layout).
                 Keybinding {

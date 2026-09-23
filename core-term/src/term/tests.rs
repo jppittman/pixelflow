@@ -384,10 +384,15 @@ fn mouse_release_ends_selection_activity() {
             "Selection end point should be retained."
         );
     }
-    assert_eq!(
-        action,
-        Some(EmulatorAction::RequestRedraw),
-        "Action should be RequestRedraw."
+    assert!(
+        matches!(
+            action,
+            Some(EmulatorAction::Copy {
+                selection: crate::term::action::Selection::Primary,
+                ..
+            })
+        ),
+        "A finished drag becomes the primary selection, got {action:?}"
     );
 }
 
@@ -417,7 +422,10 @@ fn initiate_copy_returns_the_selected_text_as_a_copy_to_clipboard_action() {
     let action = emu.interpret_input(EmulatorInput::User(UserInputAction::InitiateCopy));
     assert_eq!(
         action,
-        Some(EmulatorAction::CopyToClipboard("Hello".to_string())),
+        Some(EmulatorAction::Copy {
+            selection: crate::term::action::Selection::Clipboard,
+            text: "Hello".to_string()
+        }),
         "Selected text mismatch."
     );
 }
@@ -442,7 +450,10 @@ fn initiate_copy_joins_block_selected_rows_with_newlines() {
     let action = emu.interpret_input(EmulatorInput::User(UserInputAction::InitiateCopy));
     assert_eq!(
         action,
-        Some(EmulatorAction::CopyToClipboard("ABC\nDE".to_string())), // Adjusted expected output
+        Some(EmulatorAction::Copy {
+            selection: crate::term::action::Selection::Clipboard,
+            text: "ABC\nDE".to_string()
+        }),
         "Block selected text mismatch."
     );
 }

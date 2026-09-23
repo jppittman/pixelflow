@@ -66,6 +66,7 @@ use pixelflow_graphics::fonts::GlyphAtlas;
 use pixelflow_runtime::api::private::EngineData;
 use pixelflow_runtime::api::public::EngineHandle;
 use pixelflow_runtime::api::public::{AppData, AppManagement};
+use pixelflow_runtime::input::MouseButton;
 use pixelflow_runtime::{EngineEventControl, EngineEventData, EngineEventManagement};
 use std::sync::Arc;
 
@@ -225,6 +226,25 @@ impl TerminalApp {
         }
     }
 
+    /// Reports a mouse event to the program, in whatever encoding it asked for.
+    fn report_mouse(
+        &self,
+        button: MouseButton,
+        (x, y): (u32, u32),
+        kind: crate::term::MouseEventKind,
+    ) {
+        let (col, row) = self.emulator.cell_at(x, y);
+        let params = crate::term::MouseEncodingParams {
+            button,
+            col,
+            row,
+            kind,
+        };
+        if let Some(bytes) = self.emulator.encode_mouse_event(params) {
+            self.write_pty(bytes);
+        }
+    }
+
     /// Hands a user action to the emulator and carries out what it asks for.
     fn interpret_user_input(&mut self, input: UserInputAction) {
         if let Some(action) = self.emulator.interpret_input(EmulatorInput::User(input)) {
@@ -241,12 +261,15 @@ impl TerminalApp {
             EmulatorAction::Quit => self.request_quit(),
             EmulatorAction::SetTitle(title) => self.request_engine(AppManagement::SetTitle(title)),
             EmulatorAction::RingBell => self.request_engine(AppManagement::Bell),
-            EmulatorAction::CopyToClipboard(text) => {
-                self.request_engine(AppManagement::CopyToClipboard(text))
+            EmulatorAction::Copy { selection, text } => {
+                self.request_engine(AppManagement::Copy { selection, text })
             }
             // The text comes back as `EngineEventManagement::Paste`.
-            EmulatorAction::RequestClipboardContent => {
-                self.request_engine(AppManagement::RequestPaste)
+            EmulatorAction::RequestClipboardContent(selection) => {
+                self.request_engine(AppManagement::RequestPaste(selection))
+            }
+            EmulatorAction::ToggleFullscreen => {
+                self.request_engine(AppManagement::ToggleFullscreen)
             }
         }
     }
@@ -695,82 +718,56 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 self.interpret_user_input(input);
             }
             EngineEventManagement::MouseClick { button, x, y } => {
-                let (col, row) = self.emulator.cell_at(x, y);
-                log::trace!(
-                    "Mouse click: button={:?} at cell ({}, {})",
-                    button,
-                    col,
-                    row
-                );
                 self.pressed_mouse_button = Some(button);
-                if let Some(bytes) =
-                    self.emulator
-                        .encode_mouse_event(crate::term::MouseEncodingParams {
-                            button,
-                            col,
-                            row,
-                            kind: crate::term::MouseEventKind::Press,
+                if self.emulator.is_mouse_tracking_active() {
+                    self.report_mouse(button, (x, y), crate::term::MouseEventKind::Press);
+                    return Ok(());
+                }
+                match button {
+                    MouseButton::Left => {
+                        self.interpret_user_input(UserInputAction::StartSelection {
+                            x_px: saturate_u16(x),
+                            y_px: saturate_u16(y),
                         })
-                {
-                    self.write_pty(bytes);
+                    }
+                    MouseButton::Middle => {
+                        self.interpret_user_input(UserInputAction::RequestPrimaryPaste)
+                    }
+                    _ => {}
                 }
             }
             EngineEventManagement::MouseRelease { button, x, y } => {
-                let (col, row) = self.emulator.cell_at(x, y);
-                log::trace!(
-                    "Mouse release: button={:?} at cell ({}, {})",
-                    button,
-                    col,
-                    row
-                );
                 self.pressed_mouse_button = None;
-                if let Some(bytes) =
-                    self.emulator
-                        .encode_mouse_event(crate::term::MouseEncodingParams {
-                            button,
-                            col,
-                            row,
-                            kind: crate::term::MouseEventKind::Release,
-                        })
-                {
-                    self.write_pty(bytes);
+                if self.emulator.is_mouse_tracking_active() {
+                    self.report_mouse(button, (x, y), crate::term::MouseEventKind::Release);
+                    return Ok(());
+                }
+                if button == MouseButton::Left {
+                    self.interpret_user_input(UserInputAction::ApplySelectionClear);
                 }
             }
             EngineEventManagement::MouseMove { x, y, mods: _ } => {
-                let (col, row) = self.emulator.cell_at(x, y);
-                log::trace!("Mouse move: cell ({}, {})", col, row);
-                // any-event mode (1003) reports all motion;
-                // button-event mode (1002) only reports motion while a button is held
+                // any-event mode (1003) reports all motion; button-event mode
+                // (1002) only motion while a button is held.
                 if self.emulator.reports_all_motion() {
-                    let button = self
-                        .pressed_mouse_button
-                        .unwrap_or(pixelflow_runtime::input::MouseButton::Left);
-                    if let Some(bytes) =
-                        self.emulator
-                            .encode_mouse_event(crate::term::MouseEncodingParams {
-                                button,
-                                col,
-                                row,
-                                kind: crate::term::MouseEventKind::Motion,
-                            })
-                    {
-                        self.write_pty(bytes);
-                    }
-                } else if self.emulator.reports_button_motion() {
-                    // button-event mode: only report when a button is held
+                    let button = self.pressed_mouse_button.unwrap_or(MouseButton::Left);
+                    self.report_mouse(button, (x, y), crate::term::MouseEventKind::Motion);
+                    return Ok(());
+                }
+                if self.emulator.reports_button_motion() {
                     if let Some(button) = self.pressed_mouse_button {
-                        if let Some(bytes) =
-                            self.emulator
-                                .encode_mouse_event(crate::term::MouseEncodingParams {
-                                    button,
-                                    col,
-                                    row,
-                                    kind: crate::term::MouseEventKind::Motion,
-                                })
-                        {
-                            self.write_pty(bytes);
-                        }
+                        self.report_mouse(button, (x, y), crate::term::MouseEventKind::Motion);
                     }
+                    return Ok(());
+                }
+                if self.emulator.is_mouse_tracking_active() {
+                    return Ok(());
+                }
+                if self.pressed_mouse_button == Some(MouseButton::Left) {
+                    self.interpret_user_input(UserInputAction::ExtendSelection {
+                        x_px: saturate_u16(x),
+                        y_px: saturate_u16(y),
+                    });
                 }
             }
             EngineEventManagement::MouseScroll {
@@ -828,6 +825,11 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
         // No polling needed - PTY data comes in via handle_data
         Ok(ActorStatus::Idle)
     }
+}
+
+/// A window coordinate as the emulator's selection actions take it.
+fn saturate_u16(px: u32) -> u16 {
+    u16::try_from(px).unwrap_or(u16::MAX)
 }
 
 /// Handles returned by [`spawn_terminal_app`]: a keep-alive handle for the
@@ -1446,7 +1448,9 @@ mod tests {
         drain_engine(&mut engine, &mut probe);
         assert!(matches!(
             probe.requests.as_slice(),
-            [pixelflow_runtime::api::public::AppManagement::RequestPaste]
+            [pixelflow_runtime::api::public::AppManagement::RequestPaste(
+                pixelflow_runtime::input::Selection::Clipboard
+            )]
         ));
     }
 
@@ -1513,5 +1517,81 @@ mod tests {
         let mut engine_probe = EngineProbe::default();
         drain_engine(&mut engine, &mut engine_probe);
         assert!(!engine_probe.scenes.is_empty(), "a zoomed frame was drawn");
+    }
+
+    #[test]
+    fn a_mouse_drag_selects_and_becomes_the_primary_selection() {
+        let (mut app, _writer_rx, _tx, mut engine) = create_test_app();
+        app.handle_data(pty(b"hello world")).expect("pty data");
+
+        // Default cells are 10x16 points: drag across "hello" on row 0.
+        for event in [
+            EngineEventManagement::MouseClick {
+                button: MouseButton::Left,
+                x: 1,
+                y: 1,
+            },
+            EngineEventManagement::MouseMove {
+                x: 41,
+                y: 1,
+                mods: Default::default(),
+            },
+            EngineEventManagement::MouseRelease {
+                button: MouseButton::Left,
+                x: 41,
+                y: 1,
+            },
+        ] {
+            app.handle_management(event).expect("mouse");
+        }
+
+        let mut probe = EngineProbe::default();
+        drain_engine(&mut engine, &mut probe);
+        assert!(
+            probe.requests.iter().any(|request| matches!(
+                request,
+                pixelflow_runtime::api::public::AppManagement::Copy {
+                    selection: pixelflow_runtime::input::Selection::Primary,
+                    text,
+                } if text == "hello"
+            )),
+            "requests: {:?}",
+            probe.requests
+        );
+    }
+
+    #[test]
+    fn a_middle_click_pastes_the_primary_selection_and_f11_toggles_fullscreen() {
+        use pixelflow_runtime::input::{KeySymbol, Modifiers};
+        let (mut app, _writer_rx, _tx, mut engine) = create_test_app();
+
+        app.handle_management(EngineEventManagement::MouseClick {
+            button: MouseButton::Middle,
+            x: 5,
+            y: 5,
+        })
+        .expect("middle click");
+        app.handle_management(EngineEventManagement::KeyDown {
+            key: KeySymbol::F11,
+            mods: Modifiers::empty(),
+            text: None,
+        })
+        .expect("f11");
+
+        let mut probe = EngineProbe::default();
+        drain_engine(&mut engine, &mut probe);
+        assert!(
+            matches!(
+                probe.requests.as_slice(),
+                [
+                    pixelflow_runtime::api::public::AppManagement::RequestPaste(
+                        pixelflow_runtime::input::Selection::Primary
+                    ),
+                    pixelflow_runtime::api::public::AppManagement::ToggleFullscreen,
+                ]
+            ),
+            "requests: {:?}",
+            probe.requests
+        );
     }
 }
