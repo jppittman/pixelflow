@@ -130,7 +130,10 @@ fn handle_esc_command(
             emulator.designate_character_set(g_idx, CharacterSet::from_char(final_char));
             None
         }
-        EscCommand::ResetToInitialState => emulator.reset(),
+        EscCommand::ResetToInitialState => {
+            emulator.reset();
+            None
+        }
         _ => {
             debug!("Unhandled Esc command: {:?}", esc_cmd);
             None
@@ -293,7 +296,10 @@ fn handle_csi_command(emulator: &mut TerminalEmulator, csi: CsiCommand) -> Optio
             emulator.screen.set_tabstop(cursor_x);
             None
         }
-        CsiCommand::Reset => emulator.reset(),
+        CsiCommand::Reset => {
+            emulator.reset();
+            None
+        }
         CsiCommand::Unsupported(intermediates, final_byte_opt) => {
             warn!(
                 "TerminalEmulator received CsiCommand::Unsupported: intermediates={:?}, final={:?}. This is usually an error from the parser.",
