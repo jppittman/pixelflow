@@ -12,7 +12,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::guards::{SelectArm, SelectGuard, analyze_select_guards};
+use super::guards::{FoldReads, SelectArm, SelectGuard, analyze_select_guards};
 use super::{Gpr, KReg, OperandSource, PtrReg, Reg, ScheduledOp, operand_sources, reloads_wanted};
 
 /// A value in the program (SSA-style).
@@ -1893,7 +1893,7 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
             Scope::GuardArm(_) => unreachable!("plan_carries never asks about a guard arm"),
         }
     };
-    let meta_of = |j: usize| -> &pixelflow_ir::fold::Fold {
+    let meta_of = |j: usize| -> &pixelflow_ir::fold::RangeFold {
         let fold = &nest.folds[j];
         let def = &schedule_of(fold.parent)[fold.at];
         let ScheduledOp::Reduce(meta, _) = &def.op else {
@@ -2209,7 +2209,62 @@ impl RegisterAllocator for LinearScan {
             }
         };
 
-        let body_scan = self.scan(nest.body.schedule, file, &BTreeMap::new(), &nest.body.roots);
+        // Every scope's `Select` guards, before any scan: what an arm may own
+        // depends on what the loops the scope opens read from it, and what
+        // it is worth depends on what they cost (`FoldReads`), which takes
+        // those loops' schedules — and the loop below reaches a fold only
+        // after the scope it opens in. Innermost first: a fold's price is
+        // made of the folds inside it, and a child's index is always above
+        // its parent's.
+        let schedule_of = |scope: Scope| match scope {
+            Scope::Body => nest.body.schedule.as_slice(),
+            Scope::Fold(j) => nest.folds[j].schedule.as_slice(),
+            Scope::GuardArm(_) => unreachable!("a fold never opens in a guard arm"),
+        };
+        let mut reads: Vec<FoldReads> = (0..=nest.folds.len())
+            .map(|_| FoldReads::default())
+            .collect();
+        for scope in (0..nest.folds.len())
+            .rev()
+            .map(Scope::Fold)
+            .chain(core::iter::once(Scope::Body))
+        {
+            let schedule = schedule_of(scope);
+            let opened = FoldReads::new(
+                schedule,
+                nest.folds
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, fold)| fold.parent == scope)
+                    .map(|(k, fold)| {
+                        let inner = &reads[scope_ix(Scope::Fold(k))];
+                        (schedule[fold.at].value, fold.schedule.as_slice(), inner)
+                    }),
+            );
+            reads[scope_ix(scope)] = opened;
+        }
+        let guards_in = |scope: Scope, roots: &[ValueId]| {
+            analyze_select_guards(schedule_of(scope), roots, &reads[scope_ix(scope)])
+        };
+        let mut guards: Vec<Vec<SelectGuard>> =
+            core::iter::once(guards_in(Scope::Body, &nest.body.roots))
+                .chain(
+                    nest.folds
+                        .iter()
+                        .enumerate()
+                        .map(|(j, fold)| guards_in(Scope::Fold(j), &fold.roots)),
+                )
+                .collect();
+
+        let body_scan = self.scan(
+            nest.body.schedule,
+            file,
+            Boundary {
+                live_in: &BTreeMap::new(),
+                roots: &nest.body.roots,
+            },
+            core::mem::take(&mut guards[scope_ix(Scope::Body)]),
+        );
         let mut body_parked: BTreeMap<ValueId, Where> = BTreeMap::new();
         let body_carries = park_roots(
             &body_scan,
@@ -2334,8 +2389,11 @@ impl RegisterAllocator for LinearScan {
             let scan = self.scan(
                 fold.schedule,
                 &file.inside(carried_in),
-                &fold_parked,
-                &fold.roots,
+                Boundary {
+                    live_in: &fold_parked,
+                    roots: &fold.roots,
+                },
+                core::mem::take(&mut guards[scope_ix(Scope::Fold(index))]),
             );
             // This fold's own roots, for the folds inside it: carried from
             // what its own code leaves free, or parked.
@@ -2405,7 +2463,10 @@ impl RegisterAllocator for LinearScan {
                 vectors: RegSet::of(&taken_at_def),
                 pointers: GprSet::EMPTY,
             }));
-            let scan = self.scan(arm.schedule, &inside, &BTreeMap::new(), &[]);
+            // An arm parks nothing and opens no fold: its schedule is a
+            // separate arena's, which `extract_guards` carves nothing out of.
+            let arm_guards = analyze_select_guards(&arm.schedule, &[], &FoldReads::default());
+            let scan = self.scan(arm.schedule, &inside, Boundary::CLOSED, arm_guards);
             guard_arms.push(GuardArmScope {
                 parent: arm.parent,
                 at: arm.at,
@@ -2643,16 +2704,35 @@ struct Pass {
     cursor: Vec<usize>,
 }
 
-/// What a pass reads about a scope beyond its schedule: the parks it enters
-/// with, the roots it hands off, and its guards' mask reads and arms. The
-/// same for both classes' passes over one scope.
+/// What crosses a scope's edges: the values an enclosing scope parked for it,
+/// which it reads and never computes, and the values it computes for the
+/// scopes inside it, which it hands off. What a scan is told beside its
+/// schedule and its guards.
 #[derive(Clone, Copy)]
-struct Reads<'a> {
+struct Boundary<'a> {
     /// Where each value an enclosing scope parked lives for the whole of
     /// this one.
     live_in: &'a BTreeMap<ValueId, Where>,
     /// The values this scope computes for the scopes inside it.
     roots: &'a [ValueId],
+}
+
+impl Boundary<'_> {
+    /// A scope nothing crosses into or out of: a guard arm, whose schedule is
+    /// a separate arena's and which opens no fold.
+    const CLOSED: Boundary<'static> = Boundary {
+        live_in: &BTreeMap::new(),
+        roots: &[],
+    };
+}
+
+/// What a pass reads about a scope beyond its schedule: its [`Boundary`],
+/// and its guards' mask reads and arms. The same for both classes' passes
+/// over one scope.
+#[derive(Clone, Copy)]
+struct Reads<'a> {
+    /// The parks it enters with and the roots it hands off.
+    boundary: Boundary<'a>,
     /// Per instruction, every mask a guard emitted before it reads
     /// ([`guard_sites`]).
     sites: &'a [Vec<ValueId>],
@@ -2674,8 +2754,7 @@ impl Pass {
     /// definition otherwise emits nothing and leaves the park unwritten.
     fn new(dag: &[Def], file: &RegisterFile, reads: Reads<'_>, class: Class) -> Self {
         let Reads {
-            live_in,
-            roots,
+            boundary: Boundary { live_in, roots },
             sites,
             arms: _,
         } = reads;
@@ -3024,9 +3103,14 @@ impl LinearScan {
     /// whole of this one — the answer this scan must read rather than choose,
     /// because that scope already chose it.
     ///
-    /// `roots` are the values this scope computes for the scopes inside it:
-    /// read outside this schedule, so no `Select` arm may own one (a skipped
-    /// arm would leave the park unwritten for a loop that runs regardless).
+    /// `boundary` is what crosses this scope's edges: the parks it enters
+    /// with and the roots it hands to the scopes inside it ([`Boundary`]).
+    ///
+    /// `guards` are this schedule's `Select` guards: [`analyze_select_guards`]
+    /// over it, told what the scopes inside it read — its roots, which no arm
+    /// may own (a skipped arm would leave the park unwritten for a loop that
+    /// runs regardless), and what each loop it opens reads, which no arm may
+    /// own unless the loop is skipped with it.
     ///
     /// The vector pass and the pointer pass see the same schedule, the same
     /// guard arms and the same parks; each places its own class's values in
@@ -3037,15 +3121,15 @@ impl LinearScan {
         &self,
         dag: Vec<Def>,
         file: &RegisterFile,
-        live_in: &BTreeMap<ValueId, Where>,
-        roots: &[ValueId],
+        boundary: Boundary<'_>,
+        guards: Vec<SelectGuard>,
     ) -> Scan {
         if dag.is_empty() {
             return Scan {
                 schedule: dag,
                 ranges: Vec::new(),
                 scratch: vec![],
-                guards: Vec::new(),
+                guards,
             };
         }
 
@@ -3055,12 +3139,10 @@ impl LinearScan {
         // skipped path never ran the load. Eviction inside an arm needs no such
         // rule — the value's slot was written at its definition, which every
         // path reaching any of its readers ran.
-        let guards = analyze_select_guards(&dag, roots);
         let arms = guarded_arms(&guards, dag.len());
         let sites = guard_sites(&guards, dag.len());
         let reads = Reads {
-            live_in,
-            roots,
+            boundary,
             sites: &sites,
             arms: &arms,
         };
@@ -3607,7 +3689,9 @@ pub fn no_temps(_op: &ScheduledOp) -> u8 {
 /// body out into its own `ScopeFold`; the `ValueId` `ScheduledOp::Reduce`
 /// still carries is `schedule_variance`'s and `extract_folds`'s own concern
 /// (they run before extraction, and after respectively, over different
-/// schedules), never an operand this scope's allocation resolves. A `Seq`
+/// schedules), never an operand this scope's allocation resolves. What the
+/// loop it opens reads from this scope is a dependency all the same, and the
+/// guard analysis has it as one: [`FoldReads`]. A `Seq`
 /// sequences two effects and reads no register; a `Write` reads the one
 /// value it stores — its row and column are binders, found where their
 /// folds keep them, not operands.
@@ -3906,10 +3990,8 @@ mod tests {
     /// A scope that enters with nothing parked, hands nothing off and holds
     /// no guard: `sites` is per instruction, so it is the caller's.
     fn no_reads(sites: &[Vec<ValueId>]) -> Reads<'_> {
-        static NO_PARKS: BTreeMap<ValueId, Where> = BTreeMap::new();
         Reads {
-            live_in: &NO_PARKS,
-            roots: &[],
+            boundary: Boundary::CLOSED,
             sites,
             arms: &[],
         }
@@ -5331,7 +5413,7 @@ mod tests {
     /// reserve" — the failure this test turns into a named assertion.
     fn assert_reservations_match_residency(a: &Allocation<'_>, file: &RegisterFile) {
         let schedule = a.schedule();
-        let sites = guard_sites(&analyze_select_guards(schedule, a.roots()), schedule.len());
+        let sites = guard_sites(a.select_guards(), schedule.len());
         for (i, d) in schedule.iter().enumerate() {
             if matches!(d.op, ScheduledOp::Reduce(..)) {
                 continue; // Its own trip test reserves through the guard gate.
@@ -5412,9 +5494,9 @@ mod tests {
     }
 
     /// A four-trip fold, the metadata every fixture below hangs a scope off.
-    fn fold_meta() -> pixelflow_ir::fold::Fold {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
-        Fold::new(
+    fn fold_meta() -> pixelflow_ir::fold::RangeFold {
+        use pixelflow_ir::fold::{Binder, Monoid, RangeFold};
+        RangeFold::new(
             Monoid::SUM,
             Binder::from_slot(0).expect("slot 0 exists"),
             0..4,

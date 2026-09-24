@@ -564,8 +564,8 @@ handle.send(Message::Data(MyDataMsg))?;           // Lowest (backpressure)
 
 - **Hot paths:** the loop nest is inside the emitted code — one collapse call per stripe, not one per row or per SIMD batch
 - **Glyph caching:** a glyph bakes once and reads back as a gather over its bound buffer (`fonts/cache.rs`)
-- **Glyph coverage:** a winding number about a reference point, per-pixel and discriminant-free (`fonts/loop_blinn.rs`, docs/plans/2026-09-08-loop-blinn-glyph.md). Its bound is a domain-side extent because `u² − v` outside its control triangle is *wrong*, not merely slow — so the glyph is where a `Union` of index ranges earns its keep
-- **Antialiasing:** symbolic derivatives — `Kernel::dx()`/`dy()`, resolved before emission. A glyph's *winding* is exact (hard masks selecting signed constants); only the distance feeding the ramp is soft, so a comparison landing on the wrong side costs a rounding rather than half a unit of coverage
+- **Glyph coverage:** the exact area of the pixel under ink, `min(|Σ_p σ_p·area(χ_p)|, 1)` — one fold over a table of monotone quadratic arcs (`fonts/loop_blinn.rs`, `fonts/monotone.rs`, docs/plans/2026-09-23-a-glyph-is-a-formula.md). The author writes the integrand and the e-graph integrates it (`FactorFold`, `NarrowInterval`, `ArcMoment`); no interval fold reaches the emitter (`pixelflow-graphics/tests/glyph_is_closed.rs`). `Kernel::area` binds its pixel at construction, so a glyph kernel is correct under translation only — a scaling `at` integrates a pixel of the wrong size
+- **Antialiasing:** is the area — no ramp, no distance. `Kernel::dx()`/`dy()` remain the symbolic derivatives, resolved before emission, for a kernel that does ramp on a distance
 - **One kernel per scene:** four channel kernels compile together, so shared geometry is emitted once
 
 ## Cost Model and the Guide (offline, supervised)

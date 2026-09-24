@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use pixelflow_graphics::fonts::{Font, GlyphAtlas};
+use pixelflow_ir::Fold;
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 use pixelflow_pipeline::schema::fnv1a64_hex;
 
@@ -61,6 +62,9 @@ fn tile_for(density: f32) -> u32 {
 
 /// Every fold trip count reachable from `root`, largest first.
 ///
+/// Ranges only: an interval has no trip count — it is an integral, and
+/// legalization replaces it by a fixed quadrature rather than a loop.
+///
 /// These are the numbers baked into the program. Two glyphs agree on a
 /// program only if they agree on this whole multiset, so it — not the piece
 /// count, which is a proxy for it — is what a cache key partitions on.
@@ -72,8 +76,12 @@ fn trip_counts(arena: &ExprArena, root: ExprId) -> Vec<u32> {
         if core::mem::replace(&mut seen[id.0 as usize], true) {
             continue;
         }
-        if let ExprNode::Reduce { fold, .. } = arena.node(id) {
-            trips.push(fold.len());
+        if let ExprNode::Reduce {
+            fold: Fold::Range(range),
+            ..
+        } = arena.node(id)
+        {
+            trips.push(range.len());
         }
         stack.extend(arena.children(id));
     }

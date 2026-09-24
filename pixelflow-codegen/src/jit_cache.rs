@@ -131,8 +131,11 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // that is the only place it cannot be forgotten.
     //
     // It bails to the arena as given for constructs the e-graph does not
-    // model (a `Tuple` root; `Reduce` is unrolled ahead of saturation and
-    // does optimize); those still compile, just without the extra fusion.
+    // model (`egraph::insert`'s `Declined`: a `Guard`, a `Param`, an op
+    // `Vocabulary::Runtime` does not resolve, such as a `RawGather`); those
+    // still compile, just without the extra fusion. A `Reduce` is modelled —
+    // it enters the e-graph as itself, and a fold extraction keeps is
+    // emitted as a loop.
     //
     // The relink after it renumbers the tables into the canonical order the
     // key was built from — extraction redeclares identities in its own

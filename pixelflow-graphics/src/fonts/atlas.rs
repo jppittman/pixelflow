@@ -186,7 +186,7 @@ impl GlyphAtlas {
                     &Kernel::y().add(&Kernel::constant(PIXEL_CENTER)),
                 );
                 let lattice = Lattice { extent: [n, n] };
-                // `glyph.kernel()` declares the winding table `glyph` built as
+                // `glyph.kernel()` declares the piece table `glyph` built as
                 // a slot (S1a), so a bare `Lattice::bake` (which binds
                 // nothing itself) would panic on it — `Glyph::bake` goes
                 // through `Manifold::compile`/`bind` instead, and the table

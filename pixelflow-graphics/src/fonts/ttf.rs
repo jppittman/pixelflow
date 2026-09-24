@@ -319,32 +319,21 @@ impl<'a> Font<'a> {
         self.cmap.lookup(ch as u32)
     }
 
-    /// The glyph for `ch` in font units, as a [`Glyph`]: a coverage
-    /// `Kernel` whose winding sum reads a piece table at a
-    /// `Kernel::sum_over` binder — the table travels with the kernel itself
-    /// (`Kernel::with_buffer_data`), so baking or collapsing it needs no
-    /// separate bind; antialiasing resolves from `Dwrt` at bake.
-    #[must_use]
-    pub fn glyph_kernel(&self, ch: char) -> Option<Glyph> {
-        self.glyph_kernel_by_id(self.cmap.lookup(ch as u32)?)
-    }
-
-    /// [`Font::glyph_kernel`] by pre-looked-up glyph ID.
-    ///
-    /// Built in font units, so its antialiasing ramp is one *font unit* wide
-    /// and its support is bounded at one font unit past the outline. For a
-    /// ramp that is one screen pixel wide, scale the outline before the
-    /// kernel exists — [`Font::glyph_scaled_by_id`] — rather than the kernel
-    /// after.
-    #[must_use]
-    pub fn glyph_kernel_by_id(&self, id: u16) -> Option<Glyph> {
-        Some(loop_blinn::glyph(&self.outline_by_id(id)?))
-    }
-
     /// The `size`-scaled glyph for `ch` as a [`Glyph`]: the ascent line sits
     /// at screen y=0 (top) and the descent at y=`size`, with screen Y
-    /// increasing downward. See [`Font::glyph_kernel`] for the binding this
-    /// carries alongside the kernel.
+    /// increasing downward.
+    ///
+    /// Its coverage `Kernel` is the area of each pixel under ink, one fold
+    /// over a piece table, and the table travels with the kernel itself
+    /// (`Kernel::with_buffer_data`), so baking or collapsing it needs no
+    /// separate bind.
+    ///
+    /// **Only in the frame it is drawn in.** The outline is scaled before
+    /// the kernel exists, not the kernel after. The pixel a glyph integrates
+    /// over is its own frame's unit square, so a glyph built in font units
+    /// would antialias over one *font unit* and bound its support one font
+    /// unit past the outline; there is deliberately no such glyph. Callers
+    /// that want the geometry in font units take [`Font::outline_by_id`].
     #[must_use]
     pub fn glyph_kernel_scaled(&self, ch: char, size: f32) -> Option<Glyph> {
         let id = self.cmap.lookup(ch as u32)?;
@@ -522,6 +511,21 @@ impl<'a> Font<'a> {
     }
 
     /// Decode a compound glyph: every component's outline, transformed.
+    ///
+    /// **A mirrored component is reversed.** A component placed by a
+    /// reflection (a 2×2 transform with negative determinant) comes out
+    /// inside out: its contours wind −1 around ink where the rest of the
+    /// glyph winds +1. The non-zero rule does not mind, since `|w|` is the
+    /// same. Coverage does mind, because it adds signed area. Where a
+    /// mirrored half abuts its original, as the two halves of a symmetric
+    /// glyph built from one component do, a pixel straddling the join sums
+    /// `+a − (1 − a)`, and the join shows as a seam. Reversing the mirrored
+    /// component's contours restores the orientation the font drew it with.
+    /// The whole-glyph screen flip (`Font::to_screen`) mirrors every contour
+    /// at once and so changes no relative orientation; it is left alone.
+    ///
+    /// Where two components genuinely overlap, coverage still reads `|Σ|`
+    /// clamped to 1. That is FreeType's approximation, and it is accepted.
     fn compound(&self, r: &mut R) -> Option<Outline> {
         let mut outline = Outline::default();
         loop {
@@ -550,13 +554,23 @@ impl<'a> Font<'a> {
                 m[0] = r.i16()? as f32 / F2DOT14;
                 m[3] = r.i16()? as f32 / F2DOT14;
             } else if fl & COMPONENT_HAVE_A_TWO_BY_TWO != 0 {
+                // TrueType's order is `xscale, scale01, scale10, yscale`,
+                // and `scale01` is the one that carries `x` into `y′`:
+                // `x′ = xscale·x + scale10·y`, `y′ = scale01·x + yscale·y`
+                // (FreeType's `yx`, `xy`). `Affine` is row-major, so the
+                // middle two land in each other's slots.
                 m[0] = r.i16()? as f32 / F2DOT14;
-                m[1] = r.i16()? as f32 / F2DOT14;
                 m[2] = r.i16()? as f32 / F2DOT14;
+                m[1] = r.i16()? as f32 / F2DOT14;
                 m[3] = r.i16()? as f32 / F2DOT14;
             }
             if let Some(component) = self.outline(id) {
-                outline.append(component.transformed(Affine(m)));
+                let placement = Affine(m);
+                let placed = component.transformed(placement);
+                outline.append(match placement.mirrors() {
+                    true => placed.reversed(),
+                    false => placed,
+                });
             }
             if fl & COMPONENT_MORE_COMPONENTS == 0 {
                 break;

@@ -27,7 +27,7 @@ use pixelflow_graphics::render::color::Rgba8;
 use pixelflow_graphics::render::pixel::Pixel;
 use pixelflow_graphics::scene3d::{Hit, Plane, Ray, Rgba, Sphere, checker, sky};
 use pixelflow_ir::optimize::{Optimize, Rewritten};
-use pixelflow_ir::passes::{ExpandReduce, LowerDwrt};
+use pixelflow_ir::passes::{ExpandReduce, Resolve};
 use pixelflow_ir::{ExprArena, ExprId, ExprNode, LatticeShape};
 use pixelflow_pipeline::shader_bench::{SHADERTOY_KERNEL_NAMES, named_shadertoy_kernel};
 use pixelflow_search::egraph::optimizer::KeepJournal;
@@ -208,9 +208,9 @@ fn corpus(cli: &Cli) -> Vec<Case> {
             if n >= cli.max_glyphs {
                 break;
             }
-            // `glyph_kernel_scaled` yields a `Glyph` — its two folds and its
-            // support — and `kernel()` is the single exit that applies the
-            // coverage ramp once. See fonts/loop_blinn.rs.
+            // `glyph_kernel_scaled` yields a `Glyph` — its area fold and its
+            // support — and `kernel()` is the single exit that turns the
+            // signed area into coverage once. See fonts/loop_blinn.rs.
             let Some(kernel) = parsed
                 .glyph_kernel_scaled(ch, tile as f32)
                 .map(|g| g.kernel())
@@ -269,7 +269,7 @@ fn dag_cost(arena: &ExprArena, root: ExprId) -> usize {
 }
 
 fn legalize(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    match pixelflow_ir::pipeline![LowerDwrt, ExpandReduce].optimize(arena, root) {
+    match pixelflow_ir::pipeline![Resolve, ExpandReduce].optimize(arena, root) {
         Rewritten::Changed(a, r) => (a, r),
         Rewritten::Unchanged => (arena.clone(), root),
         Rewritten::Declined => panic!("legalizing prefix declined a real kernel"),
@@ -439,13 +439,9 @@ fn node_label(egraph: &EGraph, class: EClassId, idx: usize) -> String {
                 .collect();
             format!("{}({})", op.name(), cs.join(","))
         }
-        ENode::Reduce { fold, body } => format!(
-            "Reduce[{}..{} step {}]({})",
-            fold.range().start,
-            fold.range().end,
-            fold.stride(),
-            egraph.find(*body).index()
-        ),
+        ENode::Reduce { fold, body } => {
+            format!("Reduce[{fold}]({})", egraph.find(*body).index())
+        }
     }
 }
 

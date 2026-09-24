@@ -78,7 +78,7 @@ pub mod x86_64;
 pub use encoded::EncodedInst;
 pub use storage::{Slot, SourceOperand, StackFrame, Storage, StoreTarget};
 
-use pixelflow_ir::fold::Fold;
+use pixelflow_ir::fold::{Fold, RangeFold};
 use pixelflow_ir::kind::OpKind;
 
 pub use guards::SelectArm;
@@ -2215,23 +2215,13 @@ fn emit_scope<B: IsaBackend>(
 
             // The result is read from the accumulator's slot — where this
             // scope's placement of the def says it is — so a carried
-            // accumulator lands there once, on the way out.
+            // accumulator lands there once, on the way out. A scope inside
+            // reads it there too: a `Reduce` is never a root (`stays_put`),
+            // so nothing hands it over or carries it.
             if let Some(a) = acc_reg
                 && accumulates
             {
                 backend.slot_store(&mut asm.code, a, acc_slot);
-            }
-
-            // A fold this scope parks for the scopes inside is a root like
-            // any other, handed over right here. They read it from the
-            // accumulator's slot, pinned for them as its park — unless the
-            // allocator carries it, and then the carry is loaded once, here,
-            // from the slot the loop just left it in.
-            if parked.contains_key(vid)
-                && let Some(inner) = allocation.within().next()
-                && let regalloc::Where::Reg(carry) = inner.at_head(*vid)
-            {
-                backend.slot_load(&mut asm.code, carry, acc_slot);
             }
             continue;
         }
@@ -2324,23 +2314,9 @@ fn emit_scope<B: IsaBackend>(
                 guard_slot,
             );
 
+            // Every reader finds the result in `guard_slot`: a `Guard` is
+            // never a root (`stays_put`), so nothing hands it over.
             asm.bind(join);
-
-            // A guard whose result some scope inside this one reads as a
-            // park, the same idea as a fold's accumulator a few lines above
-            // — though in practice `place_roots` never promotes one this way
-            // today (`schedule_variance`'s answer for a `Guard` is its
-            // mask's, and a mask reaching a fold's own closure at all is
-            // already inside that fold's own binder-dependent territory more
-            // often than not); kept for the same reason the fold case states
-            // its own explicitly, rather than relying on that never changing
-            // silently.
-            if parked.contains_key(vid)
-                && let Some(inner) = allocation.within().next()
-                && let regalloc::Where::Reg(carry) = inner.at_head(*vid)
-            {
-                backend.slot_load(&mut asm.code, carry, guard_slot);
-            }
             continue;
         }
 
@@ -2555,7 +2531,11 @@ pub enum ScheduledOp {
     /// the loop's result comes from [`regalloc::Allocation::opens_at`]
     /// naming the [`regalloc::Scope::Fold`] this def opens, not from this
     /// `ValueId`.
-    Reduce(Fold, regalloc::ValueId),
+    ///
+    /// A [`RangeFold`], by type: a loop is what this becomes, and only a
+    /// range is one. An interval cannot reach a schedule —
+    /// `arena_to_schedule` refuses it — so nothing downstream asks.
+    Reduce(RangeFold, regalloc::ValueId),
     /// A surviving `Guard`: the mask, and its two arms' names. `mask` is a
     /// real value in *this* schedule (`arena_to_schedule` maps it like any
     /// other child); the two `KernelKey`s are not — they name kernels whose
@@ -2873,7 +2853,10 @@ fn arena_to_schedule_from(
             ExprNode::Nary(_, _) => panic!("Nary not supported in JIT arena compilation"),
             // The lane fold, executed by lanes: its body is the store, and
             // the store is this def, with the fold's trip count as its width.
-            ExprNode::Reduce { fold, body } if matches!(arena.node(body), ExprNode::Write { lane, .. } if lane == fold.binder()) =>
+            ExprNode::Reduce {
+                fold: Fold::Range(fold),
+                body,
+            } if matches!(arena.node(body), ExprNode::Write { lane, .. } if lane == fold.binder()) =>
             {
                 let ExprNode::Write {
                     row, col, value, ..
@@ -2895,7 +2878,25 @@ fn arena_to_schedule_from(
             // value's `ValueId` in *this* numbering. `extract_folds` reads
             // it back out into the fold's own `ScopeFold`; nothing after
             // that resolves it as an operand (see `ScheduledOp::Reduce`).
-            ExprNode::Reduce { fold, body } => ScheduledOp::Reduce(fold, map_child(body)),
+            ExprNode::Reduce {
+                fold: Fold::Range(fold),
+                body,
+            } => ScheduledOp::Reduce(fold, map_child(body)),
+            // Unreachable precondition, like `Dwrt` above: every compile
+            // entry point runs `passes::resolve`, which replaces an integral
+            // no rule closed by its quadrature. An interval is not a loop, so
+            // there is nothing here to schedule; a survivor means this
+            // schedule was built without the lowering pipeline.
+            ExprNode::Reduce {
+                fold: fold @ Fold::Interval(_),
+                ..
+            } => panic!(
+                "arena_to_schedule: an interval fold ({fold}) reached the JIT \
+                 emitter. An integral is not a loop; passes::resolve replaces \
+                 every one by its quadrature in every compile entry point, so \
+                 a survivor means this schedule was built without the \
+                 lowering pipeline."
+            ),
             // G2: a `Guard` is not lowered away like `Reduce`/`Ref` above —
             // it is meant to be *emitted*, not expanded. Its mask is the one
             // real child in this arena, mapped like any other operand; its
@@ -3046,9 +3047,12 @@ fn scope_schedule(
     // where an arm's entries are worth gathering into one run. A no-op
     // unless it buys a branch. Before `attach_folds`, because it is a
     // permutation and a fold's position is a fact about its parent's final
-    // order.
-    let body = guards::cluster_select_arms(body);
-    let pending = pending.into_iter().map(cluster_pending).collect();
+    // order. The folds first: what a fold costs, which decides whether an
+    // arm owning it pays for a branch, is made of the folds inside it.
+    let (pending, inner): (Vec<PendingFold>, Vec<guards::FoldReads>) =
+        pending.into_iter().map(cluster_pending).unzip();
+    let reads = pending_reads(&body, &pending, &inner);
+    let body = guards::cluster_select_arms(body, &reads);
     let mut scoped = regalloc::ScopedSchedule {
         body: regalloc::ScopeRegion {
             roots: Vec::new(),
@@ -3067,13 +3071,35 @@ fn scope_schedule(
 }
 
 /// [`guards::cluster_select_arms`] over a pending fold's schedule and, one
-/// level down, each of its children's.
-fn cluster_pending(fold: PendingFold) -> PendingFold {
-    PendingFold {
+/// level down, each of its children's — innermost first, and handing back
+/// the folds the fold's own schedule opens, which the scope it opens in
+/// prices it by.
+fn cluster_pending(fold: PendingFold) -> (PendingFold, guards::FoldReads) {
+    let (children, inner): (Vec<PendingFold>, Vec<guards::FoldReads>) =
+        fold.children.into_iter().map(cluster_pending).unzip();
+    let reads = pending_reads(&fold.schedule, &children, &inner);
+    let clustered = PendingFold {
         reduce_vid: fold.reduce_vid,
-        schedule: guards::cluster_select_arms(fold.schedule),
-        children: fold.children.into_iter().map(cluster_pending).collect(),
-    }
+        schedule: guards::cluster_select_arms(fold.schedule, &reads),
+        children,
+    };
+    (clustered, reads)
+}
+
+/// What each of `folds`, opened in `scope`, reads from it and costs, `inner`
+/// being what each fold's own schedule opens, in the same order.
+fn pending_reads(
+    scope: &[regalloc::Def],
+    folds: &[PendingFold],
+    inner: &[guards::FoldReads],
+) -> guards::FoldReads {
+    guards::FoldReads::new(
+        scope,
+        folds
+            .iter()
+            .zip(inner)
+            .map(|(fold, inner)| (fold.reduce_vid, fold.schedule.as_slice(), inner)),
+    )
 }
 
 /// Whether a def is a placeholder already, and so not the placement's to
@@ -3340,10 +3366,11 @@ fn extract_folds_bound_by(
         // A nested `Reduce` that depends on a binder bound here is followed
         // *into*: its body is not an operand (`regalloc::operands` says so —
         // the def's own emission never reads it), but it is this closure's
-        // to carry, so the recursion below can carve it out again one level
-        // down. One that does not is a placeholder like any other hoisted
-        // value, remembered so the level below does not mistake it for a
-        // fold of its own.
+        // to carry — `regalloc::structural_children`, which the walk below
+        // follows, yields it — so the recursion below can carve it out again
+        // one level down. One that does not is a placeholder like any other
+        // hoisted value, remembered so the level below does not mistake it
+        // for a fold of its own.
         //
         // A `Guard` is the exception to stopping: `stays_put` says a fold
         // emits one wherever it reaches it, hoisted or not, so its mask is
@@ -3371,14 +3398,10 @@ fn extract_folds_bound_by(
                 )
             });
             let op = &schedule[at].op;
-            let nested_body = match op {
-                ScheduledOp::Reduce(..) => {
-                    claimed[v.0 as usize] = true;
-                    None
-                }
-                _ => None,
-            };
-            for operand in regalloc::structural_children(op).chain(nested_body) {
+            if matches!(op, ScheduledOp::Reduce(..)) {
+                claimed[v.0 as usize] = true;
+            }
+            for operand in regalloc::structural_children(op) {
                 if mark[operand.0 as usize] {
                     continue;
                 }
@@ -4043,7 +4066,7 @@ fn schedule_guard_arm(
     });
     let (arena, root) = kernel.parts();
     let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
-    let (arena, root) = pixelflow_ir::passes::lower_dwrt_owned(&arena, root).unwrap_or_else(|e| {
+    let (arena, root) = pixelflow_ir::passes::resolve(&arena, root).unwrap_or_else(|e| {
         panic!("schedule_guard_arm: {key:?}'s arm has no derivative rule: {e}")
     });
     let schedule = arena_to_schedule_from(&arena, root, GUARD_ARM_NO_ORIGIN, starting_id);
@@ -4143,9 +4166,9 @@ fn compile_via_backend<B: IsaBackend>(
     let guard_map: alloc::collections::BTreeMap<regalloc::ValueId, u32> = (0..nest.guard_count())
         .map(|k| (nest.guard_reduce_vid(k), guard_slot(k)))
         .collect();
-    // Every root of every scope, parked above the fold and guard slots. A
-    // root that is a fold's own result is parked where the loop already
-    // leaves it — its accumulator slot — rather than copied. A value two
+    // Every root of every scope, parked above the fold and guard slots. No
+    // root is a fold's or a guard's own result — `stays_put` keeps both out
+    // of `roots` — so each one takes a park slot of its own. A value two
     // sibling scopes both compute (a row's main batches and its remainder
     // share their closures) is one root with one slot: the two never run at
     // once, and each writes it before its own scopes read it.
@@ -4156,18 +4179,23 @@ fn compile_via_backend<B: IsaBackend>(
         .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
     for scope in scopes {
         for &root in nest.scope(scope).roots() {
+            // Loud, because the other outcome is silent: `emit_scope`'s
+            // `Reduce` and `Guard` arms end their def before the hand-off, so
+            // a park for either would never be written and every scope
+            // inside would read whatever the slot held.
+            assert!(
+                !fold_map.contains_key(&root) && !guard_map.contains_key(&root),
+                "{root:?} is a fold's or a guard's result, which `stays_put` \
+                 keeps out of every scope's roots"
+            );
             if parks.contains_key(&root) {
                 continue;
             }
-            let slot = match fold_map.get(&root) {
-                Some(&acc) => acc,
-                None => park_base + parks.len() as u32 * vector_bytes,
-            };
+            let slot = park_base + parks.len() as u32 * vector_bytes;
             parks.insert(root, slot);
         }
     }
-    let park_slots = parks.values().filter(|&&slot| slot >= park_base).count() as u32;
-    let total = park_base + park_slots * vector_bytes;
+    let total = park_base + parks.len() as u32 * vector_bytes;
 
     let (body, _, _, spill_count) = emit_scope(
         body_alloc,
@@ -4428,6 +4456,18 @@ mod tests {
         let two = a.push_const(2.0);
         let root = a.push_binary(OpKind::Mul, x, two);
         let _ = arena_to_schedule(&a, root, RAW_ORIGIN);
+    }
+
+    /// And the same for an integral: an interval fold is not a loop, and
+    /// `passes::resolve` replaces every one by its quadrature before a
+    /// schedule is built. A constant integrand, so no coordinate reaches the
+    /// scheduler ahead of the fold and trips its own panic first.
+    #[test]
+    #[should_panic(expected = "an interval fold")]
+    fn a_surviving_interval_fails_loudly() {
+        let area = pixelflow_ir::Kernel::constant(1.0).area();
+        let (arena, root) = area.parts();
+        let _ = arena_to_schedule(arena, root, RAW_ORIGIN);
     }
 
     /// And the same for a `Ref`: its body is not in this arena at all, so a
@@ -4848,7 +4888,9 @@ mod tests {
     ///
     /// The `Reduce` arm ends its def early, past the hand-off, so a carried
     /// fold result used to reach the scopes inside in a register nothing had
-    /// loaded. `X + Σ_{i<3} 2i = X + 6`.
+    /// loaded. A fold result is never a root now (`stays_put`), so nothing
+    /// carries one: the scopes inside read it from its accumulator slot.
+    /// `X + Σ_{i<3} 2i = X + 6`.
     #[test]
     fn a_lattice_invariant_fold_is_the_bodys_own() {
         use pixelflow_ir::fold::{Binder, Fold, Monoid};
@@ -6045,10 +6087,10 @@ mod tests {
             let scopes = core::iter::once(regalloc::Scope::Body)
                 .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
             scopes.map(|s| nest.scope(s)).find_map(|view| {
-                analyze_select_guards(view.schedule(), view.roots())
-                    .into_iter()
+                view.select_guards()
+                    .iter()
                     .find(|g| g.has_guarded_arm())
-                    .map(|g| (view, g))
+                    .map(|g| (view, g.clone()))
             })
         }
 
@@ -6133,15 +6175,59 @@ mod tests {
         /// position, for a schedule built the way `compile` builds it.
         fn guarded_entries(a: &ExprArena, root: ExprId, cluster: bool) -> alloc::vec::Vec<usize> {
             let schedule = native_schedule(a, root, POINT);
+            // Flat, not scoped: no fold is carved out, so none reads anything.
+            let folds = guards::FoldReads::default();
             let schedule = if cluster {
-                guards::cluster_select_arms(schedule)
+                guards::cluster_select_arms(schedule, &folds)
             } else {
                 schedule
             };
-            analyze_select_guards(&schedule, &[])
+            analyze_select_guards(&schedule, &[], &folds)
                 .iter()
                 .map(|g| g.total_guarded_entries())
                 .collect()
+        }
+
+        /// Trip count of [`a_fold_owned_by_an_arm_is_guarded`]'s fold.
+        const ARM_FOLD_TRIPS: u32 = 64;
+
+        /// `(X > 0) ? Σ_{j<64} |X − j| : 0`, plus a value carried across: an
+        /// arm that is a loop and nothing else. All the scope holds of the
+        /// loop is its `Reduce` def, which the latency table prices 0; the
+        /// arm is priced as the loop it opens (`guards::FoldReads`), clears
+        /// the mispredict bound, and is guarded — and the answer on the
+        /// batch that skips the loop is the false arm's.
+        #[test]
+        fn a_fold_owned_by_an_arm_is_guarded() {
+            use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let zero = a.push_const(0.0);
+            let cond = a.push_binary(OpKind::Gt, x, zero);
+            let binder = Binder::from_slot(0).expect("slot 0 exists");
+            let j = a.push_var(binder.var());
+            let diff = a.push_binary(OpKind::Sub, x, j);
+            let term = a.push_unary(OpKind::Abs, diff);
+            let fold = a.push_reduce(Fold::new(Monoid::SUM, binder, 0..ARM_FOLD_TRIPS), term);
+            let sel = a.push_ternary(OpKind::Select, cond, fold, zero);
+            let carried = a.push_binary(OpKind::Sub, x, y);
+            let root = a.push_binary(OpKind::Add, sel, carried);
+
+            assert_guard_forms(&a, root);
+
+            let point = compile(&a, root, POINT).expect("a guarded fold compiles");
+            for &(px, py) in &[(3.0f32, 4.0f32), (-3.0, 4.0), (40.5, -2.0), (-0.5, 0.0)] {
+                let arm = if px > 0.0 {
+                    (0..ARM_FOLD_TRIPS).map(|j| (px - j as f32).abs()).sum()
+                } else {
+                    0.0
+                };
+                let want = arm + (px - py);
+                let got = eval_point(&point.code, px, py);
+                assert_eq!(got, want, "at ({px}, {py})");
+            }
         }
 
         /// Both levels of a nested select are guarded once the schedule is
@@ -6372,11 +6458,11 @@ mod tests {
                 .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
             let (scope, guard) = scopes
                 .find_map(|s| {
-                    let view = nest.scope(s);
-                    analyze_select_guards(view.schedule(), view.roots())
-                        .into_iter()
+                    nest.scope(s)
+                        .select_guards()
+                        .iter()
                         .find(|g| g.is_guarded(SelectArm::True))
-                        .map(|g| (s, g))
+                        .map(|g| (s, g.clone()))
                 })
                 .expect("the true arm is exclusive and contiguous, so it is guarded");
 
@@ -7311,6 +7397,65 @@ mod tests {
             let out = eval_batch(&res.code, &[data.as_ptr()], &[0.5f32], 0.0, 0.0);
             for (i, got) in out.iter().enumerate() {
                 assert_eq!(*got, data[i.min(3)] + 0.5, "lane {i}");
+            }
+        }
+
+        /// `select(u > 0, p(t[u]), 0) + (u + 1) + x`, `p` a polynomial long
+        /// enough to be worth a branch: a select over per-call values, so the
+        /// body computes it and clusters its arms, and `u + 1` — read by the
+        /// root, not the select — is what makes the true arm non-contiguous
+        /// until it does. The arm reads the table through its `Context`
+        /// pointer, which only the arm's broadcast reads. A pointer operand is
+        /// a read to the guard analysis, so clustering keeps that pointer
+        /// ahead of the broadcast rather than sinking it past the select as a
+        /// stranger.
+        #[test]
+        fn a_per_call_select_reads_its_table_through_a_defined_pointer() {
+            use pixelflow_ir::arena::{BufferDecl, BufferIdentity};
+            let data = [4.0f32, 1.5, -2.0, 0.5];
+            let poly = |t: f32| ((t * t + t) * t + 3.0) * t * t + 1.0;
+            let mut a = ExprArena::new();
+            let buf = a.declare_buffer(BufferDecl {
+                id: BufferIdentity::mint(),
+                width: data.len() as u32,
+                height: 1,
+            });
+            let u = a.declare_uniform(decl(0.0));
+            let x = a.push_var(0);
+            let uu = a.push_uniform(u);
+            let zero = a.push_const(0.0);
+            let one = a.push_const(1.0);
+            let three = a.push_const(3.0);
+            let mask = a.push_binary(OpKind::Gt, uu, zero);
+            let leaf = a.push_buffer(buf);
+            let t = a.push_binary(OpKind::RawGather, leaf, uu);
+            let tt = a.push_binary(OpKind::Mul, t, t);
+            let p = a.push_binary(OpKind::Add, tt, t);
+            let p = a.push_binary(OpKind::Mul, p, t);
+            let p = a.push_binary(OpKind::Add, p, three);
+            let p = a.push_binary(OpKind::Mul, p, t);
+            let p = a.push_binary(OpKind::Mul, p, t);
+            let p = a.push_binary(OpKind::Add, p, one);
+            let sel = a.push_ternary(OpKind::Select, mask, p, zero);
+            let intruder = a.push_binary(OpKind::Add, uu, one);
+            let lhs = a.push_binary(OpKind::Add, sel, intruder);
+            let root = a.push_binary(OpKind::Add, lhs, x);
+
+            let res = compile(&a, root, batch()).expect("compile");
+            for block in [1.0f32, 2.0, 3.0, 0.0, -1.0] {
+                let arm = if block > 0.0 {
+                    poly(data[block as usize])
+                } else {
+                    0.0
+                };
+                let out = eval_batch(&res.code, &[data.as_ptr()], &[block], 0.0, 0.0);
+                for (i, got) in out.iter().enumerate() {
+                    assert_eq!(
+                        *got,
+                        arm + (block + 1.0) + i as f32,
+                        "lane {i}, u = {block}"
+                    );
+                }
             }
         }
 

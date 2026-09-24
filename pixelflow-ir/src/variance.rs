@@ -1,8 +1,9 @@
 //! # Variance Analysis
 //!
 //! Which variables an expression depends on, as a bitset. This is the shared
-//! type used by both the e-graph analysis (`pixelflow-search`) and the compiler
-//! codegen (`pixelflow-compiler`).
+//! type used by both the e-graph's extractor (`pixelflow-search`, which prices
+//! a node by [`LatticeShape::evals`] of it) and codegen's loop placement
+//! (`pixelflow-codegen`'s `schedule_variance` and `place_roots`).
 //!
 //! ## Variable Mapping
 //!
@@ -39,7 +40,8 @@
 /// Coordinates X=bit0, Y=bit1; reduction index slots in bits `4..64`.
 /// Bits 2 and 3 are the retired Z and W axes and are never set. Operations:
 /// - `union`: bitwise OR (join — a binary op depends on both operands' vars)
-/// - `meet`: minimum across e-class representatives (pick lowest-deps form)
+/// - `intersection`: bitwise AND (meet — what every one of several equal
+///   terms is free of, the whole term is free of)
 /// - `without`: set difference — what a binder does to its own index
 ///
 /// This type is `no_std` compatible and zero-cost (single `u64`). It was a
@@ -147,25 +149,23 @@ impl Variance {
         Self(self.0 & !other.0)
     }
 
-    /// Meet: the minimum-variance representative.
-    /// Used ACROSS e-nodes in the same e-class (pick the cheapest representation).
+    /// Intersection (meet): the variables both operands depend on.
     ///
-    /// Compares by popcount first (fewer deps = better), then by raw value for
-    /// determinism.
+    /// Used ACROSS terms known to be equal. Each term's variance is an
+    /// over-approximation of the one function they all denote, so a variable
+    /// absent from *any* of them is absent from the function:
+    ///
+    /// ```text
+    /// var(C) = ⋂_{n ∈ C} var(n)
+    /// ```
+    ///
+    /// This is the lattice meet, not a choice of representative: `X ∩ Y` is
+    /// `CONST`, because a function that is constant along `Y` (the first
+    /// term says so) and constant along `X` (the second does) is constant.
     #[inline]
     #[must_use]
-    pub const fn meet(self, other: Self) -> Self {
-        let a_pop = self.0.count_ones();
-        let b_pop = other.0.count_ones();
-        if a_pop < b_pop {
-            self
-        } else if b_pop < a_pop {
-            other
-        } else if self.0 <= other.0 {
-            self
-        } else {
-            other
-        }
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
     }
 
     // --- Queries ---
@@ -331,10 +331,12 @@ fn referent_variance(_key: crate::key::KernelKey) -> Variance {
 ///
 /// Cost: O(n) where n = `arena.len()`. No allocations beyond the result vec.
 ///
-/// Public because it is the input the public `find_hoistable_*` functions
-/// require, and because `pixelflow-search`'s NNUE featurizer uses it to
-/// populate the variance histogram on arena-built accumulators (the same
-/// classification `egraph::deps::DepsAnalysis` provides on e-graphs).
+/// Public because `pixelflow-search` calls it from outside this crate: its
+/// `nnue::factored::variance_histogram`, the classification behind
+/// `Extraction::chosen_variance`, reads the whole per-node table (the e-graph
+/// keeps the same fact per class, as `EGraph::variance`). In this crate
+/// `passes::unroll_reduce` and `passes::lower_dwrt`'s tabulation rule read it
+/// the same way.
 #[must_use]
 pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> {
     use crate::arena::{ExprId, ExprNode};
@@ -422,228 +424,6 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
     result
 }
 
-/// Compute variance for every node in a DAG.
-///
-/// Because `dag.iter()` visits nodes strictly in children-before-parents order,
-/// a single forward pass over `dag.iter()` suffices.
-///
-/// Returns a [`SideTable<Variance>`] indexed directly by [`Node<'_, ExprData>`].
-#[must_use]
-pub fn compute_dag_variance(
-    dag: &crate::dag::Dag<crate::expr::ExprData>,
-) -> crate::dag::SideTable<Variance> {
-    use crate::expr::ExprData;
-
-    let mut table = dag.side_table(Variance::CONST);
-
-    for node in dag.iter() {
-        let v = match *node {
-            ExprData::Var(idx) => {
-                if idx < Variance::VARIABLES {
-                    Variance::from_var(idx)
-                } else {
-                    Variance::ALL
-                }
-            }
-            ExprData::Const(_) | ExprData::Buffer(_) | ExprData::Uniform(_) => Variance::CONST,
-            ExprData::Param(_) => Variance::ALL,
-            // The only node that *removes* a dependency: its binder is
-            // bound here, so the body's variance on that one slot does not
-            // escape.
-            //
-            // The binder comes off `Fold`, not out of a `Const` child. That
-            // is the whole of the difference: this arm used to read a float,
-            // ask `floorf` whether it was really an integer, check the
-            // integer against a magic range to see whether it was really a
-            // binder slot, and fall back to `Variance::ALL` when any of that
-            // failed — a widening that was silent and unfalsifiable.
-            ExprData::Reduce(fold) => {
-                let body = node.children().next();
-                let body_v = body.map_or(Variance::ALL, |b| table[b]);
-                body_v.without(Variance::from_var(fold.binder().var()))
-            }
-            // A name has no variance of its own to compute. `Ref` is a leaf
-            // whose referent lives in another graph, so nothing here can see
-            // what it depends on; `ALL` is the sound answer, and the linker
-            // (`passes::expand_refs`) is what turns it into a real one.
-            ExprData::Ref(_) => Variance::ALL,
-            // A `Guard` varies with its mask (the one real child here) and
-            // with whatever either arm varies with, resolved the same way a
-            // `Ref` leaf's variance is: both arms union in, since nothing at
-            // this level knows which one a lane-varying mask will take.
-            ExprData::Guard { on, off } => {
-                let mask = node
-                    .children()
-                    .next()
-                    .expect("Guard has one child: the mask");
-                table[mask]
-                    .union(referent_variance(on))
-                    .union(referent_variance(off))
-            }
-            ExprData::Op(_) => {
-                let mut v = Variance::CONST;
-                for child in node.children() {
-                    v = v.union(table[child]);
-                }
-                v
-            }
-        };
-        table[node] = v;
-    }
-
-    table
-}
-
-/// Find arena nodes that should be hoisted out of the X-loop.
-///
-/// [`find_hoistable_out_of`] with `0` — the pixel loop's question.
-#[must_use]
-/// NOTE (2026-08-03): this is the ARENA-side hoisting analysis, and it has no
-/// callers. The live loop-invariant-code-motion in the collapse compile path
-/// does the same job over the *schedule* instead — see `schedule_variance` and
-/// `plan_collapse_hoist` in pixelflow-codegen's `emit/mod.rs`, which
-/// `compile_via_backend` runs at two scopes (whole-nest, then
-/// per-row). So this is one analysis implemented twice at two tiers, the same
-/// shape as the chain rule was. Which copy survives is an open question, not a
-/// dormant feature.
-pub fn find_hoistable_arena_nodes(
-    arena: &crate::arena::ExprArena,
-    root: crate::arena::ExprId,
-    variance: &[Variance],
-    max: usize,
-) -> Vec<crate::arena::ExprId> {
-    find_hoistable_out_of(0, arena, root, variance, max)
-}
-
-/// Find arena nodes that should be hoisted out of the scope binding `var`.
-///
-/// Returns up to `max` `ExprId`s that are:
-/// 1. invariant in `var` (so hoisting is legal)
-/// 2. non-trivial (not Var or Const — actual computation worth hoisting)
-/// 3. used by at least one `var`-dependent node (so hoisting pays)
-///
-/// Results are sorted by estimated cost (transcendentals first).
-///
-/// One function serves every level of the nest, because "can this leave the
-/// loop" is one question asked of different variables: `0` for the pixel loop,
-/// `1` for a scanline, a reduction's own slot for hoisting out of the fold —
-/// which is the rewrite `⊕_i (f(i) · c) = c · ⊕_i f(i)` stated as an analysis.
-///
-/// # Panics
-///
-/// Panics if `var >= Variance::VARIABLES`.
-#[must_use]
-pub fn find_hoistable_out_of(
-    var: u8,
-    arena: &crate::arena::ExprArena,
-    root: crate::arena::ExprId,
-    variance: &[Variance],
-    max: usize,
-) -> Vec<crate::arena::ExprId> {
-    use crate::arena::{ExprId, ExprNode};
-    use crate::kind::OpKind;
-
-    assert!(
-        var < Variance::VARIABLES,
-        "variable index must be below Variance::VARIABLES"
-    );
-    let n = arena.len();
-
-    // Mark which nodes are reachable from root
-    let mut reachable = alloc::vec![false; n];
-    let mut stack = alloc::vec![root];
-    while let Some(id) = stack.pop() {
-        let idx = id.0 as usize;
-        if idx >= n || reachable[idx] {
-            continue;
-        }
-        reachable[idx] = true;
-        for child in arena.children(id) {
-            stack.push(child);
-        }
-    }
-
-    // Mark which reachable nodes are consumed by a `var`-dependent node: those
-    // are the ones whose value has to cross the loop boundary to be useful.
-    let mut feeds_dependent = alloc::vec![false; n];
-    for i in 0..n {
-        if !reachable[i] {
-            continue;
-        }
-        let id = ExprId(i as u32);
-        if variance[i].depends_on(var) {
-            for child in arena.children(id) {
-                feeds_dependent[child.0 as usize] = true;
-            }
-        }
-    }
-
-    // Collect hoistable candidates
-    let mut candidates: Vec<(ExprId, u8)> = Vec::new(); // (id, priority)
-    for i in 0..n {
-        if !reachable[i] || !feeds_dependent[i] {
-            continue;
-        }
-        let v = variance[i];
-        if !v.is_invariant_in(var) || v.is_const() {
-            continue; // Must be invariant in `var` and non-const
-        }
-        let id = ExprId(i as u32);
-        let node = arena.node(id);
-
-        // Skip trivial nodes (Var, Const, Param, Buffer, Uniform) — not worth a register
-        let priority = match node {
-            ExprNode::Var(_)
-            | ExprNode::Const(_)
-            | ExprNode::Param(_)
-            | ExprNode::Buffer(_)
-            | ExprNode::Uniform(_) => {
-                continue;
-            }
-            // A loop-invariant memory read is well worth a register.
-            ExprNode::Ternary(OpKind::Gather, _, _, _) => 2,
-            ExprNode::Unary(
-                OpKind::Sin
-                | OpKind::Cos
-                | OpKind::Exp
-                | OpKind::Exp2
-                | OpKind::Ln
-                | OpKind::Log2
-                | OpKind::Log10
-                | OpKind::Sqrt
-                | OpKind::Asin
-                | OpKind::Acos
-                | OpKind::Atan
-                | OpKind::Atan2
-                | OpKind::Pow
-                | OpKind::Tan,
-                _,
-            ) => 3, // Transcendentals: highest priority
-            ExprNode::Unary(_, _) => 1,
-            ExprNode::Binary(op, _, _) => match op {
-                OpKind::Div => 2, // Division is expensive
-                OpKind::Pow | OpKind::Atan2 => 3,
-                _ => 1, // Add, Sub, Mul are cheap
-            },
-            _ => 1,
-        };
-
-        candidates.push((id, priority));
-    }
-
-    // Sort by priority (highest first), then by ExprId (topological order)
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-
-    candidates.into_iter().take(max).map(|(id, _)| id).collect()
-}
-
-// Several tests below call `compute_arena_variance` directly. That is testing
-// the public API, not an exception to it: the function is `pub`, and
-// `pixelflow-search`'s `nnue::factored` calls it from outside this crate. Its
-// in-crate callers are `passes::unroll_reduce` and `eval::eval_scalar`, both of
-// which consume the whole per-node table; `find_hoistable_out_of` and
-// `find_hoistable_arena_nodes` are not callers at all — they take an
-// already-computed variance slice from theirs.
 /// The extents of the lattice a kernel is compiled for: samples per axis,
 /// `[x, y]`.
 ///
@@ -657,7 +437,8 @@ pub fn find_hoistable_out_of(
 /// (`docs/plans/2026-09-01-loop-aware-codegen.md`).
 ///
 /// An axis of extent 1 is a per-call constant; an axis of larger extent is a
-/// binder the emitted code either distributes (unrolls) or factors (loops).
+/// binder the emitted code loops over: `passes::lattice::collapse` wraps the
+/// kernel in one fold per axis, and codegen emits each as a loop.
 /// [`varying`](Self::varying) names the binders as a [`Variance`], so
 /// `deps(node) ∩ shape.varying()` is the scope a node's value lives at.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -702,18 +483,22 @@ impl LatticeShape {
     /// How many times this lattice evaluates a value whose dependencies are
     /// `deps` — the weight its cost carries in the whole program.
     ///
-    /// The loop nest runs W outermost to X innermost, and nothing is
+    /// The loop nest runs Y outermost to X innermost, and nothing is
     /// materialized, so a value is recomputed once per iteration of the
-    /// innermost binder it depends on: the product of the extents from that
+    /// innermost axis it depends on: the product of the extents from that
     /// axis outward. A value depending on X runs at every sample; one
-    /// depending only on Z runs once per Z plane; one depending on nothing
-    /// runs once per call. That single rule is loop-invariant code motion,
-    /// hoisting out of a reduction, and constant folding, priced.
+    /// depending only on Y runs once per row; one depending on nothing — a
+    /// uniform's arithmetic included — runs once per call. That single rule
+    /// is loop-invariant code motion and constant folding, priced.
     ///
-    /// A dependency on a reduction binder counts as the innermost scope: the
-    /// binder sits inside the coordinate nest and this type does not carry
-    /// its extent. Binders are distributed before the e-graph sees them, so
-    /// the case does not arise in practice.
+    /// A dependency on a reduction binder counts as the innermost scope,
+    /// every sample: this type carries neither the binder's trip count nor
+    /// where codegen places its fold (one that reads no coordinate runs once
+    /// per call, outside the lattice's folds). The case arises whenever a fold
+    /// survives saturation — `pixelflow-search`'s extractor weights every node
+    /// of a fold's body by this — so a node that reads a binder weighs what a
+    /// per-sample node weighs, whatever else it reads, and the fold's trip
+    /// count is not in the weight at all.
     #[inline]
     #[must_use]
     pub const fn evals(self, deps: Variance) -> u64 {
@@ -758,6 +543,11 @@ impl LatticeShape {
 mod tests {
     use super::*;
 
+    // Several tests below call `compute_arena_variance` directly. That is
+    // testing the public API, not an exception to it: the function is `pub`,
+    // and `pixelflow-search`'s `nnue::factored` calls it from outside this
+    // crate (see its doc).
+
     #[test]
     fn verify_from_var() {
         assert_eq!(Variance::from_var(0), Variance::X);
@@ -793,18 +583,21 @@ mod tests {
     }
 
     #[test]
-    fn verify_meet() {
-        // Fewer deps wins
-        assert_eq!(Variance::CONST.meet(Variance::X), Variance::CONST);
-        assert_eq!(Variance::X.meet(Variance::CONST), Variance::CONST);
+    fn verify_intersection() {
+        assert_eq!(Variance::CONST.intersection(Variance::X), Variance::CONST);
+        assert_eq!(Variance::X.intersection(Variance::CONST), Variance::CONST);
 
-        // Same popcount: lower raw value wins (deterministic)
-        assert_eq!(Variance::X.meet(Variance::Y), Variance::X); // 0b0001 < 0b0010
-        assert_eq!(Variance::Y.meet(Variance::X), Variance::X);
+        // Two single, different variables share nothing: a function constant
+        // along each is constant. A popcount minimum would have answered `X`.
+        assert_eq!(Variance::X.intersection(Variance::Y), Variance::CONST);
+        assert_eq!(Variance::Y.intersection(Variance::X), Variance::CONST);
 
-        // 2-bit vs 1-bit: 1-bit wins
         let xy = Variance::X.union(Variance::Y);
-        assert_eq!(xy.meet(Variance::from_var(4)), Variance::from_var(4));
+        let slot = Variance::from_var(4);
+        assert_eq!(xy.intersection(slot), Variance::CONST);
+        assert_eq!(xy.intersection(Variance::Y), Variance::Y);
+        assert_eq!(xy.union(slot).intersection(slot), slot);
+        assert_eq!(Variance::ALL.intersection(xy), xy);
     }
 
     #[test]
@@ -1158,48 +951,11 @@ mod tests {
             );
         }
     }
-
-    /// The LICM rule and the reduction-hoisting rule are one query at different
-    /// variables: `⊕_i (f(i) · c) = c · ⊕_i f(i)` when `deps(c) ∩ {i} = {}`
-    /// (REDUCTIONS_AND_FOLDS.md:109) is `find_hoistable_out_of(i, …)`.
-    #[test]
-    fn hoisting_out_of_a_binder_is_the_same_query_as_licm() {
-        use crate::Kernel;
-        use crate::arena::ExprNode;
-        use crate::kind::OpKind;
-
-        // Σ_{i<8} (i · sin(Y)) — sin(Y) is invariant in the index, so it can
-        // leave the fold; it is NOT invariant in Y.
-        let k = Kernel::sum_over(8, |i| i.mul(&Kernel::y().sin()));
-        let (arena, root) = k.parts();
-        let v = super::compute_arena_variance(arena);
-
-        let ExprNode::Reduce { body, .. } = arena.node(root) else {
-            panic!("expected a Reduce at the root");
-        };
-        let out_of_binder = super::find_hoistable_out_of(4, arena, body, &v, 8);
-        let sin = out_of_binder
-            .iter()
-            .find(|id| matches!(arena.node(**id), ExprNode::Unary(OpKind::Sin, _)));
-        assert!(
-            sin.is_some(),
-            "sin(Y) must be hoistable out of the fold, got {out_of_binder:?}"
-        );
-
-        // Asking about Y instead finds nothing: sin(Y) cannot cross that scope.
-        let out_of_y = super::find_hoistable_out_of(1, arena, body, &v, 8);
-        assert!(
-            !out_of_y
-                .iter()
-                .any(|id| matches!(arena.node(*id), ExprNode::Unary(OpKind::Sin, _))),
-            "sin(Y) must not be hoistable out of Y, got {out_of_y:?}"
-        );
-    }
 }
 
 #[cfg(test)]
 mod lattice_shape_tests {
-    use super::{LatticeShape, Variance, compute_dag_variance};
+    use super::{LatticeShape, Variance};
 
     #[test]
     fn binders_are_the_axes_with_extent_above_one() {
@@ -1240,23 +996,5 @@ mod lattice_shape_tests {
         assert_eq!(a.key_bytes()[4..8], 8u32.to_le_bytes());
         assert_ne!(a.key_bytes(), b.key_bytes());
         assert_eq!(a.extent(), [8, 8]);
-    }
-
-    #[test]
-    fn verify_compute_dag_variance() {
-        use crate::dag::Builder;
-        use crate::expr::ExprBuilderExt;
-        use crate::kind::OpKind;
-
-        let mut b = Builder::new();
-        let x = b.push_var(0); // Variance::X
-        let y = b.push_var(1); // Variance::Y
-        let add = b.push_binary(OpKind::Add, x, y); // Variance::COORDS
-        let c = b.push_const(5.0); // Variance::CONST
-        let mul = b.push_binary(OpKind::Mul, add, c); // Variance::COORDS
-        let rooted = b.finish(&[mul]);
-
-        let var_table = compute_dag_variance(&rooted);
-        assert_eq!(var_table[rooted.entry()], Variance::COORDS);
     }
 }

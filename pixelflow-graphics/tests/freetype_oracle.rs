@@ -47,11 +47,10 @@
 //! will pass on code that does not compile. Likewise the test itself runs only
 //! under `--features freetype`.
 //!
-//! Known and deliberately not asserted: the reverse direction. There are two
-//! texels where FreeType has ink and we do not, unchanged by any work here —
-//! this rasterizer ramps coverage only in X, so a horizontal edge gets no
-//! vertical antialiasing and lands a texel boundary hard. That is a separate,
-//! pre-existing defect with its own fix, and gating on it would assert a bug.
+//! The reverse direction — texels where FreeType has ink and we do not — is
+//! pinned by count, not asserted to zero ([`TEXELS_WE_MISS_FULL`]): what is
+//! left of it is FreeType's hinting reading a texel whose exact area is just
+//! under a half as just over it.
 #![cfg(feature = "freetype")]
 
 use freetype as ft;
@@ -95,9 +94,13 @@ const SIZES: [u32; 11] = [7, 11, 13, 15, 17, 19, 21, 32, 38, 40, 48];
 /// than half of that (the sample count is quadratic in the size).
 const GLYPHS_FAST: [char; 6] = ['8', 'O', 'A', '{', '}', 'f'];
 const SIZES_FAST: [u32; 3] = [7, 19, 32];
-/// How far the total ink we lay down may stray from the reference's. Measured
-/// at 0.19% over the corpus below, so this is roughly 10x headroom — loose enough never to fire on an antialiasing difference, tight
-/// enough that dropping or duplicating whole strokes cannot hide behind it.
+/// How far the total ink we lay down may stray from the reference's.
+/// Measured at 0.02% over the full corpus and 0.15% over the presubmit
+/// subset (both below FreeType's ink), where the distance-ramp renderer read
+/// 0.20% and 0.41% above it — so this is thirteen times the larger of the
+/// two today and five times the ramp's worst: loose enough never to fire on
+/// an antialiasing difference, tight enough that dropping or duplicating
+/// whole strokes cannot hide behind it.
 const INK_RATIO_TOLERANCE: f64 = 0.02;
 /// Texels we ink where FreeType finds none, over the corpus below. **Zero**,
 /// and asserted as zero.
@@ -116,17 +119,28 @@ const INK_RATIO_TOLERANCE: f64 = 0.02;
 const KNOWN_ORPHAN_TEXELS: usize = 0;
 
 /// Texels FreeType inks and we do not, over the pairs below — **pinned**, not
-/// capped. It is zero on this set, which reads like a claim that the defect is
-/// absent; it is not. Widen the glyph set and it is 50: this rasterizer ramps
-/// coverage only in X, so a horizontal edge gets no vertical antialiasing and
-/// lands a texel boundary hard. Pinned rather than bounded because both
-/// directions are news — upward is that defect spreading, downward is somebody
-/// having fixed it, and either should be a deliberate edit here rather than a
-/// silent drift.
-const TEXELS_WE_MISS_FULL: u32 = 3;
+/// capped, because both directions are news and either should be a
+/// deliberate edit here rather than a silent drift. The assertion names
+/// every one.
+///
+/// Two, and neither is ours to fix: `{`@7 texel (2, 1) and `S`@7 texel
+/// (1, 5), where FreeType reads 0.504 and 0.510 and we read 0.494 — which is
+/// their exact area (0.4936 and 0.4942, `tests/common/exact_area.rs`), just
+/// under the half this counts at. FreeType's side is hinted and supersampled
+/// sixteen to a texel on device rows that need not meet the texel's edges,
+/// which moves a horizontal edge's coverage by up to 1/32.
+///
+/// It was 3, three different texels, when coverage was a ramp on the
+/// distance to the nearest edge: `{`@7 (2, 1) read 0.448, `}`@7 (2, 3) 0.452
+/// and `}`@7 (1, 5) 0.485, against exact areas of 0.494, 0.516 and 0.501 —
+/// the ramp's own error at a corner. Coverage is the exact area now
+/// (`fonts/loop_blinn.rs`), so both `}` texels read their area and are
+/// inked; `S`@7 (1, 5) is new, and is the same threshold straddle as `{`.
+const TEXELS_WE_MISS_FULL: usize = 2;
 /// The same count over [`GLYPHS_FAST`]/[`SIZES_FAST`], measured separately:
-/// a subset of the corpus is a different number, not a smaller one.
-const TEXELS_WE_MISS_FAST: u32 = 3;
+/// a subset of the corpus is a different number, not a smaller one. One:
+/// `{`@7 (2, 1), as above (it was 3, the same three).
+const TEXELS_WE_MISS_FAST: usize = 1;
 
 fn font_path() -> String {
     format!(
@@ -141,7 +155,7 @@ fn font_path() -> String {
 struct Corpus {
     glyphs: &'static [char],
     sizes: &'static [u32],
-    texels_we_miss: u32,
+    texels_we_miss: usize,
 }
 
 /// Presubmit. See [`GLYPHS_FAST`] for the cost measurement behind the split.
@@ -197,13 +211,11 @@ fn compare_against_freetype(corpus: &Corpus) {
     let descender = face.raw().descender as f32;
 
     let mut orphans = Vec::new();
-    // The reverse direction, recorded as a number that may not grow rather
-    // than asserted to zero: FreeType inks texels we leave blank because this
-    // rasterizer ramps coverage only in X, so a horizontal edge gets no
-    // vertical antialiasing. That is a real, separate defect (see the module
-    // docs); pinning today's count stops it spreading without asserting it
-    // away.
-    let mut we_miss = 0u32;
+    // The reverse direction, pinned by count rather than asserted to zero:
+    // what is left of it is FreeType's hinting, not our coverage (see
+    // `TEXELS_WE_MISS_FULL`), and every texel is named so a change is argued
+    // texel by texel.
+    let mut we_miss = Vec::new();
     let mut ink_ours = 0.0f64;
     let mut ink_reference = 0.0f64;
 
@@ -306,7 +318,11 @@ fn compare_against_freetype(corpus: &Corpus) {
                             })
                         });
                         if !ours_near {
-                            we_miss += 1;
+                            we_miss.push(format!(
+                                "{ch}@{size} texel ({i},{j}): FreeType {:.3}, ours {:.3}",
+                                reference(i, j),
+                                ours(i, j)
+                            ));
                         }
                     }
                     if cov > OURS_INKED && !corroborated(i, j) {
@@ -332,18 +348,28 @@ fn compare_against_freetype(corpus: &Corpus) {
     // Total ink. A predicate about individual texels is weak on its own — it
     // survives deleting every other row, or shifting the whole glyph by a
     // texel — and this closes that: two rasterizers drawing the same outlines
-    // put down the same amount of ink. Measured 0.19% apart, bounded at 2%.
+    // put down the same amount of ink. Measured 0.02% apart over the full
+    // corpus, bounded at 2% (`INK_RATIO_TOLERANCE`).
     let ratio = ink_ours / ink_reference;
+    eprintln!(
+        "freetype_oracle: ink ratio {ratio:.5}, {} texels we miss, {} orphans\n{}",
+        we_miss.len(),
+        orphans.len(),
+        we_miss.join("\n")
+    );
     assert!(
         (ratio - 1.0).abs() < INK_RATIO_TOLERANCE,
         "we lay down {ratio:.4}x FreeType's ink ({ink_ours:.1} vs \
          {ink_reference:.1}) — the outlines are not being filled the same way"
     );
     assert_eq!(
-        we_miss, texels_we_miss,
-        "FreeType inks {we_miss} texels we leave blank, pinned at \
-         {texels_we_miss} — up means a defect has spread, down means the \
-         ramp has improved and this number wants lowering"
+        we_miss.len(),
+        texels_we_miss,
+        "FreeType inks {} texels we leave blank, pinned at {texels_we_miss} — \
+         up means a defect has spread, down means coverage has improved and \
+         this number wants lowering:\n{}",
+        we_miss.len(),
+        we_miss.join("\n")
     );
 
     // Asserted empty, which it was not until 2026-09-08 — see

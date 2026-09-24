@@ -186,14 +186,14 @@ op_table! {
     RawGather = 48,
 
     // --- Reduction (lattice fold) ---
-    /// Fold a body over a bounded domain. Encoded
-    /// `Nary(Reduce, [Const(combiner), Const(reduce_var), Const(extent), body])`:
-    /// `combiner` is the monoid op index (`Add`/`Mul`/`Min`/`Max`), `body`
-    /// references `Var(reduce_var)` (a binder-space index), and the fold runs over
-    /// `0..extent`. The combiner is a *child* (a parameter), not baked into the
-    /// opcode, so one `Reduce` covers every monoid and can later take an
-    /// arbitrary combiner function. Lowered to an unrolled accumulation by
-    /// `expand_reduce` before codegen — the analogue of `Gather -> RawGather`.
+    /// Fold a body over a bounded domain: the kind of an
+    /// `ExprNode::Reduce { fold, body }`, whose one child is `body`. The
+    /// monoid it folds under, the binder `body` reads through its `Var`, and
+    /// the range that binder runs over are a [`Fold`](crate::fold::Fold) in
+    /// the node, not children — see `fold.rs` for the `Const`-child encoding
+    /// it replaced. Legal through codegen, which emits a surviving fold as a
+    /// loop (`passes::legalize`); `expand_reduce` unrolls one only for a
+    /// caller that asks.
     Reduce = 49,
 
     // --- Uniforms (per-call scalars) ---

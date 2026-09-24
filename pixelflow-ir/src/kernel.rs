@@ -24,7 +24,7 @@ use crate::expr::{
     Environment, ExprBuilderExt, ExprData, copy_subgraph, from_arena, splice, substitute_vars,
     to_arena,
 };
-use crate::fold::{Binder, Fold, Monoid};
+use crate::fold::{Binder, Fold, IntervalFold, Monoid};
 use crate::kind::OpKind;
 
 /// One bit per placeholder index, set while that index is claimed by a binder
@@ -91,6 +91,11 @@ impl Drop for BinderScope {
         PLACEHOLDERS_IN_USE.fetch_and(!(1 << self.0), Ordering::Relaxed);
     }
 }
+
+/// Half the side of the pixel [`Kernel::area`] integrates over: the pixel
+/// is `[-½, ½)` on each axis about the sample, so its midpoint is the point
+/// every unintegrated kernel samples.
+const PIXEL_HALF_WIDTH: f32 = 0.5;
 
 /// The lowest binder not already bound by a `Reduce` in `arena`.
 ///
@@ -704,31 +709,96 @@ impl Kernel {
         Self::wrap(b.finish(&[root]), env, buffers)
     }
 
-    /// `⊕_{i ∈ 0..extent} body(i)` — **the** reduction binder: fold `body` over
+    /// `⊕_{i ∈ range} body(i)` — **the** reduction binder: fold `body` over
     /// a bounded discrete domain under `monoid`, eliminating that dimension.
     ///
     /// This is the primitive; [`Kernel::sum_over`] and friends are one-line
-    /// helpers over it, and a new [`Monoid`] extends the language without
-    /// touching this method.
+    /// helpers over it at `0..extent`, and a new [`Monoid`] extends the
+    /// language without touching this method.
     ///
     /// The closure receives the bound index as a `Kernel` of its own, so Rust's
     /// scoping *is* the binder's scoping — an index cannot escape the fold that
     /// binds it, and a repeated index in nested folds is a genuine contraction
-    /// rather than an accident. `extent` is a static count, which is what keeps
-    /// the language total and its cost closed-form (`|D| × cost(body)`); the
+    /// rather than an accident. `range` is static, which is what keeps the
+    /// language total and its cost closed-form (`|D| × cost(body)`); the
     /// backend unrolls, so the domain is bounded in practice as well as in
     /// principle.
+    ///
+    /// **Where the domain starts is the fold's, not the body's.** Two folds
+    /// whose bodies read `table[i]` over different rows of one table have
+    /// one body, and the e-graph reasons about it once; spelling the second
+    /// as `table[i + offset]` over `0..len` gives it a body of its own.
     ///
     /// Nesting is supported (up to [`Binder::COUNT`] live binders — the
     /// reserved index space): each fold takes the lowest index slot its body
     /// does not already bind.
     ///
+    /// # Panics
+    ///
+    /// Panics if `range` runs backwards.
+    ///
     /// ```ignore
     /// // Σ_d q(d)·k(d) — a contraction over the shared index.
-    /// Kernel::over(Monoid::SUM, 64, |d| q.at_index(d).mul(&k.at_index(d)))
+    /// Kernel::over(Monoid::SUM, 0..64, |d| q.at_index(d).mul(&k.at_index(d)))
     /// ```
     #[must_use]
-    pub fn over(monoid: Monoid, extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
+    pub fn over(
+        monoid: Monoid,
+        range: core::ops::Range<u32>,
+        body: impl FnOnce(&Kernel) -> Kernel,
+    ) -> Self {
+        Self::bind_fresh(|binder| Fold::new(monoid, binder, range), body)
+    }
+
+    /// `∫∫` of `self` over the pixel: `∫_{u_y ∈ [-½, ½)} ∫_{u_x ∈ [-½, ½)}
+    /// self(X + u_x, Y + u_y)` — the area integral antialiasing is, as two
+    /// folds over intervals, each binding a fresh index.
+    ///
+    /// `X` and `Y` appear here and nowhere else: the IR sees two ordinary
+    /// folds, and which coordinate an interval perturbs is a fact about its
+    /// body, not a field of the fold
+    /// (docs/plans/2026-09-23-an-integral-is-a-fold.md §2). The pixel is
+    /// centred on the sample, so the midpoint of the integral is the point
+    /// every other kernel computes.
+    ///
+    /// **Bound at construction, like every fold.** [`Kernel::at`] afterwards
+    /// substitutes the *result's* coordinates and never the bound indices, so
+    /// the order of composition says which pixel is meant:
+    ///
+    /// - `k.at(σ).area()` is the screen pixel under the warped shape — what a
+    ///   glyph wants, `area` the last thing before a lattice collapses it;
+    /// - `k.area().at(σ)` is the warped pixel: `k`'s own unit cell, carried to
+    ///   the screen by `σ`.
+    ///
+    /// They agree for a translation and differ once `σ` scales or bends.
+    ///
+    /// An integral no rewrite rule closes is legalized by quadrature before
+    /// the kernel reaches a backend (`passes::resolve`).
+    #[must_use]
+    pub fn area(&self) -> Self {
+        let pixel = |binder| {
+            Fold::Interval(IntervalFold::new(
+                binder,
+                -PIXEL_HALF_WIDTH,
+                PIXEL_HALF_WIDTH,
+            ))
+        };
+        Self::bind_fresh(pixel, |u_y| {
+            Self::bind_fresh(pixel, |u_x| {
+                self.at(&Self::x().add(u_x), &Self::y().add(u_y))
+            })
+        })
+    }
+
+    /// The binder every fold is built with: `body` against a fresh index,
+    /// folded by whatever `fold_at` makes of the slot that index lands in.
+    ///
+    /// The slot is chosen only after the body exists, which is why the fold
+    /// is a function of it rather than a value — see the comments below.
+    fn bind_fresh(
+        fold_at: impl FnOnce(Binder) -> Fold,
+        body: impl FnOnce(&Kernel) -> Kernel,
+    ) -> Self {
         // Build the body against a placeholder index unique to this binder,
         // then rename it to a real slot once we can see which slots the body
         // already binds. Choosing the slot up-front is impossible: the body
@@ -750,7 +820,7 @@ impl Kernel {
         // children — combiner index, binder slot, extent — and left every
         // reader to recover them by position and by asking a float whether
         // it was really a small integer.
-        let root = b.push_reduce(Fold::new(monoid, binder, 0..extent), body_root);
+        let root = b.push_reduce(fold_at(binder), body_root);
         // Only `body`'s own graph is used above — no other kernel is spliced
         // in — so its buffer table carries forward unchanged.
         Self::wrap(b.finish(&[root]), env, body.inner.buffers.clone())
@@ -760,41 +830,41 @@ impl Kernel {
     /// sum over a bounded index.
     #[must_use]
     pub fn sum_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::SUM, extent, body)
+        Self::over(Monoid::SUM, 0..extent, body)
     }
 
     /// `Π_{i ∈ 0..extent} body(i)`.
     #[must_use]
     pub fn product_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::PRODUCT, extent, body)
+        Self::over(Monoid::PRODUCT, 0..extent, body)
     }
 
     /// `max_{i ∈ 0..extent} body(i)` — the stabilizer half of a softmax, and
     /// the shape of any "best over a bounded set" query.
     #[must_use]
     pub fn max_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::MAX, extent, body)
+        Self::over(Monoid::MAX, 0..extent, body)
     }
 
     /// `min_{i ∈ 0..extent} body(i)` — e.g. the nearest hit of a bounded set
     /// of SDFs.
     #[must_use]
     pub fn min_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::MIN, extent, body)
+        Self::over(Monoid::MIN, 0..extent, body)
     }
 
     /// `∃_{i ∈ 0..extent} body(i)` — a mask that is set where *any* index
     /// satisfies `body`.
     #[must_use]
     pub fn any_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::ANY, extent, body)
+        Self::over(Monoid::ANY, 0..extent, body)
     }
 
     /// `∀_{i ∈ 0..extent} body(i)` — a mask that is set where *every* index
     /// satisfies `body`.
     #[must_use]
     pub fn all_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::ALL, extent, body)
+        Self::over(Monoid::ALL, 0..extent, body)
     }
 
     /// Sample `self` at warped coordinates — contramap / `.at()`. Each of
@@ -1214,6 +1284,94 @@ mod tests {
 
         let merged = left.add(&right);
         assert_eq!(merged.buffer_data().count(), 1);
+    }
+
+    /// Whether `var` is read anywhere under `root`.
+    fn reads(arena: &ExprArena, root: ExprId, var: u8) -> bool {
+        let mut seen = alloc::vec![false; arena.len()];
+        let mut stack = alloc::vec![root];
+        while let Some(id) = stack.pop() {
+            if core::mem::replace(&mut seen[id.0 as usize], true) {
+                continue;
+            }
+            if arena.node(id) == crate::arena::ExprNode::Var(var) {
+                return true;
+            }
+            stack.extend(arena.children(id));
+        }
+        false
+    }
+
+    /// `area`'s two folds: `(outer, inner, integrand)`.
+    fn pixel_folds(
+        kernel: &Kernel,
+    ) -> (
+        crate::fold::IntervalFold,
+        crate::fold::IntervalFold,
+        ExprArena,
+        ExprId,
+    ) {
+        use crate::arena::ExprNode;
+        let (arena, root) = kernel.parts();
+        let ExprNode::Reduce {
+            fold: Fold::Interval(outer),
+            body,
+        } = arena.node(root)
+        else {
+            panic!("area's root is an integral: {:?}", arena.node(root));
+        };
+        let ExprNode::Reduce {
+            fold: Fold::Interval(inner),
+            body,
+        } = arena.node(body)
+        else {
+            panic!("and so is its body: {:?}", arena.node(body));
+        };
+        (outer, inner, arena.clone(), body)
+    }
+
+    /// **`area` is two pixel intervals over the kernel at `(X + u_x, Y + u_y)`.**
+    /// Distinct slots, both `[-½, ½)`, and the integrand is the kernel with
+    /// `X` read as `X + u_x` and `Y` as `Y + u_y` — the inner fold's binder
+    /// perturbing `X`, the outer's `Y`.
+    #[test]
+    fn area_is_two_pixel_intervals_over_the_shifted_kernel() {
+        use crate::arena::ExprNode;
+        let (outer, inner, arena, integrand) = pixel_folds(&Kernel::x().mul(&Kernel::y()).area());
+        assert_ne!(outer.binder(), inner.binder());
+        for fold in [outer, inner] {
+            assert_eq!(
+                (fold.lo(), fold.hi()),
+                (-PIXEL_HALF_WIDTH, PIXEL_HALF_WIDTH)
+            );
+        }
+        let ExprNode::Binary(OpKind::Mul, x_side, y_side) = arena.node(integrand) else {
+            panic!("the integrand is X·Y, shifted: {:?}", arena.node(integrand));
+        };
+        let shifted = |side: ExprId, axis: u8, by: u8| {
+            matches!(arena.node(side), ExprNode::Binary(OpKind::Add, a, b)
+                if arena.node(a) == ExprNode::Var(axis) && arena.node(b) == ExprNode::Var(by))
+        };
+        assert!(shifted(x_side, 0, inner.binder().var()), "X + u_x");
+        assert!(shifted(y_side, 1, outer.binder().var()), "Y + u_y");
+    }
+
+    /// **`at` never reaches a bound index.** `area(k).at(2X, 3Y)` keeps both
+    /// folds exactly — same slots, same pixel — and the integrand still reads
+    /// each binder: the warp substituted the result's `X` and `Y`, which are
+    /// the only coordinates the integral leaves free.
+    #[test]
+    fn a_warp_of_an_area_keeps_its_binders() {
+        let k = Kernel::x().mul(&Kernel::y());
+        let (outer, inner, _, _) = pixel_folds(&k.area());
+        let warped = k.area().at(
+            &Kernel::x().mul(&Kernel::constant(2.0)),
+            &Kernel::y().mul(&Kernel::constant(3.0)),
+        );
+        let (warped_outer, warped_inner, arena, integrand) = pixel_folds(&warped);
+        assert_eq!((warped_outer, warped_inner), (outer, inner));
+        assert!(reads(&arena, integrand, inner.binder().var()));
+        assert!(reads(&arena, integrand, outer.binder().var()));
     }
 
     /// The other side of that merge: two DIFFERENT tabulations claiming the

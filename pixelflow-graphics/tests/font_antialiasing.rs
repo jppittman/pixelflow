@@ -1,20 +1,20 @@
-//! Tests for gradient-normalized edge-ramp antialiasing in the font path.
+//! Tests for antialiasing in the font path.
 //!
-//! Antialiasing is intrinsic to the glyph coverage `Kernel`: each edge
-//! function's `DX`/`DY` become symbolic `Dwrt` resolved at bake, so the
-//! coverage ramp is ~1 *screen* pixel wide at any glyph scale (the chain
-//! rule runs through every coordinate warp). There is no separate hard/AA
-//! mode — the old Field-domain "hard step" was a degenerate mode of the
-//! retired combinator pipeline.
+//! Antialiasing is intrinsic to the glyph coverage `Kernel`: coverage is the
+//! area of the pixel under ink (`fonts/loop_blinn.rs`), so across a straight
+//! edge it rises linearly over exactly one pixel of the frame the glyph is
+//! built in — the screen, for `Font::glyph_kernel_scaled` at any size. There
+//! is no separate hard/AA mode — the old Field-domain "hard step" was a
+//! degenerate mode of the retired combinator pipeline.
 
 use pixelflow_core::{Kernel, Lattice};
 use pixelflow_graphics::fonts::{loop_blinn, Contour, Font, Glyph, Outline, Segment};
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
-/// Evaluate a coverage kernel at a single point, binding `glyph`'s winding
-/// table if it has one (`glyph`'s `Kernel::sum_over` winding sum reads a
-/// bound piece table — S1a of
+/// Evaluate a coverage kernel at a single point, binding `glyph`'s piece
+/// table if it has one (`glyph`'s `Kernel::sum_over` reads a bound piece
+/// table — S1a of
 /// docs/plans/2026-09-09-glyph-as-a-fold-execution.md). The compile cache
 /// makes repeated samples of the same kernel cheap.
 fn sample(glyph: &Glyph, x: f32, y: f32) -> f32 {
@@ -22,7 +22,7 @@ fn sample(glyph: &Glyph, x: f32, y: f32) -> f32 {
 }
 
 /// Bake `kernel` (derived from `glyph` by a coordinate contramap, so it
-/// declares the same winding table) over `lattice`.
+/// declares the same piece table) over `lattice`.
 fn bake(lattice: Lattice, kernel: &Kernel, glyph: &Glyph) -> Vec<f32> {
     glyph.bake(kernel, lattice).into_buffer()
 }
@@ -158,7 +158,8 @@ fn ramp_width_is_one_screen_pixel_at_any_scale() {
         widths.push(w);
     }
 
-    // The symbolic chain-rule payoff: 4x the glyph scale, same screen ramp.
+    // The glyph is built in the screen frame at every size, so 4x the glyph
+    // scale integrates the same screen pixel.
     let diff = (widths[0] - widths[1]).abs();
     assert!(
         diff <= 0.5,

@@ -10,6 +10,7 @@ use super::provenance::{ApplicationRecord, Origin, UnionEvent};
 use super::provenance::{ENodeId, Provenance};
 use super::rewrite::{Rewrite, RewriteAction};
 use super::rules::RuleId;
+use pixelflow_ir::Variance;
 use pixelflow_ir::kind::OpKind;
 
 /// A potential rewrite target: (rule, e-class, node within class).
@@ -106,6 +107,32 @@ pub struct EGraph {
     /// the moment congruence closure does its work. The fact must outlive the
     /// nodes.
     const_fact: Vec<Option<u32>>,
+    /// Which binders each class may depend on, indexed by class id — the
+    /// per-class variance fact (docs/plans/2026-09-23-an-integral-is-a-fold.md
+    /// §1, §3), kept beside `const_fact` and out of `EClass::nodes` for the
+    /// same reason: a guard read mid-`rebuild` must not see a drained class.
+    ///
+    /// **Law:** `var_fact[C] ⊇ var(⟦C⟧)` — the fact over-approximates the
+    /// variance of the one function every member of `C` denotes, so a bit
+    /// absent from the fact is a binder the class is provably constant along.
+    ///
+    /// - **Seeded** in [`EGraph::add`] by [`ENode::variance`], the node's
+    ///   transfer function, over its children's facts *as they stand then*.
+    ///   Each child's fact over-approximates the child, and the transfer is
+    ///   monotone, so the seed over-approximates the node.
+    /// - **Merged** in [`EGraph::union`] by *intersection*. Both classes
+    ///   denote the same function and both facts over-approximate it, so a
+    ///   bit either one lacks is a bit the function lacks. A fact only ever
+    ///   shrinks from its seed and never grows up from `∅` — the greatest
+    ///   fixpoint, not the least — which is why a cycle cannot certify an
+    ///   invariance: a class holding `x` and `x + 0` got each member's fact
+    ///   from facts that already existed, never from an assumption about
+    ///   itself.
+    /// - **Never repaired upward.** A union that shrinks a child's fact does
+    ///   not revisit the parents seeded from the larger one. A stale parent
+    ///   fact is still a superset, so a rule reading it may miss an
+    ///   opportunity but can never fire wrongly; soundness needs no repair.
+    var_fact: Vec<Variance>,
     /// Unions REFUSED because they would assert two numerically unequal
     /// constants equal — a proved falsehood the graph declines to absorb.
     /// Distinct (bits, bits) pairs, kept for reporting and tests; see
@@ -193,7 +220,21 @@ pub struct EGraph {
 /// its own node list, or its direct children's, changing at all, and a
 /// 1-hop scheme would silently never re-check it — under-saturation that no
 /// correctness test can see, only a comparison against the un-skipped
-/// extraction cost can.
+/// extraction cost can. The runtime tier's `FactorFold` (outside
+/// `all_rules`, in `fold_rules`) is depth 2 as well for the product at a
+/// body's top: it reads a fold's body class and then its operands' variance
+/// facts, and a fact changes only when its own class is unioned, which bumps
+/// that class's `last_changed`.
+///
+/// The integration rules (`integral`) and `FactorFold`'s n-ary flattening
+/// read deeper — a fold, its body's factors, an indicator's comparison, the
+/// comparison's affine operands. Audited by this doc's own method on the
+/// area oracle's kernels (`pixelflow-core/tests/area_oracle.rs`): with every
+/// class dirty for every rule, the same integrals close and every texel's
+/// error is unchanged, because each of their triggers is a class the
+/// derivation itself just created, or a class one hop below a fold.
+/// Anything this tracker misses deeper is an opportunity missed, never a
+/// wrong rewrite.
 ///
 /// This is a single, uniform, crate-wide constant rather than a per-rule
 /// depth precisely so a future rule cannot silently exceed it the way a
@@ -325,6 +366,7 @@ impl Clone for EGraph {
             #[cfg(feature = "provenance-journal")]
             active_application: self.active_application,
             const_fact: self.const_fact.clone(),
+            var_fact: self.var_fact.clone(),
             refused_const_unions: self.refused_const_unions.clone(),
             applications: self.applications,
             #[cfg(feature = "provenance-journal")]
@@ -410,6 +452,20 @@ pub enum SaturationStop {
     ApplicationBudget,
 }
 
+/// The limits every phase of one saturation run shares: rounds, classes,
+/// and the wall-clock ceiling measured from the run's start. A later phase
+/// gets the rounds an earlier one left (`EGraph::saturate_bounded`), so a
+/// run never reports more rounds than its caller allowed. The application
+/// budget is the graph's own (`EGraph::application_cap`), so it is shared by
+/// construction.
+#[derive(Clone, Copy)]
+struct RoundLimits {
+    max_iters: usize,
+    max_classes: usize,
+    start: std::time::Instant,
+    timeout: Option<std::time::Duration>,
+}
+
 /// Result of one [`EGraph::saturate_with_limits`] run: how many rounds it
 /// took and how many rule applications fired in total, whichever limit
 /// (iteration count, class count, timeout, or convergence) ended the run.
@@ -476,6 +532,7 @@ impl EGraph {
             #[cfg(feature = "provenance-journal")]
             active_application: None,
             const_fact: Vec::new(),
+            var_fact: Vec::new(),
             refused_const_unions: Vec::new(),
             applications: 0,
             #[cfg(feature = "provenance-journal")]
@@ -513,6 +570,7 @@ impl EGraph {
             #[cfg(feature = "provenance-journal")]
             active_application: None,
             const_fact: Vec::new(),
+            var_fact: Vec::new(),
             refused_const_unions: Vec::new(),
             applications: 0,
             #[cfg(feature = "provenance-journal")]
@@ -686,6 +744,9 @@ impl EGraph {
             self.provenance.record_origin(enode_id, origin);
         }
         self.const_fact.push(node.as_f32().map(f32::to_bits));
+        // `node` is canonical, so every child indexes its class's live fact.
+        let variance = node.variance(|child| self.var_fact[child.index()]);
+        self.var_fact.push(variance);
         self.classes.push(EClass {
             nodes: vec![node.clone()],
             tags: vec![enode_id],
@@ -704,6 +765,29 @@ impl EGraph {
     #[must_use]
     pub fn refused_const_unions(&self) -> &[(u32, u32)] {
         &self.refused_const_unions
+    }
+
+    /// The binders `class` may depend on: a superset of what the function it
+    /// denotes varies with, so `!variance(c).depends_on(b)` proves `c` is
+    /// constant along `b` (see the `var_fact` field for the law and why it
+    /// holds without repair).
+    ///
+    /// The side condition every loop-transformation rule over a fold asks —
+    /// `⊕_i (c ⊗ f) = c ⊗ ⊕_i f` iff `i ∉ var(c)` — asked of the class
+    /// rather than of one representative.
+    #[must_use]
+    pub(crate) fn variance(&self, class: EClassId) -> Variance {
+        self.var_fact[self.find(class).index()]
+    }
+
+    /// The literal `class` is known to equal, if it is one — the class's
+    /// constant fact, which outlives a mid-`rebuild` drain of its nodes (see
+    /// the `const_fact` field). A comparison mask reads here as the NaN its
+    /// all-ones pattern is, so a caller that wants a *number* asks for one
+    /// it can recognize (`1.0`, a finite nonzero slope).
+    #[must_use]
+    pub(crate) fn constant(&self, class: EClassId) -> Option<f32> {
+        self.const_fact[self.find(class).index()].map(f32::from_bits)
     }
 
     pub fn union(&mut self, a: EClassId, b: EClassId) -> EClassId {
@@ -776,6 +860,9 @@ impl EGraph {
         if self.const_fact[parent.index()].is_none() {
             self.const_fact[parent.index()] = self.const_fact[child.index()];
         }
+        // Intersection, not a choice: see `var_fact`'s law.
+        self.var_fact[parent.index()] =
+            self.var_fact[parent.index()].intersection(self.var_fact[child.index()]);
         // `parent`'s own node list just changed (gained `child`'s nodes) —
         // see `class_is_dirty`/`DIRTY_TRACKING_MAX_DEPTH`.
         self.mutation_counter += 1;
@@ -1295,6 +1382,21 @@ impl EGraph {
     /// The one rewrite-until-budget-exhausted loop. Every saturation entry
     /// point in this crate funnels here rather than re-deciding, in a second
     /// copy, when to stop.
+    ///
+    /// **Integrals close first.** When the graph holds an integral, the
+    /// integration family (`integral::closes_integrals`) runs to a fixpoint
+    /// before the whole rule set does, under the same limits — rounds, classes,
+    /// applications, clock — the derivation of a closed form is three rounds
+    /// of that family and nothing else, and a graph that reaches its class
+    /// cap in the first round of the full set would otherwise stop it
+    /// half-closed. The phase is decided by the graph and the rule set alone,
+    /// so it is as deterministic as the rest of the run; a graph with no
+    /// integral skips it, and saturates exactly as it did before it existed.
+    /// Its rounds and unions are reported with the run's, and a budget it
+    /// exhausts ends the run there. The rounds it takes come out of
+    /// `max_iters`, as its applications come out of `max_applications`: a
+    /// caller that asked for `n` rounds is told of at most `n`, which is what
+    /// an accountant of rounds across calls (`run_anytime_curve`) subtracts.
     fn saturate_bounded(
         &mut self,
         max_iters: usize,
@@ -1309,25 +1411,89 @@ impl EGraph {
         // the shared loop rather than in `saturate_with_limits`, so
         // `saturate_budgeted` — and therefore every production tier — is
         // held to it too.
-        let max_classes = max_classes.min(HARD_CLASS_LIMIT);
-        let start = std::time::Instant::now();
-        // `Instant + Duration::MAX` panics, so the deadline is optional
-        // rather than "infinitely far away".
-        let deadline = timeout.map(|t| start + t);
+        let limits = RoundLimits {
+            max_iters,
+            max_classes: max_classes.min(HARD_CLASS_LIMIT),
+            start: std::time::Instant::now(),
+            timeout,
+        };
         // The cap is enforced deep inside the scan, where an application is
         // about to commit — the only place that can stop mid-round without
         // letting the round decide how far past the budget to go.
         let previous_cap = self.application_cap;
         self.application_cap = max_applications.map(|n| self.applications.saturating_add(n));
+
+        let closing = self.integral_closure_rules();
+        let closed = (!closing.is_empty()).then(|| self.rounds(&closing, &limits));
+        let stats = match closed {
+            // A budget or a ceiling the closing phase ran into ends the run:
+            // the full rule set would meet it on its first check.
+            Some(closed)
+                if !matches!(
+                    closed.stop,
+                    SaturationStop::Quiesced | SaturationStop::IterationCeiling
+                ) =>
+            {
+                closed
+            }
+            _ => {
+                let every: Vec<usize> = (0..self.rules.len()).collect();
+                let spent = closed.map_or(0, |closed| closed.iterations);
+                let left = RoundLimits {
+                    max_iters: limits.max_iters.saturating_sub(spent),
+                    ..limits
+                };
+                let main = self.rounds(&every, &left);
+                match closed {
+                    Some(closed) => SaturationStats {
+                        iterations: closed.iterations + main.iterations,
+                        total_unions: closed.total_unions + main.total_unions,
+                        stop: main.stop,
+                    },
+                    None => main,
+                }
+            }
+        };
+
+        self.application_cap = previous_cap;
+        stats
+    }
+
+    /// The rule indices of the integration family when the graph holds an
+    /// integral, and none otherwise — `saturate_bounded`'s closing phase.
+    pub(crate) fn integral_closure_rules(&self) -> Vec<usize> {
+        let holds_integral = self
+            .classes
+            .iter()
+            .any(|class| class.nodes.iter().any(super::fold_rules::is_integral));
+        if !holds_integral {
+            return Vec::new();
+        }
+        (0..self.rules.len())
+            .filter(|&idx| {
+                self.rule_ids
+                    .get(idx)
+                    .is_some_and(|&id| super::integral::closes_integrals(id))
+            })
+            .collect()
+    }
+
+    /// Rewrite rounds of `rules`, in order, until a limit or a sweep that
+    /// changes nothing stops them.
+    fn rounds(&mut self, rules: &[usize], limits: &RoundLimits) -> SaturationStats {
+        // `Instant + Duration::MAX` panics, so the deadline is optional
+        // rather than "infinitely far away".
+        let deadline = limits.timeout.map(|t| limits.start + t);
+        let max_classes = limits.max_classes;
         let mut iterations = 0;
         let mut total_unions = 0;
         // Recorded at the point the loop decides to stop — never inferred
         // afterwards from the counters.
         let mut stop = SaturationStop::IterationCeiling;
 
-        for _ in 0..max_iters {
-            if let Some(t) = timeout {
-                if start.elapsed() >= t {
+        for _ in 0..limits.max_iters {
+            if let Some(t) = limits.timeout {
+                if limits.start.elapsed() >= t {
                     stop = SaturationStop::Timeout;
                     break;
                 }
@@ -1353,10 +1519,9 @@ impl EGraph {
             // Apply all rules in a single batch — one rebuild per iteration
             let (unions, sweep) = {
                 let mut batch = self.batch();
-                let n_rules = batch.graph.rules.len();
                 let mut total = 0;
                 let mut sweep = ScanStop::Completed;
-                for rule_idx in 0..n_rules {
+                for &rule_idx in rules {
                     if batch.node_count() > max_classes {
                         sweep = ScanStop::ClassCap;
                         break;
@@ -1423,8 +1588,6 @@ impl EGraph {
                 }
             }
         }
-
-        self.application_cap = previous_cap;
 
         SaturationStats {
             iterations,
@@ -2082,21 +2245,8 @@ impl EGraph {
             RewriteAction::Differentiate { inner, var } => self.predict(|s| {
                 derivative_shape(s, inner, *var);
             }),
-            RewriteAction::PeelFold {
-                head,
-                head_root,
-                rest,
-                body,
-            } => self.predict(|s| {
-                peel_fold_shape(s, head, *head_root, *rest, *body);
-            }),
-            RewriteAction::HalveFold {
-                shift,
-                shift_root,
-                halved,
-                body,
-            } => self.predict(|s| {
-                halve_fold_shape(s, shift, *shift_root, *halved, *body);
+            RewriteAction::Plan(plan) => self.predict(|s| {
+                plan_shape(s, plan);
             }),
         }
     }
@@ -2237,23 +2387,9 @@ impl EGraph {
                 let deriv_id = derivative_shape(self, &inner, var);
                 self.union_counted(class_id, deriv_id)
             }
-            RewriteAction::PeelFold {
-                head,
-                head_root,
-                rest,
-                body,
-            } => {
-                let peeled = peel_fold_shape(self, &head, head_root, rest, body);
-                self.union_counted(class_id, peeled)
-            }
-            RewriteAction::HalveFold {
-                shift,
-                shift_root,
-                halved,
-                body,
-            } => {
-                let doubled = halve_fold_shape(self, &shift, shift_root, halved, body);
-                self.union_counted(class_id, doubled)
+            RewriteAction::Plan(plan) => {
+                let built = plan_shape(self, &plan);
+                self.union_counted(class_id, built)
             }
         }
     }
@@ -2886,28 +3022,21 @@ fn instantiate_template<S: NodeSink>(
     }
 }
 
-/// Build `head ⊕ ⊕_{rest} body` — one peeled term combined with the fold over
-/// what is left.
+/// Build a [`Plan`](super::fold_rules::Plan) — every fold and integration
+/// rule's right-hand side — and return the class of its root.
 ///
-/// The head arrives as a template because computing it needs to *read* the
-/// graph (walking the body's classes to substitute the binder), which a
-/// [`NodeSink`] cannot do; the rule does that half and this replays it. The
-/// tail names `body` directly: peeling moves the range, never the body, which
-/// is what makes the rule affordable at all.
-fn peel_fold_shape<S: NodeSink>(
-    sink: &mut S,
-    head: &[super::fold_rules::HeadNode],
-    head_root: super::fold_rules::HeadRef,
-    rest: pixelflow_ir::Fold,
-    body: EClassId,
-) -> EClassId {
+/// The plan arrives already computed because computing it needs to *read*
+/// the graph (walking a body's classes to substitute a binder, recognizing an
+/// integrand), which a [`NodeSink`] cannot do; the rule does that half and
+/// this replays it, node by node in build order.
+fn plan_shape<S: NodeSink>(sink: &mut S, plan: &super::fold_rules::Plan) -> EClassId {
     use super::fold_rules::{HeadNode, HeadRef};
-    let mut planned: Vec<EClassId> = Vec::with_capacity(head.len());
+    let mut planned: Vec<EClassId> = Vec::with_capacity(plan.nodes.len());
     let resolve = |r: HeadRef, planned: &[EClassId]| match r {
         HeadRef::Plan(i) => planned[i as usize],
         HeadRef::Class(c) => c,
     };
-    for entry in head {
+    for entry in &plan.nodes {
         let id = match entry {
             HeadNode::Const(bits) => sink.make(ENode::Const(*bits)),
             HeadNode::Op { op, children } => sink.make(ENode::Op {
@@ -2921,65 +3050,7 @@ fn peel_fold_shape<S: NodeSink>(
         };
         planned.push(id);
     }
-    let head = resolve(head_root, &planned);
-    let rest_class = sink.make(ENode::Reduce { fold: rest, body });
-    let op = super::fold_rules::combiner_op(rest.monoid())
-        .expect("PeelFold checked the combiner before emitting this action");
-    // `rest` first: the peel takes the *last* index, so the accumulator is on
-    // the left and the chain leans the way `expand_reduce` builds it.
-    sink.make(ENode::Op {
-        op,
-        children: vec![rest_class, head],
-    })
-}
-
-/// Build `Reduce { fold: halved, body: body ⊕ shift }` — a fold's body
-/// doubled and its trip count halved.
-///
-/// `shift` arrives as a template for the reason `peel_fold_shape`'s `head`
-/// does: computing it needs to *read* the graph, which a [`NodeSink`]
-/// cannot do. `body` names the unshifted half directly — nothing about it
-/// changes, so nothing about it is rebuilt.
-fn halve_fold_shape<S: NodeSink>(
-    sink: &mut S,
-    shift: &[super::fold_rules::HeadNode],
-    shift_root: super::fold_rules::HeadRef,
-    halved: pixelflow_ir::Fold,
-    body: EClassId,
-) -> EClassId {
-    use super::fold_rules::{HeadNode, HeadRef};
-    let mut planned: Vec<EClassId> = Vec::with_capacity(shift.len());
-    let resolve = |r: HeadRef, planned: &[EClassId]| match r {
-        HeadRef::Plan(i) => planned[i as usize],
-        HeadRef::Class(c) => c,
-    };
-    for entry in shift {
-        let id = match entry {
-            HeadNode::Const(bits) => sink.make(ENode::Const(*bits)),
-            HeadNode::Op { op, children } => sink.make(ENode::Op {
-                op: *op,
-                children: children.iter().map(|c| resolve(*c, &planned)).collect(),
-            }),
-            HeadNode::Reduce { fold, body } => sink.make(ENode::Reduce {
-                fold: *fold,
-                body: resolve(*body, &planned),
-            }),
-        };
-        planned.push(id);
-    }
-    let shifted = resolve(shift_root, &planned);
-    let op = super::fold_rules::combiner_op(halved.monoid())
-        .expect("HalveFold checked the combiner before emitting this action");
-    // `body` first: `b ⊕ b[binder := binder+s]`, the unshifted (original
-    // left-to-right order) half on the left.
-    let doubled_body = sink.make(ENode::Op {
-        op,
-        children: vec![body, shifted],
-    });
-    sink.make(ENode::Reduce {
-        fold: halved,
-        body: doubled_body,
-    })
+    resolve(plan.root, &planned)
 }
 
 /// Build the e-class of the derivative of `inner` with respect to variable
@@ -4632,5 +4703,131 @@ mod mask_tests {
             "withholding a candidate and every re-derivation of it must change what the \
              run built — otherwise Δ is measuring nothing"
         );
+    }
+}
+
+/// The per-class variance fact (`var_fact`): seeded by the transfer function,
+/// merged by intersection, and a superset of the truth whatever the graph did
+/// to reach it.
+#[cfg(test)]
+mod variance_fact_tests {
+    use super::*;
+    use pixelflow_ir::{Binder, Fold, Monoid};
+
+    fn op2(op: &'static dyn Op, a: EClassId, b: EClassId) -> ENode {
+        ENode::Op {
+            op,
+            children: vec![a, b],
+        }
+    }
+
+    /// **Free of what any member is free of.** `X − X` is seeded `{X}` from
+    /// its children; the graph then learns it equals `0`, and the class is
+    /// `{X} ∩ ∅ = ∅`. A parent seeded before the union keeps its larger fact
+    /// — no upward repair — which is still a superset of the truth, so a rule
+    /// reading it can miss the invariance but never invent one.
+    #[test]
+    fn a_class_is_free_of_what_any_member_is_free_of() {
+        let mut eg = EGraph::new();
+        let x = eg.add(ENode::Var(0));
+        let y = eg.add(ENode::Var(1));
+        let x_minus_x = eg.add(op2(&ops::Sub, x, x));
+        let parent = eg.add(op2(&ops::Mul, x_minus_x, y));
+        assert_eq!(eg.variance(x_minus_x), Variance::X, "seeded from X and X");
+        assert_eq!(eg.variance(parent), Variance::COORDS);
+
+        let zero = eg.add(ENode::constant(0.0));
+        eg.union(x_minus_x, zero);
+        eg.rebuild();
+
+        assert_eq!(
+            eg.variance(x_minus_x),
+            Variance::CONST,
+            "one member proves the class constant, so the class is"
+        );
+        assert!(
+            eg.variance(parent).depends_on_x(),
+            "the parent's seed is stale and says so: still a superset of the \
+             truth ({{Y}}), which is all soundness needs"
+        );
+    }
+
+    /// **The meet is an intersection, not a pick.** A class proved equal to
+    /// both a Y-only and an X-only term varies with neither — a popcount
+    /// minimum would have kept one of the two.
+    #[test]
+    fn two_disjoint_members_leave_nothing() {
+        let mut eg = EGraph::new();
+        let x = eg.add(ENode::Var(0));
+        let y = eg.add(ENode::Var(1));
+        let sin_x = eg.add(ENode::Op {
+            op: &ops::Sin,
+            children: vec![x],
+        });
+        let sin_y = eg.add(ENode::Op {
+            op: &ops::Sin,
+            children: vec![y],
+        });
+        eg.union(sin_x, sin_y);
+        eg.rebuild();
+        assert_eq!(eg.variance(sin_x), Variance::CONST);
+    }
+
+    /// **A fold frees its binder**, and only its binder: `Σ_i (i · X)` varies
+    /// with `X`, its body with both.
+    #[test]
+    fn a_fold_removes_its_binder() {
+        let mut eg = EGraph::new();
+        let binder = Binder::from_slot(0).expect("a live binder");
+        let i = eg.add(ENode::Var(binder.var()));
+        let x = eg.add(ENode::Var(0));
+        let body = eg.add(op2(&ops::Mul, i, x));
+        let fold = eg.add(ENode::Reduce {
+            fold: Fold::new(Monoid::SUM, binder, 0..8),
+            body,
+        });
+        assert_eq!(
+            eg.variance(body),
+            Variance::X.union(Variance::from_var(binder.var()))
+        );
+        assert_eq!(eg.variance(fold), Variance::X);
+    }
+
+    /// **A cycle does not certify invariance.** Once `X + 0` is merged with
+    /// `X`, the class holds a member whose child is the class itself. Every
+    /// fact in it was seeded from facts that already existed — `X`'s own bit
+    /// — and never from an assumption about the class, so the cycle leaves
+    /// `{X}` standing. A least fixpoint started from `∅` closes at `∅`
+    /// instead: `var(C) = {X} ∩ var(C + 0)` and `var(C + 0) = var(C)`, so
+    /// `∅` is a fixpoint, and it is false.
+    #[test]
+    fn a_cycle_does_not_certify_invariance() {
+        let mut eg = EGraph::new();
+        let x = eg.add(ENode::Var(0));
+        let zero = eg.add(ENode::constant(0.0));
+        let x_plus_0 = eg.add(op2(&ops::Add, x, zero));
+        eg.union(x_plus_0, x);
+        eg.rebuild();
+
+        let class = eg.find(x);
+        assert!(
+            eg.nodes(class)
+                .iter()
+                .any(|n| n.children_slice().iter().any(|&c| eg.find(c) == class)),
+            "precondition: the class reaches itself"
+        );
+        assert_eq!(eg.variance(class), Variance::X);
+    }
+
+    /// The fact survives a clone — a search branch reads the same facts its
+    /// parent had.
+    #[test]
+    fn a_clone_keeps_the_facts() {
+        let mut eg = EGraph::new();
+        let x = eg.add(ENode::Var(0));
+        let y = eg.add(ENode::Var(1));
+        let sum = eg.add(op2(&ops::Add, x, y));
+        let copy = eg.clone();
+        assert_eq!(copy.variance(sum), Variance::COORDS);
     }
 }

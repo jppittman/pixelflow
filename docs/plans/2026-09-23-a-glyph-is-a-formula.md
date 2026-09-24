@@ -2,8 +2,25 @@
 
 ## Metadata
 - **Author**: JP (direction), Claude (draft)
-- **Status**: `Draft` — denotation proposed 2026-09-23; the measure's
-  syntax and the definite-range rule added the same day. Nothing built.
+- **Status**: §1 `Built`, §4.2–§4.4 not. The denotation was proposed
+  2026-09-23. §1 is built as amended by
+  [an-integral-is-a-fold](2026-09-23-an-integral-is-a-fold.md) (§2's
+  interval fold for §4.1's `Area`; §8 steps 3–6): a glyph's coverage is the
+  exact area of each pixel under ink, one fold with one body, closed in the
+  e-graph by `FactorFold`, `NarrowInterval` and `ArcMoment`. JP chose the
+  exact area for a curved piece, so `S_p` is not first order and the
+  crescent is gone: a curve is a monotone arc, and its crossing and its
+  sliver are one term. §5's subtraction is done, with the sliver, the
+  bulge columns and `MAX_DEVIATION` besides (§5's "`COL_DEVIATION` stays
+  while `S_p` is first order" no longer applies); `bucketed_trip_count`,
+  `padding_row`, `Support`, `Glyph::over` and `run` stay until the tree
+  exists. §6's first row is measured
+  ([results](../results/2026-09-23-glyph-is-a-formula.md)): `8`@32 went
+  from 250 to 217 µs at AVX-512, not the ~25–35 µs estimated, because the
+  per-piece row cut is not yet lowered as a jump. `loop_blinn_winding`
+  passes unmodified (13 tests; §6 counted 9), and `freetype_oracle`'s pins
+  are re-derived and argued. §4.2 (a range is a value), §4.3's box-as-branch for the row
+  cut, and §4.4 (the tree as data) are not built.
 - **Created**: 2026-09-23
 - **Verified against**: `470e0e0e` (`claude/sse-deletion`: main with #1286,
   #1289, #1290, #1291, #1292), the tree
@@ -199,6 +216,19 @@ shape.
 Four capabilities, each a denotation the language nearly has.
 
 ### 4.1 `area` — the definite integral over the pixel
+
+> **Partly withdrawn by [an-integral-is-a-fold](2026-09-23-an-integral-is-a-fold.md) §2.**
+> Three things below no longer hold, and this section is kept as written
+> rather than rewritten. The node shape: an integral is not
+> `Area { integrand, form }` but a fold over an interval
+> (`Fold::Interval`), whose binder is what the form operands were trying to
+> be. The rule that "`at` never substitutes the measure": the integral binds
+> at construction like every fold, and `at` is plain precomposition —
+> `area(k.at(σ))` is the screen pixel under the warped shape, `area(k).at(σ)`
+> the warped pixel. And the corner cell `[x₀, x₀+1)`: the pixel is centred,
+> `[−½, ½)` about the sample, which is what this section's own formulas
+> already assumed. The rules, the integrands and the build order stand, as
+> rules over interval folds.
 
 The sampling adjoint the lattice has been missing: `area(k)` is the
 box-filtered sample, `∫∫_pixel k`. It is the antialiasing primitive for

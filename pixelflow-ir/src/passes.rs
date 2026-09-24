@@ -1,11 +1,12 @@
 //! IR-to-IR transforms: legalization.
 //!
-//! [`legalize`] runs six passes, each `(arena, root) -> (arena, root)`, each
+//! [`legalize`] runs seven passes, each `(arena, root) -> (arena, root)`, each
 //! turning nodes no backend can emit into nodes every backend can:
 //!
 //! | pass | consumes | produces |
 //! |---|---|---|
 //! | [`expand_refs`] | `Ref` | the referent, spliced in |
+//! | `expand_intervals` (in [`resolve`]) | an interval `Reduce` (an integral) | its quadrature: the body at the rule's points, weighted |
 //! | [`lower_dwrt`] | `Dwrt` | arithmetic, and *re-introduces* transcendentals |
 //! | [`lattice::collapse`] | a kernel over `X`/`Y` | the same kernel wrapped in the lattice's row/col/lane folds around one `Write` |
 //! | [`lattice::pack`] | `collapse`'s degenerate `[0,1)` lane fold | the same folds strip-mined to the target's lane width |
@@ -15,9 +16,13 @@
 //! The order in that table is the order they must run: differentiating a `sin`
 //! produces a `cos`, so `lower_dwrt` has to go before the pass that expands
 //! them; you cannot differentiate a *name*, so `expand_refs` goes before
-//! everything; a derivative is taken with respect to `X` before `collapse`
-//! substitutes `X` away, and a read's address arithmetic is built over the
-//! lattice's binders after it, so the two lattice passes sit between
+//! everything; `lower_dwrt` refuses every `Reduce`, so an integral it is
+//! asked to differentiate must already be its quadrature — which is exact to
+//! do first, the bounds being constants (`d∘Q = Q∘d`) — and the two are one
+//! function, [`resolve`], so every entry that lowers a derivative gets that
+//! order from one place; a derivative is taken with respect to `X` before
+//! `collapse` substitutes `X` away, and a read's address arithmetic is built
+//! over the lattice's binders after it, so the two lattice passes sit between
 //! (docs/plans/2026-09-16-collapse-is-a-fold.md §2.3). Every pass is
 //! idempotent and has an identity fast-path, so running one that has nothing
 //! to do is free — except the two lattice passes, which always wrap: after
@@ -25,15 +30,17 @@
 //! monoid whose body is a `Write`. That is the shape every backend emits, and
 //! the only shape.
 //!
-//! **`Reduce` is legal in the arena and [`legalize`] leaves every one
+//! **A range `Reduce` is legal in the arena and [`legalize`] leaves every one
 //! standing**, nested or not: codegen emits a surviving fold as a loop, and a
-//! fold inside a fold's body as a loop inside a loop. [`expand_reduce`] is
-//! still here for a caller that wants a fold unrolled — a test comparing the
-//! two shapes — and is on no production path.
+//! fold inside a fold's body as a loop inside a loop. An *interval* `Reduce`
+//! is not — an integral is not a loop — and `expand_intervals` replaces
+//! each by its quadrature. [`expand_reduce`] is still here for a caller that
+//! wants every fold gone — a test comparing the two shapes — and is on no
+//! production path.
 //!
 //! **Nothing here knows what it is lowering *for*.** There is no `cfg` in this
-//! module beyond `#[cfg(test)]`, and no import outside `crate::{arena, kind,
-//! variance}`. The legal set happens to be uniform across the backends today;
+//! module beyond `#[cfg(test)]`, and no import outside `crate::{arena, fold,
+//! kind, variance}`. The legal set happens to be uniform across the backends today;
 //! if it stops being uniform, that belongs in a target description these passes
 //! consult, not in a `cfg` here.
 //!
@@ -55,7 +62,7 @@
 //! Nothing re-fuses `mul`+`add` into `MulAdd` afterwards — see `horner_step`.
 
 use crate::arena::{ExprArena, ExprId, ExprNode};
-use crate::fold::Fold;
+use crate::fold::{Fold, IntervalFold, RangeFold};
 use crate::kind::OpKind;
 use crate::variance::Variance;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -84,8 +91,8 @@ pub mod demand;
 ///
 /// # Errors
 ///
-/// Propagates [`lower_dwrt_owned`]'s error for expressions with no derivative
-/// rule — bound-memory reads, integer/bit ops, reductions.
+/// Propagates [`resolve`]'s error for expressions with no derivative rule —
+/// bound-memory reads, integer/bit ops, range reductions.
 pub fn legalize(
     arena: &ExprArena,
     root: ExprId,
@@ -94,9 +101,9 @@ pub fn legalize(
     // `expand_refs` before anything else: every pass below reads structure,
     // and a reference has none to read — you cannot differentiate a name.
     let (arena, root) = expand_refs_owned(arena, root);
-    // `lower_dwrt` next: differentiating a `sin` manufactures a `cos`, so it
-    // has to precede the pass that expands them.
-    let (mut arena, root) = lower_dwrt_owned(&arena, root)?;
+    // `resolve` next — integrals, then derivatives: differentiating a `sin`
+    // manufactures a `cos`, so it has to precede the pass that expands them.
+    let (mut arena, root) = resolve(&arena, root)?;
     // The lattice, as folds: after `collapse` no coordinate `Var` exists,
     // and `pack` strip-mines its column fold to the width the caller's
     // target executes by lanes. Before `expand_gather`, so a read's address
@@ -462,16 +469,26 @@ fn lower_gather(arena: &mut ExprArena, buf: ExprId, x: ExprId, y: ExprId) -> Exp
 /// Unroll every `Reduce` reachable from `root` into an explicit accumulation
 /// tree, returning the (possibly new) root in the same arena.
 ///
-/// N inlined copies of `body`, one per index the fold's range visits, the
-/// reduction index substituted as a `Const` in each — [`unroll_reduce`] has
-/// the exact combining shape. Because the range is static (bound memory),
-/// each copy's gather indices become constant, so the emitter folds their
-/// addresses to immediates: the fold compiles to a flat, call-free, unrolled
-/// kernel. This is the reduction analogue of [`expand_gather`].
+/// A range becomes N inlined copies of `body`, one per index the fold's
+/// range visits, the reduction index substituted as a `Const` in each —
+/// [`unroll_reduce`] has the exact combining shape. Because the range is
+/// static (bound memory), each copy's gather indices become constant, so the
+/// emitter folds their addresses to immediates: the fold compiles to a flat,
+/// call-free, unrolled kernel. This is the reduction analogue of
+/// [`expand_gather`]. An interval becomes its quadrature, as
+/// `expand_intervals` would make it, so no `Reduce` of either domain
+/// survives.
 pub fn expand_reduce(arena: &mut ExprArena, root: ExprId) -> ExprId {
     rebuild_arena(arena, root, |arena, node, m| match node {
         // The body is already lowered; unroll the fold over it.
-        ExprNode::Reduce { fold, body } => Some(unroll_reduce(arena, *fold, m(*body))),
+        ExprNode::Reduce {
+            fold: Fold::Range(range),
+            body,
+        } => Some(unroll_reduce(arena, *range, m(*body))),
+        ExprNode::Reduce {
+            fold: Fold::Interval(interval),
+            body,
+        } => Some(quadrature(arena, *interval, m(*body))),
         _ => None,
     })
 }
@@ -493,14 +510,14 @@ pub fn expand_reduce_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprI
 
 /// Build the unrolled accumulation for one fold whose body is already lowered.
 ///
-/// This is [`Fold::halve`] run to exhaustion, falling back to
-/// [`Fold::peel_back`] for the odd remainder at whatever level it arises —
+/// This is [`RangeFold::halve`] run to exhaustion, falling back to
+/// [`RangeFold::peel_back`] for the odd remainder at whatever level it arises —
 /// the same preference `egraph::fold_rules::HalveFold` gives the saturator.
 /// Sharing the two methods (rather than each restating "even → pair up, odd
 /// → strip one from the back") is what keeps a fold that survives extraction
 /// unrolling into the *identical* shape one saturation resolved itself: one
 /// definition of "fully unrolled," not two that happen to agree today.
-fn unroll_reduce(arena: &mut ExprArena, fold: Fold, body: ExprId) -> ExprId {
+fn unroll_reduce(arena: &mut ExprArena, fold: RangeFold, body: ExprId) -> ExprId {
     // Empty domain folds to the monoid identity.
     if fold.is_empty() {
         return arena.push_const(fold.monoid().identity());
@@ -529,15 +546,15 @@ fn unroll_reduce(arena: &mut ExprArena, fold: Fold, body: ExprId) -> ExprId {
 }
 
 /// Combine `terms` — `fold`'s own terms, already substituted, left to
-/// right — the way repeated [`Fold::halve`] does: pair adjacent terms,
-/// recursing on the doubled-stride fold, until [`Fold::halve`] declines
+/// right — the way repeated [`RangeFold::halve`] does: pair adjacent terms,
+/// recursing on the doubled-stride fold, until [`RangeFold::halve`] declines
 /// (an odd count, or the single-term base case), at which point
-/// [`Fold::peel_back`] strips the last term and this recurses on the even
+/// [`RangeFold::peel_back`] strips the last term and this recurses on the even
 /// remainder. Threading `fold` through rather than re-deriving "even vs
 /// odd" from `terms.len()` keeps this one definition: the decomposition
-/// [`Fold::halve`]/[`Fold::peel_back`] already are, not a second copy of
+/// [`RangeFold::halve`]/[`RangeFold::peel_back`] already are, not a second copy of
 /// their logic that could drift from it.
-fn combine_halved(arena: &mut ExprArena, fold: Fold, terms: &[ExprId], op: OpKind) -> ExprId {
+fn combine_halved(arena: &mut ExprArena, fold: RangeFold, terms: &[ExprId], op: OpKind) -> ExprId {
     debug_assert_eq!(
         fold.len() as usize,
         terms.len(),
@@ -564,6 +581,132 @@ fn combine_halved(arena: &mut ExprArena, fold: Fold, terms: &[ExprId], op: OpKin
     }
     let rest_val = combine_halved(arena, rest, &terms[..terms.len() - 1], op);
     arena.push_binary(op, rest_val, last)
+}
+
+// ──────────────────────────────── Integrals ──────────────────────────────────
+
+/// Replace one integral whose body is already lowered by its quadrature:
+/// `∫_lo^hi f(u) du ↦ Σ_k w_k · f(p_k)`, the nodes `(p_k, w_k)` being
+/// whatever [`IntervalFold::quadrature`] says they are. This pass chooses no
+/// rule of its own: the rule and the count a price charges for it
+/// ([`Fold::evaluations`]) are read from the same place.
+///
+/// The substitution is [`Substitution`]'s, the one `expand_reduce` unrolls a
+/// range with: capture-safe (a nested fold rebinding the same slot is
+/// returned untouched), and sharing every subtree that does not read the
+/// binder across nodes rather than copying it into each.
+fn quadrature(arena: &mut ExprArena, interval: IntervalFold, body: ExprId) -> ExprId {
+    let var = interval.binder().var();
+    // Computed once, before any node is appended: every id the body reaches
+    // predates this point, so the table covers each one a substitution asks
+    // about.
+    let variance = crate::variance::compute_arena_variance(arena);
+    let terms: Vec<ExprId> = interval
+        .quadrature()
+        .iter()
+        .map(|node| {
+            let sample = Substitution::new(body, var, node.point, &variance).apply(arena, body);
+            let weight = arena.push_const(node.weight);
+            arena.push_binary(OpKind::Mul, weight, sample)
+        })
+        .collect();
+    terms
+        .into_iter()
+        .reduce(|partial, term| arena.push_binary(OpKind::Add, partial, term))
+        .expect("a quadrature rule has at least one node")
+}
+
+/// Replace every interval fold reachable from `root` by its [`quadrature`],
+/// innermost first, returning the (possibly new) root in the same arena.
+/// Range folds are copied unchanged: they are loops, and codegen runs them.
+///
+/// Legalization, and only that: an integral a rewrite rule closed never
+/// reaches here, and one that does is computed by the rule
+/// [`IntervalFold::quadrature`] names. Expects references already expanded —
+/// a `Ref` is closed to substitution, so an integral inside one would
+/// survive this pass unseen.
+pub(crate) fn expand_intervals(arena: &mut ExprArena, root: ExprId) -> ExprId {
+    rebuild_arena(arena, root, |arena, node, m| match node {
+        ExprNode::Reduce {
+            fold: Fold::Interval(interval),
+            body,
+        } => Some(quadrature(arena, *interval, m(*body))),
+        _ => None,
+    })
+}
+
+/// Whether an interval fold is anywhere in `arena` — reachable or not, the
+/// same over-approximate test every fast path here makes.
+fn holds_interval(arena: &ExprArena) -> bool {
+    arena.nodes().any(|(_, n)| {
+        matches!(
+            n,
+            ExprNode::Reduce {
+                fold: Fold::Interval(_),
+                ..
+            }
+        )
+    })
+}
+
+/// Resolve what the calculus left symbolic: every integral to its
+/// quadrature, then every `Dwrt` to its derivative.
+///
+/// **The one place that order is written.** Every entry that hands a term to
+/// a backend lowers derivatives, and each must first remove integrals,
+/// because [`lower_dwrt`] refuses every `Reduce` — a derivative of an
+/// integral would otherwise decline, and the entry fall back to whatever it
+/// falls back to, silently. Doing quadrature first is exact, not a
+/// convenience: the bounds are constants and the rule's nodes fixed, so
+/// differentiating the quadrature is the quadrature of the derivative.
+/// [`legalize`], the runtime tier's post-extraction lowering, and codegen's
+/// guard arms all call this rather than restating the pair.
+///
+/// Expects references already expanded, as every caller has by then: a name
+/// has no derivative, and an integral inside one is out of reach.
+///
+/// # Errors
+///
+/// Propagates [`lower_dwrt_owned`]'s error for an expression with no
+/// derivative rule.
+pub fn resolve(arena: &ExprArena, root: ExprId) -> Result<(ExprArena, ExprId), &'static str> {
+    // Nothing to integrate — every kernel today but an `area` — costs
+    // nothing here: `lower_dwrt_owned` makes the one copy it always made.
+    if !holds_interval(arena) {
+        return lower_dwrt_owned(arena, root);
+    }
+    let mut owned = arena.clone();
+    let root = expand_intervals(&mut owned, root);
+    let resolved = lower_dwrt_owned(&owned, root)?;
+    debug_assert!(
+        !reaches_interval(&resolved.0, resolved.1),
+        "resolve left an integral reachable: every interval fold must be closed by a rule \
+         or replaced by its quadrature before a backend sees the term"
+    );
+    Ok(resolved)
+}
+
+/// Whether an interval fold is reachable from `root` — [`resolve`]'s
+/// postcondition, asked of what it returns. Reachable, not merely present:
+/// `expand_intervals` rebuilds into the same arena, which still holds the
+/// folds it replaced.
+fn reaches_interval(arena: &ExprArena, root: ExprId) -> bool {
+    let mut seen = alloc::vec![false; arena.len()];
+    let mut stack = alloc::vec![root];
+    while let Some(id) = stack.pop() {
+        if core::mem::replace(&mut seen[id.0 as usize], true) {
+            continue;
+        }
+        if let ExprNode::Reduce {
+            fold: Fold::Interval(_),
+            ..
+        } = arena.node(id)
+        {
+            return true;
+        }
+        stack.extend(arena.children(id));
+    }
+    false
 }
 
 /// One unrolled term of a fold: the body with the bound index replaced by a
@@ -647,9 +790,16 @@ impl<'a> Substitution<'a> {
                     .collect();
                 arena.push_nary(op, &mapped)
             }
-            // A nested fold binds a slot of its own — `lowest_free_binder`
-            // never reissues a live one — so this index cannot be captured
-            // and the substitution simply passes through the body.
+            // A nested fold that rebinds this very slot shadows it: nothing
+            // under it reads the index being substituted, whatever the
+            // variance table says. Said structurally rather than left to the
+            // table, because "a nested fold never reuses a live slot" is
+            // false across a `Ref` — `Kernel::over` chooses its slot without
+            // seeing through one, and `expand_refs` then splices a fold
+            // rebinding the slot inside a fold that binds it.
+            ExprNode::Reduce { fold, .. } if fold.binder().var() == self.var => return id,
+            // Any other nested fold binds a slot of its own, so this index
+            // passes through its body.
             ExprNode::Reduce { fold, body } => {
                 let body = self.apply(arena, body);
                 arena.push_reduce(fold, body)
@@ -727,7 +877,18 @@ pub fn lower_dwrt_owned(
     arena: &ExprArena,
     root: ExprId,
 ) -> Result<(ExprArena, ExprId), &'static str> {
-    if !arena.nodes().any(|(_, n)| {
+    if !holds_dwrt(arena) {
+        return Ok((arena.clone(), root));
+    }
+    let mut owned = arena.clone();
+    let new_root = lower_dwrt(&mut owned, root)?;
+    Ok((owned, new_root))
+}
+
+/// Whether a `Dwrt` of any arity is anywhere in `arena` — the test every
+/// `Dwrt` fast path here makes.
+fn holds_dwrt(arena: &ExprArena) -> bool {
+    arena.nodes().any(|(_, n)| {
         matches!(
             n,
             ExprNode::Unary(OpKind::Dwrt, _)
@@ -735,12 +896,7 @@ pub fn lower_dwrt_owned(
                 | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
                 | ExprNode::Nary(OpKind::Dwrt, _)
         )
-    }) {
-        return Ok((arena.clone(), root));
-    }
-    let mut owned = arena.clone();
-    let new_root = lower_dwrt(&mut owned, root)?;
-    Ok((owned, new_root))
+    })
 }
 
 /// Build `∂(expr)/∂(Var(var))` as new nodes in `arena`, sharing the primal
@@ -1798,8 +1954,12 @@ mod dwrt_tests {
         let mut a = ExprArena::new();
         let body = a.push_var(4);
         let red = a.push_reduce(Fold::new(Monoid::SUM, binder(), 0..4), body);
-        let ExprNode::Reduce { fold, .. } = a.node(red) else {
-            panic!("expected a fold");
+        let ExprNode::Reduce {
+            fold: Fold::Range(fold),
+            ..
+        } = a.node(red)
+        else {
+            panic!("expected a range fold");
         };
         assert_eq!(fold.len(), 4);
         // The trip count is not reachable from the node's children, so no
@@ -2122,20 +2282,33 @@ pub struct LowerDwrt;
 
 impl Optimize for LowerDwrt {
     fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if !arena.nodes().any(|(_, n)| {
-            matches!(
-                n,
-                ExprNode::Unary(OpKind::Dwrt, _)
-                    | ExprNode::Binary(OpKind::Dwrt, _, _)
-                    | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-                    | ExprNode::Nary(OpKind::Dwrt, _)
-            )
-        }) {
+        if !holds_dwrt(arena) {
             return Rewritten::Unchanged;
         }
         let mut owned = arena.clone();
         match lower_dwrt(&mut owned, root) {
             Ok(new_root) => Rewritten::Changed(owned, new_root),
+            Err(_) => Rewritten::Declined,
+        }
+    }
+}
+
+/// [`resolve`] as a pipeline stage: every integral to its quadrature, then
+/// every `Dwrt` to its derivative.
+///
+/// The runtime tier's no-saturation path runs this where it would otherwise
+/// run [`LowerDwrt`] alone, so a derivative of an integral lowers there too.
+/// Declines where [`resolve`] errors — a genuinely non-differentiable op.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Resolve;
+
+impl Optimize for Resolve {
+    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
+        if !holds_interval(arena) && !holds_dwrt(arena) {
+            return Rewritten::Unchanged;
+        }
+        match resolve(arena, root) {
+            Ok((owned, new_root)) => Rewritten::Changed(owned, new_root),
             Err(_) => Rewritten::Declined,
         }
     }
@@ -2229,14 +2402,18 @@ mod nested_reduce_tests {
             5,
             "both folds must survive legalization, inside the lattice's three"
         );
-        let ExprNode::Reduce { fold, .. } = legalized.node(new_root) else {
+        let ExprNode::Reduce {
+            fold: Fold::Range(fold),
+            ..
+        } = legalized.node(new_root)
+        else {
             panic!("root must be the lattice's row fold");
         };
         assert_eq!(fold.monoid(), Monoid::SEQ);
         assert_eq!(fold.range(), 0..1);
         let outer = (0..legalized.len())
             .map(|k| ExprId(k as u32))
-            .find(|id| matches!(legalized.node(*id), ExprNode::Reduce { fold, .. } if fold.range() == (0..2)))
+            .find(|id| matches!(legalized.node(*id), ExprNode::Reduce { fold: Fold::Range(fold), .. } if fold.range() == (0..2)))
             .expect("the outer kernel fold survives");
         let ExprNode::Reduce { body, .. } = legalized.node(outer) else {
             unreachable!()
@@ -2245,7 +2422,7 @@ mod nested_reduce_tests {
             panic!("the outer body must still be `inner + j`");
         };
         assert!(
-            matches!(legalized.node(lhs), ExprNode::Reduce { fold, .. } if fold.range() == (0..3)),
+            matches!(legalized.node(lhs), ExprNode::Reduce { fold: Fold::Range(fold), .. } if fold.range() == (0..3)),
             "the inner Reduce must be the outer body's own operand, not unrolled into it"
         );
     }
@@ -2378,6 +2555,176 @@ mod ref_expansion_tests {
                 );
             }
             other => panic!("expand_refs must not splice a Guard's arms away, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use super::*;
+    use crate::fold::{Binder, Fold, IntervalFold, Monoid};
+
+    fn slot(n: u8) -> Binder {
+        Binder::from_slot(n).expect("a live slot")
+    }
+
+    fn integral(arena: &mut ExprArena, binder: Binder, lo: f32, hi: f32, body: ExprId) -> ExprId {
+        arena.push_reduce(Fold::Interval(IntervalFold::new(binder, lo, hi)), body)
+    }
+
+    /// `Binary(op, Const(c), rest)`'s `rest`, or a panic naming what was
+    /// there instead.
+    fn scaled_by(arena: &ExprArena, id: ExprId, op: OpKind, c: f32) -> ExprId {
+        match arena.node(id) {
+            ExprNode::Binary(o, k, rest)
+                if o == op && matches!(arena.node(k), ExprNode::Const(v) if v == c) =>
+            {
+                rest
+            }
+            other => panic!("expected {op:?}({c}, _), got {other:?}"),
+        }
+    }
+
+    /// `∫_1^3 u·X du ↦ 2·(2·X)`: the body at the midpoint, weighted by the
+    /// length — both read off the interval, neither the pixel's identity.
+    #[test]
+    fn quadrature_is_the_weighted_midpoint_sample() {
+        let mut a = ExprArena::new();
+        let u = a.push_var(slot(0).var());
+        let x = a.push_var(0);
+        let body = a.push_binary(OpKind::Mul, u, x);
+        let root = integral(&mut a, slot(0), 1.0, 3.0, body);
+
+        let new_root = expand_intervals(&mut a, root);
+        let sample = scaled_by(&a, new_root, OpKind::Mul, 2.0);
+        let rest = scaled_by(&a, sample, OpKind::Mul, 2.0);
+        assert_eq!(a.node(rest), ExprNode::Var(0));
+    }
+
+    /// Two integrals over one slot, sharing one hash-consed body: each gets
+    /// its own midpoint. The rebuilt body is shared; the substitution is
+    /// per interval.
+    #[test]
+    fn sibling_intervals_sharing_a_body_each_take_their_own_midpoint() {
+        let mut a = ExprArena::new();
+        let u = a.push_var(slot(0).var());
+        let x = a.push_var(0);
+        let body = a.push_binary(OpKind::Mul, u, x);
+        let near = integral(&mut a, slot(0), 1.0, 3.0, body);
+        let far = integral(&mut a, slot(0), 10.0, 12.0, body);
+        let root = a.push_binary(OpKind::Add, near, far);
+
+        let new_root = expand_intervals(&mut a, root);
+        let ExprNode::Binary(OpKind::Add, near, far) = a.node(new_root) else {
+            panic!("the sum survives: {:?}", a.node(new_root));
+        };
+        let near = scaled_by(&a, scaled_by(&a, near, OpKind::Mul, 2.0), OpKind::Mul, 2.0);
+        let far = scaled_by(&a, scaled_by(&a, far, OpKind::Mul, 2.0), OpKind::Mul, 11.0);
+        assert_eq!(a.node(near), ExprNode::Var(0));
+        assert_eq!(a.node(far), ExprNode::Var(0));
+    }
+
+    /// `∫_{u ∈ [1,3)} (u + Σ_{u ∈ [0,2)} u)`: the sum rebinds the
+    /// integral's slot, and shadows it. Quadrature substitutes the midpoint
+    /// for the integral's `u` and stops at the sum — its `u` is its own:
+    /// `2·(2 + Σ_{u<2} u)`, not `2·(2 + Σ_{u<2} 2)`.
+    #[test]
+    fn quadrature_stops_at_a_fold_that_rebinds_its_slot() {
+        let mut a = ExprArena::new();
+        let u = a.push_var(slot(0).var());
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, slot(0), 0..2), u);
+        let body = a.push_binary(OpKind::Add, u, inner);
+        let root = integral(&mut a, slot(0), 1.0, 3.0, body);
+
+        let new_root = expand_intervals(&mut a, root);
+        let sample = scaled_by(&a, new_root, OpKind::Mul, 2.0);
+        let ExprNode::Binary(OpKind::Add, midpoint, sum) = a.node(sample) else {
+            panic!("the body's sum survives: {:?}", a.node(sample));
+        };
+        assert_eq!(a.node(midpoint), ExprNode::Const(2.0));
+        assert_eq!(
+            sum, inner,
+            "the shadowing fold is the original node, untouched"
+        );
+    }
+
+    /// **The resolve order.** `∂/∂X ∫_{u ∈ [-½,½)} (X + u)² du` has no
+    /// derivative rule through the fold, so lowering the `Dwrt` alone
+    /// declines — which, in the runtime tier, threw the saturation away —
+    /// while `resolve` takes the quadrature first and succeeds, leaving
+    /// neither an integral nor a `Dwrt` reachable.
+    #[test]
+    fn resolve_lowers_a_derivative_of_an_integral() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let u = a.push_var(slot(0).var());
+        let shifted = a.push_binary(OpKind::Add, x, u);
+        let square = a.push_binary(OpKind::Mul, shifted, shifted);
+        let area = integral(&mut a, slot(0), -0.5, 0.5, square);
+        let axis = a.push_const(0.0);
+        let root = a.push_binary(OpKind::Dwrt, area, axis);
+
+        assert!(
+            lower_dwrt_owned(&a, root).is_err(),
+            "a derivative does not pass through a fold"
+        );
+        let (out, out_root) = resolve(&a, root).expect("quadrature first, then the derivative");
+        let mut seen = alloc::vec![false; out.len()];
+        let mut stack = alloc::vec![out_root];
+        while let Some(id) = stack.pop() {
+            if core::mem::replace(&mut seen[id.0 as usize], true) {
+                continue;
+            }
+            let node = out.node(id);
+            assert!(
+                !matches!(
+                    node,
+                    ExprNode::Reduce { .. } | ExprNode::Binary(OpKind::Dwrt, ..)
+                ),
+                "resolve leaves {node:?} reachable"
+            );
+            stack.extend(out.children(id));
+        }
+    }
+
+    /// `legalize` resolves an integral before the lattice wraps the kernel:
+    /// the lattice's own three folds are the only ones left, all ranges.
+    #[test]
+    fn legalize_replaces_an_integral_by_its_quadrature() {
+        use crate::arena::{UniformDecl, UniformIdentity};
+        use crate::variance::LatticeShape;
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let u = a.push_var(slot(0).var());
+        let body = a.push_binary(OpKind::Add, x, u);
+        let root = integral(&mut a, slot(0), -0.5, 0.5, body);
+
+        let origin = || UniformDecl {
+            id: UniformIdentity::mint(),
+            default: 0.0,
+        };
+        let collapse = lattice::Collapse {
+            domain: lattice::Domain {
+                shape: LatticeShape::new([4, 1]),
+                origin: [origin(), origin()],
+            },
+            lanes: 4,
+        };
+        let (out, out_root) = legalize(&a, root, &collapse).expect("legalize");
+        let mut seen = alloc::vec![false; out.len()];
+        let mut stack = alloc::vec![out_root];
+        while let Some(id) = stack.pop() {
+            if core::mem::replace(&mut seen[id.0 as usize], true) {
+                continue;
+            }
+            if let ExprNode::Reduce { fold, .. } = out.node(id) {
+                assert!(
+                    matches!(fold, Fold::Range(_)),
+                    "legalize leaves {fold} reachable"
+                );
+            }
+            stack.extend(out.children(id));
         }
     }
 }

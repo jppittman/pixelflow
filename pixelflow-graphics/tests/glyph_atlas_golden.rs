@@ -9,15 +9,15 @@
 //! hardware FMA and two without, `Recip`/`Rsqrt` are estimates that differ
 //! *between ISA levels of the same machine*, and `Round` ties away from zero
 //! on aarch64 where x86 ties to even. Glyph coverage is computed through
-//! exactly that arithmetic (winding sums, `Dwrt` antialiasing ramps), so a
-//! bit-exact hash of the raw `f32` buffer is architecture- *and*
-//! build-configuration-dependent by construction, and asserting it is stable
-//! asserts something false. Measured, not assumed: dumping this exact atlas
-//! at the SSE2 baseline, AVX2+FMA and AVX512F+DQ levels on one x86_64 host
-//! shows up to 2630 of 42768 texels differing in the raw `f32` bytes between
-//! ISA levels, worst delta ~2.1e-4 — this is *before* considering aarch64,
-//! which was not available to measure directly and uses different rounding
-//! modes again.
+//! exactly that arithmetic (each pixel's closed-form area: square roots,
+//! divides, fused products), so a bit-exact hash of the raw `f32` buffer is
+//! architecture-dependent by construction, and asserting it is stable
+//! asserts something false. Measured, not assumed, when coverage became the
+//! exact area (`fonts/loop_blinn.rs`): this atlas's raw `f32` buffer is
+//! bit-identical between the AVX2 and AVX-512 tiers on one x86_64 host (0 of
+//! 42768 texels differ) — but aarch64 was not available to measure, and its
+//! rounding differs again. (The distance-ramp renderer before it differed
+//! in up to 2630 texels between x86 levels, worst delta ~2.1e-4.)
 //!
 //! **It promises what reaches the screen stays the same**, within the
 //! platform noise the language licenses. The buffer is quantized to the same
@@ -30,14 +30,13 @@
 //! measured are ≤3.6e-5, two orders of magnitude smaller, which is the actual
 //! argument for why quantizing is sound here and not merely convenient.
 //!
-//! **Quantization alone is not quite enough, measured**: of 2669 texels with
+//! **Quantization alone is not quite enough, measured**: of 3917 texels with
 //! genuine (non-trivial, i.e. not exactly `0.0` or `1.0`) computed coverage,
-//! the closest to a quantization boundary sits 2.15e-6 away in coverage units
-//! — comfortably within the platform divergence above. Diffing the truncated
-//! 8-bit bytes across the same three x86 ISA levels: 0 texels differ between
-//! SSE2 and AVX2+FMA; **12 of 42768 differ by exactly 1** between either of
-//! those and AVX512F+DQ, all boundary-straddling texels flipping across a
-//! single quantization step. `tolerance = 1` absorbs exactly that, measured;
+//! the closest to a quantization boundary sits 1.84e-7 away in coverage units
+//! — a rounding another target's arithmetic can cross. The distance-ramp
+//! renderer measured it across x86 levels: **12 of 42768 texels differed by
+//! exactly 1**, all boundary-straddling texels flipping across a single
+//! quantization step. `tolerance = 1` absorbs exactly that;
 //! `max_mismatched_fraction = 0.01` (matching every other golden in this
 //! crate) is headroom for aarch64's unmeasured but plausibly comparable
 //! divergence, not a number chosen to make this pass.
@@ -65,14 +64,17 @@
 //! ## Regenerating
 //!
 //! `UPDATE_GOLDENS=1 cargo test -p pixelflow-graphics --test glyph_atlas_golden`
-//! (see `tests/common/mod.rs`). Regenerate at the workspace's default build
-//! configuration — no `RUSTFLAGS` target-feature override, i.e. whatever
-//! `.cargo/config.toml`'s `[build] rustflags` alone produces (the SSE2
-//! baseline on x86_64) — so the stored golden matches what `cargo test`
-//! produces by default rather than whatever `-C target-cpu`/`target-feature`
-//! happened to be set on the generating machine. A committed golden that
-//! depends on the generator's own flags is a trap for whoever regenerates it
-//! next.
+//! (see `tests/common/mod.rs`). The ISA tier is the host's, decided at
+//! startup (`pixelflow_codegen::isa::detect`), so regenerate with no
+//! `PIXELFLOW_ISA` override and say which tier the generating host ran.
+//!
+//! **Last regenerated** when coverage became the exact area under each
+//! texel (`fonts/loop_blinn.rs`, docs/plans/2026-09-23-a-glyph-is-a-formula.md),
+//! on an AVX-512 host: 2824 of 42768 texels moved, 2446 of them by more than
+//! one step, worst 102 steps; the atlas's ink fell 1.1% (2083.8 → 2059.8
+//! texels) and its saturated texels from 322 to 214 — the distance ramp
+//! read a texel as full wherever its centre was half a pixel inside, where
+//! the area reads what the ink covers.
 //!
 //! **A known, expected collision**: a concurrent change to glyph
 //! rasterization (fixing a real rendering bug a FreeType comparison caught,
