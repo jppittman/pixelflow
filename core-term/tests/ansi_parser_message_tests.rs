@@ -21,21 +21,30 @@ use std::time::Duration;
 /// Parser actor using the real AnsiProcessor
 struct RealParserActor {
     parser: AnsiProcessor,
-    cmd_tx: SyncSender<Vec<AnsiCommand>>,
+    cmd_tx: SyncSender<Vec<Parsed>>,
     bytes_processed: Arc<AtomicUsize>,
 }
 
-/// Reads a batch the way the app does, each text character recorded as the
-/// `Print` it stands for.
-struct Commands(Vec<AnsiCommand>);
+/// One element of what a batch delivers: a character of its text, or a
+/// command.
+#[derive(Debug, Clone, PartialEq)]
+enum Parsed {
+    Char(char),
+    Command(AnsiCommand),
+}
+
+use Parsed::{Char, Command};
+
+/// Reads a batch the way the app does — through `AnsiSink`.
+struct Commands(Vec<Parsed>);
 
 impl AnsiSink for Commands {
     fn text(&mut self, run: &str) {
-        self.0.extend(run.chars().map(AnsiCommand::Print));
+        self.0.extend(run.chars().map(Char));
     }
 
     fn command(&mut self, command: AnsiCommand) {
-        self.0.push(command);
+        self.0.push(Command(command));
     }
 }
 
@@ -70,7 +79,7 @@ impl Actor<Vec<u8>, (), ()> for RealParserActor {
 #[test]
 fn cuj_pty02_real_parser_simple_text() {
     // Given: A real parser actor
-    let (cmd_tx, cmd_rx) = sync_channel::<Vec<AnsiCommand>>(100);
+    let (cmd_tx, cmd_rx) = sync_channel::<Vec<Parsed>>(100);
     let bytes_processed = Arc::new(AtomicUsize::new(0));
 
     let (parser_tx, mut parser_rx) = ActorScheduler::<Vec<u8>, (), ()>::new(10, 64);
@@ -100,13 +109,7 @@ fn cuj_pty02_real_parser_simple_text() {
     // Verify each character
     let chars: Vec<char> = commands
         .iter()
-        .filter_map(|cmd| {
-            if let AnsiCommand::Print(c) = cmd {
-                Some(*c)
-            } else {
-                None
-            }
-        })
+        .filter_map(|cmd| if let Char(c) = cmd { Some(*c) } else { None })
         .collect();
     assert_eq!(chars, vec!['H', 'e', 'l', 'l', 'o']);
 }
@@ -114,7 +117,7 @@ fn cuj_pty02_real_parser_simple_text() {
 #[test]
 fn cuj_pty02_real_parser_escape_sequence() {
     // Given: A real parser actor
-    let (cmd_tx, cmd_rx) = sync_channel::<Vec<AnsiCommand>>(100);
+    let (cmd_tx, cmd_rx) = sync_channel::<Vec<Parsed>>(100);
     let bytes_processed = Arc::new(AtomicUsize::new(0));
 
     let (parser_tx, mut parser_rx) = ActorScheduler::<Vec<u8>, (), ()>::new(10, 64);
@@ -144,7 +147,7 @@ fn cuj_pty02_real_parser_escape_sequence() {
 
     // Verify it's a cursor position command
     match &commands[0] {
-        AnsiCommand::Csi(csi) => {
+        Command(AnsiCommand::Csi(csi)) => {
             // CursorPosition(1, 1) for ESC[H
             let debug_str = format!("{:?}", csi);
             assert!(
@@ -160,7 +163,7 @@ fn cuj_pty02_real_parser_escape_sequence() {
 #[test]
 fn cuj_pty02_real_parser_sgr_color() {
     // Given: A real parser actor
-    let (cmd_tx, cmd_rx) = sync_channel::<Vec<AnsiCommand>>(100);
+    let (cmd_tx, cmd_rx) = sync_channel::<Vec<Parsed>>(100);
     let bytes_processed = Arc::new(AtomicUsize::new(0));
 
     let (parser_tx, mut parser_rx) = ActorScheduler::<Vec<u8>, (), ()>::new(10, 64);
@@ -189,7 +192,7 @@ fn cuj_pty02_real_parser_sgr_color() {
     assert_eq!(commands.len(), 1, "Should have 1 SGR command");
 
     match &commands[0] {
-        AnsiCommand::Csi(csi) => {
+        Command(AnsiCommand::Csi(csi)) => {
             let debug_str = format!("{:?}", csi);
             assert!(
                 debug_str.contains("SetGraphicsRendition"),
@@ -204,7 +207,7 @@ fn cuj_pty02_real_parser_sgr_color() {
 #[test]
 fn cuj_pty02_real_parser_mixed_text_and_escapes() {
     // Given: A real parser actor
-    let (cmd_tx, cmd_rx) = sync_channel::<Vec<AnsiCommand>>(100);
+    let (cmd_tx, cmd_rx) = sync_channel::<Vec<Parsed>>(100);
     let bytes_processed = Arc::new(AtomicUsize::new(0));
 
     let (parser_tx, mut parser_rx) = ActorScheduler::<Vec<u8>, (), ()>::new(10, 64);
@@ -233,16 +236,16 @@ fn cuj_pty02_real_parser_mixed_text_and_escapes() {
     assert_eq!(commands.len(), 4, "Should have 4 commands (H, i, CSI, !)");
 
     // Verify order
-    assert!(matches!(commands[0], AnsiCommand::Print('H')));
-    assert!(matches!(commands[1], AnsiCommand::Print('i')));
-    assert!(matches!(commands[2], AnsiCommand::Csi(_)));
-    assert!(matches!(commands[3], AnsiCommand::Print('!')));
+    assert!(matches!(commands[0], Char('H')));
+    assert!(matches!(commands[1], Char('i')));
+    assert!(matches!(commands[2], Command(AnsiCommand::Csi(_))));
+    assert!(matches!(commands[3], Char('!')));
 }
 
 #[test]
 fn cuj_pty02_real_parser_incremental_escape() {
     // Given: A real parser actor
-    let (cmd_tx, cmd_rx) = sync_channel::<Vec<AnsiCommand>>(100);
+    let (cmd_tx, cmd_rx) = sync_channel::<Vec<Parsed>>(100);
     let bytes_processed = Arc::new(AtomicUsize::new(0));
 
     let (parser_tx, mut parser_rx) = ActorScheduler::<Vec<u8>, (), ()>::new(10, 64);
@@ -282,7 +285,7 @@ fn cuj_pty02_real_parser_incremental_escape() {
     // Should have exactly one CSI command
     let csi_count = all_commands
         .iter()
-        .filter(|c| matches!(c, AnsiCommand::Csi(_)))
+        .filter(|c| matches!(c, Command(AnsiCommand::Csi(_))))
         .count();
     assert_eq!(
         csi_count, 1,
@@ -293,7 +296,7 @@ fn cuj_pty02_real_parser_incremental_escape() {
 #[test]
 fn cuj_pty02_real_parser_c0_control() {
     // Given: A real parser actor
-    let (cmd_tx, cmd_rx) = sync_channel::<Vec<AnsiCommand>>(100);
+    let (cmd_tx, cmd_rx) = sync_channel::<Vec<Parsed>>(100);
     let bytes_processed = Arc::new(AtomicUsize::new(0));
 
     let (parser_tx, mut parser_rx) = ActorScheduler::<Vec<u8>, (), ()>::new(10, 64);
@@ -324,7 +327,7 @@ fn cuj_pty02_real_parser_c0_control() {
     // All should be C0Control variants
     for cmd in &commands {
         assert!(
-            matches!(cmd, AnsiCommand::C0Control(_)),
+            matches!(cmd, Command(AnsiCommand::C0Control(_))),
             "Expected C0Control, got: {:?}",
             cmd
         );
@@ -334,7 +337,7 @@ fn cuj_pty02_real_parser_c0_control() {
 #[test]
 fn cuj_pty02_real_parser_high_throughput() {
     // Given: A real parser actor
-    let (cmd_tx, cmd_rx) = sync_channel::<Vec<AnsiCommand>>(1000);
+    let (cmd_tx, cmd_rx) = sync_channel::<Vec<Parsed>>(1000);
     let bytes_processed = Arc::new(AtomicUsize::new(0));
 
     let (parser_tx, mut parser_rx) = ActorScheduler::<Vec<u8>, (), ()>::new(100, 128);
@@ -388,7 +391,7 @@ fn cuj_pty02_real_parser_high_throughput() {
 /// Simulates the complete terminal message chain
 struct TerminalMessageChain {
     parser_tx: actor_scheduler::ActorHandle<Vec<u8>, (), ()>,
-    commands_received: Arc<Mutex<Vec<AnsiCommand>>>,
+    commands_received: Arc<Mutex<Vec<Parsed>>>,
     parser_handle: Option<thread::JoinHandle<()>>,
     app_handle: Option<thread::JoinHandle<()>>,
 }
@@ -399,7 +402,7 @@ impl TerminalMessageChain {
         let commands_clone = commands_received.clone();
 
         // Parser → App channel
-        let (cmd_tx, cmd_rx) = sync_channel::<Vec<AnsiCommand>>(100);
+        let (cmd_tx, cmd_rx) = sync_channel::<Vec<Parsed>>(100);
 
         // ReadThread → Parser channel (actor scheduler)
         let (parser_tx, mut parser_rx) = ActorScheduler::<Vec<u8>, (), ()>::new(10, 64);
@@ -433,7 +436,7 @@ impl TerminalMessageChain {
         self.parser_tx.send(Message::Data(data)).unwrap();
     }
 
-    fn get_commands(&self) -> Vec<AnsiCommand> {
+    fn get_commands(&self) -> Vec<Parsed> {
         self.commands_received.lock().unwrap().clone()
     }
 
@@ -470,10 +473,10 @@ fn cuj_e2e_complete_message_chain_delivers_erase_move_and_print_commands_in_orde
     assert_eq!(
         commands,
         vec![
-            AnsiCommand::Csi(CsiCommand::EraseInDisplay(2)),
-            AnsiCommand::Csi(CsiCommand::CursorPosition(1, 1)),
-            AnsiCommand::Print('H'),
-            AnsiCommand::Print('i'),
+            Command(AnsiCommand::Csi(CsiCommand::EraseInDisplay(2))),
+            Command(AnsiCommand::Csi(CsiCommand::CursorPosition(1, 1))),
+            Char('H'),
+            Char('i'),
         ]
     );
 }
@@ -496,13 +499,7 @@ fn cuj_e2e_rapid_small_writes() {
     // Then: All characters should arrive
     let chars: String = commands
         .iter()
-        .filter_map(|c| {
-            if let AnsiCommand::Print(ch) = c {
-                Some(*ch)
-            } else {
-                None
-            }
-        })
+        .filter_map(|c| if let Char(ch) = c { Some(*ch) } else { None })
         .collect();
 
     assert_eq!(chars, "typing rapidly...");

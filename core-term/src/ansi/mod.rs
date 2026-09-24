@@ -7,12 +7,11 @@
 //! ## Architecture: Two-Stage Pipeline
 //!
 //! ```text
-//! PTY Bytes          Lexer              Parser              Commands
-//! (UTF-8)            (tokens)           (state machine)     (enums)
+//! PTY Bytes          Lexer              Parser              AnsiBatch
+//! (UTF-8)            (tokens)           (state machine)     (text runs + commands)
 //!    ↓                ↓                  ↓                   ↓
-//! [0x41, 0x1B]  →  [Print('A'),  →  [Print('A'),  →  [Print('A'),
-//!                   C0Control(ESC)]    Csi(...)]           Csi(SetGraphicsRendition(...)),
-//!                                                           ...]
+//! [0x41, 0x1B]  →  [Print('A'),  →  text "A",         →  text: "A",
+//!                   C0Control(ESC)]    Csi(...)            commands: [(1, Csi(...)), ...]
 //! ```
 //!
 //! The parser follows the **ANSI/ECMA-48** standard, handling:
@@ -87,9 +86,10 @@
 //!
 //! ### Supported Command Types
 //!
+//! Printable characters are not commands: they are the batch's text.
+//!
 //! | Variant | Example | Meaning |
 //! |---------|---------|---------|
-//! | Print(char) | 'A' | Printable character |
 //! | C0Control | LF, CR, BEL | ASCII control codes |
 //! | Csi(CsiCommand) | CursorPosition(5, 10) | Cursor movement, text attributes |
 //! | Esc(EscCommand) | SaveCursor | Direct ESC sequences |
@@ -98,8 +98,8 @@
 //!
 //! ## Stage 3: Application Integration
 //!
-//! Once parsed into `AnsiCommand`s, the application:
-//! 1. **Applies semantics**: Print → render glyph, SetGraphicsRendition → update text attributes
+//! Once parsed into an `AnsiBatch`, the application:
+//! 1. **Applies semantics**: text runs → glyphs, SetGraphicsRendition → update text attributes
 //! 2. **Updates terminal state**: CursorPosition → move cursor, EraseInLine → clear line
 //! 3. **Queues renders**: Signal that screen needs redrawing
 //!
@@ -112,7 +112,7 @@
 //! → Parser: AnsiBatch { text: "hello(bold red)",
 //!                        commands: [(5, Csi(SetGraphicsRendition([Bold, Foreground(Red)]))),
 //!                                   (15, Csi(SetGraphicsRendition([Reset])))] }
-//! → App: Render "hello" in bold red, then reset
+//! → App: Render "hello", then "(bold red)" in bold red, then reset
 //! ```
 //!
 //! ## Incremental Processing Contract

@@ -50,12 +50,6 @@ pub enum EmulatorInput {
 
     /// An internal control event, such as a resize notification from the orchestrator.
     Control(ControlEvent),
-
-    /// A single raw character.
-    ///
-    /// This is typically used for direct character input that doesn't involve
-    /// full ANSI processing.
-    RawChar(char),
 }
 
 /// Defines the essential public interface for a terminal emulator.

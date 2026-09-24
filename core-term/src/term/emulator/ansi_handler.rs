@@ -25,19 +25,13 @@ pub(super) fn process_ansi_command(
     emulator: &mut TerminalEmulator,
     command: AnsiCommand,
 ) -> Option<EmulatorAction> {
-    if !matches!(command, AnsiCommand::Print(_)) {
-        emulator.cursor_wrap_next = false;
-    }
+    emulator.cursor_wrap_next = false;
 
     match command {
         AnsiCommand::C0Control(c0) => handle_c0_control(emulator, c0),
         AnsiCommand::Esc(esc_cmd) => handle_esc_command(emulator, esc_cmd),
         AnsiCommand::Csi(csi) => handle_csi_command(emulator, csi),
         AnsiCommand::Osc(data) => emulator.handle_osc(data),
-        AnsiCommand::Print(ch) => {
-            emulator.print_char(ch);
-            None
-        }
         _ => {
             debug!(
                 "Unhandled ANSI command type in TerminalEmulator: {:?}",

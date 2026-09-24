@@ -10,6 +10,7 @@
 //! pairwise coverage exercises every 2-way interaction with a handful of cases.
 
 use super::pict::pairwise;
+use super::tests::{Command, Parsed};
 use super::{
     commands::{AnsiCommand, Attribute, CsiCommand},
     AnsiProcessor,
@@ -94,7 +95,7 @@ fn sgr_factors() -> Vec<Vec<Level>> {
     ]
 }
 
-fn process(bytes: &[u8]) -> Vec<AnsiCommand> {
+fn process(bytes: &[u8]) -> Vec<Parsed> {
     super::tests::parse(&mut AnsiProcessor::new(), bytes)
 }
 
@@ -131,7 +132,7 @@ fn build_case(factors: &[Vec<Level>], row: &[usize]) -> (Vec<u8>, Vec<Attribute>
 fn parsed_attrs(seq: &[u8]) -> Option<Vec<Attribute>> {
     let commands = process(seq);
     match commands.as_slice() {
-        [AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs))] => Some(attrs.clone()),
+        [Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs)))] => Some(attrs.clone()),
         _ => None,
     }
 }

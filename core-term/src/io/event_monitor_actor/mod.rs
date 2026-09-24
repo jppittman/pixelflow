@@ -302,13 +302,13 @@ mod tests {
     /// PtySender double that records parsed output and the child-exit signal.
     #[derive(Clone, Default)]
     struct CaptureSink {
-        commands: Arc<Mutex<Vec<AnsiCommand>>>,
+        text: Arc<Mutex<String>>,
         child_exited: Arc<AtomicBool>,
     }
 
     impl PtySender for CaptureSink {
         fn send(&self, mut batch: AnsiBatch) -> Result<(), anyhow::Error> {
-            batch.drain_into(&mut Record(&mut self.commands.lock().unwrap()));
+            batch.drain_into(&mut Record(&mut self.text.lock().unwrap()));
             Ok(())
         }
         fn send_child_exited(&self) -> Result<(), anyhow::Error> {
@@ -317,31 +317,20 @@ mod tests {
         }
     }
 
-    /// Reads a batch the way the app does, each text character recorded as
-    /// the `Print` it stands for.
-    struct Record<'a>(&'a mut Vec<AnsiCommand>);
+    /// Reads a batch the way the app does, keeping only the printed text.
+    struct Record<'a>(&'a mut String);
 
     impl AnsiSink for Record<'_> {
         fn text(&mut self, run: &str) {
-            self.0.extend(run.chars().map(AnsiCommand::Print));
+            self.0.push_str(run);
         }
 
-        fn command(&mut self, command: AnsiCommand) {
-            self.0.push(command);
-        }
+        fn command(&mut self, _command: AnsiCommand) {}
     }
 
     impl CaptureSink {
         fn printed_text(&self) -> String {
-            self.commands
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(|cmd| match cmd {
-                    AnsiCommand::Print(c) => Some(*c),
-                    _ => None,
-                })
-                .collect()
+            self.text.lock().unwrap().clone()
         }
 
         fn wait_for(&self, timeout: Duration, pred: impl Fn(&Self) -> bool) -> bool {
