@@ -1,8 +1,8 @@
 //! `TerminalEmulator::print_text` must leave the terminal exactly as feeding
-//! the same text one `AnsiCommand::Print` per character does.
+//! it the same text one character at a time does.
 //!
-//! Every scenario is applied twice from the same PTY bytes — once with text
-//! runs through `print_text`, once character by character — and the rendered
+//! Every scenario is applied twice from the same PTY bytes — once with whole
+//! text runs, once character by character — and the rendered
 //! snapshots must match. Each scenario ends with a probe character, so a
 //! difference in pending-wrap state shows up as a difference on screen.
 
@@ -26,16 +26,13 @@ impl AnsiSink for Runs<'_> {
     }
 }
 
-/// Applies text one `Print` per character.
+/// Applies text one character per `print_text` call.
 struct Chars<'a>(&'a mut TerminalEmulator);
 
 impl AnsiSink for Chars<'_> {
     fn text(&mut self, run: &str) {
         for c in run.chars() {
-            drop(
-                self.0
-                    .interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(c))),
-            );
+            self.0.print_text(c.encode_utf8(&mut [0; 4]));
         }
     }
 

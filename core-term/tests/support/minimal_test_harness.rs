@@ -1,7 +1,7 @@
 //! Minimal test harness for testing ANSI → Terminal Grid
 //!
-//! This harness allows you to inject ANSI commands directly into a terminal
-//! emulator and inspect the grid state.
+//! This harness allows you to inject text and ANSI commands directly into a
+//! terminal emulator and inspect the grid state.
 
 use core_term::ansi::commands::AnsiCommand;
 use core_term::config::Config;
@@ -36,11 +36,9 @@ impl MinimalTestHarness {
         // Ignore actions (they would be PTY writes or redraws)
     }
 
-    /// Inject multiple ANSI commands
-    pub fn inject_ansi_batch(&mut self, cmds: Vec<AnsiCommand>) {
-        for cmd in cmds {
-            self.inject_ansi(cmd);
-        }
+    /// Print PTY text into the terminal emulator
+    pub fn print_text(&mut self, text: &str) {
+        self.emulator.print_text(text);
     }
 
     /// Get the grid snapshot for inspection

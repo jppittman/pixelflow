@@ -168,18 +168,10 @@ impl TerminalEmulator {
                 // Delegate to control event handler
                 input_handler::process_control_event(self, event)
             }
-            EmulatorInput::RawChar(ch) => {
-                // Reset viewport to live screen when receiving PTY output
-                self.viewport_offset = 0;
-                // Delegate to raw character processor
-                self.print_char(ch);
-                None
-            }
         }
     }
 
-    /// Prints a run of PTY text, exactly as one `AnsiCommand::Print` per
-    /// character would.
+    /// Prints a run of PTY text.
     pub fn print_text(&mut self, run: &str) {
         // Reset viewport to live screen when receiving PTY output
         self.viewport_offset = 0;

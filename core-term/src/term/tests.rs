@@ -226,12 +226,12 @@ fn assert_screen_state(
 #[test]
 fn it_should_print_characters_left_to_right_and_advance_the_cursor() {
     let mut term = create_test_emulator(10, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     // Cursor is at (0,1) *after* printing 'A' at (0,0)
     assert_screen_state(&snapshot, &["A         "], Some((0, 1)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
+    term.print_text("B");
     let snapshot_b = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot_b, &["AB        "], Some((0, 2)));
 }
@@ -244,9 +244,9 @@ fn it_should_move_to_column_zero_of_the_next_line_when_lnm_is_set_and_lf_is_rece
         StandardModeConstant::LinefeedNewlineMode as u16,
     ))));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
+    term.print_text("B");
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     // With LNM ON, LF moves to next line AND performs carriage return. 'B' prints at (1,0), cursor moves to (1,1)
     // Testing behavior: cursor should be at column 0 after LF (that's what LNM does)
@@ -256,11 +256,11 @@ fn it_should_move_to_column_zero_of_the_next_line_when_lnm_is_set_and_lf_is_rece
 #[test]
 fn it_should_return_cursor_to_column_zero_and_overwrite_on_carriage_return() {
     let mut term = create_test_emulator(10, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('C')));
+    term.print_text("A");
+    term.print_text("B");
+    term.print_text("C");
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('D')));
+    term.print_text("D");
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     // "ABC", CR -> (0,0), "D" prints at (0,0) over 'A', cursor moves to (0,1)
     assert_screen_state(&snapshot, &["DBC       "], Some((0, 1)));
@@ -286,7 +286,7 @@ fn fill_emulator_screen(emu: &mut TerminalEmulator, text_lines: Vec<String>) {
             emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
         }
         for char_val in line.chars() {
-            emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(char_val)));
+            emu.print_text(char_val.encode_utf8(&mut [0; 4]));
         }
     }
 }
@@ -622,18 +622,18 @@ fn selection_is_cleared_when_returning_from_the_alt_screen_to_the_primary_screen
 #[test]
 fn it_should_preserve_content_and_cursor_when_resizing_to_a_larger_grid() {
     let mut term = create_test_emulator(5, 2);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('2')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('3')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('4')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('5')));
+    term.print_text("1");
+    term.print_text("2");
+    term.print_text("3");
+    term.print_text("4");
+    term.print_text("5");
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('C')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('D')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('E')));
+    term.print_text("A");
+    term.print_text("B");
+    term.print_text("C");
+    term.print_text("D");
+    term.print_text("E");
 
     term.interpret_input(EmulatorInput::Control(resize_event(10, 4)));
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
@@ -647,14 +647,14 @@ fn it_should_preserve_content_and_cursor_when_resizing_to_a_larger_grid() {
 #[test]
 fn it_should_truncate_content_when_resizing_to_a_smaller_grid() {
     let mut term = create_test_emulator(5, 2);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('H')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('e')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('l')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('l')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('o')));
+    term.print_text("H");
+    term.print_text("e");
+    term.print_text("l");
+    term.print_text("l");
+    term.print_text("o");
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('W')));
+    term.print_text("W");
 
     term.interpret_input(EmulatorInput::Control(resize_event(3, 1)));
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
@@ -675,7 +675,7 @@ fn it_should_write_a_printable_keypress_to_the_pty_and_echo_it_to_the_grid() {
         Some(EmulatorAction::WritePty("X".to_string().into_bytes()))
     );
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
+    term.print_text("X");
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["X    "], Some((0, 1)));
 }
@@ -704,26 +704,26 @@ fn ps1_multiline_prompt_at_bottom_causes_scroll() {
     let mut term = create_test_emulator(5, 3);
 
     for _ in 0..5 {
-        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+        term.print_text("A");
     }
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
     for _ in 0..5 {
-        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
+        term.print_text("B");
     }
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('P')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('>')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(' ')));
+    term.print_text("P");
+    term.print_text("1");
+    term.print_text(">");
+    term.print_text(" ");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('$')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(' ')));
+    term.print_text("$");
+    term.print_text(" ");
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["BBBBB", "P1>  ", "$    "], Some((2, 2)));
@@ -734,19 +734,19 @@ fn ps1_multiline_prompt_ends_on_last_line_no_scroll_by_prompt() {
     let mut term = create_test_emulator(5, 3);
 
     for _ in 0..5 {
-        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+        term.print_text("A");
     }
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('L')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
+    term.print_text("L");
+    term.print_text("1");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('$')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(' ')));
+    term.print_text("$");
+    term.print_text(" ");
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["AAAAA", "L1   ", "$    "], Some((2, 2)));
@@ -757,25 +757,25 @@ fn ps1_multiline_prompt_last_line_fills_screen_then_input() {
     let mut term = create_test_emulator(3, 2);
 
     for _ in 0..3 {
-        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+        term.print_text("A");
     }
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
+    term.print_text("B");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('C')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('D')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('E')));
+    term.print_text("C");
+    term.print_text("D");
+    term.print_text("E");
 
     let snapshot_after_prompt = term.get_render_snapshot().expect("Snapshot was None");
     // After filling line with 3 chars (CDE), cursor should be at rightmost position
     assert_screen_state(&snapshot_after_prompt, &["B  ", "CDE"], Some((1, 2)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
+    term.print_text("X");
 
     let snapshot_after_input = term.get_render_snapshot().expect("Snapshot was None");
     // After wrap, 'X' should appear on next line, screen should scroll
@@ -787,25 +787,25 @@ fn ps1_prompt_causes_multiple_scrolls() {
     let mut term = create_test_emulator(3, 2);
 
     for _ in 0..3 {
-        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+        term.print_text("A");
     }
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('L')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
+    term.print_text("L");
+    term.print_text("1");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('L')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('2')));
+    term.print_text("L");
+    term.print_text("2");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('$')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(' ')));
+    term.print_text("$");
+    term.print_text(" ");
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["L2 ", "$  "], Some((1, 2)));
@@ -815,20 +815,20 @@ fn ps1_prompt_causes_multiple_scrolls() {
 fn ps1_prompt_with_internal_wrapping_and_scrolling() {
     let mut term = create_test_emulator(3, 2);
     for _ in 0..3 {
-        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+        term.print_text("A");
     }
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('L')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('l')));
+    term.print_text("L");
+    term.print_text("1");
+    term.print_text("l");
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('o')));
+    term.print_text("o");
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('n')));
+    term.print_text("n");
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('g')));
+    term.print_text("g");
     // This LF is after 'g' which is the last char on the line and causes a wrap.
     // The wrap itself moves to the next line, column 0.
     // So, only an LF is needed here, not CR+LF, if the intent is just to move down.
@@ -839,8 +839,8 @@ fn ps1_prompt_with_internal_wrapping_and_scrolling() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('L')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('2')));
+    term.print_text("L");
+    term.print_text("2");
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["ong", "L2 "], Some((1, 2)));
@@ -850,14 +850,14 @@ fn ps1_prompt_with_internal_wrapping_and_scrolling() {
 fn ps1_multiline_exact_fill_then_scroll_on_final_lf() {
     let mut term = create_test_emulator(3, 2);
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('P')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
+    term.print_text("P");
+    term.print_text("1");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('P')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('2')));
+    term.print_text("P");
+    term.print_text("2");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
@@ -871,7 +871,7 @@ fn ps1_multiline_with_sgr_at_bottom_scrolls() {
     let mut term = create_test_emulator(5, 2);
 
     for _ in 0..5 {
-        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+        term.print_text("A");
     }
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
@@ -881,8 +881,8 @@ fn ps1_multiline_with_sgr_at_bottom_scrolls() {
             NamedColor::Red,
         ))]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('P')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
+    term.print_text("P");
+    term.print_text("1");
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Reset]),
     )));
@@ -895,8 +895,8 @@ fn ps1_multiline_with_sgr_at_bottom_scrolls() {
             NamedColor::Green,
         ))]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('$')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(' ')));
+    term.print_text("$");
+    term.print_text(" ");
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Reset]),
     )));
@@ -985,26 +985,26 @@ fn lf_scrolls_the_partial_scrolling_region_when_the_cursor_is_at_its_bottom_with
         CsiCommand::CursorPosition(1, 1),
     )));
     for _ in 0..5 {
-        emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
+        emu.print_text("X");
     }
 
     emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(2, 1),
     )));
     for _ in 0..5 {
-        emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
+        emu.print_text("X");
     }
     emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(3, 1),
     )));
     for _ in 0..5 {
-        emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('Y')));
+        emu.print_text("Y");
     }
     emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(4, 1),
     )));
-    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('Z')));
-    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('Z')));
+    emu.print_text("Z");
+    emu.print_text("Z");
 
     let snapshot_before_lf = emu.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(
@@ -1292,11 +1292,11 @@ mod get_selected_text_tests {
     fn get_selected_text_renders_untouched_cells_as_spaces() {
         let mut emu = create_test_emulator(5, 1);
         // Create sparse content: "A   E" by printing A, moving cursor to col 4, then printing E
-        emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+        emu.print_text("A");
         emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
             CsiCommand::CursorPosition(1, 5),
         )));
-        emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('E')));
+        emu.print_text("E");
 
         send_mouse_input(&mut emu, start_selection_at(0, 0), MouseButton::Left);
         send_mouse_input(&mut emu, extend_selection_to(4, 0), MouseButton::Left);
@@ -1499,14 +1499,18 @@ fn scrolled_back_idle_snapshot_is_clean() {
     let mut term = create_test_emulator(4, 2);
     for ch in "a\r\nb\r\nc\r\nd\r\ne".chars() {
         match ch {
-            '\r' => term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(
-                crate::ansi::commands::C0Control::CR,
-            ))),
-            '\n' => term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(
-                crate::ansi::commands::C0Control::LF,
-            ))),
-            c => term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(c))),
-        };
+            '\r' => drop(
+                term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(
+                    crate::ansi::commands::C0Control::CR,
+                ))),
+            ),
+            '\n' => drop(
+                term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(
+                    crate::ansi::commands::C0Control::LF,
+                ))),
+            ),
+            c => term.print_text(c.encode_utf8(&mut [0; 4])),
+        }
     }
     assert!(term.scroll_viewport(1), "scrollback should be available");
 
