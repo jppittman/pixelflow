@@ -5,16 +5,23 @@
 //! ## Responsibilities
 //!
 //! 1. **Symbol Resolution**: Match identifiers to their definitions
-//! 2. **Scope Management**: Track let bindings within blocks
+//! 2. **Scope Management**: Track let bindings within blocks, with Rust's
+//!    lexical scoping ([`crate::symbol::Scopes`], which lowering resolves
+//!    through too)
 //! 3. **Validation**: Ensure all referenced symbols are defined
 //!
 //! ## Symbol Resolution Rules
 //!
-//! When an identifier is encountered:
-//! 1. Check if it's an intrinsic (X, Y, Z, W) → a coordinate `Var`
-//! 2. Check if it's a declared parameter → a `Param` folded in by the builder
-//! 3. Check if it's a local variable → a shared arena id
-//! 4. Otherwise → captured from the caller's scope, and Rust resolves it
+//! An identifier resolves to the innermost binding of its name in scope:
+//! 1. a `let`-bound local → a shared arena id
+//! 2. a declared parameter → a `Param` folded in by the builder
+//! 3. an intrinsic (X, Y) → a coordinate `Var`
+//! 4. otherwise → refused. A kernel body does not capture from the caller's
+//!    scope, so a name nothing here binds is an error here, with a span —
+//!    not a capture that lowering then refuses without one.
+//!
+//! Nothing shadows X or Y — a parameter or a `let` of that name is refused —
+//! so a coordinate always means the coordinate.
 //!
 //! ## Output
 //!
@@ -164,22 +171,22 @@ impl SemanticAnalyzer {
         Ok(())
     }
 
-    /// Resolve an identifier reference.
+    /// Resolve an identifier reference to the innermost binding of its name
+    /// in scope, or refuse it.
     ///
-    /// An unknown name is not an error: the expansion is a closure in the
-    /// caller's scope, so anything the symbol table does not know is captured
-    /// from the environment and Rust's own resolver reports it if it is not
-    /// there either.
+    /// An unknown name used to be accepted here as a capture from the
+    /// caller's scope, which lowering then refused as `Unknown identifier` —
+    /// one stage accepting what a later one refuses, and the later one has no
+    /// span to point with. Worse, it hid an out-of-scope local: the leaked
+    /// binding lowering never popped was still there to be found, so
+    /// `{ { let a = X; a }; a }` compiled.
     fn resolve_ident(&self, ident: &Ident) -> syn::Result<SymbolKind> {
         let name = ident.to_string();
         if let Some(symbol) = self.symbols.lookup(&name) {
             return Ok(symbol.kind);
         }
         // `Z` and `W` were coordinate intrinsics until a lattice became two
-        // axes. An unknown name is normally a capture from the caller's
-        // scope, so without this they would resolve to whatever the caller
-        // happens to have in scope — or to nothing, with a message about a
-        // missing variable rather than about the change.
+        // axes; say so, rather than that the name is missing.
         if let Some(axis) = RETIRED_COORDINATES.iter().find(|a| **a == name) {
             return Err(syn::Error::new(
                 ident.span(),
@@ -191,7 +198,17 @@ impl SemanticAnalyzer {
                 ),
             ));
         }
-        Ok(SymbolKind::Local)
+        Err(syn::Error::new(
+            ident.span(),
+            format!(
+                "cannot find `{name}` in this kernel body\n\
+                 note: a kernel body sees X, Y, its parameters, and the `let` bindings in \
+                 scope; a `let` inside a block goes out of scope where the block ends\n\
+                 note: a value from the enclosing Rust scope is not captured\n\
+                 help: to use an outside value, declare it as a parameter of this kernel \
+                 and pass it at the call site"
+            ),
+        ))
     }
 
     /// Analyze a method call.
@@ -298,50 +315,54 @@ impl SemanticAnalyzer {
             .map(|(_, count)| *count)
     }
 
-    /// Analyze a block expression.
+    /// Analyze a block expression in a scope of its own.
     fn analyze_block(&mut self, block: &BlockExpr) -> syn::Result<()> {
-        // Enter a new scope
         self.symbols.push_scope();
+        let analyzed = self.analyze_block_contents(block);
+        self.symbols.pop_scope();
+        analyzed
+    }
 
-        // Analyze each statement
+    /// A block's statements in order, then its value, in the scope
+    /// [`Self::analyze_block`] opened.
+    fn analyze_block_contents(&mut self, block: &BlockExpr) -> syn::Result<()> {
         for stmt in &block.stmts {
             match stmt {
-                Stmt::Let(let_stmt) => {
-                    self.analyze_let(let_stmt)?;
-                }
-                Stmt::Expr(expr) => {
-                    self.analyze_expr(expr)?;
-                }
+                Stmt::Let(let_stmt) => self.analyze_let(let_stmt)?,
+                Stmt::Expr(expr) => self.analyze_expr(expr)?,
             }
         }
-
-        // Analyze the final expression
-        if let Some(expr) = &block.expr {
-            self.analyze_expr(expr)?;
+        match &block.expr {
+            Some(expr) => self.analyze_expr(expr),
+            None => Ok(()),
         }
-
-        // Exit the scope
-        self.symbols.pop_scope();
-
-        Ok(())
     }
 
     /// Analyze a let statement.
     fn analyze_let(&mut self, let_stmt: &LetStmt) -> syn::Result<()> {
-        // First, analyze the initializer (uses current scope)
-        self.analyze_expr(&let_stmt.init)?;
-
-        // Then register the new binding
         let name = let_stmt.name.to_string();
 
-        // Warning: shadowing intrinsics in let is allowed but unusual
+        // A `let X` would make `X` mean the local below it — and lowering
+        // used to match the coordinate names before locals, so the kernel
+        // silently read the coordinate instead (`{ let X = Y; X }` gave X).
+        // Refused for the same reason as a parameter named X.
         if self.symbols.is_intrinsic(&name) {
-            // Could emit a warning here in the future
+            return Err(syn::Error::new(
+                let_stmt.name.span(),
+                format!(
+                    "`let {name}` shadows the intrinsic coordinate variable `{name}`\n\
+                     note: intrinsics are: X, Y (coordinate variables), and every use of one \
+                     in a kernel body means the coordinate\n\
+                     help: rename this binding to something else"
+                ),
+            ));
         }
 
+        // The initializer is analyzed before the binding exists, so it sees
+        // whatever the name meant before: `let a = a + 1.0;`.
+        self.analyze_expr(&let_stmt.init)?;
         self.symbols
             .register_local(let_stmt.name.clone(), let_stmt.ty.clone());
-
         Ok(())
     }
 }
@@ -383,29 +404,85 @@ mod tests {
         assert!(analyze(kernel).is_ok());
     }
 
-    /// Semantic analysis does not reject an unknown name: the expansion is a
-    /// closure written where the caller wrote it, so Rust's own resolver is
-    /// the one that can say whether the name exists.
+    /// A name nothing in the kernel binds is refused here, with its span.
     ///
-    /// **This proves only that `analyze` accepts it — not that the kernel
-    /// compiles.** It does not: arena lowering has no node for a captured
-    /// Rust binding and refuses with `Unknown identifier`, so
-    /// `let scale = 2.0; kernel!(|| X * scale)` is a compile error today
-    /// (verified). The name this test used to carry —
-    /// `an_unknown_name_is_captured_from_the_callers_scope` — claimed the
-    /// end-to-end behavior and so read as coverage of something nothing
-    /// checks.
-    ///
-    /// It is the same shape as the `round`/`log10`/`pow` and
-    /// `fract`/`hypot`/`clamp` defects: one stage accepts what a later stage
-    /// refuses, because the surface is spelled separately at each stage. A
-    /// capture is expressible — the emitted tokens sit in the caller's scope,
-    /// so it could fold as a `Const` exactly as a parameter does — so this is
-    /// an unimplemented capability, not an impossible one. Pass it as a
-    /// parameter meanwhile.
+    /// This test used to pin the opposite — `analyze` accepted an unknown name
+    /// as a capture from the caller's scope — while documenting that the
+    /// kernel did not compile, because arena lowering has no node for a
+    /// captured Rust binding and refused it as `Unknown identifier`. That is
+    /// the shape of the `round`/`log10`/`pow` and `fract`/`hypot`/`clamp`
+    /// defects: one stage accepting what a later stage refuses. It also hid
+    /// an out-of-scope local (see the next test). A capture is still
+    /// expressible — the emitted tokens sit in the caller's scope, so it
+    /// could fold as a `Const` exactly as a parameter does — and when it is
+    /// built, it is built in both stages at once. Pass it as a parameter
+    /// meanwhile, which is what the message says.
     #[test]
-    fn analysis_accepts_an_unknown_name_and_leaves_it_to_rusts_resolver() {
+    fn an_unknown_name_is_refused_not_captured() {
         let input = quote! { |r: f32| X * X + captured_from_env };
+        let kernel = parse(input).unwrap();
+        let err = analyze(kernel).expect_err("a kernel body does not capture");
+        let text = err.to_string();
+        assert!(
+            text.contains("cannot find `captured_from_env`") && text.contains("parameter"),
+            "the message must name the identifier and the way out, got: {text}"
+        );
+    }
+
+    /// Probe p15. A `let` inside a block goes out of scope where the block
+    /// ends, and a use after it is an error, as rustc makes it one. Before
+    /// the fix this compiled and read the leaked binding: 3 at `X = 3`.
+    #[test]
+    fn a_local_used_after_its_block_ends_is_refused() {
+        let input = quote! {
+            || {
+                {
+                    let a = X;
+                    a
+                };
+                a
+            }
+        };
+        let kernel = parse(input).unwrap();
+        let err = analyze(kernel).expect_err("`a` is out of scope");
+        assert!(err.to_string().contains("cannot find `a`"), "got: {err}");
+    }
+
+    /// Probe p5. `let X` and `let Y` are refused, as a parameter named X or Y
+    /// is. Before the fix `{ let X = Y; X }` compiled and read the
+    /// coordinate X, because lowering matched the coordinate names before
+    /// locals.
+    #[test]
+    fn a_let_named_after_a_coordinate_is_refused() {
+        for input in [
+            quote! { || { let X = Y; X } },
+            quote! { || { let Y: f32 = X; Y } },
+            quote! { |r: f32| r + { let X = r; X } },
+        ] {
+            let kernel = parse(input).unwrap();
+            let err = analyze(kernel).expect_err("a coordinate cannot be shadowed");
+            assert!(
+                err.to_string().contains("shadows the intrinsic coordinate"),
+                "got: {err}"
+            );
+        }
+    }
+
+    /// A parameter shadowed by a `let` in an inner block is visible again
+    /// after the block. The table used to drop the name outright when the
+    /// inner block ended; with unknown names now refused, that would have
+    /// turned a correct kernel into an error.
+    #[test]
+    fn a_parameter_shadowed_in_an_inner_block_is_in_scope_after_it() {
+        let input = quote! { |r: f32| ({ let r = X; r }) + r };
+        let kernel = parse(input).unwrap();
+        assert!(analyze(kernel).is_ok());
+    }
+
+    /// A `let`'s initializer sees the binding it is about to shadow.
+    #[test]
+    fn a_let_initializer_sees_the_binding_it_shadows() {
+        let input = quote! { |r: f32| { let r = r * 2.0; let a = X; let a = a + r; a } };
         let kernel = parse(input).unwrap();
         assert!(analyze(kernel).is_ok());
     }

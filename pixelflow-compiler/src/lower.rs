@@ -8,11 +8,11 @@
 //!
 //! Emission — arena to the `TokenStream` that rebuilds it — is [`crate::emit`].
 
-use crate::ast::{BinaryOp, Expr, UnaryOp};
+use crate::ast::{BinaryOp, BlockExpr, Expr, Stmt, UnaryOp};
+use crate::symbol::Scopes;
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId};
 use std::collections::HashMap;
-use syn::Lit;
 
 /// DSL method calls that denote a fixed composition of primitive ops rather
 /// than a single [`OpKind`] — `(name, arg_count)`, `arg_count` excluding the
@@ -55,53 +55,31 @@ pub fn ast_to_arena(
 ) -> Result<ExprId, String> {
     let mut lowering = Lowering {
         param_indices,
-        locals: HashMap::new(),
+        locals: Scopes::default(),
         arena,
     };
     lowering.lower(expr)
 }
 
 /// State threaded through the AST → arena walk: parameter names (fixed for
-/// the whole kernel), `let`-bound locals (grows as blocks are walked), and
-/// the arena nodes are pushed into.
+/// the whole kernel), `let`-bound locals (one scope per block being walked,
+/// with Rust's lexical scoping), and the arena nodes are pushed into.
 struct Lowering<'a> {
     param_indices: &'a HashMap<String, u8>,
-    locals: HashMap<String, ExprId>,
+    locals: Scopes<ExprId>,
     arena: &'a mut ExprArena,
 }
 
 impl Lowering<'_> {
     /// Translate an AST node into the arena, resolving `let`-bound locals via
-    /// `self.locals`. The optimizer emits `let`-bindings (a [`Expr::Block`]) for
-    /// shared subexpressions; each binding maps to a single [`ExprId`], so the
-    /// arena faithfully preserves the discovered CSE as a DAG rather than
-    /// duplicating subtrees.
+    /// `self.locals`. Each binding maps to a single [`ExprId`], so a local
+    /// used twice is one node and the arena is a DAG rather than duplicated
+    /// subtrees.
     fn lower(&mut self, expr: &Expr) -> Result<ExprId, String> {
         match expr {
-            Expr::Ident(ident) => {
-                let name = ident.name.to_string();
-                match name.as_str() {
-                    "X" => Ok(self.arena.push_var(0)),
-                    "Y" => Ok(self.arena.push_var(1)),
-                    _ => {
-                        if let Some(&id) = self.locals.get(&name) {
-                            Ok(id)
-                        } else if let Some(&idx) = self.param_indices.get(&name) {
-                            Ok(self.arena.push_param(idx))
-                        } else {
-                            Err(format!("Unknown identifier: {}", name))
-                        }
-                    }
-                }
-            }
+            Expr::Ident(ident) => self.resolve(&ident.name.to_string()),
 
-            Expr::Literal(lit) => {
-                if let Some(val) = extract_f64_from_lit(&lit.lit) {
-                    Ok(self.arena.push_const(val as f32))
-                } else {
-                    Err("Non-numeric literal".to_string())
-                }
-            }
+            Expr::Literal(lit) => Ok(self.arena.push_const(lit.value)),
 
             Expr::Binary(binary) => {
                 let lhs = self.lower(&binary.lhs)?;
@@ -253,40 +231,73 @@ impl Lowering<'_> {
             // Parentheses are transparent - just recurse into the inner expression
             Expr::Paren(inner) => self.lower(inner),
 
-            // Blocks carry the optimizer's CSE: each `let __n = <expr>;` binds a
-            // shared subexpression to a single arena node, and the final expression
-            // references those bindings by name.
+            // A block's `let`s live in a scope of their own, which ends with it.
             Expr::Block(block) => {
-                for stmt in &block.stmts {
-                    match stmt {
-                        crate::ast::Stmt::Let(let_stmt) => {
-                            let id = self.lower(&let_stmt.init)?;
-                            self.locals.insert(let_stmt.name.to_string(), id);
-                        }
-                        // A non-binding statement has no value to thread; evaluate
-                        // it so any nested error surfaces, then discard the id.
-                        crate::ast::Stmt::Expr(e) => {
-                            let _ = self.lower(e)?;
-                        }
-                    }
-                }
-                match &block.expr {
-                    Some(final_expr) => self.lower(final_expr),
-                    None => Err("Block has no final expression".to_string()),
-                }
+                self.locals.push_scope();
+                let value = self.lower_block_contents(block);
+                self.locals.pop_scope();
+                value
             }
 
             // The parser's catch-all: syntax the DSL has no node for, kept
-            // whole so the error can name it. A captured local lands here —
-            // `let s = 2.0; kernel!(|| X * s)` — and "unsupported expression
-            // type" was a poor way to say "`s` is not in scope inside a
-            // kernel body".
+            // whole so the error can name it. An unbound name never lands
+            // here: sema refuses it, with a span, before lowering runs.
             Expr::Verbatim(e) => Err(format!(
                 "unsupported expression in a kernel body: `{}`",
                 quote::quote!(#e)
             )),
 
             _ => Err("Unsupported expression type".to_string()),
+        }
+    }
+
+    /// The node a name refers to: the innermost `let` binding of it in scope,
+    /// else a coordinate, else a parameter.
+    ///
+    /// Bindings come first because that is what lexical scoping means. `sema`
+    /// refuses a `let` named X or Y, so today the order only decides a
+    /// local against a parameter it shadows; but matching `"X"` before the
+    /// locals was how `{ let X = Y; X }` came to read the coordinate, and a
+    /// lowering that is right only because an earlier stage refused its
+    /// input is one refactor away from that bug again.
+    fn resolve(&mut self, name: &str) -> Result<ExprId, String> {
+        if let Some(&id) = self.locals.lookup(name) {
+            return Ok(id);
+        }
+        // The same order sema documents: a binding, then a parameter, then
+        // the coordinates. Sema refuses a parameter named X or Y, so the two
+        // stages agree without one relying on the other's refusal.
+        if let Some(&idx) = self.param_indices.get(name) {
+            return Ok(self.arena.push_param(idx));
+        }
+        match name {
+            "X" => Ok(self.arena.push_var(0)),
+            "Y" => Ok(self.arena.push_var(1)),
+            _ => Err(format!("Unknown identifier: {name}")),
+        }
+    }
+
+    /// A block's statements in order, then its value, in the scope the
+    /// caller opened for it.
+    fn lower_block_contents(&mut self, block: &BlockExpr) -> Result<ExprId, String> {
+        for stmt in &block.stmts {
+            match stmt {
+                // The initializer is lowered before the binding exists, so it
+                // sees whatever the name meant before: `let a = a + 1.0;`.
+                Stmt::Let(let_stmt) => {
+                    let id = self.lower(&let_stmt.init)?;
+                    self.locals.bind(let_stmt.name.to_string(), id);
+                }
+                // A non-binding statement has no value to thread; lower it so
+                // any nested error surfaces, then discard the id.
+                Stmt::Expr(e) => {
+                    self.lower(e)?;
+                }
+            }
+        }
+        match &block.expr {
+            Some(final_expr) => self.lower(final_expr),
+            None => Err("Block has no final expression".to_string()),
         }
     }
 }
@@ -298,11 +309,66 @@ fn push_dwrt(arena: &mut ExprArena, expr: ExprId, var: u8) -> ExprId {
     arena.push_binary(OpKind::Dwrt, expr, v)
 }
 
-/// Extract f64 from a syn::Lit.
-fn extract_f64_from_lit(lit: &Lit) -> Option<f64> {
-    match lit {
-        Lit::Float(f) => f.base10_parse::<f64>().ok(),
-        Lit::Int(i) => i.base10_parse::<i64>().ok().map(|v| v as f64),
-        _ => None,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse;
+    use pixelflow_ir::arena::ExprNode;
+    use quote::quote;
+
+    /// Lower a body straight from the parser, with no `sema` in front: what
+    /// lowering itself makes of a name, whatever an earlier stage would
+    /// refuse.
+    fn lower_unanalyzed(input: proc_macro2::TokenStream) -> (ExprArena, ExprId) {
+        let unanalyzed = crate::sema::AnalyzedKernel {
+            def: parse(input).expect("the body parses"),
+        };
+        let params = param_indices(&unanalyzed);
+        let mut arena = ExprArena::new();
+        let root =
+            ast_to_arena(&unanalyzed.def.body, &params, &mut arena).expect("the body lowers");
+        (arena, root)
+    }
+
+    /// Probe p5, at the stage that got it wrong. `sema` now refuses
+    /// `let X`, but lowering resolves a name through its scopes before the
+    /// coordinates regardless: `{ let X = Y; X }` is the local, which is `Y`.
+    /// It was `Var(0)`.
+    #[test]
+    fn a_binding_is_resolved_before_a_coordinate_of_the_same_name() {
+        let (arena, root) = lower_unanalyzed(quote! { || { let X = Y; X } });
+        assert!(
+            matches!(arena.node(root), ExprNode::Var(1)),
+            "`X` is the local bound to Y, got {:?}",
+            arena.node(root)
+        );
+    }
+
+    /// A local shadows the parameter it is named after, and only inside its
+    /// block.
+    #[test]
+    fn a_binding_shadows_a_parameter_only_inside_its_block() {
+        let (arena, root) = lower_unanalyzed(quote! { |r: f32| ({ let r = X; r }) + r });
+        let ExprNode::Binary(OpKind::Add, inner, outer) = arena.node(root) else {
+            panic!("expected the sum, got {:?}", arena.node(root));
+        };
+        assert!(
+            matches!(arena.node(inner), ExprNode::Var(0)),
+            "inner `r` is X"
+        );
+        assert!(
+            matches!(arena.node(outer), ExprNode::Param(0)),
+            "outer `r` is the parameter"
+        );
+    }
+
+    /// A literal lowers to the value the parser gave it, bit for bit.
+    #[test]
+    fn a_literal_lowers_to_the_value_the_parser_rounded_once() {
+        let (arena, root) = lower_unanalyzed(quote! { || 1.00000005960464477539062500001 });
+        let ExprNode::Const(value) = arena.node(root) else {
+            panic!("expected a constant, got {:?}", arena.node(root));
+        };
+        assert_eq!(value.to_bits(), 0x3f80_0001);
     }
 }
