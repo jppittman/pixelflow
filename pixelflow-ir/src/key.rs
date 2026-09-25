@@ -31,7 +31,8 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::arena::{BufferDecl, ExprArena, ExprId, ExprNode, UniformDecl};
+use crate::arena::{BufferDecl, ExprArena, ExprId, ExprNode, UniformDecl, UniformIdentity};
+use crate::dag::Memo;
 
 /// The identity of a kernel: a 64-bit digest of its whole [`Canonical`] form
 /// — the shape bytes **and** the link.
@@ -220,6 +221,11 @@ struct Walk<'a> {
     scratch: Vec<u8>,
     buffers: Vec<BufferDecl>,
     uniforms: Vec<UniformDecl>,
+    /// `uniforms` by identity: the slot each instance holds, so an
+    /// occurrence is one lookup however many arguments the program declares.
+    /// A search of the table instead was quadratic in them — 2·10⁹ compares
+    /// to key a program of 66k arguments once.
+    uniform_slots: Memo<UniformIdentity, u64>,
 }
 
 /// The table holds twice the arena's nodes, so a probe sequence is short
@@ -253,6 +259,7 @@ impl<'a> Walk<'a> {
             scratch: Vec::new(),
             buffers: Vec::new(),
             uniforms: Vec::new(),
+            uniform_slots: Memo::new(),
         }
     }
 
@@ -387,21 +394,23 @@ impl<'a> Walk<'a> {
                 }
             }
             // Slot by first occurrence, extents in the key: the code folds
-            // its address arithmetic against them.
+            // its address arithmetic against them. Encoded at `BufferId`'s
+            // own width, which `declare_buffer` already bounds the table by.
             ExprNode::Buffer(b) => {
                 let decl = *self.arena.buffer_decl(b);
                 self.scratch.push(7);
-                let slot = dense_slot(&mut self.buffers, decl);
+                let slot = u16::try_from(dense_slot(&mut self.buffers, decl))
+                    .expect("declare_buffer already asserted the buffer table fits u16");
                 self.scratch.extend_from_slice(&slot.to_le_bytes());
                 self.scratch.extend_from_slice(&decl.width.to_le_bytes());
                 self.scratch.extend_from_slice(&decl.height.to_le_bytes());
             }
-            // Offset by first occurrence; the default is the block's
-            // business, not the code's.
+            // Offset by first occurrence, at `UniformId`'s full width; the
+            // default is the block's business, not the code's.
             ExprNode::Uniform(u) => {
                 let decl = *self.arena.uniform_decl(u);
                 self.scratch.push(8);
-                let slot = dense_slot(&mut self.uniforms, decl);
+                let slot = self.uniform_slot(decl);
                 self.scratch.extend_from_slice(&slot.to_le_bytes());
             }
             // A leaf with an identity of its own, like `Buffer`: the key it
@@ -449,6 +458,25 @@ impl<'a> Walk<'a> {
         }
     }
 
+    /// The dense slot of `decl`'s instance, appending it on first sight — the
+    /// same numbering [`dense_slot`] gives a buffer, found by identity in one
+    /// lookup rather than by a search of the table. An instance is one slot:
+    /// a second declaration of its identity with another default is the
+    /// corrupt graph [`ExprArena::uniform_slot_for`] refuses, and is refused
+    /// here the same way rather than silently numbered as a second argument.
+    fn uniform_slot(&mut self, decl: UniformDecl) -> u64 {
+        let fresh = self.uniforms.len() as u64;
+        let slot = *self.uniform_slots.entry(decl.id).or_insert_with(|| {
+            self.uniforms.push(decl);
+            fresh
+        });
+        assert_eq!(
+            self.uniforms[slot as usize], decl,
+            "two declarations share a UniformIdentity but disagree on the default"
+        );
+        slot
+    }
+
     fn finish(self) -> Canonical {
         Canonical {
             key: self.key,
@@ -458,13 +486,18 @@ impl<'a> Walk<'a> {
     }
 }
 
-/// The dense slot of `decl` in `table`, appending it on first sight.
-fn dense_slot<T: PartialEq + Copy>(table: &mut Vec<T>, decl: T) -> u16 {
+/// The dense slot of `decl` in `table`, appending it on first sight. A
+/// control-plane index, so 64 bits; a caller whose id type is narrower
+/// narrows it, and says why. A search, so its cost is the table's length:
+/// fine for a buffer table, which [`ExprArena::declare_buffer`] bounds by
+/// `BufferId`; a uniform table is unbounded and is indexed instead
+/// ([`Walk::uniform_slot`]).
+fn dense_slot<T: PartialEq + Copy>(table: &mut Vec<T>, decl: T) -> u64 {
     let slot = table.iter().position(|d| *d == decl).unwrap_or_else(|| {
         table.push(decl);
         table.len() - 1
     });
-    u16::try_from(slot).expect("dense slot fits the table index width")
+    slot as u64
 }
 
 #[cfg(test)]
@@ -909,5 +942,82 @@ mod tests {
         let swapped_guard = swapped_arena.push_guard(swapped_mask, off, on);
         let swapped = KernelKey::of(&swapped_arena, swapped_guard);
         assert_ne!(base, swapped, "on and off are not interchangeable");
+    }
+
+    /// Nothing bounds a program's argument count — a glyph carries ten
+    /// uniforms per piece and the font decides the piece count — so a kernel
+    /// past the 65,535 slots `UniformId` used to stop at declares, keys and
+    /// links like any other. Declared and keyed, never compiled at a lattice:
+    /// the width is the claim here, not the emitter.
+    ///
+    /// The key pin is semantic rather than a byte search: under a 16-bit
+    /// slot, slot `65,536 + k` encodes as slot `k`, so a program reading
+    /// that argument and one reading argument `k` in its place hash-cons to
+    /// the same bytes, and the cache would hand the second the first's code.
+    #[test]
+    fn a_kernel_past_the_old_u16_width_declares_keys_and_links() {
+        use crate::arena::{UniformDecl, UniformId, UniformIdentity};
+
+        const ARGUMENTS: usize = u16::MAX as usize + 1_000;
+        const LAST: usize = ARGUMENTS - 1;
+        /// The slot `LAST` would have wrapped to at 16 bits.
+        const LAST_WRAPPED: usize = LAST - (u16::MAX as usize + 1);
+
+        let decls: Vec<UniformDecl> = (0..ARGUMENTS)
+            .map(|i| UniformDecl {
+                id: UniformIdentity::mint(),
+                default: i as f32,
+            })
+            .collect();
+        // A balanced sum over every argument, the last leaf reading `last`.
+        let sum_of_all = |last: usize| -> (ExprArena, ExprId) {
+            let mut arena = ExprArena::new();
+            let slots: Vec<UniformId> = decls.iter().map(|d| arena.declare_uniform(*d)).collect();
+            let mut terms: Vec<ExprId> = (0..ARGUMENTS)
+                .map(|i| arena.push_uniform(slots[if i == LAST { last } else { i }]))
+                .collect();
+            while terms.len() > 1 {
+                terms = terms
+                    .chunks(2)
+                    .map(|pair| match *pair {
+                        [a, b] => arena.push_binary(OpKind::Add, a, b),
+                        [a] => a,
+                        _ => unreachable!("chunks of two"),
+                    })
+                    .collect();
+            }
+            (arena, terms[0])
+        };
+
+        let (arena, root) = sum_of_all(LAST);
+        assert_eq!(arena.uniforms().len(), ARGUMENTS, "every argument declared");
+        let linked = canonical(&arena, root);
+        assert_eq!(
+            linked.uniforms.len(),
+            ARGUMENTS,
+            "every argument in the link"
+        );
+        assert_eq!(
+            linked.uniforms[LAST], decls[LAST],
+            "in first-occurrence order"
+        );
+
+        let (aliased, aliased_root) = sum_of_all(LAST_WRAPPED);
+        assert_ne!(
+            linked.key,
+            canonical(&aliased, aliased_root).key,
+            "slot {LAST} must not key as slot {LAST_WRAPPED}"
+        );
+
+        // The link step maps every reachable leaf to its slot in the link,
+        // the last of them past the old width.
+        let (relinked, _) = arena.relink(root, &linked.buffers, &linked.uniforms);
+        assert_eq!(relinked.uniforms().len(), ARGUMENTS);
+        assert!(
+            relinked
+                .nodes()
+                .any(|(_, node)| node == ExprNode::Uniform(UniformId(LAST as u64))),
+            "the last argument is read at slot {LAST}"
+        );
     }
 }

@@ -402,6 +402,11 @@ and no digests are committed (one-pipeline §5, gate policy).
   search (`manifold.rs:113-125`) goes with it: the `Args` record is
   positional.
 - **Deprioritized.** 64-bit fold ends (A5) have no driver in this plan.
+  Likewise the caps A4 leaves beside the uniform chain, so the remaining
+  widths stay visible: `push_nary` and the key's `Nary` child count at
+  `u16::MAX`, `RangeFold`'s `u32` ends, `BufferId(u16)` /
+  `BufferIdentity(u32)` (§1.6: buffers are leaving),
+  `ScheduledOp::Context(u16)`, `ExprId(u32)` and `Binder(u8)`.
 
 ### Phase B: the syntax grows the font's constructs
 

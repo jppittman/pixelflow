@@ -15,6 +15,7 @@ use super::{
     AsmInsn, AsmProgram, Assembly, Binding, CONST_POOL, CONST_POOL_ALIGN, EncodedInst, Gpr, Label,
     LabelRef, Loc, PtrReg, Reg, WritePlan, regalloc,
 };
+use crate::error::CompileError;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
@@ -930,6 +931,35 @@ pub(in crate::emit) const fn frame_slot(offset: u32) -> Mem<Imm32> {
         base: ptr::RSP,
         disp: Imm32(offset as i32),
     }
+}
+
+/// Bytes one `f32` occupies: the element pitch of a uniform block.
+const F32_BYTES: u64 = 4;
+
+/// The `offset`-th `f32` of the block at `base`, `[base + 4*offset]`, as a
+/// `disp32` operand — the one place a uniform's 64-bit slot meets the
+/// width x86 gives a displacement, shared by the VEX and EVEX tiers the way
+/// [`mem_operand_into`] is.
+///
+/// # Errors
+///
+/// [`CompileError::BudgetExceeded`] when `4 * offset` does not fit a signed
+/// 32-bit displacement: an offset past the encoding is refused, never
+/// wrapped into an address that reads some other argument.
+pub(in crate::emit) fn block_element(
+    base: PtrReg,
+    offset: u64,
+) -> Result<Mem<Imm32>, CompileError> {
+    let disp = offset
+        .checked_mul(F32_BYTES)
+        .and_then(|bytes| i32::try_from(bytes).ok())
+        .ok_or(CompileError::BudgetExceeded(
+            "uniform offset past x86's disp32",
+        ))?;
+    Ok(Mem {
+        base,
+        disp: Imm32(disp),
+    })
 }
 
 /// One tier's `cvttss2si` pair — the VEX or EVEX spelling of the same

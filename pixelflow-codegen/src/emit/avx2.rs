@@ -27,6 +27,7 @@
 use super::x86_64;
 use super::x86_64::{Disp, Imm32, Mem, NoDisp, frame_slot, ptr};
 use super::{AsmProgram, EncodedInst, Gpr, PtrReg, Reg, SourceOperand, assemble, unimplemented_op};
+use crate::error::CompileError;
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
 
@@ -392,15 +393,20 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::Con
 /// `dst = splat(base[offset])` at 256 bits: `vbroadcastss ymm<dst>, [base +
 /// 4*offset]` (VEX.256.66.0F38.W0 18 /r). `base` is the block's address,
 /// wherever the allocator keeps that pointer value.
-pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, base: PtrReg, offset: u16) {
-    AsmProgram::from([Vex::m0f38_66(0x18).rm(
-        dst.0,
-        Mem {
-            base,
-            disp: Imm32(i32::from(offset) * 4),
-        },
-    )])
-    .assemble(code);
+///
+/// # Errors
+///
+/// [`CompileError::BudgetExceeded`] when the element lies past a `disp32`
+/// ([`x86_64::block_element`]).
+pub fn emit_uniform_load(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    base: PtrReg,
+    offset: u64,
+) -> Result<(), CompileError> {
+    let element = x86_64::block_element(base, offset)?;
+    AsmProgram::from([Vex::m0f38_66(0x18).rm(dst.0, element)]).assemble(code);
+    Ok(())
 }
 
 /// `dst = splat(base[idx])` at 256 bits, the index being the same in every
@@ -1350,7 +1356,7 @@ pub(crate) mod driver {
                     );
                 }
                 ResolvedOp::Uniform { dst, base, offset } => {
-                    super::emit_uniform_load(code, *dst, *base, *offset);
+                    super::emit_uniform_load(code, *dst, *base, *offset)?;
                 }
                 ResolvedOp::Context { dst, slot } => {
                     let ctx = self

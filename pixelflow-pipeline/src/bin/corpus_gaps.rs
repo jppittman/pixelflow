@@ -464,7 +464,7 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
         Const(u32),
         Param(u8),
         Buffer(u16),
-        Uniform(u16),
+        Uniform(u64),
         Op(OpKind, Vec<u32>),
         /// A fold's identity is its metadata plus its body — the bits are
         /// the metadata, and two folds sharing them fold the same way.
