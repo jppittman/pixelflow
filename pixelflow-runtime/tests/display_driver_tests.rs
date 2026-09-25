@@ -7,7 +7,7 @@ use pixelflow_runtime::api::public::{
     EngineEventManagement, WindowDescriptor,
 };
 use pixelflow_runtime::display::messages::{DisplayControl, DisplayEvent, DisplayMgmt, WindowId};
-use pixelflow_runtime::input::{KeySymbol, Modifiers, MouseButton};
+use pixelflow_runtime::input::{KeySymbol, Modifiers, MouseButton, Selection};
 
 // ============================================================================
 // DisplayControl Tests
@@ -135,9 +135,11 @@ fn display_event_scroll_with_float_deltas() {
 #[test]
 fn display_event_paste_data_works() {
     let event = DisplayEvent::PasteData {
+        selection: Selection::Clipboard,
         text: "Hello, clipboard!".to_string(),
     };
-    if let DisplayEvent::PasteData { text } = event {
+    if let DisplayEvent::PasteData { selection, text } = event {
+        assert_eq!(selection, Selection::Clipboard);
         assert_eq!(text, "Hello, clipboard!");
     } else {
         panic!("PasteData variant check failed");

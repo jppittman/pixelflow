@@ -130,10 +130,9 @@ impl PlatformOps for MetalOps {
                 }
             }
             // macOS has no primary selection; both read the pasteboard.
-            DisplayControl::RequestPaste { .. } => {
-                if let Some(text) = NSPasteboard::general().string() {
-                    out.event(DisplayEvent::PasteData { text });
-                }
+            DisplayControl::RequestPaste { selection } => {
+                let text = NSPasteboard::general().string().unwrap_or_default();
+                out.event(DisplayEvent::PasteData { selection, text });
             }
         }
         Ok(())

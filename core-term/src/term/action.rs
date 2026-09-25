@@ -385,6 +385,35 @@ pub enum ControlEvent {
 
 // --- Emulator Actions (Signaled to Orchestrator) ---
 
+/// An OSC 52 query awaiting the content of the selection it asked for.
+///
+/// Holds the reply's form; the orchestrator supplies the content once the
+/// platform has read it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectionReport {
+    /// The `Pc` the program asked with, echoed in the reply.
+    targets: String,
+}
+
+impl SelectionReport {
+    pub(crate) fn new(targets: &str) -> Self {
+        Self {
+            targets: targets.to_string(),
+        }
+    }
+
+    /// The bytes that answer the query: `OSC 52 ; Pc ; base64(content) ST`.
+    #[must_use]
+    pub fn reply(&self, content: &str) -> Vec<u8> {
+        format!(
+            "\x1b]52;{};{}\x1b\\",
+            self.targets,
+            super::base64::encode(content.as_bytes())
+        )
+        .into_bytes()
+    }
+}
+
 /// Actions that the terminal emulator signals to the orchestrator.
 ///
 /// After processing user input or control events, the emulator generates
@@ -534,6 +563,20 @@ pub enum EmulatorAction {
     ///
     /// This is asynchronous—the emulator doesn't block waiting for the response.
     RequestClipboardContent(Selection),
+
+    /// Answer a program's OSC 52 query with the content of a selection.
+    ///
+    /// # Contract
+    ///
+    /// **Emulator**: A program asked for the selection's content.
+    ///
+    /// **Orchestrator**: Reads the selection and writes
+    /// `report.reply(content)` to the PTY — or, if clipboard reads are not
+    /// allowed, does nothing, which programs treat as no answer.
+    ReportSelection {
+        selection: Selection,
+        report: SelectionReport,
+    },
 
     /// Enter full screen, or leave it.
     ToggleFullscreen,

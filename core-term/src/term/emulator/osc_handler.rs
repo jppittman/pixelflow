@@ -1,7 +1,8 @@
 // src/term/emulator/osc_handler.rs
 
 use super::TerminalEmulator;
-use crate::term::action::{EmulatorAction, Selection};
+use crate::term::action::{EmulatorAction, Selection, SelectionReport};
+use crate::term::base64;
 use log::debug;
 
 /// OSC 52: manipulate selection data.
@@ -56,15 +57,10 @@ impl TerminalEmulator {
 ///
 /// `c` (or no target at all, which xterm reads as its configured default) is
 /// the clipboard; `p` alone is the primary selection. A `Pd` of `?` asks for
-/// the selection's contents to be written back to the program, which would
-/// let anything that can print to the terminal read the user's clipboard, so
-/// it is refused.
+/// the selection's contents to be written back to the program; whether that
+/// is answered is the app's call (`behavior.allow_clipboard_read`).
 fn set_selection(content: &str) -> Option<EmulatorAction> {
     let (targets, payload) = content.split_once(';')?;
-    if payload == OSC_SELECTION_QUERY {
-        debug!("OSC 52: refusing a selection query");
-        return None;
-    }
     let selection = match (
         targets.is_empty() || targets.contains('c'),
         targets.contains('p'),
@@ -72,36 +68,14 @@ fn set_selection(content: &str) -> Option<EmulatorAction> {
         (false, true) => Selection::Primary,
         _ => Selection::Clipboard,
     };
-    let text = String::from_utf8(decode_base64(payload)?).ok()?;
-    Some(EmulatorAction::Copy { selection, text })
-}
-
-/// Decodes standard base64 (RFC 4648 §4), padding optional. `None` for any
-/// character outside the alphabet.
-fn decode_base64(encoded: &str) -> Option<Vec<u8>> {
-    let sextet = |c: u8| -> Option<u32> {
-        Some(u32::from(match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        }))
-    };
-    let digits = encoded.trim_end_matches('=').as_bytes();
-    let mut decoded = Vec::with_capacity(digits.len() * 3 / 4);
-    for chunk in digits.chunks(4) {
-        let mut bits = 0u32;
-        for &digit in chunk {
-            bits = (bits << 6) | sextet(digit)?;
-        }
-        // A chunk of n digits carries 6n bits, the top 8(n-1) of them data.
-        let data_bytes = chunk.len().saturating_sub(1);
-        bits <<= 6 * (4 - chunk.len());
-        decoded.extend_from_slice(&bits.to_be_bytes()[1..=data_bytes]);
+    if payload == OSC_SELECTION_QUERY {
+        return Some(EmulatorAction::ReportSelection {
+            selection,
+            report: SelectionReport::new(targets),
+        });
     }
-    Some(decoded)
+    let text = String::from_utf8(base64::decode(payload)?).ok()?;
+    Some(EmulatorAction::Copy { selection, text })
 }
 
 #[cfg(test)]
@@ -132,8 +106,22 @@ mod tests {
     }
 
     #[test]
-    fn osc_52_refuses_to_read_the_selection_back_and_ignores_garbage() {
-        assert_eq!(osc("52;c;?"), None);
+    fn osc_52_query_asks_for_the_named_selection_and_echoes_its_target() {
+        let Some(EmulatorAction::ReportSelection { selection, report }) = osc("52;c;?") else {
+            panic!("a query must ask for the selection");
+        };
+        assert_eq!(selection, Selection::Clipboard);
+        assert_eq!(report.reply("hi"), b"\x1b]52;c;aGk=\x1b\\".to_vec());
+
+        let Some(EmulatorAction::ReportSelection { selection, report }) = osc("52;p;?") else {
+            panic!("a query must ask for the selection");
+        };
+        assert_eq!(selection, Selection::Primary);
+        assert_eq!(report.reply(""), b"\x1b]52;p;\x1b\\".to_vec());
+    }
+
+    #[test]
+    fn osc_52_ignores_garbage() {
         assert_eq!(osc("52;c;not base64!"), None);
         assert_eq!(osc("52;c;/w=="), None, "0xFF is not UTF-8");
     }

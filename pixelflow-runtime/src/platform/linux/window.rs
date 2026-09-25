@@ -297,6 +297,16 @@ impl X11Window {
         }
     }
 
+    /// The selection an X atom names, if it is one this window reads.
+    #[must_use]
+    pub fn selection_named(&self, atom: xlib::Atom) -> Option<Selection> {
+        match atom {
+            atom if atom == self.atoms.clipboard => Some(Selection::Clipboard),
+            xlib::XA_PRIMARY => Some(Selection::Primary),
+            _ => None,
+        }
+    }
+
     pub fn request_paste(&self, selection: Selection) {
         let selection_atom = match selection {
             Selection::Clipboard => self.atoms.clipboard,

@@ -354,8 +354,9 @@ pub enum DisplayControl {
     ///
     /// **Sender**: Requests the content of a selection.
     ///
-    /// **Receiver**: Reads that selection and emits a `DisplayEvent::PasteData`
-    /// with the content. If it is empty or unavailable, may emit no event. A
+    /// **Receiver**: Reads that selection and emits exactly one
+    /// `DisplayEvent::PasteData` naming it — with empty text when the
+    /// selection is empty or unavailable, so every request is answered. A
     /// platform with no primary selection reads its clipboard for `Primary`.
     ///
     /// # Example Use
@@ -523,7 +524,9 @@ pub enum DisplayEvent {
     FocusLost {
         id: WindowId,
     },
+    /// The answer to one `DisplayControl::RequestPaste`.
     PasteData {
+        selection: Selection,
         text: String,
     },
     CloseRequested {

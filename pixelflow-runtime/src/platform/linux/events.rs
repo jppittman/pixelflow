@@ -154,13 +154,21 @@ unsafe fn handle_selection_request(event: &xlib::XEvent, window: &mut super::win
     xlib::XFlush(window.display);
 }
 
+/// Answers a `request_paste`. The server sends exactly one `SelectionNotify`
+/// per conversion — with no property when the selection has no owner or the
+/// owner refused — so answering each one keeps the one-answer-per-request
+/// contract.
 unsafe fn handle_selection_notify(
     event: &xlib::XEvent,
     window: &mut super::window::X11Window,
 ) -> Option<DisplayEvent> {
     let sel = event.selection;
+    let selection = window.selection_named(sel.selection)?;
     if sel.property == 0 {
-        return None;
+        return Some(DisplayEvent::PasteData {
+            selection,
+            text: String::new(),
+        });
     }
 
     let mut type_ret = 0;
@@ -184,13 +192,16 @@ unsafe fn handle_selection_notify(
         &mut prop_ret,
     );
 
-    if !prop_ret.is_null() {
-        let data = std::slice::from_raw_parts(prop_ret, nitems as usize);
-        let text = String::from_utf8_lossy(data).to_string();
-        xlib::XFree(prop_ret as *mut std::ffi::c_void);
-        return Some(DisplayEvent::PasteData { text });
+    if prop_ret.is_null() {
+        return Some(DisplayEvent::PasteData {
+            selection,
+            text: String::new(),
+        });
     }
-    None
+    let data = std::slice::from_raw_parts(prop_ret, nitems as usize);
+    let text = String::from_utf8_lossy(data).to_string();
+    xlib::XFree(prop_ret as *mut std::ffi::c_void);
+    Some(DisplayEvent::PasteData { selection, text })
 }
 
 fn handle_button_press(e: xlib::XButtonEvent, id: WindowId, state: u32) -> Option<DisplayEvent> {
