@@ -13,6 +13,13 @@
 //! emitted. Emission takes an arena rather than an AST so that the optimizer
 //! has somewhere to stand.
 //!
+//! What is emitted depends on how the block was spelled
+//! ([`Spelling`](crate::ast::Spelling)). The closure form is an expression:
+//! a `Kernel`, or a builder closure over its parameters. The items form is
+//! items: one host `fn` per entry, returning a `Kernel`, and one host
+//! `const` per `pub const`. A helper is inlined and a private `const` is
+//! folded, so neither leaves a trace.
+//!
 //! [`Kernel`]: pixelflow_core::Kernel
 
 use pixelflow_ir::OpKind;
@@ -21,12 +28,13 @@ use pixelflow_ir::optimize::Optimize;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
+use crate::ast::{ConstItem, FnItem, Role, Spelling};
 use crate::lower;
 use crate::sema::AnalyzedKernel;
 
 /// Emit arena-backend code for an analyzed kernel.
 ///
-/// On success, returns a token stream evaluating to:
+/// For the closure form, a token stream evaluating to:
 /// - zero params — a [`Kernel`](pixelflow_core::Kernel) value, built at load
 ///   time from the arena this expansion computed.
 /// - N params — a builder `|p0, ..., pN| -> Kernel` whose arguments are
@@ -37,23 +45,59 @@ use crate::sema::AnalyzedKernel;
 ///   instead. The *type* at the call site chooses, so every site that passes
 ///   an `f32` keeps folding.
 ///
+/// For the items form, one `fn name(params) -> Kernel` per entry, its
+/// parameters bound exactly as a builder's are, and one `const` per `pub
+/// const`.
+///
 /// Kernels compose as *values* — `Kernel::at`/`sum`/`select`/arithmetic — not
 /// by inlining a manifold through a macro slot, so there is no
 /// manifold-typed parameter and nothing here to lower one with.
 ///
-/// `optimizer` rewrites the lowered arena before it is emitted. It is a
+/// `optimizer` rewrites each lowered arena before it is emitted. It is a
 /// parameter rather than a branch because "do not optimize" is a value:
 /// `kernel_raw!` passes [`Identity`](pixelflow_ir::optimize::Identity), and
 /// that is the entire difference between the two macros.
 ///
-/// Returns `Err` if the body contains an operation lowering cannot express.
+/// Returns `Err` if a body contains an operation lowering cannot express.
 pub fn emit_kernel(
     analyzed: &AnalyzedKernel,
     optimizer: &mut dyn Optimize,
 ) -> Result<TokenStream, String> {
-    let param_map = lower::param_indices(analyzed);
+    match analyzed.def.spelling {
+        Spelling::Closure => {
+            let [entry] = analyzed.def.fns.as_slice() else {
+                unreachable!("the closure form parses to exactly one entry");
+            };
+            let arena_code = entry_arena(entry, analyzed, optimizer)?;
+            Ok(emit_closure(entry, &arena_code))
+        }
+        Spelling::Items => {
+            let mut items = TokenStream::new();
+            for c in analyzed.def.consts.iter().filter(|c| is_pub(&c.vis)) {
+                items.extend(emit_const(c, analyzed.consts[&c.name.to_string()]));
+            }
+            for entry in analyzed.def.fns.iter().filter(|f| f.role() == Role::Entry) {
+                let arena_code = entry_arena(entry, analyzed, optimizer)?;
+                items.extend(emit_entry(entry, &arena_code));
+            }
+            Ok(items)
+        }
+    }
+}
+
+fn is_pub(vis: &syn::Visibility) -> bool {
+    !matches!(vis, syn::Visibility::Inherited)
+}
+
+/// Lower an entry, run the optimizer over it, and emit the code that
+/// rebuilds the arena: an expression evaluating to `(arena, root)`.
+fn entry_arena(
+    entry: &FnItem,
+    analyzed: &AnalyzedKernel,
+    optimizer: &mut dyn Optimize,
+) -> Result<TokenStream, String> {
     let mut arena = ExprArena::new();
-    let root = lower::ast_to_arena(&analyzed.def.body, &param_map, &mut arena)?;
+    let root = lower::lower_entry(entry, analyzed, &mut arena)?;
 
     // Declining is ordinary and needs no arm: the lowered term stands, and a
     // kernel that reaches the runtime tier unoptimized is optimized there.
@@ -62,15 +106,18 @@ pub fn emit_kernel(
         .into_changed()
         .unwrap_or((arena, root));
 
-    let arena_code = arena_to_tokens(&arena, root);
+    Ok(arena_to_tokens(&arena, root))
+}
 
-    if analyzed.def.params.is_empty() {
-        return Ok(quote! {
+/// The closure form's expansion: a `Kernel`, or a builder closure.
+fn emit_closure(entry: &FnItem, arena_code: &TokenStream) -> TokenStream {
+    if entry.params.is_empty() {
+        return quote! {
             {
                 let (__arena, __root) = #arena_code;
                 ::pixelflow_core::Kernel::from_parts(__arena, __root)
             }
-        });
+        };
     }
 
     // The builder. A closure cannot be generic over its argument types, so
@@ -78,29 +125,104 @@ pub fn emit_kernel(
     // are inferred at the call site — `f32` from a float literal or variable,
     // `Uniform` from a handle — and each `let` binding of a builder is one
     // signature. Arguments appear in declaration order.
-    let param_names: Vec<proc_macro2::Ident> =
-        analyzed.def.params.iter().map(|p| p.name.clone()).collect();
-    let generics: Vec<proc_macro2::Ident> = (0..param_names.len())
-        .map(|i| format_ident!("__A{i}"))
-        .collect();
-    let scalar = quote! { ::pixelflow_core::__macro::ir::Scalar };
-    let arity = param_names.len();
+    let Bound {
+        names,
+        generics,
+        scalar,
+        body,
+    } = bind_params(entry, arena_code);
 
-    Ok(quote! {
+    quote! {
         {
             fn __builder< #( #generics: ::core::convert::Into<#scalar> ),* >()
                 -> impl Fn( #( #generics ),* ) -> ::pixelflow_core::Kernel
             {
-                move | #( #param_names: #generics ),* | {
-                    let (mut __arena, __root) = #arena_code;
-                    let __params: [#scalar; #arity] = [ #( #param_names.into() ),* ];
-                    let __root = __arena.substitute_params(__root, &__params);
-                    ::pixelflow_core::Kernel::from_parts(__arena, __root)
-                }
+                move | #( #names: #generics ),* | #body
             }
             __builder()
         }
-    })
+    }
+}
+
+/// An entry's expansion: a host function returning a `Kernel`, generic over
+/// its parameters exactly as a builder is, with the entry's visibility and
+/// doc comments.
+fn emit_entry(entry: &FnItem, arena_code: &TokenStream) -> TokenStream {
+    let attrs = &entry.attrs;
+    let vis = &entry.vis;
+    let name = &entry.name;
+    if entry.params.is_empty() {
+        return quote! {
+            #(#attrs)*
+            #[must_use]
+            #vis fn #name() -> ::pixelflow_core::Kernel {
+                let (__arena, __root) = #arena_code;
+                ::pixelflow_core::Kernel::from_parts(__arena, __root)
+            }
+        };
+    }
+    let Bound {
+        names,
+        generics,
+        scalar,
+        body,
+    } = bind_params(entry, arena_code);
+    quote! {
+        #(#attrs)*
+        #[must_use]
+        #vis fn #name< #( #generics: ::core::convert::Into<#scalar> ),* >( #( #names: #generics ),* )
+            -> ::pixelflow_core::Kernel
+        #body
+    }
+}
+
+/// The pieces of a parameterized expansion: the parameter names, one type
+/// parameter per name, the `Scalar` path they convert into, and the body
+/// that folds them in.
+struct Bound<'a> {
+    names: Vec<&'a proc_macro2::Ident>,
+    generics: Vec<proc_macro2::Ident>,
+    scalar: TokenStream,
+    body: TokenStream,
+}
+
+/// How an entry's parameters reach the arena: each `Param(i)` is
+/// substituted with the argument in position `i`, converted to a `Scalar`.
+fn bind_params<'a>(entry: &'a FnItem, arena_code: &TokenStream) -> Bound<'a> {
+    let names: Vec<&proc_macro2::Ident> = entry.params.iter().map(|p| &p.name).collect();
+    let generics: Vec<proc_macro2::Ident> =
+        (0..names.len()).map(|i| format_ident!("__A{i}")).collect();
+    let scalar = quote! { ::pixelflow_core::__macro::ir::Scalar };
+    let arity = names.len();
+    let body = quote! {
+        {
+            let (mut __arena, __root) = #arena_code;
+            let __params: [#scalar; #arity] = [ #( #names.into() ),* ];
+            let __root = __arena.substitute_params(__root, &__params);
+            ::pixelflow_core::Kernel::from_parts(__arena, __root)
+        }
+    };
+    Bound {
+        names,
+        generics,
+        scalar,
+        body,
+    }
+}
+
+/// A `pub const`'s host twin, holding the value `sema` evaluated. By bit
+/// pattern, for the reason [`arena_to_tokens`] gives: it is exact, and a
+/// const may be non-finite (`1.0 / 0.0`), which a decimal literal cannot
+/// spell.
+fn emit_const(item: &ConstItem, value: f32) -> TokenStream {
+    let attrs = &item.attrs;
+    let vis = &item.vis;
+    let name = &item.name;
+    let bits = value.to_bits();
+    quote! {
+        #(#attrs)*
+        #vis const #name: f32 = f32::from_bits(#bits);
+    }
 }
 
 /// Emit the arena, node for node, as code that rebuilds it at load time.
@@ -259,4 +381,64 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId) -> TokenStream {
 fn opkind_to_tokens(kind: OpKind) -> TokenStream {
     let variant = format_ident!("{}", kind.variant_name());
     quote! { ::pixelflow_core::__macro::ir::OpKind::#variant }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse;
+    use crate::sema::analyze;
+    use pixelflow_ir::optimize::Identity;
+    use quote::quote;
+
+    /// The expansion of `input`, unoptimized, as text.
+    fn expansion(input: proc_macro2::TokenStream) -> String {
+        let analyzed = analyze(parse(input).expect("parses")).expect("analyzes");
+        emit_kernel(&analyzed, &mut Identity)
+            .expect("emits")
+            .to_string()
+    }
+
+    /// The items form expands to items: a `fn` per entry with the entry's
+    /// visibility and doc comment, a `const` per `pub const`, and nothing
+    /// for a helper or a private `const`.
+    #[test]
+    fn the_items_form_expands_to_items() {
+        let code = expansion(quote! {
+            const R: f32 = 1.0;
+            /// Twice the radius.
+            pub const TWO_R: f32 = R * 2.0;
+            fn sq(x: f32) -> f32 { x * x }
+            /// The circle.
+            pub fn circle(cx: f32) -> f32 { sq(X - cx) - R }
+            pub(crate) fn plain() -> f32 { X }
+        });
+        assert!(
+            code.contains("pub const TWO_R : f32 = f32 :: from_bits ("),
+            "{code}"
+        );
+        assert!(
+            code.contains("Twice the radius."),
+            "the const's doc: {code}"
+        );
+        assert!(
+            !code.contains("const R :"),
+            "a private const is folded: {code}"
+        );
+        assert!(!code.contains("fn sq"), "a helper is inlined: {code}");
+        assert!(code.contains("The circle."), "the entry's doc: {code}");
+        assert!(code.contains("# [must_use] pub fn circle <"), "{code}");
+        assert!(code.contains("(cx : __A0)"), "{code}");
+        assert!(code.contains("pub (crate) fn plain () ->"), "{code}");
+    }
+
+    /// The closure form expands to an expression, as it always has.
+    #[test]
+    fn the_closure_form_expands_to_an_expression() {
+        let code = expansion(quote! { || X });
+        assert!(code.starts_with("{ let (__arena , __root) ="), "{code}");
+        let code = expansion(quote! { |r: f32| X - r });
+        assert!(code.contains("fn __builder <"), "{code}");
+        assert!(code.ends_with("__builder () }"), "{code}");
+    }
 }

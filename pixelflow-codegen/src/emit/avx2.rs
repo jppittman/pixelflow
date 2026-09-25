@@ -27,6 +27,7 @@
 use super::x86_64;
 use super::x86_64::{Disp, Imm32, Mem, NoDisp, frame_slot, ptr};
 use super::{AsmProgram, EncodedInst, Gpr, PtrReg, Reg, SourceOperand, assemble, unimplemented_op};
+use crate::error::CompileError;
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
 
@@ -392,15 +393,20 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::Con
 /// `dst = splat(base[offset])` at 256 bits: `vbroadcastss ymm<dst>, [base +
 /// 4*offset]` (VEX.256.66.0F38.W0 18 /r). `base` is the block's address,
 /// wherever the allocator keeps that pointer value.
-pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, base: PtrReg, offset: u16) {
-    AsmProgram::from([Vex::m0f38_66(0x18).rm(
-        dst.0,
-        Mem {
-            base,
-            disp: Imm32(i32::from(offset) * 4),
-        },
-    )])
-    .assemble(code);
+///
+/// # Errors
+///
+/// [`CompileError::BudgetExceeded`] when the element lies past a `disp32`
+/// ([`x86_64::block_element`]).
+pub fn emit_uniform_load(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    base: PtrReg,
+    offset: u64,
+) -> Result<(), CompileError> {
+    let element = x86_64::block_element(base, offset)?;
+    AsmProgram::from([Vex::m0f38_66(0x18).rm(dst.0, element)]).assemble(code);
+    Ok(())
 }
 
 /// `dst = splat(base[idx])` at 256 bits, the index being the same in every
@@ -480,13 +486,13 @@ pub fn emit_unary(code: &mut Vec<u8>, unary: super::Unary, pool: &mut x86_64::Co
 
 /// How many registers this backend's encodings need beyond their operands.
 ///
-/// `Neg`/`Abs` build a sign mask, and the select blends through a temporary;
+/// `Neg`/`Abs` build a sign mask, and the `If` blends through a temporary;
 /// every other encoding here is a single non-destructive VEX instruction.
 pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
         ScheduledOp::Unary(OpKind::Neg | OpKind::Abs, _) => 1,
-        ScheduledOp::Ternary(OpKind::Select, ..) => 1,
+        ScheduledOp::Ternary(OpKind::If, ..) => 1,
         // The gather's truncated-index lanes and its all-ones mask, which the
         // instruction requires distinct from each other and from `dst`.
         ScheduledOp::Gather(..) => 2,
@@ -580,7 +586,7 @@ pub fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount
 /// `tmp` is the allocator's temp for this instruction, which it picks disjoint
 /// from every operand — the `debug_assert` restates that here, where the
 /// instruction would silently blend garbage if it ever failed.
-pub fn emit_select(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg, tmp: Option<Reg>) {
+pub fn emit_if(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg, tmp: Option<Reg>) {
     let tmp = super::declared_temp(tmp);
     debug_assert!(tmp.0 != dst.0 && tmp.0 != if_true.0 && tmp.0 != if_false.0);
     vandps(code, tmp.0, dst.0, if_true.0); // tmp = mask & if_true
@@ -802,7 +808,7 @@ mod tests {
 
         /// Bit-exact check for mask results: an all-ones/all-zeros lane is
         /// NaN under float subtraction, so `check`'s epsilon comparison can't
-        /// be used for compares/selects' underlying mask bit pattern.
+        /// be used for compares/`If`s' underlying mask bit pattern.
         fn check_bits(got: [f32; 8], want: impl Fn(usize) -> u32, tag: &str) {
             for (i, &g) in got.iter().enumerate() {
                 let w = want(i);
@@ -923,18 +929,18 @@ mod tests {
         }
 
         #[test]
-        fn emit_select_blends_if_true_and_if_false_by_the_mask() {
+        fn emit_if_blends_if_true_and_if_false_by_the_mask() {
             skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Lt, Reg(5), X, Y); // mask
             emit_mov(&mut c, Reg(6), Reg(5));
-            emit_select(&mut c, Reg(6), X, Y, Some(TEMP)); // dst = mask ? x : y
+            emit_if(&mut c, Reg(6), X, Y, Some(TEMP)); // dst = mask ? x : y
             emit_mov(&mut c, X, Reg(6));
             check(
                 run(&c, xs, ys, zs),
                 |i| if xs[i] < ys[i] { xs[i] } else { ys[i] },
-                "select",
+                "if",
             );
         }
 
@@ -1192,7 +1198,7 @@ pub(crate) mod driver {
     /// SysV has no callee-saved vector registers and the collapse ABI passes
     /// no vector, so every one of the sixteen is the allocator's. The gather
     /// borrows two of them across its own sequence (the truncated indices
-    /// and the mask), the sign mask and the select blend borrow one — all
+    /// and the mask), the sign mask and the `If` blend borrow one — all
     /// reservations the allocator makes for one instruction, so all of them
     /// are its the rest of the time.
     const AVX2_FILE: regalloc::RegisterFile = regalloc::RegisterFile {
@@ -1350,7 +1356,7 @@ pub(crate) mod driver {
                     );
                 }
                 ResolvedOp::Uniform { dst, base, offset } => {
-                    super::emit_uniform_load(code, *dst, *base, *offset);
+                    super::emit_uniform_load(code, *dst, *base, *offset)?;
                 }
                 ResolvedOp::Context { dst, slot } => {
                     let ctx = self
@@ -1397,13 +1403,13 @@ pub(crate) mod driver {
                     }
                     super::emit_binary(code, OpKind::Add, *dst, *dst, *c);
                 }
-                ResolvedOp::Select {
+                ResolvedOp::If {
                     dst,
                     if_true,
                     if_false,
                 } => {
                     // setup_mov already placed the vector mask in dst.
-                    super::emit_select(code, *dst, *if_true, *if_false, plan.scratch.temp(0));
+                    super::emit_if(code, *dst, *if_true, *if_false, plan.scratch.temp(0));
                 }
             }
             Ok(())
@@ -1481,7 +1487,7 @@ pub(crate) mod driver {
             self.consts.finish(asm);
         }
 
-        // Select short-circuit guards: vmovmskps -> eax[7:0], then a test
+        // If short-circuit guards: vmovmskps -> eax[7:0], then a test
         // of the low byte (al == 0xFF for all-true — see
         // `super::emit_cmp_al_imm8`'s doc for why the sign-extending
         // `cmp eax, imm8` would not do).
@@ -1492,9 +1498,9 @@ pub(crate) mod driver {
             super::emit_movmskps_eax(&mut asm.code, test.reg);
             match test.arm {
                 // ZF set when eax == 0: no lane is true, so the true arm is dead.
-                SelectArm::True => x86_64::emit_test_eax(&mut asm.code),
+                IfArm::True => x86_64::emit_test_eax(&mut asm.code),
                 // ZF set when al == 0xFF: every lane is true, so the false arm is.
-                SelectArm::False => super::emit_cmp_al_imm8(&mut asm.code, 0xFF),
+                IfArm::False => super::emit_cmp_al_imm8(&mut asm.code, 0xFF),
             }
             asm.push(x86::Jcc::je(label));
         }
@@ -1579,7 +1585,7 @@ pub(crate) mod driver {
         }
 
         fn emit_ret(&mut self, code: &mut Vec<u8>) {
-            AsmProgram::from([x86::Inst::Ret]).assemble(code);
+            x86::return_to_caller(code);
         }
     }
 }

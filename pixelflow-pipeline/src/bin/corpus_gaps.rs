@@ -464,7 +464,7 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
         Const(u32),
         Param(u8),
         Buffer(u16),
-        Uniform(u16),
+        Uniform(u64),
         Op(OpKind, Vec<u32>),
         /// A fold's identity is its metadata plus its body — the bits are
         /// the metadata, and two folds sharing them fold the same way.
@@ -665,7 +665,7 @@ fn census(arena: &ExprArena, root: ExprId) -> Census {
         if k == OpKind::Gather || k == OpKind::RawGather {
             gathers += 1;
         }
-        if let ExprNode::Ternary(OpKind::Select, m, a, b) = arena.node(id) {
+        if let ExprNode::Ternary(OpKind::If, m, a, b) = arena.node(id) {
             selects.push((m, a, b));
         }
     }

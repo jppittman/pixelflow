@@ -70,7 +70,7 @@ fn packed_scene(color: &Rgba) -> Scene {
 }
 
 /// What fraction of the frame the sphere covers — the area whose reflected
-/// world the select's guard gets to skip in every other batch.
+/// world the `If`'s guard gets to skip in every other batch.
 fn sphere_coverage() -> f64 {
     let ray = ray();
     let mask = sphere(&ray).mask().select(&k(1.0), &k(0.0));

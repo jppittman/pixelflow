@@ -7,7 +7,7 @@
 //! `x86_64.rs`'s, shared with AVX2.
 //!
 //! Scope: arithmetic, FMA, sqrt/recip/rsqrt, min/max, bitwise, comparisons,
-//! select, constant broadcast, the integer bit-manipulation atoms
+//! `If`, constant broadcast, the integer bit-manipulation atoms
 //! (`IAdd`/`BitAnd`/`BitOr`/`TruncToInt`/`IntToFloat`), and `ShiftImm` (see
 //! `emit_shift_imm`) — so the exp/log lowering reaches this backend intact.
 //! Comparisons go through the k-register class (`vcmpps` -> `vpmovm2d`, see
@@ -25,8 +25,9 @@
 //! red zone).
 
 use super::x86_64;
-use super::x86_64::{Disp, Imm32, Mem, NoDisp, frame_slot};
+use super::x86_64::{Disp, Mem, NoDisp, frame_slot};
 use super::{AsmProgram, EncodedInst, Gpr, KReg, PtrReg, Reg, assemble, unimplemented_op};
+use crate::error::CompileError;
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
 
@@ -276,7 +277,7 @@ const UNUSED_VVVV: u8 = 0;
 /// How many registers this backend's encodings need beyond their operands.
 ///
 /// Only the `Neg`/`Abs` sign mask: EVEX is non-destructive and `vpternlogd`
-/// blends a select with no temporary.
+/// blends an `If` with no temporary.
 pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
@@ -316,7 +317,7 @@ pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
 /// A comparison's `vcmpps` destination — `k1`, chosen by hand before this
 /// work and now a `RegisterFile::mask_scratch` reservation — and a remainder
 /// store's writemask. Every other op either has no mask (arithmetic) or
-/// reads the mask as an ordinary vector (`Select`).
+/// reads the mask as an ordinary vector (`If`).
 pub(crate) fn mask_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
@@ -478,15 +479,20 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::Con
 /// [`emit_const`]'s is, so EVEX's compressed-`disp8` scaling never enters
 /// into it. `base` is the block's address, wherever the allocator keeps
 /// that pointer value.
-pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, base: PtrReg, offset: u16) {
-    AsmProgram::from([Evex::m0f38_66(0x18).rm(
-        dst.0,
-        Mem {
-            base,
-            disp: Imm32(i32::from(offset) * 4),
-        },
-    )])
-    .assemble(code);
+///
+/// # Errors
+///
+/// [`CompileError::BudgetExceeded`] when the element lies past a `disp32`
+/// ([`x86_64::block_element`]).
+pub fn emit_uniform_load(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    base: PtrReg,
+    offset: u64,
+) -> Result<(), CompileError> {
+    let element = x86_64::block_element(base, offset)?;
+    AsmProgram::from([Evex::m0f38_66(0x18).rm(dst.0, element)]).assemble(code);
+    Ok(())
 }
 
 /// `dst = splat(base[idx])` at 512 bits, the index being the same in every
@@ -534,7 +540,7 @@ pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Re
 }
 
 // =============================================================================
-// Masks & select — a mask is an ordinary vector (all-ones / all-zeros lanes) in
+// Masks & `If` — a mask is an ordinary vector (all-ones / all-zeros lanes) in
 // the regular zmm register file, exactly like NEON. It flows through the shared
 // allocator as a normal value; the k-register these encoders use transiently
 // (a `vcmpps`/`vptestmd` destination, immediately widened or read into the
@@ -602,7 +608,7 @@ pub fn emit_compare(code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2], k:
 /// One `vpternlogd dst, if_true, if_false, 0xCA` (EVEX.512.66.0F3A.W0 25 /r ib):
 /// the truth table 0xCA computes `A?B:C` per bit with A=dst(mask), B=if_true,
 /// C=if_false, i.e. a per-lane select for an all-ones/all-zeros mask.
-pub fn emit_select(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg) {
+pub fn emit_if(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg) {
     assemble(
         code,
         [Evex::m0f3a_66(0x25)
@@ -611,7 +617,7 @@ pub fn emit_select(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg) {
     );
 }
 
-/// Set flags from a vector mask for the Select short-circuit guards.
+/// Set flags from a vector mask for the If short-circuit guards.
 ///
 /// `vptestmd k, mask, mask` sets `k[i]` for each nonzero lane — `k` is this
 /// guard's `RegisterFile::mask_guard_temps` reservation; `kortestw k,k` then
@@ -1233,7 +1239,7 @@ pub(crate) mod driver {
         scratch: regalloc::RegSet::range(0, 32),
         // Nothing. Every register this backend's encodings destroy is a
         // per-instruction reservation, borrowed only across the one
-        // instruction that needs it. The select needs none — `vpternlogd`
+        // instruction that needs it. The `If` needs none — `vpternlogd`
         // consumes its three operands.
         fixed: &[],
         temps_for: super::temps_for,
@@ -1392,7 +1398,7 @@ pub(crate) mod driver {
                     );
                 }
                 ResolvedOp::Uniform { dst, base, offset } => {
-                    super::emit_uniform_load(code, *dst, *base, *offset);
+                    super::emit_uniform_load(code, *dst, *base, *offset)?;
                 }
                 ResolvedOp::Context { dst, slot } => {
                     let ctx = self
@@ -1448,7 +1454,7 @@ pub(crate) mod driver {
                     }
                     super::emit_binary(code, OpKind::Add, *dst, *dst, *c);
                 }
-                ResolvedOp::Select {
+                ResolvedOp::If {
                     dst,
                     if_true,
                     if_false,
@@ -1535,7 +1541,7 @@ pub(crate) mod driver {
             self.consts.finish(asm);
         }
 
-        // Select short-circuit guards: reduce the vector mask to flags (vptestmd +
+        // If short-circuit guards: reduce the vector mask to flags (vptestmd +
         // kortestw) and branch. jz = all-false (skip true arm); jc = all-true (skip
         // false arm). The k-register spelling of AVX2's `vmovmskps` guards.
         /// [`MaskTest::scratch`] is unused: this tier reduces the mask with
@@ -1549,9 +1555,9 @@ pub(crate) mod driver {
             // condition rather than a different reduction.
             asm.push(match test.arm {
                 // ZF set when k1 == 0: no lane is true, so the true arm is dead.
-                SelectArm::True => x86::Jcc::je(label),
+                IfArm::True => x86::Jcc::je(label),
                 // CF set when k1 == 0xFFFF: every lane is, so the false arm is.
-                SelectArm::False => x86::Jcc::jb(label),
+                IfArm::False => x86::Jcc::jb(label),
             });
         }
 
@@ -1644,7 +1650,7 @@ pub(crate) mod driver {
         }
 
         fn emit_ret(&mut self, code: &mut Vec<u8>) {
-            AsmProgram::from([x86::Inst::Ret]).assemble(code);
+            x86::return_to_caller(code);
         }
     }
 

@@ -49,14 +49,14 @@
 //! a backend's business. Expanding them here means no emitter ever contains
 //! transcendental assembly, the polynomial has one home, and precision is a
 //! property of this code rather than of whichever backend you landed on.
-//! The expansions deliberately avoid `MulAdd` and `Select`, staying inside the
+//! The expansions deliberately avoid `MulAdd` and `If`, staying inside the
 //! differentiable primitive set so `lower_dwrt` can still get through them.
 //!
-//! They may use `Select`. [`legalize`] runs `lower_dwrt` *before*
+//! They may use `If`. [`legalize`] runs `lower_dwrt` *before*
 //! `expand_transcendentals` — the chain rule manufactures `Sin`/`Cos` nodes
 //! that the transcendental pass must still lower — so an expansion is only ever
 //! evaluated, never differentiated, and derivatives are taken against the
-//! symbolic rules in `diff_node` instead. (`lower_dwrt` carries a `Select` rule
+//! symbolic rules in `diff_node` instead. (`lower_dwrt` carries an `If` rule
 //! regardless: it blends the branch derivatives on the primal mask.)
 //!
 //! Nothing re-fuses `mul`+`add` into `MulAdd` afterwards — see `horner_step`.
@@ -840,7 +840,7 @@ impl<'a> Substitution<'a> {
 ///
 /// This is the runtime peer of the e-graph `ChainRule` (pixelflow-search):
 /// same algebra, applied directly to the arena with no e-graph dependency.
-/// Derivatives of piecewise ops (`Min`/`Max`/`Select`/`Clamp`/`Abs`) mirror
+/// Derivatives of piecewise ops (`Min`/`Max`/`If`/`Clamp`/`Abs`) mirror
 /// the `Jet2` forward-mode semantics in pixelflow-core — a mask on the primal
 /// values selecting between branch derivatives — so a kernel differentiated
 /// here matches the combinator-over-`Jet2` path within numeric tolerance.
@@ -906,7 +906,7 @@ fn holds_dwrt(arena: &ExprArena) -> bool {
 ///
 /// Fully iterative — no recursion over expression depth, so arbitrarily deep
 /// kernels cannot overflow the stack. Two passes: (1) mark the nodes whose
-/// derivative a rule actually consumes (lazy per op: `Select` masks and
+/// derivative a rule actually consumes (lazy per op: `If` masks and
 /// comparison operands are never differentiated), walking an explicit stack;
 /// (2) compute marked derivatives in ascending id order — the arena is
 /// append-only, so children always precede parents.
@@ -1038,7 +1038,7 @@ fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
                 stack.push(c);
             }
             // The mask is never differentiated.
-            OpKind::Select => {
+            OpKind::If => {
                 stack.push(b);
                 stack.push(c);
             }
@@ -1049,7 +1049,7 @@ fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
         ExprNode::Reduce { .. } => {}
         // No rule: differentiating a branch is not a question this design
         // answers (a `Guard`'s two arms are two different functions, and
-        // `Select`'s own rule below blends their derivatives on the primal
+        // `If`'s own rule below blends their derivatives on the primal
         // mask — whether a `Guard` should do the same, or refuse, is a
         // decision for whichever stage first composes `Guard` with the
         // calculus, not G1). `diff_node` raises the error for the node
@@ -1217,13 +1217,13 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
                 let da = dchild(memo, a);
                 let db = dchild(memo, b);
                 let mask = arena.push_binary(OpKind::Lt, a, b);
-                Ok(arena.push_ternary(OpKind::Select, mask, da, db))
+                Ok(arena.push_ternary(OpKind::If, mask, da, db))
             }
             OpKind::Max => {
                 let da = dchild(memo, a);
                 let db = dchild(memo, b);
                 let mask = arena.push_binary(OpKind::Gt, a, b);
-                Ok(arena.push_ternary(OpKind::Select, mask, da, db))
+                Ok(arena.push_ternary(OpKind::If, mask, da, db))
             }
             // Masks are step functions: zero derivative almost everywhere.
             OpKind::Lt | OpKind::Le | OpKind::Gt | OpKind::Ge | OpKind::Eq | OpKind::Ne => {
@@ -1278,11 +1278,11 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
                 let prod = d_add(arena, t1, t2);
                 Ok(d_add(arena, prod, dc))
             }
-            // Blend the branch derivatives on the primal mask (Jet2 select).
-            OpKind::Select => {
+            // Blend the branch derivatives on the primal mask (Jet2 `If`).
+            OpKind::If => {
                 let db = dchild(memo, b);
                 let dc = dchild(memo, c);
-                Ok(arena.push_ternary(OpKind::Select, a, db, dc))
+                Ok(arena.push_ternary(OpKind::If, a, db, dc))
             }
             OpKind::Gather => rules.tabulation(arena, &[b, c]),
             _ => Err("lower_dwrt: no derivative rule for this ternary op"),
@@ -1295,7 +1295,7 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
         // this lowering is a *fallback*; the place for it is the rule set,
         // where the e-graph can also decline it.
         ExprNode::Reduce { .. } => Err("lower_dwrt: no derivative rule for a bounded fold"),
-        // `Select`'s rule blends the branch derivatives on the primal mask;
+        // `If`'s rule blends the branch derivatives on the primal mask;
         // whether a `Guard` should do the same or refuse outright is a
         // question for whichever stage first composes `Guard` with the
         // calculus. G1 only makes the node constructible, so this declines
@@ -1472,8 +1472,8 @@ pub const ATAN_MINIMAX: [f32; 4] = [0.999_268_04, -0.321_431_33, 0.146_614_41, -
 ///
 /// Reduces to a ratio in [-1,1] (swapping y/x when |y|>|x|), a degree-7 odd
 /// polynomial for atan on that interval, then
-/// quadrant fix-ups via `Select` on comparison masks. Uses `Select`/`Lt`/`Gt`/
-/// `Ge`/`Recip` — all primitives the value path emits. (Like other Select-using
+/// quadrant fix-ups via `If` on comparison masks. Uses `If`/`Lt`/`Gt`/
+/// `Ge`/`Recip` — all primitives the value path emits. (Like other If-using
 /// expansions this is value-path only; the jet path has no Ternary rule.)
 fn expand_atan2(arena: &mut ExprArena, y: ExprId, x: ExprId) -> ExprId {
     let pi = arena.push_const(core::f32::consts::PI);
@@ -1489,7 +1489,7 @@ fn expand_atan2(arena: &mut ExprArena, y: ExprId, x: ExprId) -> ExprId {
     let recip_x = arena.push_unary(OpKind::Recip, x);
     let x_over_y = arena.push_binary(OpKind::Mul, x, recip_y);
     let y_over_x = arena.push_binary(OpKind::Mul, y, recip_x);
-    let ratio = arena.push_ternary(OpKind::Select, swap, x_over_y, y_over_x);
+    let ratio = arena.push_ternary(OpKind::If, swap, x_over_y, y_over_x);
 
     // atan(ratio) on [-1,1]: ratio · Horner(c7,c5,c3,c1)(ratio²).
     let r2 = arena.push_binary(OpKind::Mul, ratio, ratio);
@@ -1503,17 +1503,17 @@ fn expand_atan2(arena: &mut ExprArena, y: ExprId, x: ExprId) -> ExprId {
     // If swapped, result is ±π/2 − atan_small (sign from ratio).
     let ratio_nonneg = arena.push_binary(OpKind::Ge, ratio, zero);
     let neg_half_pi = arena.push_unary(OpKind::Neg, half_pi);
-    let signed_half = arena.push_ternary(OpKind::Select, ratio_nonneg, half_pi, neg_half_pi);
+    let signed_half = arena.push_ternary(OpKind::If, ratio_nonneg, half_pi, neg_half_pi);
     let swapped_val = arena.push_binary(OpKind::Sub, signed_half, atan_small);
-    let atan_val = arena.push_ternary(OpKind::Select, swap, swapped_val, atan_small);
+    let atan_val = arena.push_ternary(OpKind::If, swap, swapped_val, atan_small);
 
     // Quadrant fix-up: if x < 0, add ±π (sign from y).
     let x_neg = arena.push_binary(OpKind::Lt, x, zero);
     let y_neg = arena.push_binary(OpKind::Lt, y, zero);
     let neg_pi = arena.push_unary(OpKind::Neg, pi);
-    let adjust = arena.push_ternary(OpKind::Select, y_neg, neg_pi, pi);
+    let adjust = arena.push_ternary(OpKind::If, y_neg, neg_pi, pi);
     let adjusted = arena.push_binary(OpKind::Add, atan_val, adjust);
-    arena.push_ternary(OpKind::Select, x_neg, adjusted, atan_val)
+    arena.push_ternary(OpKind::If, x_neg, adjusted, atan_val)
 }
 
 /// `2^x` as a primitive subgraph.
@@ -1555,7 +1555,7 @@ fn expand_exp2(arena: &mut ExprArena, arg_x: ExprId) -> ExprId {
     // Outside domain (NaN input), return NaN. Check original arg_x, not clamped x.
     let is_not_nan = arena.push_binary(OpKind::Eq, arg_x, arg_x);
     let nan = arena.push_const(f32::NAN);
-    arena.push_ternary(OpKind::Select, is_not_nan, val, nan)
+    arena.push_ternary(OpKind::If, is_not_nan, val, nan)
 }
 
 /// `log2(x)` as a primitive subgraph (documented domain x > 0).
@@ -1570,7 +1570,7 @@ fn expand_exp2(arena: &mut ExprArena, arg_x: ExprId) -> ExprId {
 /// via the split constant `log2 e = 1 + LOG2EA` to avoid the rounding from one
 /// full-width multiply. Accurate to ~1 ulp over the reduced range.
 ///
-/// Uses `Select` on a `Ge` mask for the range reduction, so (like the other
+/// Uses `If` on a `Ge` mask for the range reduction, so (like the other
 /// bit-manipulating expansions) this is value-path only.
 fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     // Reinterpret x's bits as int (free) and extract exponent: e = (bits >> 23) - 127.
@@ -1592,10 +1592,10 @@ fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     let reduce = arena.push_binary(OpKind::Ge, m, sqrt2);
     let half = arena.push_const(0.5);
     let m_halved = arena.push_binary(OpKind::Mul, m, half);
-    let m = arena.push_ternary(OpKind::Select, reduce, m_halved, m);
+    let m = arena.push_ternary(OpKind::If, reduce, m_halved, m);
     let one = arena.push_const(1.0);
     let e_bumped = arena.push_binary(OpKind::Add, e, one);
-    let e = arena.push_ternary(OpKind::Select, reduce, e_bumped, e);
+    let e = arena.push_ternary(OpKind::If, reduce, e_bumped, e);
 
     let t = arena.push_binary(OpKind::Sub, m, one);
 
@@ -1630,7 +1630,7 @@ fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     let zero = arena.push_const(0.0);
     let in_domain = arena.push_binary(OpKind::Lt, zero, x);
     let nan = arena.push_const(f32::NAN);
-    arena.push_ternary(OpKind::Select, in_domain, val, nan)
+    arena.push_ternary(OpKind::If, in_domain, val, nan)
 }
 
 /// Largest `|x|` for which `sin`/`cos`/`tan` return a value. Beyond it they
@@ -1826,7 +1826,7 @@ fn expand_sin_phase(arena: &mut ExprArena, x: ExprId, phase: f32) -> ExprId {
     let abs_x = arena.push_unary(OpKind::Abs, x);
     let in_domain = arena.push_binary(OpKind::Lt, abs_x, limit);
     let nan = arena.push_const(f32::NAN);
-    arena.push_ternary(OpKind::Select, in_domain, s, nan)
+    arena.push_ternary(OpKind::If, in_domain, s, nan)
 }
 
 /// `acc·x + add` as one `MulAdd` node.
@@ -1860,7 +1860,7 @@ fn expand_sin_phase(arena: &mut ExprArena, x: ExprId, phase: f32) -> ExprId {
 /// less accurate than two, so the FMA tiers move toward the true value, not
 /// away from it, and the polynomial's range guarantees (`|sin| ≤ 1`, the
 /// `TRIG_DOMAIN` NaN edge) are unaffected — they come from the reduction and
-/// the `Select`, neither of which is a Horner step.
+/// the `If`, neither of which is a Horner step.
 fn horner_step(arena: &mut ExprArena, acc: ExprId, x: ExprId, add: ExprId) -> ExprId {
     arena.push_ternary(OpKind::MulAdd, acc, x, add)
 }

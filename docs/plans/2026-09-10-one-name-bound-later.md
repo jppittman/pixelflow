@@ -141,7 +141,7 @@ goal is that there is one kind of name.
   puts extents in, because the address arithmetic was folded against them.
   Those are two different binding times behaving correctly, and a unified name
   must keep the difference.
-- `Select` semantics, the floating-point contract, and the fold's denotation
+- `If` semantics, the floating-point contract, and the fold's denotation
   are untouched.
 
 ## 6. Order

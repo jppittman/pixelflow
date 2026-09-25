@@ -62,30 +62,85 @@ use pixelflow_ir::optimize::{Identity, Optimize, Rewritten};
 use pixelflow_search::Saturate;
 use proc_macro::TokenStream;
 
-/// The `kernel!` macro: closure syntax for a [`Kernel`](pixelflow_core::Kernel),
+/// The plan that owns the constructs the front end refuses by phase: a
+/// refusal of one names the phase that brings it.
+pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
+
+/// The `kernel!` macro: the language, as a block of items or as a closure,
 /// optimized by the e-graph at macro-expansion time.
 ///
-/// - Zero params → a `Kernel` value.
-/// - N params → a builder closure `move |p0: f32, ...| -> Kernel` that
-///   constant-folds its arguments into the fragment.
+/// # The items form
 ///
-/// Kernels compose as values — `Kernel::at`/`sum`/`select`/arithmetic — so
-/// there is no manifold-typed parameter. Derivatives (`DX`/`DY`) become
-/// symbolic `Dwrt` nodes, resolved by the e-graph here when it can and by
-/// codegen otherwise.
+/// A block of `const` items and `fn` items
+/// (docs/plans/2026-09-25-the-language-is-kernel.md §1.2):
 ///
-/// # Syntax
-///
-/// ```ignore
-/// kernel!(|param1: f32, param2: f32, ...| expression)
-/// ```
-///
-/// # Example
+/// - A `pub fn name(params) -> f32 { body }` is an **entry**: the macro
+///   emits a host `pub fn name(params) -> Kernel`. Its parameters are bound
+///   exactly as a builder's are, through `Into<Scalar>` (see below).
+/// - A private `fn` is a **helper**: type-checked once, inlined at each call.
+///   Helpers may call helpers; a cycle is refused, because the language is a
+///   DAG. `X` and `Y` appear only in entries — a helper takes its
+///   coordinates as arguments, so that applying it to a shifted coordinate
+///   warps it.
+/// - A `const NAME: f32 = expr;` is evaluated at expansion, per operation in
+///   `f32`, from literals, other consts, `+ - * /`, unary `-` and
+///   parentheses. A `pub const` is also emitted as a host `pub const`.
 ///
 /// ```ignore
 /// use pixelflow_compiler::kernel;
 /// use pixelflow_core::{Kernel, Lattice};
 ///
+/// kernel! {
+///     pub const UNIT: f32 = 1.0;
+///
+///     /// The distance from `(cx, cy)`; a function of its arguments.
+///     fn dist(x: f32, y: f32, cx: f32, cy: f32) -> f32 {
+///         let dx = x - cx;
+///         let dy = y - cy;
+///         (dx * dx + dy * dy).sqrt()
+///     }
+///
+///     /// The signed distance to the circle: the entry reads `X` and `Y`.
+///     pub fn circle(cx: f32, cy: f32, r: f32) -> f32 {
+///         dist(X, Y, cx, cy) - r
+///     }
+///
+///     /// One inside the unit disc, zero outside; a choice is spelled `if`.
+///     pub fn disc(cx: f32, cy: f32) -> f32 {
+///         if dist(X, Y, cx, cy) < UNIT { UNIT } else { 0.0 }
+///     }
+/// }
+///
+/// let unit_circle: Kernel = circle(0.0, 0.0, UNIT);
+/// let plane = Lattice::frame(64, 64).bake(&unit_circle);
+/// ```
+///
+/// # Types
+///
+/// Every expression is an `f32` or a `bool`. A comparison (`<`, `<=`, `>`,
+/// `>=`, `==`, `!=`) gives a `bool`; `&` and `|` combine two `bool`s; an
+/// `if c { a } else { b }` chooses by one, and both arms have the same type.
+/// A `bool` where an `f32` is expected, or the reverse, is a type error at
+/// expansion: `X.select(Y, 7.0)` used to blend a number as a mask. The IR
+/// keeps one lane for both; the type lives in the front end.
+///
+/// `if` is the choice. `.select(a, b)` still lowers to the same node this
+/// phase, and Phase B of the plan removes it.
+///
+/// # The closure form
+///
+/// ```ignore
+/// kernel!(|param1: f32, param2: f32, ...| expression)
+/// ```
+///
+/// Sugar for a block with one entry, whose type is inferred, and the
+/// expansion is an expression rather than an item:
+///
+/// - Zero params → a `Kernel` value.
+/// - N params → a builder closure `move |p0: f32, ...| -> Kernel` that
+///   constant-folds its arguments into the fragment.
+///
+/// ```ignore
 /// let circle = kernel!(|cx: f32, cy: f32, r: f32| {
 ///     let dx = X - cx;
 ///     let dy = Y - cy;
@@ -96,15 +151,21 @@ use proc_macro::TokenStream;
 /// let plane = Lattice::frame(64, 64).bake(&unit_circle);
 /// ```
 ///
+/// Kernels compose as values — `Kernel::at`/`sum`/`select`/arithmetic — so
+/// there is no manifold-typed parameter. Derivatives (`DX`/`DY`) become
+/// symbolic `Dwrt` nodes, resolved by the e-graph here when it can and by
+/// codegen otherwise.
+///
 /// # Parameters
 ///
-/// A builder's arguments are anything `Into<Scalar>`, and the type at the
-/// call site decides what the parameter is. An `f32` is folded into the
-/// fragment as a constant, so `circle(0.0, 0.0, 1.0)` is the same kernel it
-/// always was. A [`Uniform`](pixelflow_core::Uniform) handle makes the
-/// parameter an *argument* of the compiled kernel instead — invariant across
-/// the lattice, bound per call from a `UniformBlock`, never folded — so a
-/// scene transform or a cursor position moves without a recompile:
+/// An entry's arguments (a builder's too) are anything `Into<Scalar>`, and
+/// the type at the call site decides what the parameter is. An `f32` is
+/// folded into the fragment as a constant, so `circle(0.0, 0.0, 1.0)` is the
+/// same kernel it always was. A [`Uniform`](pixelflow_core::Uniform) handle
+/// makes the parameter an *argument* of the compiled kernel instead —
+/// invariant across the lattice, bound per call from a `UniformBlock`, never
+/// folded — so a scene transform or a cursor position moves without a
+/// recompile:
 ///
 /// ```ignore
 /// let cx = Uniform::new(0.0);
@@ -116,9 +177,11 @@ use proc_macro::TokenStream;
 ///
 /// # Pipeline
 ///
-/// 1. **Parser**: closure syntax → AST
-/// 2. **Semantic analysis**: symbol resolution, method validation
-/// 3. **Arena lowering**: the AST becomes an `ExprArena`
+/// 1. **Parser**: items or closure syntax → AST
+/// 2. **Semantic analysis**: symbol resolution, types, `const` evaluation,
+///    the call graph
+/// 3. **Arena lowering**: each entry's body becomes an `ExprArena`, helpers
+///    inlined
 /// 4. **Optimization**: e-graph saturation + latency-prior extraction, on
 ///    the arena. A kernel carrying a `Dwrt` declines here and is optimized
 ///    at bake time instead, so composition still gets the chain rule.
@@ -234,6 +297,7 @@ fn expand(input: TokenStream, optimizer: &mut dyn Optimize) -> TokenStream {
 #[cfg(test)]
 mod every_advertised_method_compiles {
     use crate::lower::LIBRARY_METHODS;
+    use crate::sema::{MethodTyping, method_typing};
     use crate::{Identity, Optimize, emit, macro_tier, parser, sema};
     use pixelflow_ir::{OpKind, known_method_names};
     use proc_macro2::Span;
@@ -250,13 +314,27 @@ mod every_advertised_method_compiles {
         KernelRaw,
     }
 
-    /// Expand `X.<method>(X, ..)` through `which` macro's own pipeline —
-    /// the same calls [`kernel`] and [`kernel_raw`] make — and report
-    /// whether it yields code.
+    /// Expand a well-typed call of `method` through `which` macro's own
+    /// pipeline — the same calls [`kernel`] and [`kernel_raw`] make — and
+    /// report whether it yields code.
+    ///
+    /// Well-typed by `sema`'s own typing of the op: an `f32` operand is `X`,
+    /// a `bool` one is `X.lt(X)`. The sweep asks the stage under test what
+    /// it takes, which is fine for what this checks — that every stage has
+    /// a path for every advertised name — and the typing itself is pinned
+    /// by `sema`'s tests.
     fn expand(which: Macro, method: &str, arg_count: usize) -> Result<(), String> {
         let name = Ident::new(method, Span::call_site());
-        let args = (0..arg_count).map(|_| quote!(X));
-        let body = quote! { || X.#name(#(#args),*) };
+        let number = quote!(X);
+        let mask = quote!(X.lt(X));
+        let (receiver, args): (proc_macro2::TokenStream, Vec<proc_macro2::TokenStream>) =
+            match OpKind::from_method_call(method, arg_count).map(method_typing) {
+                Some(MethodTyping::Choice) => (mask, vec![number.clone(), number]),
+                Some(MethodTyping::Comparison) | Some(MethodTyping::Arithmetic) | None => {
+                    (number.clone(), vec![number; arg_count])
+                }
+            };
+        let body = quote! { || #receiver.#name(#(#args),*) };
 
         let def = parser::parse(body).map_err(|e| e.to_string())?;
         let analyzed = sema::analyze(def).map_err(|e| e.to_string())?;

@@ -265,7 +265,7 @@ this host, SSE2, single thread:
   a branch **only when some lane in the batch needs it** — the sphere
   covers 2.9% of the frame, so the surface lane skips the reflected world
   in ~97% of batches. The packed kernel *has* the equivalent — the emitter
-  guards a `Select`'s arm-exclusive schedule range with a branch on the
+  guards an `If`'s arm-exclusive schedule range with a branch on the
   mask's uniformity (`pixelflow-codegen/src/emit/guards.rs`) — and it does
   not fire here, for a reason that is in the schedule analysis and not in
   the language: a value is guardable only if **every consumer lies inside
@@ -274,7 +274,7 @@ this host, SSE2, single thread:
   footprint) feeds all four channels' arms, so from any single select's
   view it is shared, and only the few per-channel scalar ops at the leaves
   are ever skipped. The old tier never had this problem because its colours
-  flowed as one packed word through one `Select`.
+  flowed as one packed word through one `If`.
 
 Two things that look like levers and are not, both measured: raising the
 runtime saturation class cap (telemetry says the chrome kernel hits
@@ -291,7 +291,7 @@ Two things that are levers, neither measured yet, and a stage for them:
 **S3b — a choice between colours is one select.** Two fixes, general and
 local, and both should land:
 
-1. *Language, typed:* `Bits::select(mask, a, b)`. `Select` is already a
+1. *Language, typed:* `Bits::select(mask, a, b)`. `If` is already a
    bitwise blend on every backend, so a select over packed words is the
    same instruction with an honest type. A colour in graphics becomes a
    tree — four channel kernels at the leaves, a choice between colours at
@@ -367,7 +367,7 @@ emits last (a complemented mask) left it with 108 intruders instead of 41.
 
 **Three things in codegen, and the second two were found by the first.**
 
-1. **Clustering.** `cluster_select_arms` stable-partitions the region
+1. **Clustering.** `cluster_if_arms` stable-partitions the region
    between the mask and the select into shared, then true-exclusive, then
    false-exclusive — always a legal topological order, because a shared
    value can never depend on an arm-exclusive one — and *sinks* whatever

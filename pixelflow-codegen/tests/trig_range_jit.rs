@@ -27,9 +27,9 @@
 //!
 //! Every assertion below compares a JIT result against `in_domain`, a
 //! two-line predicate over the *input* — finite and `|x| < TRIG_DOMAIN` —
-//! matching the `Lt`/`Select` guard `expand_sin_phase` (`pixelflow-ir/src/
+//! matching the `Lt`/`If` guard `expand_sin_phase` (`pixelflow-ir/src/
 //! passes.rs`) builds into the expansion itself. It does not evaluate
-//! `Sin`/`Cos`/`Tan`/`Select`/`Lt` a second time through any oracle, so a bug
+//! `Sin`/`Cos`/`Tan`/`If`/`Lt` a second time through any oracle, so a bug
 //! shared by every tier (the failure mode that let the original defect ship,
 //! per CLAUDE.md) cannot cancel out here the way a same-form differential
 //! check would let it.

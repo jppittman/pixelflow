@@ -15,6 +15,7 @@ use super::{
     AsmInsn, AsmProgram, Assembly, Binding, CONST_POOL, CONST_POOL_ALIGN, EncodedInst, Gpr, Label,
     LabelRef, Loc, PtrReg, Reg, WritePlan, regalloc,
 };
+use crate::error::CompileError;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
@@ -135,6 +136,26 @@ pub fn anchor(asm: &mut Assembly) {
     });
 }
 
+/// Every x86 tier's return: `vzeroupper; ret`.
+///
+/// The caller is Rust built for baseline x86-64, so its floating point is
+/// legacy SSE, and Intel cores charge legacy-SSE code for vector registers
+/// whose upper halves a VEX or EVEX instruction left dirty — a state
+/// transition on older cores, a false dependency and a merge per
+/// instruction on Skylake and later — until something clears them, which
+/// nothing in a Rust caller does. So the kernel clears them on the way out.
+/// Nothing is lost: the collapse ABI returns nothing in a vector register,
+/// and every result is already stored.
+///
+/// Measured on an AVX-512 Xeon, with a 1×1 kernel whose Rust caller runs a
+/// 256-term scalar sum after each call: the call cost 190 ns over the sum on
+/// the AVX-512 tier and 88 ns on AVX2 without this, and 32 and 15 ns with
+/// it. The charge is not the call's: the same sum, run after one call and
+/// never calling again, took 482 ns rather than 266.
+pub(crate) fn return_to_caller(code: &mut Vec<u8>) {
+    AsmProgram::from([Inst::Vzeroupper, Inst::Ret]).assemble(code);
+}
+
 // =============================================================================
 // The pointer class: an address between a general register and memory
 // =============================================================================
@@ -229,7 +250,7 @@ pub struct BroadcastGprs {
 }
 
 // =============================================================================
-// Branches — for the shared driver's Select short-circuit guards.
+// Branches — for the shared driver's If short-circuit guards.
 // =============================================================================
 
 /// TEST eax, eax (sets ZF iff eax == 0).
@@ -424,6 +445,7 @@ pub enum Inst {
     AddImm8 { dst: Gpr, imm: Imm8 },
     AddImm32 { dst: Gpr, imm: Imm32 },
     SubImm32 { dst: Gpr, imm: Imm32 },
+    Vzeroupper,
     Ret,
     MovLoadPtr(MovLoadPtr),
     Encoded(EncodedInst),
@@ -501,6 +523,7 @@ impl AsmInsn for Inst {
             Inst::AddImm8 { dst, imm } => add(code, dst, imm),
             Inst::AddImm32 { dst, imm } => add(code, dst, imm),
             Inst::SubImm32 { dst, imm } => sub(code, dst, imm),
+            Inst::Vzeroupper => vzeroupper(code),
             Inst::Ret => ret(code),
             Inst::Jmp(j) => j.emit_into(code),
             Inst::Jcc(j) => j.emit_into(code),
@@ -622,6 +645,14 @@ pub fn sub(code: &mut Vec<u8>, dst: Gpr, Imm32(imm): Imm32) {
 #[inline(always)]
 pub fn ret(code: &mut Vec<u8>) {
     code.push(0xC3);
+}
+
+/// `vzeroupper` — `VEX.128.0F.WIG 77`: zero bits 128 and up of vector
+/// registers 0–15, the sixteen a legacy-SSE instruction can name. The same
+/// three bytes on every tier, which is why it lives here.
+#[inline(always)]
+pub fn vzeroupper(code: &mut Vec<u8>) {
+    code.extend_from_slice(&[0xC5, 0xF8, 0x77]);
 }
 
 /// The 4-bit condition an x86 `jcc` tests — the whole field, not a selection.
@@ -902,6 +933,35 @@ pub(in crate::emit) const fn frame_slot(offset: u32) -> Mem<Imm32> {
     }
 }
 
+/// Bytes one `f32` occupies: the element pitch of a uniform block.
+const F32_BYTES: u64 = 4;
+
+/// The `offset`-th `f32` of the block at `base`, `[base + 4*offset]`, as a
+/// `disp32` operand — the one place a uniform's 64-bit slot meets the
+/// width x86 gives a displacement, shared by the VEX and EVEX tiers the way
+/// [`mem_operand_into`] is.
+///
+/// # Errors
+///
+/// [`CompileError::BudgetExceeded`] when `4 * offset` does not fit a signed
+/// 32-bit displacement: an offset past the encoding is refused, never
+/// wrapped into an address that reads some other argument.
+pub(in crate::emit) fn block_element(
+    base: PtrReg,
+    offset: u64,
+) -> Result<Mem<Imm32>, CompileError> {
+    let disp = offset
+        .checked_mul(F32_BYTES)
+        .and_then(|bytes| i32::try_from(bytes).ok())
+        .ok_or(CompileError::BudgetExceeded(
+            "uniform offset past x86's disp32",
+        ))?;
+    Ok(Mem {
+        base,
+        disp: Imm32(disp),
+    })
+}
+
 /// One tier's `cvttss2si` pair — the VEX or EVEX spelling of the same
 /// instruction, which is the only thing that varies between the tiers'
 /// address arithmetic.
@@ -1160,6 +1220,8 @@ mod gpr_tests {
         assert_eq!(asm(|c| add(c, RSI, Imm8(64))), [0x48, 0x83, 0xC6, 0x40]);
         // C3 — RET
         assert_eq!(asm(ret), [0xC3]);
+        // VEX.128.0F.WIG 77 — VZEROUPPER
+        assert_eq!(asm(vzeroupper), [0xC5, 0xF8, 0x77]);
         // REX.W B8+rd io — MOV r64, imm64
         assert_eq!(
             asm(|c| movabs(c, RAX, 0x3F80_0000_0000_0000)),

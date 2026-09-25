@@ -11,7 +11,7 @@
 //!
 //! Every formula is an identity over ℝ. What each one does in `f32` is on
 //! its own doc. No formula divides by a value that can be zero, even in an
-//! arm a `Select` discards — the e-graph would prove it zero, and then prove
+//! arm an `If` discards — the e-graph would prove it zero, and then prove
 //! false equalities of the quotient ([`mean_of_clamp`], "The divisor") —
 //! and none lets a quotient decide a saturated or degenerate case: the mean
 //! of a clamp decides those by comparison first, and a monotone root
@@ -231,7 +231,7 @@ pub struct MonotoneArc {
 /// product with zero the graph holds, and what is built from those classes
 /// collapses — a whole chord's area extracted as the constant `0`, measured
 /// (`a_literal_slope_is_its_exact_area` in
-/// `pixelflow-core/tests/area_adversarial.rs`). A `Select` guarding
+/// `pixelflow-core/tests/area_adversarial.rs`). An `If` guarding
 /// the *result* does not help, because the e-graph reasons about the
 /// quotient's class whatever consumes it; the divisor itself has to be one
 /// no rule can prove zero. `select(narrow, 1, d)` is `1` wherever `d` is
@@ -295,18 +295,18 @@ pub fn mean_of_clamp(arena: &mut ExprArena, sweep: Sweep, band: Band) -> ExprId 
     // Never `d` itself where `d` may be zero, not even in the arm `narrow`
     // discards: see "The divisor" in the doc above.
     let one = arena.push_const(1.0);
-    let divisor = arena.push_ternary(OpKind::Select, narrow, one, d);
+    let divisor = arena.push_ternary(OpKind::If, narrow, one, d);
     let general = arena.push_binary(OpKind::Div, numerator, divisor);
     let degenerate = clamp(arena, centre, [p, q]);
-    let inside = arena.push_ternary(OpKind::Select, narrow, degenerate, general);
+    let inside = arena.push_ternary(OpKind::If, narrow, degenerate, general);
 
     let highest = arena.push_binary(OpKind::Max, from, to);
     let under = arena.push_binary(OpKind::Le, highest, p);
-    let at_most_p = arena.push_ternary(OpKind::Select, under, p, inside);
+    let at_most_p = arena.push_ternary(OpKind::If, under, p, inside);
 
     let lowest = arena.push_binary(OpKind::Min, from, to);
     let over = arena.push_binary(OpKind::Ge, lowest, q);
-    arena.push_ternary(OpKind::Select, over, q, at_most_p)
+    arena.push_ternary(OpKind::If, over, q, at_most_p)
 }
 
 /// `τ(δ) = δ / max(step + √max(step² + bend·δ, 0), floor)`: the parameter at

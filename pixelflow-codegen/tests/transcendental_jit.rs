@@ -172,7 +172,7 @@ fn nan_comparisons_agree_between_tiers() {
 
 /// A folded comparison must be substitutable for an executed one.
 ///
-/// `Select` and `BitAnd` are bitwise on every backend, so a mask lane that is
+/// `If` and `BitAnd` are bitwise on every backend, so a mask lane that is
 /// merely *truthy* corrupts them: with `1.0` (`0x3f800000`) standing in for
 /// true, `runtime_mask & 1.0` is `0x3f800000`, and blending `7.0` against `9.0`
 /// through that pattern yields `4.5` — a value neither branch held. This is the

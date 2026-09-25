@@ -4,6 +4,7 @@
 //! These are the "atoms" that compound operations are built from.
 
 use super::{AsmInsn, AsmProgram, Gpr, Label, LabelRef, PtrReg, Reg, assemble, unimplemented_op};
+use crate::error::CompileError;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -78,7 +79,7 @@ pub enum Inst {
     Orr(Reg, Reg, Reg),
     Mov(Reg, Reg),
 
-    // Select guard masks
+    // If guard masks
     Uminv(Reg, Reg),
     Umaxv(Reg, Reg),
     FmovToGp(Reg),
@@ -356,19 +357,41 @@ pub fn emit_dup_lane0(code: &mut Vec<u8>, dst: Reg, src: Reg) {
 
 /// `dst = splat(base[offset])`: `ldr s<dst>, [base, #offset*4]` reads the
 /// value and `dup` spreads it. `base` is the block's address, wherever the
-/// allocator keeps that pointer value.
-pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, base: PtrReg, offset: u16) {
+/// allocator keeps that pointer value. An element past the 12-bit scaled
+/// immediate is addressed through IP0, as any deep displacement is
+/// ([`table::address_in_ip0`]).
+///
+/// # Errors
+///
+/// [`CompileError::BudgetExceeded`] when the element's byte offset is past
+/// the 32-bit offset [`Mem`] carries — refused, never wrapped into an
+/// address that reads some other argument. That bound is the operand
+/// type's, not the instruction's: `imm12` is the instruction's, and the IP0
+/// fallback covers everything past it up to `Mem`'s.
+pub fn emit_uniform_load(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    base: PtrReg,
+    offset: u64,
+) -> Result<(), CompileError> {
+    let bytes = offset
+        .checked_mul(u64::from(S_BYTES))
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or(CompileError::BudgetExceeded(
+            "uniform byte offset past the 32-bit offset `Mem` carries",
+        ))?;
     AsmProgram::from([
         Inst::ldr_s(
             dst,
             Mem {
                 base,
-                offset: u32::from(offset) * S_BYTES,
+                offset: bytes,
             },
         ),
         Inst::DupLane0(dst, dst),
     ])
     .assemble(code);
+    Ok(())
 }
 
 // =============================================================================
@@ -725,7 +748,7 @@ fn emit_shl(code: &mut Vec<u8>, dst: Reg, src: Reg, shift: u8) {
 /// Newton-Raphson step that refines them needs somewhere to hold the
 /// correction. `Neg` and `Abs` are single instructions here (`FNEG`, `FABS`),
 /// unlike the x86 backends where they materialize a sign mask, and `BSL`
-/// blends a select from its three operands.
+/// blends an `If` from its three operands.
 pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
@@ -1930,7 +1953,7 @@ pub(crate) mod driver {
         // Nothing. v30 is the gather's truncated-index register, a `temps_for`
         // answer since the gathers landed; v29 used to be `UNARY_SCRATCH`,
         // reserved whole-kernel so a reciprocal estimate could borrow it. The
-        // select needs none either: `BSL` reads its three operands directly,
+        // `If` needs none either: `BSL` reads its three operands directly,
         // and `FNEG`/`FABS` are single instructions.
         fixed: &[],
         temps_for: super::temps_for,
@@ -2125,11 +2148,11 @@ pub(crate) mod driver {
         fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
             let scratch = guard_scratch(test.scratch, test.reg);
             match test.arm {
-                SelectArm::True => {
+                IfArm::True => {
                     AsmProgram::from([Inst::Umaxv(scratch, test.reg), Inst::FmovToGp(scratch)])
                         .assemble(&mut asm.code);
                 }
-                SelectArm::False => {
+                IfArm::False => {
                     AsmProgram::from([
                         Inst::Uminv(scratch, test.reg),
                         Inst::FmovToGp(scratch),
@@ -2421,7 +2444,7 @@ pub(crate) mod driver {
                 );
             }
             ResolvedOp::Uniform { dst, base, offset } => {
-                super::emit_uniform_load(code, *dst, *base, *offset);
+                super::emit_uniform_load(code, *dst, *base, *offset)?;
             }
             ResolvedOp::Context { dst, slot } => {
                 // The one read of the context pointer (x0 per AAPCS64):
@@ -2465,7 +2488,7 @@ pub(crate) mod driver {
                 // FADD(dst, dst, c)
                 AsmProgram::from([Inst::Fadd(*dst, *dst, *c)]).assemble(code);
             }
-            ResolvedOp::Select {
+            ResolvedOp::If {
                 dst,
                 if_true,
                 if_false,

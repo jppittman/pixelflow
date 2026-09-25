@@ -86,7 +86,11 @@ pub struct Sample {
 /// order. `gen_strict_labels` wrote histogram keys as `format!("{op:?}")`
 /// (a bare variant name, e.g. `"Abs"`), so `format!("{:?}", op)` here reads
 /// back exactly the same strings — one definition of the op-name spelling
-/// (`OpKind`'s own `Debug` impl), not restated.
+/// (`OpKind`'s own `Debug` impl), not restated. That spelling is persisted:
+/// strict-label and r2g datasets key `neighborhood_op_hist` by it and Guide
+/// checkpoints record it as `op_names`, so renaming a variant (as `Select`
+/// became `If`) means regenerating them; every reader refuses an unknown name
+/// loudly rather than misreading one.
 #[must_use]
 pub fn op_index_table() -> (Vec<String>, HashMap<String, usize>) {
     let names: Vec<String> = OpKind::all().map(|op| format!("{op:?}")).collect();

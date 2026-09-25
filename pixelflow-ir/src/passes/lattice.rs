@@ -451,12 +451,12 @@ mod tests {
             .uniforms()
             .iter()
             .position(|d| d.id == domain.origin[0].id)
-            .expect("x0 declared") as u16;
+            .expect("x0 declared");
         let y0_pos = arena
             .uniforms()
             .iter()
             .position(|d| d.id == domain.origin[1].id)
-            .expect("y0 declared") as u16;
+            .expect("y0 declared");
         let expected_x = alloc::format!(
             "add(add(Uniform({x0_pos}), Var({})), Var({}))",
             col_fold.binder().var(),

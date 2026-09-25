@@ -39,7 +39,7 @@ pub struct CollapseKernel {
     ///
     /// This is not cosmetic: collapse cost is *not* independent of a
     /// buffer's values. `emit_skip_if_all_false`/`emit_skip_if_all_true`
-    /// (`pixelflow-codegen/src/emit/mod.rs`) branch on a `Select` guard's
+    /// (`pixelflow-codegen/src/emit/mod.rs`) branch on an `If` guard's
     /// mask at runtime, and a zero-filled piece table makes a glyph's every
     /// crossing-span mask uniformly false — the guard skips an arm
     /// production always takes. Replaying zeros here measures that skipped
@@ -102,7 +102,7 @@ impl Trips {
 // v3 carried a buffer's *shape* only; replay bound every declared buffer to
 // zeros (`dummy_context`) on the premise that "collapse cost depends on the
 // arena's shape, not the buffer's values." That premise was false: a
-// `Select` guard's runtime skip (`emit_skip_if_all_false`/`_all_true` in
+// `If` guard's runtime skip (`emit_skip_if_all_false`/`_all_true` in
 // `pixelflow-codegen/src/emit/mod.rs`) branches on whether any lane's mask
 // is set, which is a fact about the *data*, not the shape. A zero-filled
 // piece table makes every one of a glyph's crossing-span masks uniformly
@@ -839,7 +839,7 @@ mod tests {
 
         // The buffer's actual contents, not just its shape, survive the
         // round trip exactly — bit for bit, since these values decide the
-        // guard masks a `Select` skips or takes at runtime.
+        // guard masks an `If` skips or takes at runtime.
         let decoded_data = decoded.buffer_data[0]
             .as_ref()
             .expect("captured buffer contents must survive the round trip, not decode to None");

@@ -103,7 +103,7 @@ fn specs() -> Vec<OpSpec> {
             stage: UnaryScaled(1.25, 0.8),
         },
         OpSpec {
-            op: Select,
+            op: If,
             stage: CondBlend(0.8, 1.25),
         },
         // Hardware/NR unary math.
@@ -351,7 +351,7 @@ fn main() {
         "op", "lat_ns", "tbl_cycles", "(Add=4 unit)", "thr_ns", "prior"
     );
     for ((spec, &slope), &thr) in specs.iter().zip(&lat_slope).zip(&thr_marginal) {
-        // Unary/select stages carry a Mul on the chain path; subtract its slope.
+        // Unary/`If` stages carry a Mul on the chain path; subtract its slope.
         let lat_ns = match spec.stage {
             Stage::UnaryScaled(..) | Stage::CondBlend(..) => slope - mul_slope,
             _ => slope,

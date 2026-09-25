@@ -1,6 +1,6 @@
 //! Every path a collapse can take through the emitter, executed: a uniform
 //! and a gather read through the context, a surviving `Reduce` nested in the
-//! lattice's folds, a `Select` whose guard may branch, and a shape narrower
+//! lattice's folds, an `If` whose guard may branch, and a shape narrower
 //! than a batch — each at a width with a remainder, each checked against the
 //! kernel's own definition computed in scalar `f32`.
 
@@ -173,18 +173,18 @@ fn a_reduce_runs_inside_the_lattices_folds() {
     check(&out, |x, y| (0..5).map(|k| (x + k as f32) * y).sum());
 }
 
-/// `if x < y { x * x } else { y * y }`: a select whose mask varies by lane
+/// `if x < y { x * x } else { y * y }`: an `If` whose mask varies by lane
 /// in some batches and is uniform in others, so both the blend and the
 /// guarded branch execute.
 #[test]
-fn a_select_blends_and_branches() {
+fn an_if_blends_and_branches() {
     let mut a = ExprArena::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
     let lt = a.push_binary(OpKind::Lt, x, y);
     let xx = a.push_binary(OpKind::Mul, x, x);
     let yy = a.push_binary(OpKind::Mul, y, y);
-    let root = a.push_ternary(OpKind::Select, lt, xx, yy);
+    let root = a.push_ternary(OpKind::If, lt, xx, yy);
 
     let out = collapse(&a, root, &[], &[]);
     check(&out, |x, y| if x < y { x * x } else { y * y });

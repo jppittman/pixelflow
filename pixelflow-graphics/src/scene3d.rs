@@ -81,10 +81,10 @@ fn scale(v: &[Kernel; 3], s: &Kernel) -> [Kernel; 3] {
 /// A tree, not an array, and that is the whole of stage S3b's language half.
 /// A choice between colours is one thing that happens once, so it is one node
 /// here and [`crate::render::scene::compile_packed_for`] lowers it to one
-/// `Select` on the packed words. Distributing it over the channels — four
-/// selects sharing a mask, which is what an array of channels forces — is the
+/// `If` on the packed words. Distributing it over the channels — four
+/// `If`s sharing a mask, which is what an array of channels forces — is the
 /// same picture and a different program: the emitter may skip a value under a
-/// select's arm only when *every* consumer of it lies inside that arm, and a
+/// `If`'s arm only when *every* consumer of it lies inside that arm, and a
 /// reflected world feeding four arms is, from each one's view, shared. It then
 /// runs in every batch, for the 97% of the frame the sphere does not cover.
 ///
@@ -126,11 +126,11 @@ impl Rgba {
     /// mask.
     ///
     /// The catamorphism is the whole interface to the tree's shape, and the
-    /// only one — which is how "a choice is one select" stays a property of
+    /// only one — which is how "a choice is one `If`" stays a property of
     /// the type rather than of every caller's discipline. There is no way to
     /// reach the arms of a choice and pack them separately, so the packer
     /// ([`crate::render::scene::compile_packed_for`]) cannot accidentally be
-    /// written as four selects again, and a caller that only wants to count
+    /// written as four `If`s again, and a caller that only wants to count
     /// nodes or size the code gets the same one traversal.
     pub fn fold<T>(
         &self,

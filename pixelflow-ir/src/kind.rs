@@ -136,7 +136,16 @@ op_table! {
     Ne = 35,
 
     // --- Control Flow ---
-    Select = 36,
+    /// `If(m, a, b)` is `if m then a else b`: two live cases, so it is
+    /// dispatch, not a fold — everything downstream carries both arms. A
+    /// batch whose mask is uniform takes one arm, and that is a jump; only
+    /// a mask that varies by lane blends, and the bitwise blend is the
+    /// fallback for that one case, not the definition. It was named
+    /// `Select` until docs/plans/2026-09-25-the-language-is-kernel.md D18:
+    /// that name hid the `if`, and the emitter built on the misreading —
+    /// blend by default, a branch bought per node in `emit/guards.rs` —
+    /// cost 73% of a glyph bake (docs/BACKLOG.md, X1).
+    If = 36,
 
     // --- Structure ---
     Tuple = 37,
@@ -441,7 +450,7 @@ impl OpKind {
             | Self::RawGather
             | Self::Seq => 2,
 
-            Self::MulAdd | Self::Select | Self::Gather => 3,
+            Self::MulAdd | Self::If | Self::Gather => 3,
 
             // The body. The algebra, the binder and the range are the node's
             // own metadata ([`Fold`](crate::Fold)) rather than three `Const`
@@ -490,7 +499,14 @@ impl OpKind {
             Self::Ge => "ge",
             Self::Eq => "eq",
             Self::Ne => "ne",
-            Self::Select => "select",
+            // Spelled as the `kernel!` method that lowers to it, which keeps its
+            // name until Phase B of docs/plans/2026-09-25-the-language-is-kernel.md
+            // renames it `if`. This string is also what the training corpus
+            // fingerprint, the arena's `Display` and `cost_by_name` carry, so
+            // renaming the variant does not reach it. (`variant_name`, which
+            // `kernel!`'s expansion spells `OpKind::` paths with, and the derived
+            // `Debug`, which Guide datasets and checkpoints persist, did follow.)
+            Self::If => "select",
             Self::Tuple => "tuple",
             Self::TruncToInt => "trunc_to_int",
             Self::IntToFloat => "int_to_float",
@@ -550,7 +566,8 @@ impl OpKind {
             "ge" => Some(Self::Ge),
             "eq" => Some(Self::Eq),
             "ne" => Some(Self::Ne),
-            "select" => Some(Self::Select),
+            // The method's spelling, and the persisted one — see `name`.
+            "select" => Some(Self::If),
             "tuple" => Some(Self::Tuple),
             "trunc_to_int" => Some(Self::TruncToInt),
             "int_to_float" => Some(Self::IntToFloat),
@@ -615,7 +632,7 @@ impl OpKind {
                 | Self::Eq
                 | Self::Ne
                 | Self::MulAdd
-                | Self::Select
+                | Self::If
         )
     }
 
@@ -631,6 +648,11 @@ impl OpKind {
     /// This is the one place `(name, arity) -> op` is decided; a compiler
     /// front end that re-lists method names itself is a second place for that
     /// mapping to drift from this one.
+    ///
+    /// `.select(a, b)` resolves to [`OpKind::If`], the node `if m { a } else
+    /// { b }` lowers to. `if` is the spelling; the method keeps working
+    /// until Phase B of docs/plans/2026-09-25-the-language-is-kernel.md
+    /// removes it (D15).
     #[must_use]
     pub fn from_method_call(name: &str, arg_count: usize) -> Option<Self> {
         let op = Self::from_name(name)?;
@@ -664,7 +686,7 @@ impl OpKind {
             | Self::Ge
             | Self::Eq
             | Self::Ne
-            | Self::Select => 4,
+            | Self::If => 4,
             Self::Mul | Self::MulAdd | Self::Recip | Self::Rsqrt => 5,
             // Bit-manip primitives: single cheap integer/convert instructions.
             Self::TruncToInt
@@ -744,7 +766,7 @@ impl OpKind {
     /// - Tuple (structural, not computational)
     /// - MulAdd (fused — should only arise from rewrite rules)
     /// - Lt/Le/Gt/Ge/Eq/Ne (return masks, not floats — type-invalid in arithmetic)
-    /// - Select (needs mask input — only valid composed with a comparison)
+    /// - If (needs mask input — only valid composed with a comparison)
     /// - Buffer/Gather (memory ops — require a bound buffer, not synthesizable)
     /// - Uniform/Param (unbound scalar slots — a value arrives per call or
     ///   from a builder, so a generator cannot synthesize one that evaluates)
@@ -762,7 +784,7 @@ impl OpKind {
                 | Self::Ge
                 | Self::Eq
                 | Self::Ne
-                | Self::Select
+                | Self::If
                 | Self::Buffer
                 | Self::Gather
                 | Self::RawGather
@@ -842,7 +864,7 @@ impl OpKind {
             Self::Seq => EmitStyle::Special,
 
             // Ternary method: (a).mul_add(b, c)
-            Self::MulAdd | Self::Select => EmitStyle::TernaryMethod,
+            Self::MulAdd | Self::If => EmitStyle::TernaryMethod,
         }
     }
 
@@ -887,7 +909,7 @@ impl OpKind {
     /// A comparison lane: all bits set for true, all clear for false.
     ///
     /// This is not a stylistic choice about how to spell a boolean — it is the
-    /// only representation the consumers accept. `Select` is a *bitwise* blend
+    /// only representation the consumers accept. `If`'s lane-varying path is a *bitwise* blend
     /// on every backend (`vandps`/`vandnps`/`vorps` on AVX2, one
     /// `vpternlogd 0xCA` on AVX-512, `BSL` on aarch64), and `BitAnd`/`BitOr`
     /// are literal bitwise ops, so a mask lane's job is to be a per-bit
@@ -912,7 +934,7 @@ impl OpKind {
     ///
     /// Comparisons produce masks ([`Self::mask`] — all-ones, which reads as
     /// NaN); the integer-domain primitives reinterpret lanes as `i32` and are
-    /// how exp/log lower to arithmetic; `Select`/`BitAnd`/`BitOr` pass patterns
+    /// how exp/log lower to arithmetic; `If`/`BitAnd`/`BitOr` pass patterns
     /// through. For all of them a non-finite float reading is the intended
     /// output rather than an overflow, which is what separates them from
     /// `1e38 * 1e38` — the case a folder is right to refuse.
@@ -926,7 +948,7 @@ impl OpKind {
                 | Self::Ge
                 | Self::Eq
                 | Self::Ne
-                | Self::Select
+                | Self::If
                 | Self::BitAnd
                 | Self::BitOr
                 | Self::TruncToInt
@@ -1005,11 +1027,11 @@ impl OpKind {
             // crate chose to contract it into: under `-fp-contract=fast` a
             // fold's answer must not depend on the folder's build profile.
             Self::MulAdd => Some(libm::fmaf(x, y, z)),
-            // The bitwise blend every backend emits — `vandps`/`vandnps`/`vorps`
+            // The bitwise blend every backend emits for a lane-varying mask — `vandps`/`vandnps`/`vorps`
             // on AVX2, one `vpternlogd 0xCA` on AVX-512, `BSL` on
             // aarch64. Spelling it `if x != 0.0` would be right only for a
             // canonical [`Self::mask`] and silently wrong for anything else.
-            Self::Select => Some(f32::from_bits(
+            Self::If => Some(f32::from_bits(
                 (x.to_bits() & y.to_bits()) | (!x.to_bits() & z.to_bits()),
             )),
             _ => None,
@@ -1456,7 +1478,7 @@ mod from_method_call {
     #[test]
     fn resolves_a_ternary_method_at_two_args() {
         assert_eq!(OpKind::from_method_call("mul_add", 2), Some(OpKind::MulAdd));
-        assert_eq!(OpKind::from_method_call("select", 2), Some(OpKind::Select));
+        assert_eq!(OpKind::from_method_call("select", 2), Some(OpKind::If));
     }
 
     #[test]
@@ -1613,7 +1635,7 @@ mod algebraic_properties {
         OpKind::Ge,
         OpKind::Eq,
         OpKind::Ne,
-        OpKind::Select,
+        OpKind::If,
         OpKind::Buffer,
         OpKind::Gather,
         OpKind::RawGather,
@@ -1641,7 +1663,7 @@ mod algebraic_properties {
         OpKind::Ge,
         OpKind::Eq,
         OpKind::Ne,
-        OpKind::Select,
+        OpKind::If,
         OpKind::BitAnd,
         OpKind::BitOr,
         OpKind::TruncToInt,
@@ -1730,7 +1752,7 @@ mod algebraic_properties {
                 | OpKind::RawGather
                 | OpKind::Seq => 2,
 
-                OpKind::MulAdd | OpKind::Select | OpKind::Gather => 3,
+                OpKind::MulAdd | OpKind::If | OpKind::Gather => 3,
 
                 OpKind::Reduce => 1,
             };
@@ -1918,23 +1940,17 @@ mod eval_ternary_arms {
     }
 
     #[test]
-    fn blend_y_and_z_bitwise_by_the_x_mask_for_select() {
+    fn blend_y_and_z_bitwise_by_the_x_mask_for_if() {
         let true_mask = OpKind::mask(true);
         let false_mask = OpKind::mask(false);
         let y = 7.0f32;
         let z = 9.0f32;
         assert_eq!(
-            OpKind::Select
-                .eval_ternary(true_mask, y, z)
-                .unwrap()
-                .to_bits(),
+            OpKind::If.eval_ternary(true_mask, y, z).unwrap().to_bits(),
             y.to_bits()
         );
         assert_eq!(
-            OpKind::Select
-                .eval_ternary(false_mask, y, z)
-                .unwrap()
-                .to_bits(),
+            OpKind::If.eval_ternary(false_mask, y, z).unwrap().to_bits(),
             z.to_bits()
         );
     }

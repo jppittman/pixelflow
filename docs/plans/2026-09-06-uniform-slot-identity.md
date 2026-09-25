@@ -315,8 +315,9 @@ impl UniformBlock {
 and `atlas`.
 
 **Link order.** `compile` walks the reachable subgraph from the root in the
-same canonical order `jit_cache.rs` already uses for its key (ascending node
-id, ids remapped dense) and assigns offsets by *first occurrence*. The link
+same canonical order `jit_cache.rs` uses for its key (`canonical` in
+`pixelflow-ir/src/key.rs`: post-order from the root, structurally equal
+subterms hash-consed) and assigns offsets by *first occurrence*. The link
 table maps identity to offset. The JIT-cache key records uniforms by their
 dense offset, never by identity, so two compositions with the same shape hit
 the same code and differ only in the block they bind. The same canonicalization

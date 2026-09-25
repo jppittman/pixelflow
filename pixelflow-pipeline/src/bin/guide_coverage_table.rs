@@ -168,9 +168,9 @@ impl Group {
     fn of_op_name(name: &str) -> Group {
         match name {
             "Var" | "Const" | "Buffer" | "Tuple" => Group::Leaf,
-            "Add" | "Sub" | "Neg" | "Abs" | "Min" | "Max" | "Select" | "Lt" | "Le" | "Gt"
-            | "Ge" | "Eq" | "Ne" | "Floor" | "Ceil" | "Round" | "TruncToInt" | "IntToFloat"
-            | "IAdd" | "Shl" | "Shr" | "BitAnd" | "BitOr" => Group::Lin,
+            "Add" | "Sub" | "Neg" | "Abs" | "Min" | "Max" | "If" | "Lt" | "Le" | "Gt" | "Ge"
+            | "Eq" | "Ne" | "Floor" | "Ceil" | "Round" | "TruncToInt" | "IntToFloat" | "IAdd"
+            | "Shl" | "Shr" | "BitAnd" | "BitOr" => Group::Lin,
             "Mul" | "MulAdd" => Group::Mul,
             "Div" | "Recip" => Group::Div,
             "Sqrt" | "Rsqrt" => Group::Root,

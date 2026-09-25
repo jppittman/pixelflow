@@ -1,8 +1,8 @@
-//! Which schedule entries a `Select`'s short-circuit branch may skip, and
+//! Which schedule entries an `If`'s short-circuit branch may skip, and
 //! the ordering that lets one branch span them.
 //!
 //! A property of the **schedule**, not of allocation and not of emission: it
-//! asks only which values each arm of a `Select` computes for itself, and the
+//! asks only which values each arm of an `If` computes for itself, and the
 //! answer is the same whatever registers those values end up in. Both sides
 //! read it — the emitter to place the branches, the allocator to keep a split
 //! live range from naming a register a skipped arm never loaded — so it lives
@@ -12,9 +12,9 @@
 //! an arm is only guardable when the values it owns are one contiguous run.
 //! An arm can own two hundred values and be refused because forty entries
 //! belonging to some other expression happen to sit between its first and its
-//! last. [`cluster_select_arms`] is the answer to exactly that case, and only
+//! last. [`cluster_if_arms`] is the answer to exactly that case, and only
 //! that case — it stable-partitions the region between the mask and the
-//! select into shared, then true-exclusive, then false-exclusive values. That
+//! `If` into shared, then true-exclusive, then false-exclusive values. That
 //! is always a legal topological order, because a shared value can never
 //! depend on an arm-exclusive one (if it did, the exclusivity filter would
 //! have rejected the value: it has a consumer outside the arm).
@@ -43,7 +43,7 @@ use super::regalloc::{Def, ValueId};
 /// This schedule's demand, keyed by [`ValueId`] —
 /// `pixelflow_ir::passes::demand::demand_of` instantiated for
 /// [`ScheduledOp`]: every op passes its own demand through to its operands
-/// unchanged except `Select`, whose mask is observed with the select and
+/// unchanged except `If`, whose mask is observed with the `If` and
 /// whose arms are observed only under their own polarity. The one
 /// definition of the DNF algebra and the backward pass lives in
 /// `pixelflow-ir`; this closure is the only thing specific to a schedule
@@ -67,7 +67,7 @@ fn demand_of_schedule(
         schedule.iter().map(|def| def.value),
         root,
         |vid, observed| match ops.get(vid.0 as usize).and_then(Option::as_ref) {
-            Some(ScheduledOp::Ternary(OpKind::Select, mask, if_true, if_false)) => {
+            Some(ScheduledOp::Ternary(OpKind::If, mask, if_true, if_false)) => {
                 alloc::vec![
                     (*mask, observed.clone()),
                     (*if_true, observed.and_literal(Literal::set(*mask))),
@@ -83,21 +83,21 @@ fn demand_of_schedule(
     )
 }
 
-/// Which arm of a `Select` node a guard branch skips or targets.
+/// Which arm of an `If` node a guard branch skips or targets.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SelectArm {
+pub enum IfArm {
     /// The `if_true` arm: skipped when all lanes of the mask are false.
     True,
     /// The `if_false` arm: skipped when all lanes of the mask are true.
     False,
 }
 
-impl SelectArm {
-    /// Both arms of a conditional select.
+impl IfArm {
+    /// Both arms of an `If`.
     pub const ALL: [Self; 2] = [Self::True, Self::False];
 }
 
-/// A value associated with each arm of a `Select` node (`True` and `False`).
+/// A value associated with each arm of an `If` node (`True` and `False`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ArmPair<T> {
     pub true_arm: T,
@@ -116,19 +116,19 @@ impl<T> ArmPair<T> {
 
     /// Access the value for `arm`.
     #[inline]
-    pub const fn get(&self, arm: SelectArm) -> &T {
+    pub const fn get(&self, arm: IfArm) -> &T {
         match arm {
-            SelectArm::True => &self.true_arm,
-            SelectArm::False => &self.false_arm,
+            IfArm::True => &self.true_arm,
+            IfArm::False => &self.false_arm,
         }
     }
 
     /// Mutably access the value for `arm`.
     #[inline]
-    pub fn get_mut(&mut self, arm: SelectArm) -> &mut T {
+    pub fn get_mut(&mut self, arm: IfArm) -> &mut T {
         match arm {
-            SelectArm::True => &mut self.true_arm,
-            SelectArm::False => &mut self.false_arm,
+            IfArm::True => &mut self.true_arm,
+            IfArm::False => &mut self.false_arm,
         }
     }
 
@@ -157,30 +157,30 @@ impl<T> ArmPair<T> {
     }
 }
 
-impl<T> core::ops::Index<SelectArm> for ArmPair<T> {
+impl<T> core::ops::Index<IfArm> for ArmPair<T> {
     type Output = T;
     #[inline]
-    fn index(&self, arm: SelectArm) -> &Self::Output {
+    fn index(&self, arm: IfArm) -> &Self::Output {
         self.get(arm)
     }
 }
 
-impl<T> core::ops::IndexMut<SelectArm> for ArmPair<T> {
+impl<T> core::ops::IndexMut<IfArm> for ArmPair<T> {
     #[inline]
-    fn index_mut(&mut self, arm: SelectArm) -> &mut Self::Output {
+    fn index_mut(&mut self, arm: IfArm) -> &mut Self::Output {
         self.get_mut(arm)
     }
 }
 
-/// Describes a Select node's short-circuit structure in the schedule.
+/// Describes an If node's short-circuit structure in the schedule.
 ///
-/// For `Select(mask, if_true, if_false)`, identifies contiguous ranges of
+/// For `If(mask, if_true, if_false)`, identifies contiguous ranges of
 /// schedule entries that are exclusive to each arm (not shared with mask
 /// or the other arm). These ranges can be guarded by conditional branches.
 #[derive(Debug, Clone)]
-pub(crate) struct SelectGuard {
-    /// Schedule index of the Select node itself.
-    pub(crate) select_idx: usize,
+pub(crate) struct IfGuard {
+    /// Schedule index of the If node itself.
+    pub(crate) if_idx: usize,
     /// ValueId of the mask operand (already computed before arms).
     pub(crate) mask_vid: ValueId,
     /// Range of schedule indices exclusive to each arm: `[start, end)`.
@@ -188,14 +188,14 @@ pub(crate) struct SelectGuard {
     pub(crate) ranges: ArmPair<(usize, usize)>,
 }
 
-impl SelectGuard {
+impl IfGuard {
     /// Schedule index range exclusive to the given arm: `[start, end)`.
     #[must_use]
     #[inline]
-    pub(crate) const fn range(&self, arm: SelectArm) -> (usize, usize) {
+    pub(crate) const fn range(&self, arm: IfArm) -> (usize, usize) {
         match arm {
-            SelectArm::True => self.ranges.true_arm,
-            SelectArm::False => self.ranges.false_arm,
+            IfArm::True => self.ranges.true_arm,
+            IfArm::False => self.ranges.false_arm,
         }
     }
 
@@ -218,7 +218,7 @@ impl SelectGuard {
     /// Whether this arm is guarded (has a non-empty range).
     #[must_use]
     #[inline]
-    pub(crate) fn is_guarded(&self, arm: SelectArm) -> bool {
+    pub(crate) fn is_guarded(&self, arm: IfArm) -> bool {
         let (s, e) = self.range(arm);
         s != e
     }
@@ -227,7 +227,7 @@ impl SelectGuard {
     #[must_use]
     #[inline]
     pub(crate) fn has_guarded_arm(&self) -> bool {
-        SelectArm::ALL.iter().any(|&arm| self.is_guarded(arm))
+        IfArm::ALL.iter().any(|&arm| self.is_guarded(arm))
     }
 
     /// Total entries skipped across both arms.
@@ -451,7 +451,7 @@ impl FoldReads {
 
 /// What executing `def` once costs where it is scheduled, in latency-prior
 /// cycles — the table's price for its op, and for a `Reduce` the price of the
-/// loop it opens here ([`FoldReads`]). The summand of a `Select` arm's price
+/// loop it opens here ([`FoldReads`]). The summand of an `If` arm's price
 /// and of a fold body's, which are one question: what running these entries
 /// costs.
 fn def_cycles(def: &Def, folds: &FoldReads, cycles: &CostModel) -> usize {
@@ -519,22 +519,22 @@ fn transitive_deps(
     deps
 }
 
-/// One `Select`'s arms as schedule positions: the entries each arm computes
+/// One `If`'s arms as schedule positions: the entries each arm computes
 /// for itself and nothing else.
 ///
 /// Exclusivity only — whether a branch can actually span an arm is
-/// [`SelectArms::range`], which is where the *order* gets its say.
-struct SelectArms {
-    select_idx: usize,
-    select_vid: ValueId,
+/// [`IfArms::range`], which is where the *order* gets its say.
+struct IfArms {
+    if_idx: usize,
+    if_vid: ValueId,
     mask_vid: ValueId,
     /// Where the mask lands, or `usize::MAX` when it is not in this scope's
     /// schedule (a live-in from an enclosing one).
     mask_idx: usize,
     indices: ArmPair<IndexSet>,
-    /// Everything the select reads, transitively, as schedule positions —
+    /// Everything the `If` reads, transitively, as schedule positions —
     /// which is also, by complement, everything between the mask and the
-    /// select that the select does NOT need.
+    /// `If` that the `If` does NOT need.
     cone: IndexSet,
     /// What each arm's own entries cost, in latency-prior cycles — what a
     /// guard on that arm could save, against what the branch costs when it
@@ -542,41 +542,41 @@ struct SelectArms {
     cycles: ArmPair<usize>,
 }
 
-impl SelectArms {
+impl IfArms {
     /// The half-open range a branch may skip for `arm`, or an empty range
-    /// at the select when it may not.
+    /// at the `If` when it may not.
     ///
     /// The branch skips the WHOLE range when the mask is uniform, so every
     /// index in it must belong to this arm; and the uniformity test reads the
     /// mask's register at the range's start, so the mask must be computed by
     /// then. (Schedules from the macro pipeline emit the mask before both
     /// arms, but arena-composed kernels may schedule an arm BEFORE it —
-    /// guarding that would branch on an uninitialized register. The select
+    /// guarding that would branch on an uninitialized register. The `If`
     /// still evaluates correctly through the unconditional blend.)
-    fn range(&self, arm: SelectArm) -> (usize, usize) {
+    fn range(&self, arm: IfArm) -> (usize, usize) {
         let indices = &self.indices[arm];
         let cycles = self.cycles[arm];
         if cycles <= MISPREDICT_PENALTY_CYCLES {
-            return (self.select_idx, self.select_idx);
+            return (self.if_idx, self.if_idx);
         }
         let (Some(start), Some(last)) = (indices.min(), indices.max()) else {
-            return (self.select_idx, self.select_idx);
+            return (self.if_idx, self.if_idx);
         };
         let end = last + 1;
         let one_run = (start..end).all(|idx| indices.contains(idx));
         if one_run && self.mask_idx < start {
             (start, end)
         } else {
-            (self.select_idx, self.select_idx)
+            (self.if_idx, self.if_idx)
         }
     }
 
     fn true_range(&self) -> (usize, usize) {
-        self.range(SelectArm::True)
+        self.range(IfArm::True)
     }
 
     fn false_range(&self) -> (usize, usize) {
-        self.range(SelectArm::False)
+        self.range(IfArm::False)
     }
 
     fn ranges(&self) -> ArmPair<(usize, usize)> {
@@ -590,15 +590,15 @@ impl SelectArms {
         let refused = |cycles: usize, range: (usize, usize)| {
             cycles > MISPREDICT_PENALTY_CYCLES && range.0 == range.1
         };
-        SelectArm::ALL
+        IfArm::ALL
             .iter()
             .any(|&arm| refused(self.cycles[arm], self.range(arm)))
     }
 }
 
-/// Analyze the schedule for Select nodes and compute short-circuit guard ranges.
+/// Analyze the schedule for If nodes and compute short-circuit guard ranges.
 ///
-/// For each Select, partitions schedule entries into:
+/// For each If, partitions schedule entries into:
 /// - Shared: needed by mask, or by both arms (must always execute)
 /// - True-exclusive: only needed by the true arm (skip if mask all-false)
 /// - False-exclusive: only needed by the false arm (skip if mask all-true)
@@ -609,20 +609,20 @@ impl SelectArms {
 /// `folds` is what each loop this scope opens reads from it, which makes the
 /// loop's `Reduce` def a consumer of each of those values ([`FoldReads`]).
 ///
-/// Returns guards sorted by select_idx (ascending).
-pub(crate) fn analyze_select_guards(
+/// Returns guards sorted by if_idx (ascending).
+pub(crate) fn analyze_if_guards(
     schedule: &[Def],
     external: &[ValueId],
     folds: &FoldReads,
-) -> Vec<SelectGuard> {
-    let arms = select_arms(schedule, external, folds);
+) -> Vec<IfGuard> {
+    let per_if = if_arms(schedule, external, folds);
     let mut telemetry = Telemetry::new();
     let mut guards = Vec::new();
 
     // One backward pass over the whole DAG, and only when someone is
     // reading: demand is what an arm *may skip*, which is a weaker
     // condition than what the partition may *move*, so it is recorded
-    // beside `exclusive` rather than replacing it. See `SelectStat`.
+    // beside `exclusive` rather than replacing it. See `IfStat`.
     let demand = telemetry
         .is_on()
         .then(|| {
@@ -631,11 +631,11 @@ pub(crate) fn analyze_select_guards(
         })
         .flatten();
 
-    for select in &arms {
-        let ranges = select.ranges();
+    for arms in &per_if {
+        let ranges = arms.ranges();
         let demand_exclusive = demand.as_ref().map_or(ArmPair::new(0, 0), |d| {
             let observed = |v: ValueId| d.get(&v).cloned().unwrap_or_default();
-            let arm = |lit: Literal<ValueId>| observed(select.select_vid).and_literal(lit);
+            let arm = |lit: Literal<ValueId>| observed(arms.if_vid).and_literal(lit);
             let count = |pred: &Demand<ValueId>| {
                 schedule
                     .iter()
@@ -646,17 +646,17 @@ pub(crate) fn analyze_select_guards(
                     .count()
             };
             ArmPair::new(
-                count(&arm(Literal::set(select.mask_vid))),
-                count(&arm(Literal::clear(select.mask_vid))),
+                count(&arm(Literal::set(arms.mask_vid))),
+                count(&arm(Literal::clear(arms.mask_vid))),
             )
         });
-        telemetry.select(|| SelectStat {
+        telemetry.if_stat(|| IfStat {
             demand_exclusive,
-            select_idx: select.select_idx,
-            mask_idx: select.mask_idx,
-            exclusive: select.indices.as_ref().map(|s| s.len()),
+            if_idx: arms.if_idx,
+            mask_idx: arms.mask_idx,
+            exclusive: arms.indices.as_ref().map(|s| s.len()),
             guarded: ranges.map(|(s, e)| e - s),
-            intruders: select
+            intruders: arms
                 .indices
                 .as_ref()
                 .map(|indices| intruders(indices, schedule)),
@@ -664,9 +664,9 @@ pub(crate) fn analyze_select_guards(
 
         // Only create a guard if at least one arm has exclusive nodes
         if ranges.true_arm.0 != ranges.true_arm.1 || ranges.false_arm.0 != ranges.false_arm.1 {
-            guards.push(SelectGuard {
-                select_idx: select.select_idx,
-                mask_vid: select.mask_vid,
+            guards.push(IfGuard {
+                if_idx: arms.if_idx,
+                mask_vid: arms.mask_vid,
                 ranges,
             });
         }
@@ -676,12 +676,12 @@ pub(crate) fn analyze_select_guards(
     guards
 }
 
-/// Every `Select` in the schedule, with the entries exclusive to each arm.
+/// Every `If` in the schedule, with the entries exclusive to each arm.
 ///
 /// `external` values have a consumer outside the schedule (see
-/// [`analyze_select_guards`]), which no arm's closure can contain; a value a
+/// [`analyze_if_guards`]), which no arm's closure can contain; a value a
 /// fold reads has that fold's `Reduce` def as a consumer ([`FoldReads`]).
-fn select_arms(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Vec<SelectArms> {
+fn if_arms(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Vec<IfArms> {
     let mut arms = Vec::new();
 
     if schedule.is_empty() {
@@ -709,7 +709,7 @@ fn select_arms(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Vec
 
     // Global consumer map: consumers[v.0] = every value that reads v as an
     // operand. A node may only be guarded (skipped when its arm's mask is
-    // uniform) if EVERY consumer is inside that arm's subtree (or the select
+    // uniform) if EVERY consumer is inside that arm's subtree (or the `If`
     // itself) — otherwise an outer/sibling expression reads a register the
     // branch never computed. Subtree-local exclusivity (below) is necessary but
     // NOT sufficient; this is the global check that was missing.
@@ -724,7 +724,7 @@ fn select_arms(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Vec
         }
     }
     // A reader outside the schedule is a consumer no arm can contain: a name
-    // no def here has, so it is never "in the set" and never the select.
+    // no def here has, so it is never "in the set" and never the `If`.
     const OUTSIDE: ValueId = ValueId(u32::MAX);
     for root in external {
         if (root.0 as usize) <= max_vid {
@@ -734,7 +734,7 @@ fn select_arms(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Vec
 
     for (i, def) in schedule.iter().enumerate() {
         let (sel_vid, sop) = (&def.value, &def.op);
-        if let ScheduledOp::Ternary(OpKind::Select, mask_vid, true_vid, false_vid) = sop {
+        if let ScheduledOp::Ternary(OpKind::If, mask_vid, true_vid, false_vid) = sop {
             // (the exclusivity analysis, unchanged)
             // Compute transitive deps for each subtree using the dense O(1) lookup
             let mask_deps = transitive_deps(*mask_vid, &schedule_ops, folds);
@@ -742,7 +742,7 @@ fn select_arms(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Vec
             let false_deps = transitive_deps(*false_vid, &schedule_ops, folds);
 
             // A node is safe to skip under this arm only if every one of its
-            // consumers is ALSO skipped under it — or is the select itself.
+            // consumers is ALSO skipped under it — or is the `If` itself.
             // Reaching the arm is not enough: a value can be inside the arm's
             // cone and still be shared with the world outside it, and a
             // dependency of such a value would then be skipped while its
@@ -835,9 +835,9 @@ fn select_arms(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Vec
             let (true_cycles, false_cycles) =
                 (arm_cycles(&true_indices), arm_cycles(&false_indices));
 
-            arms.push(SelectArms {
-                select_idx: i,
-                select_vid: *sel_vid,
+            arms.push(IfArms {
+                if_idx: i,
+                if_vid: *sel_vid,
                 mask_vid: *mask_vid,
                 mask_idx,
                 indices: ArmPair::new(true_indices, false_indices),
@@ -872,12 +872,12 @@ fn select_arms(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Vec
 /// batches, 3.2x faster with one).
 const MISPREDICT_PENALTY_CYCLES: usize = 16;
 
-/// Reorder a scope's schedule so that a select's arm-exclusive entries form
+/// Reorder a scope's schedule so that an `If`'s arm-exclusive entries form
 /// one run — where that, and only that, is what stands between the arm and a
 /// branch.
 ///
-/// The transformation per select is a stable partition of the entries between
-/// the mask and the select into shared, then true-exclusive, then
+/// The transformation per `If` is a stable partition of the entries between
+/// the mask and the `If` into shared, then true-exclusive, then
 /// false-exclusive. It is always a legal topological order:
 ///
 /// - No shared entry depends on an arm-exclusive one. If it did, that value
@@ -888,8 +888,8 @@ const MISPREDICT_PENALTY_CYCLES: usize = 16;
 /// - Relative order is preserved inside each group, and every group's
 ///   dependencies now precede it.
 ///
-/// Outermost first — a select is scheduled after everything in its arms, so an
-/// enclosing select comes later — and each select is partitioned **once**,
+/// Outermost first — an `If` is scheduled after everything in its arms, so an
+/// enclosing `If` comes later — and each `If` is partitioned **once**,
 /// unconditionally.
 ///
 /// # This used to be a search, and that was the wrong shape
@@ -905,85 +905,84 @@ const MISPREDICT_PENALTY_CYCLES: usize = 16;
 /// The accept/reject test existed to protect register pressure: partitioning
 /// moves shared values ahead of both arms, so they live across the skipped
 /// arm, and that was judged "a cost worth paying for a branch and not
-/// otherwise". That reasoning takes `Select` to be a blend with the branch as
+/// otherwise". That reasoning takes `If` to be a blend with the branch as
 /// an upsell to be justified. It is not — a uniform mask *takes an arm*, and
 /// the blend is the fallback for a mask that varies by lane (CLAUDE.md,
-/// "Select contains an if"). The branch is not optional, so neither is the
+/// "`If` contains an if"). The branch is not optional, so neither is the
 /// live-range cost of admitting it, and the test has nothing left to decide.
 ///
 /// What still decides something is [`MISPREDICT_PENALTY_CYCLES`] — one
-/// comparison per select, not a search: an arm too cheap to pay for its own
-/// branch is never partitioned, because [`SelectArms::refused_for_order`] is
+/// comparison per `If`, not a search: an arm too cheap to pay for its own
+/// branch is never partitioned, because [`IfArms::refused_for_order`] is
 /// false for it. That bound is measured (a glyph's coverage mask is 3.6x
 /// *slower* guarded), so "always admit the jump" is a statement about what
-/// `Select` means, not a licence to branch on a two-instruction arm.
+/// `If` means, not a licence to branch on a two-instruction arm.
 ///
 /// `folds` is what each loop this scope opens reads from it ([`FoldReads`]):
 /// a permutation is only legal if it keeps those reads ahead of the loop, and
 /// a loop's `Reduce` def names none of them as an operand.
-pub(crate) fn cluster_select_arms(schedule: Vec<Def>, folds: &FoldReads) -> Vec<Def> {
+pub(crate) fn cluster_if_arms(schedule: Vec<Def>, folds: &FoldReads) -> Vec<Def> {
     let mut current = schedule;
-    // Keyed by the select's *value*: the one identity that survives a
-    // reordering, where a schedule position does not. Each select is
+    // Keyed by the `If`'s *value*: the one identity that survives a
+    // reordering, where a schedule position does not. Each `If` is
     // partitioned at most once, so this terminates in at most one pass per
-    // select and there is no round cap to choose.
+    // `If` and there is no round cap to choose.
     let mut partitioned: alloc::collections::BTreeSet<ValueId> =
         alloc::collections::BTreeSet::new();
 
     loop {
         // Recomputed each time because `partition_around` returns a new
-        // schedule and `SelectArms` holds indices into the old one. Only the
+        // schedule and `IfArms` holds indices into the old one. Only the
         // region it rewrites moves, and relative order is preserved within
-        // each group, so a select already contiguous inside that region stays
+        // each group, so an `If` already contiguous inside that region stays
         // contiguous.
         // Clustering knows which values each loop reads, but not which of
         // them `place_roots` will park: it runs before the roots are placed.
         // That only costs a guard — the analysis that ranges an arm is told
         // about the roots, and excludes them — never correctness: a parked
         // value is one a loop reads, and `folds` keeps it ahead of the loop.
-        let arms = select_arms(&current, &[], folds);
+        let arms = if_arms(&current, &[], folds);
         let Some(candidate) = arms
             .iter()
             .rev()
-            .find(|c| c.refused_for_order() && !partitioned.contains(&c.select_vid))
+            .find(|c| c.refused_for_order() && !partitioned.contains(&c.if_vid))
         else {
             break;
         };
-        partitioned.insert(candidate.select_vid);
+        partitioned.insert(candidate.if_vid);
         current = partition_around(&current, candidate, folds);
     }
 
     current
 }
 
-/// The schedule with `select`'s region stable-partitioned into shared, then
+/// The schedule with the region of the `If` that `arms` describes
+/// stable-partitioned into shared, then
 /// true-exclusive, then false-exclusive entries.
-fn partition_around(schedule: &[Def], select: &SelectArms, folds: &FoldReads) -> Vec<Def> {
-    let first_arm = select.indices[SelectArm::True]
+fn partition_around(schedule: &[Def], arms: &IfArms, folds: &FoldReads) -> Vec<Def> {
+    let first_arm = arms.indices[IfArm::True]
         .iter()
-        .chain(select.indices[SelectArm::False].iter())
+        .chain(arms.indices[IfArm::False].iter())
         .min();
     let Some(first_arm) = first_arm else {
         return schedule.to_vec();
     };
     // The mask is shared, so it lands in the first group wherever it started;
     // the region begins at whichever of the two comes first.
-    let start = first_arm.min(select.mask_idx);
-    let region = start..select.select_idx;
+    let start = first_arm.min(arms.mask_idx);
+    let region = start..arms.if_idx;
 
     // A scope's result is its last entry, so nothing may be placed after it:
-    // when the select IS the root, the strangers stay ahead of the arms.
-    let sink_past_select = select.select_idx + 1 < schedule.len();
+    // when the `If` IS the root, the strangers stay ahead of the arms.
+    let sink_past_if = arms.if_idx + 1 < schedule.len();
     let in_any_arm = |i: &usize| {
-        select.indices[SelectArm::True].contains(*i)
-            || select.indices[SelectArm::False].contains(*i)
+        arms.indices[IfArm::True].contains(*i) || arms.indices[IfArm::False].contains(*i)
     };
-    let stays_before =
-        |i: &usize| (select.cone.contains(*i) || !sink_past_select) && !in_any_arm(i);
+    let stays_before = |i: &usize| (arms.cone.contains(*i) || !sink_past_if) && !in_any_arm(i);
 
     let mut out = Vec::with_capacity(schedule.len());
     out.extend_from_slice(&schedule[..start]);
-    // What the select reads and neither arm owns: it must be computed before
+    // What the `If` reads and neither arm owns: it must be computed before
     // the arms, because the arms read it.
     out.extend(
         region
@@ -991,17 +990,17 @@ fn partition_around(schedule: &[Def], select: &SelectArms, folds: &FoldReads) ->
             .filter(stays_before)
             .map(|i| schedule[i].clone()),
     );
-    for arm in SelectArm::ALL {
+    for arm in IfArm::ALL {
         out.extend(
-            select.indices[arm]
+            arms.indices[arm]
                 .iter()
                 .filter(|i| region.contains(i))
                 .map(|i| schedule[i].clone()),
         );
     }
-    out.push(schedule[select.select_idx].clone());
-    // What the select does NOT read sinks past it, keeping its order. Legal
-    // for the same reason the partition is: nothing the select reads can read
+    out.push(schedule[arms.if_idx].clone());
+    // What the `If` does NOT read sinks past it, keeping its order. Legal
+    // for the same reason the partition is: nothing the `If` reads can read
     // one of these, or it would be in the cone. And it is the better place —
     // hoisting a stranger ahead of both arms would keep it live across the
     // arm a branch is there to skip, which is pressure bought for nothing.
@@ -1011,7 +1010,7 @@ fn partition_around(schedule: &[Def], select: &SelectArms, folds: &FoldReads) ->
             .filter(|i| !stays_before(i) && !in_any_arm(i))
             .map(|i| schedule[i].clone()),
     );
-    out.extend_from_slice(&schedule[select.select_idx + 1..]);
+    out.extend_from_slice(&schedule[arms.if_idx + 1..]);
 
     debug_assert_eq!(
         out.len(),
@@ -1059,9 +1058,9 @@ pub struct IntruderStats {
     pub leaves: usize,
 }
 
-/// What one `Select` in the schedule offered a guard, and what survived.
-struct SelectStat {
-    select_idx: usize,
+/// What one `If` in the schedule offered a guard, and what survived.
+struct IfStat {
+    if_idx: usize,
     /// Where the mask lands in the schedule; a guard needs it before the arm.
     mask_idx: usize,
     /// Values exclusive to each arm — what a guard could skip if the
@@ -1077,9 +1076,9 @@ struct SelectStat {
     /// Short of that the gap is the point: demand answers *may this be
     /// skipped*, while `exclusive` answers the stronger *may this be skipped
     /// and also moved*, which is what
-    /// [`cluster_select_arms`]'s three-way partition needs. Two selects
-    /// sharing a mask separate them — the inner select's arms are
-    /// demand-exclusive to the outer one, but the inner select itself is
+    /// [`cluster_if_arms`]'s three-way partition needs. Two `If`s
+    /// sharing a mask separate them — the inner `If`'s arms are
+    /// demand-exclusive to the outer one, but the inner `If` itself is
     /// shared and reads them, so moving them past it is illegal. The gap
     /// is the headroom a partition that ordered within its groups would
     /// unlock.
@@ -1124,13 +1123,13 @@ fn intruders(arm: &IndexSet, schedule: &[Def]) -> IntruderStats {
 /// Diagnosis only, and off by default: nothing the emitter decides with, and
 /// no emitted byte changes. It exists because "the guard did not fire" is a
 /// claim about the *schedule*, and the only way to settle it is to count. The
-/// two numbers per select are the two ways a guard is lost and they have
+/// two numbers per `If` are the two ways a guard is lost and they have
 /// different fixes: `exclusive` short of the arm's size is the analysis
 /// refusing (a value some other expression also reads), while `guarded` short
 /// of `exclusive` is the *order* refusing (the arm's own values are not a
 /// contiguous run, so one branch cannot span them).
 struct Telemetry {
-    stats: Option<Vec<SelectStat>>,
+    stats: Option<Vec<IfStat>>,
 }
 
 impl Telemetry {
@@ -1148,7 +1147,7 @@ impl Telemetry {
 
     /// The stat is built lazily: computing it walks the schedule, and nothing
     /// should pay for that when the telemetry is off.
-    fn select(&mut self, stat: impl FnOnce() -> SelectStat) {
+    fn if_stat(&mut self, stat: impl FnOnce() -> IfStat) {
         if let Some(stats) = self.stats.as_mut() {
             stats.push(stat());
         }
@@ -1170,6 +1169,10 @@ impl Telemetry {
             .iter()
             .map(|s| s.demand_exclusive.true_arm + s.demand_exclusive.false_arm)
             .sum();
+        // `selects=`/`per_select=` are the line's persisted spelling: the op
+        // is `If` since D18 of docs/plans/2026-09-25-the-language-is-kernel.md,
+        // but `pixelflow-pipeline/scripts/corpus_gaps_aggregate.py` keys on
+        // these field names, so they stay.
         std::eprintln!(
             "guard-telemetry: schedule={sched_len} selects={} guarded={covered} \
              exclusive={offered} demand_exclusive={demanded} per_select={:?}",
@@ -1178,7 +1181,7 @@ impl Telemetry {
                 .iter()
                 .map(|s| {
                     (
-                        s.select_idx,
+                        s.if_idx,
                         s.mask_idx,
                         (s.exclusive.true_arm, s.exclusive.false_arm),
                         (s.demand_exclusive.true_arm, s.demand_exclusive.false_arm),
@@ -1268,13 +1271,13 @@ mod tests {
     }
 
     // The arm op in each fixture is load-bearing, not decoration.
-    // `SelectArms::range` refuses any arm costing `<= MISPREDICT_PENALTY_CYCLES`
+    // `IfArms::range` refuses any arm costing `<= MISPREDICT_PENALTY_CYCLES`
     // — guarding one cannot pay for a mispredict — so the op has to clear that
     // bar for a guard to exist at all to pin the range of. `Rsqrt` is 21 cycles
     // in `latency_prior`; a `Neg` is 3, and every assertion here would read
     // zero guards.
 
-    /// A `Select` whose true arm alone does work exclusive to it — the false
+    /// An `If` whose true arm alone does work exclusive to it — the false
     /// arm is just the mask again, so it contributes nothing beyond
     /// `mask_deps`. Pins the exact range rather than only "a guard formed
     /// somewhere," which the whole-kernel `assert_guard_forms`-style tests
@@ -1287,14 +1290,14 @@ mod tests {
             def(2, ScheduledOp::Unary(OpKind::Rsqrt, ValueId(1))),
             def(
                 3,
-                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(2), ValueId(0)),
+                ScheduledOp::Ternary(OpKind::If, ValueId(0), ValueId(2), ValueId(0)),
             ),
         ];
 
-        let guards = analyze_select_guards(&schedule, &[], &FoldReads::default());
+        let guards = analyze_if_guards(&schedule, &[], &FoldReads::default());
 
         assert_eq!(guards.len(), 1);
-        assert_eq!(guards[0].select_idx, 3);
+        assert_eq!(guards[0].if_idx, 3);
         assert_eq!(guards[0].mask_vid, ValueId(0));
         assert_eq!(guards[0].true_range(), (1, 3));
         assert_eq!(guards[0].false_range(), (3, 3));
@@ -1309,14 +1312,14 @@ mod tests {
             def(2, ScheduledOp::Unary(OpKind::Rsqrt, ValueId(1))),
             def(
                 3,
-                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(0), ValueId(2)),
+                ScheduledOp::Ternary(OpKind::If, ValueId(0), ValueId(0), ValueId(2)),
             ),
         ];
 
-        let guards = analyze_select_guards(&schedule, &[], &FoldReads::default());
+        let guards = analyze_if_guards(&schedule, &[], &FoldReads::default());
 
         assert_eq!(guards.len(), 1);
-        assert_eq!(guards[0].select_idx, 3);
+        assert_eq!(guards[0].if_idx, 3);
         assert_eq!(guards[0].true_range(), (3, 3));
         assert_eq!(guards[0].false_range(), (1, 3));
     }
@@ -1334,14 +1337,14 @@ mod tests {
             def(1, ScheduledOp::Unary(OpKind::Rsqrt, ValueId(3))), // ValueId(3) has no Def
             def(
                 4,
-                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(0), ValueId(1)),
+                ScheduledOp::Ternary(OpKind::If, ValueId(0), ValueId(0), ValueId(1)),
             ),
         ];
 
-        let guards = analyze_select_guards(&schedule, &[], &FoldReads::default());
+        let guards = analyze_if_guards(&schedule, &[], &FoldReads::default());
 
         assert_eq!(guards.len(), 1);
-        assert_eq!(guards[0].select_idx, 2);
+        assert_eq!(guards[0].if_idx, 2);
         assert_eq!(guards[0].false_range(), (1, 2));
     }
 
@@ -1360,7 +1363,7 @@ mod tests {
             def(2, ScheduledOp::Unary(OpKind::Recip, ValueId(1))),
             def(
                 3,
-                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(2), ValueId(0)),
+                ScheduledOp::Ternary(OpKind::If, ValueId(0), ValueId(2), ValueId(0)),
             ),
         ];
 
@@ -1370,7 +1373,7 @@ mod tests {
             "fixture assumes Recip sits exactly on the gate",
         );
 
-        assert!(analyze_select_guards(&schedule, &[], &FoldReads::default()).is_empty());
+        assert!(analyze_if_guards(&schedule, &[], &FoldReads::default()).is_empty());
     }
 
     /// A four-trip fold; the scope its body was carved into is not what
@@ -1398,7 +1401,7 @@ mod tests {
             def(3, ScheduledOp::Binary(OpKind::Mul, ValueId(1), ValueId(2))),
             def(
                 4,
-                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(3), ValueId(0)),
+                ScheduledOp::Ternary(OpKind::If, ValueId(0), ValueId(3), ValueId(0)),
             ),
             def(5, reduce()),
             def(6, ScheduledOp::Binary(OpKind::Add, ValueId(4), ValueId(5))),
@@ -1411,16 +1414,16 @@ mod tests {
             [(ValueId(5), &sibling[..], &FoldReads::default())],
         );
 
-        let blind = analyze_select_guards(&schedule, &[], &FoldReads::default());
+        let blind = analyze_if_guards(&schedule, &[], &FoldReads::default());
         assert_eq!(blind[0].true_range(), (1, 4), "the arm owned `W` unseen");
 
-        let guards = analyze_select_guards(&schedule, &[], &folds);
+        let guards = analyze_if_guards(&schedule, &[], &folds);
         assert_eq!(guards.len(), 1);
         assert_eq!(guards[0].true_range(), (2, 4), "`W` is not the arm's");
     }
 
     /// `s` is read only by `W`'s body, and `W` is in the true arm: `s` is in
-    /// the select's cone, not a stranger to be sunk past it — which would put
+    /// the `If`'s cone, not a stranger to be sunk past it — which would put
     /// it after the loop that reads it.
     #[test]
     fn cluster_keeps_what_a_fold_reads_ahead_of_the_fold() {
@@ -1433,7 +1436,7 @@ mod tests {
             def(5, ScheduledOp::Binary(OpKind::Mul, ValueId(2), ValueId(4))),
             def(
                 6,
-                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(5), ValueId(0)),
+                ScheduledOp::Ternary(OpKind::If, ValueId(0), ValueId(5), ValueId(0)),
             ),
             def(7, ScheduledOp::Binary(OpKind::Add, ValueId(6), ValueId(1))),
         ];
@@ -1446,21 +1449,21 @@ mod tests {
                 .expect("a permutation keeps every def")
         };
 
-        let blind = cluster_select_arms(schedule.clone(), &FoldReads::default());
+        let blind = cluster_if_arms(schedule.clone(), &FoldReads::default());
         assert!(
             at(&blind, 3) > at(&blind, 4),
             "`s` sank past its loop unseen"
         );
 
-        let clustered = cluster_select_arms(schedule, &folds);
+        let clustered = cluster_if_arms(schedule, &folds);
         assert!(at(&clustered, 3) < at(&clustered, 4));
         assert!(is_topological(&clustered, &folds));
     }
 
     /// A gather's base is a pointer operand, not a vector one, and it is a
     /// read all the same: the `Context` the arm's `Broadcast` addresses
-    /// through is in the select's cone, not a stranger to be sunk past the
-    /// select — which would put the pointer's definition after its reader.
+    /// through is in the `If`'s cone, not a stranger to be sunk past the
+    /// `If` — which would put the pointer's definition after its reader.
     /// `Y + Y` sits between the arm's entries and is read by the root, so the
     /// arm is refused for order and clustering runs.
     #[test]
@@ -1474,7 +1477,7 @@ mod tests {
             def(5, ScheduledOp::Broadcast(ValueId(2), ValueId(4))),
             def(
                 6,
-                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(5), ValueId(0)),
+                ScheduledOp::Ternary(OpKind::If, ValueId(0), ValueId(5), ValueId(0)),
             ),
             def(7, ScheduledOp::Binary(OpKind::Add, ValueId(6), ValueId(3))),
         ];
@@ -1486,7 +1489,7 @@ mod tests {
                 .expect("a permutation keeps every def")
         };
 
-        let clustered = cluster_select_arms(schedule, &folds);
+        let clustered = cluster_if_arms(schedule, &folds);
         assert!(
             at(&clustered, 4) < at(&clustered, 5),
             "the pointer sank past the broadcast that reads it: {clustered:?}"
@@ -1507,7 +1510,7 @@ mod tests {
 
     /// `select(X < 20, F, 0) + Y`, with `F` the `Reduce` def `fold` opening
     /// at position 3 — the true arm's only entry of its own.
-    fn select_over_a_fold(fold: pixelflow_ir::fold::RangeFold, body_root: u32) -> Vec<Def> {
+    fn if_over_a_fold(fold: pixelflow_ir::fold::RangeFold, body_root: u32) -> Vec<Def> {
         alloc::vec![
             def(0, ScheduledOp::Var(0)),
             def(1, ScheduledOp::Const(20.0)),
@@ -1516,7 +1519,7 @@ mod tests {
             def(4, ScheduledOp::Const(0.0)),
             def(
                 5,
-                ScheduledOp::Ternary(OpKind::Select, ValueId(2), ValueId(3), ValueId(4)),
+                ScheduledOp::Ternary(OpKind::If, ValueId(2), ValueId(3), ValueId(4)),
             ),
             def(6, ScheduledOp::Var(1)),
             def(7, ScheduledOp::Binary(OpKind::Add, ValueId(5), ValueId(6))),
@@ -1549,13 +1552,13 @@ mod tests {
         let cycles = CostModel::latency_prior();
         let fold = sum_over(0, ARM_TRIPS);
         let body = distance_body(fold, 10);
-        let schedule = select_over_a_fold(fold, 12);
+        let schedule = if_over_a_fold(fold, 12);
         let folds = FoldReads::new(&schedule, [(ValueId(3), &body[..], &FoldReads::default())]);
 
         let n = ARM_TRIPS as usize;
         let k = cycles.cost(OpKind::Sub) + cycles.cost(OpKind::Abs);
         let combine = cycles.cost(OpKind::Add);
-        let arms = select_arms(&schedule, &[], &folds);
+        let arms = if_arms(&schedule, &[], &folds);
         assert_eq!(arms.len(), 1);
         assert_eq!(
             arms[0].cycles.true_arm,
@@ -1564,16 +1567,16 @@ mod tests {
         );
         assert_eq!(arms[0].cycles.true_arm, cycles.fold_cost(fold, k));
 
-        let blind = select_arms(&schedule, &[], &FoldReads::default());
+        let blind = if_arms(&schedule, &[], &FoldReads::default());
         assert_eq!(
             blind[0].cycles.true_arm, 0,
             "a Reduce def that opens no loop here is a slot read, and the table prices it 0"
         );
 
-        let guards = analyze_select_guards(&schedule, &[], &folds);
+        let guards = analyze_if_guards(&schedule, &[], &folds);
         assert_eq!(guards.len(), 1);
         assert_eq!(guards[0].true_range(), (3, 4), "the loop is skipped whole");
-        assert!(analyze_select_guards(&schedule, &[], &FoldReads::default()).is_empty());
+        assert!(analyze_if_guards(&schedule, &[], &FoldReads::default()).is_empty());
     }
 
     /// A table read whose address the lane binder does not reach is a
@@ -1595,7 +1598,7 @@ mod tests {
             def(4, ScheduledOp::Const(0.0)),
             def(
                 5,
-                ScheduledOp::Ternary(OpKind::Select, ValueId(2), ValueId(3), ValueId(4)),
+                ScheduledOp::Ternary(OpKind::If, ValueId(2), ValueId(3), ValueId(4)),
             ),
             def(6, ScheduledOp::Var(1)),
             def(7, ScheduledOp::Binary(OpKind::Add, ValueId(5), ValueId(6))),
@@ -1616,10 +1619,10 @@ mod tests {
 
         let k =
             cycles.cost(OpKind::RawGather) + cycles.cost(OpKind::Sub) + cycles.cost(OpKind::Abs);
-        let arms = select_arms(&schedule, &roots, &folds);
+        let arms = if_arms(&schedule, &roots, &folds);
         assert_eq!(arms[0].cycles.true_arm, cycles.fold_cost(fold, k));
 
-        let guards = analyze_select_guards(&schedule, &roots, &folds);
+        let guards = analyze_if_guards(&schedule, &roots, &folds);
         assert_eq!(guards[0].true_range(), (4, 5), "the loop, not its pointer");
     }
 
@@ -1647,13 +1650,13 @@ mod tests {
             &outer_body,
             [(ValueId(21), &inner_body[..], &FoldReads::default())],
         );
-        let schedule = select_over_a_fold(outer, 23);
+        let schedule = if_over_a_fold(outer, 23);
         let folds = FoldReads::new(&schedule, [(ValueId(3), &outer_body[..], &inside)]);
 
         let k = cycles.cost(OpKind::Sub) + cycles.cost(OpKind::Abs);
         let inner_loop = cycles.fold_cost(inner, k);
         let outer_loop = cycles.fold_cost(outer, inner_loop + k);
-        let arms = select_arms(&schedule, &[], &folds);
+        let arms = if_arms(&schedule, &[], &folds);
         assert_eq!(arms[0].cycles.true_arm, outer_loop);
         assert!(
             outer_loop >= (OUTER_TRIPS * ARM_TRIPS) as usize * k,

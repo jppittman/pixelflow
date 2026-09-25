@@ -201,7 +201,7 @@ materialize(&manifold, x_start, y, &mut buffer);
 
 Under the hood:
 - `Field` = `SimdVec<f32>` (4 lanes on ARM NEON, 8 on AVX2)
-- Expressions build an AST of `Add`, `Mul`, `Sqrt`, `Select`, etc.
+- Expressions build an AST of `Add`, `Mul`, `Sqrt`, `If`, etc.
 - Evaluation inlines to tight SIMD loops
 - Zero runtime dispatch—the compiler monomorphizes everything
 

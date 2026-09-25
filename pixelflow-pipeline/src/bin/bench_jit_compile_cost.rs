@@ -89,11 +89,11 @@ fn build_kernel_arena(target_nodes: usize, salt: f32) -> (ExprArena, ExprId) {
     while arena.len() < target_nodes {
         let remaining = target_nodes - arena.len();
         cur = match step % 8 {
-            // Select costs 2 nodes (its Lt guard + the Select itself);
+            // If costs 2 nodes (its Lt guard + the If itself);
             // when only 1 node of budget remains, fall through to `_`.
             0 if remaining >= 2 => {
                 let inside = arena.push_binary(OpKind::Lt, cur, c);
-                arena.push_ternary(OpKind::Select, inside, dx2, cur)
+                arena.push_ternary(OpKind::If, inside, dx2, cur)
             }
             1 => arena.push_unary(OpKind::Sqrt, cur),
             2 => arena.push_binary(OpKind::Mul, cur, dx),
