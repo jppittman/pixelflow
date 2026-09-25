@@ -5,10 +5,13 @@
 - **Status**: `Proposed`. Amended 2026-09-25 by
   [the-language-is-kernel](2026-09-25-the-language-is-kernel.md): the front end
   (§3.2), the build-time entry, CL4–CL5, Q1 and Q4 are superseded there.
-  After JP's ruling that there are no tables, this plan's tables backed by
-  uniforms are superseded too: §1.3, A8, CL8 and Q2. So are its program per
-  control-point count and its frame (§1.6, Q3). A font is one program per zoom
-  level, choosing among glyphs with `if` (the-language-is-kernel §1.6–§1.8).
+  After JP's ruling that there are no tables and the control points are
+  uniforms, this plan's tables backed by uniforms are superseded too: §1.3,
+  A8, CL8 and Q2, and the fold over pieces they fed. A glyph's program is
+  the kernel for its number of control points, `N` copies of one piece body
+  over scalar uniforms, and the measured `U_band` is that program
+  (the-language-is-kernel §1.6–§1.8). The frame (§1.6, Q3) is superseded:
+  a cell is one call.
 - **Created**: 2026-09-24; revised 2026-09-25
 - **Verified against**: `8b7b75a`. The inputs were:
   - four maps (optimizer, front end, backend and artifact, bound buffers);
