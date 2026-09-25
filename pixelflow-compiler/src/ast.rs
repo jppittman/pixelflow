@@ -20,7 +20,7 @@
 //!
 //! Expr
 //!   ├── Ident(name)                    // Variable reference: X, cx, etc.
-//!   ├── Literal(value)                 // Numeric literal: 1.0, 2.5
+//!   ├── Literal(value)                 // Numeric literal, as its f32: 1.0, 2.5
 //!   ├── Binary(op, lhs, rhs)           // a + b, x * y
 //!   ├── Unary(op, operand)             // -x
 //!   ├── Call(method, receiver, args)   // x.sqrt(), a.max(b)
@@ -106,10 +106,14 @@ pub struct IdentExpr {
     pub span: Span,
 }
 
-/// A literal expression.
+/// A numeric literal, already the `f32` it denotes.
+///
+/// The parser decides the value — rounding a float once, as rustc does, and
+/// refusing a literal that names no `f32` — so no later stage holds the
+/// source text or rounds it again.
 #[derive(Debug, Clone)]
 pub struct LiteralExpr {
-    pub lit: syn::Lit,
+    pub value: f32,
     // Kept for AST-node uniformity; not all node types' spans are read today.
     #[allow(dead_code)]
     pub span: Span,
