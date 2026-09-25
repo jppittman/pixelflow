@@ -41,11 +41,13 @@ use alloc::vec::Vec;
 // unconditional fallback so this crate keeps building under
 // `--no-default-features` — no_std, no optional deps. `hash-memo` upgrades
 // it to a `hashbrown::HashMap` (needs `Eq + Hash` instead) for callers who
-// want the faster lookup and can afford the dependency.
+// want the faster lookup and can afford the dependency. Crate-visible: the
+// key walk and the link step index a uniform table by identity through the
+// same alias, so there is one answer to "which map under `no_std`".
 #[cfg(feature = "hash-memo")]
-type Memo<K, V> = hashbrown::HashMap<K, V>;
+pub(crate) type Memo<K, V> = hashbrown::HashMap<K, V>;
 #[cfg(not(feature = "hash-memo"))]
-type Memo<K, V> = alloc::collections::BTreeMap<K, V>;
+pub(crate) type Memo<K, V> = alloc::collections::BTreeMap<K, V>;
 
 use core::fmt;
 use core::hash::{Hash, Hasher};

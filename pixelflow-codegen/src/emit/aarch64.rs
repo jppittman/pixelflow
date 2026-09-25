@@ -4,6 +4,7 @@
 //! These are the "atoms" that compound operations are built from.
 
 use super::{AsmInsn, AsmProgram, Gpr, Label, LabelRef, PtrReg, Reg, assemble, unimplemented_op};
+use crate::error::CompileError;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -356,19 +357,41 @@ pub fn emit_dup_lane0(code: &mut Vec<u8>, dst: Reg, src: Reg) {
 
 /// `dst = splat(base[offset])`: `ldr s<dst>, [base, #offset*4]` reads the
 /// value and `dup` spreads it. `base` is the block's address, wherever the
-/// allocator keeps that pointer value.
-pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, base: PtrReg, offset: u16) {
+/// allocator keeps that pointer value. An element past the 12-bit scaled
+/// immediate is addressed through IP0, as any deep displacement is
+/// ([`table::address_in_ip0`]).
+///
+/// # Errors
+///
+/// [`CompileError::BudgetExceeded`] when the element's byte offset is past
+/// the 32-bit offset [`Mem`] carries — refused, never wrapped into an
+/// address that reads some other argument. That bound is the operand
+/// type's, not the instruction's: `imm12` is the instruction's, and the IP0
+/// fallback covers everything past it up to `Mem`'s.
+pub fn emit_uniform_load(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    base: PtrReg,
+    offset: u64,
+) -> Result<(), CompileError> {
+    let bytes = offset
+        .checked_mul(u64::from(S_BYTES))
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or(CompileError::BudgetExceeded(
+            "uniform byte offset past the 32-bit offset `Mem` carries",
+        ))?;
     AsmProgram::from([
         Inst::ldr_s(
             dst,
             Mem {
                 base,
-                offset: u32::from(offset) * S_BYTES,
+                offset: bytes,
             },
         ),
         Inst::DupLane0(dst, dst),
     ])
     .assemble(code);
+    Ok(())
 }
 
 // =============================================================================
@@ -2421,7 +2444,7 @@ pub(crate) mod driver {
                 );
             }
             ResolvedOp::Uniform { dst, base, offset } => {
-                super::emit_uniform_load(code, *dst, *base, *offset);
+                super::emit_uniform_load(code, *dst, *base, *offset)?;
             }
             ResolvedOp::Context { dst, slot } => {
                 // The one read of the context pointer (x0 per AAPCS64):

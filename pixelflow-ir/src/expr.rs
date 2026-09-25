@@ -510,10 +510,10 @@ impl Environment {
                     self.uniforms[i], decl,
                     "two declarations share a UniformIdentity but disagree on default"
                 );
-                UniformId(i as u16)
+                UniformId(i as u64)
             }
             None => {
-                let id = UniformId(self.uniforms.len() as u16);
+                let id = UniformId(self.uniforms.len() as u64);
                 self.uniforms.push(decl);
                 id
             }

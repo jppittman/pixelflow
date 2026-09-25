@@ -619,6 +619,14 @@ mod tests {
     /// dense little-endian indices) rather than as an opaque byte literal,
     /// because `OpCode`'s numbering is explicitly not stable across releases
     /// and pinning *that* would be a gate on the wrong thing.
+    ///
+    /// Re-derived once since: a uniform's slot is encoded at `UniformId`'s
+    /// width, and that width went from 16 to 64 bits when the cap it put on
+    /// a program's argument count was removed
+    /// (docs/plans/2026-09-25-the-language-is-kernel.md, A4). A buffer's slot
+    /// stays at `BufferId`'s 16, as buffers are on their way out. The key is
+    /// never persisted, so the encoding moving is a fact to pin, not a
+    /// migration.
     #[test]
     fn the_compile_key_is_the_canonical_bytes_plus_the_shape() {
         let buffer = BufferDecl {
@@ -664,8 +672,8 @@ mod tests {
         want.extend_from_slice(&0u32.to_le_bytes());
         want.extend_from_slice(&3u32.to_le_bytes());
         want.extend_from_slice(&4u32.to_le_bytes());
-        want.push(8); // Uniform, by dense offset
-        want.extend_from_slice(&0u16.to_le_bytes());
+        want.push(8); // Uniform, by dense offset, at `UniformId`'s width
+        want.extend_from_slice(&0u64.to_le_bytes());
         want.push(4); // Binary
         want.extend_from_slice(&OpKind::Add.marshal().to_bytes());
         want.extend_from_slice(&5u32.to_le_bytes());

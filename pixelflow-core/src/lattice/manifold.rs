@@ -49,6 +49,7 @@ extern crate std;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use std::collections::HashMap;
 use std::sync::RwLock;
 
 use pixelflow_codegen::CompiledKernel;
@@ -91,7 +92,44 @@ pub struct UniformBlock {
     values: Arc<Vec<f32>>,
     /// The link this block is laid out against, shared with the manifold
     /// that made it; a bound manifold checks it is the very same table.
-    link: Arc<[UniformDecl]>,
+    link: Arc<Link>,
+}
+
+/// A compiled kernel's arguments in the offset order its block is read in,
+/// with each identity's offset indexed once, here, at compile time.
+///
+/// The index is what makes [`UniformBlock::set`] a lookup: a search over the
+/// link per `set` made filling a block of `n` arguments `O(n²)`, and a
+/// glyph's block is thousands (ten per piece, and the font decides the
+/// piece count). Shared between the manifold, its blocks and its bound
+/// manifolds, so "the same link" is pointer equality.
+#[derive(Debug)]
+struct Link {
+    decls: Vec<UniformDecl>,
+    offsets: HashMap<UniformIdentity, usize>,
+}
+
+impl Link {
+    fn new(decls: Vec<UniformDecl>) -> Self {
+        let offsets: HashMap<UniformIdentity, usize> = decls
+            .iter()
+            .enumerate()
+            .map(|(offset, decl)| (decl.id, offset))
+            .collect();
+        // The link step numbers each instance once, so an identity that
+        // appears twice is a corrupt link: refuse it rather than let one
+        // handle silently write the other's offset.
+        assert_eq!(
+            offsets.len(),
+            decls.len(),
+            "Manifold: a link names an argument at two offsets"
+        );
+        Self { decls, offsets }
+    }
+
+    fn offset(&self, id: UniformIdentity) -> Result<usize, UnknownUniform> {
+        self.offsets.get(&id).copied().ok_or(UnknownUniform(id))
+    }
 }
 
 /// A handle that is not one of the program's arguments.
@@ -112,10 +150,7 @@ impl core::error::Error for UnknownUniform {}
 
 impl UniformBlock {
     fn offset(&self, u: Uniform) -> Result<usize, UnknownUniform> {
-        self.link
-            .iter()
-            .position(|d| d.id == u.identity())
-            .ok_or(UnknownUniform(u.identity()))
+        self.link.offset(u.identity())
     }
 
     /// Bind `v` to the argument `u` names.
@@ -151,6 +186,7 @@ impl UniformBlock {
     /// the kernel read the same block.
     pub fn entries(&self) -> impl Iterator<Item = (UniformIdentity, f32)> + '_ {
         self.link
+            .decls
             .iter()
             .map(|d| d.id)
             .zip(self.values.iter().copied())
@@ -275,7 +311,7 @@ pub struct Manifold {
     /// The kernel's arguments, in the offset order its block is read in —
     /// the link. Shared with every block and bound manifold made from here,
     /// so "the same link" is pointer equality.
-    link: Arc<[UniformDecl]>,
+    link: Arc<Link>,
     /// Every argument at its default, built once here so that `bind` — a
     /// per-frame call, four times a frame on the terminal path — is a
     /// refcount and never an allocation, uniforms or none.
@@ -342,7 +378,7 @@ impl Manifold {
             .map(|(id, data)| (id, Arc::clone(data)))
             .collect();
         let slots: Arc<[BufferDecl]> = linked.buffers.into();
-        let link: Arc<[UniformDecl]> = linked.uniforms.into();
+        let link = Arc::new(Link::new(linked.uniforms));
         Self {
             jit: Arc::clone(&linked.kernel),
             codes: Arc::new(Codes {
@@ -376,7 +412,7 @@ impl Manifold {
     /// The kernel's arguments, in the order the block holds them.
     #[must_use]
     pub fn uniforms(&self) -> &[UniformDecl] {
-        &self.link
+        &self.link.decls
     }
 
     /// A block with every argument at its default, laid out per this
@@ -482,7 +518,7 @@ struct Codes {
     /// them, since the link is a function of the kernel's structure alone,
     /// and checked to be when a new shape is compiled.
     slots: Arc<[BufferDecl]>,
-    link: Arc<[UniformDecl]>,
+    link: Arc<Link>,
     compiled: RwLock<Vec<(LatticeShape, Arc<CompiledKernel>)>>,
 }
 
@@ -499,7 +535,7 @@ impl Codes {
         let linked = pixelflow_codegen::jit_cache::compile(&self.kernel, shape)
             .expect("Manifold: kernel failed to compile at a band's shape");
         debug_assert!(
-            linked.buffers[..] == self.slots[..] && linked.uniforms[..] == self.link[..],
+            linked.buffers[..] == self.slots[..] && linked.uniforms[..] == self.link.decls[..],
             "Manifold: a kernel's link changed with the shape it was compiled at"
         );
         let mut table = self
@@ -532,7 +568,7 @@ pub struct BoundManifold {
     /// them is the block's.
     buffer_slots: usize,
     /// The link the block below is laid out against.
-    link: Arc<[UniformDecl]>,
+    link: Arc<Link>,
     /// The argument values the kernel reads, in link order — the manifold's
     /// defaults or a block's values, shared rather than copied; empty when
     /// it has none, and then no block pointer is passed at all.
@@ -903,5 +939,92 @@ mod tests {
             .at(&Kernel::x(), &Kernel::y());
         let program = Manifold::compile(&kernel, [4, 4]);
         let _refused = program.bind(&[(buffer, Arc::new(vec![0.0f32; 15]))]);
+    }
+
+    /// Nothing bounds a program's argument count, so a block past the 65,535
+    /// slots `UniformId` used to stop at lays out, and fills, like any
+    /// other. Laid out from its link directly — declared, never compiled at
+    /// a lattice — so the pin is the width and the lookup, not the emitter.
+    ///
+    /// Every slot is set and read back, which is also what pins `set` being
+    /// a lookup: a search over the link per `set` made a fill of `n`
+    /// arguments `O(n²)`, and at this size that is billions of compares —
+    /// the measured fill of a 2,000-argument block went from 651 µs to
+    /// 32 µs (release, median of 31) when the index replaced it.
+    #[test]
+    fn a_block_past_the_old_u16_width_lays_out_and_fills() {
+        const ARGUMENTS: usize = u16::MAX as usize + 1_000;
+        let handles: Vec<Uniform> = (0..ARGUMENTS).map(|i| Uniform::new(i as f32)).collect();
+        let link = Arc::new(Link::new(handles.iter().map(|u| u.decl()).collect()));
+        let defaults: Vec<f32> = link.decls.iter().map(|d| d.default).collect();
+        let mut block = UniformBlock {
+            values: Arc::new(defaults),
+            link,
+        };
+        assert_eq!(block.values().len(), ARGUMENTS);
+        assert_eq!(
+            block.get(handles[ARGUMENTS - 1]),
+            Ok((ARGUMENTS - 1) as f32),
+            "the last argument sits at its own offset, at its default"
+        );
+
+        for (i, u) in handles.iter().enumerate() {
+            block
+                .set(*u, -(i as f32))
+                .expect("every handle is an argument");
+        }
+        for (i, u) in handles.iter().enumerate() {
+            assert_eq!(block.get(*u), Ok(-(i as f32)), "argument {i}");
+        }
+        let stranger = Uniform::new(0.0);
+        assert_eq!(
+            block.set(stranger, 1.0),
+            Err(UnknownUniform(stranger.identity())),
+            "a handle that is not an argument is refused, not found by luck"
+        );
+    }
+
+    /// The public path at a glyph's scale (a glyph of 189 pieces carries
+    /// 1,894 arguments): a program of two thousand, compiled, its block
+    /// filled through the handles, and the code reading what the block
+    /// holds — so the offsets the index answers are the ones the code was
+    /// compiled against.
+    #[test]
+    fn a_program_of_thousands_of_arguments_fills_its_block_through_the_handles() {
+        const ARGUMENTS: usize = 2_000;
+        let handles: Vec<Uniform> = (0..ARGUMENTS).map(|_| Uniform::new(0.0)).collect();
+        // A balanced sum, so the kernel reads every argument.
+        let mut terms: Vec<Kernel> = handles.iter().map(|u| u.kernel()).collect();
+        while terms.len() > 1 {
+            terms = terms
+                .chunks(2)
+                .map(|pair| match pair {
+                    [a, b] => a.add(b),
+                    [a] => a.clone(),
+                    _ => unreachable!("chunks of two"),
+                })
+                .collect();
+        }
+        let program = Manifold::compile(&terms[0], [1, 1]);
+        assert_eq!(program.uniforms().len(), ARGUMENTS);
+
+        let mut block = program.block();
+        for u in &handles {
+            block.set(*u, 1.0).expect("declared");
+        }
+        let bound = program.bind(&[]);
+        assert_eq!(
+            bound.clone().with_uniforms(&block).eval_at(0.5, 0.5),
+            ARGUMENTS as f32,
+            "every argument read at the value its handle set"
+        );
+        // One argument moved through its handle moves the sum by exactly
+        // that argument: the handle's offset is that argument's, not a
+        // neighbour's.
+        block.set(handles[ARGUMENTS - 1], 3.0).expect("declared");
+        assert_eq!(
+            bound.with_uniforms(&block).eval_at(0.5, 0.5),
+            ARGUMENTS as f32 + 2.0
+        );
     }
 }

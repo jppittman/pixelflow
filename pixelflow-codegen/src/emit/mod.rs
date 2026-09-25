@@ -922,8 +922,11 @@ pub enum ResolvedOp {
     Broadcast { dst: Reg, idx: Reg, base: PtrReg },
     /// Uniform broadcast: `dst = splat(base[offset])`, the scalar at
     /// `4 * offset` of the block `base` addresses, broadcast to every lane:
-    /// `vbroadcastss` on every x86 tier, `ldr s` + `dup` on NEON.
-    Uniform { dst: Reg, base: PtrReg, offset: u16 },
+    /// `vbroadcastss` on every x86 tier, `ldr s` + `dup` on NEON. The
+    /// offset is the slot at its full control-plane width; each encoder
+    /// narrows it to the displacement its instruction has, and refuses one
+    /// that does not fit.
+    Uniform { dst: Reg, base: PtrReg, offset: u64 },
     /// A context pointer: `dst = ctx[slot]`, one `mov`/`ldr` from the
     /// context array the kernel is called with. The definition of every
     /// [`regalloc::Class::Pointer`] value, and the only instruction that
@@ -1171,7 +1174,7 @@ impl EmitCtx {
         let (arena, root) = pixelflow_ir::passes::legalize(arena, root, &collapse)
             .map_err(CompileError::Legalize)?;
         let origin_ids = origin_slots(&arena);
-        let schedule = arena_to_schedule(&arena, root, origin_ids);
+        let schedule = arena_to_schedule(&arena, root, Some(origin_ids));
         compile_native(schedule, self)
     }
 }
@@ -1210,7 +1213,7 @@ fn origin_slots(arena: &pixelflow_ir::arena::ExprArena) -> [UniformId; 2] {
             .iter()
             .position(|d| d.id == decl.id)
             .unwrap_or_else(|| panic!("a legalized arena declares the origin; this one does not"));
-        UniformId(slot as u16)
+        UniformId(slot as u64)
     })
 }
 
@@ -2484,8 +2487,8 @@ pub enum ScheduledOp {
     /// from the block whose base is the pointer operand — the link's
     /// uniform block, or the origin's. Not a leaf to the placement, since
     /// the load is an instruction worth doing once per call rather than
-    /// once per batch.
-    Uniform(regalloc::ValueId, u16),
+    /// once per batch. The offset is a [`UniformId`]'s slot, at its width.
+    Uniform(regalloc::ValueId, u64),
     /// The `k`-th pointer of the context the kernel is called with: a
     /// buffer's base for `k` below the buffer count, the link's uniform
     /// block and the origin block after. The definition of every
@@ -2638,7 +2641,10 @@ fn shift_immediate(op: OpKind, count: f32) -> u8 {
 ///   [`ScheduledOp::Lanes`], the iota every lane-varying value is built on.
 ///
 /// `origin` is the uniform slots of the two [`origin`] scalars, which read
-/// from the context entry after the link's block rather than from it.
+/// from the context entry after the link's block rather than from it — or
+/// `None` for an arena that declares no origin at all, because
+/// `passes::lattice::collapse` never wrapped it (a guard's arm, see
+/// [`schedule_guard_arm`]). Then every uniform is the link's.
 ///
 /// # Panics
 ///
@@ -2647,7 +2653,7 @@ fn shift_immediate(op: OpKind, count: f32) -> u8 {
 fn arena_to_schedule(
     arena: &pixelflow_ir::arena::ExprArena,
     root: pixelflow_ir::arena::ExprId,
-    origin: [UniformId; 2],
+    origin: Option<[UniformId; 2]>,
 ) -> Vec<regalloc::Def> {
     arena_to_schedule_from(arena, root, origin, 0)
 }
@@ -2670,7 +2676,7 @@ fn arena_to_schedule(
 fn arena_to_schedule_from(
     arena: &pixelflow_ir::arena::ExprArena,
     root: pixelflow_ir::arena::ExprId,
-    origin: [UniformId; 2],
+    origin: Option<[UniformId; 2]>,
     starting_id: u32,
 ) -> Vec<regalloc::Def> {
     use pixelflow_ir::arena::{ExprId, ExprNode};
@@ -2774,8 +2780,9 @@ fn arena_to_schedule_from(
             // The block's base is a `Context` def made here on first use,
             // ahead of this def so the schedule stays topological.
             ExprNode::Uniform(u) => {
-                let (ctx_slot, offset) = match origin.iter().position(|&o| o == u) {
-                    Some(axis) => (buffers + 1, axis as u16),
+                let axis = origin.and_then(|slots| slots.iter().position(|&o| o == u));
+                let (ctx_slot, offset) = match axis {
+                    Some(axis) => (buffers + 1, axis as u64),
                     None => (buffers, u.0),
                 };
                 let block = *blocks.entry(ctx_slot).or_insert_with(|| {
@@ -4016,16 +4023,6 @@ fn extract_guards(scoped: &mut regalloc::ScopedSchedule) {
     scoped.guard_arms = arms;
 }
 
-/// Uniform slots [`schedule_guard_arm`] hands `arena_to_schedule` in place of
-/// a real [`origin_slots`] answer.
-///
-/// A guard arm's arena is never wrapped by `passes::lattice::collapse` (see
-/// [`schedule_guard_arm`]'s doc), so it declares no origin uniform — these
-/// two slot numbers exist only so a real [`UniformId`] in the arm never
-/// aliases them by coincidence, and `u16::MAX` down is far past any arena's
-/// own uniform table.
-const GUARD_ARM_NO_ORIGIN: [UniformId; 2] = [UniformId(u16::MAX), UniformId(u16::MAX - 1)];
-
 /// Resolve `key`, legalize it short of the lattice, and schedule it as one
 /// arm of a `Guard`.
 ///
@@ -4069,7 +4066,10 @@ fn schedule_guard_arm(
     let (arena, root) = pixelflow_ir::passes::resolve(&arena, root).unwrap_or_else(|e| {
         panic!("schedule_guard_arm: {key:?}'s arm has no derivative rule: {e}")
     });
-    let schedule = arena_to_schedule_from(&arena, root, GUARD_ARM_NO_ORIGIN, starting_id);
+    // No origin: the arm's arena was never wrapped by `collapse`, so it
+    // declares none, and every uniform it reads is the link's. Said as the
+    // type, not as two sentinel slot numbers a real slot could one day reach.
+    let schedule = arena_to_schedule_from(&arena, root, None, starting_id);
     for def in &schedule {
         assert!(
             !matches!(def.op, ScheduledOp::Reduce(..) | ScheduledOp::Guard(..)),
@@ -4411,7 +4411,7 @@ mod tests {
         };
         let (a, root) = pixelflow_ir::passes::legalize(a, root, &collapse).expect("legalize");
         let ids = origin_slots(&a);
-        arena_to_schedule(&a, root, ids)
+        arena_to_schedule(&a, root, Some(ids))
     }
 
     /// [`schedule_for`] at this host's own lane count.
@@ -4424,7 +4424,7 @@ mod tests {
     /// A raw arena declares no uniform at all, so [`origin_slots`] has
     /// nothing to find; the tests below that feed the scheduler an
     /// unlegalized arena on purpose name the slots themselves.
-    const RAW_ORIGIN: [UniformId; 2] = [UniformId(0), UniformId(1)];
+    const RAW_ORIGIN: Option<[UniformId; 2]> = Some([UniformId(0), UniformId(1)]);
 
     /// A `Dwrt` that reaches the scheduler (a caller bypassed the lowering
     /// pipeline) must fail loudly at the schedule boundary, not as a cryptic
@@ -7602,20 +7602,228 @@ mod tests {
         #[test]
         fn every_backend_encodes_the_broadcast_load() {
             let mut avx2 = Vec::new();
-            avx2::emit_uniform_load(&mut avx2, Reg(5), x86_64::ptr::RAX, 3);
+            avx2::emit_uniform_load(&mut avx2, Reg(5), x86_64::ptr::RAX, 3).expect("fits");
             assert_eq!(avx2, [0xC4, 0xE2, 0x7D, 0x18, 0xA8, 0x0C, 0, 0, 0]);
 
             let mut avx512 = Vec::new();
-            avx512::emit_uniform_load(&mut avx512, Reg(5), x86_64::ptr::RAX, 3);
+            avx512::emit_uniform_load(&mut avx512, Reg(5), x86_64::ptr::RAX, 3).expect("fits");
             assert_eq!(avx512, [0x62, 0xF2, 0x7D, 0x48, 0x18, 0xA8, 0x0C, 0, 0, 0]);
 
             let mut neon = Vec::new();
-            aarch64::emit_uniform_load(&mut neon, Reg(5), aarch64::ptr::X9, 3);
+            aarch64::emit_uniform_load(&mut neon, Reg(5), aarch64::ptr::X9, 3).expect("fits");
             let words: Vec<u32> = neon
                 .chunks(4)
                 .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                 .collect();
             assert_eq!(words, [0xBD40_0D25, 0x4E04_04A5]);
+        }
+
+        /// The slot `UniformId` used to stop at, and one past it, in
+        /// bytes: `65_539` is the offset above, shifted up by a full 16-bit
+        /// range, so that the byte offset `262_156` (`0x0004_000C`) is
+        /// `0x0C` wrapped to 16 bits — the load a narrower offset would
+        /// have emitted for it, reading argument 3.
+        const PAST_U16: u64 = 3 + (u16::MAX as u64 + 1);
+        const PAST_U16_BYTES: u32 = 262_156;
+
+        /// The same load with the offset past the old width: the x86 tiers
+        /// carry the full `disp32` (same prefix and ModRM as the offset-3
+        /// bytes above, only the displacement changes), and NEON, whose
+        /// scaled immediate stops at 4095 elements, computes the address
+        /// into IP0 in `add`-immediate steps and reads `[x16]` — the same
+        /// path a deep spill frame takes.
+        #[test]
+        fn every_backend_encodes_a_load_past_the_old_u16_offset() {
+            let mut avx2 = Vec::new();
+            avx2::emit_uniform_load(&mut avx2, Reg(5), x86_64::ptr::RAX, PAST_U16).expect("fits");
+            assert_eq!(avx2, [0xC4, 0xE2, 0x7D, 0x18, 0xA8, 0x0C, 0x00, 0x04, 0x00]);
+
+            let mut avx512 = Vec::new();
+            avx512::emit_uniform_load(&mut avx512, Reg(5), x86_64::ptr::RAX, PAST_U16)
+                .expect("fits");
+            assert_eq!(
+                avx512,
+                [0x62, 0xF2, 0x7D, 0x48, 0x18, 0xA8, 0x0C, 0x00, 0x04, 0x00]
+            );
+
+            let mut neon = Vec::new();
+            aarch64::emit_uniform_load(&mut neon, Reg(5), aarch64::ptr::X9, PAST_U16)
+                .expect("fits");
+            let words: Vec<u32> = neon
+                .chunks(4)
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect();
+            let step = aarch64::table::MAX_ADD_IMM;
+            let full_adds = PAST_U16_BYTES / step;
+            let remainder = PAST_U16_BYTES % step;
+            let add = |src: u32, imm: u32| 0x9100_0000 | (imm << 10) | (src << 5) | 16;
+            let mut want = alloc::vec![add(9, step)];
+            want.extend(core::iter::repeat_n(add(16, step), full_adds as usize - 1));
+            want.push(add(16, remainder));
+            want.push(0xBD40_0000 | (16 << 5) | 5); // ldr s5, [x16]
+            want.push(0x4E04_04A5); // dup v5.4s, v5.s[0]
+            assert_eq!(words, want);
+        }
+
+        /// The width is the encoder's, and an offset past it is refused,
+        /// never wrapped: a wrapped displacement would be a load of some
+        /// other argument, with plausible pixels. x86's `disp32` is signed,
+        /// so the last element it reaches is at `i32::MAX / 4`; NEON's
+        /// [`aarch64::Mem`] holds a 32-bit byte offset.
+        #[test]
+        fn an_offset_past_the_displacement_is_refused_on_every_backend() {
+            const LAST_DISP32: u64 = i32::MAX as u64 / 4;
+            const LAST_NEON: u64 = u32::MAX as u64 / 4;
+            let refused = |r: Result<(), CompileError>| {
+                assert!(
+                    matches!(r, Err(CompileError::BudgetExceeded(_))),
+                    "expected a refusal, got {r:?}"
+                );
+            };
+
+            let mut code = Vec::new();
+            avx2::emit_uniform_load(&mut code, Reg(0), x86_64::ptr::RAX, LAST_DISP32)
+                .expect("the last element a disp32 reaches");
+            refused(avx2::emit_uniform_load(
+                &mut code,
+                Reg(0),
+                x86_64::ptr::RAX,
+                LAST_DISP32 + 1,
+            ));
+            avx512::emit_uniform_load(&mut code, Reg(0), x86_64::ptr::RAX, LAST_DISP32)
+                .expect("the last element a disp32 reaches");
+            refused(avx512::emit_uniform_load(
+                &mut code,
+                Reg(0),
+                x86_64::ptr::RAX,
+                LAST_DISP32 + 1,
+            ));
+            refused(aarch64::emit_uniform_load(
+                &mut code,
+                Reg(0),
+                aarch64::ptr::X9,
+                LAST_NEON + 1,
+            ));
+            // And nothing wrapped: a refused offset emits no bytes at all.
+            refused(avx2::emit_uniform_load(
+                &mut Vec::new(),
+                Reg(0),
+                x86_64::ptr::RAX,
+                u64::MAX,
+            ));
+        }
+
+        /// The whole path at that width: an arena declaring more arguments
+        /// than 16 bits index, reading the last, scheduled and emitted by
+        /// each backend from this host. The slot survives `arena_to_schedule`
+        /// and `resolve_operands` unnarrowed, and the bytes carry the
+        /// displacement of the argument actually read.
+        ///
+        /// The schedule is read *by block*, the way
+        /// `a_uniform_and_what_depends_on_it_alone_land_in_the_body` tells
+        /// the kernel's uniform from the origin's: the link's block (context
+        /// slot 0, there being no buffers) is read exactly once, at
+        /// `PAST_U16`, and the origin's block (slot 1) exactly twice, at 0
+        /// and 1 — `x0` and `y0` at the slots `origin_slots` found for them,
+        /// which lie past every one of the kernel's own. That is what pins
+        /// `origin_slots` at the widened width: were it to narrow its
+        /// answer to 16 bits, slots `PAST_U16 + 1` and `+ 2` would come back
+        /// as 4 and 5, match no read, and the origin would schedule as two
+        /// *link* reads past the end of the block — while the `PAST_U16`
+        /// read and its displacement in the bytes stayed exactly as they are.
+        #[test]
+        fn a_uniform_past_the_old_u16_width_loads_on_every_backend() {
+            use pixelflow_ir::arena::{UniformDecl, UniformIdentity};
+            const ARGUMENTS: u64 = PAST_U16 + 1;
+            let mut a = ExprArena::new();
+            let mut last = None;
+            for i in 0..ARGUMENTS {
+                last = Some(a.declare_uniform(UniformDecl {
+                    id: UniformIdentity::mint(),
+                    default: i as f32,
+                }));
+            }
+            let last = last.expect("declared");
+            assert_eq!(last, UniformId(PAST_U16));
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let xy = a.push_binary(OpKind::Add, x, y);
+            let u = a.push_uniform(last);
+            let root = a.push_binary(OpKind::Add, xy, u);
+
+            let ctx = EmitCtx::default();
+            let for_backend = |file: regalloc::RegisterFile| {
+                schedule_for(&a, root, POINT, file.vector_bytes / BYTES_PER_LANE)
+            };
+            let mut avx2b = avx2::driver::Avx2Backend::new(ctx.clone());
+            let mut avx512b = avx512::driver::Avx512Backend::new(ctx.clone());
+            let mut neon = aarch64::driver::Aarch64Backend::new(ctx);
+
+            // Every uniform read, as (the context slot of the block it reads,
+            // its offset in that block), sorted.
+            let block_reads = |schedule: &[regalloc::Def]| -> Vec<(u16, u64)> {
+                let block_of = |base: regalloc::ValueId| {
+                    schedule
+                        .iter()
+                        .find_map(|d| match d.op {
+                            ScheduledOp::Context(slot) if d.value == base => Some(slot),
+                            _ => None,
+                        })
+                        .expect("a uniform read's base is a block's Context def")
+                };
+                let mut reads: Vec<(u16, u64)> = schedule
+                    .iter()
+                    .filter_map(|d| match d.op {
+                        ScheduledOp::Uniform(base, offset) => Some((block_of(base), offset)),
+                        _ => None,
+                    })
+                    .collect();
+                reads.sort_unstable();
+                reads
+            };
+            assert_eq!(
+                block_reads(&for_backend(avx2b.register_file())),
+                [(0, PAST_U16), (1, 0), (1, 1)],
+                "the last argument from the link's block, at its full width; \
+                 x0 and y0 from the origin's block, at theirs"
+            );
+
+            let disp = PAST_U16_BYTES.to_le_bytes();
+            for (tier, code) in [
+                (
+                    "AVX2",
+                    compile_via_backend(for_backend(avx2b.register_file()), &mut avx2b)
+                        .expect("AVX2")
+                        .code,
+                ),
+                (
+                    "AVX-512",
+                    compile_via_backend(for_backend(avx512b.register_file()), &mut avx512b)
+                        .expect("AVX-512")
+                        .code,
+                ),
+            ] {
+                assert!(
+                    code.as_bytes().windows(disp.len()).any(|w| w == disp),
+                    "{tier}: no vbroadcastss with disp32 {PAST_U16_BYTES:#x}"
+                );
+            }
+
+            let neon_code = compile_via_backend(for_backend(neon.register_file()), &mut neon)
+                .expect("NEON")
+                .code;
+            let words: Vec<u32> = neon_code
+                .as_bytes()
+                .chunks(4)
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect();
+            let step = aarch64::table::MAX_ADD_IMM;
+            let add_ip0 = 0x9100_0000 | (step << 10) | (16 << 5) | 16;
+            let ldr_s_ip0 = |w: u32| (w & !0x1F) == 0xBD40_0000 | (16 << 5);
+            assert!(
+                words.contains(&add_ip0) && words.iter().copied().any(ldr_s_ip0),
+                "NEON: no IP0-addressed load of the argument"
+            );
         }
 
         /// The `Context` def's own instruction, per backend: `mov r9, [rdi +
@@ -8345,7 +8553,7 @@ mod tests {
             let root = arena.substitute_vars_with(packed_root, &[(MARKER, guard)]);
 
             let ids = origin_slots(&arena);
-            let schedule = arena_to_schedule(&arena, root, ids);
+            let schedule = arena_to_schedule(&arena, root, Some(ids));
             let code = compile_native(schedule, EmitCtx::default())
                 .expect("a hand-built Guard should compile")
                 .code;

@@ -25,7 +25,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::dag::{Builder, Id, Node};
+use crate::dag::{Builder, Id, Memo, Node};
 use crate::fold::{Binder, Fold};
 use crate::kernel::Scalar;
 use crate::key::KernelKey;
@@ -150,6 +150,10 @@ pub struct BufferId(pub u16);
 ///
 /// So identity is provenance. You get one by minting it, and copy it into
 /// every declaration that names that memory; nothing else can collide with it.
+///
+/// Still 32 bits, unlike [`UniformIdentity`]: buffers are leaving the
+/// language (docs/plans/2026-09-25-the-language-is-kernel.md §1.6), so their
+/// widths are left where they are rather than widened on the way out.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct BufferIdentity(u32);
 
@@ -162,12 +166,15 @@ impl BufferIdentity {
     /// identity and aliasing two unrelated buffers.
     #[must_use]
     pub fn mint() -> Self {
-        static NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        Self(mint_identity(&NEXT, "BufferIdentity"))
+        static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let id = u32::try_from(mint_identity(&NEXT, "BufferIdentity"))
+            .unwrap_or_else(|_| panic!("BufferIdentity: counter exhausted"));
+        Self(id)
     }
 }
 
-/// The one counter discipline behind every provenance identity.
+/// The one counter discipline behind every provenance identity, at the
+/// control plane's width.
 ///
 /// `fetch_add` + assert was wrong: the add WRAPS before the assert fires, so
 /// if that panic is ever caught — or merely unwinds a non-fatal worker thread
@@ -175,7 +182,7 @@ impl BufferIdentity {
 /// identity that is still live. Two unrelated buffers (or uniforms) would
 /// then compare identical and merge into one splice/JIT slot. `fetch_update`
 /// declining to store leaves the counter permanently exhausted instead.
-fn mint_identity(counter: &core::sync::atomic::AtomicU32, what: &str) -> u32 {
+fn mint_identity(counter: &core::sync::atomic::AtomicU64, what: &str) -> u64 {
     counter
         .fetch_update(
             core::sync::atomic::Ordering::Relaxed,
@@ -206,10 +213,18 @@ pub struct BufferDecl {
 
 // ───────────────────────────────────────── Uniforms ───────────────────────────
 
-/// Slot index into an [`ExprArena`]'s uniform table. Copy, 2 bytes. Not an
+/// Slot index into an [`ExprArena`]'s uniform table. Copy, 8 bytes. Not an
 /// identity: two arenas each call their own first uniform slot 0.
+///
+/// 64 bits because nothing bounds how many arguments a program takes — a
+/// glyph carries ten per piece and a font decides the piece count — and a
+/// narrower slot was a limit on the language nobody chose (the `u16` it used
+/// to be capped a kernel at 65,535 arguments through an assertion in
+/// [`ExprArena::declare_uniform`]). The hardware's widths are applied where
+/// the hardware sets them: the encoder that turns a slot into a
+/// displacement.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
-pub struct UniformId(pub u16);
+pub struct UniformId(pub u64);
 
 /// Which uniform a declaration refers to, independent of any arena.
 ///
@@ -221,7 +236,7 @@ pub struct UniformId(pub u16);
 /// say that across a splice, so, exactly as for [`BufferIdentity`], identity
 /// is provenance: minted once, copied into every declaration of the instance.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
-pub struct UniformIdentity(u32);
+pub struct UniformIdentity(u64);
 
 impl UniformIdentity {
     /// Mint an identity distinct from every other in this process.
@@ -232,7 +247,7 @@ impl UniformIdentity {
     /// identity and aliasing two unrelated uniforms.
     #[must_use]
     pub fn mint() -> Self {
-        static NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         Self(mint_identity(&NEXT, "UniformIdentity"))
     }
 }
@@ -725,18 +740,11 @@ impl ExprArena {
         self.intern(NodeData::Buffer(id), &[])
     }
 
-    /// Declare a uniform slot, returning its [`UniformId`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the uniform table is full (`u16::MAX` slots).
+    /// Declare a uniform slot, returning its [`UniformId`]. The table has no
+    /// cap of its own: a slot is 64 bits wide, and how many arguments a
+    /// program takes is the program's business.
     pub fn declare_uniform(&mut self, decl: UniformDecl) -> UniformId {
-        assert!(
-            self.uniforms.len() < u16::MAX as usize,
-            "declare_uniform: uniform table full ({} slots)",
-            self.uniforms.len()
-        );
-        let id = UniformId(self.uniforms.len() as u16);
+        let id = UniformId(self.uniforms.len() as u64);
         self.uniforms.push(decl);
         id
     }
@@ -755,7 +763,7 @@ impl ExprArena {
                     self.uniforms[i], decl,
                     "two declarations share a UniformIdentity but disagree on the default"
                 );
-                UniformId(i as u16)
+                UniformId(i as u64)
             }
             None => self.declare_uniform(decl),
         }
@@ -1796,14 +1804,23 @@ impl ExprArena {
             assert_eq!(buffers[i], decl, "relink: buffer declaration disagrees");
             BufferId(i as u16)
         };
+        // The link by identity, built once: a search of it per occurrence
+        // was quadratic in the arguments, and nothing bounds those. First
+        // entry wins, as `position` did, should an order name one twice.
+        let mut uniform_index: Memo<UniformIdentity, u64> = Memo::new();
+        for (i, decl) in uniforms.iter().enumerate() {
+            uniform_index.entry(decl.id).or_insert(i as u64);
+        }
         let uniform_slot = |u: UniformId| -> UniformId {
             let decl = self.uniforms[u.0 as usize];
-            let i = uniforms
-                .iter()
-                .position(|d| d.id == decl.id)
+            let i = *uniform_index
+                .get(&decl.id)
                 .unwrap_or_else(|| panic!("relink: reachable {decl:?} is not in the link"));
-            assert_eq!(uniforms[i], decl, "relink: uniform declaration disagrees");
-            UniformId(i as u16)
+            assert_eq!(
+                uniforms[i as usize], decl,
+                "relink: uniform declaration disagrees"
+            );
+            UniformId(i)
         };
 
         let mut out = ExprArena::with_capacity(self.len());
