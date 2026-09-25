@@ -26,3 +26,5 @@ mutants.out.old/
 # state, not project content — and large enough (tens of MB) that a stray
 # `git add -A` would sweep them into a commit.
 .claude/worktrees/
+# Per-agent build caches (one per parallel worktree; see docs/plans/2026-09-25-the-language-is-kernel.md).
+/target.noindex-*/
