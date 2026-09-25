@@ -53,9 +53,11 @@ are the same kind of thing.
 ## 2. Identity is the compile cache's key, and they are not two things
 
 **Decision (JP, 2026-09-09).** A referent is named the way `jit_cache` names
-one: `canonical(arena, root)` walks the reachable subgraph in ascending id
-order, remaps children densely, and encodes each node — a structural content
-hash. Two kernels with that key are the same kernel.
+one: `canonical(arena, root)` (`pixelflow-ir/src/key.rs`) walks the
+reachable subgraph in post-order from the root, hash-consing structurally
+equal subterms, and encodes each node — a structural content hash that does
+not depend on the order the arena was built in. Two kernels with that key are
+the same kernel.
 
 So one content-addressed store serves three purposes that are currently
 three mechanisms:

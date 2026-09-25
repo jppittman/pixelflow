@@ -471,6 +471,40 @@ impl<'a> Iterator for ExprChildren<'a> {
 
 impl ExactSizeIterator for ExprChildren<'_> {}
 
+// From the back as well, for a walk that pushes children onto a stack and
+// wants to pop the first one first — `key::canonical`'s post-order — without
+// collecting them into a `Vec` at every node on the way.
+impl DoubleEndedIterator for ExprChildren<'_> {
+    fn next_back(&mut self) -> Option<ExprId> {
+        match self {
+            Self::Zero => None,
+            Self::One(id) => {
+                let id = *id;
+                *self = Self::Zero;
+                Some(id)
+            }
+            Self::Two(a, b) => {
+                let a = *a;
+                let b = *b;
+                *self = Self::One(a);
+                Some(b)
+            }
+            Self::Three(a, b, c) => {
+                let a = *a;
+                let b = *b;
+                let c = *c;
+                *self = Self::Two(a, b);
+                Some(c)
+            }
+            Self::Nary(slice) => {
+                let (last, rest) = slice.split_last()?;
+                *self = Self::Nary(rest);
+                Some(*last)
+            }
+        }
+    }
+}
+
 // ───────────────────────────────────── ExprArena ─────────────────────────────
 
 /// Arena-allocated expression storage. Append-only, O(1) drop.

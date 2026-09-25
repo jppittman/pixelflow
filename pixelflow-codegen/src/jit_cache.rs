@@ -15,12 +15,13 @@
 //! Keys are the [`LatticeShape`] the kernel is compiled for — its extents,
 //! so a lattice of a different size is a different kernel and a window
 //! resize recompiles, by decision — plus the **canonical form of the
-//! reachable subgraph**: nodes in ascending id order with ids remapped
-//! dense. Construction garbage (dead
-//! nodes left behind by `substitute_params` / splicing rebuilds) does not
-//! perturb the key, so logically identical kernels hit regardless of build
-//! history. Keys are compared by full equality — a hash collision can cause
-//! a wasted probe, never wrong code.
+//! reachable subgraph**: a post-order walk from the root with structurally
+//! equal subterms hash-consed, so neither construction garbage (dead nodes
+//! left behind by `substitute_params` / splicing rebuilds) nor the order a
+//! builder pushed the live nodes in perturbs the key, and logically
+//! identical kernels hit regardless of build history. Keys are compared by
+//! full equality — a hash collision can cause a wasted probe, never wrong
+//! code.
 //!
 //! ## The link step
 //!
@@ -346,6 +347,109 @@ mod tests {
         );
     }
 
+    /// `X + Y` with its leaves pushed in either order is one program, so it
+    /// is one compiled region: the key is a function of what the root
+    /// denotes, not of where a builder happened to push the leaves.
+    #[test]
+    fn x_plus_y_pushed_in_either_order_is_one_entry() {
+        // A constant no other kernel in this binary reads, so neither order
+        // can hit an entry some other test made.
+        const ONLY_HERE: f32 = 0.6180339;
+        let x_first = {
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let k = a.push_const(ONLY_HERE);
+            let sum = a.push_binary(OpKind::Add, x, y);
+            let root = a.push_binary(OpKind::Mul, sum, k);
+            Kernel::from_parts(a, root)
+        };
+        let y_first = {
+            let mut a = ExprArena::new();
+            let k = a.push_const(ONLY_HERE);
+            let y = a.push_var(1);
+            let x = a.push_var(0);
+            let sum = a.push_binary(OpKind::Add, x, y);
+            let root = a.push_binary(OpKind::Mul, sum, k);
+            Kernel::from_parts(a, root)
+        };
+        assert!(
+            Arc::ptr_eq(&kernel_of(&x_first), &kernel_of(&y_first)),
+            "one program pushed in two orders must share one compiled region"
+        );
+    }
+
+    /// A subterm written twice and the same subterm shared are one program,
+    /// so they are one compiled region — and one argument: the link folds
+    /// the two slots naming one instance back to one, which is the only
+    /// duplicate an interning arena can carry.
+    #[test]
+    fn a_duplicated_subterm_and_a_shared_one_are_one_entry() {
+        let decl = UniformDecl {
+            id: UniformIdentity::mint(),
+            default: 0.25,
+        };
+        let shared = {
+            let mut a = ExprArena::new();
+            let u = a.declare_uniform(decl);
+            let x = a.push_var(0);
+            let leaf = a.push_uniform(u);
+            let xu = a.push_binary(OpKind::Mul, x, leaf);
+            let root = a.push_binary(OpKind::Add, xu, xu);
+            Kernel::from_parts(a, root)
+        };
+        let duplicated = {
+            let mut a = ExprArena::new();
+            let u1 = a.declare_uniform(decl);
+            let u2 = a.declare_uniform(decl);
+            let x = a.push_var(0);
+            let leaf1 = a.push_uniform(u1);
+            let leaf2 = a.push_uniform(u2);
+            let xu1 = a.push_binary(OpKind::Mul, x, leaf1);
+            let xu2 = a.push_binary(OpKind::Mul, x, leaf2);
+            let root = a.push_binary(OpKind::Add, xu1, xu2);
+            Kernel::from_parts(a, root)
+        };
+        let l_shared = compile(&shared, TEST_SHAPE).expect("compile");
+        let l_duplicated = compile(&duplicated, TEST_SHAPE).expect("compile");
+        assert!(
+            Arc::ptr_eq(&l_shared.kernel, &l_duplicated.kernel),
+            "a duplicated subterm and a shared one must share one compiled region"
+        );
+        assert_eq!(l_shared.uniforms, [decl]);
+        assert_eq!(l_duplicated.uniforms, [decl], "two slots, one argument");
+    }
+
+    /// One argument read twice and two arguments read once each are two
+    /// programs: the same shape bytes but for the slot numbers, which is
+    /// enough.
+    #[test]
+    fn one_argument_read_twice_and_two_arguments_are_two_entries() {
+        let decl = |default| UniformDecl {
+            id: UniformIdentity::mint(),
+            default,
+        };
+        let one_argument = {
+            let mut a = ExprArena::new();
+            let u = a.declare_uniform(decl(0.0));
+            let leaf = a.push_uniform(u);
+            let root = a.push_binary(OpKind::Add, leaf, leaf);
+            Kernel::from_parts(a, root)
+        };
+        let two_arguments = {
+            let mut a = ExprArena::new();
+            let u = a.declare_uniform(decl(0.0));
+            let v = a.declare_uniform(decl(0.0));
+            let (lu, lv) = (a.push_uniform(u), a.push_uniform(v));
+            let root = a.push_binary(OpKind::Add, lu, lv);
+            Kernel::from_parts(a, root)
+        };
+        assert!(
+            !Arc::ptr_eq(&kernel_of(&one_argument), &kernel_of(&two_arguments)),
+            "u + u and u + v must not share a cache entry"
+        );
+    }
+
     #[test]
     fn same_kernel_at_two_extents_is_two_entries() {
         let k = circle_arena(false);
@@ -526,42 +630,46 @@ mod tests {
             id: UniformIdentity::mint(),
             default: 0.5,
         };
+        // Pushed in one order, keyed in another: the walk is post-order from
+        // the root, children first to last, so the `Buffer` leaf the gather
+        // names first comes out first and the uniform the root names last
+        // comes out just before the root — whatever order they were pushed.
         let mut a = ExprArena::new();
         let buf_slot = a.declare_buffer(buffer);
         let uni_slot = a.declare_uniform(uniform);
-        let x = a.push_var(0); // dense 0
-        let c = a.push_const(2.5); // dense 1
-        let scaled = a.push_binary(OpKind::Mul, x, c); // dense 2
-        let u = a.push_uniform(uni_slot); // dense 3
-        let y = a.push_var(1); // dense 4
-        // Pushes the `Buffer` leaf (dense 5) then the `Gather` (dense 6).
+        let x = a.push_var(0); // canonical 1
+        let c = a.push_const(2.5); // canonical 2
+        let scaled = a.push_binary(OpKind::Mul, x, c); // canonical 3
+        let u = a.push_uniform(uni_slot); // canonical 6
+        let y = a.push_var(1); // canonical 4
+        // Pushes the `Buffer` leaf (canonical 0) then the `Gather` (5).
         let g = a.push_gather(buf_slot, scaled, y);
-        let root = a.push_binary(OpKind::Add, g, u); // dense 7
+        let root = a.push_binary(OpKind::Add, g, u); // canonical 7
 
         let mut want: Vec<u8> = Vec::new();
+        want.push(7); // Buffer, by dense slot, then extents
+        want.extend_from_slice(&0u16.to_le_bytes());
+        want.extend_from_slice(&4u32.to_le_bytes());
+        want.extend_from_slice(&2u32.to_le_bytes());
         want.extend_from_slice(&[0, 0]); // Var(0)
         want.push(1); // Const
         want.extend_from_slice(&2.5f32.to_bits().to_le_bytes());
         want.push(4); // Binary
         want.extend_from_slice(&OpKind::Mul.marshal().to_bytes());
-        want.extend_from_slice(&0u32.to_le_bytes());
         want.extend_from_slice(&1u32.to_le_bytes());
-        want.push(8); // Uniform, by dense offset
-        want.extend_from_slice(&0u16.to_le_bytes());
-        want.extend_from_slice(&[0, 1]); // Var(1)
-        want.push(7); // Buffer, by dense slot, then extents
-        want.extend_from_slice(&0u16.to_le_bytes());
-        want.extend_from_slice(&4u32.to_le_bytes());
         want.extend_from_slice(&2u32.to_le_bytes());
+        want.extend_from_slice(&[0, 1]); // Var(1)
         want.push(5); // Ternary
         want.extend_from_slice(&OpKind::Gather.marshal().to_bytes());
-        want.extend_from_slice(&5u32.to_le_bytes());
-        want.extend_from_slice(&2u32.to_le_bytes());
+        want.extend_from_slice(&0u32.to_le_bytes());
+        want.extend_from_slice(&3u32.to_le_bytes());
         want.extend_from_slice(&4u32.to_le_bytes());
+        want.push(8); // Uniform, by dense offset
+        want.extend_from_slice(&0u16.to_le_bytes());
         want.push(4); // Binary
         want.extend_from_slice(&OpKind::Add.marshal().to_bytes());
+        want.extend_from_slice(&5u32.to_le_bytes());
         want.extend_from_slice(&6u32.to_le_bytes());
-        want.extend_from_slice(&3u32.to_le_bytes());
 
         let got = canonical(&a, root);
         assert_eq!(got.key, want, "the canonical encoding moved");
