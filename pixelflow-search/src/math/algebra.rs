@@ -1175,7 +1175,7 @@ mod platform_specific_fold_tests {
     }
 
     /// A folded comparison and an executed one have to be the same operand.
-    /// `Select`/`BitAnd` are bitwise on every backend, so a folded `1.0` would
+    /// `If`/`BitAnd` are bitwise on every backend, so a folded `1.0` would
     /// blend `7.0` against `9.0` into `4.5`; the mask has to be all-ones.
     #[test]
     fn comparison_folds_produce_mask_bit_patterns() {
@@ -1187,16 +1187,10 @@ mod platform_specific_fold_tests {
         assert_eq!(folds(&ops::Ne, &[2.0, 2.0]).map(f32::to_bits), Some(f));
         // And such a mask blends exactly, through the same bitwise formula the
         // backends emit. (`BitAnd`/`BitOr` have no e-graph `Op` — they appear
-        // only after lowering — so `Select` is the folder-visible consumer; the
+        // only after lowering — so `If` is the folder-visible consumer; the
         // end-to-end path through a real `and` is covered by
         // `pixelflow-ir/tests/transcendental_jit.rs`.)
-        assert_eq!(
-            folds(&ops::Select, &[f32::from_bits(t), 7.0, 9.0]),
-            Some(7.0)
-        );
-        assert_eq!(
-            folds(&ops::Select, &[f32::from_bits(f), 7.0, 9.0]),
-            Some(9.0)
-        );
+        assert_eq!(folds(&ops::If, &[f32::from_bits(t), 7.0, 9.0]), Some(7.0));
+        assert_eq!(folds(&ops::If, &[f32::from_bits(f), 7.0, 9.0]), Some(9.0));
     }
 }

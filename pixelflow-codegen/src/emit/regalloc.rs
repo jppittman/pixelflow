@@ -12,7 +12,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::guards::{FoldReads, SelectArm, SelectGuard, analyze_select_guards};
+use super::guards::{FoldReads, IfArm, IfGuard, analyze_if_guards};
 use super::{Gpr, KReg, OperandSource, PtrReg, Reg, ScheduledOp, operand_sources, reloads_wanted};
 
 /// A value in the program (SSA-style).
@@ -293,7 +293,7 @@ pub struct RegisterFile {
     /// allocator's.
     pub scratch: RegSet,
 
-    /// How many registers a `Select` short-circuit guard destroys while
+    /// How many registers an `If` short-circuit guard destroys while
     /// reducing its mask to a branch condition.
     ///
     /// One on aarch64, where `UMAXV`/`UMINV` write a scalar into a vector
@@ -304,7 +304,7 @@ pub struct RegisterFile {
     /// and a count is what the allocator reserves against.
     ///
     /// A guard is emitted *between* instructions, at the head of a guarded arm
-    /// and at the `Select` that owns it, so this is reserved on those
+    /// and at the `If` that owns it, so this is reserved on those
     /// instructions and nowhere else.
     pub guard_temps: u8,
 
@@ -402,7 +402,7 @@ pub struct RegisterFile {
     /// The mask-class [`RegisterFile::temps_for`].
     pub mask_temps_for: fn(&ScheduledOp) -> u8,
 
-    /// How many mask registers a `Select` short-circuit guard destroys
+    /// How many mask registers an `If` short-circuit guard destroys
     /// reducing its mask to a branch condition — the mask-class
     /// [`RegisterFile::guard_temps`]. AVX-512's guard needs one (`vptestmd`'s
     /// `k`-register destination before `kortestw` reads it into the flags);
@@ -426,7 +426,7 @@ impl RegisterFile {
 
         assert!(
             self.guard_temps as usize <= 1,
-            "a backend's Select guard asked for more scratch than `Scratch` \
+            "a backend's If guard asked for more scratch than `Scratch` \
              reserves for one"
         );
 
@@ -484,7 +484,7 @@ impl RegisterFile {
 
         assert!(
             self.mask_guard_temps as usize <= 1,
-            "a backend's Select guard asked for more mask scratch than \
+            "a backend's If guard asked for more mask scratch than \
              `Scratch` reserves for one"
         );
 
@@ -519,8 +519,8 @@ impl RegisterFile {
     ///
     /// | worst instruction | temps | operands | guard | result | dst | total |
     /// |---|---|---|---|---|---|---|
-    /// | aarch64 `Select` at a guarded arm's head | 0 | 3 | 2 | 0 | 1 | **6** |
-    /// | AVX2 `Select` at a guarded arm's head | 1 | 3 | 1 | 0 | 1 | **6** |
+    /// | aarch64 `If` at a guarded arm's head | 0 | 3 | 2 | 0 | 1 | **6** |
+    /// | AVX2 `If` at a guarded arm's head | 1 | 3 | 1 | 0 | 1 | **6** |
     /// | AVX2 gather at a guarded arm's head | 2 | 1 | 1 | 0 | 1 | 5 |
     ///
     /// The `result` column is 0 everywhere because it is reserved only for a
@@ -864,9 +864,9 @@ struct ScopeCode {
     scratch: Vec<Scratch>,
     /// Values this scope computes for the scopes inside it, in slot order.
     roots: Vec<ValueId>,
-    /// This scope's `Select` guards, straight from the [`Scan`] that produced
-    /// `schedule` — see [`Allocation::select_guards`].
-    guards: Vec<SelectGuard>,
+    /// This scope's `If` guards, straight from the [`Scan`] that produced
+    /// `schedule` — see [`Allocation::if_guards`].
+    guards: Vec<IfGuard>,
 }
 
 /// The registers one instruction may destroy for its own duration.
@@ -899,7 +899,7 @@ pub struct Scratch {
     /// files, and it is precisely the convention that has to hold
     /// register-for-register.
     ///
-    /// This is where `arm_reload` went. A `Select`'s second spilled arm is not
+    /// This is where `arm_reload` went. An `If`'s second spilled arm is not
     /// a role of its own — it is operand 2 with nowhere to be — and the same
     /// was true of `RegisterFile::reload[1]`, which served every other operand
     /// of every other instruction from outside the pool.
@@ -975,7 +975,7 @@ impl Scratch {
 
     /// The most reload targets any one instruction asks for.
     ///
-    /// Two. Three operands is the widest op, and one of them — a `Select`'s
+    /// Two. Three operands is the widest op, and one of them — an `If`'s
     /// mask, an FMA's addend, a binary's left — is reloaded straight into
     /// the destination rather than into a reservation.
     pub const MAX_RELOADS: usize = 2;
@@ -1102,8 +1102,8 @@ pub struct NestAllocation {
     folds: Vec<FoldScope>,
     /// The surviving `Guard`s' arms, indexed by [`Scope::GuardArm`]. Paired:
     /// [`RegisterAllocator::allocate_nest`] pushes a `Guard`'s
-    /// [`SelectArm::True`] entry immediately before its
-    /// [`SelectArm::False`] one, so `guard_arms[2*k]`/`guard_arms[2*k + 1]`
+    /// [`IfArm::True`] entry immediately before its
+    /// [`IfArm::False`] one, so `guard_arms[2*k]`/`guard_arms[2*k + 1]`
     /// are one `Guard`'s two arms — see [`NestAllocation::guard_count`].
     guard_arms: Vec<GuardArmScope>,
 }
@@ -1150,7 +1150,7 @@ struct GuardArmScope {
     /// The `Guard` def's position in `parent`'s schedule.
     at: usize,
     /// Which of the `Guard`'s two arms this is.
-    arm: SelectArm,
+    arm: IfArm,
     /// Everything else a scope has — this arm's own evaluation order,
     /// placements and scratch, exactly as a fold's body has its own.
     code: ScopeCode,
@@ -1402,7 +1402,7 @@ impl<'a> Allocation<'a> {
         &self.code().roots
     }
 
-    /// This scope's `Select` short-circuit guards, as analyzed once during
+    /// This scope's `If` short-circuit guards, as analyzed once during
     /// allocation.
     ///
     /// The schedule an emitter reads here is the one the allocator scanned —
@@ -1410,7 +1410,7 @@ impl<'a> Allocation<'a> {
     /// is the same question asked and answered twice. This is the answer on
     /// file; nothing downstream needs to ask again.
     #[must_use]
-    pub(crate) fn select_guards(&self) -> &'a [SelectGuard] {
+    pub(crate) fn if_guards(&self) -> &'a [IfGuard] {
         &self.code().guards
     }
 
@@ -1541,7 +1541,7 @@ impl<'a> Allocation<'a> {
     /// not the one that opens it — either an enclosing scope's `Guard`, read
     /// here as a placeholder, or a position with no `Guard` at all.
     #[must_use]
-    pub fn guard_opening_at(&self, at: usize, arm: SelectArm) -> Option<Scope> {
+    pub fn guard_opening_at(&self, at: usize, arm: IfArm) -> Option<Scope> {
         self.nest
             .guard_arms
             .iter()
@@ -1745,7 +1745,7 @@ pub struct ScopeGuardArm {
     /// The `Guard` def's position in `parent`'s schedule.
     pub at: usize,
     /// Which of the `Guard`'s two arms this is.
-    pub arm: SelectArm,
+    pub arm: IfArm,
     /// This arm's own evaluation order, in topological order, ending at the
     /// value the parent stores to the `Guard`'s result slot.
     pub schedule: Vec<Def>,
@@ -2209,7 +2209,7 @@ impl RegisterAllocator for LinearScan {
             }
         };
 
-        // Every scope's `Select` guards, before any scan: what an arm may own
+        // Every scope's `If` guards, before any scan: what an arm may own
         // depends on what the loops the scope opens read from it, and what
         // it is worth depends on what they cost (`FoldReads`), which takes
         // those loops' schedules — and the loop below reaches a fold only
@@ -2244,9 +2244,9 @@ impl RegisterAllocator for LinearScan {
             reads[scope_ix(scope)] = opened;
         }
         let guards_in = |scope: Scope, roots: &[ValueId]| {
-            analyze_select_guards(schedule_of(scope), roots, &reads[scope_ix(scope)])
+            analyze_if_guards(schedule_of(scope), roots, &reads[scope_ix(scope)])
         };
-        let mut guards: Vec<Vec<SelectGuard>> =
+        let mut guards: Vec<Vec<IfGuard>> =
             core::iter::once(guards_in(Scope::Body, &nest.body.roots))
                 .chain(
                     nest.folds
@@ -2465,7 +2465,7 @@ impl RegisterAllocator for LinearScan {
             }));
             // An arm parks nothing and opens no fold: its schedule is a
             // separate arena's, which `extract_guards` carves nothing out of.
-            let arm_guards = analyze_select_guards(&arm.schedule, &[], &FoldReads::default());
+            let arm_guards = analyze_if_guards(&arm.schedule, &[], &FoldReads::default());
             let scan = self.scan(arm.schedule, &inside, Boundary::CLOSED, arm_guards);
             guard_arms.push(GuardArmScope {
                 parent: arm.parent,
@@ -2542,11 +2542,11 @@ struct Scan {
     /// increasing schedule order. Empty for a value this scope does not place.
     ranges: Vec<Vec<(usize, Where)>>,
     scratch: Vec<Scratch>,
-    /// This scope's `Select` guards, analyzed once against `schedule` here and
+    /// This scope's `If` guards, analyzed once against `schedule` here and
     /// carried into its [`ScopeCode`] rather than recomputed at emission: the
     /// schedule a scope emits is the one it was scanned with, unchanged, so a
     /// second analysis of it would answer a question already on file.
-    guards: Vec<SelectGuard>,
+    guards: Vec<IfGuard>,
 }
 
 impl Scan {
@@ -2969,7 +2969,7 @@ impl Pass {
     /// definition wrote — into `dst` for the operand the encoding consumes
     /// there, into a reserved reload register otherwise. That is the whole
     /// of what the encoders tolerate: no encoder reads every source before
-    /// writing `dst` (`setup_mov` ahead of a `Select` or FMA on every ISA;
+    /// writing `dst` (`setup_mov` ahead of an `If` or FMA on every ISA;
     /// the decomposed `MulAdd`'s multiply before its add), so a *resident*
     /// operand in `dst`'s register would be corrupted. A displaced one is
     /// not resident, which is why the split is recorded at this index and
@@ -3039,12 +3039,12 @@ impl Pass {
     }
 }
 
-/// For each schedule index, the narrowest `Select` arm containing it.
+/// For each schedule index, the narrowest `If` arm containing it.
 ///
 /// The narrowest and not the outermost: ending a kept reload at the inner arm's
 /// end is safe under the outer one too, since every read between the two ends
 /// is inside the outer arm and so is skipped along with the load it would name.
-fn guarded_arms(guards: &[SelectGuard], len: usize) -> Vec<Option<(usize, usize)>> {
+fn guarded_arms(guards: &[IfGuard], len: usize) -> Vec<Option<(usize, usize)>> {
     let mut arms: Vec<Option<(usize, usize)>> = vec![None; len];
     for guard in guards {
         for (start, end) in guard.ranges.values().copied() {
@@ -3064,15 +3064,15 @@ fn guarded_arms(guards: &[SelectGuard], len: usize) -> Vec<Option<(usize, usize)
 /// For each schedule index, the masks a short-circuit branch reads *there*.
 ///
 /// A guard is emitted before the first instruction of each non-empty arm, and
-/// again at the `Select` itself for the uniform-mask wrapper. Those are the
+/// again at the `If` itself for the uniform-mask wrapper. Those are the
 /// only points that need a mask in a register outside an instruction's own
 /// operands, and they are the points the allocator reserves
 /// [`Scratch::guard_mask`] and [`Scratch::guard_temp`] on.
 ///
-/// Several guards can begin at one index (nested `Select`s); one reservation
+/// Several guards can begin at one index (nested `If`s); one reservation
 /// covers them all, because each resolves its mask and branches before the
 /// next one runs.
-fn guard_sites(guards: &[SelectGuard], len: usize) -> Vec<Vec<ValueId>> {
+fn guard_sites(guards: &[IfGuard], len: usize) -> Vec<Vec<ValueId>> {
     let mut sites: Vec<Vec<ValueId>> = (0..len).map(|_| Vec::new()).collect();
     for guard in guards {
         let mut at = |i: usize| {
@@ -3090,7 +3090,7 @@ fn guard_sites(guards: &[SelectGuard], len: usize) -> Vec<Vec<ValueId>> {
             at(start);
         }
         if guarded {
-            at(guard.select_idx);
+            at(guard.if_idx);
         }
     }
     sites
@@ -3106,7 +3106,7 @@ impl LinearScan {
     /// `boundary` is what crosses this scope's edges: the parks it enters
     /// with and the roots it hands to the scopes inside it ([`Boundary`]).
     ///
-    /// `guards` are this schedule's `Select` guards: [`analyze_select_guards`]
+    /// `guards` are this schedule's `If` guards: [`analyze_if_guards`]
     /// over it, told what the scopes inside it read — its roots, which no arm
     /// may own (a skipped arm would leave the park unwritten for a loop that
     /// runs regardless), and what each loop it opens reads, which no arm may
@@ -3122,7 +3122,7 @@ impl LinearScan {
         dag: Vec<Def>,
         file: &RegisterFile,
         boundary: Boundary<'_>,
-        guards: Vec<SelectGuard>,
+        guards: Vec<IfGuard>,
     ) -> Scan {
         if dag.is_empty() {
             return Scan {
@@ -3133,7 +3133,7 @@ impl LinearScan {
             };
         }
 
-        // The arms a `Select` guard may skip. A register range that begins at a
+        // The arms an `If` guard may skip. A register range that begins at a
         // read inside one, for a value defined outside it, must end there too:
         // after the arm a read has to name what it named before, because the
         // skipped path never ran the load. Eviction inside an arm needs no such
@@ -3588,7 +3588,7 @@ impl LinearScan {
             // thing (a mask reduced to a branch condition) and is emitted
             // the same way, in place of this instruction — so it reserves
             // through the same gate rather than a second one, even though
-            // `sites[i]` (built from `Select`s alone) never names it.
+            // `sites[i]` (built from `If`s alone) never names it.
             // A `Guard`'s own branch needs exactly the same two registers,
             // for exactly the same reason, at exactly the same point — its
             // mask test and branch are emitted in place of this instruction
@@ -3602,7 +3602,7 @@ impl LinearScan {
                 // `sites[i]` — the only other source `guard_mask` answers
                 // for — is what decides here for both: empty for a `Reduce`
                 // (it never asks), and, for a `Guard`, its own one operand,
-                // added because `sites` is built from `Select`s alone and
+                // added because `sites` is built from `If`s alone and
                 // does not already name it.
                 let guard_op_mask = match def.op {
                     ScheduledOp::Guard(mask, ..) => Some(mask),
@@ -4078,8 +4078,8 @@ mod tests {
     #[test]
     fn guarded_arms_prefers_the_narrowest_covering_arm() {
         use super::super::guards::ArmPair;
-        let guard = |select_idx: usize, mask: u32, true_arm: (usize, usize)| SelectGuard {
-            select_idx,
+        let guard = |if_idx: usize, mask: u32, true_arm: (usize, usize)| IfGuard {
+            if_idx,
             mask_vid: ValueId(mask),
             ranges: ArmPair::new(true_arm, (0, 0)),
         };
@@ -4404,19 +4404,19 @@ mod tests {
         assert_ne!(Where::Reg(temp), at(&a, ValueId(1)));
     }
 
-    /// A `Select` with spilled arms gets a reload target each, disjoint from
+    /// An `If` with spilled arms gets a reload target each, disjoint from
     /// its operands, its destination and its encoding temp — the registers the
     /// instruction is using at once.
     ///
-    /// The second of them used to be `select_reload`, then `arm_reload`; it is
+    /// The second of them used to be `if_reload`, then `arm_reload`; it is
     /// operand 2's entry in `Scratch::reload` now, chosen by the same
     /// `operand_sources` the emitter reads.
     #[test]
-    fn a_select_reserves_a_target_for_each_arm_it_has_to_reload() {
+    fn an_if_reserves_a_target_for_each_arm_it_has_to_reload() {
         // The mask and both arms are computed first and read last, with enough
         // filler between them to push them out of a pool sized at the floor —
         // which is what makes this a test about reload targets rather than
-        // about a `Select` whose operands all happen to be resident.
+        // about an `If` whose operands all happen to be resident.
         let width = u32::from(RegisterFile::MIN_SCRATCH) + 1;
         let mut schedule = vec![
             leaf(0),
@@ -4439,23 +4439,23 @@ mod tests {
             ));
             acc = ValueId(100 + i);
         }
-        let select = 200;
+        let if_value = 200;
         schedule.push(def(
-            select,
-            ScheduledOp::Ternary(OpKind::Select, ValueId(2), ValueId(3), ValueId(4)),
+            if_value,
+            ScheduledOp::Ternary(OpKind::If, ValueId(2), ValueId(3), ValueId(4)),
         ));
-        let at_select = schedule.len() - 1;
+        let at_if = schedule.len() - 1;
         let a = LinearScan.allocate(schedule, &TEMP_FILE);
-        let s = a.body().scratch(at_select);
+        let s = a.body().scratch(at_if);
 
         // The reservation answers the question it is for: how many of this
         // instruction's operands are not in a register where it runs.
         let resident = [
-            matches!(a.body().where_at(ValueId(2), at_select), Where::Reg(_)),
-            matches!(a.body().where_at(ValueId(3), at_select), Where::Reg(_)),
-            matches!(a.body().where_at(ValueId(4), at_select), Where::Reg(_)),
+            matches!(a.body().where_at(ValueId(2), at_if), Where::Reg(_)),
+            matches!(a.body().where_at(ValueId(3), at_if), Where::Reg(_)),
+            matches!(a.body().where_at(ValueId(4), at_if), Where::Reg(_)),
         ];
-        let op = ScheduledOp::Ternary(OpKind::Select, ValueId(2), ValueId(3), ValueId(4));
+        let op = ScheduledOp::Ternary(OpKind::If, ValueId(2), ValueId(3), ValueId(4));
         let wanted = reloads_wanted(operand_sources(&op, resident));
         assert!(wanted > 0, "no arm spilled, so nothing here is reserved");
         for role in 0..wanted {
@@ -4463,11 +4463,11 @@ mod tests {
                 .reload(role)
                 .unwrap_or_else(|| panic!("reload target {role} was not reserved"));
             assert!(TEMP_FILE.scratch.contains(arm), "{arm:?} is not the pool's");
-            for v in [ValueId(2), ValueId(3), ValueId(4), ValueId(select)] {
+            for v in [ValueId(2), ValueId(3), ValueId(4), ValueId(if_value)] {
                 assert_ne!(
                     Where::Reg(arm),
-                    a.body().where_at(v, at_select),
-                    "{arm:?} is still holding {v:?} when the Select reloads into it"
+                    a.body().where_at(v, at_if),
+                    "{arm:?} is still holding {v:?} when the If reloads into it"
                 );
             }
             assert_ne!(Some(arm), s.temp(0), "the two roles must be two registers");
@@ -4478,23 +4478,23 @@ mod tests {
         assert_eq!(s.reload(wanted), None, "nothing reserved past the demand");
     }
 
-    /// `select_guards` is the guard analysis on file, not an empty stand-in:
+    /// `if_guards` is the guard analysis on file, not an empty stand-in:
     /// a schedule with a genuine exclusive arm reports it back unchanged.
     #[test]
-    fn select_guards_reports_the_arm_the_schedule_actually_has() {
+    fn if_guards_reports_the_arm_the_schedule_actually_has() {
         let schedule = vec![
             leaf(0),
             leaf(1),
             def(2, ScheduledOp::Unary(OpKind::Rsqrt, ValueId(1))),
             def(
                 3,
-                ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(2), ValueId(0)),
+                ScheduledOp::Ternary(OpKind::If, ValueId(0), ValueId(2), ValueId(0)),
             ),
         ];
         let a = alloc(schedule);
-        let guards = a.body().select_guards();
-        assert_eq!(guards.len(), 1, "the schedule has exactly one Select");
-        assert_eq!(guards[0].select_idx, 3);
+        let guards = a.body().if_guards();
+        assert_eq!(guards.len(), 1, "the schedule has exactly one If");
+        assert_eq!(guards[0].if_idx, 3);
         assert_eq!(guards[0].mask_vid, ValueId(0));
         assert_eq!(guards[0].true_range(), (1, 3));
         assert_eq!(guards[0].false_range(), (3, 3));
@@ -4508,7 +4508,7 @@ mod tests {
     /// `X` is forced to spill under pressure (seven fillers exactly fill
     /// `TEST_FILE`'s pool, and `X`'s own next read — deep inside the arm — is
     /// the farthest among the candidates, so `X` is the one evicted). The
-    /// arm then reads `X` twice: once inside it, and again as the `Select`'s
+    /// arm then reads `X` twice: once inside it, and again as the `If`'s
     /// own false-arm operand — a read at exactly the arm's end.
     #[test]
     fn a_spilled_operand_read_again_only_at_the_arms_end_is_not_kept() {
@@ -4529,20 +4529,20 @@ mod tests {
         schedule.push(leaf(50)); // mask, index 15.
         let rsqrt_index = schedule.len();
         schedule.push(def(60, ScheduledOp::Unary(OpKind::Rsqrt, x))); // index 16: reads X.
-        let select_index = schedule.len();
+        let if_index = schedule.len();
         schedule.push(def(
             70,
-            ScheduledOp::Ternary(OpKind::Select, ValueId(50), ValueId(60), x), // X again, as the false arm.
+            ScheduledOp::Ternary(OpKind::If, ValueId(50), ValueId(60), x), // X again, as the false arm.
         ));
 
         let a = alloc(schedule);
-        let guards = a.body().select_guards();
+        let guards = a.body().if_guards();
         assert_eq!(
             guards
                 .iter()
-                .find(|g| g.select_idx == select_index)
-                .map(SelectGuard::true_range),
-            Some((rsqrt_index, select_index)),
+                .find(|g| g.if_idx == if_index)
+                .map(IfGuard::true_range),
+            Some((rsqrt_index, if_index)),
             "fixture assumes the Rsqrt alone forms the true arm's exclusive range"
         );
         assert_eq!(
@@ -4553,7 +4553,7 @@ mod tests {
         assert_eq!(
             a.body().where_at(x, rsqrt_index),
             Where::Spilled,
-            "X's next read (the Select's own false arm) lands exactly at the \
+            "X's next read (the If's own false arm) lands exactly at the \
              arm's end, so keeping X in a register here would not even reach \
              it — an ordinary reload serves the Rsqrt instead"
         );
@@ -4573,7 +4573,7 @@ mod tests {
     /// the arm its own pressure — `Y` is the first leaf (so `defined_at`
     /// equals the arm's `start` exactly) but the last one consumed, so it is
     /// the one `loser` evicts when the eighth leaf needs a register. `Y` is
-    /// then read twice more, and directly again right before the `Select` —
+    /// then read twice more, and directly again right before the `If` —
     /// that last read is what keeps it resident (protected as an operand)
     /// all the way to the arm's end without any other reason to hold it,
     /// which is what makes a spurious revert there observable.
@@ -4626,22 +4626,22 @@ mod tests {
             q3,
             ScheduledOp::Binary(OpKind::Add, ValueId(q1), ValueId(q2)),
         ));
-        let root = 220; // Y's third re-read, right before the Select.
+        let root = 220; // Y's third re-read, right before the If.
         schedule.push(def(root, ScheduledOp::Binary(OpKind::Add, ValueId(q3), y)));
-        let select_index = schedule.len();
+        let if_index = schedule.len();
         schedule.push(def(
             70,
-            ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(root), ValueId(0)),
+            ScheduledOp::Ternary(OpKind::If, ValueId(0), ValueId(root), ValueId(0)),
         ));
 
         let a = alloc(schedule);
-        let guards = a.body().select_guards();
+        let guards = a.body().if_guards();
         assert_eq!(
             guards
                 .iter()
-                .find(|g| g.select_idx == select_index)
-                .map(SelectGuard::true_range),
-            Some((1, select_index)),
+                .find(|g| g.if_idx == if_index)
+                .map(IfGuard::true_range),
+            Some((1, if_index)),
             "fixture assumes the whole reduction, starting at Y's own \
              definition, is the true arm's exclusive range"
         );
@@ -4651,10 +4651,10 @@ mod tests {
             "fixture assumes Y, not one of the other leaves, is the one evicted"
         );
         assert!(
-            matches!(a.body().where_at(y, select_index), Where::Reg(_)),
+            matches!(a.body().where_at(y, if_index), Where::Reg(_)),
             "Y is arm-internal from its own definition on, so re-promoting it \
              inside the arm needs no revert at the arm's end — it should \
-             still be resident at the Select"
+             still be resident at the If"
         );
     }
 
@@ -5313,7 +5313,7 @@ mod tests {
     /// register that is still in use.
     #[test]
     fn every_ternary_operand_extends_liveness() {
-        let sel = ScheduledOp::Ternary(OpKind::Select, ValueId(0), ValueId(1), ValueId(2));
+        let sel = ScheduledOp::Ternary(OpKind::If, ValueId(0), ValueId(1), ValueId(2));
         assert_eq!(
             operands(&sel).collect::<Vec<_>>(),
             vec![ValueId(0), ValueId(1), ValueId(2)]
@@ -5327,7 +5327,7 @@ mod tests {
     /// allocation, and what lets one operand be reloaded into `dst`.
     ///
     /// The encoders write `dst` before their last read — `setup_mov` ahead
-    /// of a `Select` or FMA, the decomposed `MulAdd`'s multiply before its
+    /// of an `If` or FMA, the decomposed `MulAdd`'s multiply before its
     /// add — so a *resident* operand in `dst`'s register would be corrupted.
     /// The destination *may* take an operand's register — it is a priced
     /// candidate, not an excluded one — but when it does, the eviction is
@@ -5413,7 +5413,7 @@ mod tests {
     /// reserve" — the failure this test turns into a named assertion.
     fn assert_reservations_match_residency(a: &Allocation<'_>, file: &RegisterFile) {
         let schedule = a.schedule();
-        let sites = guard_sites(a.select_guards(), schedule.len());
+        let sites = guard_sites(a.if_guards(), schedule.len());
         for (i, d) in schedule.iter().enumerate() {
             if matches!(d.op, ScheduledOp::Reduce(..)) {
                 continue; // Its own trip test reserves through the guard gate.
@@ -5482,7 +5482,7 @@ mod tests {
             let mask = ValueId(i);
             schedule.push(def(
                 width + i,
-                ScheduledOp::Ternary(OpKind::Select, mask, acc, ValueId(1)),
+                ScheduledOp::Ternary(OpKind::If, mask, acc, ValueId(1)),
             ));
             acc = ValueId(width + i);
         }

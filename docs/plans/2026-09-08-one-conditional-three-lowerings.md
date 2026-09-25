@@ -40,21 +40,21 @@ hand-written spellings of one thing the compiler should derive.
 denotes a caller-selected collapse band, which is a legitimate public
 concept the compiler has no business deriving. §5 separates the two.
 
-The language has **one conditional**: `Select`. The compiler should have
+The language has **one conditional**: `If`. The compiler should have
 **three lowerings** of it.
 
 | what the compiler can prove about the mask | lowering | cost outside the region |
 |---|---|---|
 | it implies an index range | **domain split** — the region gets the select, the complement gets the false arm | the false arm alone, usually a fill |
 | it is uniform over a row | **hoist and guard** the row prologue | one any-true test per row |
-| nothing static | **blend** — what `Select` does today | full |
+| nothing static | **blend** — what `If` does today | full |
 
 These are not three mechanisms. They are one denotation lowered against
 three levels of static knowledge, and a single kernel routinely uses all
 three at different nodes.
 
 **Lowering 1 is a split, not a narrowed loop, and the distinction is a
-correctness one.** `Select(m, a, b)` is defined at *every* index in the
+correctness one.** `If(m, a, b)` is defined at *every* index in the
 extent. A derived range bounds where `m` can be nonzero, so outside it the
 select's value is `b` — not nothing. Narrowing the loop and stopping there
 would leave the complement holding whatever the destination was
@@ -62,7 +62,7 @@ initialized to, which is the value only when `b` happens to equal it.
 
 So the lowering emits two disjoint programs, and what the complement gets
 is **the whole root kernel specialized with `m ≡ false`** — not the
-select's false arm. The select is usually not the root: `Select(m, a, b) +
+`If`'s false arm. The `If` is usually not the root: `If(m, a, b) +
 c` must produce `b + c` over the complement, and dropping the `+ c` would
 silently delete every consumer downstream of the select. This is the normal
 case rather than a corner one — `text()` is a `Kernel::sum` over glyphs, so
@@ -98,7 +98,7 @@ values does this arm serve" is an artifact of codegen — so the natural
 place to compute it is next to the emitter, per select. That is where it
 was built, and it did not survive contact (superseded plan, §9).
 
-`Select(m, a, b)` **means** `if m then a else b`. Two cases. An arm's
+`If(m, a, b)` **means** `if m then a else b`. Two cases. An arm's
 condition is a fact about the DAG, and the region a value is observed over
 is a property to be *read*, not reconstructed.
 
@@ -274,7 +274,7 @@ superseded plan §2, which stands unchanged and becomes load-bearing here.
   `CellGridFrame::collapse_channel_rows`, and one per worker stripe in
   `render_bands` (`pixelflow-graphics/src/render/{cell_grid,scene}.rs`,
   `pixelflow-core/src/lattice/cell_grid.rs`). That has nothing to do with
-  `Select` — it is a work partition, chosen by whoever is calling, and no
+  `If` — it is a work partition, chosen by whoever is calling, and no
   compiler derives it.
 
   Two meanings on one type is the thing CLAUDE.md says to pay for at the
@@ -442,7 +442,7 @@ two meanings become two types.
 - **No tuned constant stands in for a bound.** Interval precision is a
   compile-budget knob and says so. `MISPREDICT_PENALTY_CYCLES` keeps its
   existing derivation.
-- **`Select`'s value semantics do not change.** Which lowering is chosen
+- **`If`'s value semantics do not change.** Which lowering is chosen
   changes what is computed, never what is selected.
 - **A skipped region leaves zero in its parks.** Never a mask.
 - **The frame prologue is never guarded.** It runs once per call.
@@ -455,6 +455,6 @@ two meanings become two types.
   tessellate for. A circle yields a bounding box and blends inside it.
 - Profile-guided coherence. The dynamic half of "is this guard worth it"
   is the schedule-cost residual and is not this plan.
-- Changing `Select`'s NaN or bit-pattern semantics.
+- Changing `If`'s NaN or bit-pattern semantics.
 - The glyph waist defect. Still open, still pinned by the oracle, unrelated
   to this design.

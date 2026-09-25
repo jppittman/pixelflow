@@ -107,7 +107,7 @@ fn cases() -> Vec<(&'static str, ExprArena, ExprId)> {
         out.push(("both_regions", a, r));
     }
 
-    // A Select whose mask varies by lane, with enough work in an arm to be
+    // An If whose mask varies by lane, with enough work in an arm to be
     // worth a guard: the branch path.
     {
         let mut a = ExprArena::new();
@@ -118,8 +118,8 @@ fn cases() -> Vec<(&'static str, ExprArena, ExprId)> {
         let hot = a.push_unary(OpKind::Sin, s);
         let hot2 = a.push_unary(OpKind::Exp, hot);
         let cold = a.push_unary(OpKind::Sqrt, s);
-        let r = a.push_ternary(OpKind::Select, m, hot2, cold);
-        out.push(("select_guard", a, r));
+        let r = a.push_ternary(OpKind::If, m, hot2, cold);
+        out.push(("if_guard", a, r));
     }
 
     // More live values than the pool holds: eviction, splitting, reloads.

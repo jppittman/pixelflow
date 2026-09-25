@@ -338,12 +338,12 @@ pub enum ExprNode {
         fold: Fold,
         body: ExprId,
     },
-    /// The hard lowering of [`OpKind::Select`]: a branch, where only the
+    /// The hard lowering of [`OpKind::If`]: a branch, where only the
     /// taken arm's body runs, denoting the exact same function as the soft
     /// (blend) form (docs/plans/2026-09-12-emit-should-just-emit.md §1).
     ///
     /// `mask` is a real child — it lives in *this* arena and is evaluated
-    /// unconditionally, the same value a `Select` would test. `on` and `off`
+    /// unconditionally, the same value an `If` would test. `on` and `off`
     /// are content-addressed names, not children: `passes::expand_refs` runs
     /// unconditionally in every compile entry point and would splice an
     /// `ExprNode::Ref` child in before codegen ever saw it, destroying the
@@ -790,7 +790,7 @@ impl ExprArena {
     }
 
     /// Push a `Guard(mask, on, off)` leaf-with-one-child — the hard lowering
-    /// of `Select`: only the arm the mask selects runs.
+    /// of `If`: only the arm the mask selects runs.
     ///
     /// `mask` must already exist in this arena; `on` and `off` name kernels
     /// in the [`KernelStore`](crate::store::KernelStore), exactly as
@@ -2480,7 +2480,7 @@ mod guard_tests {
     /// `kind()` gives every real operation an `OpKind`; a `Guard` is not one
     /// yet (no vocabulary, cost table, or emitter has a rule for it — G3 is
     /// what would give extraction a price to choose between it and
-    /// `Select`). Pinning the exact panic keeps that reason from silently
+    /// `If`). Pinning the exact panic keeps that reason from silently
     /// becoming "not implemented".
     #[test]
     #[should_panic(expected = "a Guard is a branch, not an operation")]

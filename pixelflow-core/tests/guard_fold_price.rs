@@ -1,4 +1,4 @@
-//! A `Select` arm that owns a fold (`Reduce`) is worth a branch by what the
+//! An `If` arm that owns a fold (`Reduce`) is worth a branch by what the
 //! fold's loop costs to run: its trip count times its body, plus the combine
 //! per trip.
 //!
@@ -21,7 +21,7 @@
 //! dropped, shows as a wrong texel. The second section is guarded now too,
 //! around more than one loop: both arms loops, an arm skipping a fold and the
 //! fold only it reads (at one and at two scopes' distance), a mask that is
-//! itself a loop, and the glyph's shape of a fold read across two selects.
+//! itself a loop, and the glyph's shape of a fold read across two `If`s.
 //! The third section is two arms the price now clears but ownership still
 //! refuses — correctness only, and what the demand-regions work (D1) is for.
 //!
@@ -72,8 +72,8 @@ const MASK_TRIPS: u32 = 8;
 const MASK_BASE: f64 = 10.0;
 /// The mask fold's threshold step.
 const MASK_STEP: f64 = 5.0;
-/// The second select's threshold in the two-select kernel: right of it, far
-/// from [`THRESHOLD`], so each select has uniform batches of its own.
+/// The second `If`'s threshold in the two-`If` kernel: right of it, far
+/// from [`THRESHOLD`], so each `If` has uniform batches of its own.
 const FAR_THRESHOLD: f64 = 40.0;
 /// Relative tolerance: `f32` summation of 64 terms, each an integer here.
 const REL_TOL: f64 = 1e-5;
@@ -318,12 +318,12 @@ fn an_arm_that_is_a_fold_under_a_mask_that_is_a_fold() {
 }
 
 /// `select(X < T, F, 0) + select(X > 40, min_k |F − 100k|, 0)` — the glyph's
-/// shape, where a winding fold is read both by its own select's arm and by
+/// shape, where a winding fold is read both by its own `If`'s arm and by
 /// the distance fold in the other's. `F` is owned by neither arm and runs on
 /// every batch; the second arm's loop is skipped where its mask is uniformly
 /// false, and still reads this batch's `F` where it runs.
 #[test]
-fn a_fold_read_across_two_selects() {
+fn a_fold_read_across_two_ifs() {
     let f = fold_of(&x());
     let nearest = Kernel::min_over(READER_TRIPS, |k| f.sub(&k.mul(&c(READER_STEP))).abs());
     let k = x()
@@ -337,8 +337,8 @@ fn a_fold_read_across_two_selects() {
             .fold(f64::INFINITY, f64::min);
         (if x < THRESHOLD { f } else { 0.0 }) + (if x > FAR_THRESHOLD { nearest } else { 0.0 })
     };
-    check("fold read across two selects", &k, want);
-    check_at("fold read across two selects", RAGGED_WIDTH, &k, want);
+    check("fold read across two ifs", &k, want);
+    check_at("fold read across two ifs", RAGGED_WIDTH, &k, want);
 }
 
 // ───── priced past the bound, and still refused by ownership ─────
@@ -360,7 +360,7 @@ fn an_arm_that_is_a_fold_reading_a_value_only_it_reads() {
     });
 }
 
-/// `Σ_{j<4} select(X + j < T, F(X + j), 0) + Y`: the select is in the outer
+/// `Σ_{j<4} select(X + j < T, F(X + j), 0) + Y`: the `If` is in the outer
 /// fold's own body. The inner loop's schedule still carries the lane and
 /// coordinate leaves `X + j` was built from before it was parked, and a leaf
 /// the loop's schedule shares is a read of it (`guards::FoldReads`), so the
@@ -384,9 +384,9 @@ fn an_arm_that_is_a_fold_in_a_folds_body() {
 
 // ────────────────────────── controls ──────────────────────────
 
-/// `F(X) + Y`: the same loop, no select.
+/// `F(X) + Y`: the same loop, no `If`.
 #[test]
-fn control_the_fold_without_the_select() {
+fn control_the_fold_without_the_if() {
     let k = fold_of(&x()).add(&y());
     check("no select", &k, |x, y| fold_ref(x) + y);
 }

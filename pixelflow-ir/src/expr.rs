@@ -60,7 +60,7 @@ pub enum ExprData {
     /// contain. What it names is a *kernel*, which is what makes it the one
     /// of the three that can be resolved back into graph.
     Ref(KernelKey),
-    /// The hard lowering of [`OpKind::Select`](crate::kind::OpKind::Select):
+    /// The hard lowering of [`OpKind::If`](crate::kind::OpKind::If):
     /// a branch, where only the taken arm's body runs, denoting the same
     /// function as the soft (blend) form
     /// (docs/plans/2026-09-12-emit-should-just-emit.md §1). Mirrors

@@ -57,7 +57,7 @@ When advising on new combinators, verify:
 
 1. **Associativity**: `(f . g) . h = f . (g . h)`
 2. **Identity**: Trivial warps and grades should disappear
-3. **Distributivity**: Select should distribute over arithmetic
+3. **Distributivity**: `If` should distribute over arithmetic
 4. **Fusion**: Consecutive warps should compose into one
 
 ## Key Files for Reference

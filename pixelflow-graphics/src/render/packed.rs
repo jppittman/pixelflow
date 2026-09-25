@@ -9,11 +9,11 @@
 //! (per call, per row) active.
 //!
 //! A colour is an [`Rgba`] tree rather than an array, so a *choice* between
-//! colours reaches here as one node and leaves as one `Select` on the packed
+//! colours reaches here as one node and leaves as one `If` on the packed
 //! words ([`pixelflow_ir::Bits::select`] — the blend the hardware already
 //! does). That is the difference between a scene the emitter can short-circuit
-//! and one it cannot: with four selects sharing a mask, everything either arm
-//! computes is shared from each select's point of view, and none of it can be
+//! and one it cannot: with four `If`s sharing a mask, everything either arm
+//! computes is shared from each `If`'s point of view, and none of it can be
 //! skipped.
 //!
 //! The layer below ([`pixelflow_core::Manifold`]) is the same object with
@@ -31,7 +31,7 @@ use crate::scene3d::Rgba;
 /// A colour packed to one `u32` pixel: each leaf's four channels packed to a
 /// byte exactly as `Pixel::from_rgba` does — `(x·255).clamp(0, 255)` then
 /// truncate toward zero — shifted to its byte lane and OR-folded, and each
-/// choice between colours blended as one `Select` on those words.
+/// choice between colours blended as one `If` on those words.
 ///
 /// `shifts[c]` is the bit position of channel `c` in `(r, g, b, a)` order.
 /// Both pixel orders are little-endian byte arrays wrapping a `u32`, so byte
@@ -42,7 +42,7 @@ use crate::scene3d::Rgba;
 /// the scalar pack's `as u8`, and `cvttps2dq`/`fcvtzs` both truncate toward
 /// zero — no per-target tie divergence to inherit.
 ///
-/// Selecting words and selecting channels give the same bits, since `Select`
+/// Selecting words and selecting channels give the same bits, since `If`
 /// is a lanewise bitwise blend and the pack is lanewise: whatever the
 /// not-taken arm packed is masked away whole. That equality is why this
 /// changes no pixel and why the goldens do not move
@@ -297,10 +297,10 @@ mod tests {
     }
 
     /// **The equality S3b rests on.** Choosing between two packed words is
-    /// choosing between each of their channels: `Select` is a lanewise
+    /// choosing between each of their channels: `If` is a lanewise
     /// bitwise blend and the pack is lanewise, so the not-taken arm's bytes
     /// are masked away whole. Bit-exact, under both byte orders — which is
-    /// why one select over a whole colour draws the same picture as four, and
+    /// why one `If` over a whole colour draws the same picture as four, and
     /// why no golden moves when the colour becomes a tree.
     #[test]
     fn selecting_packed_words_is_selecting_the_channels() {
@@ -319,11 +319,11 @@ mod tests {
             mask.select(&ca[2], &cb[2]),
             mask.select(&ca[3], &cb[3]),
         );
-        let one_select = a.select(&mask, &b);
+        let one_if = a.select(&mask, &b);
 
         for shifts in [RGBA, BGRA] {
             assert_eq!(
-                words(&packed_kernel(&one_select, shifts), 8),
+                words(&packed_kernel(&one_if, shifts), 8),
                 words(&packed_kernel(&per_channel, shifts), 8),
                 "one select on the words disagrees with four on the channels, \
                  shifts {shifts:?}"

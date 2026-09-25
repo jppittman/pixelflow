@@ -18,7 +18,7 @@
 //! `u + D₀` — the curved piece of a glyph, and its straight one — and, from
 //! `fold_rules`, the one rule both domains share: `∫ c·f = c·∫ f`
 //! (`FactorFold`). Nothing else is here yet: the constant, linearity,
-//! select, interchange and power-moment rules of the plan's table close no
+//! `If`, interchange and power-moment rules of the plan's table close no
 //! integral a chord or an arc needs, so each waits for the kernel that does
 //! (CLAUDE.md, "subtract before you add").
 //!
@@ -72,7 +72,7 @@ use super::rules::RuleId;
 /// narrow an integral to where its indicators hold, `C` the factors the
 /// variable does not reach.
 ///
-/// **Law.** Each indicator `[A ⋈ B]` — `Select(A ⋈ B, 1, 0)`, `⋈` one of
+/// **Law.** Each indicator `[A ⋈ B]` — `If(A ⋈ B, 1, 0)`, `⋈` one of
 /// `<`, `≤`, `>`, `≥` — whose difference is affine in the variable,
 /// `A − B = c·u + d`, bounds `u` by its root `t = −d/c`: from above when
 /// `A − B` must be negative and `c > 0`, or positive and `c < 0`; from below
@@ -129,7 +129,7 @@ pub struct NarrowInterval;
 /// `k` may be zero, and provably so — an argument the variable does not
 /// reach is `0·u + c` — which makes the sweep `z₁ − z₀` provably zero too.
 /// So the closed form never divides by the sweep where it can be zero, not
-/// even in an arm a `Select` discards: an e-graph that proves a divisor zero
+/// even in an arm an `If` discards: an e-graph that proves a divisor zero
 /// goes on to apply `x·recip(x) = 1` and `(x·a)/a = x` to it, which merge
 /// the quotient with classes it is not equal to (`mean_of_clamp`, "The
 /// divisor").
@@ -163,7 +163,7 @@ pub struct ClampMoment;
 /// **Side conditions**, each read off the classes, every node of each
 /// tried:
 /// - The body's factors the variable reaches are exactly two indicators
-///   and a clamp. The indicators are `Select(m, 1, 0)` of `0 ≤ T` and
+///   and a clamp. The indicators are `If(m, 1, 0)` of `0 ≤ T` and
 ///   `T < 1` in any of `≤ <` and `≥ >` spellings — strictness moves a
 ///   point, which has no length — over one class `T`.
 /// - `T` holds `D / d` or `D·(1/d)` — the author's quotient, or the
@@ -414,14 +414,14 @@ fn band_of(egraph: &EGraph, a: EClassId, b: EClassId) -> Option<EClassId> {
 }
 
 /// Which band edges `factor` is an indicator of: `(Start, T)` for
-/// `Select(m, 1, 0)` with `m` one of `0 ≤ T`, `0 < T`, `T ≥ 0`, `T > 0`, and
+/// `If(m, 1, 0)` with `m` one of `0 ≤ T`, `0 < T`, `T ≥ 0`, `T > 0`, and
 /// `(End, T)` for `T < 1`, `T ≤ 1`, `1 > T`, `1 ≥ T` — the literal read off
 /// the class constant fact, `T` canonical.
 fn edges(egraph: &EGraph, factor: EClassId) -> Vec<(Edge, EClassId)> {
     let is = |class, value: f32| egraph.constant(class) == Some(value);
     let mut found = Vec::new();
     for node in egraph.nodes(factor) {
-        let Some([mask, one, zero]) = operands(node, OpKind::Select) else {
+        let Some([mask, one, zero]) = operands(node, OpKind::If) else {
             continue;
         };
         if !is(one, 1.0) || !is(zero, 0.0) {
@@ -988,7 +988,7 @@ impl<'g> Recognizer<'g> {
     }
 
     /// The bound `factor` puts on the variable, when it is an indicator
-    /// `Select(A ⋈ B, 1, 0)` of a comparison whose difference has a literal
+    /// `If(A ⋈ B, 1, 0)` of a comparison whose difference has a literal
     /// nonzero slope. See [`NarrowInterval`] for which side.
     fn bound(&mut self, factor: EClassId) -> Option<Bound> {
         let egraph = self.egraph;
@@ -999,7 +999,7 @@ impl<'g> Recognizer<'g> {
             let &[mask, one, zero] = children.as_slice() else {
                 return None;
             };
-            if op.kind() != OpKind::Select
+            if op.kind() != OpKind::If
                 || egraph.constant(one) != Some(1.0)
                 || egraph.constant(zero) != Some(0.0)
             {
@@ -1353,12 +1353,12 @@ mod tests {
         assert_eq!(side(&eg, test), None);
     }
 
-    /// `Select(test, 1, 0)`, as a class.
+    /// `If(test, 1, 0)`, as a class.
     fn indicator(eg: &mut EGraph, test: ENode) -> EClassId {
         let (one, zero) = (eg.add(ENode::constant(1.0)), eg.add(ENode::constant(0.0)));
         let test = eg.add(test);
         eg.add(ENode::Op {
-            op: &ops::Select,
+            op: &ops::If,
             children: alloc::vec![test, one, zero],
         })
     }

@@ -24,7 +24,7 @@ pub enum CompileError {
     /// own that pass and a copy would drift from it.
     Legalize(&'static str),
 
-    /// An op reached ternary position in the DAG emitter that isn't `Select`
+    /// An op reached ternary position in the DAG emitter that isn't `If`
     /// or `MulAdd`. `passes::legalize` is supposed to leave only those two in
     /// that position, so this is the pipeline having let one through rather
     /// than a fact about `op`.

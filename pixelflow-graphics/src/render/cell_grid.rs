@@ -932,7 +932,7 @@ mod tests {
     /// The two shape-A scene kernels, dumped the way production compiles
     /// them: `bench_scene_chrome`'s chrome sphere and `bench_scene_psychedelic`'s
     /// shader, each as the ONE packed kernel `PackedManifold::compile` hands
-    /// the optimizer (four channels packed inside, selects on packed words —
+    /// the optimizer (four channels packed inside, `If`s on packed words —
     /// S3b), at the gate's 1920×1080 frame. The constructions are the gate
     /// examples' (`pixelflow-runtime/examples/bench_scene_{chrome,psychedelic}.rs`)
     /// restated here because `packed_kernel` is private to this crate and the

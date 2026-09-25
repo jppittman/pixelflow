@@ -249,7 +249,7 @@ pub struct BroadcastGprs {
 }
 
 // =============================================================================
-// Branches — for the shared driver's Select short-circuit guards.
+// Branches — for the shared driver's If short-circuit guards.
 // =============================================================================
 
 /// TEST eax, eax (sets ZF iff eax == 0).

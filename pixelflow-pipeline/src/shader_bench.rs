@@ -42,14 +42,14 @@
 //! |---|---|---|---|---|---|
 //! | `cosine_palette` | Cosine Color Palette (article) | Inigo Quilez (iq) | <https://iquilezles.org/articles/palettes/> (example: shadertoy.com/view/Xl2GRc) | CC BY-NC-SA 3.0 (default, unconfirmed) | transcendental-heavy, famous |
 //! | `smooth_min_scene` | smin (smooth minimum) (article) | Inigo Quilez (iq) | <https://iquilezles.org/articles/smin/> (example: shadertoy.com/view/DlVcW1) | CC BY-NC-SA 3.0 (default, unconfirmed) | SDF-composition-heavy |
-//! | `mandelbrot_distance` | distance to the Mandelbrot set (article) | Inigo Quilez (iq) | <https://iquilezles.org/articles/distancefractals/> (example: shadertoy.com/view/lsX3W4) | CC BY-NC-SA 3.0 (default, unconfirmed) | select/branch-heavy, famous |
+//! | `mandelbrot_distance` | distance to the Mandelbrot set (article) | Inigo Quilez (iq) | <https://iquilezles.org/articles/distancefractals/> (example: shadertoy.com/view/lsX3W4) | CC BY-NC-SA 3.0 (default, unconfirmed) | `If`/branch-heavy, famous |
 //! | `star_sdf` | 2D distance functions — sdPentagram (article) | Inigo Quilez (iq) | <https://iquilezles.org/articles/distfunctions2d/> (example: shadertoy.com/view/t3X3z4) | CC BY-NC-SA 3.0 (default, unconfirmed) | SDF-composition-heavy |
 //! | `gyroid_slice` | gyroid SDF | zzggbb | <https://www.shadertoy.com/view/wtfSRS> (2019-07-17) | CC BY-NC-SA 3.0 (default, unconfirmed) | SDF-composition-heavy, famous technique |
 //! | `plasma` | Plasma 90x | bitek | <https://www.shadertoy.com/view/4ssGR7> (2013-04-16) | CC BY-NC-SA 3.0 (default, unconfirmed) | transcendental-heavy |
 //! | `domain_warp_fbm` | Domain Warping (article) | Inigo Quilez (iq) | <https://iquilezles.org/articles/warp/> (example: shadertoy.com/view/4s23zzM) | CC BY-NC-SA 3.0 (default, unconfirmed) | transcendental-heavy, famous |
-//! | `kaleidoscope_fold` | Kaleidoscope Tutorial | deliaev | <https://www.shadertoy.com/view/WdcSRr> (2020-07-22) | CC BY-NC-SA 3.0 (default, unconfirmed) | select/branch-heavy |
-//! | `metaballs` | Metaball | unresolved handle | <https://www.shadertoy.com/view/Xdl3Wl> (2013); technique: Blinn 1982 | CC BY-NC-SA 3.0 (default, unconfirmed) | select/branch-heavy |
-//! | `julia_set` | Julia - Distance 2 | Inigo Quilez (iq) | <https://www.shadertoy.com/view/3llyzl> | CC BY-NC-SA 3.0 (confirmed) | select/branch-heavy, famous |
+//! | `kaleidoscope_fold` | Kaleidoscope Tutorial | deliaev | <https://www.shadertoy.com/view/WdcSRr> (2020-07-22) | CC BY-NC-SA 3.0 (default, unconfirmed) | `If`/branch-heavy |
+//! | `metaballs` | Metaball | unresolved handle | <https://www.shadertoy.com/view/Xdl3Wl> (2013); technique: Blinn 1982 | CC BY-NC-SA 3.0 (default, unconfirmed) | `If`/branch-heavy |
+//! | `julia_set` | Julia - Distance 2 | Inigo Quilez (iq) | <https://www.shadertoy.com/view/3llyzl> | CC BY-NC-SA 3.0 (confirmed) | `If`/branch-heavy, famous |
 //! | `smoothstep_vignette` | smoothstep (glossary) | Patricio Gonzalez Vivo (Book of Shaders) | <https://thebookofshaders.com/glossary/?search=smoothstep> | CC BY-NC-SA (site-wide, version unconfirmed) | fma-friendly polynomial |
 //! | `torus_slice` | Signed Distance Functions — sdTorus (article) | Inigo Quilez (iq) | <https://iquilezles.org/articles/distfunctions/> (playlist: shadertoy.com/playlist/43cXRl) | CC BY-NC-SA 3.0 (default, unconfirmed) | SDF-composition-heavy |
 //!
@@ -200,7 +200,7 @@ impl Build for ExprArena {
         self.push_ternary(OpKind::MulAdd, x, y, z)
     }
     fn select(&mut self, cond: ExprId, t: ExprId, f: ExprId) -> ExprId {
-        self.push_ternary(OpKind::Select, cond, t, f)
+        self.push_ternary(OpKind::If, cond, t, f)
     }
 }
 
@@ -298,7 +298,7 @@ fn smooth_min_scene() -> (ExprArena, ExprId) {
 
 /// Distance estimate to the Mandelbrot set via the Hubbard-Douady potential
 /// `d = sqrt(m2/dz2) * 0.5 * ln(m2)`, fixed at 5 unrolled iterations. Escape
-/// is a compare-and-freeze (`Select`) rather than a data-dependent loop
+/// is a compare-and-freeze (`If`) rather than a data-dependent loop
 /// exit: pixelflow kernels have no branches, so a fixed iteration count
 /// keeps updating past an escaped point unless something stops it — the
 /// freeze makes that numerically harmless instead of a silently wrong
@@ -313,7 +313,7 @@ fn smooth_min_scene() -> (ExprArena, ExprId) {
 ///   blocks automated fetch), treated conservatively as CC BY-NC-SA 3.0.
 /// - Fetched: 2026-08-27.
 /// - Simplified: 5 fixed unrolled iterations (the article's own examples
-///   iterate until escape or a few hundred steps); escape is a `Select`
+///   iterate until escape or a few hundred steps); escape is an `If`
 ///   freeze rather than an early `break`; `c` is the pixel position clamped
 ///   into `[-2,2]^2` rather than driven by a pan/zoom camera transform.
 fn mandelbrot_distance() -> (ExprArena, ExprId) {
@@ -389,7 +389,7 @@ fn mandelbrot_distance() -> (ExprArena, ExprId) {
 ///   blocks automated fetch), treated conservatively as CC BY-NC-SA 3.0.
 /// - Fetched: 2026-08-27.
 /// - Simplified: `sign(...)` (not a pixelflow op) is replaced with a
-///   `Ge`+`Select` producing +-1 — GLSL's `sign(0)==0` becomes `+1` here, a
+///   `Ge`+`If` producing +-1 — GLSL's `sign(0)==0` becomes `+1` here, a
 ///   difference only on the measure-zero set where the argument is exactly
 ///   zero.
 fn star_sdf() -> (ExprArena, ExprId) {
@@ -645,7 +645,7 @@ fn domain_warp_fbm() -> (ExprArena, ExprId) {
 
 /// N-fold kaleidoscope: fold the polar angle into a repeating wedge (mirror
 /// symmetry via `floor` + `abs`), reconstruct Cartesian coordinates, and
-/// evaluate a striped pattern with a hard-threshold `Select` branch plus a
+/// evaluate a striped pattern with a hard-threshold `If` branch plus a
 /// radial ring modulation.
 ///
 /// - Shader: "Kaleidoscope Tutorial"
@@ -697,7 +697,7 @@ fn kaleidoscope_fold() -> (ExprArena, ExprId) {
     let one = a.k(1.0);
     let negone = a.k(-1.0);
     let branch = a.select(branch_cond, one, negone);
-    let stripe = a.mul(branch, pattern); // == |pattern|, via a genuine Select.
+    let stripe = a.mul(branch, pattern); // == |pattern|, via a genuine If.
 
     let ring_f = a.k(5.0);
     let rf = a.mul(r, ring_f);
@@ -711,7 +711,7 @@ fn kaleidoscope_fold() -> (ExprArena, ExprId) {
 }
 
 /// Three-ball metaball field: sum of inverse-square "energy" contributions,
-/// thresholded to a hard silhouette (`Select`) and blended with a softened
+/// thresholded to a hard silhouette (`If`) and blended with a softened
 /// version of the same threshold.
 ///
 /// - Shader: "Metaball", posted 2013 (a simple 2D metaballs shader).
@@ -783,7 +783,7 @@ fn metaballs() -> (ExprArena, ExprId) {
 /// - License: CC BY-NC-SA 3.0 (confirmed).
 /// - Fetched: 2026-08-27.
 /// - Simplified: 5 fixed unrolled iterations rather than a data-dependent
-///   distance-estimate raymarch; escape is a `Select` freeze, not an early
+///   distance-estimate raymarch; escape is an `If` freeze, not an early
 ///   `break`; smooth coloring is evaluated once from the final frozen z
 ///   rather than iq's true continuous per-iteration distance estimate (this
 ///   kernel has no loop-carried iteration counter to make that exact).

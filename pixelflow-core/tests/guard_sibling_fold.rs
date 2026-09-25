@@ -1,10 +1,10 @@
-//! A kernel fold (`Reduce`) inside a `Select` arm, when something outside the
+//! A kernel fold (`Reduce`) inside an `If` arm, when something outside the
 //! arm depends on it — or it depends on something outside the arm — through
 //! the fold's *body* rather than through a register operand.
 //!
 //! `pixelflow-codegen/src/emit/guards.rs` decides which schedule entries a
-//! select's arm owns (`select_arms`), and reorders a scope so an arm is one
-//! contiguous run (`cluster_select_arms`). Both used to read dependencies off
+//! `If`'s arm owns (`if_arms`), and reorders a scope so an arm is one
+//! contiguous run (`cluster_if_arms`). Both used to read dependencies off
 //! `regalloc::operands` alone, which treats a `Reduce` def as a leaf: once
 //! `extract_folds` has carved a fold's body into its own scope, nothing in the
 //! enclosing scope's schedule recorded what that body reads. They now read it
@@ -25,9 +25,9 @@
 //!
 //! 2. **Clustering moved a fold's input past the fold.**
 //!    `out = select(X < T, W·sin(X/10), 0)` with `W = Σ_j |X + Y − j/2|`.
-//!    `X + Y` is a batch-scope root read only by `W`'s body, so to the select
+//!    `X + Y` is a batch-scope root read only by `W`'s body, so to the `If`
 //!    it was a stranger — outside its cone, since `W`'s `Reduce` had no
-//!    operands — and `partition_around` sank it past the select, *after* `W`'s
+//!    operands — and `partition_around` sank it past the `If`, *after* `W`'s
 //!    loop. `W` then read the previous batch's `X + Y` on every batch, whether
 //!    or not any guard fired; `is_topological` walked the same leaf-`Reduce`
 //!    operands and did not notice. No sibling fold is involved.
@@ -38,7 +38,7 @@
 //! which failed before `FoldReads` as well: they pin the claims its doc makes
 //! (the edges are transitive, and every scope has them), not new mechanisms.
 //!
-//! The controls at the bottom compile the same folds without the select, with
+//! The controls at the bottom compile the same folds without the `If`, with
 //! an arm that owns nothing to guard or cluster, and with the sibling reading
 //! `W` through an ordinary batch-scope value — all correct.
 //!
@@ -48,7 +48,7 @@
 //!
 //! `PIXELFLOW_GUARD_TELEMETRY=1 cargo test -p pixelflow-core --test
 //! guard_sibling_fold -- --nocapture --test-threads=1` prints, per scope,
-//! which selects were guarded and how many entries each arm skips.
+//! which `If`s were guarded and how many entries each arm skips.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
@@ -225,7 +225,7 @@ fn a_guard_keeps_a_fold_a_sibling_fold_reads_sibling_first() {
 // ──── 2. clustering may not sink a fold's input past the fold ────
 
 /// `select(X < T, W·sin, 0)` with `W` reading `X + Y`. No sibling. When
-/// clustering sank `X + Y` past the select, this was wrong on the *true*
+/// clustering sank `X + Y` past the `If`, this was wrong on the *true*
 /// side — the batches that do run the arm — because `W`'s loop ran before
 /// this batch's `X + Y` was computed.
 #[test]
@@ -370,7 +370,7 @@ const OUTER_TRIPS: u32 = 6;
 const INNER_TRIPS: u32 = 40;
 
 /// Bug 1 inside a fold's own body: `Σ_j select(X + j < T, V_j·sin, 0) + U_j`
-/// with `V_j = Σ_m |X + j − m/2|` and `U_j = Σ_k |V_j − 40k|`. The select, `V`
+/// with `V_j = Σ_m |X + j − m/2|` and `U_j = Σ_k |V_j − 40k|`. The `If`, `V`
 /// and `U` are all in the outer fold's scope, whose edges `allocate_nest`
 /// and `cluster_pending` build from that fold's children.
 #[test]
@@ -412,7 +412,7 @@ fn control_the_fold_alone() {
     check("fold alone", &w_of_x(), |x, _| w_ref(x));
 }
 
-/// `D` alone: a fold reading a fold, no select.
+/// `D` alone: a fold reading a fold, no `If`.
 #[test]
 fn control_the_sibling_alone() {
     check("sibling alone", &sibling_of(&w_of_x()), |x, _| {
@@ -420,9 +420,9 @@ fn control_the_sibling_alone() {
     });
 }
 
-/// `W·sin + D`: the same folds and the same arm work, no select.
+/// `W·sin + D`: the same folds and the same arm work, no `If`.
 #[test]
-fn control_both_folds_without_the_select() {
+fn control_both_folds_without_the_if() {
     let w = w_of_x_plus_y();
     let k = heavy_of(&w).add(&sibling_of(&w));
     check("no select", &k, |x, y| {

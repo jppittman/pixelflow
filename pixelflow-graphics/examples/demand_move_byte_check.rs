@@ -6,16 +6,16 @@
 //!   difference is a bug: relocating the demand pass may change no guard
 //!   decision and no emitted byte. Measured identical on both fixtures.
 //! - Across Stage C (`a77e526a` → hash-consing), the glyph fixture is
-//!   *expected* to change and the select fixture is not: consing lets the
+//!   *expected* to change and the `If` fixture is not: consing lets the
 //!   post-extraction passes share subexpressions they used to duplicate,
 //!   so the glyph program shrank from 19,566 to 10,005 bytes with the
 //!   pixel goldens unchanged, while a kernel with no shared work is
 //!   byte-identical (428 bytes). §5.3 of the plan records both.
 //!
 //! Fixtures:
-//! - A guarded `Select` kernel (mirrors
+//! - A guarded `If` kernel (mirrors
 //!   `pixelflow-codegen/tests/collapse_paths.rs`'s
-//!   `a_select_blends_and_branches`), at a shape wide enough for the guard
+//!   `an_if_blends_and_branches`), at a shape wide enough for the guard
 //!   to actually fire.
 //! - The glyph `8` at 32px, composed with `.at(x+0.5, y+0.5)`, compiled
 //!   through the same production path (`pixelflow_codegen::jit_cache::compile`)
@@ -40,10 +40,10 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
-/// `Select(x < y, sqrt(x), abs(y))`: a guardable select whose arms are each
+/// `If(x < y, sqrt(x), abs(y))`: a guardable `If` whose arms are each
 /// cheap enough to schedule but distinct in cost, so a real branch is on
 /// the table for the emitter to take or refuse.
-fn guarded_select_kernel() -> Kernel {
+fn guarded_if_kernel() -> Kernel {
     let x = Kernel::x();
     let y = Kernel::y();
     let mask = x.lt(&y);
@@ -65,8 +65,8 @@ fn report(label: &str, kernel: &Kernel, shape: LatticeShape) {
 
 fn main() {
     report(
-        "guarded_select",
-        &guarded_select_kernel(),
+        "guarded_if",
+        &guarded_if_kernel(),
         LatticeShape::new([64, 64]),
     );
 
