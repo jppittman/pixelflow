@@ -92,7 +92,7 @@ Three structures, one rule:
 |---|---|---|
 | `Ref(k)` | a **call** | never survives — `expand_refs` always inlines (L5) |
 | `Reduce { fold }` | a **loop** | never survives — `ExpandReduce` always unrolls |
-| `Select(m, a, b)` with a derived range | a **domain split** | never derived — no mask ⟹ range (D1/D2) |
+| `If(m, a, b)` with a derived range | a **domain split** | never derived — no mask ⟹ range (D1/D2) |
 
 In all three the flattened form is the *fallback*, and today it is the only
 form. Each has a real cost on the other side — a call boundary the register

@@ -138,13 +138,13 @@ program that is a value, and `Assembly` — push, bind, finish — for the emitt
 which discovers its instructions while walking a schedule and so cannot hand
 over a finished list. Both keep one label map and both resolve the same way.
 
-Both loops in the emitter moved onto it: the collapse nest and the `Select`
+Both loops in the emitter moved onto it: the collapse nest and the `If`
 short-circuit. That deleted `emit_jump`, `patch_branch`,
 `emit_skip_if_all_false`, `emit_skip_if_all_true`, `IsaBackend::Branch`,
 `Aarch64Branch`, `Cond19`, `Rel26`, `Rel32`, `emit_jmp_rel32` and `patch_rel32`
 — the whole fixup-token mechanism, five impls of it. The two skip verbs folded
 into one `branch_if_arm_is_dead(.., MaskTest, Label)`, because they differed
-only in which uniform mask lets an arm go, which is what `SelectArm` already
+only in which uniform mask lets an arm go, which is what `IfArm` already
 names. Emitted bytes are unchanged, which is what the goldens are for.
 
 **R1 — emit one.** `arena_to_schedule` grows a `Reduce` arm; the backend grows
@@ -199,7 +199,7 @@ and the allocator learns nothing about folds. That was the part that looked
 expensive and is not.
 
 **The region is a span, and a fold region is shaped like a guard region.**
-`select_guards` is already a side table of regions with
+`if_guards` is already a side table of regions with
 `branch_starts[sched_idx]`/`branch_ends[sched_idx]`, walked in schedule order
 and bound as the walk passes; `IsaBackend::loop_open`/`loop_close` are the same
 loop as `emit_loop` for a walk that cannot nest closures. The span runs from the
@@ -229,7 +229,7 @@ optimization ask B is about, not a wrong split.
   reads staying in the loop — a missed optimization (ask B), not a wrong
   split.
 - **A fold region is shaped like a guard region**, which is the part that
-  makes this tractable: `select_guards` is already a side table of regions
+  makes this tractable: `if_guards` is already a side table of regions
   with `branch_starts[sched_idx]`/`branch_ends[sched_idx]`, walked in schedule
   order and bound as the walk passes. A fold differs in two ways only — the
   branch is a back edge, and there is an accumulator.
@@ -772,7 +772,7 @@ The emitter keeps two maps and only one of them is doing work:
 
 The second is bookkeeping to remember which id was minted for which site, and
 its key is *positional* — `guard_idx` is an index into a scratch
-`Vec<SelectGuard>` — where the DAG node is the actual identity. Make the
+`Vec<IfGuard>` — where the DAG node is the actual identity. Make the
 label's identity the site and the map goes, along with its insert, its remove,
 and the `assert!(pending_binds.is_empty())` that checks the bookkeeping was
 kept.
@@ -821,5 +821,5 @@ tree of scopes with one kind of node.
   register out of the inner pool and parks the outer binders for the inner
   body, and `ExpandNestedReduce` is deleted from both compile entries. A
   glyph's winding fold is a loop inside its distance fold.
-- **No change to `Select`, `Ref`, or the fold's denotation.** A fold means what
+- **No change to `If`, `Ref`, or the fold's denotation.** A fold means what
   it meant; this is about what codegen does with one that survives.

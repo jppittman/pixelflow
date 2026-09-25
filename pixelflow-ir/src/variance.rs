@@ -393,7 +393,7 @@ pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> 
             // one: nothing here knows which arm a mask selects per-lane (and
             // a `Guard`'s whole point is that lanes may disagree), so the
             // honest answer is the union of every value the branch could
-            // read, exactly as `Select`'s soft form already does.
+            // read, exactly as `If`'s soft form already does.
             ExprNode::Guard { mask, on, off } => result[mask.0 as usize]
                 .union(referent_variance(on))
                 .union(referent_variance(off)),

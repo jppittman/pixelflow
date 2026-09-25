@@ -78,7 +78,7 @@ pub enum Inst {
     Orr(Reg, Reg, Reg),
     Mov(Reg, Reg),
 
-    // Select guard masks
+    // If guard masks
     Uminv(Reg, Reg),
     Umaxv(Reg, Reg),
     FmovToGp(Reg),
@@ -725,7 +725,7 @@ fn emit_shl(code: &mut Vec<u8>, dst: Reg, src: Reg, shift: u8) {
 /// Newton-Raphson step that refines them needs somewhere to hold the
 /// correction. `Neg` and `Abs` are single instructions here (`FNEG`, `FABS`),
 /// unlike the x86 backends where they materialize a sign mask, and `BSL`
-/// blends a select from its three operands.
+/// blends an `If` from its three operands.
 pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
@@ -1930,7 +1930,7 @@ pub(crate) mod driver {
         // Nothing. v30 is the gather's truncated-index register, a `temps_for`
         // answer since the gathers landed; v29 used to be `UNARY_SCRATCH`,
         // reserved whole-kernel so a reciprocal estimate could borrow it. The
-        // select needs none either: `BSL` reads its three operands directly,
+        // `If` needs none either: `BSL` reads its three operands directly,
         // and `FNEG`/`FABS` are single instructions.
         fixed: &[],
         temps_for: super::temps_for,
@@ -2125,11 +2125,11 @@ pub(crate) mod driver {
         fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
             let scratch = guard_scratch(test.scratch, test.reg);
             match test.arm {
-                SelectArm::True => {
+                IfArm::True => {
                     AsmProgram::from([Inst::Umaxv(scratch, test.reg), Inst::FmovToGp(scratch)])
                         .assemble(&mut asm.code);
                 }
-                SelectArm::False => {
+                IfArm::False => {
                     AsmProgram::from([
                         Inst::Uminv(scratch, test.reg),
                         Inst::FmovToGp(scratch),
@@ -2465,7 +2465,7 @@ pub(crate) mod driver {
                 // FADD(dst, dst, c)
                 AsmProgram::from([Inst::Fadd(*dst, *dst, *c)]).assemble(code);
             }
-            ResolvedOp::Select {
+            ResolvedOp::If {
                 dst,
                 if_true,
                 if_false,

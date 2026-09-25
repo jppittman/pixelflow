@@ -317,7 +317,7 @@ The payoff differs by domain:
 
 A region is the set of values whose demand implies a literal `ℓ`, at a scope
 where `ℓ` is uniform over a batch. A jump over the region when `ℓ` is false is
-the `Select` that "contains an if" (CLAUDE.md).
+the `Select` — since renamed `If` — that "contains an if" (CLAUDE.md).
 
 **The code does not compute this.** It computes per-select *exclusivity*: each
 select's arm cone, closed over the consumers visible in one scope

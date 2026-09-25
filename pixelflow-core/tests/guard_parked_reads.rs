@@ -8,7 +8,7 @@
 //! so `guards::FoldReads` must count it as a read of the fold's `Reduce` def,
 //! and the guard analysis must count a pointer operand as a read at all.
 //!
-//! The selects sit at every scope a select can: the batch (a mask on `X`),
+//! The `If`s sit at every scope an `If` can: the batch (a mask on `X`),
 //! the row (a mask on `Y` alone, uniform across the row) and the call (a mask
 //! on a uniform, one arm for the whole call). Sections 1–3 are the sibling
 //! and clustering hazards at each; section 4 is an arm that is a table fold
@@ -23,7 +23,7 @@
 //!
 //! Every kernel is checked texel by texel against a plain-`f64` reference,
 //! never a pixelflow evaluator. `PIXELFLOW_GUARD_TELEMETRY=1` prints, per
-//! scope, which selects were guarded.
+//! scope, which `If`s were guarded.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
@@ -226,7 +226,7 @@ fn a_guard_keeps_a_table_fold_a_sibling_reads() {
 }
 
 /// The same, with the heavy arm the false one, a remainder batch, and the
-/// table read per lane outside the select through the same pointer.
+/// table read per lane outside the `If` through the same pointer.
 #[test]
 fn a_guard_keeps_a_table_fold_a_sibling_reads_heavy_false_arm_ragged() {
     let t = t_table();
@@ -311,7 +311,7 @@ const TAIL_SCALE: f64 = 1.0 / 512.0;
 
 /// `select(X < T, W·p(X/256), 0) + D + p(X/512)` with
 /// `W = Σ_j p(|X − j|/128)`: fourteen constants, parked by the per-call
-/// scope, read by `W`'s body every trip, by the arm, and after the select —
+/// scope, read by `W`'s body every trip, by the arm, and after the `If` —
 /// some from a slot, reloaded inside the skipped range.
 #[test]
 fn a_guard_keeps_a_fold_reading_many_parked_constants() {
@@ -339,7 +339,7 @@ fn a_guard_keeps_a_fold_reading_many_parked_constants() {
     }
 }
 
-// ─── 2. the row scope: a select on Y alone ───
+// ─── 2. the row scope: an `If` on Y alone ───
 
 /// `sin`'s argument for the row arm, `(Y + 10)·PHASE`: `Y` alone, so the
 /// row scope computes it.
@@ -353,7 +353,7 @@ fn row_phase_ref(y: f64) -> f64 {
 
 /// `select(Y < 2, R·sin, 0) + Σ_k |R − 40k| + X` with
 /// `R = Σ_j |r[Y] − t[j]|`: `R` is a per-row fold over two broadcasts, and
-/// the select and the sibling are per-row values the row scope computes and
+/// the `If` and the sibling are per-row values the row scope computes and
 /// parks for the batches. On rows 2 and 3 the row's arm is skipped whole.
 #[test]
 fn a_row_guard_keeps_a_per_row_fold_a_sibling_reads() {
@@ -398,7 +398,7 @@ fn a_row_guard_skips_a_fold_over_parked_pointers() {
     }
 }
 
-// ─── 3. the call scope: a select on a uniform ───
+// ─── 3. the call scope: an `If` on a uniform ───
 
 /// The values `u` takes, in order: the arm runs, is skipped, runs again,
 /// is skipped again — a skipped call always follows one that ran.
@@ -462,7 +462,7 @@ fn a_call_guard_skips_a_fold_over_roots_the_batches_read() {
 
 /// `select(u > 0, F·sin(u), 0) + (u + 1) + X` with `F = Σ_j |u − t[j]|` and
 /// nothing else reading the table: the pointer is read only by the arm's
-/// loop, and `u + 1` — read by the root, not the select — makes the arm
+/// loop, and `u + 1` — read by the root, not the `If` — makes the arm
 /// non-contiguous until clustering gathers it.
 #[test]
 fn a_call_guard_over_a_fold_that_alone_reads_its_pointer() {
@@ -484,7 +484,7 @@ fn a_call_guard_over_a_fold_that_alone_reads_its_pointer() {
     });
 }
 
-/// `select(u > 0, F·sin(u), 0) + Σ_k |F + X − t[k]|`: a per-call select
+/// `select(u > 0, F·sin(u), 0) + Σ_k |F + X − t[k]|`: a per-call `If`
 /// whose arm owns a per-call fold, and a batch fold whose body reads that
 /// fold's accumulator — two scopes from where `F`'s loop ran — and the
 /// table through the same pointer.
@@ -513,7 +513,7 @@ fn a_call_guard_keeps_a_fold_a_batch_fold_reads() {
 
 /// `select(X < T, Σ_j |X − t[j]|, 0) + t[X/2]`: the arm is the loop and
 /// nothing else, priced by its trips, and guarded; the pointer its
-/// broadcasts read is read per lane after the select as well.
+/// broadcasts read is read per lane after the `If` as well.
 #[test]
 fn a_batch_arm_that_is_a_table_fold() {
     let t = t_table();

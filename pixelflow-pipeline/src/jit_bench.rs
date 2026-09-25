@@ -366,7 +366,7 @@ fn has_reachable_var(arena: &ExprArena, root: ExprId) -> bool {
 
 /// The fixed input-coordinate buffer (audit H3/H1): 64 deterministic tuples
 /// spanning signs and magnitudes (1e-4..1e4, ±0.0), cycled across evals so
-/// data-dependent cost (denormals, select paths) is visible and the recorded
+/// data-dependent cost (denormals, `If` paths) is visible and the recorded
 /// outputs cover 64 points instead of one.
 ///
 /// Tuple 0 is the legacy single test point `(0.5, 0.7)`, so

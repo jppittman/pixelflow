@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! demand(root)                        = true
-//! demand(m)   for S = Select(m, a, b) ⊇ demand(S)
+//! demand(m)   for S = If(m, a, b) ⊇ demand(S)
 //! demand(a)                           ⊇ demand(S) ∧ m
 //! demand(b)                           ⊇ demand(S) ∧ ¬m
 //! demand(v)   for consumers c₁ … cₙ   = ⋁ᵢ demand_edge(cᵢ → v)
@@ -13,7 +13,7 @@
 //!
 //! One backward pass over the DAG in reverse topological order computes it
 //! for every value at once. It is control dependence, and it belongs to the
-//! graph — not to any select, and not to any scope's slice of a schedule.
+//! graph — not to any `If`, and not to any scope's slice of a schedule.
 //!
 //! Executes §1 of `docs/plans/2026-09-07-demand-is-a-dag-property.md`. See
 //! [`ordering`](self#the-sort-this-does-not-give-you) below for the part of
@@ -27,15 +27,15 @@
 //! codegen-only representation. The algebra ([`Demand`], [`Literal`]) and
 //! the one backward pass ([`demand_of`]) that propagates it do not care what
 //! a "value" is; they care only that values come in a topological order and
-//! that one shape (a select-like branch) strengthens the predicate its
+//! that one shape (an `If`-like branch) strengthens the predicate its
 //! operands inherit. So the key type and the edge-finding are parameters,
 //! not the algorithm: [`demand_of`] is generic over `K: Ord + Copy`, and
 //! takes the topological order and the per-node edges as arguments.
 //!
 //! `pixelflow-codegen`'s `emit::guards` still needs demand keyed by
 //! `ValueId` over its own schedule shapes (`ScheduledOp`, at whatever scope
-//! a select's telemetry is computed for — a scope's local schedule, not the
-//! top-level arena, since that is where `analyze_select_guards` is actually
+//! an `If`'s telemetry is computed for — a scope's local schedule, not the
+//! top-level arena, since that is where `analyze_if_guards` is actually
 //! called from, deep inside register allocation's per-scope machinery). It
 //! gets that by calling this same generic [`demand_of`] with `ValueId` as
 //! the key and a small closure describing a `ScheduledOp`'s edges — not by
@@ -61,9 +61,9 @@
 //! ordinary shapes rather than contrived ones, and both are pinned by tests
 //! below:
 //!
-//! - **A select arm breaks superset.** For `S = Select(m, a, b)` at the
+//! - **An `If` arm breaks superset.** For `S = If(m, a, b)` at the
 //!   root, `demand(S)` is `true` and `demand(a)` is `m`. `a` produces `S`,
-//!   and `m ⊉ true`. Sorting weakest-first puts the select *before* the arm
+//!   and `m ⊉ true`. Sorting weakest-first puts the `If` *before* the arm
 //!   it consumes.
 //! - **A value shared across both arms breaks subset.** Give `p` two
 //!   consumers, one in each arm: `demand(p) = m ∨ ¬m`, while its consumer
@@ -76,7 +76,7 @@
 //! not topological. What survives is demand as a *property* — what a region
 //! is guarded on, which is what `pixelflow-codegen::emit::guards` needs.
 //! Making regions contiguous remains real work, which is what
-//! `cluster_select_arms` is, and this module does not replace it.
+//! `cluster_if_arms` is, and this module does not replace it.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -170,7 +170,7 @@ impl<K> Default for Demand<K> {
 
 // Every method below is `pub` for the same reason `Demand` itself is: a
 // caller across the crate boundary builds and combines predicates (a
-// `Select`'s mask/arms in `edges_of`) and reads them back (a guard analysis
+// `If`'s mask/arms in `edges_of`) and reads them back (a guard analysis
 // asking `is_always`/`implies`), and this algebra is the only legal way to
 // do either — see `Demand`'s own doc.
 impl<K: Ord + Copy> Demand<K> {
@@ -329,8 +329,8 @@ where
 
 /// [`demand_of`], keyed by [`ExprId`] over an [`ExprArena`] directly.
 ///
-/// The one op that strengthens demand is [`OpKind::Select`]: its mask is
-/// observed wherever the select is, but each arm only where the mask
+/// The one op that strengthens demand is [`OpKind::If`]: its mask is
+/// observed wherever the `If` is, but each arm only where the mask
 /// agrees. Every other node passes its own demand through unchanged to
 /// every child — including a `Gather`, whose index is as demanded as the
 /// load, and a `Reduce`/`Guard`/`Write`, whose one child is the body/mask/
@@ -347,7 +347,7 @@ pub fn demand_of_arena(arena: &ExprArena, root: ExprId) -> BTreeMap<ExprId, Dema
         arena.nodes().map(|(id, _)| id),
         root,
         |id, observed| match arena.node(id) {
-            ExprNode::Ternary(OpKind::Select, mask, if_true, if_false) => {
+            ExprNode::Ternary(OpKind::If, mask, if_true, if_false) => {
                 alloc::vec![
                     (mask, observed.clone()),
                     (if_true, observed.and_literal(Literal::set(mask))),
@@ -368,40 +368,40 @@ mod tests {
         ExprId(n)
     }
 
-    /// `Select(m, a, b)` at the root: the mask is always observed, each arm
+    /// `If(m, a, b)` at the root: the mask is always observed, each arm
     /// only where the mask agrees.
     #[test]
-    fn a_select_gives_each_arm_its_own_polarity() {
+    fn an_if_gives_each_arm_its_own_polarity() {
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let m = a.push_binary(OpKind::Lt, x, y);
         let t = a.push_unary(OpKind::Sqrt, x);
         let f = a.push_unary(OpKind::Abs, y);
-        let root = a.push_ternary(OpKind::Select, m, t, f);
+        let root = a.push_ternary(OpKind::If, m, t, f);
 
         let demand = demand_of_arena(&a, root);
 
         assert!(demand[&root].is_always(), "the root is always observed");
-        assert!(demand[&m].is_always(), "a mask is observed with its select");
+        assert!(demand[&m].is_always(), "a mask is observed with its `If`");
         assert_eq!(demand[&t], Demand::always().and_literal(Literal::set(m)));
         assert_eq!(demand[&f], Demand::always().and_literal(Literal::clear(m)));
     }
 
-    /// The case the per-select shape refuses: one value under the true arm
-    /// of one select and the false arm of another is `m₁ ∨ ¬m₂`, which is a
+    /// The case the per-`If` shape refuses: one value under the true arm
+    /// of one `If` and the false arm of another is `m₁ ∨ ¬m₂`, which is a
     /// two-clause predicate rather than "not exclusive".
     #[test]
-    fn a_value_under_two_selects_is_a_disjunction() {
-        // s1 = Select(m1, shared, y); s2 = Select(m2, y, shared); root = s1 + s2
+    fn a_value_under_two_ifs_is_a_disjunction() {
+        // s1 = If(m1, shared, y); s2 = If(m2, y, shared); root = s1 + s2
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let m1 = a.push_binary(OpKind::Lt, x, y);
         let m2 = a.push_binary(OpKind::Gt, x, y);
         let shared = a.push_unary(OpKind::Sqrt, x);
-        let s1 = a.push_ternary(OpKind::Select, m1, shared, y);
-        let s2 = a.push_ternary(OpKind::Select, m2, y, shared);
+        let s1 = a.push_ternary(OpKind::If, m1, shared, y);
+        let s2 = a.push_ternary(OpKind::If, m2, y, shared);
         let root = a.push_binary(OpKind::Add, s1, s2);
 
         let demand = demand_of_arena(&a, root);
@@ -420,15 +420,15 @@ mod tests {
 
     /// Nesting conjoins rather than nesting a special case.
     #[test]
-    fn a_nested_select_conjoins_its_masks() {
+    fn a_nested_if_conjoins_its_masks() {
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let m1 = a.push_binary(OpKind::Lt, x, y);
         let m2 = a.push_binary(OpKind::Gt, x, y);
         let inner_val = a.push_unary(OpKind::Sqrt, x);
-        let inner = a.push_ternary(OpKind::Select, m2, inner_val, y);
-        let root = a.push_ternary(OpKind::Select, m1, inner, x);
+        let inner = a.push_ternary(OpKind::If, m2, inner_val, y);
+        let root = a.push_ternary(OpKind::If, m1, inner, x);
 
         let demand = demand_of_arena(&a, root);
 
@@ -509,10 +509,10 @@ mod tests {
 
     /// **Skippable is not movable**, minimally.
     ///
-    /// Two selects share a mask. The inner select `inner` is shared — the
-    /// root reads it directly as well as through the outer select `outer`
+    /// Two `If`s share a mask. The inner `If` `inner` is shared — the
+    /// root reads it directly as well as through the outer `If` `outer`
     /// — so it must stay put. Its true arm `t` is observed only where the
-    /// mask is set, so demand calls it exclusive to the outer select's true
+    /// mask is set, so demand calls it exclusive to the outer `If`'s true
     /// arm, and demand is right: skipping it when the mask is all-false is
     /// sound.
     ///
@@ -522,20 +522,20 @@ mod tests {
     /// stricter rule — every consumer skipped with it — rejects `t`, and
     /// has to.
     #[test]
-    fn a_shared_inner_select_makes_its_arms_skippable_but_not_movable() {
+    fn a_shared_inner_if_makes_its_arms_skippable_but_not_movable() {
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let m = a.push_binary(OpKind::Lt, x, y);
         let t = a.push_unary(OpKind::Sqrt, x);
         let f = a.push_unary(OpKind::Abs, y);
-        let inner = a.push_ternary(OpKind::Select, m, t, f);
-        let outer = a.push_ternary(OpKind::Select, m, inner, y);
+        let inner = a.push_ternary(OpKind::If, m, t, f);
+        let outer = a.push_ternary(OpKind::If, m, inner, y);
         let root = a.push_binary(OpKind::Add, outer, inner);
 
         let demand = demand_of_arena(&a, root);
 
-        // The inner select is read outside the outer one, so nothing may
+        // The inner `If` is read outside the outer one, so nothing may
         // skip it.
         assert!(demand[&inner].is_always());
 
@@ -547,40 +547,40 @@ mod tests {
         );
         assert!(
             !demand[&inner].implies(&outer_true),
-            "while the select reading it is not — which is why moving the \
+            "while the `If` reading it is not — which is why moving the \
              arm past it would be illegal"
         );
     }
 
     // ───────────── the sort the plan expected, and does not get ─────────────
 
-    /// **A select arm refutes `demand(producer) ⊇ demand(consumer)`.**
+    /// **An `If` arm refutes `demand(producer) ⊇ demand(consumer)`.**
     ///
     /// `docs/plans/2026-09-07-demand-is-a-dag-property.md` §"The invariant
     /// that makes demand a scheduler" claims that invariant, and concludes
     /// a schedule sorted by demand weakest-first is topological with
     /// equal-demand values contiguous "by construction". An arm is a
-    /// producer of its select and is demanded strictly less often, so
-    /// weakest-first emits the select before the arm it reads.
+    /// producer of its `If` and is demanded strictly less often, so
+    /// weakest-first emits the `If` before the arm it reads.
     #[test]
-    fn a_select_arm_is_demanded_less_than_the_select_that_reads_it() {
+    fn an_if_arm_is_demanded_less_than_the_if_that_reads_it() {
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let m = a.push_binary(OpKind::Lt, x, y);
         let t = a.push_unary(OpKind::Sqrt, x);
-        let root = a.push_ternary(OpKind::Select, m, t, y);
+        let root = a.push_ternary(OpKind::If, m, t, y);
 
         let demand = demand_of_arena(&a, root);
 
         let arm = &demand[&t];
-        let select = &demand[&root];
+        let whole = &demand[&root];
         assert!(
-            arm.implies(select),
-            "the arm is demanded no more than the select"
+            arm.implies(whole),
+            "the arm is demanded no more than the `If`"
         );
         assert!(
-            !select.implies(arm),
+            !whole.implies(arm),
             "and strictly less — so the producer is not a demand-superset \
              of its consumer, and weakest-first is not topological"
         );
@@ -602,7 +602,7 @@ mod tests {
         let shared = a.push_binary(OpKind::Add, x, y);
         let t = a.push_unary(OpKind::Sqrt, shared);
         let f = a.push_unary(OpKind::Abs, shared);
-        let root = a.push_ternary(OpKind::Select, m, t, f);
+        let root = a.push_ternary(OpKind::If, m, t, f);
 
         let demand = demand_of_arena(&a, root);
 

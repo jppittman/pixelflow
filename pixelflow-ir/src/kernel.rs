@@ -640,9 +640,12 @@ impl Kernel {
     // ─────────────────────────── control ──────────────────────────
 
     /// `self ? if_true : if_false` — `self` is the mask.
+    ///
+    /// Lowers to [`OpKind::If`]. The method keeps its name until Phase B of
+    /// docs/plans/2026-09-25-the-language-is-kernel.md renames it `if`.
     #[must_use]
     pub fn select(&self, if_true: &Kernel, if_false: &Kernel) -> Self {
-        self.combine3(if_true, if_false, OpKind::Select)
+        self.combine3(if_true, if_false, OpKind::If)
     }
     /// `clamp(self, lo, hi)` = `min(max(self, lo), hi)`.
     ///
@@ -1132,7 +1135,7 @@ impl Bits {
     /// `mask ? if_true : if_false` — a choice between two lane patterns.
     ///
     /// The same IR node as [`Kernel::select`], because there was never a
-    /// second one to write: `Select` is a bitwise blend on every backend
+    /// second one to write: `If`'s lane-varying path is a bitwise blend on every backend
     /// (`andps`/`andnps`/`orps`, `vpternlogd 0xCA`, `BSL`), so a choice
     /// between patterns is the instruction that already exists. What is new
     /// is the type, and it is the whole point — a colour packed into a word

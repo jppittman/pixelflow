@@ -805,9 +805,9 @@ mod tests {
         let x = arena.push_var(0);
         let y = arena.push_var(1);
         let z = arena.push_var(2);
-        let root = arena.push_ternary(OpKind::Select, x, y, z);
+        let root = arena.push_ternary(OpKind::If, x, y, z);
 
-        let entries = vec![("select_xyz".to_string(), arena, root)];
+        let entries = vec![("if_xyz".to_string(), arena, root)];
 
         let tmp = unique_tmp("ternary");
         write_corpus(&tmp, &entries).expect("write");
@@ -815,8 +815,8 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         match loaded[0].1.node(loaded[0].2) {
-            ExprNode::Ternary(OpKind::Select, _, _, _) => {}
-            other => panic!("expected Ternary(Select,...), got {other:?}"),
+            ExprNode::Ternary(OpKind::If, _, _, _) => {}
+            other => panic!("expected Ternary(If,...), got {other:?}"),
         }
 
         let _ = std::fs::remove_file(&tmp);

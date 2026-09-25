@@ -3354,7 +3354,7 @@ mod tests {
             cur = match step % 8 {
                 0 => {
                     let inside = arena.push_binary(OpKind::Lt, cur, c);
-                    arena.push_ternary(OpKind::Select, inside, dx2, cur)
+                    arena.push_ternary(OpKind::If, inside, dx2, cur)
                 }
                 1 => arena.push_unary(OpKind::Sqrt, cur),
                 2 => arena.push_binary(OpKind::Mul, cur, dx),

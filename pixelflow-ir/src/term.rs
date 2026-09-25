@@ -129,7 +129,7 @@ pub enum Shape<'a, R> {
     /// rule in the set. The one child is the body, and the binder is bound in
     /// it — this is the only shape in the language that binds anything.
     Reduce { fold: Fold, body: R },
-    /// The hard lowering of a [`Select`](OpKind::Select): a branch, denoting
+    /// The hard lowering of a [`If`](OpKind::If): a branch, denoting
     /// the same function as the soft (blend) form
     /// (docs/plans/2026-09-12-emit-should-just-emit.md §1). Mirrors
     /// [`ExprNode::Guard`](crate::arena::ExprNode::Guard).

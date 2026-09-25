@@ -54,7 +54,7 @@ const AVX2_FLOOR: &[Feature] = &[
 /// - `avx512f` — the `zmm` register file (`zmm16..31` included) and the EVEX
 ///   encoding of everything arithmetic; `vcmpps` into a `k` register and the
 ///   `kmovw`/`kortestw` that read it (`emit_compare`, a guard's all-lanes
-///   test); `vptestmd`; `vpternlogd` (`Select`'s blend); `vrndscaleps`
+///   test); `vptestmd`; `vpternlogd` (`If`'s blend); `vrndscaleps`
 ///   (`Floor`/`Round`); `vrcp14ps`/`vrsqrt14ps`; the writemasked `vmovups`
 ///   store of a remainder (`emit_write`); `vgatherdps zmm`; `vpmovzxbd zmm`;
 ///   and `vcvttss2si`/`vmovq` in their EVEX forms.

@@ -29,7 +29,7 @@
 - **Continues**: [loop-blinn-glyph](2026-09-08-loop-blinn-glyph.md) (the
   pieces and the crescent, unchanged), [glyph-as-a-fold-execution](2026-09-09-glyph-as-a-fold-execution.md)
   (the table), [one-conditional-three-lowerings](2026-09-08-one-conditional-three-lowerings.md)
-  (`Select` lowered as a jump), [demand-is-a-dag-property](2026-09-07-demand-is-a-dag-property.md)
+  (`If` lowered as a jump), [demand-is-a-dag-property](2026-09-07-demand-is-a-dag-property.md)
   (§1–§2, control dependence as a DAG property), and
   [one-name-bound-later](2026-09-10-one-name-bound-later.md) (what is bound
   when).
@@ -407,7 +407,7 @@ runs, which are many reductions over one table, are where it shows first.
 ### 4.3 A box is a branch
 
 `select(in_box, e, identity)` where `in_box` is uniform over a batch **is a
-jump** — CLAUDE.md's "Select contains an if", and the guard machinery already
+jump** — CLAUDE.md's "`If` contains an if", and the guard machinery already
 emits it. A box nested in a box nested in a box is then a bounded volume
 hierarchy: a batch outside a node's box skips the node's whole subtree, and
 the work per batch is the depth plus the pieces at the leaf it lands in —

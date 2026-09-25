@@ -16,7 +16,7 @@
 //!   folded to an immediate by `arena_to_schedule`, so only the op + LHS
 //!   survive to codegen) — [`REQUIRED_SHIFT_OPS`].
 //! - Reaches it as `ResolvedOp::FusedMulAdd`/`DecomposedMulAdd` or
-//!   `ResolvedOp::Select` — [`REQUIRED_TERNARY_OPS`]. Not swept generically
+//!   `ResolvedOp::If` — [`REQUIRED_TERNARY_OPS`]. Not swept generically
 //!   like the arrays above (each has a distinct `ResolvedOp` shape and
 //!   `setup_mov` convention), so the per-backend tests construct these two
 //!   explicitly instead of looping.
@@ -77,8 +77,8 @@ pub(crate) const REQUIRED_BINARY_OPS: &[OpKind] = &[
 pub(crate) const REQUIRED_SHIFT_OPS: &[OpKind] = &[OpKind::Shl, OpKind::Shr];
 
 /// Ops with a bespoke `ResolvedOp` shape (`FusedMulAdd`/`DecomposedMulAdd` for
-/// `MulAdd`, `Select` for `Select`). Listed for documentation; the per-backend
+/// `MulAdd`, `If` for `If`). Listed for documentation; the per-backend
 /// tests build these plans explicitly rather than looping generically — four
 /// of them for `MulAdd` alone, since a backend owes both shapes and each
 /// `DeferredReload` spelling of the decomposed one is its own arm.
-pub(crate) const REQUIRED_TERNARY_OPS: &[OpKind] = &[OpKind::MulAdd, OpKind::Select];
+pub(crate) const REQUIRED_TERNARY_OPS: &[OpKind] = &[OpKind::MulAdd, OpKind::If];

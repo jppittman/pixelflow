@@ -63,7 +63,7 @@
 //!
 //! A piece's term is `0` wherever the pixel misses the piece's band, so the
 //! body is cut to it — the band dilated by the pixel's half-height, in
-//! screen `Y` — by a `Select` whose mask depends on the row and the piece
+//! screen `Y` — by an `If` whose mask depends on the row and the piece
 //! alone. That is an identity of the formula, and its mask is uniform over
 //! a batch: the shape a guard can jump, for every row the piece does not
 //! reach. The same reasoning one level up: `F` is `0` outside the outline's
@@ -102,7 +102,7 @@ pub const RAMP_REACH: f32 = 1.0;
 /// `1 − 2⁻²⁰` — the frame's pack truncates, so the second is byte 254 — and
 /// the pieces' bands telescope only to an ulp of the coordinates they
 /// share. Measured before the snap: interior texels off by up to `1.9e-6`
-/// (the step-5 design's gate prediction). The snap is a `Select` on the
+/// (the step-5 design's gate prediction). The snap is an `If` on the
 /// finished coverage, which no rewrite rule touches.
 pub const COVERAGE_SNAP: f32 = 1.0 / 1024.0;
 
@@ -180,7 +180,7 @@ impl Glyph {
     /// dilates the box past the pixel's own reach.
     ///
     /// The mask is also the *binning*: structurally every character is still
-    /// in the graph — `Select` is dispatch and both arms stay live — but a
+    /// in the graph — `If` is dispatch and both arms stay live — but a
     /// SIMD batch is adjacent pixels almost always inside one character's
     /// box, so the emitter's guard can skip the rest.
     #[must_use]
@@ -630,7 +630,7 @@ fn monotone_root(delta: &Kernel, step: &Kernel, bend: &Kernel) -> Kernel {
 ///
 /// The cut to the rows is an identity — outside them the term is exactly
 /// `0` — and its mask depends on the row and the piece alone, uniform over
-/// a batch: a select a guard may lower to a jump over the whole body.
+/// a batch: an `If` a guard may lower to a jump over the whole body.
 fn piece_term(c: Coeff) -> Kernel {
     let (zero, one) = (constant(0.0), constant(1.0));
     let certified = |step: usize| c(step).max(&zero);

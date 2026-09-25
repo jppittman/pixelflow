@@ -12,7 +12,7 @@
 //! blend — over two bound buffers (the per-cell data and the atlas). The
 //! per-frame update rewrites the cell buffer. This replaces the only
 //! alternative the combinator layer offered — a per-frame tree of boxed
-//! `Select`s sized by the runtime grid — with a program whose size is
+//! `If`s sized by the runtime grid — with a program whose size is
 //! independent of the grid's.
 //!
 //! ## What recompiles, and what does not
@@ -1526,7 +1526,7 @@ mod tests {
             let ranged = program.frame(&params, cells.clone(), atlas.clone());
 
             // The value encoding: the same channel kernels under the mask the
-            // select used to carry, evaluated over the whole frame.
+            // `If` used to carry, evaluated over the whole frame.
             let CellGridKernels {
                 channels,
                 buffers,

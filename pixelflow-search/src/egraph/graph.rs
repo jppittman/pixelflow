@@ -3013,7 +3013,7 @@ fn instantiate_template<S: NodeSink>(
             })
         }
         // No rule rewrites *into* a `Guard` yet — extraction cannot choose
-        // one over the `Select` it equals (G3), so no RHS template has a
+        // one over the `If` it equals (G3), so no RHS template has a
         // reason to build one, and the e-graph has no `ENode::Guard` for
         // `sink.make` to produce even if one tried.
         ExprData::Guard { on, off, .. } => {
@@ -3203,7 +3203,7 @@ fn derivative_shape<S: NodeSink>(sink: &mut S, inner: &ENode, var: u8) -> EClass
             let db = dwrt(sink, b);
             let mask = op2(sink, &ops::Lt, a, b);
             sink.make(ENode::Op {
-                op: &ops::Select,
+                op: &ops::If,
                 children: vec![mask, da, db],
             })
         }
@@ -3213,18 +3213,18 @@ fn derivative_shape<S: NodeSink>(sink: &mut S, inner: &ENode, var: u8) -> EClass
             let db = dwrt(sink, b);
             let mask = op2(sink, &ops::Gt, a, b);
             sink.make(ENode::Op {
-                op: &ops::Select,
+                op: &ops::If,
                 children: vec![mask, da, db],
             })
         }
         // Blend the branch derivatives on the primal mask; the mask itself
         // is not differentiated.
-        OpKind::Select => {
+        OpKind::If => {
             let (m, t, f) = (children[0], children[1], children[2]);
             let dt = dwrt(sink, t);
             let df = dwrt(sink, f);
             sink.make(ENode::Op {
-                op: &ops::Select,
+                op: &ops::If,
                 children: vec![m, dt, df],
             })
         }

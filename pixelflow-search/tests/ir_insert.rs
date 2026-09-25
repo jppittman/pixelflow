@@ -191,7 +191,7 @@ fn a_reference_is_declined_by_every_vocabulary() {
 
 /// A `Guard` is declined too, for a reason specific to this stage rather than
 /// a standing one: extraction has no price for choosing a `Guard` over the
-/// `Select` it equals yet (G3, docs/plans/2026-09-12-emit-should-just-emit.md),
+/// `If` it equals yet (G3, docs/plans/2026-09-12-emit-should-just-emit.md),
 /// so there is nothing for the e-graph to gain by holding one, and its arms
 /// are unrepresentable as structure for the same reason a `Ref`'s referent
 /// is — nothing here can rewrite inside a name.

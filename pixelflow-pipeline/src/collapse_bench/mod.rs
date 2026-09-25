@@ -365,7 +365,7 @@ fn output_buffer(extent: [u32; 2]) -> Vec<f32> {
 /// Collapse cost is *not* independent of a buffer's values, only of its
 /// *identity*: `emit_skip_if_all_false`/`emit_skip_if_all_true`
 /// (`pixelflow-codegen/src/emit/mod.rs`) branch at runtime on whether a
-/// `Select` guard's mask has any lane set, and a zero-filled glyph piece
+/// `If` guard's mask has any lane set, and a zero-filled glyph piece
 /// table makes every crossing-span mask uniformly false — a control-flow
 /// path production never takes. So a slot binds `buffer_data`'s real
 /// contents whenever capture provided them; a slot with none is the

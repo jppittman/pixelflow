@@ -459,15 +459,20 @@ impl Rewrite for MaxSelfNegAsAbs {
 }
 
 // ============================================================================
-// N11 — select is mask-independent when both branches agree
+// N11 — `If` is mask-independent when both branches agree
 // ============================================================================
 
 /// `select(m, a, a) = a` (N11). True for any mask value — a bitwise blend of
 /// a value with itself is that value, on every backend.
-struct SelectSameBranch;
+struct IfSameBranch;
 
-impl Rewrite for SelectSameBranch {
+impl Rewrite for IfSameBranch {
     fn name(&self) -> &str {
+        // The label is the rule's persisted key — `RuleId::from_label`, the
+        // strict-label datasets and `rule_set_fingerprint` (a frozen registered
+        // constant, registration-v2 §2) all hash it — so it keeps the spelling
+        // the method `.select` has until Phase B of
+        // docs/plans/2026-09-25-the-language-is-kernel.md renames both.
         "select-same-branch"
     }
 
@@ -475,7 +480,7 @@ impl Rewrite for SelectSameBranch {
         let ENode::Op { op, children } = node else {
             return None;
         };
-        if op.kind() != OpKind::Select || children.len() != 3 {
+        if op.kind() != OpKind::If || children.len() != 3 {
             return None;
         }
         let (a, b) = (children[1], children[2]);
@@ -486,7 +491,7 @@ impl Rewrite for SelectSameBranch {
     }
 
     fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
-        Some(arena_pat!(__a, tern OpKind::Select, (var 0), (var 1), (var 1)))
+        Some(arena_pat!(__a, tern OpKind::If, (var 0), (var 1), (var 1)))
     }
 
     fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
@@ -495,16 +500,16 @@ impl Rewrite for SelectSameBranch {
 }
 
 // ============================================================================
-// N12 / N13 — select of a comparison is min/max
+// N12 / N13 — `If` of a comparison is min/max
 // ============================================================================
 
 /// `select(lt(a,b), a, b) = min(a,b)` (N12). Over the reals; the platform
-/// NaN rows for `Lt` and `Select` diverge by design (CLAUDE.md), so no value
+/// NaN rows for `Lt` and `If` diverge by design (CLAUDE.md), so no value
 /// is promised there and this rule is exercised only at well-conditioned
 /// (non-NaN) points.
-struct SelectLtToMin;
+struct IfLtToMin;
 
-impl Rewrite for SelectLtToMin {
+impl Rewrite for IfLtToMin {
     fn name(&self) -> &str {
         "select-lt-to-min"
     }
@@ -513,7 +518,7 @@ impl Rewrite for SelectLtToMin {
         let ENode::Op { op, children } = node else {
             return None;
         };
-        if op.kind() != OpKind::Select || children.len() != 3 {
+        if op.kind() != OpKind::If || children.len() != 3 {
             return None;
         }
         let (m, x, y) = (children[0], children[1], children[2]);
@@ -528,9 +533,7 @@ impl Rewrite for SelectLtToMin {
     }
 
     fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
-        Some(
-            arena_pat!(__a, tern OpKind::Select, (bin OpKind::Lt, (var 0), (var 1)), (var 0), (var 1)),
-        )
+        Some(arena_pat!(__a, tern OpKind::If, (bin OpKind::Lt, (var 0), (var 1)), (var 0), (var 1)))
     }
 
     fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
@@ -539,9 +542,9 @@ impl Rewrite for SelectLtToMin {
 }
 
 /// `select(lt(a,b), b, a) = max(a,b)` (N13). As N12.
-struct SelectLtToMax;
+struct IfLtToMax;
 
-impl Rewrite for SelectLtToMax {
+impl Rewrite for IfLtToMax {
     fn name(&self) -> &str {
         "select-lt-to-max"
     }
@@ -550,7 +553,7 @@ impl Rewrite for SelectLtToMax {
         let ENode::Op { op, children } = node else {
             return None;
         };
-        if op.kind() != OpKind::Select || children.len() != 3 {
+        if op.kind() != OpKind::If || children.len() != 3 {
             return None;
         }
         let (m, x, y) = (children[0], children[1], children[2]);
@@ -566,9 +569,7 @@ impl Rewrite for SelectLtToMax {
     }
 
     fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
-        Some(
-            arena_pat!(__a, tern OpKind::Select, (bin OpKind::Lt, (var 0), (var 1)), (var 1), (var 0)),
-        )
+        Some(arena_pat!(__a, tern OpKind::If, (bin OpKind::Lt, (var 0), (var 1)), (var 1), (var 0)))
     }
 
     fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
@@ -577,19 +578,19 @@ impl Rewrite for SelectLtToMax {
 }
 
 // ============================================================================
-// N14 — hoist a unary op through select
+// N14 — hoist a unary op through `If`
 // ============================================================================
 
 /// `select(m, f(a), f(b)) = f(select(m, a, b))` for unary `f` (N14a–c: Neg,
 /// Abs, Sqrt). One `f` instead of two; `select` is a per-lane bitwise blend
 /// of one full operand, so applying `f` before or after the blend agrees
 /// exactly for any mask value.
-struct SelectHoistUnary {
+struct IfHoistUnary {
     func: OpKind,
     name: &'static str,
 }
 
-impl Rewrite for SelectHoistUnary {
+impl Rewrite for IfHoistUnary {
     fn name(&self) -> &str {
         self.name
     }
@@ -598,7 +599,7 @@ impl Rewrite for SelectHoistUnary {
         let ENode::Op { op, children } = node else {
             return None;
         };
-        if op.kind() != OpKind::Select || children.len() != 3 {
+        if op.kind() != OpKind::If || children.len() != 3 {
             return None;
         }
         let (m, x, y) = (children[0], children[1], children[2]);
@@ -609,26 +610,27 @@ impl Rewrite for SelectHoistUnary {
 
     fn lhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
         Some(
-            arena_pat!(__a, tern OpKind::Select, (var 0), (un self.func, (var 1)), (un self.func, (var 2))),
+            arena_pat!(__a, tern OpKind::If, (var 0), (un self.func, (var 1)), (un self.func, (var 2))),
         )
     }
 
     fn rhs_template(&self, __a: &mut ExprArena) -> Option<ExprId> {
-        Some(arena_pat!(__a, un self.func, (tern OpKind::Select, (var 0), (var 1), (var 2))))
+        Some(arena_pat!(__a, un self.func, (tern OpKind::If, (var 0), (var 1), (var 2))))
     }
 }
 
-fn select_hoist_unary_rules() -> Vec<Box<dyn Rewrite>> {
+fn if_hoist_unary_rules() -> Vec<Box<dyn Rewrite>> {
+    // Labels keep their persisted spelling; see `IfSameBranch::name`.
     vec![
-        Box::new(SelectHoistUnary {
+        Box::new(IfHoistUnary {
             func: OpKind::Neg,
             name: "select-hoist-neg",
         }),
-        Box::new(SelectHoistUnary {
+        Box::new(IfHoistUnary {
             func: OpKind::Abs,
             name: "select-hoist-abs",
         }),
-        Box::new(SelectHoistUnary {
+        Box::new(IfHoistUnary {
             func: OpKind::Sqrt,
             name: "select-hoist-sqrt",
         }),
@@ -1272,10 +1274,10 @@ pub fn experimental_rules() -> Vec<Box<dyn Rewrite>> {
     rules.push(Box::new(MinMaxDistributive)); // N8
     rules.push(Box::new(AbsAsMax)); // N9
     rules.push(Box::new(MaxSelfNegAsAbs)); // N10
-    rules.push(Box::new(SelectSameBranch)); // N11
-    rules.push(Box::new(SelectLtToMin)); // N12
-    rules.push(Box::new(SelectLtToMax)); // N13
-    rules.extend(select_hoist_unary_rules()); // N14a, N14b, N14c
+    rules.push(Box::new(IfSameBranch)); // N11
+    rules.push(Box::new(IfLtToMin)); // N12
+    rules.push(Box::new(IfLtToMax)); // N13
+    rules.extend(if_hoist_unary_rules()); // N14a, N14b, N14c
     rules.push(Box::new(CompareFlipLt)); // N15
     rules.push(Box::new(TanDefinition)); // N16
     rules.push(Box::new(TanFusion)); // N17
@@ -1332,11 +1334,11 @@ mod tests {
     /// (N14): a mask is a bit pattern, never a number (CLAUDE.md), so
     /// `Var(0)` must be bound to a genuine all-ones/all-zero pattern, not an
     /// arbitrary float — using an arbitrary float there is off-label (no
-    /// rule in the language ever constructs `Select` with a non-mask first
+    /// rule in the language ever constructs `If` with a non-mask first
     /// argument) and produces meaningless partial-bit blends on both sides
     /// alike, which is a test-harness bug, not a rule counterexample. Other
     /// slots are well-conditioned positive floats (N14c hoists `Sqrt`).
-    fn select_mask_points() -> Vec<[f32; 4]> {
+    fn if_mask_points() -> Vec<[f32; 4]> {
         let t = f32::from_bits(u32::MAX);
         let f = 0.0_f32;
         vec![
@@ -1393,7 +1395,7 @@ mod tests {
     /// Saturation smoke test: `all_rules() + experimental_rules()` (93 rules)
     /// must saturate and extract without panicking on a handful of
     /// representative expressions exercising every family here (min/max,
-    /// select, trig, exp/log, sqrt/rsqrt/recip, fma, neg, div-by-literal).
+    /// `If`, trig, exp/log, sqrt/rsqrt/recip, fma, neg, div-by-literal).
     /// This is a structural check on the new `RewriteAction` executors
     /// (graph.rs), not a semantics check — the per-family oracle tests above
     /// own semantics.
@@ -1406,7 +1408,7 @@ mod tests {
 
         let costs = CostModel::latency_prior();
 
-        // min(x, max(x, y)) — absorption + duality + select rules all apply.
+        // min(x, max(x, y)) — absorption + duality + `If` rules all apply.
         let build_min_max = |eg: &mut EGraph| {
             let x = eg.add(ENode::Var(0));
             let y = eg.add(ENode::Var(1));

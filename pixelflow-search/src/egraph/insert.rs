@@ -40,10 +40,10 @@ pub enum Declined {
     /// rewrite, and inlining it inside saturation is a rule that does not
     /// exist yet (docs/plans/2026-09-09-composition-is-linking.md §3).
     Ref(pixelflow_ir::KernelKey),
-    /// A `Guard` — the hard lowering of a `Select`
+    /// A `Guard` — the hard lowering of an `If`
     /// (docs/plans/2026-09-12-emit-should-just-emit.md). Declined for a
     /// reason specific to this stage (G1), not a standing one: extraction
-    /// has no price for choosing a `Guard` over the `Select` it is equal to,
+    /// has no price for choosing a `Guard` over the `If` it is equal to,
     /// so there is nothing yet for the e-graph to gain by holding one — the
     /// same position `Ref` is in, but temporary rather than structural.
     /// `Guard`'s arms name kernels the same way a `Ref` does, and are

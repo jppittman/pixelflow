@@ -142,7 +142,7 @@ pub fn latency_prior_cycles() -> OpMap<usize> {
         OpKind::Ge => 3,
         OpKind::Eq => 3,
         OpKind::Ne => 3,
-        OpKind::Select => 4,
+        OpKind::If => 4,
         OpKind::Tuple => 0,      // free (structural)
         OpKind::TruncToInt => 1, // cvttps2dq
         OpKind::IntToFloat => 1, // cvtdq2ps
@@ -409,7 +409,7 @@ impl CostModel {
     /// combiner chain, and the DP multiplies the body's price by the trip
     /// count where it has that price in hand (`extract.rs`'s
     /// `fold_body_multiple`). Codegen's guard analysis prices a loop a
-    /// `Select` arm owns with it whole, the body priced over the loop's own
+    /// `If` arm owns with it whole, the body priced over the loop's own
     /// schedule (`pixelflow-codegen`'s `emit::guards::FoldReads`) — an arm is
     /// worth a branch by what running it costs, and a loop costs its trips.
     ///

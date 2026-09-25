@@ -665,7 +665,7 @@ fn census(arena: &ExprArena, root: ExprId) -> Census {
         if k == OpKind::Gather || k == OpKind::RawGather {
             gathers += 1;
         }
-        if let ExprNode::Ternary(OpKind::Select, m, a, b) = arena.node(id) {
+        if let ExprNode::Ternary(OpKind::If, m, a, b) = arena.node(id) {
             selects.push((m, a, b));
         }
     }

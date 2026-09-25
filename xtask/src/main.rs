@@ -681,7 +681,7 @@ impl IsaExecutionMode {
     /// "does this op round-trip", and it was the only job that could have
     /// caught a register allocator whose guard reconciliation was skipped on
     /// one path: the shape needs a spilled value reloaded exactly at a
-    /// `Select` arm's end, which a 600-node baked kernel produces and a
+    /// `If` arm's end, which a 600-node baked kernel produces and a
     /// hand-written one does not. It ran at one tier only, and the bug was
     /// invisible there because that tier reserved one more scratch register
     /// per `MulAdd` and so allocated a different schedule.

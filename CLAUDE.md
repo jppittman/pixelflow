@@ -57,10 +57,10 @@ Behavior every target agrees on, pinned by
 | `exp`, `exp2` | saturate past ±126 exponents rather than overflowing to `inf` |
 
 A mask is a bit pattern, not a number, and that is a load-bearing distinction:
-`Select`'s **mixed-lane path** is a bitwise blend on every backend
+`If`'s **mixed-lane path** is a bitwise blend on every backend
 (`andps`/`andnps`/`orps`, `vpternlogd 0xCA`, `BSL`) and `BitAnd`/`BitOr` are
 literal bitwise ops. (The blend is the path a *lane-varying* mask takes, not
-what `Select` is — see "Select contains an if" below.) Spell a
+what `If` is — see "`If` contains an if" below.) Spell a
 true mask `1.0` and `mask & 1.0` is `0x3f800000`, which blends `7.0` against
 `9.0` into `4.5` — a value neither branch held. `OpKind::mask(bool)` is the only
 constructor, `OpKind::is_bitwise_domain()` marks the ops whose results are
@@ -416,44 +416,44 @@ docs/plans/2026-09-22-the-isa-is-decided-at-startup.md.
   **Branchless is the limit**: no case survives to runtime at all, because one
   expression is correct for every input. It is what this codebase is made of —
   a comparison yields a mask rather than a `bool`, and the language is a DAG
-  with no binder — so take it wherever the hardware offers it. `Select` is
-  **not** an example of it, however much it looks like one; see "Select
+  with no binder — so take it wherever the hardware offers it. `If` is
+  **not** an example of it, however much it looks like one; see "`If`
   contains an if" below. What it does not license is hand-rolling a
   *worse* branchless form than the instruction already there: the retired
   `Round` expansion (`(x + 0.5).floor()`, two instructions where `roundps` is
   one, and not any IEEE rounding mode) is the worked counter-example, and
   "Floating point at the edges" above is the long version.
 
-  **Select contains an if.** `Select(m, a, b)` *means* `if m then a else b`,
+  **`If` contains an if.** `If(m, a, b)` *means* `if m then a else b`,
   and that is two cases, not one. Both arms stay live and everything
-  downstream carries both. By this section's own taxonomy `Select` is
+  downstream carries both. By this section's own taxonomy `If` is
   **dispatch**, not a fold — it collapses no case and must not be read as if
   it did.
 
   So the jump is not an optimization codegen may buy; **the jump is what
-  `Select` is.** A batch whose mask is uniform takes an arm — that is the
+  `If` is.** A batch whose mask is uniform takes an arm — that is the
   conditional, executed. A batch whose mask varies *by lane* is the case a
   jump cannot serve, because different lanes want different arms, and the
   bitwise blend is the fallback for exactly that case. Blend is the
   lane-varying path, not the definition.
 
   Getting that default backwards is what produced `emit/guards.rs`: with
-  blend as the definition, a branch has to be *bought* per select
+  blend as the definition, a branch has to be *bought* per `If`
   (`MISPREDICT_PENALTY_CYCLES`) and, worse, an arm is only eligible when the
   values it owns happen to be one contiguous run of a flat schedule — so
-  `cluster_select_arms` permutes the schedule looking for that, in rounds,
+  `cluster_if_arms` permutes the schedule looking for that, in rounds,
   and it measured **73% of a glyph bake** while finding a constant 282 bytes
   (docs/BACKLOG.md, X1). Emit the arms as blocks and there is nothing to
   search for: contiguity is a consequence of building the structure rather
   than a property to be recovered after destroying it.
 
   The distinction is load-bearing, and getting it backwards has already cost.
-  If a select's meaning carries one case, then "which values does this arm
+  If an `If`'s meaning carries one case, then "which values does this arm
   serve" is an artifact of codegen, and the place to compute it is next to the
-  emitter, per select. That is where it was built, and it did not survive
+  emitter, per `If`. That is where it was built, and it did not survive
   contact. If the meaning carries two, an arm's condition is a fact about the
   DAG, the region a value is observed over is a property to be *read* rather
-  than reconstructed, and `Union`'s explicit ranges and a select's implicit
+  than reconstructed, and `Union`'s explicit ranges and an `If`'s implicit
   mask are the same thing at different levels of static knowledge. See
   docs/plans/2026-09-07-demand-is-a-dag-property.md.
 - **Platform `cfg` is encapsulation, not sprinkle** - a platform-predicate
