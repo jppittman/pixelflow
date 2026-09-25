@@ -2,8 +2,9 @@
 
 ## Metadata
 - **Author**: JP (direction), Claude (draft)
-- **Status**: `Proposed`. Phase A is decision-independent and in progress.
-  Phase D waits on Q1.
+- **Status**: `Proposed`. Revised the same day after JP's rulings on Q1:
+  there are no tables, a font is one program per zoom level, and `select`
+  is renamed `if` (§1.6, §1.7). Phase A is in progress.
 - **Created**: 2026-09-25
 - **Verified against**: `8b7b75a`, in two rounds.
   - A four-way inventory of every use of the `Kernel` builder, a
@@ -41,6 +42,15 @@
 >
 > *"The 'atlas' becomes the kernel for that number of control points,
 > everything else is a uniform."*
+>
+> On Q1: *"I think I want one program per font per zoom level. I want to
+> [avoid] table indexing because it sounds like where we've historically
+> fucked up. No, just rely on select and bounding. That forms a bsp
+> automatically. We'll make computing the programs fast, and focus on the
+> caching later. For now, recompile fonts during zoom. There are legit
+> problems there, but it's not worth fucking up the language to solve them.
+> Good enough is easy."* And: *"We shouldn't have tables at all."* And: *"You
+> might rename select if…"*
 
 ---
 
@@ -91,8 +101,9 @@ template ──instantiate(structural values)──▶ program ──P(·, s, t)
 - **Binding time decides where `P` runs, not a tier.**
   - A program whose structural parameters and shape are declared at build
     time is optimized at expansion, by the one optimizer (Phase E).
-  - Anything bound at runtime goes through the same `P` in the JIT: a new
-    `N`, a new shape, or a kernel-typed argument.
+  - Anything bound at runtime goes through the same `P` in the JIT: a font
+    loaded at runtime, a new zoom level, a new shape, or a kernel-typed
+    argument.
 - **The builder is not a surface.** `Kernel` stays as the opaque value a
   `kernel!` entry returns and `Lattice::bake` takes. Its fluent constructors
   leave the public API (Phase D).
@@ -124,7 +135,7 @@ sugar for a block with one entry.
 | `bool` | a mask; comparisons produce it; `&` and `\|` combine it | an all-ones or all-zero lane, `OpKind::mask(bool)` |
 | `usize` | a fold binder or a structural count | `Var(REDUCE_BINDER_BASE + slot)`; converted by an explicit `i as f32` |
 | records | named `f32` fields | flattened at lowering |
-| `[R; N]`, `[f32; M]` | a uniform family (§1.6) | a family of scalar uniforms |
+| structural lists | compile-time data, e.g. a font's outlines (§1.4) | none: instantiation writes them in as constants |
 | `impl Fn(f32, f32) -> f32` | a kernel-typed parameter (Phase D) | a hole spliced at instantiation |
 | `u32` bits | packed words (Phase D) | `Bits` ops |
 
@@ -135,16 +146,16 @@ a mask. F: probe p16 gives 5. After this plan it is a type error.
 
 | parameter | example | binding | in the key? |
 |---|---|---|---|
-| structural | `const N: usize` | at instantiation; each value is its own program | yes |
-| uniform | `s: f32`, `b: Bounds`, `pieces: [Row; N]` | per call, through the entry's `Args` record | no |
+| structural | `const N: usize`, a font's outlines, a zoom level's pixel size | at instantiation; each value is its own program | yes |
+| uniform | `id: f32`, `fg`, `bg`, the origin | per call, through the entry's `Args` record | no |
 | kernel-typed | `k: impl Fn(f32, f32) -> f32` | at runtime; composed, then `P` | the composed program's |
 
-- **Everything that is not structural is a uniform.** An `f32` argument no
-  longer folds into a constant because of its type at the call site; today
-  the call-site type decides (`emit.rs:79-100`).
-- **Structural parameters may be `f32` as well as `usize`.** They are keyed by
-  their bits, which is how a test pins a warp by a constant offset
-  (`glyph_area_edge_cases.rs:79-89`).
+- **Everything that is not structural is a uniform, and a uniform is a
+  scalar.** An `f32` argument no longer folds into a constant because of its
+  type at the call site; today the call-site type decides (`emit.rs:79-100`).
+- **Structural parameters may be data, not only counts.** A font's outlines
+  are structural. Instantiation writes them in as constants, and a new font
+  or a new zoom level is a new program: recompiled, cached by key.
 - **Each entry has an `Args` record.** A compiled program is bound from
   `&Args`, and "every argument supplied" is a type rather than a runtime
   assert. It replaces `Uniform` handles, `UniformBlock::set`'s linear search
@@ -159,57 +170,49 @@ a mask. F: probe p16 gives 5. After this plan it is a type error.
 | `area(\|u, v\| e)`, a prelude function | `integral(-0.5..0.5, \|v\| integral(-0.5..0.5, \|u\| e))` | two interval folds, as `Kernel::area` builds them (`kernel.rs:778-792`) |
 | `monotone_root(δ, step, bend)`, an intrinsic | τ(δ) | `integral::monotone_root`, the one definition (`integral.rs:325-360`) |
 
-**Ranges are constant** (JP): `a` and `b` are expressions over literals and
-structural parameters.
-
+- **Ranges are constant** (JP): `a` and `b` are expressions over literals and
+  structural parameters.
 - **Binder slots** are assigned inside-out, the lowest slot free in the body,
   as `bind_fresh` does (`kernel.rs:797-826`).
 - **Unrolling is the e-graph's** (`HalveFold`, `PeelFold`, `EmptyFold`;
   one-pipeline §1.4). The syntax never unrolls.
+- **A fold's body reads nothing indexed by its binder except the binder's own
+  arithmetic.** There are no tables to read (§1.6).
 
-### 1.6 Tables are uniforms
+### 1.6 There are no tables; `if` and bounding make the tree
 
-A uniform family `pieces: [Row; N]` is 10N scalar uniforms. A read
-`pieces[i].sigma` is element `10·i + 6`.
+JP: *"We shouldn't have tables at all."* Table indexing is where this
+codebase has gone wrong before:
+- the `f32`-lane index and its `EXACT_F32_INDEX` guard (`manifold.rs:315-323`);
+- the bound buffer, its per-bind copy (`manifold.rs:427`), and the
+  `MAX_BOUND_BUFFERS` panic;
+- the glyph's own table.
 
-- **What it is, named plainly.** A family of constant size, read only at
-  points affine in constant-range binders, is what GLSL ES 1.00 calls a
-  uniform array indexed by constant-index expressions: no runtime length, and
-  no index that depends on data.
-- **Why it is allowed.** JP: "It is a uniform no? The rule is that ranges have
-  to be constant."
+So the language has none:
 
-**The index is a child expression, not a typed field.** It is built from
-`Var(binder)`, `Const`, `Mul` and `Add`: the shape `Gather` has today, with a
-family where the `Buffer` was.
+- **No uniform arrays, no buffers, no `Gather` read by a program's author.**
+  Data enters a program in one of two ways:
+  - as a scalar uniform, per call;
+  - as a structural value (§1.4), written in as constants at instantiation.
+- **Choosing among alternatives is `if`.** A tree of `if`s over a uniform
+  (`if id < k { … } else { … }`) is a binary space partition over it. So is
+  a tree of bounding tests over space: a glyph's box, a piece's band.
+  - The partition falls out of `if` and bounding, and nobody builds it as a
+    structure.
+  - A mask that is uniform across a batch takes one arm, which is a jump.
+    Only a mask that varies by lane blends.
+- **`Select` is renamed `If`**, in the IR, the e-graph, the emitter and the
+  docs. CLAUDE.md needs a section, "Select contains an if", to explain what
+  the name hides. The emitter was built on the misreading, blend by default
+  with a branch bought per select (`emit/guards.rs`), and that cost 73% of a
+  glyph bake (docs/BACKLOG.md X1) and the slowness of runs. The name is the
+  bug (A6).
 
-- Sema proves that it is affine in binders and in range, and that it stays
-  below 2²⁴, so it is exact in an `f32` lane. The range is known because
-  every range is constant.
-- **Why not a typed `AffineIndex` field (F).** Every walk that tracks binders
-  reads variance from children:
-  - leaf variance is constant (`node.rs:183`, `variance.rs:367`);
-  - `HalveFold` and `PeelFold` skip classes whose variance lacks the binder
-    (`fold_rules.rs:58-65`, `:291`);
-  - `FactorFold` splits factors by the same fact;
-  - codegen places values by it (`emit/mod.rs:2811-2821`).
-- **So a typed index would be invisible to all of them.** Halving would then
-  read the same row twice and peeling would leave a binder unbound: silently
-  wrong pixels.
-- **The child expression is correct by construction** under every existing
-  walk, and the emitter lowers exactly this shape, a broadcast load
-  (`emit/mod.rs:2472-2483`).
-- A typed index can come back once the IR's binders carry an index type. It
-  has to arrive with that, not before.
-
-A fully unrolled fold's indices are constants, so each read is a scalar
-uniform at a static offset.
-
-### 1.7 The glyph
+### 1.7 A font is one program per zoom level
 
 ```rust
 kernel! {
-    /// One oriented monotone arc: one row of the piece table.
+    /// One oriented monotone arc piece.
     pub struct Row {
         pub x0: f32, pub e0x: f32, pub e1x: f32,
         pub y0: f32, pub e0y: f32, pub e1y: f32,
@@ -218,9 +221,18 @@ kernel! {
     }
     pub struct Bounds { pub x0: f32, pub y0: f32, pub x1: f32, pub y1: f32 }
 
-    pub const COVERAGE_SNAP: f32 = 1.0 / 1024.0;
-    const NEARLY_ONE: f32 = 1.0 - COVERAGE_SNAP;
+    /// Structural types: a font's data, written in as constants at instantiation.
+    pub struct Glyph { pub bounds: Bounds, pub pieces: [Row] }
+    pub struct Font { pub glyphs: [(u32, Glyph)] }
+
     const PIXEL_CENTER: f32 = 0.5;
+    const COVERAGE_SNAP: f32 = 1.0 / 1024.0;
+    const NEARLY_ONE: f32 = 1.0 - COVERAGE_SNAP;
+
+    fn coverage(f: f32) -> f32 {
+        let c = f.abs().min(1.0);
+        if c >= NEARLY_ONE { 1.0 } else if c <= COVERAGE_SNAP { 0.0 } else { c }
+    }
 
     fn indicator(m: bool) -> f32 { if m { 1.0 } else { 0.0 } }
 
@@ -236,6 +248,7 @@ kernel! {
     }
 
     /// σ·∫∫χ over the pixel about (x, S·y), cut to the rows the piece reaches.
+    /// Closed once with `p` abstract; each piece instantiates the closed form (§1.8).
     fn piece_term(p: Row, x: f32, y: f32) -> f32 {
         let term = p.sigma * area(|u, v| left_of_the_arc(p, x + u, p.s * y + v));
         if (y > p.lo) & (y < p.hi) { term } else { 0.0 }
@@ -245,98 +258,107 @@ kernel! {
         (x >= b.x0) & (x <= b.x1) & (y >= b.y0) & (y <= b.y1)
     }
 
-    fn coverage(f: f32) -> f32 {
-        let c = f.abs().min(1.0);
-        if c >= NEARLY_ONE { 1.0 } else if c <= COVERAGE_SNAP { 0.0 } else { c }
+    /// One glyph: its pieces are structural, so each is written in as constants.
+    fn glyph(g: Glyph, x: f32, y: f32) -> f32 {
+        let f: f32 = g.pieces.map(|p| piece_term(p, x, y)).sum();
+        if inside(g.bounds, x, y) { coverage(f) } else { 0.0 }
     }
 
-    /// Texel (i, j) holds coverage at (i+½, j+½).
-    pub fn texel<const N: usize>(pieces: [Row; N], bounds: Bounds) -> f32 {
-        let x = X + PIXEL_CENTER;
-        let y = Y + PIXEL_CENTER;
-        let f = (0..N).map(|i| piece_term(pieces[i], x, y)).sum();
-        if inside(bounds, x, y) { coverage(f) } else { 0.0 }
+    /// The font at one pixel size: the glyph is chosen by a tree of `if id < k`.
+    pub fn font<const FONT: Font>(id: f32) -> f32 {
+        let (x, y) = (X + PIXEL_CENTER, Y + PIXEL_CENTER);
+        FONT.by_id(id, |g| glyph(g, x, y))
     }
 }
 ```
 
-**Measured against production (F, from the sketch's probe).** The fold lowers
-to the same DAG, checked by an order-independent structural hash, for a
-square and for an O of four quadratics, with and without the half-pixel
-shift. The program shrinks from 99 to 87 nodes and from 8 to 4 uniforms. The
-difference is one-pipeline's G2: production mints the box twice.
+**The two spellings still to choose (Q2)** are `g.pieces.map(…).sum()` over a
+structural list and `FONT.by_id(id, …)`, which chooses by id. Both are
+instantiation over compile-time data: the program they produce has no fold,
+no table and no index. `by_id` becomes a balanced tree of `if id < k`.
 
-**Where it is not the same (F, all 94 inked ASCII glyphs at 7, 16 and 32 px).**
-
-- **The table read.** `Gather(Buffer, …)` becomes a family read, which is a
-  different node with the same load shape.
-- **Exact N against padded.** 9 / 29 / 35 texels differ, by at most 1.19e-7.
-  No u8 texel differs. It gives 28 to 35 programs per size where padding
-  gives 6.
-- **The key.** It changes even for an identical DAG, because `canonical`
-  follows insertion order (A3 fixes that).
-
-**What stays host Rust.** None of this is program; it produces the uniform
-values.
-
+**What stays host Rust.** None of this is program; it produces the
+structural value and the per-call uniforms.
 - font parsing, compound glyphs and mirroring (`ttf.rs`);
 - the f64 monotone split (`monotone.rs`);
-- `piece_row`'s rounding, together with its debug asserts;
-- the box's host union;
+- `piece_row`'s rounding, with its debug asserts;
 - layout.
 
-**An empty glyph stays distinct from a missing one.** Today a space bakes
-into its own atlas slot (`atlas.rs:163-200`), and the atlas golden pins that
-layout.
+**A cell is one call.** A cell calls `font` with its glyph id, colours and
+origin as uniforms. The loop over cells is host schedule until scheduling
+moves into the compiler. A call costs 6–9 ns once A2 lands (F, measured with
+`vzeroupper`), so 12k cells is about 0.1 ms of calls.
 
-### 1.8 What the macro emits
+**A zoom level recompiles the font.** Caching comes later (JP). An empty glyph
+stays distinct from a missing one, as the atlas's slot layout does today
+(`atlas.rs:163-200`).
 
-**The JIT case, always.**
+### 1.8 What it takes, and where it lands
 
-- Records become host structs (`#[repr(C)]`, `Record::write`), so host and
-  kernel share one layout definition.
-- Each entry becomes a host function: `texel(pieces: &[Row], bounds: Bounds)
-  -> Kernel`.
-- That function instantiates the lowered template, writing `N =
-  pieces.len()` into fold ends and family lengths, and returns the opaque
-  `Kernel`.
+Three problems, none of which touches the language:
+
+1. **Every piece is its own integral.** Noto's ASCII has 1,625 pieces (F).
+   Integrals written separately stop closing past about 37 in one e-graph,
+   because each pays for its own derivation under a shared class cap (F,
+   one-pipeline Appendix A).
+   - **Fix: a helper is a unit of optimization.** `piece_term`'s integral is
+     closed once, with its parameters abstract, and each piece instantiates
+     the closed form with its constants; then `ConstantFold` runs.
+   - This is "close once, instance N", with the function marking what is
+     shared, so nothing has to recognize it.
+   - It is sound because no rule matches a parameter specially: a derivation
+     over free parameters instantiates to a derivation over any values (F:
+     no rule matches `ENode::Uniform`; one-pipeline Appendix A).
+2. **Size.** At about 100 classes a piece, the font is about 160k classes,
+   over `HARD_CLASS_LIMIT` (100k, `graph.rs:512`).
+   - **Fix: each glyph is its own optimization unit, and the tree of `if`s
+     links them.** That is composition-is-linking's `Ref`: a call to a
+     separately optimized kernel.
+   - Code is about 1–3 MB for ASCII (I: 1,625 pieces at U_g's measured
+     1.75 KB each, less with constants).
+3. **Zoom latency.** A glyph compiles in about 30–150 ms today (F:
+   saturation 21–35 ms; emit 9–127 ms for an unrolled glyph, superlinear in
+   N). So a zoom level takes seconds on one thread.
+   - **Fix:** glyphs are independent units, so compile them in parallel, and
+     emit arms as blocks (X1) to remove the superlinear emit.
+   - "We'll make computing the programs fast, and focus on the caching
+     later" (JP).
+
+**What the macro emits.**
+- Records become host structs (`#[repr(C)]`).
+- Each entry becomes a host function that instantiates the lowered template
+  with its structural values and returns the opaque `Kernel`.
 - The template is a replay of `ExprArena` pushes, as `emit.rs` emits today.
-  It is instantiated in O(template) for any `N`.
-- No optimization runs at expansion, because optimization is priced against
-  a shape.
-
-**The AOT case (Phase E).** An entry names its instances, `(N, shape)`
-pairs. The same expansion runs the one optimizer on each and emits the
-optimized arenas, which are preloaded into the JIT cache under the same key.
-
-- **No machine code at expansion yet.** The tier is chosen at startup, and a
-  proc macro is not told the target.
-- **Preloading optimized arenas** keeps the law without per-arch byte tables.
+- No optimization runs at expansion unless the instance is declared (Phase
+  E).
 
 ---
 
 ## 2. Decisions
 
-The evidence settles these; each has a reason, and JP can overturn any.
+The evidence and JP's rulings settle these. JP can overturn any.
 
 | # | decision | resolution |
 |---|---|---|
-| D1 | binding times | §1.4: structural, uniform, or kernel-typed, by declaration; `Args` records |
-| D2 | what the macro compiles | JIT template always; declared instances optimized at expansion (Phase E); `macro_tier`, `Templates`, `ENode::Param` and `kernel_raw!` deleted (one-pipeline M1–M5) |
-| D3 | tables | uniform families with a child-expression index (§1.6) |
-| D4 | binders | `usize` in sema; slots inside-out; a kernel-typed argument's binders are renamed away from those live at its hole, since a fixed slot would alias an argument's own fold |
+| D1 | binding times | §1.4: structural (counts and compile-time data), uniform (scalars, per call), or kernel-typed; `Args` records |
+| D2 | what the macro compiles | the JIT template always; declared instances optimized at expansion (Phase E); `macro_tier`, `Templates`, `ENode::Param` and `kernel_raw!` deleted (one-pipeline M1–M5) |
+| D3 | tables | **none** (JP). Data enters as scalar uniforms or structural constants; choice is `if` (§1.6) |
+| D4 | binders | `usize` in sema; slots inside-out; a kernel-typed argument's binders are renamed away from those live at its hole |
 | D5 | `.at` | application is contramap (§1.2) |
 | D6 | functions across blocks or crates | inlined within a block; across blocks only as kernel-typed arguments at runtime. A proc macro sees only its own tokens |
-| D7 | records and tuples | flattened in the front end; record returns (`-> Rgba`) with one select on the packed word, as `packed.rs` relies on (Phase D) |
+| D7 | records and tuples | flattened in the front end; record returns (`-> Rgba`) with one `if` on the packed word, as `packed.rs` relies on (Phase D) |
 | D8 | masks and bits | types in sema only |
-| D10 | `CachedGlyph`, `CachedText` | deleted: no production consumer |
+| D9 | the frame | one font program per zoom level; a cell is a call with its glyph id as a uniform; a zoom recompiles; caching later (JP, §1.7) |
+| D10 | `CachedGlyph`, `CachedText`, the atlas, `BilinearSampler` | deleted as the frame moves to per-cell calls. Caching returns later as its own design (JP) |
 | D11 | loop-carried iteration | refused in the syntax. The two fractal benches (`shader_bench`) stay on the IR as compiler research |
 | D12 | binder-indexed immediates | refused; the packer names its four channels |
 | D13 | where production kernels live | above pixelflow-core. The cell grid is terminal-shaped and leaves core (CLAUDE.md: no terminal logic in PixelFlow) |
 | D14 | `kernel_raw!` | deleted. Every JIT compile optimizes (`jit_cache.rs:145`), so its promise never reached machine code |
-| D15 | spellings | §1.5's folds; `if` is the only select; `DX(e)`/`DY(e)` as today; the `.select`, `.lt`, … aliases go once the five CI-contract bodies are rewritten, keeping their names |
+| D15 | spellings | §1.5's folds; `if` is the only choice; `DX(e)`/`DY(e)` as today; the `.select`, `.lt`, … aliases go once the five CI-contract bodies are rewritten, keeping their names |
 | D16 | public surface | an opaque `Kernel`; `Uniform`, `Scalar`, `Monoid` and `Bits` leave. `__macro` narrows to what expansions name. Only compiler crates depend on `pixelflow-ir`, enforced by CI |
 | D17 | the second parser | `training/factored.rs`'s `parse_kernel_code_arena` and its printer are deleted with the corpus tool that uses them, or routed through the one parser if that tool is still needed |
+| D18 | `Select` | renamed `If` everywhere (§1.6; JP) |
+| D19 | helpers | a helper is a unit of optimization: an integral in it is closed once with its parameters abstract, then instantiated (§1.8) |
 
 ---
 
@@ -345,124 +367,111 @@ The evidence settles these; each has a reason, and JP can overturn any.
 Every CL is green on its own. Byte-neutral CLs record a `byte_probe` diff,
 and no digests are committed (one-pipeline §5, gate policy).
 
-### Phase A: foundations, independent of every open question
+### Phase A: foundations
 
 - **A1. The one parser's bugs (F, measured).**
-  - `{ let X = Y; X }` evaluates X, because lowering matches `"X"` before
-    locals.
+  - `{ let X = Y; X }` evaluates X.
   - Nested `let`s leak: `locals` is one flat map (`lower.rs:69`,
     `:259-265`).
   - An out-of-scope local is accepted.
   - Literals round twice, f64 then f32 (`lower.rs:98-103`).
-  - The parser's grammar doc is stale.
-- **A2. `vzeroupper` before `ret` on x86** (one-pipeline A6). It measured
+  - The grammar doc is stale.
+- **A2. `vzeroupper` before `ret` on x86** (one-pipeline A6). Measured
   155–170 ns per call without it and 6–9 ns with it.
 - **A3. `canonical` independent of insertion order.** It walks post-order
-  from the root and hash-conses structurally equal subterms. Then two
-  constructions of one DAG key alike, and §1.7's equivalence becomes a CI
-  check.
-- **A4. The uniform chain at 64 bits:** `UniformId`, `dense_slot`,
-  `ScheduledOp::Uniform` and `emit_uniform_load`'s offset. The encoders
-  narrow where the hardware does. A glyph at N = 189 needs 1,894 slots, and a
-  table of cells needs far more; today `declare_uniform` asserts below
-  `u16::MAX` (`arena.rs:700-704`).
-- **A5. Fold ends at 64 bits** (`RangeFold`'s `u32`, `fold.rs:384-385`).
+  from the root and hash-conses structurally equal subterms. Recompiling a
+  font at a zoom level it has seen then hits the cache, whatever order the
+  glyphs were built in.
+- **A6. `Select` renamed `If`** (D18). A mechanical rename, with CLAUDE.md's
+  "Select contains an if" section retitled.
+- **Deprioritized.** The 64-bit uniform chain (formerly A4) and 64-bit fold
+  ends (A5) were driven by tables. They remain CLAUDE.md debt and have no
+  driver in this plan.
 
-### Phase B: the syntax grows the glyph's constructs
+### Phase B: the syntax grows the font's constructs
 
-- **B1.** The items block, `if` as select, typed masks, `const` items and
-  helper `fn`s.
+- **B1.** The items block, `if` as the only choice, typed masks, `const`
+  items and helper `fn`s.
 - **B2.** Folds over constant ranges, and the binder type.
-- **B3.** Binding times and `Args`, records, and uniform families.
+- **B3.** Binding times and `Args`, records, and structural parameters,
+  counts and lists.
 - **B4.** `integral`, `area` and `monotone_root`.
 - **B5.** Lowering calls `pixelflow-ir`'s definitions, and `lower.rs`'s
   copies go.
-- **B6.** The equivalence gate: a `kernel!` glyph and the builder's glyph
-  give one key and identical pixels over ASCII at 7, 16 and 32 px.
+- **B6.** Helpers as optimization units (D19): a helper's integral is closed
+  once and instantiated.
+- **B7.** The equivalence gate: one glyph built by `kernel!` and by the
+  builder gives the same pixels over ASCII at 7, 16 and 32 px.
 
-### Phase C: the glyph is written in `kernel!`
+### Phase C: the font is written in `kernel!`
 
-- **C1.** `loop_blinn.rs` becomes the §1.7 block. It uses exact N and one
-  box, and keeps "no ink" distinct from "no glyph".
+- **C1.** The §1.7 block: glyphs as units, linked by the `if` tree, and
+  instantiated per font per pixel size.
   - The gates are `glyph_is_closed`, `glyph_exact_area`,
     `glyph_area_edge_cases`, `freetype_oracle` and the goldens.
   - Re-baselined pins go in their own commit.
-- **C2.** The glyph's tests move onto `kernel!` (the sketch's bucket B, 15
-  files).
-- **C3.** `text()` and `run` (Q3).
+- **C2.** The frame calls the font program per cell. The atlas,
+  `CachedGlyph`/`CachedText` and `BilinearSampler` go (D10). A zoom
+  recompiles.
+  - Measure the frame against today's before switching: 80×24 and 200×60,
+    at 16 and 32 px.
+- **C3.** The glyph's tests move onto `kernel!`.
+- **C4.** `text()` and `run` (Q3).
 
-### Phase D: the builder goes internal (waits on Q1)
+### Phase D: the builder goes internal
 
 - **D-a.** Kernel-typed parameters, with the capture-avoiding splice (D4).
 - **D-b.** Record returns, `u32` bits, and the packed frame.
-- **D-c.** Scenes, the cell grid, ML and the runtime examples move onto
-  `kernel!`.
+- **D-c.** Scenes, ML and the runtime examples move onto `kernel!`.
 - **D-d.** The fluent constructors leave `Kernel`. Graphics and runtime drop
-  `pixelflow-ir`. A CI check fails any crate outside the compiler crates
-  that depends on it.
+  `pixelflow-ir`. A CI check fails any crate outside the compiler crates that
+  depends on it.
 - **D-e.** The CLAUDE.md edits (Q5).
 
 ### Phase E: AOT
 
-- **E1.** Declared instances, optimized at expansion and preloaded.
+- **E1.** Declared instances (a font at declared pixel sizes), optimized at
+  expansion and preloaded.
   - The build-override opt-level goes to 3. Measured: an optimize costs
     about 190 ms at opt-level 0 and 37–40 ms in release.
   - A CI check that each preloaded arena equals the runtime optimizer's
     output.
-- **E2.** A bundled font at declared sizes, as the first user.
 
-### The parallel track (one-pipeline)
+### The parallel track
 
-- the fold phase and the price of a fold (one-pipeline M13–M15);
-- D1 placement, which reads demand;
-- X1, arms emitted as blocks.
+- X1, arms emitted as blocks. It is urgent now, because a font program is
+  mostly `if`s.
+- D1 placement, which reads demand.
+- The fold phase and the price of a fold (one-pipeline M13–M15).
 
 ---
 
 ## 4. Open questions for JP
 
-**Q1. The frame (blocks Phase D).** The cell grid reads data-dependent
-indices: `cells[⌊x·cells_per_point⌋]` and the atlas at `u0 + lx·density`,
-where `u0` is itself cell data (`cell_grid.rs:440-472`).
-
-- **What your rule settles.** Under constant ranges the cells become a fold,
-  so a zoom recompiles, once per level, through the cache. That overrides
-  `cell_grid.rs:18-36`'s reason for making the metric a uniform.
-- **What is left: the glyph a cell shows is data.** The frame needs one of:
-  - a data-indexed read (the atlas as the schedule's memo, or glyph →
-    table);
-  - one program padded to `N_max`;
-  - one program per `N`, dispatched per region.
-- **Recommendation:** keep the atlas as the schedule's memo, one declared
-  tabulation read, until D1 and the scheduler make an atlas-free frame fit
-  the budget.
+**Q1. Answered (JP):** one program per font per zoom level; no tables;
+`if` and bounding; recompile on zoom; caching later (§1.6–§1.8).
 
 **Q2. Syntax vetoes.** The syntax choices are yours:
-
 - the items block with `pub fn` entries;
 - `(0..N).map(|i| …).sum()`;
-- `[Row; N]` tables;
-- `if` as the only select;
-- `const N` as structural;
+- iterating a structural list (`g.pieces.map(…)`);
+- choosing by id (`FONT.by_id(id, …)`, or a `match`);
+- `if` as the only choice;
+- `const` parameters as structural;
 - `integral` and `area`;
 - `DX(e)`.
 
-**Q3. `text()` and `run`** (no production caller). A run written as one
-fold over all its pieces is exact but 2.6–7.7× slower at 3 or more
-characters until the emitter jumps a select inside a fold (X1). Today's
-shape, one fold per character over ragged spans, needs an IR addition the
-syntax cannot say. **Recommendation:** port to one fold and let X1 recover
-the speed, rather than keep a program that exists only on the builder.
+**Q3. `text()` and `run`** (no production caller). **Recommendation:**
+delete them. A string of glyphs is a sequence of per-cell calls, the same
+path as the terminal.
 
-**Q4. AOT's first user.** No production kernel is bound at build time
-today. The font is loaded by path, and the tile extent is the runtime cell
-height (`terminal_app.rs:67`, `:268`). **Recommendation:** a bundled font at
-declared sizes. Confirm that "compiled as a macro" means declared
-instances.
+**Q4. AOT's first user.** **Recommendation:** a bundled font at declared
+pixel sizes, since a font is now one program per size.
 
-**Q5. CLAUDE.md.** Lines 17, 19, 173, 176, 209–217, 244–249, 520–529, 558
-and 566–568 codify the builder or construction-time unrolling. The file is
-yours, and Phase D proposes the edits.
+**Q5. CLAUDE.md.** These lines codify the builder or construction-time
+unrolling: 17, 19, 173, 176, 209–217, 244–249, 520–529, 558 and 566–568.
+The "Select contains an if" section is retitled by A6. The file is yours;
+Phase D proposes the edits.
 
 ---
 
@@ -471,8 +480,7 @@ yours, and Phase D proposes the edits.
 - **A panic in font loading (F).** `Font::glyph_scaled_by_id` panics at
   `ttf.rs:507` on some glyph ids that no cmap entry reaches (NotoSansMono,
   iterating ids from 0). It is a slice index where a `None` belongs.
-- **Silent parameter wrap (F).** `Param(u8)` (`arena.rs:58`, `lower.rs:39`)
-  wraps silently past 256 parameters. B3 deletes it, because parameters
-  become uniforms.
+- **A silent wrap (F).** `Param(u8)` (`arena.rs:58`, `lower.rs:39`) wraps past
+  256 parameters. B3 deletes it.
 - **A second parser (F).** `pixelflow-pipeline/src/training/factored.rs:542`
   parses kernel code for `validate_corpus` (D17).
