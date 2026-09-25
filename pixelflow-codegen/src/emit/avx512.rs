@@ -1644,7 +1644,7 @@ pub(crate) mod driver {
         }
 
         fn emit_ret(&mut self, code: &mut Vec<u8>) {
-            AsmProgram::from([x86::Inst::Ret]).assemble(code);
+            x86::return_to_caller(code);
         }
     }
 

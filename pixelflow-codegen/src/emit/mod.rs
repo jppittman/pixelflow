@@ -5234,6 +5234,140 @@ mod tests {
         }
     }
 
+    /// Every x86 program leaves through `vzeroupper; ret`, on both tiers.
+    ///
+    /// The return is found from the driver's structure, not by scanning for
+    /// `C3`, which a ModRM byte, an immediate or a pool entry holds just as
+    /// well. A program has one return — [`compile_via_backend`] emits it
+    /// after releasing the frame, and [`IsaBackend::emit_ret`] is the only
+    /// verb that emits one — and [`EmitTraffic::trailing`] counts the bytes
+    /// after it, so the return ends `trailing` bytes before the end.
+    ///
+    /// The return grew in front of the constant pool, whose position two
+    /// labels carry: the anchor's displacement and the pool's padding. So the
+    /// pool is checked too, found the same way — through the anchor, the
+    /// instruction after the frame, whose displacement the label pass
+    /// resolved — and must sit at the first aligned byte at or after the
+    /// return when it holds anything, at the return's end when it does not,
+    /// across padding that is all zeros.
+    #[test]
+    fn every_x86_return_clears_the_upper_halves_first() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        /// `VZEROUPPER` (`VEX.128.0F.WIG 77`) then `RET` (`C3`), as the SDM
+        /// spells them rather than as the encoder under test does.
+        const CLEAN_RETURN: [u8; 4] = [0xC5, 0xF8, 0x77, 0xC3];
+        /// Bytes in an x86 pool entry: one `f32`'s bits.
+        const POOL_ENTRY: usize = 4;
+        /// A RIP-relative displacement is its instruction's last four bytes
+        /// when no immediate follows it, and none follows one in `lea`.
+        const REL32: usize = 4;
+        /// Three rows, and a width that leaves a remainder on either tier's
+        /// batch of 8 or 16 lanes, so every fold of the lattice emits.
+        const PLANE: LatticeShape = LatticeShape::new([37, 3]);
+
+        /// A kernel to compile, by name.
+        type Case<'a> = (&'static str, &'a ExprArena, ExprId);
+
+        fn check<B: IsaBackend>(tier: &str, fresh: impl Fn() -> B, kernels: &[Case<'_>]) {
+            // The anchor follows the frame's allocation, each as the backend
+            // emits them. The frame's size is an imm32 whatever its value, so
+            // an empty frame measures the same bytes.
+            let mut prologue = Assembly::default();
+            let mut probe = fresh();
+            probe.frame_alloc(&mut prologue.code, 0);
+            let frame_end = prologue.code.len();
+            probe.anchor(&mut prologue);
+            let anchor_end = prologue.code.len();
+            let lea = frame_end..anchor_end - REL32;
+
+            for &(name, arena, root) in kernels {
+                let mut backend = fresh();
+                let lanes = backend.register_file().vector_bytes / BYTES_PER_LANE;
+                let result =
+                    compile_via_backend(schedule_for(arena, root, PLANE, lanes), &mut backend)
+                        .unwrap_or_else(|e| panic!("{tier}/{name}: {e:?}"));
+                let code = result.code.as_bytes();
+                let trailing = result.traffic.trailing as usize;
+
+                let ret_end = code.len() - trailing;
+                assert_eq!(
+                    code[ret_end - CLEAN_RETURN.len()..ret_end],
+                    CLEAN_RETURN,
+                    "{tier}/{name}: the return is not `vzeroupper; ret`"
+                );
+
+                assert_eq!(
+                    code[lea.clone()],
+                    prologue.code[lea.clone()],
+                    "{tier}/{name}: the anchor is not where the frame ends"
+                );
+                let disp = i32::from_le_bytes(
+                    code[anchor_end - REL32..anchor_end]
+                        .try_into()
+                        .expect("a rel32 is four bytes"),
+                );
+                let pool = anchor_end
+                    .checked_add_signed(disp as isize)
+                    .unwrap_or_else(|| panic!("{tier}/{name}: the anchor points before the code"));
+                // Padding exists only in front of entries, so a pool that
+                // trails anything is aligned, and one that trails nothing is
+                // bound where the return ends.
+                let expected = match trailing {
+                    0 => ret_end,
+                    _ => ret_end.next_multiple_of(CONST_POOL_ALIGN),
+                };
+                assert_eq!(pool, expected, "{tier}/{name}: the anchor misses the pool");
+                assert!(
+                    code[ret_end..pool].iter().all(|&b| b == 0),
+                    "{tier}/{name}: the pool's padding is not zeros"
+                );
+                assert_eq!(
+                    (code.len() - pool) % POOL_ENTRY,
+                    0,
+                    "{tier}/{name}: the pool is not whole entries"
+                );
+            }
+        }
+
+        // Nothing but coordinates: the least a program is.
+        let mut plain = ExprArena::new();
+        let (x, y) = (plain.push_var(0), plain.push_var(1));
+        let plain_root = plain.push_binary(OpKind::Add, x, y);
+
+        // Constants, and a select on a comparison: a pool to pad.
+        let mut select = ExprArena::new();
+        let (x, y) = (select.push_var(0), select.push_var(1));
+        let edge = select.push_const(2.5);
+        let scale = select.push_const(3.7);
+        let bias = select.push_const(0.25);
+        let cond = select.push_binary(OpKind::Lt, x, edge);
+        let scaled = select.push_binary(OpKind::Mul, x, scale);
+        let biased = select.push_binary(OpKind::Add, y, bias);
+        let select_root = select.push_ternary(OpKind::Select, cond, scaled, biased);
+
+        // A surviving fold: a loop of the kernel's own inside the lattice's.
+        let binder = Binder::from_slot(0).expect("slot 0 exists");
+        let mut fold = ExprArena::new();
+        let x = fold.push_var(0);
+        let i = fold.push_var(binder.var());
+        let body = fold.push_binary(OpKind::Add, x, i);
+        let fold_root = fold.push_reduce(Fold::new(Monoid::SUM, binder, 0..4), body);
+
+        let kernels = [
+            ("plain", &plain, plain_root),
+            ("select", &select, select_root),
+            ("fold", &fold, fold_root),
+        ];
+        let ctx = EmitCtx::default;
+        check("AVX2", || avx2::driver::Avx2Backend::new(ctx()), &kernels);
+        check(
+            "AVX-512",
+            || avx512::driver::Avx512Backend::new(ctx()),
+            &kernels,
+        );
+    }
+
     /// The aarch64 constant pool must APPEND across the scopes a collapse
     /// compile pushes through one backend, never reset.
     ///
