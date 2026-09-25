@@ -8263,4 +8263,576 @@ mod tests {
             assert_eq!(run(0.0), 9.0, "off arm: 10.0 - 1.0");
         }
     }
+
+    /// The small value types the rest of this module is built from — `Label`,
+    /// `Assembly`, `PtrReg`, `Loc`, `Binding` — reached everywhere through a
+    /// full compile, but never at their own boundary: nothing here pins that
+    /// `Label::as_str` returns the name it was built from rather than some
+    /// other string, or that a `Binding::Remat` is distinguishable from a
+    /// spilled one by `as_slot`.
+    mod primitives {
+        use super::*;
+
+        #[test]
+        fn label_as_str_returns_the_name_it_was_built_from() {
+            assert_eq!(Label::new("row_top").as_str(), "row_top");
+            assert_eq!(Label::new("").as_str(), "");
+        }
+
+        #[test]
+        fn label_display_writes_the_name_without_quotes() {
+            assert_eq!(format!("{}", Label::new("v12_past_true")), "v12_past_true");
+        }
+
+        #[test]
+        fn label_debug_writes_the_name_with_quotes() {
+            assert_eq!(format!("{:?}", Label::new("batch_exit")), "\"batch_exit\"");
+        }
+
+        #[test]
+        fn assembly_with_capacity_reserves_the_requested_bytes() {
+            let asm = Assembly::with_capacity(64);
+            assert!(
+                asm.code.capacity() >= 64,
+                "capacity {} should be at least the 64 requested",
+                asm.code.capacity()
+            );
+            assert!(asm.code.is_empty());
+        }
+
+        /// A trivial `AsmInsn` for exercising the assembler without depending
+        /// on any real backend's encodings.
+        #[derive(Copy, Clone)]
+        struct TestInsn(u8);
+
+        impl AsmInsn for TestInsn {
+            fn emit_into(self, code: &mut Vec<u8>) {
+                code.push(self.0);
+            }
+        }
+
+        #[test]
+        fn assembly_push_and_finish_emit_every_instructions_bytes_in_order() {
+            let mut asm = Assembly::default();
+            asm.push(TestInsn(0xAA));
+            asm.push(TestInsn(0xBB));
+            assert_eq!(asm.finish(), alloc::vec![0xAAu8, 0xBBu8]);
+        }
+
+        #[test]
+        #[should_panic(expected = "was written twice")]
+        fn assembly_bind_refuses_to_write_the_same_label_twice() {
+            let mut asm = Assembly::default();
+            asm.bind(Label::new("top"));
+            asm.bind(Label::new("top"));
+        }
+
+        #[test]
+        #[should_panic(expected = "branched to but never written")]
+        fn assembly_finish_refuses_a_label_nothing_bound() {
+            #[derive(Copy, Clone)]
+            struct Branch;
+            impl AsmInsn for Branch {
+                fn emit_into(self, code: &mut Vec<u8>) {
+                    code.extend_from_slice(&[0u8; 4]);
+                }
+                fn label_ref(self) -> Option<LabelRef> {
+                    Some(LabelRef {
+                        label: Label::new("nowhere"),
+                        patch: |_code, _at, _target| {},
+                    })
+                }
+            }
+            let mut asm = Assembly::default();
+            asm.push(Branch);
+            let _finished = asm.finish();
+        }
+
+        /// [`AsmProgram`] implements [`AsmInsn`] itself, so one program can be
+        /// nested as a single instruction of another — this is the whole of
+        /// what makes `assemble` composable rather than a one-off entry
+        /// point. Only this path reaches `<AsmProgram<S> as AsmInsn>::emit_into`.
+        #[test]
+        fn an_asm_program_nested_inside_another_emits_its_own_instructions_in_place() {
+            let inner: AsmProgram<[Item<TestInsn>; 2]> =
+                AsmProgram::from([TestInsn(0x11), TestInsn(0x22)]);
+            let outer = AsmProgram::new([Item::Inst(inner)]);
+            let mut code = Vec::new();
+            outer.assemble(&mut code);
+            assert_eq!(code, alloc::vec![0x11u8, 0x22u8]);
+        }
+
+        #[test]
+        fn ptr_reg_raw_and_as_gpr_both_carry_its_index() {
+            let p = PtrReg(5);
+            assert_eq!(p.raw(), 5);
+            assert_eq!(p.as_gpr(), Gpr(5));
+            assert_eq!(Gpr::from(p), Gpr(5));
+        }
+
+        fn locs() -> [(Loc, Storage); 3] {
+            [
+                (Loc::Reg(Reg(1)), Storage::Reg(Reg(1))),
+                (Loc::Ptr(PtrReg(2)), Storage::Ptr(PtrReg(2))),
+                (
+                    Loc::Slot(Slot::new(16, 32)),
+                    Storage::Slot(Slot::new(16, 32)),
+                ),
+            ]
+        }
+
+        #[test]
+        fn loc_reg_returns_the_register_when_the_location_is_one() {
+            assert_eq!(Loc::Reg(Reg(7)).reg(), Reg(7));
+        }
+
+        #[test]
+        #[should_panic(expected = "expected a vector register")]
+        fn loc_reg_panics_when_the_location_is_a_pointer_register() {
+            let _reg = Loc::Ptr(PtrReg(1)).reg();
+        }
+
+        #[test]
+        #[should_panic(expected = "expected register, got stack slot")]
+        fn loc_reg_panics_when_the_location_is_a_stack_slot() {
+            let _reg = Loc::Slot(Slot::new(0, 32)).reg();
+        }
+
+        #[test]
+        fn loc_storage_maps_every_variant_to_its_matching_storage_variant() {
+            for (loc, storage) in locs() {
+                assert_eq!(loc.storage(), storage);
+            }
+        }
+
+        #[test]
+        fn loc_as_source_operand_reports_its_own_storage_and_never_a_constant() {
+            for (loc, storage) in locs() {
+                assert_eq!(loc.source_storage(), Some(storage));
+                assert_eq!(loc.source_const(), None, "a Loc is never a constant");
+            }
+            assert_eq!(Loc::Reg(Reg(1)).source_reg(), Some(Reg(1)));
+            assert_eq!(Loc::Ptr(PtrReg(1)).source_reg(), None);
+            assert_eq!(Loc::Slot(Slot::new(0, 32)).source_reg(), None);
+            assert_eq!(
+                Loc::Slot(Slot::new(8, 32)).source_slot(),
+                Some(Slot::new(8, 32))
+            );
+            assert_eq!(Loc::Reg(Reg(1)).source_slot(), None);
+            assert_eq!(Loc::Ptr(PtrReg(1)).source_slot(), None);
+        }
+
+        #[test]
+        fn loc_as_store_target_reports_a_register_or_a_slot_and_never_both() {
+            assert_eq!(Loc::Reg(Reg(1)).target_reg(), Some(Reg(1)));
+            assert_eq!(Loc::Reg(Reg(1)).target_slot(), None);
+            assert_eq!(Loc::Ptr(PtrReg(1)).target_reg(), None);
+            assert_eq!(Loc::Ptr(PtrReg(1)).target_slot(), None);
+            assert_eq!(Loc::Slot(Slot::new(0, 32)).target_reg(), None);
+            assert_eq!(
+                Loc::Slot(Slot::new(0, 32)).target_slot(),
+                Some(Slot::new(0, 32))
+            );
+            for (loc, storage) in locs() {
+                assert_eq!(loc.target_storage(), storage);
+            }
+        }
+
+        #[test]
+        fn loc_converts_from_a_register_or_a_slot() {
+            assert_eq!(Loc::from(Reg(9)), Loc::Reg(Reg(9)));
+            assert_eq!(Loc::from(Slot::new(4, 32)), Loc::Slot(Slot::new(4, 32)));
+        }
+
+        #[test]
+        fn binding_reg_returns_the_register_when_located_in_one() {
+            assert_eq!(Binding::from(Reg(3)).reg(), Reg(3));
+        }
+
+        #[test]
+        #[should_panic(expected = "expected register, got rematerialized")]
+        fn binding_reg_panics_when_the_value_is_rematerialized_rather_than_placed() {
+            let _reg = Binding::Remat(0x3f80_0000).reg();
+        }
+
+        #[test]
+        fn binding_as_loc_is_some_for_a_placed_value_and_none_for_a_constant() {
+            assert_eq!(Binding::from(Reg(1)).as_loc(), Some(Loc::Reg(Reg(1))));
+            assert_eq!(Binding::Remat(1).as_loc(), None);
+        }
+
+        #[test]
+        fn binding_as_storage_mirrors_as_loc_through_storage() {
+            assert_eq!(
+                Binding::from(Reg(1)).as_storage(),
+                Some(Storage::Reg(Reg(1)))
+            );
+            assert_eq!(Binding::Remat(1).as_storage(), None);
+        }
+
+        #[test]
+        fn binding_as_slot_is_some_only_for_a_spilled_location() {
+            let slot = Slot::new(0, 32);
+            assert_eq!(Binding::from(slot).as_slot(), Some(slot));
+            assert_eq!(Binding::from(Reg(1)).as_slot(), None);
+            assert_eq!(Binding::Remat(1).as_slot(), None);
+        }
+
+        #[test]
+        fn binding_as_source_operand_reports_a_constant_only_when_rematerialized() {
+            let slot = Slot::new(0, 32);
+            assert_eq!(
+                Binding::from(Reg(1)).source_storage(),
+                Some(Storage::Reg(Reg(1)))
+            );
+            assert_eq!(Binding::Remat(0xdead_beef).source_storage(), None);
+            assert_eq!(Binding::from(Reg(1)).source_reg(), Some(Reg(1)));
+            assert_eq!(Binding::from(slot).source_reg(), None);
+            assert_eq!(Binding::from(slot).source_slot(), Some(slot));
+            assert_eq!(Binding::from(Reg(1)).source_slot(), None);
+            assert_eq!(
+                Binding::Remat(0xdead_beef).source_const(),
+                Some(0xdead_beef)
+            );
+            assert_eq!(Binding::from(Reg(1)).source_const(), None);
+        }
+
+        #[test]
+        fn binding_converts_from_a_loc_a_register_or_a_slot() {
+            assert_eq!(
+                Binding::from(Loc::Reg(Reg(2))),
+                Binding::Loc(Loc::Reg(Reg(2)))
+            );
+            assert_eq!(Binding::from(Reg(2)), Binding::Loc(Loc::Reg(Reg(2))));
+            assert_eq!(
+                Binding::from(Slot::new(4, 32)),
+                Binding::Loc(Loc::Slot(Slot::new(4, 32)))
+            );
+        }
+    }
+
+    /// [`operand_sources`] and [`reloads_wanted`]: reached on every emitted
+    /// instruction through a full compile, but never at their own boundary —
+    /// nothing pins the two `MulAdd` forms apart, or that an operand this op
+    /// does not have leaves `resident`'s bit for it unread.
+    mod operand_source_selection {
+        use super::*;
+        use regalloc::ValueId;
+
+        const A: ValueId = ValueId(0);
+        const B: ValueId = ValueId(1);
+        const C: ValueId = ValueId(2);
+        const NONE_RESIDENT: [bool; 3] = [false, false, false];
+        const ALL_RESIDENT: [bool; 3] = [true, true, true];
+
+        #[test]
+        fn a_binary_ops_left_operand_takes_the_destination_when_it_needs_reloading() {
+            let op = ScheduledOp::Binary(OpKind::Add, A, B);
+            assert_eq!(
+                operand_sources(&op, NONE_RESIDENT),
+                [
+                    OperandSource::Destination,
+                    OperandSource::Reload(0),
+                    OperandSource::Resident,
+                ]
+            );
+        }
+
+        #[test]
+        fn a_resident_binary_operand_is_read_in_place_rather_than_reloaded() {
+            let op = ScheduledOp::Binary(OpKind::Add, A, B);
+            assert_eq!(
+                operand_sources(&op, ALL_RESIDENT),
+                [OperandSource::Resident; 3]
+            );
+        }
+
+        #[test]
+        fn a_mul_add_reloads_into_the_destination_when_both_multiplicands_need_it() {
+            let op = ScheduledOp::Ternary(OpKind::MulAdd, A, B, C);
+            assert_eq!(
+                operand_sources(&op, NONE_RESIDENT),
+                [
+                    OperandSource::Destination,
+                    OperandSource::Reload(0),
+                    OperandSource::Reload(1),
+                ],
+                "a and b are decomposed into dst; c reloads separately"
+            );
+        }
+
+        #[test]
+        fn a_mul_add_reloads_the_addend_into_the_destination_when_a_multiplicand_is_resident() {
+            let op = ScheduledOp::Ternary(OpKind::MulAdd, A, B, C);
+            assert_eq!(
+                operand_sources(&op, [true, false, false]),
+                [
+                    OperandSource::Resident,
+                    OperandSource::Reload(0),
+                    OperandSource::Destination,
+                ],
+                "the fused form takes c in dst once a multiplicand is already resident"
+            );
+        }
+
+        #[test]
+        fn a_select_always_reloads_its_mask_into_the_destination() {
+            let op = ScheduledOp::Ternary(OpKind::Select, A, B, C);
+            assert_eq!(
+                operand_sources(&op, NONE_RESIDENT),
+                [
+                    OperandSource::Destination,
+                    OperandSource::Reload(0),
+                    OperandSource::Reload(1),
+                ]
+            );
+            // Even when a multiplicand-shaped pair is resident, Select's mask
+            // (operand 0) still owns the destination — unlike MulAdd, whose
+            // dst operand depends on residency.
+            assert_eq!(
+                operand_sources(&op, [false, true, true])[0],
+                OperandSource::Destination
+            );
+        }
+
+        #[test]
+        fn a_ternary_op_with_no_destination_convention_only_ever_reloads() {
+            // No op besides MulAdd/Select ever reaches `operand_sources` as a
+            // Ternary in production, but the function's `into_dst` match is
+            // total over `ScheduledOp`, not over `OpKind`, and its fallback
+            // arm is exactly this case: nothing claims the destination, so
+            // every non-resident operand takes its own reload register.
+            let op = ScheduledOp::Ternary(OpKind::Add, A, B, C);
+            assert_eq!(
+                operand_sources(&op, NONE_RESIDENT),
+                [
+                    OperandSource::Reload(0),
+                    OperandSource::Reload(1),
+                    OperandSource::Reload(2),
+                ]
+            );
+        }
+
+        #[test]
+        fn a_unary_ops_unused_operand_slots_ignore_residency() {
+            // Arity 1: only slot 0 is real. `resident[1]`/`resident[2]` being
+            // false must not be read as "reload slots 1 and 2".
+            let op = ScheduledOp::Unary(OpKind::Neg, A);
+            assert_eq!(
+                operand_sources(&op, NONE_RESIDENT),
+                [
+                    OperandSource::Reload(0),
+                    OperandSource::Resident,
+                    OperandSource::Resident,
+                ]
+            );
+        }
+
+        #[test]
+        fn a_leaf_op_with_no_operands_asks_for_no_reloads() {
+            let op = ScheduledOp::Const(1.0);
+            assert_eq!(
+                operand_sources(&op, NONE_RESIDENT),
+                [OperandSource::Resident; 3]
+            );
+            assert_eq!(reloads_wanted(operand_sources(&op, NONE_RESIDENT)), 0);
+        }
+
+        #[test]
+        fn reloads_wanted_counts_only_the_reload_sources() {
+            assert_eq!(
+                reloads_wanted([
+                    OperandSource::Resident,
+                    OperandSource::Destination,
+                    OperandSource::Resident,
+                ]),
+                0
+            );
+            assert_eq!(
+                reloads_wanted([
+                    OperandSource::Reload(0),
+                    OperandSource::Destination,
+                    OperandSource::Reload(1),
+                ]),
+                2
+            );
+        }
+    }
+
+    /// [`shift_immediate`]: reached only through the `ShiftImm` arm of
+    /// `arena_to_schedule`, whose own tests never drive a count near the
+    /// boundary this function exists to guard.
+    mod shift_immediate_tests {
+        use super::*;
+
+        #[test]
+        fn an_integer_count_inside_the_lane_width_narrows_to_a_u8() {
+            assert_eq!(shift_immediate(OpKind::Shl, 0.0), 0);
+            assert_eq!(shift_immediate(OpKind::Shl, 31.0), 31);
+            assert_eq!(shift_immediate(OpKind::Shr, 17.0), 17);
+        }
+
+        #[test]
+        #[should_panic(expected = "is not an integer in 0..32")]
+        fn a_count_of_32_is_refused_rather_than_treated_as_the_identity_shift() {
+            // The doc's own worked example: `256.0 as u32 as u8 == 0`, and a
+            // narrowing that let this through would manufacture a
+            // legal-looking but wrong immediate. 32 is the nearer, cheaper
+            // case of the same mistake (`32 as u8 == 32`, which is still out
+            // of range for a 32-bit lane).
+            let _ = shift_immediate(OpKind::Shl, 32.0);
+        }
+
+        #[test]
+        #[should_panic(expected = "is not an integer in 0..32")]
+        fn a_negative_count_is_refused() {
+            let _ = shift_immediate(OpKind::Shl, -1.0);
+        }
+
+        #[test]
+        #[should_panic(expected = "is not an integer in 0..32")]
+        fn a_non_integer_count_is_refused() {
+            let _ = shift_immediate(OpKind::Shl, 3.5);
+        }
+    }
+
+    /// [`IsaBackend::test_ge`]'s default body — the fold trip test every
+    /// backend but AVX-512 uses (AVX-512 overrides it with its own
+    /// k-register form). On a host whose native tier *is* AVX-512, every
+    /// `EmitCtx::compile`/`native_schedule` test in this file dispatches to
+    /// the override and never reaches the default at all — so a host with
+    /// AVX-512 (this sandbox's, and most current x86-64 hardware) gives the
+    /// default's own correctness zero coverage from every other `Reduce`
+    /// test in this module, however many of them there are, unless a test
+    /// drives a non-native backend directly.
+    mod default_backend_methods {
+        use super::*;
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        /// AVX2 code runs on any AVX-512 host (a superset ISA), so this is
+        /// the one non-native backend this suite can execute rather than
+        /// merely compile — see the module doc for why that distinction
+        /// matters here. NEON cannot run on this or any x86_64 sandbox
+        /// (docs/bugs/2026-09-16-test-quality-audit-followup.md's
+        /// aarch64.rs backlog item), so the default's aarch64 call site is
+        /// left to that same carried-forward limitation.
+        #[test]
+        fn the_default_ge_trip_test_bounds_an_avx2_fold_to_its_declared_range() {
+            const AVX2_LANES: u32 = 8;
+
+            let binder = Binder::from_slot(0).expect("slot 0 exists");
+            let mut arena = ExprArena::new();
+            let x = arena.push_var(0);
+            let i = arena.push_var(binder.var());
+            let body = arena.push_binary(OpKind::Add, x, i);
+            // sum_{i=0}^{3} (X + i) = 4*X + 6 — wrong under any trip-count
+            // corruption: too few iterations undershoots, too many (or an
+            // unbounded loop that never compares true) reads past the
+            // fold's own range and either loops or lands on the wrong sum.
+            let fold = Fold::new(Monoid::SUM, binder, 0..4);
+            let root = arena.push_reduce(fold, body);
+
+            let schedule = schedule_for(&arena, root, POINT, AVX2_LANES);
+            let code = compile_via_backend(
+                schedule,
+                &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
+            )
+            .expect("an AVX2-targeted Reduce compiles")
+            .code;
+
+            for x in [0.0f32, 2.0, -1.5, 10.0] {
+                assert_eq!(eval_point(&code, x, 0.0), 4.0 * x + 6.0, "SUM at x={x}");
+            }
+        }
+    }
+
+    /// [`schedule_variance`]'s `Var` arm: every production `Var` names either
+    /// a lattice axis or a reduce binder, both well below
+    /// [`pixelflow_ir::variance::Variance::VARIABLES`] (64) — so nothing in
+    /// this file's many fold/lattice integration tests ever drives the
+    /// `idx < VARIABLES` guard's boundary or its `false` side. Kept
+    /// reachable in the type on purpose (`Var(u8)` is a full byte), so it is
+    /// pinned here directly instead.
+    mod schedule_variance_tests {
+        use super::*;
+        use pixelflow_ir::variance::Variance;
+
+        fn variance_of(op: ScheduledOp) -> Variance {
+            let schedule = alloc::vec![regalloc::Def {
+                value: regalloc::ValueId(0),
+                op,
+            }];
+            schedule_variance(&schedule)[0]
+        }
+
+        #[test]
+        fn a_var_naming_a_known_axis_is_that_axis_alone() {
+            assert_eq!(variance_of(ScheduledOp::Var(0)), Variance::from_var(0));
+            let last = Variance::VARIABLES - 1;
+            assert_eq!(
+                variance_of(ScheduledOp::Var(last)),
+                Variance::from_var(last)
+            );
+        }
+
+        #[test]
+        fn a_var_naming_no_known_axis_is_variance_all() {
+            // `VARIABLES` itself is the first index the `from_var` table
+            // cannot name — the exact boundary the guard exists to route
+            // around `from_var`'s own panic.
+            assert_eq!(
+                variance_of(ScheduledOp::Var(Variance::VARIABLES)),
+                Variance::ALL
+            );
+            assert_eq!(variance_of(ScheduledOp::Var(u8::MAX)), Variance::ALL);
+        }
+    }
+
+    /// A gap the `resolve_muladd_*` fixtures next to [`TEST_SCRATCH`] left:
+    /// every one of them spills both of `MulAdd`'s multiplicands or neither,
+    /// never exactly one — so nothing pins the decomposed path's own
+    /// condition apart from a looser one that would take it too eagerly.
+    mod resolve_operands_gap_tests {
+        use super::*;
+
+        #[test]
+        fn a_mul_add_with_only_one_multiplicand_spilled_still_takes_the_fused_path() {
+            // a resident, b spilled, c resident — the decomposed FMUL+FADD
+            // path is for when *both* multiplicands need reloading
+            // (`a_spilled && b_spilled`); one spilled multiplicand must
+            // still take the ordinary fused form, addend in dst.
+            let locs = make_locs(&[(0, 4), (2, 7)], &[(1, 16)]);
+            let op = ScheduledOp::Ternary(
+                OpKind::MulAdd,
+                regalloc::ValueId(0),
+                regalloc::ValueId(1),
+                regalloc::ValueId(2),
+            );
+            let plan =
+                resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH)
+                    .unwrap();
+
+            assert_eq!(
+                plan.setup_mov,
+                Some((Reg(8), Reg(7))),
+                "c reloads to dst first, as the fused form needs"
+            );
+            assert_eq!(
+                plan.op,
+                ResolvedOp::FusedMulAdd {
+                    dst: Reg(8),
+                    a: Reg(4),
+                    b: RELOAD[0],
+                },
+                "the fused form, not DecomposedMulAdd, even though b is spilled"
+            );
+            assert_eq!(
+                plan.reloads,
+                alloc::vec![Reload::FromStack {
+                    target: RELOAD[0],
+                    slot: Slot::new(16, 16),
+                }]
+            );
+        }
+    }
 }
