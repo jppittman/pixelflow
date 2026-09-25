@@ -6,6 +6,7 @@ use crate::io::event_monitor_actor::{PtyWriterHandle, WriterControl};
 use crate::io::traits::PtySender;
 use crate::io::Resize;
 use crate::messages::TerminalData;
+use crate::term::action::{Selection, SelectionReport};
 use crate::term::{EmulatorAction, EmulatorInput, TerminalEmulator, UserInputAction};
 use actor_scheduler::{
     Actor, ActorBuilder, ActorHandle, ActorStatus, HandlerError, HandlerResult, Message,
@@ -68,6 +69,7 @@ use pixelflow_runtime::api::public::EngineHandle;
 use pixelflow_runtime::api::public::{AppData, AppManagement};
 use pixelflow_runtime::input::MouseButton;
 use pixelflow_runtime::{EngineEventControl, EngineEventData, EngineEventManagement};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Font filename (looked up in multiple locations)
@@ -152,6 +154,10 @@ pub struct TerminalApp {
     /// Actions a PTY batch asked for, performed once the batch is applied.
     /// Kept between batches so a steady stream of replies allocates nothing.
     pty_actions: Vec<EmulatorAction>,
+    /// Selection reads asked of the engine and not yet answered, oldest
+    /// first, with what each answer is for. The engine answers every read
+    /// once, in order per selection.
+    clipboard_reads: VecDeque<(Selection, ClipboardRead)>,
     /// Device pixels per point of the current display (backing scale).
     /// The scene stays in point space; this is only a density hint for the
     /// glyph cache so bakes match the platform's sample lattice.
@@ -162,6 +168,14 @@ pub struct TerminalApp {
     /// kernels are compiled for, so it is part of the [`CellGridShape`] the
     /// recompile check compares.
     frame_px: [u32; 2],
+}
+
+/// What a selection read is for.
+enum ClipboardRead {
+    /// Paste the content into the program.
+    Paste,
+    /// Answer the program's OSC 52 query with it.
+    Report(SelectionReport),
 }
 
 /// The compiled cell-grid scene, the metric it is drawn at, and that
@@ -266,10 +280,41 @@ impl TerminalApp {
             }
             // The text comes back as `EngineEventManagement::Paste`.
             EmulatorAction::RequestClipboardContent(selection) => {
-                self.request_engine(AppManagement::RequestPaste(selection))
+                self.read_selection(selection, ClipboardRead::Paste)
+            }
+            EmulatorAction::ReportSelection { selection, report } => {
+                if !self.config.behavior.allow_clipboard_read {
+                    log::debug!("OSC 52: clipboard reads are disabled; not answering");
+                    return;
+                }
+                self.read_selection(selection, ClipboardRead::Report(report))
             }
             EmulatorAction::ToggleFullscreen => {
                 self.request_engine(AppManagement::ToggleFullscreen)
+            }
+        }
+    }
+
+    /// Asks the engine for a selection's content, remembering what it is for.
+    fn read_selection(&mut self, selection: Selection, purpose: ClipboardRead) {
+        self.clipboard_reads.push_back((selection, purpose));
+        self.request_engine(AppManagement::RequestPaste(selection));
+    }
+
+    /// Delivers a selection's content to the read that asked for it. Content
+    /// nothing asked for is a paste.
+    fn selection_read(&mut self, selection: Selection, text: String) {
+        let purpose = self
+            .clipboard_reads
+            .iter()
+            .position(|(asked, _)| *asked == selection)
+            .and_then(|index| self.clipboard_reads.remove(index))
+            .map(|(_, purpose)| purpose);
+        match purpose {
+            Some(ClipboardRead::Report(report)) => self.write_pty(report.reply(&text)),
+            Some(ClipboardRead::Paste) | None if text.is_empty() => {}
+            Some(ClipboardRead::Paste) | None => {
+                self.interpret_user_input(UserInputAction::PasteText(text))
             }
         }
     }
@@ -353,6 +398,7 @@ impl TerminalApp {
             frame_px: [0, 0],
             pressed_mouse_button: None,
             pty_actions: Vec::new(),
+            clipboard_reads: VecDeque::new(),
             density: 1.0,
         }
     }
@@ -814,8 +860,8 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
             EngineEventManagement::FocusLost => {
                 self.interpret_user_input(UserInputAction::FocusLost);
             }
-            EngineEventManagement::Paste(text) => {
-                self.interpret_user_input(UserInputAction::PasteText(text));
+            EngineEventManagement::Paste { selection, text } => {
+                self.selection_read(selection, text);
             }
         }
         Ok(())
@@ -1013,6 +1059,17 @@ mod tests {
         pixelflow_runtime::api::private::EngineActorHandle,
         pixelflow_runtime::api::private::EngineActorScheduler,
     ) {
+        create_test_app_with(Config::default())
+    }
+
+    fn create_test_app_with(
+        config: Config,
+    ) -> (
+        TerminalApp,
+        WriterScheduler,
+        pixelflow_runtime::api::private::EngineActorHandle,
+        pixelflow_runtime::api::private::EngineActorScheduler,
+    ) {
         let emulator = TerminalEmulator::new(80, 24);
         let (pty_writer, writer_rx) =
             ActorScheduler::<Vec<u8>, WriterControl, WriterManagement>::new(64, 128);
@@ -1028,7 +1085,6 @@ mod tests {
         let engine_scheduler =
             engine_builder.build_with_burst(10, actor_scheduler::ShutdownMode::default());
 
-        let config = Config::default();
         let params = TerminalAppParamsRegistered {
             emulator,
             pty_writer,
@@ -1460,12 +1516,106 @@ mod tests {
         let (mut app, mut writer_rx, _tx, _engine) = create_test_app();
 
         app.handle_data(pty(b"\x1b[?2004h")).expect("pty data");
-        app.handle_management(EngineEventManagement::Paste("ls\n".to_string()))
+        app.handle_management(clipboard_answer(Selection::Clipboard, "ls\n"))
             .expect("paste");
 
         let mut probe = WriterProbe::default();
         drain_writer(&mut writer_rx, &mut probe);
         assert_eq!(probe.data, vec![b"\x1b[200~ls\n\x1b[201~".to_vec()]);
+    }
+
+    fn clipboard_answer(selection: Selection, text: &str) -> EngineEventManagement {
+        EngineEventManagement::Paste {
+            selection,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_osc_52_query_is_answered_with_the_clipboard() {
+        let (mut app, mut writer_rx, _tx, mut engine) = create_test_app();
+
+        app.handle_data(pty(b"\x1b]52;c;?\x07")).expect("pty data");
+        let mut requests = EngineProbe::default();
+        drain_engine(&mut engine, &mut requests);
+        assert!(matches!(
+            requests.requests.as_slice(),
+            [AppManagement::RequestPaste(Selection::Clipboard)]
+        ));
+
+        app.handle_management(clipboard_answer(Selection::Clipboard, "hi"))
+            .expect("clipboard answer");
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert_eq!(probe.data, vec![b"\x1b]52;c;aGk=\x1b\\".to_vec()]);
+    }
+
+    #[test]
+    fn an_osc_52_query_goes_unanswered_when_clipboard_reads_are_off() {
+        let mut config = Config::default();
+        config.behavior.allow_clipboard_read = false;
+        let (mut app, mut writer_rx, _tx, mut engine) = create_test_app_with(config);
+
+        app.handle_data(pty(b"\x1b]52;c;?\x07")).expect("pty data");
+
+        let mut requests = EngineProbe::default();
+        drain_engine(&mut engine, &mut requests);
+        assert!(
+            requests.requests.is_empty(),
+            "the clipboard must not be read"
+        );
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert!(probe.data.is_empty());
+    }
+
+    #[test]
+    fn each_clipboard_answer_goes_to_the_read_that_asked_for_it() {
+        let (mut app, mut writer_rx, _tx, _engine) = create_test_app();
+
+        // A query of the primary selection, then a clipboard query and a
+        // clipboard paste. The primary owner answers last.
+        app.handle_data(pty(b"\x1b]52;p;?\x1b\\\x1b]52;c;?\x07"))
+            .expect("pty data");
+        app.handle_management(EngineEventManagement::KeyDown {
+            key: pixelflow_runtime::input::KeySymbol::Char('V'),
+            mods: pixelflow_runtime::input::Modifiers::CONTROL
+                | pixelflow_runtime::input::Modifiers::SHIFT,
+            text: None,
+        })
+        .expect("paste binding");
+        for (selection, text) in [
+            (Selection::Clipboard, "first"),
+            (Selection::Clipboard, "second"),
+            (Selection::Primary, "third"),
+        ] {
+            app.handle_management(clipboard_answer(selection, text))
+                .expect("clipboard answer");
+        }
+
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert_eq!(
+            probe.data,
+            vec![
+                b"\x1b]52;c;Zmlyc3Q=\x1b\\".to_vec(),
+                b"second".to_vec(),
+                b"\x1b]52;p;dGhpcmQ=\x1b\\".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_clipboard_pastes_nothing() {
+        let (mut app, mut writer_rx, _tx, _engine) = create_test_app();
+
+        app.handle_data(pty(b"\x1b[?2004h")).expect("pty data");
+        app.handle_management(clipboard_answer(Selection::Clipboard, ""))
+            .expect("paste");
+
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert!(probe.data.is_empty(), "no bracketed empty paste");
     }
 
     #[test]

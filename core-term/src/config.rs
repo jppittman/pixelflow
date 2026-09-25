@@ -312,6 +312,10 @@ pub struct BehaviorConfig {
     pub allow_alt_screen: bool,
     pub allow_window_ops: bool,
     pub default_origin_mode: bool,
+    /// Whether programs may read the clipboard with an OSC 52 query. Editors
+    /// over ssh or inside tmux use it to paste from the local clipboard; it
+    /// also lets anything that can print to the terminal read the clipboard.
+    pub allow_clipboard_read: bool,
 }
 
 impl Default for BehaviorConfig {
@@ -327,6 +331,7 @@ impl Default for BehaviorConfig {
             allow_alt_screen: true,
             allow_window_ops: false,
             default_origin_mode: false,
+            allow_clipboard_read: true,
         }
     }
 }

@@ -10,6 +10,7 @@ pub mod screen;
 pub mod unicode;
 
 pub mod action;
+mod base64;
 pub mod charset;
 mod emulator;
 pub mod layout;

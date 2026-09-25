@@ -224,18 +224,17 @@ pub enum EngineEventManagement {
     /// **Application**: May pause animations, suspend input processing, etc.
     FocusLost,
 
-    /// Text pasted from clipboard.
+    /// The content of a selection, answering `AppManagement::RequestPaste`.
     ///
     /// # Contract
     ///
-    /// **Engine**: User pasted; text comes from the system clipboard.
+    /// **Engine**: Sends exactly one per `RequestPaste`, naming the selection
+    /// that was read. The text is empty when the selection is empty or
+    /// unavailable. Answers for the same selection arrive in request order;
+    /// answers for different selections may not.
     ///
-    /// **Application**: Should insert the pasted text at the cursor position.
-    ///
-    /// # Arguments
-    ///
-    /// - UTF-8 text from the clipboard
-    Paste(String),
+    /// **Application**: Decides what the text is for — typically a paste.
+    Paste { selection: Selection, text: String },
 }
 
 /// Data events from the Engine (frame synchronization).

@@ -177,8 +177,11 @@ impl EngineCore {
             DisplayEvent::FocusLost { .. } => {
                 out.app = Some(EngineEvent::Management(EngineEventManagement::FocusLost));
             }
-            DisplayEvent::PasteData { text } => {
-                out.app = Some(EngineEvent::Management(EngineEventManagement::Paste(text)));
+            DisplayEvent::PasteData { selection, text } => {
+                out.app = Some(EngineEvent::Management(EngineEventManagement::Paste {
+                    selection,
+                    text,
+                }));
             }
             DisplayEvent::ScaleChanged { id, scale } => {
                 log::debug!("Relaying ScaleChanged: id={}, scale={}", id.0, scale);
@@ -423,6 +426,25 @@ mod tests {
                 selection: crate::input::Selection::Primary
             })
         ));
+    }
+
+    #[test]
+    fn a_paste_answer_reaches_the_app_with_its_selection() {
+        let mut core = EngineCore::new();
+        let out = core
+            .step_data(EngineData::FromDriver(DisplayEvent::PasteData {
+                selection: crate::input::Selection::Primary,
+                text: "picked".to_string(),
+            }))
+            .unwrap();
+
+        match out.app {
+            Some(EngineEvent::Management(EngineEventManagement::Paste { selection, text })) => {
+                assert_eq!(selection, crate::input::Selection::Primary);
+                assert_eq!(text, "picked");
+            }
+            other => panic!("expected the paste answer, got {other:?}"),
+        }
     }
 
     #[test]
