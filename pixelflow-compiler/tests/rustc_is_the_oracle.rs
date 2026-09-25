@@ -167,3 +167,156 @@ fn an_integer_literal_is_exact() {
     let k = kernel!(|| 1099511627776);
     assert_eq!(bake(&k), 1_099_511_627_776.0);
 }
+
+// ───────────────────── B1: the language's constructs ─────────────────────
+//
+// Each construct Phase B1 adds (docs/plans/2026-09-25-the-language-is-kernel.md
+// §1.2, §1.3) is Rust syntax, so rustc is its oracle too: the same tokens
+// as an `if`, a `fn` and a `const` in host Rust.
+
+/// The points the choices below are sampled at: on each side of every
+/// threshold, and on one.
+const CHOICE_SAMPLES: [(f32, f32); 5] =
+    [(3.0, 5.0), (5.0, 3.0), (3.5, 3.0), (4.0, 3.0), (3.0, 3.0)];
+
+/// `if c { a } else { b }` chooses as rustc's `if` chooses.
+#[test]
+fn an_if_chooses_as_rustcs_does() {
+    let k = kernel!(|| if X < Y { X } else { Y });
+    let rust = |x: f32, y: f32| if x < y { x } else { y };
+    for (x, y) in CHOICE_SAMPLES {
+        assert_eq!(Lattice::eval_at(&k, x, y), rust(x, y), "at ({x}, {y})");
+    }
+}
+
+/// An `else if` chain is a chain of choices, and a condition may be masks
+/// combined with `&`.
+#[test]
+fn an_else_if_chain_chooses_as_rustcs_does() {
+    let k = kernel!(|| {
+        let d = X - Y;
+        let inside = (d > -1.0) & (d < 1.0);
+        if inside {
+            d
+        } else if d <= -1.0 {
+            -1.0
+        } else {
+            1.0
+        }
+    });
+    let rust = |x: f32, y: f32| {
+        let d = x - y;
+        let inside = (d > -1.0) & (d < 1.0);
+        if inside {
+            d
+        } else if d <= -1.0 {
+            -1.0
+        } else {
+            1.0
+        }
+    };
+    for (x, y) in CHOICE_SAMPLES {
+        assert_eq!(Lattice::eval_at(&k, x, y), rust(x, y), "at ({x}, {y})");
+    }
+}
+
+// The block below is the host `fn`, `const` and `if` of a glyph's coverage
+// clamp (plan §1.7), written once in `kernel!` and once in Rust.
+kernel! {
+    const SNAP: f32 = 1.0 / 1024.0;
+    pub const NEARLY_ONE: f32 = 1.0 - SNAP;
+
+    /// A helper: a function of its argument, inlined at each call.
+    fn coverage(f: f32) -> f32 {
+        let c = f.abs().min(1.0);
+        if c >= NEARLY_ONE { 1.0 } else if c <= SNAP { 0.0 } else { c }
+    }
+
+    pub fn clipped(scale: f32) -> f32 {
+        coverage((X - Y) * scale)
+    }
+}
+
+const RUST_SNAP: f32 = 1.0 / 1024.0;
+const RUST_NEARLY_ONE: f32 = 1.0 - RUST_SNAP;
+
+fn rust_coverage(f: f32) -> f32 {
+    let c = f.abs().min(1.0);
+    if c >= RUST_NEARLY_ONE {
+        1.0
+    } else if c <= RUST_SNAP {
+        0.0
+    } else {
+        c
+    }
+}
+
+/// A helper and a `const` mean what a host `fn` and `const` of the same
+/// tokens mean, and a `pub const` is the host `const`.
+#[test]
+fn a_helper_and_a_const_mean_what_rusts_do() {
+    assert_eq!(NEARLY_ONE, RUST_NEARLY_ONE);
+    // The scale puts `(X - Y) * scale` at each arm: past 1, under the snap,
+    // and in between.
+    for scale in [1.0, 0.25, 0.0001, -0.5, 0.49999] {
+        let k = clipped(scale);
+        for (x, y) in CHOICE_SAMPLES {
+            assert_eq!(
+                Lattice::eval_at(&k, x, y),
+                rust_coverage((x - y) * scale),
+                "at ({x}, {y}) × {scale}"
+            );
+        }
+    }
+}
+
+// A `const` is evaluated per operation in `f32`, as rustc evaluates one.
+// The first `+ 1.0` ties to even in `f32` and stays at 2²⁴, and the second
+// must too; an evaluator carrying the exact sum in `f64` and rounding once at
+// the end reaches 2²⁴ + 2. One operation could not tell them apart — a single
+// `f64` operation cast once is correctly rounded — so the witness is two.
+const RUST_SUM: f32 = 16777216.0 + 1.0 + 1.0;
+kernel! {
+    pub const SUM: f32 = 16777216.0 + 1.0 + 1.0;
+    pub fn shifted() -> f32 { X + SUM }
+}
+
+/// A `const` rounds each operation once, in `f32`, as rustc rounds it.
+#[test]
+fn a_const_is_evaluated_in_f32_as_rustc_evaluates_it() {
+    assert_eq!(SUM, RUST_SUM);
+    assert_eq!(SUM, 16_777_216.0);
+    assert_eq!((16777216.0_f64 + 1.0 + 1.0) as f32, 16_777_218.0);
+    assert_eq!(Lattice::eval_at(&shifted(), 0.0, 0.0), RUST_SUM);
+}
+
+// A product and a sum are two roundings, never one, as rustc's const
+// evaluator never contracts them — and the proc-macro crate is built with
+// `-fp-contract=fast` (`.cargo/config.toml`), which would let an FMA in.
+// `B * C` is exactly 1 + 2⁻¹¹ + 2⁻²⁴, a tie that rounds to even, 1 + 2⁻¹¹,
+// so `+ D` gives 0; an FMA keeps the 2⁻²⁴ and gives that instead.
+const RUST_B: f32 = 1.0 + 1.0 / 4096.0;
+const RUST_C: f32 = 1.0 + 1.0 / 4096.0;
+const RUST_D: f32 = -(1.0 + 1.0 / 2048.0);
+const RUST_CONTRACTION: f32 = RUST_B * RUST_C + RUST_D;
+kernel! {
+    const B: f32 = 1.0 + 1.0 / 4096.0;
+    const C: f32 = 1.0 + 1.0 / 4096.0;
+    const D: f32 = -(1.0 + 1.0 / 2048.0);
+    pub const CONTRACTION: f32 = B * C + D;
+    pub fn contracted() -> f32 { X + CONTRACTION }
+}
+
+/// A `const` never contracts `b * c + d` into one rounding, as rustc's
+/// const evaluator never does.
+#[test]
+fn a_const_never_contracts_as_rustc_never_does() {
+    assert_eq!(CONTRACTION, RUST_CONTRACTION);
+    assert_eq!(CONTRACTION, 0.0);
+    assert_eq!(
+        RUST_B.mul_add(RUST_C, RUST_D),
+        1.0 / 16_777_216.0,
+        "one rounding: 2^-24"
+    );
+    assert_eq!(Lattice::eval_at(&contracted(), 0.0, 0.0), RUST_CONTRACTION);
+}

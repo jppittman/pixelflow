@@ -649,9 +649,10 @@ impl OpKind {
     /// front end that re-lists method names itself is a second place for that
     /// mapping to drift from this one.
     ///
-    /// `.select(a, b)` resolves to [`OpKind::If`]: the method keeps its name
+    /// `.select(a, b)` resolves to [`OpKind::If`], the node `if m { a } else
+    /// { b }` lowers to. `if` is the spelling; the method keeps working
     /// until Phase B of docs/plans/2026-09-25-the-language-is-kernel.md
-    /// renames it `if`.
+    /// removes it (D15).
     #[must_use]
     pub fn from_method_call(name: &str, arg_count: usize) -> Option<Self> {
         let op = Self::from_name(name)?;
