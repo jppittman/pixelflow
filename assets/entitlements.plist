@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+    Notarization requires the hardened runtime, which by default kills the
+    process if it marks any memory executable that wasn't loaded from a
+    signed file. core-term hits this on the runtime code path traced below --
+    NOT at every call site that merely exists in the pixelflow-ir source tree,
+    which is a broader (and wrong) standard: pixelflow-compiler's `kernel!`
+    macro is proc-macro=true and runs entirely at build time, and
+    CompileWorkspace's MAP_JIT pattern (pixelflow-ir/src/backend/emit/mod.rs)
+    is only reachable from pixelflow-pipeline's benchmark binaries, which
+    core-term does not depend on.
+
+    The path that IS reachable at runtime: rendering a glyph
+    (pixelflow-graphics/src/fonts/cache.rs, atlas.rs) calls `.bake(kernel)`,
+    which goes through pixelflow_ir::jit_cache::compile_cached /
+    compile_collapse_cached -> compile_arena_dag / compile_collapse ->
+    ExecutableCode::from_code (pixelflow-ir/src/backend/emit/executable.rs) --
+    plain mmap + mprotect(PROT_EXEC), no MAP_JIT. That's what
+    allow-unsigned-executable-memory covers; allow-jit is NOT granted here
+    because CompileWorkspace's MAP_JIT path is not part of this binary.
+    -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>
