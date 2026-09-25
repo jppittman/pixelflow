@@ -5,27 +5,31 @@
 //!
 //! ## Symbol Classes
 //!
-//! PixelFlow has a two-layer symbol table that mirrors the contramap pattern:
-//!
 //! | Class      | Binding Time        | Arena Representation | Example |
 //! |------------|---------------------|----------------------|---------|
 //! | Intrinsic  | Collapse time       | `Var(0)`, `Var(1)`   | X, Y    |
 //! | Parameter  | Construction time   | `Param(i)`           | cx, r   |
+//! | Const      | Expansion time      | `Const(v)`           | PI      |
 //! | Local      | Expression scope    | A shared `ExprId`    | dx, dy  |
+//!
+//! A helper's parameters are a fourth thing at lowering — the argument's own
+//! node, bound by name where the helper is inlined — but to `sema` they are
+//! parameters like any other: a name with a type.
 //!
 //! ## Intrinsic Coordinates
 //!
 //! The intrinsic coordinates X and Y are special:
 //! - They become `Var(0)` and `Var(1)` arena nodes
-//! - They are always in scope, and nothing shadows them: `sema` refuses a
-//!   parameter or a `let` named X or Y
+//! - They are in scope in an entry, and nothing shadows them: `sema` refuses
+//!   a parameter or a `let` named X or Y, and refuses a use of one in a
+//!   helper
 //!
 //! ## Parameter Symbols
 //!
-//! Parameters declared in the closure syntax become the builder closure's
-//! arguments: `|cx: f32, cy: f32|` produces `move |cx: f32, cy: f32| -> Kernel`,
-//! and each reference in the body is a `Param(i)` arena node the builder
-//! substitutes with the argument.
+//! An entry's parameters become the host function's arguments: `|cx: f32,
+//! cy: f32|` produces `move |cx: f32, cy: f32| -> Kernel`, and each reference
+//! in the body is a `Param(i)` arena node the builder substitutes with the
+//! argument.
 //!
 //! ## Scoping
 //!
@@ -42,9 +46,8 @@
 //! never removed anything, so an inner `let` replaced an outer one for the
 //! rest of the kernel.
 
-use proc_macro2::Span;
+use crate::sema::Ty;
 use std::collections::HashMap;
-use syn::{Ident, Type};
 
 /// The binding class of a symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,9 +56,12 @@ pub enum SymbolKind {
     /// Bound at collapse time, as a `Var` node.
     Intrinsic,
 
-    /// Captured scalar parameter from closure syntax (e.g., `r: f32`).
-    /// Bound at construction time, accessed via `self.name`.
+    /// A declared parameter (e.g., `r: f32`): an entry's is bound when its
+    /// host function runs, a helper's where the helper is inlined.
     Parameter,
+
+    /// A `const` item, evaluated at expansion.
+    Const,
 
     /// Local variable introduced by `let`.
     /// Scoped to the containing block.
@@ -63,19 +69,12 @@ pub enum SymbolKind {
 }
 
 /// A symbol in the symbol table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Symbol {
-    /// The identifier name.
-    #[allow(dead_code)]
-    pub name: Ident,
     /// What kind of symbol this is.
     pub kind: SymbolKind,
-    /// The type (if known). Intrinsics have implicit types.
-    #[allow(dead_code)]
-    pub ty: Option<Type>,
-    /// Where the symbol was defined.
-    #[allow(dead_code)]
-    pub span: Span,
+    /// The symbol's type.
+    pub ty: Ty,
 }
 
 /// Rust's lexical scoping over bindings of `V`.
@@ -84,9 +83,9 @@ pub struct Symbol {
 /// through this, which is what makes them agree on what it refers to.
 #[derive(Debug, Clone)]
 pub struct Scopes<V> {
-    /// The kernel's own scope first — its coordinates and parameters — then
-    /// one per enclosing block, innermost last. Never empty: the kernel's
-    /// scope is not a block and is never popped.
+    /// The function's own scope first — its coordinates, parameters and the
+    /// block's items — then one per enclosing block, innermost last. Never
+    /// empty: the function's scope is not a block and is never popped.
     frames: Vec<HashMap<String, V>>,
 }
 
@@ -109,7 +108,7 @@ impl<V> Scopes<V> {
     pub fn pop_scope(&mut self) {
         assert!(
             self.frames.len() > 1,
-            "popped a scope that was never pushed: the kernel's own scope is not a block"
+            "popped a scope that was never pushed: the function's own scope is not a block"
         );
         self.frames.pop();
     }
@@ -119,7 +118,7 @@ impl<V> Scopes<V> {
     pub fn bind(&mut self, name: String, value: V) {
         self.frames
             .last_mut()
-            .expect("the kernel's own scope is never popped")
+            .expect("the function's own scope is never popped")
             .insert(name, value);
     }
 
@@ -135,61 +134,51 @@ impl<V> Scopes<V> {
     }
 }
 
-/// The symbol table for a kernel compilation.
+/// The symbol table for one function's analysis.
 #[derive(Debug, Clone)]
 pub struct SymbolTable {
     symbols: Scopes<Symbol>,
 }
 
 impl SymbolTable {
+    /// The coordinate intrinsics. A lattice has two axes; `Z` and `W` are
+    /// refused by name in sema, with the message that points at uniforms.
+    pub const COORDINATES: [&'static str; 2] = ["X", "Y"];
+
     /// Create a new symbol table with intrinsic coordinates pre-populated.
     pub fn new() -> Self {
         let mut table = SymbolTable {
             symbols: Scopes::default(),
         };
-
-        // Register intrinsic coordinate variables. A lattice has two axes;
-        // `Z` and `W` are refused by name in sema, with the message that
-        // points at uniforms.
-        for name in ["X", "Y"] {
+        for name in Self::COORDINATES {
             table.symbols.bind(
                 name.to_string(),
                 Symbol {
-                    name: Ident::new(name, Span::call_site()),
                     kind: SymbolKind::Intrinsic,
-                    ty: None, // Intrinsics are polymorphic over Numeric
-                    span: Span::call_site(),
+                    ty: Ty::F32,
                 },
             );
         }
-
         table
     }
 
-    /// Register a scalar parameter symbol (e.g., `r: f32`).
-    pub fn register_parameter(&mut self, name: Ident, ty: Type) {
-        self.symbols.bind(
-            name.to_string(),
-            Symbol {
-                name,
-                kind: SymbolKind::Parameter,
-                ty: Some(ty),
-                span: Span::call_site(),
-            },
-        );
+    /// Register a parameter symbol (e.g., `r: f32`).
+    pub fn register_parameter(&mut self, name: &str, ty: Ty) {
+        self.bind(name, SymbolKind::Parameter, ty);
+    }
+
+    /// Register a `const` item. Every const is an `f32`.
+    pub fn register_const(&mut self, name: &str) {
+        self.bind(name, SymbolKind::Const, Ty::F32);
     }
 
     /// Register a local variable in the innermost scope.
-    pub fn register_local(&mut self, name: Ident, ty: Option<Type>) {
-        self.symbols.bind(
-            name.to_string(),
-            Symbol {
-                name,
-                kind: SymbolKind::Local,
-                ty,
-                span: Span::call_site(),
-            },
-        );
+    pub fn register_local(&mut self, name: &str, ty: Ty) {
+        self.bind(name, SymbolKind::Local, ty);
+    }
+
+    fn bind(&mut self, name: &str, kind: SymbolKind, ty: Ty) {
+        self.symbols.bind(name.to_string(), Symbol { kind, ty });
     }
 
     /// Look up the innermost binding of a name in scope.
@@ -203,7 +192,7 @@ impl SymbolTable {
             .is_some_and(|s| s.kind == SymbolKind::Intrinsic)
     }
 
-    /// Check if a name is a captured parameter.
+    /// Check if a name is a declared parameter.
     #[cfg(test)]
     pub fn is_parameter(&self, name: &str) -> bool {
         self.lookup(name)
@@ -250,21 +239,17 @@ mod tests {
     #[test]
     fn register_parameter_marks_name_as_parameter_and_not_intrinsic() {
         let mut table = SymbolTable::new();
-        let ident = Ident::new("radius", Span::call_site());
-        let ty: Type = syn::parse_quote!(f32);
-        table.register_parameter(ident, ty);
+        table.register_parameter("radius", Ty::F32);
 
         assert!(table.is_parameter("radius"));
         assert!(!table.is_intrinsic("radius"));
+        assert_eq!(table.lookup("radius").map(|s| s.ty), Some(Ty::F32));
     }
 
     #[test]
     fn all_names_lists_intrinsics_and_every_registered_parameter() {
         let mut table = SymbolTable::new();
-        table.register_parameter(
-            Ident::new("radius", Span::call_site()),
-            syn::parse_quote!(f32),
-        );
+        table.register_parameter("radius", Ty::F32);
 
         let names: std::collections::HashSet<String> = table.all_names().collect();
         let expected: std::collections::HashSet<String> =
@@ -276,7 +261,7 @@ mod tests {
     fn pop_scope_removes_locals_registered_since_the_matching_push_scope() {
         let mut table = SymbolTable::new();
         table.push_scope();
-        table.register_local(Ident::new("dx", Span::call_site()), None);
+        table.register_local("dx", Ty::F32);
         assert!(table.lookup("dx").is_some());
 
         table.pop_scope();
@@ -293,14 +278,16 @@ mod tests {
     #[test]
     fn pop_scope_restores_the_binding_a_local_shadowed() {
         let mut table = SymbolTable::new();
-        table.register_parameter(Ident::new("r", Span::call_site()), syn::parse_quote!(f32));
+        table.register_parameter("r", Ty::F32);
         table.push_scope();
-        table.register_local(Ident::new("r", Span::call_site()), None);
+        table.register_local("r", Ty::Bool);
         assert_eq!(table.lookup("r").map(|s| s.kind), Some(SymbolKind::Local));
+        assert_eq!(table.lookup("r").map(|s| s.ty), Some(Ty::Bool));
 
         table.pop_scope();
 
         assert!(table.is_parameter("r"));
+        assert_eq!(table.lookup("r").map(|s| s.ty), Some(Ty::F32));
     }
 
     #[test]
