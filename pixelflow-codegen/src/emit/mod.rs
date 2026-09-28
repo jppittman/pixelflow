@@ -4306,6 +4306,195 @@ mod tests {
     use super::*;
     use pixelflow_ir::arena::{ExprArena, ExprId};
 
+    /// [`Label`], [`Assembly`] and [`PtrReg`] — every other test in this file
+    /// reaches them only incidentally, through a full compile.
+    mod assembler_primitives {
+        use super::*;
+
+        /// A single fixed byte: an `AsmInsn` with no encoding logic of its
+        /// own, so a test can assert on exactly what a program emitted
+        /// without depending on any real backend's instruction encoding.
+        #[derive(Copy, Clone)]
+        struct Byte(u8);
+
+        impl AsmInsn for Byte {
+            fn emit_into(self, code: &mut Vec<u8>) {
+                code.push(self.0);
+            }
+        }
+
+        #[test]
+        fn label_as_str_returns_the_name_it_was_constructed_with() {
+            assert_eq!(Label::new("row_top").as_str(), "row_top");
+        }
+
+        #[test]
+        #[should_panic(expected = "longer than")]
+        fn label_new_panics_when_the_name_is_longer_than_its_capacity() {
+            let too_long = "x".repeat(Label::CAPACITY + 1);
+            let _unreachable = Label::new(&too_long);
+        }
+
+        #[test]
+        fn label_display_writes_the_plain_name_without_quotes() {
+            assert_eq!(format!("{}", Label::new("batch_exit")), "batch_exit");
+        }
+
+        #[test]
+        fn label_debug_writes_the_name_in_quotes() {
+            assert_eq!(format!("{:?}", Label::new("batch_exit")), "\"batch_exit\"");
+        }
+
+        #[test]
+        fn assembly_with_capacity_reserves_room_without_writing_any_bytes() {
+            let asm = Assembly::with_capacity(64);
+            assert!(asm.code.is_empty());
+            assert!(asm.code.capacity() >= 64);
+        }
+
+        #[test]
+        fn ptr_reg_raw_returns_the_underlying_register_index() {
+            assert_eq!(PtrReg(11).raw(), 11);
+        }
+
+        /// `AsmProgram` is itself an [`AsmInsn`] (`emit_into` delegates to
+        /// `assemble`), so one can be embedded inside another and assembled
+        /// as a unit — the nesting `AsmProgram::assemble`'s own doc calls
+        /// the declarative counterpart of pushing into an [`Assembly`].
+        #[test]
+        fn a_nested_asm_program_emits_its_inner_instructions_in_order() {
+            let inner = AsmProgram::from([Byte(1), Byte(2)]);
+            let outer = AsmProgram::new([Item::Inst(inner), Item::Inst(inner)]);
+            let mut code = Vec::new();
+            outer.assemble(&mut code);
+            assert_eq!(code, vec![1, 2, 1, 2]);
+        }
+    }
+
+    /// [`Loc`] and [`Binding`]'s own accessor/conversion methods — every
+    /// other test in this file reaches them only incidentally, by reading a
+    /// `Binding` a real allocation produced.
+    mod loc_and_binding {
+        use super::*;
+
+        fn slot() -> Slot {
+            Slot::new(16, 32)
+        }
+
+        #[test]
+        fn loc_source_storage_wraps_every_variant_in_some() {
+            assert_eq!(
+                Loc::Reg(Reg(3)).source_storage(),
+                Some(Storage::Reg(Reg(3)))
+            );
+            assert_eq!(
+                Loc::Ptr(PtrReg(5)).source_storage(),
+                Some(Storage::Ptr(PtrReg(5)))
+            );
+            assert_eq!(
+                Loc::Slot(slot()).source_storage(),
+                Some(Storage::Slot(slot()))
+            );
+        }
+
+        #[test]
+        fn binding_as_loc_returns_the_location_when_not_rematerialized() {
+            assert_eq!(
+                Binding::Loc(Loc::Reg(Reg(2))).as_loc(),
+                Some(Loc::Reg(Reg(2)))
+            );
+        }
+
+        #[test]
+        fn binding_as_loc_returns_none_when_rematerialized() {
+            assert_eq!(Binding::Remat(0x3f80_0000).as_loc(), None);
+        }
+
+        #[test]
+        fn binding_as_storage_returns_the_storage_when_not_rematerialized() {
+            assert_eq!(
+                Binding::Loc(Loc::Slot(slot())).as_storage(),
+                Some(Storage::Slot(slot()))
+            );
+        }
+
+        #[test]
+        fn binding_as_slot_returns_the_slot_when_the_binding_is_a_spilled_location() {
+            assert_eq!(Binding::Loc(Loc::Slot(slot())).as_slot(), Some(slot()));
+        }
+
+        #[test]
+        fn binding_as_slot_returns_none_for_a_register_or_a_rematerialized_constant() {
+            assert_eq!(Binding::Loc(Loc::Reg(Reg(0))).as_slot(), None);
+            assert_eq!(Binding::Remat(0).as_slot(), None);
+        }
+
+        #[test]
+        fn binding_source_storage_delegates_to_as_storage() {
+            assert_eq!(
+                Binding::Loc(Loc::Ptr(PtrReg(9))).source_storage(),
+                Some(Storage::Ptr(PtrReg(9)))
+            );
+            assert_eq!(Binding::Remat(1).source_storage(), None);
+        }
+    }
+
+    /// `IsaBackend::test_ge`'s default body: every backend but AVX-512
+    /// (which overrides it for its k-register comparison model) inherits
+    /// this, delegating straight to `alu(Ge, ...)` — the fold loop's trip
+    /// test is an ordinary comparison, nothing more. Every other test that
+    /// reaches a `Reduce` loop compiles through this host's *native* tier,
+    /// so on an AVX-512 host the default body is never reached by any of
+    /// them (AVX-512's own override is); this pins it directly against an
+    /// explicit AVX2 backend regardless of what the host natively is.
+    #[test]
+    fn test_ge_defaults_to_an_ordinary_ge_comparison() {
+        let mut alu_code = Vec::new();
+        avx2::driver::Avx2Backend::new(EmitCtx::default()).alu(
+            &mut alu_code,
+            OpKind::Ge,
+            Reg(4),
+            [Reg(5), Reg(6)],
+        );
+
+        let mut default_code = Vec::new();
+        avx2::driver::Avx2Backend::new(EmitCtx::default()).test_ge(
+            &mut default_code,
+            Reg(4),
+            [Reg(5), Reg(6)],
+            None,
+        );
+
+        assert_eq!(default_code, alu_code);
+    }
+
+    /// `schedule_variance`'s `Var` boundary — every other test reaches it
+    /// only through a full compile, whose `Var` indices never happen to sit
+    /// exactly at [`pixelflow_ir::variance::Variance::VARIABLES`].
+    mod schedule_variance_tests {
+        use super::*;
+        use pixelflow_ir::variance::Variance;
+
+        fn one_var(idx: u8) -> Variance {
+            let schedule = [regalloc::Def {
+                value: regalloc::ValueId(0),
+                op: ScheduledOp::Var(idx),
+            }];
+            schedule_variance(&schedule)[0]
+        }
+
+        #[test]
+        fn schedule_variance_names_the_last_in_range_variable_directly() {
+            let idx = Variance::VARIABLES - 1;
+            assert_eq!(one_var(idx), Variance::from_var(idx));
+        }
+
+        #[test]
+        fn schedule_variance_treats_an_index_at_variables_as_every_variable() {
+            assert_eq!(one_var(Variance::VARIABLES), Variance::ALL);
+        }
+    }
+
     /// Lanes in one SIMD batch at the tier this host selected.
     fn lanes() -> usize {
         crate::isa::jit_vector_bytes() / core::mem::size_of::<f32>()
@@ -5504,6 +5693,71 @@ mod tests {
     }
 
     // =========================================================================
+    // operand_sources unit tests — MulAdd's destination choice depends on
+    // residency, and every other test reaches it only through the full
+    // resolve_operands/compile pipeline.
+    // =========================================================================
+
+    fn v(n: u32) -> regalloc::ValueId {
+        regalloc::ValueId(n)
+    }
+
+    fn mul_add() -> ScheduledOp {
+        ScheduledOp::Ternary(OpKind::MulAdd, v(0), v(1), v(2))
+    }
+
+    /// Both multiplicands resident: the fused `FMA` form is used, so the
+    /// non-resident addend is the one read straight into the destination.
+    #[test]
+    fn operand_sources_puts_the_addend_in_the_destination_when_both_multiplicands_are_resident() {
+        let sources = operand_sources(&mul_add(), [true, true, false]);
+        assert_eq!(
+            sources,
+            [
+                OperandSource::Resident,
+                OperandSource::Resident,
+                OperandSource::Destination,
+            ]
+        );
+        assert_eq!(reloads_wanted(sources), 0);
+    }
+
+    /// Only one multiplicand resident: still the fused form — the guard
+    /// requires *both* multiplicands non-resident, not just one, to switch
+    /// to the decomposed form. This is what distinguishes `&&` from `||` in
+    /// the guard: an `||` would wrongly take the decomposed path here.
+    #[test]
+    fn operand_sources_still_fuses_when_only_one_multiplicand_needs_reloading() {
+        let sources = operand_sources(&mul_add(), [false, true, false]);
+        assert_eq!(
+            sources,
+            [
+                OperandSource::Reload(0),
+                OperandSource::Resident,
+                OperandSource::Destination,
+            ]
+        );
+        assert_eq!(reloads_wanted(sources), 1);
+    }
+
+    /// Both multiplicands need reloading: the decomposed `FMUL`/`FADD` form
+    /// is used, so the product goes into the destination and the addend (if
+    /// resident) needs no reload of its own.
+    #[test]
+    fn operand_sources_decomposes_into_the_destination_when_both_multiplicands_need_reloading() {
+        let sources = operand_sources(&mul_add(), [false, false, true]);
+        assert_eq!(
+            sources,
+            [
+                OperandSource::Destination,
+                OperandSource::Reload(0),
+                OperandSource::Resident,
+            ]
+        );
+        assert_eq!(reloads_wanted(sources), 1);
+    }
+
+    // =========================================================================
     // resolve_operands unit tests — the spill logic that was buggy
     // =========================================================================
 
@@ -5559,7 +5813,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_binary_no_spills() {
+    fn resolve_operands_reads_both_operands_directly_when_neither_is_spilled() {
         // left=v4, right=v5, dst=v6 — all in registers
         let locs = make_locs(&[(0, 4), (1, 5), (2, 6)], &[]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -5584,7 +5838,7 @@ mod tests {
     /// costs no reservation at all — which is why a binary never needs two,
     /// however many of its operands are in memory.
     #[test]
-    fn resolve_binary_left_spilled() {
+    fn resolve_operands_reloads_a_spilled_left_operand_into_the_destination() {
         // left spilled at offset 0, right in v5
         let locs = make_locs(&[(1, 5), (2, 6)], &[(0, 0)]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -5611,7 +5865,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_binary_both_spilled() {
+    fn resolve_operands_reloads_both_operands_when_both_are_spilled() {
         // Both spilled: left → dst (temp trick), right → tmp_op
         let locs = make_locs(&[(2, 6)], &[(0, 0), (1, 16)]);
         let op = ScheduledOp::Binary(OpKind::Mul, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -5687,7 +5941,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_muladd_fmla_path() {
+    fn resolve_operands_fuses_muladd_into_one_fmla_when_every_operand_is_resident() {
         // a in reg, b in reg, c in reg → FMLA with setup_mov for c→dst
         let locs = make_locs(&[(0, 4), (1, 5), (2, 7), (3, 8)], &[]);
         let op = ScheduledOp::Ternary(
@@ -5712,8 +5966,45 @@ mod tests {
         );
     }
 
+    /// Only one multiplicand spilled: still the fused FMLA path, same as
+    /// when neither is. This is what distinguishes `&&` from a wrongly
+    /// lenient `||` in the decompose guard -- an `||` would wrongly
+    /// decompose here.
     #[test]
-    fn resolve_muladd_decomposed_both_ab_spilled() {
+    fn resolve_operands_still_fuses_muladd_when_only_one_multiplicand_is_spilled() {
+        // a spilled, b and c in registers
+        let locs = make_locs(&[(1, 5), (2, 7), (3, 8)], &[(0, 0)]);
+        let op = ScheduledOp::Ternary(
+            OpKind::MulAdd,
+            regalloc::ValueId(0),
+            regalloc::ValueId(1),
+            regalloc::ValueId(2),
+        );
+        let plan =
+            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+
+        assert_eq!(plan.reloads.len(), 1);
+        assert_eq!(
+            plan.reloads[0],
+            Reload::FromStack {
+                target: RELOAD[0],
+                slot: Slot::new(0, 16),
+            }
+        );
+        assert_eq!(plan.setup_mov, Some((Reg(8), Reg(7))));
+        assert_eq!(
+            plan.op,
+            ResolvedOp::FusedMulAdd {
+                dst: Reg(8),
+                a: RELOAD[0],
+                b: Reg(5)
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_operands_decomposes_muladd_into_multiply_and_add_when_both_multiplicands_are_spilled()
+     {
         // a and b both spilled → decomposed FMUL+FADD path
         // c in register
         let locs = make_locs(&[(2, 7), (3, 8)], &[(0, 0), (1, 16)]);
@@ -5762,7 +6053,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_muladd_decomposed_all_three_spilled() {
+    fn resolve_operands_defers_the_addends_reload_past_the_multiply_when_all_three_muladd_operands_are_spilled()
+     {
         // a, b, c all spilled → decomposed with deferred c reload
         let locs = make_locs(&[(3, 8)], &[(0, 0), (1, 16), (2, 32)]);
         let op = ScheduledOp::Ternary(
@@ -5789,7 +6081,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_var_is_nop() {
+    fn resolve_operands_emits_no_instruction_for_a_var_already_in_its_register() {
         let locs = make_locs(&[(0, 0)], &[]);
         let op = ScheduledOp::Var(0);
         let plan =
@@ -5799,7 +6091,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_const() {
+    fn resolve_operands_loads_a_consts_bit_pattern_into_the_destination() {
         let locs = make_locs(&[(0, 6)], &[]);
         let op = ScheduledOp::Const(core::f32::consts::PI);
         let plan =
@@ -5875,7 +6167,7 @@ mod tests {
     }
 
     #[test]
-    fn arena_compile_simple() {
+    fn compile_adds_two_variables_without_touching_memory() {
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
@@ -5892,7 +6184,7 @@ mod tests {
     }
 
     #[test]
-    fn arena_compile_with_constant() {
+    fn compile_evaluates_arithmetic_with_a_constant_folded_in() {
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
         let two = arena.push_const(2.0);
@@ -5920,7 +6212,7 @@ mod tests {
     /// subject here — what spilling *does* — no longer depends on how small
     /// the pool can be made.
     #[test]
-    fn arena_compile_with_spills() {
+    fn compile_spills_and_still_computes_the_correct_sum_under_a_narrow_register_budget() {
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
@@ -5961,7 +6253,8 @@ mod tests {
     // The shared driver's Select short-circuit guard, on every backend that
     // has a JIT.
     //
-    // `sched_select_guards` below covers this path on whichever tier the
+    // `compile_takes_the_correct_select_arm_under_the_guard_short_circuit`
+    // below covers this path on whichever tier the
     // host runs, and `avx512_select_guards` covers AVX-512 by name. aarch64
     // had no guard test at all, which mattered because
     // that is the one backend whose guard needs a scratch register: reducing a
@@ -7144,7 +7437,7 @@ mod tests {
         /// so it compiled one function twice and asserted it equalled
         /// itself; only the ground-truth comparison was load-bearing.
         #[test]
-        fn sched_no_spill_is_correct() {
+        fn compile_fits_a_three_input_expression_without_spilling_and_computes_the_correct_value() {
             // f = sqrt(X*X + Y*Y) - Y*U, a non-commutative shape whose third
             // input is the kernel's argument rather than a third coordinate.
             let mut a = ExprArena::new();
@@ -7176,7 +7469,8 @@ mod tests {
         /// A wide expression that exceeds the allocatable registers must spill
         /// and still compute the right answer.
         #[test]
-        fn sched_spills_and_is_correct() {
+        fn compile_spills_a_wide_reduction_at_the_register_floor_and_still_computes_the_correct_sum()
+         {
             // sum_{i=1..=10} (X + i) * (Y + i), as a balanced tree, against a
             // pool at the floor: more live at once than seven registers hold.
             let mut a = ExprArena::new();
@@ -7233,7 +7527,7 @@ mod tests {
         /// the kernel's arguments alone would be lattice-invariant and hoist
         /// out of the body entirely, leaving nothing for a guard to skip.
         #[test]
-        fn sched_select_guards() {
+        fn compile_takes_the_correct_select_arm_under_the_guard_short_circuit() {
             let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
