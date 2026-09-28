@@ -177,8 +177,11 @@ impl EngineCore {
             DisplayEvent::FocusLost { .. } => {
                 out.app = Some(EngineEvent::Management(EngineEventManagement::FocusLost));
             }
-            DisplayEvent::PasteData { text } => {
-                out.app = Some(EngineEvent::Management(EngineEventManagement::Paste(text)));
+            DisplayEvent::PasteData { selection, text } => {
+                out.app = Some(EngineEvent::Management(EngineEventManagement::Paste {
+                    selection,
+                    text,
+                }));
             }
             DisplayEvent::ScaleChanged { id, scale } => {
                 log::debug!("Relaying ScaleChanged: id={}, scale={}", id.0, scale);
@@ -186,12 +189,6 @@ impl EngineCore {
                     id,
                     scale,
                 }));
-            }
-            DisplayEvent::ClipboardDataRequested => {
-                unimplemented!("Clipboard data requested")
-            }
-            DisplayEvent::WindowDestroyed { .. } => {
-                unimplemented!("window destroyed, forward to app unimplemented");
             }
         }
     }
@@ -244,9 +241,6 @@ impl Transducer for EngineCore {
             EngineControl::GreenReady(..) => {
                 unreachable!("handled by the engine shell")
             }
-            EngineControl::DriverAck => {
-                unimplemented!("DriverAck not yet implemented");
-            }
         }
         Ok(out)
     }
@@ -277,11 +271,19 @@ impl Transducer for EngineCore {
                     height,
                 });
             }
-            AppManagement::CopyToClipboard(text) => {
-                out.driver_control = Some(DisplayControl::Copy { text });
+            AppManagement::Copy { selection, text } => {
+                out.driver_control = Some(DisplayControl::Copy { selection, text });
             }
-            AppManagement::RequestPaste => {
-                out.driver_control = Some(DisplayControl::RequestPaste);
+            AppManagement::RequestPaste(selection) => {
+                out.driver_control = Some(DisplayControl::RequestPaste { selection });
+            }
+            AppManagement::ToggleFullscreen => {
+                out.driver_control = Some(DisplayControl::ToggleFullscreen {
+                    id: WindowId::PRIMARY,
+                });
+            }
+            AppManagement::Bell => {
+                out.driver_control = Some(DisplayControl::Bell);
             }
             AppManagement::SetCursorIcon(icon) => {
                 out.driver_control = Some(DisplayControl::SetCursor {
@@ -407,6 +409,65 @@ mod tests {
             matches!(out.coordinator, Some(CoordinatorData::Submit(_))),
             "a new scene must be forwarded to the coordinator"
         );
+    }
+
+    #[test]
+    fn a_paste_request_names_its_selection_to_the_driver() {
+        let mut core = EngineCore::new();
+        let out = core
+            .step_management(AppManagement::RequestPaste(
+                crate::input::Selection::Primary,
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            out.driver_control,
+            Some(DisplayControl::RequestPaste {
+                selection: crate::input::Selection::Primary
+            })
+        ));
+    }
+
+    #[test]
+    fn a_paste_answer_reaches_the_app_with_its_selection() {
+        let mut core = EngineCore::new();
+        let out = core
+            .step_data(EngineData::FromDriver(DisplayEvent::PasteData {
+                selection: crate::input::Selection::Primary,
+                text: "picked".to_string(),
+            }))
+            .unwrap();
+
+        match out.app {
+            Some(EngineEvent::Management(EngineEventManagement::Paste { selection, text })) => {
+                assert_eq!(selection, crate::input::Selection::Primary);
+                assert_eq!(text, "picked");
+            }
+            other => panic!("expected the paste answer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fullscreen_request_toggles_the_primary_window() {
+        let mut core = EngineCore::new();
+        let out = core
+            .step_management(AppManagement::ToggleFullscreen)
+            .unwrap();
+
+        assert!(matches!(
+            out.driver_control,
+            Some(DisplayControl::ToggleFullscreen {
+                id: WindowId::PRIMARY
+            })
+        ));
+    }
+
+    #[test]
+    fn an_app_bell_rings_the_driver_bell() {
+        let mut core = EngineCore::new();
+        let out = core.step_management(AppManagement::Bell).unwrap();
+
+        assert!(matches!(out.driver_control, Some(DisplayControl::Bell)));
     }
 
     #[test]

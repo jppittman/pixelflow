@@ -6,7 +6,8 @@ use crate::io::event_monitor_actor::{PtyWriterHandle, WriterControl};
 use crate::io::traits::PtySender;
 use crate::io::Resize;
 use crate::messages::TerminalData;
-use crate::term::{EmulatorInput, TerminalEmulator};
+use crate::term::action::{Selection, SelectionReport};
+use crate::term::{EmulatorAction, EmulatorInput, TerminalEmulator, UserInputAction};
 use actor_scheduler::{
     Actor, ActorBuilder, ActorHandle, ActorStatus, HandlerError, HandlerResult, Message,
     SystemStatus,
@@ -28,16 +29,22 @@ impl TerminalAppSender {
     }
 }
 
-/// Feeds a PTY batch to the emulator: text as runs, commands one at a time.
-struct EmulatorSink<'a>(&'a mut TerminalEmulator);
+/// Feeds a PTY batch to the emulator: text as runs, commands one at a time,
+/// keeping every action the commands ask for so none is lost.
+struct EmulatorSink<'a> {
+    emulator: &'a mut TerminalEmulator,
+    actions: &'a mut Vec<EmulatorAction>,
+}
 
 impl AnsiSink for EmulatorSink<'_> {
     fn text(&mut self, run: &str) {
-        self.0.print_text(run);
+        self.emulator.print_text(run);
     }
 
     fn command(&mut self, command: AnsiCommand) {
-        self.0.interpret_input(EmulatorInput::Ansi(command));
+        if let Some(action) = self.emulator.interpret_input(EmulatorInput::Ansi(command)) {
+            self.actions.push(action);
+        }
     }
 }
 
@@ -58,9 +65,11 @@ impl PtySender for TerminalAppSender {
 use pixelflow_graphics::fonts::loader::{LoadedFont, MmapSource};
 use pixelflow_graphics::fonts::GlyphAtlas;
 use pixelflow_runtime::api::private::EngineData;
-use pixelflow_runtime::api::public::AppData;
 use pixelflow_runtime::api::public::EngineHandle;
+use pixelflow_runtime::api::public::{AppData, AppManagement};
+use pixelflow_runtime::input::MouseButton;
 use pixelflow_runtime::{EngineEventControl, EngineEventData, EngineEventManagement};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Font filename (looked up in multiple locations)
@@ -142,6 +151,13 @@ pub struct TerminalApp {
     /// Currently pressed mouse button, tracked for motion reporting.
     /// Set on MouseClick, cleared on MouseRelease.
     pressed_mouse_button: Option<pixelflow_runtime::input::MouseButton>,
+    /// Actions a PTY batch asked for, performed once the batch is applied.
+    /// Kept between batches so a steady stream of replies allocates nothing.
+    pty_actions: Vec<EmulatorAction>,
+    /// Selection reads asked of the engine and not yet answered, oldest
+    /// first, with what each answer is for. The engine answers every read
+    /// once, in order per selection.
+    clipboard_reads: VecDeque<(Selection, ClipboardRead)>,
     /// Device pixels per point of the current display (backing scale).
     /// The scene stays in point space; this is only a density hint for the
     /// glyph cache so bakes match the platform's sample lattice.
@@ -152,6 +168,14 @@ pub struct TerminalApp {
     /// kernels are compiled for, so it is part of the [`CellGridShape`] the
     /// recompile check compares.
     frame_px: [u32; 2],
+}
+
+/// What a selection read is for.
+enum ClipboardRead {
+    /// Paste the content into the program.
+    Paste,
+    /// Answer the program's OSC 52 query with it.
+    Report(SelectionReport),
 }
 
 /// The compiled cell-grid scene, the metric it is drawn at, and that
@@ -216,6 +240,100 @@ impl TerminalApp {
         }
     }
 
+    /// Reports a mouse event to the program, in whatever encoding it asked for.
+    fn report_mouse(
+        &self,
+        button: MouseButton,
+        (x, y): (u32, u32),
+        kind: crate::term::MouseEventKind,
+    ) {
+        let (col, row) = self.emulator.cell_at(x, y);
+        let params = crate::term::MouseEncodingParams {
+            button,
+            col,
+            row,
+            kind,
+        };
+        if let Some(bytes) = self.emulator.encode_mouse_event(params) {
+            self.write_pty(bytes);
+        }
+    }
+
+    /// Hands a user action to the emulator and carries out what it asks for.
+    fn interpret_user_input(&mut self, input: UserInputAction) {
+        if let Some(action) = self.emulator.interpret_input(EmulatorInput::User(input)) {
+            self.perform(action);
+        }
+    }
+
+    /// Carries out what the emulator asked of the world outside it.
+    fn perform(&mut self, action: EmulatorAction) {
+        match action {
+            EmulatorAction::WritePty(bytes) => self.write_pty(bytes),
+            EmulatorAction::ResizePty { cols, rows } => self.resize_pty(cols, rows),
+            EmulatorAction::RequestRedraw => self.send_frame(),
+            EmulatorAction::Quit => self.request_quit(),
+            EmulatorAction::SetTitle(title) => self.request_engine(AppManagement::SetTitle(title)),
+            EmulatorAction::RingBell => self.request_engine(AppManagement::Bell),
+            EmulatorAction::Copy { selection, text } => {
+                self.request_engine(AppManagement::Copy { selection, text })
+            }
+            // The text comes back as `EngineEventManagement::Paste`.
+            EmulatorAction::RequestClipboardContent(selection) => {
+                self.read_selection(selection, ClipboardRead::Paste)
+            }
+            EmulatorAction::ReportSelection { selection, report } => {
+                if !self.config.behavior.allow_clipboard_read {
+                    log::debug!("OSC 52: clipboard reads are disabled; not answering");
+                    return;
+                }
+                self.read_selection(selection, ClipboardRead::Report(report))
+            }
+            EmulatorAction::ToggleFullscreen => {
+                self.request_engine(AppManagement::ToggleFullscreen)
+            }
+        }
+    }
+
+    /// Asks the engine for a selection's content, remembering what it is for.
+    fn read_selection(&mut self, selection: Selection, purpose: ClipboardRead) {
+        self.clipboard_reads.push_back((selection, purpose));
+        self.request_engine(AppManagement::RequestPaste(selection));
+    }
+
+    /// Delivers a selection's content to the read that asked for it. Content
+    /// nothing asked for is a paste.
+    fn selection_read(&mut self, selection: Selection, text: String) {
+        let purpose = self
+            .clipboard_reads
+            .iter()
+            .position(|(asked, _)| *asked == selection)
+            .and_then(|index| self.clipboard_reads.remove(index))
+            .map(|(_, purpose)| purpose);
+        match purpose {
+            Some(ClipboardRead::Report(report)) => self.write_pty(report.reply(&text)),
+            Some(ClipboardRead::Paste) | None if text.is_empty() => {}
+            Some(ClipboardRead::Paste) | None => {
+                self.interpret_user_input(UserInputAction::PasteText(text))
+            }
+        }
+    }
+
+    /// Asks the engine for something the terminal cannot do itself.
+    fn request_engine(&self, request: AppManagement) {
+        if let Err(e) = self.engine_tx.send(Message::Management(request)) {
+            log::warn!("Failed to send request to engine: {}", e);
+        }
+    }
+
+    /// Shuts the application down. Without an engine there is no window to
+    /// keep alive, so a failure to ask is fatal.
+    fn request_quit(&self) {
+        self.engine_tx
+            .send(Message::Management(AppManagement::Quit))
+            .expect("Failed to send Quit to engine");
+    }
+
     /// Resize the PTY via the writer's control lane (preempts queued writes).
     fn resize_pty(&self, cols: u16, rows: u16) {
         if let Err(e) = self
@@ -231,8 +349,7 @@ impl TerminalApp {
 
     /// Creates a new terminal app (internal - use spawn_terminal_app instead).
     fn new_registered(params: TerminalAppParamsRegistered) -> Self {
-        // Memory-map the font file from the appropriate location
-        let font_path = find_font_path();
+        let font_path = params.font_path;
         let source = MmapSource::open(&font_path).unwrap_or_else(|e| {
             panic!("Failed to open font file at {}: {}", font_path.display(), e)
         });
@@ -280,6 +397,8 @@ impl TerminalApp {
             has_presented: false,
             frame_px: [0, 0],
             pressed_mouse_button: None,
+            pty_actions: Vec::new(),
+            clipboard_reads: VecDeque::new(),
             density: 1.0,
         }
     }
@@ -543,17 +662,21 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 self.send_frame();
             }
             TerminalData::Pty(mut batch) => {
-                batch.drain_into(&mut EmulatorSink(&mut self.emulator));
-                // We don't necessarily send a frame here anymore, relying on VSync (RequestFrame)
-                // or we could trigger a redraw if we want immediate feedback (but risk flooding)
-                // For now, let's just update state. The next RequestFrame will pick it up.
+                // Drawing is left to the next vsync frame request; only the
+                // actions (replies to the shell, title, bell, ...) run now.
+                let mut actions = std::mem::take(&mut self.pty_actions);
+                batch.drain_into(&mut EmulatorSink {
+                    emulator: &mut self.emulator,
+                    actions: &mut actions,
+                });
+                for action in actions.drain(..) {
+                    self.perform(action);
+                }
+                self.pty_actions = actions;
             }
             TerminalData::ChildExited => {
-                use pixelflow_runtime::api::public::AppManagement;
                 log::info!("PTY child exited, shutting down");
-                self.engine_tx
-                    .send(Message::Management(AppManagement::Quit))
-                    .expect("Failed to send Quit to engine");
+                self.request_quit();
             }
         }
         Ok(())
@@ -586,7 +709,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 height_px,
             } => {
                 self.frame_px = [width_px, height_px];
-                use crate::term::{ControlEvent, EmulatorAction, EmulatorInput};
+                use crate::term::{ControlEvent, EmulatorInput};
                 // Convert u32 pixels to u16 for ControlEvent
                 // Saturate at u16::MAX to prevent overflow panics
                 let width_u16 = width_px.min(u16::MAX as u32) as u16;
@@ -597,11 +720,8 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                     height_px: height_u16,
                 });
 
-                // Process the resize and handle the resulting action
-                if let Some(EmulatorAction::ResizePty { cols, rows }) =
-                    self.emulator.interpret_input(input)
-                {
-                    self.resize_pty(cols, rows);
+                if let Some(action) = self.emulator.interpret_input(input) {
+                    self.perform(action);
                 }
 
                 // Request a redraw after resize
@@ -633,130 +753,67 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
     fn handle_management(&mut self, mgmt: EngineEventManagement) -> HandlerResult {
         match mgmt {
             EngineEventManagement::KeyDown { key, mods, text } => {
-                use crate::term::{EmulatorAction, EmulatorInput, UserInputAction};
-
-                let input = EmulatorInput::User(UserInputAction::KeyInput {
-                    symbol: key,
-                    modifiers: mods,
-                    text: text.map(std::borrow::Cow::Owned),
-                });
-
-                if let Some(action) = self.emulator.interpret_input(input) {
-                    match action {
-                        EmulatorAction::WritePty(bytes) => {
-                            self.write_pty(bytes);
-                        }
-                        EmulatorAction::Quit => {
-                            // Handle quit - send quit to engine
-                            use pixelflow_runtime::api::public::AppManagement;
-                            self.engine_tx
-                                .send(Message::Management(AppManagement::Quit))
-                                .expect("Failed to send Quit to engine");
-                        }
-                        EmulatorAction::SetTitle(_title) => {
-                            unimplemented!("EmulatorAction::SetTitle");
-                        }
-                        EmulatorAction::RingBell => {
-                            unimplemented!("EmulatorAction::RingBell");
-                        }
-                        EmulatorAction::RequestRedraw => {
-                            self.send_frame();
-                        }
-                        EmulatorAction::SetCursorVisibility(_visible) => {
-                            unimplemented!("EmulatorAction::SetCursorVisibility");
-                        }
-                        EmulatorAction::CopyToClipboard(_text) => {
-                            unimplemented!("EmulatorAction::CopyToClipboard");
-                        }
-                        EmulatorAction::RequestClipboardContent => {
-                            unimplemented!("EmulatorAction::RequestClipboardContent");
-                        }
-                        EmulatorAction::ResizePty { cols, rows } => {
-                            self.resize_pty(cols, rows);
-                        }
-                    }
-                }
+                // A bound chord is the terminal's own command; anything else
+                // is typing for the program.
+                let input = crate::keys::map_key_event_to_action(key, mods, &self.config)
+                    .unwrap_or(UserInputAction::KeyInput {
+                        symbol: key,
+                        modifiers: mods,
+                        text: text.map(std::borrow::Cow::Owned),
+                    });
+                self.interpret_user_input(input);
             }
             EngineEventManagement::MouseClick { button, x, y } => {
-                let col = (x / self.config.appearance.cell_width_px as u32) as usize;
-                let row = (y / self.config.appearance.cell_height_px as u32) as usize;
-                log::trace!(
-                    "Mouse click: button={:?} at cell ({}, {})",
-                    button,
-                    col,
-                    row
-                );
                 self.pressed_mouse_button = Some(button);
-                if let Some(bytes) =
-                    self.emulator
-                        .encode_mouse_event(crate::term::MouseEncodingParams {
-                            button,
-                            col,
-                            row,
-                            kind: crate::term::MouseEventKind::Press,
+                if self.emulator.is_mouse_tracking_active() {
+                    self.report_mouse(button, (x, y), crate::term::MouseEventKind::Press);
+                    return Ok(());
+                }
+                match button {
+                    MouseButton::Left => {
+                        self.interpret_user_input(UserInputAction::StartSelection {
+                            x_px: saturate_u16(x),
+                            y_px: saturate_u16(y),
                         })
-                {
-                    self.write_pty(bytes);
+                    }
+                    MouseButton::Middle => {
+                        self.interpret_user_input(UserInputAction::RequestPrimaryPaste)
+                    }
+                    _ => {}
                 }
             }
             EngineEventManagement::MouseRelease { button, x, y } => {
-                let col = (x / self.config.appearance.cell_width_px as u32) as usize;
-                let row = (y / self.config.appearance.cell_height_px as u32) as usize;
-                log::trace!(
-                    "Mouse release: button={:?} at cell ({}, {})",
-                    button,
-                    col,
-                    row
-                );
                 self.pressed_mouse_button = None;
-                if let Some(bytes) =
-                    self.emulator
-                        .encode_mouse_event(crate::term::MouseEncodingParams {
-                            button,
-                            col,
-                            row,
-                            kind: crate::term::MouseEventKind::Release,
-                        })
-                {
-                    self.write_pty(bytes);
+                if self.emulator.is_mouse_tracking_active() {
+                    self.report_mouse(button, (x, y), crate::term::MouseEventKind::Release);
+                    return Ok(());
+                }
+                if button == MouseButton::Left {
+                    self.interpret_user_input(UserInputAction::ApplySelectionClear);
                 }
             }
             EngineEventManagement::MouseMove { x, y, mods: _ } => {
-                let col = (x / self.config.appearance.cell_width_px as u32) as usize;
-                let row = (y / self.config.appearance.cell_height_px as u32) as usize;
-                log::trace!("Mouse move: cell ({}, {})", col, row);
-                // any-event mode (1003) reports all motion;
-                // button-event mode (1002) only reports motion while a button is held
+                // any-event mode (1003) reports all motion; button-event mode
+                // (1002) only motion while a button is held.
                 if self.emulator.reports_all_motion() {
-                    let button = self
-                        .pressed_mouse_button
-                        .unwrap_or(pixelflow_runtime::input::MouseButton::Left);
-                    if let Some(bytes) =
-                        self.emulator
-                            .encode_mouse_event(crate::term::MouseEncodingParams {
-                                button,
-                                col,
-                                row,
-                                kind: crate::term::MouseEventKind::Motion,
-                            })
-                    {
-                        self.write_pty(bytes);
-                    }
-                } else if self.emulator.reports_button_motion() {
-                    // button-event mode: only report when a button is held
+                    let button = self.pressed_mouse_button.unwrap_or(MouseButton::Left);
+                    self.report_mouse(button, (x, y), crate::term::MouseEventKind::Motion);
+                    return Ok(());
+                }
+                if self.emulator.reports_button_motion() {
                     if let Some(button) = self.pressed_mouse_button {
-                        if let Some(bytes) =
-                            self.emulator
-                                .encode_mouse_event(crate::term::MouseEncodingParams {
-                                    button,
-                                    col,
-                                    row,
-                                    kind: crate::term::MouseEventKind::Motion,
-                                })
-                        {
-                            self.write_pty(bytes);
-                        }
+                        self.report_mouse(button, (x, y), crate::term::MouseEventKind::Motion);
                     }
+                    return Ok(());
+                }
+                if self.emulator.is_mouse_tracking_active() {
+                    return Ok(());
+                }
+                if self.pressed_mouse_button == Some(MouseButton::Left) {
+                    self.interpret_user_input(UserInputAction::ExtendSelection {
+                        x_px: saturate_u16(x),
+                        y_px: saturate_u16(y),
+                    });
                 }
             }
             EngineEventManagement::MouseScroll {
@@ -770,8 +827,7 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 // When mouse tracking is active, report scroll as button press events
                 if self.emulator.is_mouse_tracking_active() && dy != 0.0 {
                     use pixelflow_runtime::input::MouseButton;
-                    let col = (x / self.config.appearance.cell_width_px as u32) as usize;
-                    let row = (y / self.config.appearance.cell_height_px as u32) as usize;
+                    let (col, row) = self.emulator.cell_at(x, y);
                     let button = if dy < 0.0 {
                         MouseButton::ScrollUp
                     } else {
@@ -799,19 +855,13 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
                 }
             }
             EngineEventManagement::FocusGained => {
-                log::trace!("Focus gained");
-                // Some applications care about focus for bracketed paste mode
-                // Could send \x1b[I if bracketed paste is enabled
+                self.interpret_user_input(UserInputAction::FocusGained);
             }
             EngineEventManagement::FocusLost => {
-                log::trace!("Focus lost");
-                // Some applications care about focus for bracketed paste mode
-                // Could send \x1b[O if bracketed paste is enabled
+                self.interpret_user_input(UserInputAction::FocusLost);
             }
-            EngineEventManagement::Paste(text) => {
-                log::trace!("Paste: {} bytes", text.len());
-                // Send pasted text to PTY
-                self.write_pty(text.into_bytes());
+            EngineEventManagement::Paste { selection, text } => {
+                self.selection_read(selection, text);
             }
         }
         Ok(())
@@ -821,6 +871,11 @@ impl Actor<TerminalData, EngineEventControl, EngineEventManagement> for Terminal
         // No polling needed - PTY data comes in via handle_data
         Ok(ActorStatus::Idle)
     }
+}
+
+/// A window coordinate as the emulator's selection actions take it.
+fn saturate_u16(px: u32) -> u16 {
+    u16::try_from(px).unwrap_or(u16::MAX)
 }
 
 /// Handles returned by [`spawn_terminal_app`]: a keep-alive handle for the
@@ -900,6 +955,7 @@ pub fn spawn_terminal_app(params: TerminalAppParams) -> std::io::Result<Terminal
         pty_writer: params.pty_writer,
         config: params.config,
         engine_tx,
+        font_path: find_font_path(),
     };
 
     let mut app = TerminalApp::new_registered(app_params_registered);
@@ -920,6 +976,8 @@ struct TerminalAppParamsRegistered {
     pty_writer: PtyWriterHandle,
     config: Config,
     engine_tx: EngineHandle,
+    /// The font file to memory-map.
+    font_path: std::path::PathBuf,
 }
 
 #[cfg(test)]
@@ -985,34 +1043,33 @@ mod tests {
         }
     }
 
+    /// The committed fallback font. The app's own font is LFS-tracked, and a
+    /// checkout without git-lfs holds a pointer there, not a font; the
+    /// fallback is exempt from LFS so these tests always run.
+    fn test_font_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../pixelflow-graphics/assets/DejaVuSansMono-Fallback.ttf")
+    }
+
     // Helper to create a test instance
     // Returns scheduler to keep doorbell channel alive during test
-    // Returns None if font is missing/invalid (e.g. LFS pointer), skipping the test.
-    fn create_test_app() -> Option<(
+    fn create_test_app() -> (
         TerminalApp,
         WriterScheduler,
         pixelflow_runtime::api::private::EngineActorHandle,
         pixelflow_runtime::api::private::EngineActorScheduler,
-    )> {
-        // Check font availability to avoid panic if LFS not present
-        let font_path = find_font_path();
-        if !font_path.exists() {
-            eprintln!(
-                "Test skipped: Font file not found at {}",
-                font_path.display()
-            );
-            return None;
-        }
-        if let Ok(metadata) = std::fs::metadata(&font_path) {
-            if metadata.len() < 1000 {
-                eprintln!(
-                    "Test skipped: Font file at {} appears to be an LFS pointer (size < 1000 bytes)",
-                    font_path.display()
-                );
-                return None;
-            }
-        }
+    ) {
+        create_test_app_with(Config::default())
+    }
 
+    fn create_test_app_with(
+        config: Config,
+    ) -> (
+        TerminalApp,
+        WriterScheduler,
+        pixelflow_runtime::api::private::EngineActorHandle,
+        pixelflow_runtime::api::private::EngineActorScheduler,
+    ) {
         let emulator = TerminalEmulator::new(80, 24);
         let (pty_writer, writer_rx) =
             ActorScheduler::<Vec<u8>, WriterControl, WriterManagement>::new(64, 128);
@@ -1028,24 +1085,21 @@ mod tests {
         let engine_scheduler =
             engine_builder.build_with_burst(10, actor_scheduler::ShutdownMode::default());
 
-        let config = Config::default();
         let params = TerminalAppParamsRegistered {
             emulator,
             pty_writer,
             config,
             engine_tx: EngineHandle::new_for_test(engine_tx_for_test),
+            font_path: test_font_path(),
         };
         let app = TerminalApp::new_registered(params);
 
-        Some((app, writer_rx, engine_tx, engine_scheduler))
+        (app, writer_rx, engine_tx, engine_scheduler)
     }
 
     #[test]
     fn it_should_resize_the_emulator_and_forward_a_pty_resize_on_control_resize() {
-        let (mut app, mut writer_rx, _, _scheduler) = match create_test_app() {
-            Some(v) => v,
-            None => return,
-        };
+        let (mut app, mut writer_rx, _, _scheduler) = create_test_app();
 
         // Initial size is 80x24
         let snapshot_initial = app.emulator.get_render_snapshot().expect("Snapshot");
@@ -1128,24 +1182,12 @@ mod tests {
         use crate::io::pty::{NixPty, PtyChannel, PtyConfig};
         use std::time::{Duration, Instant};
 
-        let font_path = find_font_path();
-        if !font_path.exists()
-            || std::fs::metadata(&font_path)
-                .map(|m| m.len() < 1000)
-                .unwrap_or(true)
-        {
-            eprintln!(
-                "Test skipped: usable font not found at {}",
-                font_path.display()
-            );
-            return;
-        }
-
         let pty = NixPty::spawn_with_config(&PtyConfig {
             command_executable: "/bin/sh",
             args: &["-c", "yes"],
             initial_cols: 80,
             initial_rows: 24,
+            working_directory: None,
         })
         .expect("spawn pty running yes");
         let child = pty.child_pid();
@@ -1179,6 +1221,7 @@ mod tests {
             pty_writer,
             config: Config::default(),
             engine_tx: EngineHandle::new_for_test(engine_tx),
+            font_path: test_font_path(),
         });
         let app_thread = std::thread::spawn(move || {
             app_rx.run(&mut app);
@@ -1221,7 +1264,7 @@ mod tests {
                 if !key_sent && Instant::now() >= key_at {
                     key_tx
                         .send(Message::Management(EngineEventManagement::KeyDown {
-                            key: pixelflow_runtime::input::KeySymbol::Char('\u{3}'),
+                            key: pixelflow_runtime::input::KeySymbol::Char('c'),
                             mods: pixelflow_runtime::input::Modifiers::CONTROL,
                             text: Some("\u{3}".to_string()),
                         }))
@@ -1266,10 +1309,7 @@ mod tests {
 
     #[test]
     fn it_should_write_the_typed_character_to_the_pty_on_keydown() {
-        let (mut app, mut writer_rx, _, _scheduler) = match create_test_app() {
-            Some(v) => v,
-            None => return,
-        };
+        let (mut app, mut writer_rx, _, _scheduler) = create_test_app();
 
         // Simulate KeyDown
         let key_event = EngineEventManagement::KeyDown {
@@ -1287,10 +1327,12 @@ mod tests {
         assert_eq!(probe.data, vec![vec![b'a']]);
     }
 
-    /// Test double for the engine actor: records the scenes the app renders.
+    /// Test double for the engine actor: records the scenes the app renders
+    /// and the requests it makes.
     #[derive(Default)]
     struct EngineProbe {
         scenes: Vec<Scene>,
+        requests: Vec<pixelflow_runtime::api::public::AppManagement>,
     }
 
     impl
@@ -1314,8 +1356,9 @@ mod tests {
         }
         fn handle_management(
             &mut self,
-            _msg: pixelflow_runtime::api::public::AppManagement,
+            msg: pixelflow_runtime::api::public::AppManagement,
         ) -> HandlerResult {
+            self.requests.push(msg);
             Ok(())
         }
         fn handle_os(&mut self, _status: SystemStatus) -> Result<ActorStatus, HandlerError> {
@@ -1352,10 +1395,7 @@ mod tests {
         use pixelflow_graphics::render::color::PlatformPixel;
         use pixelflow_graphics::render::frame::Frame;
 
-        let (mut app, _writer_rx, _tx, mut engine_scheduler) = match create_test_app() {
-            Some(v) => v,
-            None => return,
-        };
+        let (mut app, _writer_rx, _tx, mut engine_scheduler) = create_test_app();
         let (r, g, b, _) = app.config.colors.background.to_f32_rgba();
         let close = |got: u8, want: f32| (got as f32 - want * 255.0).abs() <= 2.0;
 
@@ -1399,6 +1439,310 @@ mod tests {
             close(px.r(), r) && close(px.g(), g) && close(px.b(), b),
             "post-resize scene pixel {:?} != default background ({r}, {g}, {b})",
             (px.r(), px.g(), px.b()),
+        );
+    }
+
+    /// PTY output, as the parser actor delivers it.
+    fn pty(bytes: &[u8]) -> TerminalData {
+        use crate::ansi::{AnsiParser, AnsiProcessor};
+        TerminalData::Pty(AnsiProcessor::new().process_bytes(bytes))
+    }
+
+    #[test]
+    fn a_device_status_request_from_the_shell_is_answered_on_the_pty() {
+        let (mut app, mut writer_rx, _tx, _engine) = create_test_app();
+
+        app.handle_data(pty(b"\x1b[6n")).expect("pty data");
+
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert_eq!(probe.data, vec![b"\x1b[1;1R".to_vec()]);
+    }
+
+    #[test]
+    fn a_bell_from_the_shell_rings_the_engine_bell() {
+        let (mut app, _writer_rx, _tx, mut engine) = create_test_app();
+
+        app.handle_data(pty(b"\x07")).expect("pty data");
+
+        let mut probe = EngineProbe::default();
+        drain_engine(&mut engine, &mut probe);
+        assert!(matches!(
+            probe.requests.as_slice(),
+            [pixelflow_runtime::api::public::AppManagement::Bell]
+        ));
+    }
+
+    #[test]
+    fn a_title_from_the_shell_sets_the_window_title() {
+        let (mut app, _writer_rx, _tx, mut engine) = create_test_app();
+
+        app.handle_data(pty(b"\x1b]2;build: ok\x07"))
+            .expect("pty data");
+
+        let mut probe = EngineProbe::default();
+        drain_engine(&mut engine, &mut probe);
+        assert!(matches!(
+            probe.requests.as_slice(),
+            [pixelflow_runtime::api::public::AppManagement::SetTitle(title)] if title == "build: ok"
+        ));
+    }
+
+    #[test]
+    fn the_paste_binding_asks_the_engine_for_the_clipboard() {
+        use pixelflow_runtime::input::{KeySymbol, Modifiers};
+        let (mut app, _writer_rx, _tx, mut engine) = create_test_app();
+
+        // As X11 reports Ctrl+Shift+V: the shifted keysym, and what it typed.
+        app.handle_management(EngineEventManagement::KeyDown {
+            key: KeySymbol::Char('V'),
+            mods: Modifiers::CONTROL | Modifiers::SHIFT,
+            text: Some("\u{16}".to_string()),
+        })
+        .expect("key down");
+
+        let mut probe = EngineProbe::default();
+        drain_engine(&mut engine, &mut probe);
+        assert!(matches!(
+            probe.requests.as_slice(),
+            [pixelflow_runtime::api::public::AppManagement::RequestPaste(
+                pixelflow_runtime::input::Selection::Clipboard
+            )]
+        ));
+    }
+
+    #[test]
+    fn pasted_text_reaches_the_shell_bracketed_when_it_asked() {
+        let (mut app, mut writer_rx, _tx, _engine) = create_test_app();
+
+        app.handle_data(pty(b"\x1b[?2004h")).expect("pty data");
+        app.handle_management(clipboard_answer(Selection::Clipboard, "ls\n"))
+            .expect("paste");
+
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert_eq!(probe.data, vec![b"\x1b[200~ls\n\x1b[201~".to_vec()]);
+    }
+
+    fn clipboard_answer(selection: Selection, text: &str) -> EngineEventManagement {
+        EngineEventManagement::Paste {
+            selection,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_osc_52_query_is_answered_with_the_clipboard() {
+        let (mut app, mut writer_rx, _tx, mut engine) = create_test_app();
+
+        app.handle_data(pty(b"\x1b]52;c;?\x07")).expect("pty data");
+        let mut requests = EngineProbe::default();
+        drain_engine(&mut engine, &mut requests);
+        assert!(matches!(
+            requests.requests.as_slice(),
+            [AppManagement::RequestPaste(Selection::Clipboard)]
+        ));
+
+        app.handle_management(clipboard_answer(Selection::Clipboard, "hi"))
+            .expect("clipboard answer");
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert_eq!(probe.data, vec![b"\x1b]52;c;aGk=\x1b\\".to_vec()]);
+    }
+
+    #[test]
+    fn an_osc_52_query_goes_unanswered_when_clipboard_reads_are_off() {
+        let mut config = Config::default();
+        config.behavior.allow_clipboard_read = false;
+        let (mut app, mut writer_rx, _tx, mut engine) = create_test_app_with(config);
+
+        app.handle_data(pty(b"\x1b]52;c;?\x07")).expect("pty data");
+
+        let mut requests = EngineProbe::default();
+        drain_engine(&mut engine, &mut requests);
+        assert!(
+            requests.requests.is_empty(),
+            "the clipboard must not be read"
+        );
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert!(probe.data.is_empty());
+    }
+
+    #[test]
+    fn each_clipboard_answer_goes_to_the_read_that_asked_for_it() {
+        let (mut app, mut writer_rx, _tx, _engine) = create_test_app();
+
+        // A query of the primary selection, then a clipboard query and a
+        // clipboard paste. The primary owner answers last.
+        app.handle_data(pty(b"\x1b]52;p;?\x1b\\\x1b]52;c;?\x07"))
+            .expect("pty data");
+        app.handle_management(EngineEventManagement::KeyDown {
+            key: pixelflow_runtime::input::KeySymbol::Char('V'),
+            mods: pixelflow_runtime::input::Modifiers::CONTROL
+                | pixelflow_runtime::input::Modifiers::SHIFT,
+            text: None,
+        })
+        .expect("paste binding");
+        for (selection, text) in [
+            (Selection::Clipboard, "first"),
+            (Selection::Clipboard, "second"),
+            (Selection::Primary, "third"),
+        ] {
+            app.handle_management(clipboard_answer(selection, text))
+                .expect("clipboard answer");
+        }
+
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert_eq!(
+            probe.data,
+            vec![
+                b"\x1b]52;c;Zmlyc3Q=\x1b\\".to_vec(),
+                b"second".to_vec(),
+                b"\x1b]52;p;dGhpcmQ=\x1b\\".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_clipboard_pastes_nothing() {
+        let (mut app, mut writer_rx, _tx, _engine) = create_test_app();
+
+        app.handle_data(pty(b"\x1b[?2004h")).expect("pty data");
+        app.handle_management(clipboard_answer(Selection::Clipboard, ""))
+            .expect("paste");
+
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert!(probe.data.is_empty(), "no bracketed empty paste");
+    }
+
+    #[test]
+    fn focus_changes_reach_the_shell_once_it_asks_for_them() {
+        let (mut app, mut writer_rx, _tx, _engine) = create_test_app();
+
+        app.handle_management(EngineEventManagement::FocusLost)
+            .expect("focus lost");
+        app.handle_data(pty(b"\x1b[?1004h")).expect("pty data");
+        app.handle_management(EngineEventManagement::FocusGained)
+            .expect("focus gained");
+
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        assert_eq!(probe.data, vec![b"\x1b[I".to_vec()]);
+    }
+
+    #[test]
+    fn the_zoom_binding_resizes_the_pty_and_the_next_frame_draws_at_the_new_size() {
+        use pixelflow_runtime::input::{KeySymbol, Modifiers};
+        let (mut app, mut writer_rx, _tx, mut engine) = create_test_app();
+        app.handle_control(EngineEventControl::Resized {
+            id: WindowId(0),
+            width_px: 800,
+            height_px: 480,
+        })
+        .expect("resize");
+
+        // As X11 reports Ctrl+Shift+=: the shifted keysym.
+        app.handle_management(EngineEventManagement::KeyDown {
+            key: KeySymbol::Char('+'),
+            mods: Modifiers::CONTROL | Modifiers::SHIFT,
+            text: None,
+        })
+        .expect("key down");
+
+        let mut probe = WriterProbe::default();
+        drain_writer(&mut writer_rx, &mut probe);
+        let [initial, zoomed] = probe.resizes.as_slice() else {
+            panic!(
+                "expected the window resize and the zoom, got {:?}",
+                probe.resizes
+            );
+        };
+        assert!(zoomed.cols < initial.cols && zoomed.rows < initial.rows);
+
+        // The cell buffer is sized to the zoomed grid; a program still
+        // compiled for the old one would panic binding it.
+        app.handle_data(request_frame()).expect("frame after zoom");
+        let mut engine_probe = EngineProbe::default();
+        drain_engine(&mut engine, &mut engine_probe);
+        assert!(!engine_probe.scenes.is_empty(), "a zoomed frame was drawn");
+    }
+
+    #[test]
+    fn a_mouse_drag_selects_and_becomes_the_primary_selection() {
+        let (mut app, _writer_rx, _tx, mut engine) = create_test_app();
+        app.handle_data(pty(b"hello world")).expect("pty data");
+
+        // Default cells are 10x16 points: drag across "hello" on row 0.
+        for event in [
+            EngineEventManagement::MouseClick {
+                button: MouseButton::Left,
+                x: 1,
+                y: 1,
+            },
+            EngineEventManagement::MouseMove {
+                x: 41,
+                y: 1,
+                mods: Default::default(),
+            },
+            EngineEventManagement::MouseRelease {
+                button: MouseButton::Left,
+                x: 41,
+                y: 1,
+            },
+        ] {
+            app.handle_management(event).expect("mouse");
+        }
+
+        let mut probe = EngineProbe::default();
+        drain_engine(&mut engine, &mut probe);
+        assert!(
+            probe.requests.iter().any(|request| matches!(
+                request,
+                pixelflow_runtime::api::public::AppManagement::Copy {
+                    selection: pixelflow_runtime::input::Selection::Primary,
+                    text,
+                } if text == "hello"
+            )),
+            "requests: {:?}",
+            probe.requests
+        );
+    }
+
+    #[test]
+    fn a_middle_click_pastes_the_primary_selection_and_f11_toggles_fullscreen() {
+        use pixelflow_runtime::input::{KeySymbol, Modifiers};
+        let (mut app, _writer_rx, _tx, mut engine) = create_test_app();
+
+        app.handle_management(EngineEventManagement::MouseClick {
+            button: MouseButton::Middle,
+            x: 5,
+            y: 5,
+        })
+        .expect("middle click");
+        app.handle_management(EngineEventManagement::KeyDown {
+            key: KeySymbol::F11,
+            mods: Modifiers::empty(),
+            text: None,
+        })
+        .expect("f11");
+
+        let mut probe = EngineProbe::default();
+        drain_engine(&mut engine, &mut probe);
+        assert!(
+            matches!(
+                probe.requests.as_slice(),
+                [
+                    pixelflow_runtime::api::public::AppManagement::RequestPaste(
+                        pixelflow_runtime::input::Selection::Primary
+                    ),
+                    pixelflow_runtime::api::public::AppManagement::ToggleFullscreen,
+                ]
+            ),
+            "requests: {:?}",
+            probe.requests
         );
     }
 }

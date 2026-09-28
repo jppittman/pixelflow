@@ -346,8 +346,6 @@ pub enum EscCommand {
 /// Represents a parsed ANSI escape command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnsiCommand {
-    /// A printable character.
-    Print(char),
     /// A C0 control code (e.g., CR, LF).
     C0Control(C0Control),
     /// A C1 control code.
