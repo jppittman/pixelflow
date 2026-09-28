@@ -4468,6 +4468,33 @@ mod tests {
         assert_eq!(default_code, alu_code);
     }
 
+    /// `schedule_variance`'s `Var` boundary — every other test reaches it
+    /// only through a full compile, whose `Var` indices never happen to sit
+    /// exactly at [`pixelflow_ir::variance::Variance::VARIABLES`].
+    mod schedule_variance_tests {
+        use super::*;
+        use pixelflow_ir::variance::Variance;
+
+        fn one_var(idx: u8) -> Variance {
+            let schedule = [regalloc::Def {
+                value: regalloc::ValueId(0),
+                op: ScheduledOp::Var(idx),
+            }];
+            schedule_variance(&schedule)[0]
+        }
+
+        #[test]
+        fn schedule_variance_names_the_last_in_range_variable_directly() {
+            let idx = Variance::VARIABLES - 1;
+            assert_eq!(one_var(idx), Variance::from_var(idx));
+        }
+
+        #[test]
+        fn schedule_variance_treats_an_index_at_variables_as_every_variable() {
+            assert_eq!(one_var(Variance::VARIABLES), Variance::ALL);
+        }
+    }
+
     /// Lanes in one SIMD batch at the tier this host selected.
     fn lanes() -> usize {
         crate::isa::jit_vector_bytes() / core::mem::size_of::<f32>()
