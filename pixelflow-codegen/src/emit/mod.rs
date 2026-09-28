@@ -5966,6 +5966,42 @@ mod tests {
         );
     }
 
+    /// Only one multiplicand spilled: still the fused FMLA path, same as
+    /// when neither is. This is what distinguishes `&&` from a wrongly
+    /// lenient `||` in the decompose guard -- an `||` would wrongly
+    /// decompose here.
+    #[test]
+    fn resolve_operands_still_fuses_muladd_when_only_one_multiplicand_is_spilled() {
+        // a spilled, b and c in registers
+        let locs = make_locs(&[(1, 5), (2, 7), (3, 8)], &[(0, 0)]);
+        let op = ScheduledOp::Ternary(
+            OpKind::MulAdd,
+            regalloc::ValueId(0),
+            regalloc::ValueId(1),
+            regalloc::ValueId(2),
+        );
+        let plan =
+            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+
+        assert_eq!(plan.reloads.len(), 1);
+        assert_eq!(
+            plan.reloads[0],
+            Reload::FromStack {
+                target: RELOAD[0],
+                slot: Slot::new(0, 16),
+            }
+        );
+        assert_eq!(plan.setup_mov, Some((Reg(8), Reg(7))));
+        assert_eq!(
+            plan.op,
+            ResolvedOp::FusedMulAdd {
+                dst: Reg(8),
+                a: RELOAD[0],
+                b: Reg(5)
+            }
+        );
+    }
+
     #[test]
     fn resolve_operands_decomposes_muladd_into_multiply_and_add_when_both_multiplicands_are_spilled()
      {
