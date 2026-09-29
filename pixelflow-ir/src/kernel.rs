@@ -95,7 +95,11 @@ impl Drop for BinderScope {
 /// Half the side of the pixel [`Kernel::area`] integrates over: the pixel
 /// is `[-½, ½)` on each axis about the sample, so its midpoint is the point
 /// every unintegrated kernel samples.
-const PIXEL_HALF_WIDTH: f32 = 0.5;
+///
+/// The one definition of the pixel: `kernel!`'s `area(|u, v| e)` integrates
+/// over the same interval, so a pixel written in the syntax and one built
+/// here are one program.
+pub const PIXEL_HALF_WIDTH: f32 = 0.5;
 
 /// The lowest binder not already bound by a `Reduce` in `arena`.
 ///

@@ -12,6 +12,7 @@
 //! | Const      | Expansion time      | `Const(v)`, or a count | PI, N |
 //! | Local      | Expression scope    | A shared `ExprId`    | dx, dy  |
 //! | Index      | A fold's body       | The fold's binder `Var` | i    |
+//! | Variable   | An integral's body  | The integral's binder `Var` | u |
 //!
 //! A helper's parameters are a fourth thing at lowering — the argument's own
 //! node, bound by name where the helper is inlined — but to `sema` they are
@@ -71,6 +72,10 @@ pub enum SymbolKind {
     /// A fold's index, the closure's parameter: a `usize`, scoped to the
     /// fold's body.
     Index,
+
+    /// An integral's variable, the closure's parameter: an `f32`, scoped to
+    /// the integral's body.
+    Variable,
 }
 
 /// A symbol in the symbol table.
@@ -186,6 +191,12 @@ impl SymbolTable {
     /// scope the fold's body is typed in.
     pub fn register_index(&mut self, name: &str) {
         self.bind(name, SymbolKind::Index, Ty::Usize);
+    }
+
+    /// Register an integral's variable, an `f32`, in the innermost scope:
+    /// the scope the integral's body is typed in.
+    pub fn register_variable(&mut self, name: &str) {
+        self.bind(name, SymbolKind::Variable, Ty::F32);
     }
 
     fn bind(&mut self, name: &str, kind: SymbolKind, ty: Ty) {
