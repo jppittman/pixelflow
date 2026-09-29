@@ -34,6 +34,7 @@
 //!   ├── Call(func, args)               // DX(e), a helper: f(x, y)
 //!   ├── If(cond, then, else)           // if c { a } else { b }
 //!   ├── Fold(reduction, range, binder, body) // (0..N).map(|i| e).sum()
+//!   ├── Integral(bounds, variable, body)     // integral(lo..hi, |u| e); area(|u, v| e)
 //!   ├── Cast(operand)                  // i as f32
 //!   ├── Block(stmts, expr)             // { let dx = ...; dx * dx }
 //!   └── Paren(inner)                   // (a + b)
@@ -161,6 +162,10 @@ pub enum Expr {
     /// A fold over a constant range: `(0..N).map(|i| e).sum()`.
     Fold(FoldExpr),
 
+    /// An integral over a constant interval: `integral(lo..hi, |u| e)`, and
+    /// each of the two `area(|u, v| e)` is.
+    Integral(IntegralExpr),
+
     /// A conversion: `i as f32`.
     Cast(CastExpr),
 
@@ -184,6 +189,7 @@ impl Expr {
             Expr::Call(e) => e.span,
             Expr::If(e) => e.span,
             Expr::Fold(e) => e.span,
+            Expr::Integral(e) => e.span,
             Expr::Cast(e) => e.span,
             Expr::Block(e) => e.span,
             Expr::Paren(inner) => inner.span(),
@@ -391,7 +397,8 @@ pub struct FoldExpr {
     pub span: Span,
 }
 
-/// The half-open `lo..hi` a fold ranges over.
+/// The half-open `lo..hi` a fold ranges over, or an integral integrates
+/// over: `usize`s for a fold, `f32`s for an integral.
 #[derive(Debug, Clone)]
 pub struct RangeExpr {
     pub lo: Box<Expr>,
@@ -416,6 +423,51 @@ pub enum Reduction {
     /// `.all(|i| m)`: a mask's `&`, identity all-set.
     All,
 }
+
+/// `∫_lo^hi e du`: the integral of `body` over `variable ∈ [lo, hi)`
+/// (docs/plans/2026-09-25-the-language-is-kernel.md §1.5).
+///
+/// `integral(lo..hi, |u| e)` is one. `area(|u, v| e)`, the prelude's pixel,
+/// is two, as the parser writes it out:
+/// `integral(-H..H, |v| integral(-H..H, |u| e))` with `H` the IR's
+/// `PIXEL_HALF_WIDTH` — `v` outermost, as `Kernel::area` builds it.
+///
+/// The variable is an `f32`, a coordinate of integration: a body computes
+/// with it as with any value, unlike a fold's index. It is in scope in the
+/// body and nowhere else. The closure is not a value, as a fold's is not.
+#[derive(Debug, Clone)]
+pub struct IntegralExpr {
+    pub bounds: IntegralBounds,
+    /// The closure's parameter: the variable of integration.
+    pub variable: Ident,
+    pub body: Box<Expr>,
+    /// The span of the name that wrote it: `integral` or `area`.
+    pub span: Span,
+}
+
+/// Where an integral's interval comes from.
+#[derive(Debug, Clone)]
+pub enum IntegralBounds {
+    /// `lo..hi` as written: constant `f32`s, evaluated by `sema` at
+    /// expansion.
+    Written(RangeExpr),
+    /// The pixel about the sample, `[-H, H)` for `H` the IR's
+    /// `PIXEL_HALF_WIDTH`: what `area` integrates over each axis. It has no
+    /// tokens of its own, so it cannot be restated as a literal here.
+    Pixel,
+}
+
+/// `integral(lo..hi, |u| e)`: the integral over a constant interval.
+pub const INTEGRAL: &str = "integral";
+/// `area(|u, v| e)`: the integral over the pixel about the sample.
+pub const AREA: &str = "area";
+/// `monotone_root(δ, step, bend)`: the parameter at which a certified rise
+/// reaches `δ`, pixelflow-ir's `integral::monotone_root`.
+pub const MONOTONE_ROOT: &str = "monotone_root";
+/// The functions the language defines (plan §1.5). No `const` or `fn` of a
+/// block may take one of these names: a call to one always means the
+/// language's.
+pub const LANGUAGE_FUNCTIONS: [&str; 3] = [INTEGRAL, AREA, MONOTONE_ROOT];
 
 /// `operand as f32`, the language's one conversion. The target is always
 /// `f32` — the parser refuses any other — so it is not stored. `sema`

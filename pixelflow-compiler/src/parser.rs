@@ -20,10 +20,10 @@
 //! param   ::= IDENT ':' type
 //! type    ::= 'f32' | 'bool'                 -- an entry's parameters are `f32`
 //!
-//! cexpr   ::= cexpr ('+' | '-' | '*' | '/') cexpr   -- an `f32` const's initializer,
-//!           | '-' cexpr | '(' cexpr ')'            -- evaluated at expansion,
-//!           | IDENT 'as' 'f32'                     -- per operation in f32
-//!           | IDENT | LITERAL
+//! cexpr   ::= cexpr ('+' | '-' | '*' | '/') cexpr   -- an `f32` const's initializer
+//!           | '-' cexpr | '(' cexpr ')'            -- or an integral's bounds,
+//!           | IDENT 'as' 'f32'                     -- evaluated at expansion,
+//!           | IDENT | LITERAL                      -- per operation in f32
 //! iexpr   ::= iexpr ('+' | '-' | '*' | '/') iexpr   -- a `usize`: a range's bounds
 //!           | '(' iexpr ')'                        -- or a `usize` const's
 //!           | IDENT | INTEGER                      -- initializer, evaluated at
@@ -37,6 +37,8 @@
 //!           | IDENT '(' (expr (',' expr)*)? ')'    -- a helper, inlined
 //!           | 'if' expr block 'else' (block | 'if' …)   -- the choice
 //!           | fold
+//!           | integral
+//!           | 'monotone_root' '(' expr ',' expr ',' expr ')'   -- τ(δ), from (δ, step, bend)
 //!           | IDENT 'as' 'f32'         -- a `usize` (a fold's index or a
 //!                                      -- `usize` const) as a value
 //!           | '(' expr ')'
@@ -54,6 +56,12 @@
 //!           | range '.all' '(' binder expr ')'                           -- ∀, of bools
 //! range   ::= '(' iexpr '..' iexpr ')'     -- half-open, constant, forwards
 //! binder  ::= '|' IDENT '|'                -- the index: a `usize`
+//! integral ::= 'integral' '(' cexpr '..' cexpr ',' '|' IDENT '|' expr ')'
+//!                                          -- ∫ over [lo, hi); the variable an `f32`
+//!           | 'area' '(' '|' IDENT ',' IDENT '|' expr ')'
+//!                                          -- the pixel: integral(-H..H, |v|
+//!                                          -- integral(-H..H, |u| expr)), H the IR's
+//!                                          -- PIXEL_HALF_WIDTH
 //! F32     ::= '::' '<' 'f32' '>'
 //! binop   ::= '+' | '-' | '*' | '/'
 //!           | '<' | '<=' | '>' | '>=' | '==' | '!='    -- a comparison: a bool
@@ -68,20 +76,29 @@
 //!
 //! A `let` is scoped as Rust scopes it (`crate::symbol`), and so is a fold's
 //! index: its body sees the enclosing bindings, an enclosing fold's index
-//! among them. Nothing shadows `X`, `Y`, a `const` or a `fn`: a parameter, a
-//! `let` or an index of that name is refused. `X` and `Y` appear only in an
-//! entry; a helper takes its coordinates as arguments
+//! among them; so is an integral's variable. Nothing shadows `X`, `Y`, a
+//! `const` or a `fn`: a parameter, a `let`, an index or a variable of that
+//! name is refused. `X` and `Y` appear only in an entry; a helper takes its
+//! coordinates as arguments
 //! (docs/plans/2026-09-25-the-language-is-kernel.md §1.2). A fold
 //! (plan §1.5) denotes ⊕ of its body over `i ∈ [a, b)`, and its monoid's
-//! identity when the range is empty; the syntax never unrolls it.
+//! identity when the range is empty; the syntax never unrolls it. An
+//! integral denotes ∫ of its body over `u ∈ [lo, hi)`; whether it closes is
+//! the e-graph's, and one it leaves open is legalized by quadrature.
+//! `integral`, `area` and `monotone_root` are the language's: a call to one
+//! always means it, and no `const` or `fn` takes one of their names.
 //!
 //! Refused here, with a span, at the token: an item that is not a `const` or
 //! a `fn` (records are B3 of the plan above), generics on either (B3), a
-//! parameter typed as a closure (B4), a `fn` without a declared return type,
-//! an `if` without an `else` or an `if let`, `loop`/`while`/`for`,
-//! assignment, `return`, a closure anywhere but a fold's (B4), a tuple (D7,
-//! B3), a field access (B3), a range anywhere but a fold's (`integral` is
-//! B4), an inclusive or open-ended range, a method on a range or a mapped
+//! parameter typed as a closure (Phase D), a `fn` without a declared return
+//! type, an `if` without an `else` or an `if let`, `loop`/`while`/`for`,
+//! assignment, `return`, a closure anywhere but a fold's or an integral's, a
+//! tuple (D7, B3), a field access (B3), a range anywhere but a fold's or an
+//! integral's, an `integral` or an `area` of any other shape than the two
+//! above (an argument missing or extra, the interval not a range, the
+//! closure's parameters not one plain name for `integral` and two for
+//! `area`, a parameter with a type, a qualified closure or one with a return
+//! type), an inclusive or open-ended range, a method on a range or a mapped
 //! range that is not one of the fold's spellings, `.map`, `.any` or `.all`
 //! over anything but a range (iterating a family of records is B3), a
 //! `.fold` whose arguments are not one of the two above, a fold's closure
@@ -98,19 +115,23 @@
 //! AST holds only what the language means.
 //!
 //! Parsed, and refused by `sema`: an unbound or retired name, a coordinate in
-//! a helper, a call to an entry or to an unknown function (`integral`,
-//! `area` and `monotone_root` name B4), recursion, an unknown method or a
-//! known one at the wrong arity, a type error (every expression is an `f32`
-//! or a `bool`; a `usize` is used only as `i as f32`), an `as` of anything
-//! but a `usize` name, an integer an `f32` does not hold exactly where a
-//! value is expected, a `const` whose initializer is not a `cexpr` or an
-//! `iexpr`, a negated `usize`, a range whose bounds are not constant or that
-//! runs backwards, `.at()`, `.constant()`, `.collapse()`, and a block with no
-//! final expression.
+//! a helper, a call to an entry or to an unknown function, `monotone_root`
+//! with other than three `f32`s, a `const` or `fn` named `integral`, `area`
+//! or `monotone_root`, recursion, an unknown method or a known one at the
+//! wrong arity, a type error (every expression is an `f32` or a `bool`; a
+//! `usize` is used only as `i as f32`; an integrand is an `f32`), an `as` of
+//! anything but a `usize` name, an integer an `f32` does not hold exactly
+//! where a value is expected, a `const` whose initializer is not a `cexpr`
+//! or an `iexpr`, a negated `usize`, a range whose bounds are not constant
+//! or that runs backwards, an integral whose bounds are not constant or are
+//! not an interval the IR admits (`IntervalFold::try_new`: finite, `lo <
+//! hi`, a finite length), `.at()`, `.constant()`, `.collapse()`, and a block
+//! with no final expression.
 //!
 //! Refused by lowering, where the language meets the IR's widths: a range
 //! bound past 2²⁴, the last integer bound a fold's index — an `f32` lane —
-//! names exactly, and folds nested deeper than the IR has binders.
+//! names exactly, and folds and integrals nested deeper than the IR has
+//! binders.
 //!
 //! ## Implementation Note
 //!
@@ -120,9 +141,9 @@
 
 use crate::PLAN;
 use crate::ast::{
-    BinaryExpr, BinaryOp, BlockExpr, CallExpr, CastExpr, ConstItem, Expr, FnItem, FoldExpr,
-    IdentExpr, IfExpr, KernelDef, LetStmt, Literal, LiteralExpr, MethodCallExpr, Param, RangeExpr,
-    Reduction, Spelling, Stmt, UnaryExpr, UnaryOp,
+    AREA, BinaryExpr, BinaryOp, BlockExpr, CallExpr, CastExpr, ConstItem, Expr, FnItem, FoldExpr,
+    INTEGRAL, IdentExpr, IfExpr, IntegralBounds, IntegralExpr, KernelDef, LetStmt, Literal,
+    LiteralExpr, MethodCallExpr, Param, RangeExpr, Reduction, Spelling, Stmt, UnaryExpr, UnaryOp,
 };
 use proc_macro2::{Span, TokenStream};
 use syn::parse::{Parse, ParseStream};
@@ -373,8 +394,8 @@ fn convert_param(input: syn::FnArg) -> syn::Result<Param> {
                 format!(
                     "a kernel-typed parameter\n\
                      \n\
-                     note: passing a function to a kernel `fn` is B4 and Phase D of {PLAN}; \
-                     this parameter is a scalar, `f32` or `bool`"
+                     note: passing a function to a kernel `fn` is Phase D of {PLAN}; this \
+                     parameter is a scalar, `f32` or `bool`"
                 ),
             ));
         }
@@ -516,6 +537,9 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
         }
 
         syn::Expr::Call(expr_call) => {
+            if let Some(integral) = an_integral(&expr_call) {
+                return integral;
+            }
             // Free function call: V(m), DX(expr), a helper, etc.
             // Extract the function name from the callee
             if let syn::Expr::Path(ref path) = *expr_call.func {
@@ -582,7 +606,7 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
                 "a range in a kernel body\n\
                  \n\
                  note: a range is the domain of a fold: {FOLD_SPELLINGS}\n\
-                 note: `integral(lo..hi, |u| e)` is B4 of {PLAN}"
+                 note: or of an integral: {INTEGRAL_SPELLINGS}"
             ),
         )),
 
@@ -626,8 +650,9 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
             format!(
                 "a closure in a kernel body\n\
                  \n\
-                 note: a closure is a fold's body, and nothing else: {FOLD_SPELLINGS}\n\
-                 note: a function as an argument is B4 of {PLAN}; a private `fn` in the \
+                 note: a closure is the body of a fold or an integral, and nothing else: \
+                 {FOLD_SPELLINGS}; {INTEGRAL_SPELLINGS}\n\
+                 note: a function as an argument is Phase D of {PLAN}; a private `fn` in the \
                  block is a helper, called by name"
             ),
         )),
@@ -1005,6 +1030,213 @@ fn convert_range(range: &syn::ExprRange) -> syn::Result<RangeExpr> {
         return Err(syn::Error::new_spanned(
             range,
             "a fold's range names both of its bounds: `a..b`",
+        ));
+    };
+    Ok(RangeExpr {
+        lo: Box::new(convert_expr((**lo).clone())?),
+        hi: Box::new(convert_expr((**hi).clone())?),
+        span: range.limits.span(),
+    })
+}
+
+// ───────────────────────────── integrals ─────────────────────────────
+
+/// Every spelling of an integral, as a refusal of any other names them.
+const INTEGRAL_SPELLINGS: &str =
+    "`integral(lo..hi, |u| e)`, and `area(|u, v| e)` over the pixel about the sample";
+
+/// How the closure of `integral` or `area` is spelled, for the refusal of
+/// any other shape.
+struct ClosureShape {
+    /// Whose closure it is.
+    function: &'static str,
+    /// Its one spelling.
+    spelling: &'static str,
+    /// What its parameters are.
+    parameters: &'static str,
+}
+
+/// `integral(lo..hi, |u| body)`.
+const INTEGRAL_CLOSURE: ClosureShape = ClosureShape {
+    function: INTEGRAL,
+    spelling: "|u| body",
+    parameters: "one parameter, the variable of integration",
+};
+
+/// `area(|u, v| body)`.
+const AREA_CLOSURE: ClosureShape = ClosureShape {
+    function: AREA,
+    spelling: "|u, v| body",
+    parameters: "two parameters, the offsets across the pixel along X and along Y",
+};
+
+/// A call to `integral` or `area`, converted, or `None` for any other call.
+///
+/// Their arguments are a range and a closure, which a body holds nowhere
+/// else, so they are read here, where the closure is still one: the AST
+/// holds no closure to hand a later stage. What the bounds are — constant,
+/// an interval — is `sema`'s question, since it evaluates them.
+fn an_integral(call: &syn::ExprCall) -> Option<syn::Result<Expr>> {
+    let syn::Expr::Path(path) = &*call.func else {
+        return None;
+    };
+    if path.qself.is_some() {
+        return None;
+    }
+    let name = path.path.get_ident()?;
+    match name.to_string().as_str() {
+        INTEGRAL => Some(convert_integral(name, call)),
+        AREA => Some(convert_area(name, call)),
+        _ => None,
+    }
+}
+
+/// `integral(lo..hi, |u| e)`: ∫ of `e` over `u ∈ [lo, hi)`.
+fn convert_integral(name: &syn::Ident, call: &syn::ExprCall) -> syn::Result<Expr> {
+    let [interval, closure] = call.args.iter().collect::<Vec<_>>()[..] else {
+        return Err(syn::Error::new(
+            name.span(),
+            format!(
+                "`integral` takes two arguments, its interval and the closure `|u| body`, \
+                 but {} were supplied\n\
+                 \n\
+                 note: `integral(lo..hi, |u| e)` is ∫ of `e` over `u ∈ [lo, hi)`, the bounds \
+                 constant `f32`s",
+                call.args.len()
+            ),
+        ));
+    };
+    let Some(range) = a_range(interval) else {
+        return Err(syn::Error::new_spanned(
+            interval,
+            "an integral's first argument is its interval: a constant `lo..hi`",
+        ));
+    };
+    let syn::Expr::Closure(closure) = closure else {
+        return Err(syn::Error::new_spanned(
+            closure,
+            "an integral's second argument is the closure `|u| body`: its parameter is the \
+             variable of integration, and its body the integrand",
+        ));
+    };
+    let ([variable], body) = integral_closure(closure, &INTEGRAL_CLOSURE)?;
+    Ok(Expr::Integral(IntegralExpr {
+        bounds: IntegralBounds::Written(convert_interval(range)?),
+        variable,
+        body: Box::new(body),
+        span: name.span(),
+    }))
+}
+
+/// `area(|u, v| e)`, the prelude's pixel: exactly
+/// `integral(-H..H, |v| integral(-H..H, |u| e))`, `H` the IR's
+/// `PIXEL_HALF_WIDTH`, the `v` integral outermost — as `Kernel::area` builds
+/// it. The author writes the shift: `area(|u, v| f(X + u, Y + v))` is the
+/// builder's `f.area()`.
+fn convert_area(name: &syn::Ident, call: &syn::ExprCall) -> syn::Result<Expr> {
+    let [syn::Expr::Closure(closure)] = call.args.iter().collect::<Vec<_>>()[..] else {
+        return Err(syn::Error::new(
+            name.span(),
+            "`area` takes one argument, the closure `|u, v| body`\n\
+             \n\
+             note: `area(|u, v| e)` is ∫∫ of `e` over the pixel about the sample, `u` across it \
+             along X and `v` along Y; the body writes the shift, `f(X + u, Y + v)`",
+        ));
+    };
+    let ([u, v], body) = integral_closure(closure, &AREA_CLOSURE)?;
+    let across = |variable, body| {
+        Expr::Integral(IntegralExpr {
+            bounds: IntegralBounds::Pixel,
+            variable,
+            body: Box::new(body),
+            span: name.span(),
+        })
+    };
+    Ok(across(v, across(u, body)))
+}
+
+/// The variables and the body of an integral's closure: `N` plain names,
+/// each an `f32` always, so none carries a type. Unqualified and with no
+/// return type, as a fold's closure is: it is the integrand, not a value.
+fn integral_closure<const N: usize>(
+    closure: &syn::ExprClosure,
+    shape: &ClosureShape,
+) -> syn::Result<([syn::Ident; N], Expr)> {
+    let ClosureShape {
+        function,
+        spelling,
+        parameters,
+    } = shape;
+    let qualified = !closure.attrs.is_empty()
+        || closure.lifetimes.is_some()
+        || closure.constness.is_some()
+        || closure.movability.is_some()
+        || closure.asyncness.is_some()
+        || closure.capture.is_some();
+    if qualified {
+        return Err(syn::Error::new_spanned(
+            closure,
+            format!(
+                "`{function}`'s closure is `{spelling}`, unqualified\n\
+                 \n\
+                 note: it is the integrand, not a value: nothing is captured, moved or awaited"
+            ),
+        ));
+    }
+    if let syn::ReturnType::Type(_, ty) = &closure.output {
+        return Err(syn::Error::new_spanned(
+            ty,
+            format!(
+                "`{function}`'s closure declares no return type: its body is the integrand, an `f32`"
+            ),
+        ));
+    }
+    let mut variables = Vec::with_capacity(N);
+    for param in &closure.inputs {
+        let variable = match param {
+            Pat::Ident(pat_ident) => plain_name(pat_ident, param)?,
+            Pat::Type(typed) => {
+                return Err(syn::Error::new_spanned(
+                    &typed.ty,
+                    "an integral's variable is an `f32`, always; write the plain name, `|u|`",
+                ));
+            }
+            other => {
+                return Err(syn::Error::new_spanned(
+                    other,
+                    "an integral's variable is a plain name: `|u|`",
+                ));
+            }
+        };
+        variables.push(variable);
+    }
+    let variables = variables.try_into().map_err(|_| {
+        syn::Error::new(
+            closure.or1_token.span(),
+            format!("`{function}`'s closure takes {parameters}: `{spelling}`"),
+        )
+    })?;
+    Ok((variables, convert_expr((*closure.body).clone())?))
+}
+
+/// An integral's `lo..hi`: both bounds, half-open. Whether they are
+/// constant, and an interval the IR admits, is `sema`'s question: it
+/// evaluates them.
+fn convert_interval(range: &syn::ExprRange) -> syn::Result<RangeExpr> {
+    if let syn::RangeLimits::Closed(dots) = &range.limits {
+        return Err(syn::Error::new_spanned(
+            dots,
+            "an inclusive range: an integral is over a half-open `lo..hi`\n\
+             \n\
+             note: an end is a point, and a point has no length, so `..=` would denote the same \
+             integral\n\
+             help: write `lo..hi`",
+        ));
+    }
+    let (Some(lo), Some(hi)) = (&range.start, &range.end) else {
+        return Err(syn::Error::new_spanned(
+            range,
+            "an integral's interval names both of its bounds: `lo..hi`",
         ));
     };
     Ok(RangeExpr {
@@ -1439,17 +1671,23 @@ mod tests {
         }
     }
 
-    /// A range anywhere but a fold's names the fold's spellings, and the
-    /// integral (B4) it will also belong to.
+    /// A range anywhere but a fold's or an integral's names the spellings of
+    /// both.
     #[test]
     fn a_range_is_refused_naming_the_fold_and_the_integral() {
-        let err = refusal(quote! { || integral(0.0..1.0, X) });
-        assert!(
-            err.contains("a range")
-                && err.contains("(a..b).map(|i| e).sum()")
-                && err.contains("B4"),
-            "got: {err}"
-        );
+        for input in [
+            quote! { || X + (0.0..1.0) },
+            quote! { || DX(0.0..1.0) },
+            quote! { || { let r = 0..4; X } },
+        ] {
+            let err = refusal(input);
+            assert!(
+                err.contains("a range in a kernel body")
+                    && err.contains("(a..b).map(|i| e).sum()")
+                    && err.contains("integral(lo..hi, |u| e)"),
+                "got: {err}"
+            );
+        }
     }
 
     /// Every other Rust expression is refused at the token, named, with
@@ -1882,20 +2120,27 @@ mod tests {
         );
     }
 
-    /// A closure is a fold's body and nothing else: anywhere else it is
-    /// refused, naming the fold's spellings and B4.
+    /// A closure is the body of a fold or an integral and nothing else:
+    /// anywhere else it is refused, naming the spellings of both, and the
+    /// phase that brings a function as an argument.
     #[test]
-    fn a_closure_outside_a_fold_is_refused_naming_b4() {
+    fn a_closure_outside_a_fold_or_an_integral_is_refused() {
         for input in [
             quote! { || X.max(|i| i) },
             quote! { || { let f = |x: f32| x; X } },
             quote! { || (0..4).map(|i| X).sum() + (|j| Y) },
+            quote! { || integral(0.0..1.0, |u| u) * (|w| w) },
+            quote! { || area(|u, v| X.max(|w| w)) },
+            quote! { || DX(|u| u) },
         ] {
             let err = refusal(input);
             assert!(
                 err.contains("a closure in a kernel body")
-                    && err.contains("a fold's body")
-                    && err.contains("B4"),
+                    && err.contains("the body of a fold or an integral")
+                    && err.contains("(a..b).map(|i| e).sum()")
+                    && err.contains("integral(lo..hi, |u| e)")
+                    && err.contains("area(|u, v| e)")
+                    && err.contains("Phase D"),
                 "got: {err}"
             );
         }
@@ -1903,7 +2148,7 @@ mod tests {
 
     /// A fold's spelling over something that is not a range is iterating a
     /// family of records, and is refused naming B3, where the closure's own
-    /// refusal would name B4.
+    /// refusal would name the fold and the integral.
     #[test]
     fn iterating_anything_but_a_range_is_refused_naming_b3() {
         for input in [
@@ -1973,9 +2218,122 @@ mod tests {
             (quote! { pub fn f(mut x: f32) -> f32 { x } }, "plain name"),
             (
                 quote! { pub fn f(g: impl Fn(f32) -> f32) -> f32 { X } },
-                "B4",
+                "Phase D",
             ),
             (quote! { const fn f() -> f32 { X } }, "`const fn`"),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(input);
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
+    }
+
+    // ─────────────────────────── integrals ───────────────────────────
+
+    /// The integral the body `|| <expr>` parses to.
+    fn integral(input: TokenStream) -> IntegralExpr {
+        let def = parse(quote! { || #input }).expect("the integral parses");
+        match &entry(&def).body {
+            Expr::Integral(integral) => integral.clone(),
+            other => panic!("expected an integral, got {other:?}"),
+        }
+    }
+
+    /// `integral(lo..hi, |u| e)` is one integral over the bounds written,
+    /// its closure's parameter the variable and its body the integrand; the
+    /// interval may be parenthesized, as a fold's range may.
+    #[test]
+    fn an_integral_parses_with_its_interval_variable_and_body() {
+        for input in [
+            quote! { integral(0.0..1.0, |u| u * X) },
+            quote! { integral((0.0..1.0), |u| u * X) },
+        ] {
+            let parsed = integral(input);
+            assert_eq!(parsed.variable.to_string(), "u");
+            let IntegralBounds::Written(range) = &parsed.bounds else {
+                panic!("the interval is the one written");
+            };
+            assert!(matches!(*range.lo, Expr::Literal(_)));
+            assert!(matches!(*parsed.body, Expr::Binary(_)));
+        }
+        let parsed = integral(quote! { integral(-H..H * 2.0, |w| w) });
+        let IntegralBounds::Written(range) = &parsed.bounds else {
+            panic!("the interval is the one written");
+        };
+        assert!(matches!(*range.lo, Expr::Unary(_)));
+        assert!(matches!(*range.hi, Expr::Binary(_)));
+    }
+
+    /// `area(|u, v| e)` is exactly `integral(-H..H, |v| integral(-H..H,
+    /// |u| e))` over the pixel: two integrals, the `v` one outermost, as
+    /// `Kernel::area` builds them.
+    #[test]
+    fn area_is_two_integrals_over_the_pixel_v_outermost() {
+        let outer = integral(quote! { area(|u, v| X + u) });
+        assert!(matches!(outer.bounds, IntegralBounds::Pixel));
+        assert_eq!(outer.variable.to_string(), "v");
+        let Expr::Integral(inner) = &*outer.body else {
+            panic!("the outer integral's body is the inner integral");
+        };
+        assert!(matches!(inner.bounds, IntegralBounds::Pixel));
+        assert_eq!(inner.variable.to_string(), "u");
+        assert!(matches!(*inner.body, Expr::Binary(_)));
+    }
+
+    /// An integral or an `area` spelled any other way is refused where it
+    /// is written, naming its one spelling: `area` with one parameter
+    /// among them.
+    #[test]
+    fn an_integral_spelled_any_other_way_is_refused() {
+        let cases: [(TokenStream, &str); 15] = [
+            (quote! { || integral(0.0..1.0) }, "takes two arguments"),
+            (
+                quote! { || integral(0.0..1.0, |u| u, 2.0) },
+                "takes two arguments",
+            ),
+            (
+                quote! { || integral(X, |u| u) },
+                "first argument is its interval",
+            ),
+            (
+                quote! { || integral(0.0..1.0, X) },
+                "second argument is the closure `|u| body`",
+            ),
+            (
+                quote! { || integral(0.0..=1.0, |u| u) },
+                "an inclusive range",
+            ),
+            (
+                quote! { || integral(0.0.., |u| u) },
+                "names both of its bounds",
+            ),
+            (
+                quote! { || integral(0.0..1.0, |u, v| u) },
+                "`integral`'s closure takes one parameter",
+            ),
+            (
+                quote! { || integral(0.0..1.0, |u: f32| u) },
+                "an `f32`, always",
+            ),
+            (quote! { || integral(0.0..1.0, |_| X) }, "a plain name"),
+            (quote! { || integral(0.0..1.0, move |u| u) }, "unqualified"),
+            (
+                quote! { || integral(0.0..1.0, |u| -> f32 { u }) },
+                "declares no return type",
+            ),
+            (
+                quote! { || area(|u| X + u) },
+                "`area`'s closure takes two parameters, the offsets across the pixel",
+            ),
+            (
+                quote! { || area(|u, v, w| X) },
+                "`area`'s closure takes two parameters",
+            ),
+            (quote! { || area(X) }, "`area` takes one argument"),
+            (
+                quote! { || area(|u, v| X, |u, v| Y) },
+                "`area` takes one argument",
+            ),
         ];
         for (input, expected) in cases {
             let err = refusal(input);

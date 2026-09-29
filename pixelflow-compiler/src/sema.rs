@@ -25,6 +25,10 @@
 //! 5. **Folds**: a fold's bounds are constant and run forwards
 //!    ([`range_bounds`]), and its body is a term of its monoid, an `f32` or
 //!    a `bool`, in a scope where the closure's parameter is the index.
+//! 6. **Integrals**: an integral's bounds are constant `f32`s and an
+//!    interval the IR admits ([`interval_bounds`]), and its body is an
+//!    `f32`, in a scope where the closure's parameter is the variable, an
+//!    `f32`. `monotone_root` takes three `f32`s.
 //!
 //! ## Symbol Resolution Rules
 //!
@@ -33,7 +37,8 @@
 //! 2. a declared parameter → an entry's is a `Param` bound by the host
 //!    function, a helper's is the argument at the call
 //! 3. a fold's index → the fold's binder, a `usize`, visible in the fold's
-//!    body and nowhere else
+//!    body and nowhere else; an integral's variable → the integral's binder,
+//!    an `f32`, likewise
 //! 4. a `const` → its value
 //! 5. an intrinsic (X, Y) → a coordinate `Var`, in an entry only: a helper
 //!    takes its coordinates as arguments, so that application is contramap
@@ -42,9 +47,11 @@
 //!    scope, so a name nothing here binds is an error here, with a span —
 //!    not a capture that lowering then refuses without one.
 //!
-//! Nothing shadows X, Y, a `const` or a `fn` — a parameter, a `let` or a
-//! fold's index of that name is refused — so a coordinate always means the
-//! coordinate and an item always means the item.
+//! Nothing shadows X, Y, a `const` or a `fn` — a parameter, a `let`, a
+//! fold's index or an integral's variable of that name is refused — so a
+//! coordinate always means the coordinate and an item always means the item.
+//! No item takes the name of a function of the language (`integral`, `area`,
+//! `monotone_root`), so a call to one always means the language's.
 //!
 //! ## Output
 //!
@@ -54,11 +61,12 @@
 use crate::PLAN;
 use crate::ast::{
     BinaryExpr, BinaryOp, BlockExpr, CallExpr, CastExpr, ConstItem, Expr, FnItem, FoldExpr, IfExpr,
-    KernelDef, LetStmt, MethodCallExpr, Param, RangeExpr, Reduction, Role, Spelling, Stmt, UnaryOp,
+    IntegralBounds, IntegralExpr, KernelDef, LANGUAGE_FUNCTIONS, LetStmt, MONOTONE_ROOT,
+    MethodCallExpr, Param, RangeExpr, Reduction, Role, Spelling, Stmt, UnaryOp,
 };
 use crate::lower::{LIBRARY_METHODS, Projection};
 use crate::symbol::{SymbolKind, SymbolTable};
-use pixelflow_ir::{OpKind, known_method_names};
+use pixelflow_ir::{Binder, IntervalFold, OpKind, known_method_names};
 use proc_macro2::Span;
 use std::collections::HashMap;
 use syn::{Ident, Type};
@@ -245,9 +253,8 @@ const RETIRED_METHODS: [&str; 3] = ["at", "constant", "collapse"];
 /// the identity on an arena value.
 const CLONE: &str = "clone";
 
-/// The functions of the language that B4 brings (plan §1.5): an integral,
-/// the pixel's area, and the monotone root. A call to one names the phase.
-const B4_FUNCTIONS: [&str; 3] = ["integral", "area", "monotone_root"];
+/// `monotone_root`'s arguments: the height `δ`, and the rise's step and bend.
+const MONOTONE_ROOT_ARGUMENTS: usize = 3;
 
 /// Maximum per-character difference for a same-length method name to be
 /// suggested as a typo fix (e.g. `sqrtt` -> `sqrt`).
@@ -319,6 +326,17 @@ impl Items {
             return Err(syn::Error::new(
                 name.span(),
                 format!("`{text}` is a projection; an item cannot be named after it"),
+            ));
+        }
+        if LANGUAGE_FUNCTIONS.contains(&text.as_str()) {
+            return Err(syn::Error::new(
+                name.span(),
+                format!(
+                    "`{text}` is a function of the language; an item cannot be named after it\n\
+                     \n\
+                     note: `integral`, `area` and `monotone_root` are the language's (§1.5 of \
+                     {PLAN}), and a call to one always means it"
+                ),
             ));
         }
         if self.consts.contains_key(&text) || self.fns.contains_key(&text) {
@@ -497,6 +515,8 @@ impl<'a> FnAnalyzer<'a> {
 
             Expr::Fold(fold) => self.type_of_fold(fold),
 
+            Expr::Integral(integral) => self.type_of_integral(integral),
+
             Expr::Cast(cast) => self.type_of_cast(cast),
 
             Expr::Block(block) => self.type_of_block(block),
@@ -519,6 +539,61 @@ impl<'a> FnAnalyzer<'a> {
         let typed = self.expect(&fold.body, term, what);
         self.symbols.pop_scope();
         typed
+    }
+
+    /// `integral(lo..hi, |u| e)`, and each integral of `area`: the bounds
+    /// are constant and an interval, and the body is an `f32` — an integral
+    /// of a mask means nothing — typed in a scope of its own where the
+    /// closure's parameter is the variable, an `f32`. The body sees every
+    /// enclosing binding, as a fold's does.
+    fn type_of_integral(&mut self, integral: &IntegralExpr) -> syn::Result<Ty> {
+        match &integral.bounds {
+            IntegralBounds::Written(range) => {
+                interval_bounds(range, self.consts)?;
+            }
+            IntegralBounds::Pixel => {}
+        }
+        self.refuse_shadowing_an_item(&integral.variable, "an integral's variable")?;
+        self.symbols.push_scope();
+        self.symbols
+            .register_variable(&integral.variable.to_string());
+        let typed = self.expect(
+            &integral.body,
+            Ty::F32,
+            "an integral's body is its integrand, an `f32`; a mask becomes one by a choice, \
+             `if m { 1.0 } else { 0.0 }`",
+        );
+        self.symbols.pop_scope();
+        typed
+    }
+
+    /// `monotone_root(δ, step, bend)`: three `f32`s in, the parameter `τ(δ)`
+    /// out (pixelflow-ir's `integral::monotone_root`).
+    fn type_of_monotone_root(&mut self, call: &CallExpr) -> syn::Result<Ty> {
+        if call.args.len() != MONOTONE_ROOT_ARGUMENTS {
+            return Err(syn::Error::new(
+                call.func.span(),
+                format!(
+                    "`{MONOTONE_ROOT}` takes {MONOTONE_ROOT_ARGUMENTS} arguments, \
+                     `(delta, step, bend)`, but {} {} supplied\n\
+                     \n\
+                     note: `monotone_root(δ, step, bend)` is the parameter at which the rise \
+                     `t·(2·step + bend·t)` reaches the height `δ`",
+                    call.args.len(),
+                    if call.args.len() == 1 { "was" } else { "were" },
+                ),
+            ));
+        }
+        for arg in &call.args {
+            self.expect(
+                arg,
+                Ty::F32,
+                &format!(
+                    "`{MONOTONE_ROOT}` takes `f32`s: the height, and the rise's step and bend"
+                ),
+            )?;
+        }
+        Ok(Ty::F32)
     }
 
     /// `i as f32`: a `usize`, named, as a value. Nothing else converts —
@@ -846,15 +921,8 @@ impl<'a> FnAnalyzer<'a> {
             };
             return self.expect(arg, Ty::F32, "a projection takes an `f32`");
         }
-        if B4_FUNCTIONS.contains(&name.as_str()) {
-            return Err(syn::Error::new(
-                call.func.span(),
-                format!(
-                    "`{name}` is not yet a function of the language\n\
-                     \n\
-                     note: `integral`, `area` and `monotone_root` are B4 of {PLAN}"
-                ),
-            ));
+        if name == MONOTONE_ROOT {
+            return self.type_of_monotone_root(call);
         }
         Err(syn::Error::new(
             call.func.span(),
@@ -1155,6 +1223,198 @@ impl UsizeScope for RangeScope<'_> {
     }
 }
 
+// ───────────────────────── f32 constants ─────────────────────────
+
+/// `f32` arithmetic at expansion: what an `f32` const's initializer and an
+/// integral's bounds are built from — literals, `f32` consts, a `usize`
+/// const `as f32`, `+ - * /`, unary `-` and parentheses — each operation in
+/// `f32`, as rustc's const evaluator does it (see [`evaluate_consts`]).
+///
+/// A trait, as [`UsizeScope`] is, because the two differ only in what a
+/// name means: a `const` being evaluated may name another, evaluated on
+/// demand; a bound names an `f32` const, already evaluated, or it is not
+/// constant.
+trait F32Scope: UsizeScope {
+    /// The value of `name` in an `f32` expression, or why it has none.
+    fn f32_named(&mut self, name: &Ident) -> syn::Result<f32>;
+
+    /// The refusal of something an `f32` constant is not built from.
+    fn not_an_f32_constant(&self, span: Span) -> syn::Error;
+
+    fn eval_f32(&mut self, expr: &Expr) -> syn::Result<f32> {
+        match expr {
+            Expr::Literal(literal) => literal.f32_value(),
+            Expr::Ident(ident) => self.f32_named(&ident.name),
+            Expr::Paren(inner) => self.eval_f32(inner),
+            // Rust's own `as`, which rounds to the nearest `f32` as rustc's
+            // does: exact up to 2²⁴.
+            Expr::Cast(cast) => {
+                let Some(name) = cast.named() else {
+                    return Err(self.not_an_f32_constant(cast.span));
+                };
+                Ok(self.usize_named(name)? as f32)
+            }
+            Expr::Unary(unary) => match unary.op {
+                UnaryOp::Neg => Ok(-self.eval_f32(&unary.operand)?),
+            },
+            Expr::Binary(binary) => {
+                let lhs = self.eval_f32(&binary.lhs)?;
+                let rhs = self.eval_f32(&binary.rhs)?;
+                match binary.op {
+                    BinaryOp::Add => Ok(lhs + rhs),
+                    BinaryOp::Sub => Ok(lhs - rhs),
+                    BinaryOp::Mul => Ok(lhs * rhs),
+                    BinaryOp::Div => Ok(lhs / rhs),
+                    BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr => Err(self.not_an_f32_constant(binary.span)),
+                }
+            }
+            other => Err(self.not_an_f32_constant(other.span())),
+        }
+    }
+}
+
+/// An integral's bounds, evaluated at expansion: each an `f32` constant
+/// ([`F32Scope`]), and the two an interval pixelflow-ir admits.
+///
+/// The one evaluation of them: `sema` checks an integral with it, and
+/// lowering reads the bounds it returns, so the two cannot disagree on an
+/// interval.
+///
+/// Bounds are constant (plan §1.5), as a range's are. Whether they make an
+/// interval is `IntervalFold::try_new`'s to say — the contract's one
+/// definition, asked here at expansion so a refusal is an error at the
+/// bounds rather than a panic when the kernel is built. The contract does
+/// not depend on which index an integral binds, so any binder asks it;
+/// lowering asks again, with the binder it chose. Only the explanation of a
+/// refusal is this function's own.
+pub(crate) fn interval_bounds(
+    range: &RangeExpr,
+    consts: &HashMap<String, ConstValue>,
+) -> syn::Result<(f32, f32)> {
+    let mut scope = IntervalScope { consts };
+    let lo = scope.eval_f32(&range.lo)?;
+    let hi = scope.eval_f32(&range.hi)?;
+    let admitted = Binder::all()
+        .next()
+        .and_then(|binder| IntervalFold::try_new(binder, lo, hi))
+        .is_some();
+    if admitted {
+        return Ok((lo, hi));
+    }
+    let why = why_not_an_interval(lo, hi);
+    Err(syn::Error::new(
+        range.span,
+        format!(
+            "this integral's interval is not one the IR admits\n\
+             \n\
+             note: {why}\n\
+             note: an integral is over `lo..hi` with finite ends, `lo < hi`, and a finite length \
+             (`IntervalFold::try_new`)"
+        ),
+    ))
+}
+
+/// Why `lo..hi` is not an interval: the explanation of a refusal
+/// `IntervalFold::try_new` made, which is the one that decides.
+fn why_not_an_interval(lo: f32, hi: f32) -> String {
+    if !(lo.is_finite() && hi.is_finite()) {
+        return format!(
+            "an end of `{lo:?}..{hi:?}` is not finite: an integral is over a bounded interval"
+        );
+    }
+    if lo == hi {
+        return format!(
+            "`{lo:?}..{hi:?}` is empty: its integral would be `0.0` whatever the body, and an \
+             empty interval is unrepresentable in the IR"
+        );
+    }
+    if lo > hi {
+        return format!(
+            "the interval `{lo:?}..{hi:?}` runs backwards: an integral is over `lo..hi` with \
+             `lo < hi`"
+        );
+    }
+    format!(
+        "the length of `{lo:?}..{hi:?}`, `hi - lo`, overflows `f32`: an integral's interval \
+         has a finite measure"
+    )
+}
+
+/// What an integral's bound may name: a const, already evaluated — an `f32`
+/// one, or a `usize` one `as f32`.
+struct IntervalScope<'a> {
+    consts: &'a HashMap<String, ConstValue>,
+}
+
+impl IntervalScope<'_> {
+    /// The refusal of a name that is not a `const` in a bound.
+    fn not_a_const(name: &Ident) -> syn::Error {
+        syn::Error::new(
+            name.span(),
+            format!(
+                "an integral's bounds are constant, and `{name}` is not a `const`\n\
+                 \n\
+                 note: a bound is evaluated at expansion, from literals, `f32` consts, a `usize` \
+                 const `as f32`, `+ - * /`, unary `-` and parentheses; a variable, a fold's \
+                 index, a parameter, a `let` and a coordinate are not constant\n\
+                 note: integral bounds are constant: a program's shape is known when it is \
+                 compiled (§1.5 of {PLAN})"
+            ),
+        )
+    }
+}
+
+impl UsizeScope for IntervalScope<'_> {
+    fn usize_named(&mut self, name: &Ident) -> syn::Result<u64> {
+        match self.consts.get(&name.to_string()) {
+            Some(ConstValue::Usize(value)) => Ok(*value),
+            Some(ConstValue::F32(_)) => Err(syn::Error::new(
+                name.span(),
+                format!(
+                    "`{name}` is an `f32` const already: `as f32` converts a `usize`\n\
+                     \n\
+                     help: write `{name}`"
+                ),
+            )),
+            None => Err(Self::not_a_const(name)),
+        }
+    }
+
+    fn not_a_count(&self, span: Span) -> syn::Error {
+        self.not_an_f32_constant(span)
+    }
+}
+
+impl F32Scope for IntervalScope<'_> {
+    fn f32_named(&mut self, name: &Ident) -> syn::Result<f32> {
+        match self.consts.get(&name.to_string()) {
+            Some(ConstValue::F32(value)) => Ok(*value),
+            Some(ConstValue::Usize(_)) => Err(a_count_is_not_a_value(name)),
+            None => Err(Self::not_a_const(name)),
+        }
+    }
+
+    fn not_an_f32_constant(&self, span: Span) -> syn::Error {
+        syn::Error::new(
+            span,
+            format!(
+                "integral bounds are constant\n\
+                 \n\
+                 note: a bound is evaluated at expansion, from literals, `f32` consts, a `usize` \
+                 const `as f32`, `+ - * /`, unary `-` and parentheses, each operation in `f32`\n\
+                 note: a program's shape is known when it is compiled (§1.5 of {PLAN})"
+            ),
+        )
+    }
+}
+
 /// Every `const`'s value.
 ///
 /// A `const` is evaluated here, at expansion, and gets the value rustc gives
@@ -1214,6 +1474,21 @@ impl UsizeScope for ConstEvaluator<'_> {
     }
 }
 
+impl F32Scope for ConstEvaluator<'_> {
+    /// The `f32` const `name`'s value; a `usize` const is a count, and is a
+    /// value only as `name as f32`.
+    fn f32_named(&mut self, name: &Ident) -> syn::Result<f32> {
+        match self.value_of(name)? {
+            ConstValue::F32(value) => Ok(value),
+            ConstValue::Usize(_) => Err(a_count_is_not_a_value(name)),
+        }
+    }
+
+    fn not_an_f32_constant(&self, span: Span) -> syn::Error {
+        Self::not_constant(span)
+    }
+}
+
 impl ConstEvaluator<'_> {
     /// The value of the const `name`, evaluating it on first demand.
     fn value_of(&mut self, name: &Ident) -> syn::Result<ConstValue> {
@@ -1257,56 +1532,6 @@ impl ConstEvaluator<'_> {
         self.in_progress.pop();
         self.values.insert(key, value);
         Ok(value)
-    }
-
-    /// The `f32` const `name`'s value; a `usize` const is a count, and is a
-    /// value only as `name as f32`.
-    fn f32_named(&mut self, name: &Ident) -> syn::Result<f32> {
-        match self.value_of(name)? {
-            ConstValue::F32(value) => Ok(value),
-            ConstValue::Usize(_) => Err(a_count_is_not_a_value(name)),
-        }
-    }
-
-    /// An `f32` initializer's value: literals, other `f32` consts, a `usize`
-    /// const `as f32`, `+ - * /`, unary `-` and parentheses, each operation
-    /// in `f32`.
-    fn eval_f32(&mut self, expr: &Expr) -> syn::Result<f32> {
-        match expr {
-            Expr::Literal(literal) => literal.f32_value(),
-            Expr::Ident(ident) => self.f32_named(&ident.name),
-            Expr::Paren(inner) => self.eval_f32(inner),
-            // Rust's own `as`, which rounds to the nearest `f32` as rustc's
-            // does: exact up to 2²⁴.
-            Expr::Cast(cast) => {
-                let Some(name) = cast.named() else {
-                    return Err(Self::not_constant(cast.span));
-                };
-                Ok(self.usize_named(name)? as f32)
-            }
-            Expr::Unary(unary) => match unary.op {
-                UnaryOp::Neg => Ok(-self.eval_f32(&unary.operand)?),
-            },
-            Expr::Binary(binary) => {
-                let lhs = self.eval_f32(&binary.lhs)?;
-                let rhs = self.eval_f32(&binary.rhs)?;
-                match binary.op {
-                    BinaryOp::Add => Ok(lhs + rhs),
-                    BinaryOp::Sub => Ok(lhs - rhs),
-                    BinaryOp::Mul => Ok(lhs * rhs),
-                    BinaryOp::Div => Ok(lhs / rhs),
-                    BinaryOp::Lt
-                    | BinaryOp::Le
-                    | BinaryOp::Gt
-                    | BinaryOp::Ge
-                    | BinaryOp::Eq
-                    | BinaryOp::Ne
-                    | BinaryOp::BitAnd
-                    | BinaryOp::BitOr => Err(Self::not_constant(binary.span)),
-                }
-            }
-            other => Err(Self::not_constant(other.span())),
-        }
     }
 
     fn not_constant(span: Span) -> syn::Error {
@@ -1416,6 +1641,7 @@ fn collect_calls(expr: &Expr, fns: &[String], out: &mut Vec<(String, Span)>) {
         }
         // A bound is constant, so it calls nothing; a body may.
         Expr::Fold(fold) => collect_calls(&fold.body, fns, out),
+        Expr::Integral(integral) => collect_calls(&integral.body, fns, out),
         Expr::Cast(cast) => collect_calls(&cast.operand, fns, out),
         Expr::Block(block) => collect_block_calls(block, fns, out),
         Expr::Paren(inner) => collect_calls(inner, fns, out),
@@ -1848,14 +2074,31 @@ mod tests {
             err.contains("recursion is refused") && err.contains("`f` calls `f`"),
             "got: {err}"
         );
+        // And through an integrand, `area`'s among them.
+        for input in [
+            quote! {
+                fn f(x: f32) -> f32 { integral(0.0..1.0, |u| f(x + u)) }
+                pub fn g() -> f32 { f(X) }
+            },
+            quote! {
+                fn f(x: f32) -> f32 { area(|u, v| f(x + u + v)) }
+                pub fn g() -> f32 { f(X) }
+            },
+        ] {
+            let err = refusal(input);
+            assert!(
+                err.contains("recursion is refused") && err.contains("`f` calls `f`"),
+                "got: {err}"
+            );
+        }
     }
 
     /// A call is checked at its arity and its parameters' types; an entry
-    /// is not callable; an unknown function is not captured; a function B4
-    /// brings names the phase.
+    /// is not callable; an unknown function is not captured; the language's
+    /// `monotone_root` takes three `f32`s.
     #[test]
     fn a_call_is_checked() {
-        let cases: [(TokenStream, &str); 8] = [
+        let cases: [(TokenStream, &str); 9] = [
             (
                 quote! { fn h(x: f32) -> f32 { x } pub fn f() -> f32 { h(X, Y) } },
                 "`h` takes 1 argument, but 2 were supplied",
@@ -1877,16 +2120,27 @@ mod tests {
                 "`h` is a function, not a value",
             ),
             (
-                quote! { pub fn f() -> f32 { monotone_root(X, 1.0, 2.0) } },
-                "`monotone_root` is not yet a function of the language",
+                quote! { pub fn f() -> f32 { monotone_root(X, 1.0) } },
+                "`monotone_root` takes 3 arguments, `(delta, step, bend)`, but 2 were supplied",
             ),
-            (quote! { pub fn f() -> f32 { area(X) } }, "B4"),
-            (quote! { pub fn f() -> f32 { integral(X) } }, "B4"),
+            (
+                quote! { pub fn f() -> f32 { monotone_root(X, 1.0, 2.0, 3.0) } },
+                "but 4 were supplied",
+            ),
+            (
+                quote! { pub fn f() -> f32 { monotone_root(X < Y, 1.0, 2.0) } },
+                "`monotone_root` takes `f32`s",
+            ),
+            (
+                quote! { pub fn f() -> bool { monotone_root(X, 1.0, 2.0) } },
+                "expected `bool`, found `f32`",
+            ),
         ];
         for (input, expected) in cases {
             let err = refusal(input);
             assert!(err.contains(expected), "expected `{expected}`, got: {err}");
         }
+        accepted(quote! { || monotone_root(Y - 1.0, X.max(0.0), 0.5) * 2.0 });
     }
 
     /// A `fn` returns what it declares.
@@ -2251,6 +2505,212 @@ mod tests {
                 MethodTyping::Choice => assert_eq!(op.arity(), 3, "{name}"),
                 MethodTyping::Arithmetic => {}
             }
+        }
+    }
+
+    // ───────────────────────────── integrals ─────────────────────────────
+
+    /// The bounds of the integral an entry's body ends in, as `sema`
+    /// evaluates them for lowering to read.
+    fn bounds_of_the_integral(input: TokenStream) -> (f32, f32) {
+        let analyzed = accepted(input);
+        let mut body = &analyzed.def.fns[0].body;
+        while let Expr::Block(block) = body {
+            body = block.expr.as_deref().expect("the block has a value");
+        }
+        let Expr::Integral(integral) = body else {
+            panic!("the body is an integral, got {body:?}");
+        };
+        let IntegralBounds::Written(range) = &integral.bounds else {
+            panic!("the bounds are written");
+        };
+        interval_bounds(range, &analyzed.consts).expect("an interval")
+    }
+
+    /// An integral's bounds are `f32` constants, evaluated at expansion as an
+    /// `f32` const's initializer is: literals, `f32` consts, a `usize`
+    /// const `as f32`, `+ - * /`, unary `-`. An integer literal is its
+    /// `f32`, as it is wherever a value is expected.
+    #[test]
+    fn an_integrals_bounds_are_evaluated_at_expansion() {
+        assert_eq!(
+            bounds_of_the_integral(quote! { || integral(0..1, |u| u) }),
+            (0.0, 1.0)
+        );
+        assert_eq!(
+            bounds_of_the_integral(quote! {
+                const H: f32 = 1.0 / 4.0;
+                const N: usize = 3;
+                pub fn f() -> f32 { integral(-H..H * (N as f32) + 0.5, |u| u * X) }
+            }),
+            (-0.25, 1.25)
+        );
+    }
+
+    /// Integral bounds are constant (plan §1.5): a bound naming a
+    /// parameter, a coordinate, a `let`, a fold's index or an enclosing
+    /// integral's variable, or built from anything but constant arithmetic,
+    /// is refused where it is written.
+    #[test]
+    fn an_integral_bound_that_is_not_constant_is_refused() {
+        let cases: [(TokenStream, &str); 8] = [
+            (
+                quote! { |c: f32| integral(0.0..c, |u| u) },
+                "an integral's bounds are constant, and `c` is not a `const`",
+            ),
+            (
+                quote! { || integral(0.0..X, |u| u) },
+                "and `X` is not a `const`",
+            ),
+            (
+                quote! { || { let h = 1.0; integral(0.0..h, |u| u) } },
+                "and `h` is not a `const`",
+            ),
+            (
+                quote! { || (0..4).map(|i| integral(0.0..(i as f32), |u| u)).sum() },
+                "and `i` is not a `const`",
+            ),
+            (
+                quote! { || integral(0.0..1.0, |u| integral(0.0..u, |v| v)) },
+                "and `u` is not a `const`",
+            ),
+            (
+                quote! { || integral(0.0..X.floor(), |u| u) },
+                "integral bounds are constant",
+            ),
+            (
+                quote! { || integral(0.0..(1.0 < 2.0), |u| u) },
+                "integral bounds are constant",
+            ),
+            (
+                quote! { const N: usize = 2; pub fn f() -> f32 { integral(0.0..N, |u| u) } },
+                "`N` is a `usize`",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(input);
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
+    }
+
+    /// The interval is one pixelflow-ir admits (`IntervalFold::try_new`),
+    /// or a spanned error at the bounds saying why: it runs backwards, it is
+    /// empty, an end is not finite, or its length overflows. It was a panic
+    /// in the IR's constructor when the kernel was built.
+    #[test]
+    fn an_interval_the_ir_refuses_is_a_spanned_error() {
+        let cases: [(TokenStream, &str); 5] = [
+            (
+                quote! { || integral(1.0..0.0, |u| u) },
+                "`1.0..0.0` runs backwards",
+            ),
+            (
+                quote! { || integral(1.0..1.0, |u| u) },
+                "`1.0..1.0` is empty",
+            ),
+            (quote! { || integral(-0.0..0.0, |u| u) }, "is empty"),
+            (
+                quote! {
+                    const FAR: f32 = 1.0 / 0.0;
+                    pub fn f() -> f32 { integral(0.0..FAR, |u| u) }
+                },
+                "is not finite",
+            ),
+            (
+                quote! { || integral(-3.0e38..3.0e38, |u| u) },
+                "overflows `f32`",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(input);
+            assert!(
+                err.contains(expected) && err.contains("IntervalFold::try_new"),
+                "expected `{expected}`, got: {err}"
+            );
+        }
+        // The narrowest interval an `f32` spells is admitted.
+        let above_one = f32::from_bits(1.0_f32.to_bits() + 1);
+        assert_eq!(
+            bounds_of_the_integral(quote! { || integral(1.0..1.00000012, |u| u) }),
+            (1.0, above_one)
+        );
+    }
+
+    /// An integral's variable is scoped as a fold's index is: its body sees
+    /// it and every enclosing binding, it shadows a parameter there, and
+    /// nothing past the body sees it — `area`'s two variables alike. It
+    /// shadows no item.
+    #[test]
+    fn an_integrals_variable_is_scoped_to_its_body() {
+        accepted(quote! { |u: f32| integral(0.0..1.0, |u| u * X) + u });
+        accepted(quote! { || integral(0.0..1.0, |u| area(|v, w| u * v * w)) });
+        let cases: [(TokenStream, &str); 5] = [
+            (
+                quote! { || integral(0.0..1.0, |u| u) + u },
+                "cannot find `u`",
+            ),
+            (quote! { || area(|u, v| X + u) + v }, "cannot find `v`"),
+            (quote! { || area(|u, v| X + u) * u }, "cannot find `u`"),
+            (
+                quote! { || integral(0.0..1.0, |X| X) },
+                "an integral's variable `X` shadows the intrinsic",
+            ),
+            (
+                quote! {
+                    const C: f32 = 1.0;
+                    pub fn f() -> f32 { area(|C, v| X + C) }
+                },
+                "shadows the `const C`",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(input);
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
+    }
+
+    /// An integral's variable is an `f32` a body computes with, unlike a
+    /// fold's index; its integrand is an `f32`, and so is the integral.
+    #[test]
+    fn an_integral_types_as_an_f32_of_an_f32() {
+        accepted(quote! { || integral(0.0..1.0, |u| (u * u + X).sqrt()) });
+        accepted(quote! { pub fn f() -> bool { area(|u, v| X + u) < 0.5 } });
+        let cases: [(TokenStream, &str); 3] = [
+            (
+                quote! { || integral(0.0..1.0, |u| u < X) },
+                "an integral's body is its integrand, an `f32`",
+            ),
+            (
+                quote! { || integral(0.0..1.0, |u| u as f32) },
+                "this expression's type is `f32`",
+            ),
+            (
+                quote! { || if area(|u, v| X) { X } else { Y } },
+                "expected `bool`, found `f32`",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(input);
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
+    }
+
+    /// `integral`, `area` and `monotone_root` are the language's: no `const`
+    /// or `fn` of a block takes one of their names, so a call to one always
+    /// means it.
+    #[test]
+    fn the_language_functions_are_reserved() {
+        for input in [
+            quote! { fn integral(x: f32) -> f32 { x } pub fn f() -> f32 { X } },
+            quote! { const area: f32 = 1.0; pub fn f() -> f32 { X } },
+            quote! { fn monotone_root(x: f32) -> f32 { x } pub fn f() -> f32 { X } },
+            quote! { pub fn area() -> f32 { X } },
+        ] {
+            let err = refusal(input);
+            assert!(
+                err.contains("is a function of the language; an item cannot be named after it"),
+                "got: {err}"
+            );
         }
     }
 }

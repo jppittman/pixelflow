@@ -669,9 +669,10 @@ pub(crate) struct QuadratureNode {
 /// No monoid: an integral is a sum, and `Σ` is the only algebra with a
 /// measure to integrate against. [`Fold::monoid`] answers `Σ` for it.
 ///
-/// Opaque outside this crate, and built only by `Kernel::area` (or decoded
-/// by [`Fold::from_bits`]): which interval a kernel integrates is a fact its
-/// constructor chose, not one a consumer edits.
+/// Its fields are private: it is built by `Kernel::area`, by `kernel!`'s
+/// lowering of `integral` and `area` through [`IntervalFold::try_new`], or
+/// decoded by [`Fold::from_bits`], and nothing edits one. Which interval a
+/// kernel integrates is a fact its constructor chose.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct IntervalFold {
     binder: Binder,
@@ -697,7 +698,16 @@ impl IntervalFold {
         })
     }
 
-    fn try_new(binder: Binder, lo: f32, hi: f32) -> Option<Self> {
+    /// `∫_lo^hi`, binding `binder`, or `None` where the crate's panicking
+    /// constructor would panic: an end that is not finite, `lo >= hi`, or a
+    /// length `hi - lo` that overflows.
+    ///
+    /// The total form of the contract, and its one definition. `kernel!`
+    /// builds an integral a body writes through this, at expansion, so an
+    /// interval the IR refuses is a compile error at the bounds rather than
+    /// a panic when the kernel is built.
+    #[must_use]
+    pub fn try_new(binder: Binder, lo: f32, hi: f32) -> Option<Self> {
         let (lo, hi) = (Endpoint::new(lo)?, Endpoint::new(hi)?);
         (lo.get() < hi.get() && (hi.get() - lo.get()).is_finite()).then_some(Self {
             binder,
