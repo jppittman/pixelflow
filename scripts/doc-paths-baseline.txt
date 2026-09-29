@@ -37,3 +37,8 @@ docs/plans/2026-09-06-uniform-slot-identity.md	ir_bridge.rs
 docs/plans/2026-09-06-uniform-slot-identity.md	jit_manifold.rs
 docs/plans/2026-09-06-uniform-slot-identity.md	pixelflow-compiler/src/jit_backend.rs
 docs/plans/2026-09-06-uniform-slot-identity.md	pixelflow-graphics/src/animation.rs
+
+# CLAUDE.md is JP's file, which an agent does not edit. Its "Glyph coverage"
+# note still cites the test the integral's deletion (2026-09-29) took with
+# it; the note's replacement waits on JP, and this line goes when it lands.
+CLAUDE.md	pixelflow-graphics/tests/glyph_is_closed.rs
