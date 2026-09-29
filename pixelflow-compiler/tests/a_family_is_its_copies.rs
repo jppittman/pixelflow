@@ -10,6 +10,13 @@
 //! index for the family. Its count is structural: two glyphs of one `N` are
 //! one program, whatever their pieces, and `N = 3` and `N = 4` are two.
 //!
+//! One key with the terms written out holds at `N ≥ 1`. At `N = 0` a fold
+//! around an iteration whose body binds a fold of its own may key apart
+//! from the same program written out: lowering chose the enclosing fold's
+//! binder around the body, which `N = 0` deletes, so the two differ by a
+//! binder's name alone. They are α-equivalent and compute the same pixels;
+//! the cost is one degenerate program compiled twice, never a value.
+//!
 //! The block below is §1.7's, as the plan writes it, with the iteration
 //! spelled as it was chosen (§4 Q2): it expands, bakes, keys and rebinds.
 //! What an iteration *means* is pinned against rustc in
@@ -423,6 +430,92 @@ kernel_raw! {
         let total = a.w * X + b.w * X;
         a.x * total + b.x * total
     }
+
+    /// Every triple's `a.x·b.w + c.x·r`: an iteration nested two deep over
+    /// one family, so the innermost template's copies are made inside the
+    /// middle one's, whose copies are made inside the outer one's, and each
+    /// reads its elements at the program's slots.
+    pub fn triples<const N: usize>(masses: [Mass; N], r: f32) -> f32 {
+        masses
+            .into_iter()
+            .map(|a| {
+                masses
+                    .into_iter()
+                    .map(|b| masses.into_iter().map(|c| a.x * b.w + c.x * r).sum::<f32>())
+                    .sum::<f32>()
+            })
+            .sum()
+    }
+
+    /// The same at `N = 2`, written out: its eight terms.
+    pub fn triples_of_two(p: Mass, q: Mass, r: f32) -> f32 {
+        (((p.x * p.w + p.x * r) + (p.x * p.w + q.x * r))
+            + ((p.x * q.w + p.x * r) + (p.x * q.w + q.x * r)))
+            + (((q.x * p.w + p.x * r) + (q.x * p.w + q.x * r))
+                + ((q.x * q.w + p.x * r) + (q.x * q.w + q.x * r)))
+    }
+
+    /// Three families nested three deep inside a fold, the innermost body
+    /// reading every element, the fold's index, an argument and a record's
+    /// field; each level's body more than the level inside it.
+    pub fn layers<const A: usize, const B: usize, const C: usize>(
+        r: f32,
+        outer: [Mass; A],
+        middle: [f32; B],
+        inner: [Mass; C],
+        m: Mass,
+    ) -> f32 {
+        (0..2)
+            .map(|i| {
+                outer
+                    .into_iter()
+                    .map(|p| {
+                        middle
+                            .into_iter()
+                            .map(|q| {
+                                inner
+                                    .into_iter()
+                                    .map(|s| p.x * q + s.w * (i as f32) + m.x * r)
+                                    .sum::<f32>()
+                                    * q
+                            })
+                            .sum::<f32>()
+                            + p.w
+                    })
+                    .sum::<f32>()
+            })
+            .sum()
+    }
+
+    /// Two masses' slots as one record, element-major, as a family of two
+    /// declares them.
+    pub struct TwoMasses { pub x0: f32, pub w0: f32, pub x1: f32, pub w1: f32 }
+
+    /// Two scalars' slots as one record.
+    pub struct TwoScalars { pub q0: f32, pub q1: f32 }
+
+    /// The same with two elements in each family, written out, each
+    /// family's slots a record of their own.
+    pub fn layers_of_two(r: f32, p: TwoMasses, q: TwoScalars, s: TwoMasses, m: Mass) -> f32 {
+        (0..2)
+            .map(|i| {
+                ((((p.x0 * q.q0 + s.w0 * (i as f32) + m.x * r)
+                    + (p.x0 * q.q0 + s.w1 * (i as f32) + m.x * r))
+                    * q.q0
+                    + ((p.x0 * q.q1 + s.w0 * (i as f32) + m.x * r)
+                        + (p.x0 * q.q1 + s.w1 * (i as f32) + m.x * r))
+                        * q.q1)
+                    + p.w0)
+                    + ((((p.x1 * q.q0 + s.w0 * (i as f32) + m.x * r)
+                        + (p.x1 * q.q0 + s.w1 * (i as f32) + m.x * r))
+                        * q.q0
+                        + ((p.x1 * q.q1 + s.w0 * (i as f32) + m.x * r)
+                            + (p.x1 * q.q1 + s.w1 * (i as f32) + m.x * r))
+                            * q.q1)
+                        + p.w1)
+            })
+            .sum()
+    }
 }
 
 /// An iteration nested in another over the same family is `N²` copies:
@@ -462,6 +555,96 @@ fn an_iteration_reading_another_shares_its_result() {
     assert_eq!(program_key(&shared), program_key(&shares_of_two(a, b)));
     // X = 0.5: the total is 2·½ + 5·½, and 1·3.5 + 3·3.5.
     assert_eq!(Lattice::eval_at(&shared, 0.5, 0.0), 14.0);
+}
+
+/// `family` is `written_out`: one canonical key, and the same value in each
+/// uniform slot — so every copy reads its elements from the slots the host
+/// function declared them in, not merely slots of the same shape.
+fn assert_is_written_out(family: &Kernel, written_out: &Kernel) {
+    let (family_arena, family_root) = family.parts();
+    let (written_arena, written_root) = written_out.parts();
+    let family_form = canonical(family_arena, family_root);
+    let written_form = canonical(written_arena, written_root);
+    assert_eq!(
+        family_form.key,
+        written_form.key,
+        "family: {}\nwritten out: {}",
+        family_arena.display(family_root),
+        written_arena.display(written_root)
+    );
+    let values = |form: &pixelflow_ir::key::Canonical| -> Vec<u32> {
+        form.uniforms.iter().map(|u| u.default.to_bits()).collect()
+    };
+    assert_eq!(values(&family_form), values(&written_form));
+}
+
+/// An iteration nested two deep over one family is `N³` copies: at `N = 2`,
+/// `Σ_a Σ_b Σ_c (a.x·b.w + c.x·r)` is its eight terms written out. The
+/// innermost copies are made inside the middle iteration's template, whose
+/// copies are made inside the outer one's, so each reads its element where
+/// the host function declared it only if every template on the way holds
+/// the slots of the arena it is copied into. Counting one arena's table
+/// while copying another's passes every iteration one deep, and fails this.
+#[test]
+fn an_iteration_nested_two_deep_is_every_triple() {
+    let (p, q) = (Mass { x: 1.0, w: 2.0 }, Mass { x: 3.0, w: 0.25 });
+    let r = 0.5;
+    let nested = triples::<2>([p, q], r);
+    assert_is_written_out(&nested, &triples_of_two(p, q, r));
+    let masses = [p, q];
+    let by_rust: f32 = masses
+        .iter()
+        .map(|a| {
+            masses
+                .iter()
+                .map(|b| masses.iter().map(|c| a.x * b.w + c.x * r).sum::<f32>())
+                .sum::<f32>()
+        })
+        .sum();
+    assert_eq!(Lattice::eval_at(&nested, 0.5, 0.0), by_rust);
+    assert_eq!(Lattice::eval_at(&triples::<0>([], r), 0.5, 0.0), 0.0);
+}
+
+/// Three families nested three deep inside a fold are their copies: with
+/// two elements each, the program is the fold over its terms written out,
+/// every level reading the one outside it, the index, an argument and a
+/// record's field.
+#[test]
+fn three_families_nested_in_a_fold_are_their_terms_written_out() {
+    let (p0, p1) = (Mass { x: 1.0, w: 2.0 }, Mass { x: 3.0, w: 0.25 });
+    let (q0, q1) = (0.5, 1.25);
+    let (s0, s1) = (Mass { x: 5.0, w: 0.75 }, Mass { x: 7.0, w: 1.5 });
+    let (r, m) = (0.5, Mass { x: 0.125, w: 9.0 });
+    let nested = layers::<2, 2, 2>(r, [p0, p1], [q0, q1], [s0, s1], m);
+    let two = |a: Mass, b: Mass| TwoMasses {
+        x0: a.x,
+        w0: a.w,
+        x1: b.x,
+        w1: b.w,
+    };
+    let written_out = layers_of_two(r, two(p0, p1), TwoScalars { q0, q1 }, two(s0, s1), m);
+    assert_is_written_out(&nested, &written_out);
+    let by_rust: f32 = (0..2)
+        .map(|i| {
+            [p0, p1]
+                .iter()
+                .map(|p| {
+                    [q0, q1]
+                        .iter()
+                        .map(|q| {
+                            [s0, s1]
+                                .iter()
+                                .map(|s| p.x * q + s.w * (i as f32) + m.x * r)
+                                .sum::<f32>()
+                                * q
+                        })
+                        .sum::<f32>()
+                        + p.w
+                })
+                .sum::<f32>()
+        })
+        .sum();
+    assert_eq!(Lattice::eval_at(&nested, 0.5, 0.0), by_rust);
 }
 
 /// A family is declared, and streamed by `write_into`, where it is written
@@ -600,4 +783,93 @@ fn the_macro_docs_family_example_bakes_and_rebinds() {
     args.write_into(&mut block).expect("cover's own arguments");
     let again = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
     assert_eq!(again.buffer(), lattice.bake(&cover(args.discs)).buffer());
+}
+
+/// A block written where no prelude is in scope: records, a `pub const`, a
+/// helper, a tuple `let`, a family iterated two deep in a fold, a family of
+/// `f32`s, their `Args` stream, and the closure form's family. The
+/// expansion names every item by path, so it expands in a
+/// `#[no_implicit_prelude]` module as anywhere else — which a bare `Some`
+/// or an `Iterator` method called through the prelude's trait would not.
+#[no_implicit_prelude]
+mod without_a_prelude {
+    ::pixelflow_compiler::kernel! {
+        /// A point with a weight.
+        pub struct Mass { pub x: f32, pub w: f32 }
+
+        /// Half.
+        pub const HALF: f32 = 0.5;
+
+        fn weighed(m: Mass, r: f32) -> f32 { m.x * r + m.w }
+
+        /// Every pair's weighed product, plus each fold index, plus a half
+        /// where some `v` is past `X`.
+        pub fn nested<const N: usize>(masses: [Mass; N], v: [f32; 2], r: f32) -> f32 {
+            let (a, b) = (r, X);
+            (0..2)
+                .map(|i| {
+                    masses
+                        .into_iter()
+                        .map(|p| {
+                            masses
+                                .into_iter()
+                                .map(|q| weighed(p, a) * q.w + (i as f32))
+                                .sum::<f32>()
+                        })
+                        .sum::<f32>()
+                })
+                .sum::<f32>()
+                + if v.into_iter().any(|e| b < e) { HALF } else { 0.0 }
+        }
+    }
+
+    /// The closure form's family, scaled.
+    pub fn scaled(v: [f32; 2], r: f32) -> ::pixelflow_core::Kernel {
+        let scaled = ::pixelflow_compiler::kernel!(|v: [f32; 2], r: f32| v
+            .into_iter()
+            .map(|e| e * r)
+            .sum::<f32>());
+        scaled(v, r)
+    }
+}
+
+/// The block without a prelude means what it says, and its program rebinds
+/// from its `Args`.
+#[test]
+fn a_family_expands_where_no_prelude_is_in_scope() {
+    use without_a_prelude::{HALF, Mass, NestedArgs, nested, scaled};
+    let masses = [Mass { x: 1.0, w: 2.0 }, Mass { x: 3.0, w: 0.25 }];
+    let (v, r) = ([0.25, 4.0], 0.5);
+    let x = 0.5;
+    let by_rust: f32 = (0..2)
+        .map(|i| {
+            masses
+                .iter()
+                .map(|p| {
+                    masses
+                        .iter()
+                        .map(|q| (p.x * r + p.w) * q.w + i as f32)
+                        .sum::<f32>()
+                })
+                .sum::<f32>()
+        })
+        .sum::<f32>()
+        + if v.iter().any(|&e| x < e) { HALF } else { 0.0 };
+    let kernel = nested::<2>(masses, v, r);
+    assert_eq!(Lattice::eval_at(&kernel, x, 0.0), by_rust);
+
+    let lattice = Lattice::frame(4, 2);
+    let program = Manifold::compile(&kernel, lattice.extent);
+    let mut block = program.block();
+    let args = NestedArgs {
+        masses: [Mass { x: 0.5, w: 1.5 }, Mass { x: -1.0, w: 4.0 }],
+        v: [3.0, 0.125],
+        r: 2.0,
+    };
+    args.write_into(&mut block).expect("nested's own arguments");
+    let rebound = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
+    let baked = lattice.bake(&nested(args.masses, args.v, args.r));
+    assert_eq!(rebound.buffer(), baked.buffer());
+
+    assert_eq!(Lattice::eval_at(&scaled([1.0, 2.0], 0.5), 0.0, 0.0), 1.5);
 }

@@ -354,11 +354,17 @@ Three problems, none of which touches the language:
 - Each entry becomes a host function that instantiates the lowered template
   with its structural values and returns the opaque `Kernel`.
 - The template is a replay of `ExprArena` pushes, as `emit.rs` emits today.
-- A family's iteration is its body's own template, built once over an
-  abstract element and the terms every copy shares (built once, outside
-  it), and copied per element at instantiation, the element's uniforms and
-  the shared terms in its inputs' places (B3). B6 closes that template
-  once, before the copies.
+- A family's iteration is its body's own template, built over an abstract
+  element and the terms every copy shares (built once, outside it), and
+  copied per element at instantiation, the element's uniforms and the
+  shared terms in its inputs' places (B3). Templates are built innermost
+  first. A body that iterates no family itself, as §1.7's glyph's does
+  not, has a template the size of the body whatever `N` is. A body that
+  does holds the table of the arena it is copied into and its inner
+  iteration's copies, `N` of them, so its template grows with `N` and is
+  one instantiation's. B6 closes each template as it is built, before its
+  copies, so an enclosing template holds closed inner copies rather than
+  `N` open integrals (the shape the first problem above stops closing).
 - No optimization runs at expansion unless the instance is declared (Phase
   E).
 
@@ -430,21 +436,40 @@ and no digests are committed (one-pipeline §5, gate policy).
 ### Phase B: the syntax grows the font's constructs
 
 - **B1.** The items block, `if` as the only choice, typed masks, `const`
-  items and helper `fn`s.
-- **B2.** Folds over constant ranges, and the binder type.
+  items and helper `fn`s. **Done** in `fb324728`.
+- **B2.** Folds over constant ranges, and the binder type. **Done** in
+  `96c240b8`.
 - **B3.** Binding times and `Args`, records, structural counts, and families
   of records iterated at instantiation. **Done**: records, binding times and
-  `Args` in `f002fb6a`; families and tuple `let`s in (this commit).
-- **B4.** `integral`, `area` and `monotone_root`.
+  `Args` in `f002fb6a`; families and tuple `let`s in `e65a72e3` (B3's
+  second half).
+- **B4.** `integral`, `area` and `monotone_root`. **Done** in `d9d759a4`,
+  with review follow-ups in `68781e16`.
 - **B5.** Lowering calls `pixelflow-ir`'s definitions, and `lower.rs`'s
   copies go.
 - **B6.** Helpers as optimization units (D19): a helper's integral is closed
   once and instantiated.
+  - Two units are closed, both through `ExprArena::splice_with`: a
+    helper's template over its parameters, and a family's template over
+    its shared terms and its element. For §1.7's glyph they coincide: the
+    family's body is `piece_term(p, x, y)`, whose element `p` and inputs
+    `x`, `y` are the helper's parameters.
   - A family's iteration is lowered as `body + marker`, which survives a
     splice and not a rewrite: reassociated, `t + (body + marker)` reads as
     an iteration of `t + body`. Nothing optimizes one today (B3 pins it);
     before B6 closes a template, key the iteration by a handle a rewrite
     cannot move.
+  - A template's inputs are `Uniform` leaves, and a uniform's variance is
+    constant on the lattice (`variance.rs`, "a uniform is here"). An input
+    stands for any term the copies share, `x = X + ½` included. That is
+    sound for every rewrite conditioned on binder-invariance, since an input
+    reads no binder its template holds (pinned by
+    `an_input_reads_no_binder_its_template_holds`), but extraction would
+    price `x`-dependent work as per-call. Before extracting in a template,
+    seed each input's variance from the term it stands for, or give a
+    template's input a leaf meaning of its own.
+  - Close templates innermost first (§1.8): a template whose body iterates
+    a family holds its inner copies and is built per instantiation.
 - **B7.** The equivalence gate: one glyph built by `kernel!` and by the
   builder gives the same pixels over ASCII at 7, 16 and 32 px.
 

@@ -678,7 +678,7 @@ impl Kernel {
     /// Note this is the **fixed-arity** fold over a slice of distinct terms,
     /// not [`Kernel::over`], which folds one body over a bounded index.
     ///
-    /// Its shape is [`Chain`]'s, the one a fold of distinct terms has —
+    /// Its shape is `Chain`'s, the one a fold of distinct terms has —
     /// `((k₀ ⊕ k₁) ⊕ k₂) ⊕ …` — which a `kernel!` family's instantiation
     /// builds through too.
     #[must_use]
