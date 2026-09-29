@@ -28,6 +28,9 @@
 use crate::arena::{ExprArena, ExprId, ExprNode};
 use crate::fold::IntervalFold;
 use crate::kind::OpKind;
+// The composition `Kernel::clamp` builds, so a closed form's clamp is the
+// term an author's is.
+use crate::library::clamp;
 
 /// A span whose clamp is averaged over no wider than this fraction of the
 /// band is averaged by its midpoint instead, by [`mean_of_clamp`].
@@ -663,13 +666,6 @@ fn climb(arena: &mut ExprArena, rise: Rise, [s, t]: [ExprId; 2]) -> ExprId {
     let bent = arena.push_binary(OpKind::Mul, rise.bend, span);
     let slope = arena.push_binary(OpKind::Add, twice, bent);
     arena.push_binary(OpKind::Mul, width, slope)
-}
-
-/// `min(max(z, lower), upper)` — the composition `Kernel::clamp` builds, so a
-/// closed form's clamp is the same term an author's is.
-fn clamp(arena: &mut ExprArena, z: ExprId, [lower, upper]: [ExprId; 2]) -> ExprId {
-    let floored = arena.push_binary(OpKind::Max, z, lower);
-    arena.push_binary(OpKind::Min, floored, upper)
 }
 
 /// `factor·x`, or `x` itself when the factor is 1.

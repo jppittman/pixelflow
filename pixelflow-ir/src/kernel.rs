@@ -16,16 +16,20 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::convert::Infallible;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arena::{BufferDecl, BufferIdentity, ExprArena, ExprId, UniformDecl, UniformIdentity};
+use crate::arena::{
+    Axis, BufferDecl, BufferIdentity, ExprArena, ExprId, Unclosed, UniformDecl, UniformIdentity,
+};
 use crate::dag::{Builder, Dag, Node, Rooted};
 use crate::expr::{
     Environment, ExprBuilderExt, ExprData, copy_subgraph, from_arena, splice, substitute_vars,
     to_arena,
 };
-use crate::fold::{Binder, Chain, Fold, IntervalFold, Monoid};
+use crate::fold::{Binder, Chain, Fold, IntervalFold, Monoid, Placeholder};
 use crate::kind::OpKind;
+use crate::library::{self, Terms};
 
 /// One bit per placeholder index, set while that index is claimed by a binder
 /// under construction. Claims are taken and released in any order, so this is a
@@ -35,60 +39,46 @@ use crate::kind::OpKind;
 /// 0 while B still holds 1, and the next claim hands out 1 again.
 static PLACEHOLDERS_IN_USE: AtomicU64 = AtomicU64::new(0);
 
-/// Placeholder indices sit above the retired coordinate space (`0..4`, of
-/// which only X and Y are live) and the whole reduction index space
-/// (`4..Variance::VARIABLES`) — past every index a real binder can take,
-/// which is what keeps a placeholder's rename from ever reaching a binder
-/// an inner fold has already chosen. A `Kernel` never contains the
-/// compiler's manifold-param slots (the value-producing macro path rejects
-/// manifold params outright), so everything from here up is free.
-const PLACEHOLDER_BASE: u32 = crate::variance::Variance::VARIABLES as u32;
-
-/// A reduction's bound index while its body is under construction, before a
-/// real slot is chosen.
+/// A [`Placeholder`] claimed for a binder under construction, released on
+/// drop.
 ///
-/// The placeholder must be unique among binders that are *simultaneously* being
-/// built: a nested fold renames every occurrence of its own placeholder to a
-/// real slot, so if it shared one with the fold enclosing it, it would capture
-/// the outer index — `Σ_i Σ_j f(i, j)` would silently become `Σ_i Σ_j f(j, j)`.
-/// The claim is released on drop, so the space is bounded by how many binders
-/// are open at this instant, not by how many kernels have ever been built.
-///
-/// [`lowest_free_binder`] caps nesting at [`Binder::COUNT`]; the 64
-/// placeholders here admit that many binders under construction at once,
-/// however they nest across threads, and exhaustion panics rather than
-/// aliasing an index.
-struct BinderScope(u32);
+/// The placeholder must be unique among binders that are *simultaneously*
+/// being built (see [`Placeholder`]), and kernels are built on many threads
+/// at once, so the claim is taken from a set every thread shares. It is
+/// released on drop, so the space is bounded by how many binders are open at
+/// this instant, not by how many kernels have ever been built: the
+/// [`Placeholder::COUNT`] placeholders admit that many binders under
+/// construction at once, however they nest across threads, and exhaustion
+/// panics rather than aliasing an index.
+struct BinderScope {
+    /// The bit of [`PLACEHOLDERS_IN_USE`] this claim holds.
+    bit: u32,
+    placeholder: Placeholder,
+}
 
 impl BinderScope {
     fn enter() -> Self {
         let mut in_use = PLACEHOLDERS_IN_USE.load(Ordering::Relaxed);
         loop {
             let bit = (!in_use).trailing_zeros();
-            assert!(
-                bit < u64::BITS,
-                "too many kernel binders under construction at once"
-            );
+            let placeholder = Placeholder::nth(bit as usize)
+                .unwrap_or_else(|| panic!("too many kernel binders under construction at once"));
             match PLACEHOLDERS_IN_USE.compare_exchange_weak(
                 in_use,
                 in_use | (1 << bit),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Self(bit),
+                Ok(_) => return Self { bit, placeholder },
                 Err(observed) => in_use = observed,
             }
         }
-    }
-
-    fn placeholder(&self) -> u8 {
-        (PLACEHOLDER_BASE + self.0) as u8
     }
 }
 
 impl Drop for BinderScope {
     fn drop(&mut self) {
-        PLACEHOLDERS_IN_USE.fetch_and(!(1 << self.0), Ordering::Relaxed);
+        PLACEHOLDERS_IN_USE.fetch_and(!(1 << self.bit), Ordering::Relaxed);
     }
 }
 
@@ -100,34 +90,6 @@ impl Drop for BinderScope {
 /// over the same interval, so a pixel written in the syntax and one built
 /// here are one program.
 pub const PIXEL_HALF_WIDTH: f32 = 0.5;
-
-/// The lowest binder not already bound by a `Reduce` in `arena`.
-///
-/// Binders are built inside-out, so a fold sees every inner fold's slot and
-/// takes the next free one — distinct live binders never share an index.
-///
-/// # Panics
-///
-/// Panics when every slot is live, i.e. one fold deeper than the index space.
-fn lowest_free_binder(dag: &Dag<ExprData>) -> Binder {
-    let mut used = [false; Binder::COUNT];
-    for node in dag.iter() {
-        // `ExprData::Reduce(Fold)` is why this is two lines. Read off a
-        // `Const` child it was a float, tested against `floorf` and a magic
-        // range, and asked again by every pass that wanted a binder.
-        if let ExprData::Reduce(fold) = *node {
-            used[fold.binder().slot() as usize] = true;
-        }
-    }
-    Binder::all()
-        .find(|b| !used[b.slot() as usize])
-        .unwrap_or_else(|| {
-            panic!(
-                "more than {} live nested reductions: the index space is full",
-                Binder::COUNT
-            )
-        })
-}
 
 /// A named scalar argument of a kernel: the JIT tier's spelling of a
 /// builder's struct field.
@@ -233,6 +195,30 @@ fn merge_buffer_data(
     }
 }
 
+/// Kernel values as a place to build [`library`] terms: a node is a
+/// `Kernel`, built as every combinator builds one — the receiver copied,
+/// the operand spliced in, one node on top — so a composite built through
+/// the one definition lays out its arena as the combinators always did.
+struct Values;
+
+impl library::sealed::Sealed for Values {}
+
+impl Terms for Values {
+    type Term = Kernel;
+
+    fn constant(&mut self, value: f32) -> Kernel {
+        Kernel::constant(value)
+    }
+
+    fn unary(&mut self, op: OpKind, operand: Kernel) -> Kernel {
+        operand.map(op)
+    }
+
+    fn binary(&mut self, op: OpKind, [a, b]: [Kernel; 2]) -> Kernel {
+        a.combine(&b, op)
+    }
+}
+
 impl Kernel {
     fn wrap(
         rooted: Rooted<ExprData>,
@@ -312,16 +298,16 @@ impl Kernel {
     /// The X coordinate.
     #[must_use]
     pub fn x() -> Self {
-        Self::coord(0)
+        Self::coord(Axis::X)
     }
     /// The Y coordinate.
     #[must_use]
     pub fn y() -> Self {
-        Self::coord(1)
+        Self::coord(Axis::Y)
     }
-    fn coord(i: u8) -> Self {
+    fn coord(axis: Axis) -> Self {
         let mut b = Builder::new();
-        let r = b.push_var(i);
+        let r = b.push_var(axis.var());
         Self::wrap(b.finish(&[r]), Environment::new(), BTreeMap::new())
     }
 
@@ -346,8 +332,8 @@ impl Kernel {
     /// thing that becomes machine code.
     #[must_use]
     pub fn from_parts(arena: ExprArena, root: ExprId) -> Self {
-        let (rooted, env) = from_arena(&arena, root);
-        let entry = rooted.entry();
+        let kernel = Self::adopt(arena, root, BTreeMap::new());
+        let entry = kernel.root();
         assert!(
             entry.retired_axis().is_none(),
             "Kernel::from_parts: the arena names Var({}), which was the {} \
@@ -361,12 +347,23 @@ impl Kernel {
             },
             crate::arena::COORD_AXES,
         );
+        kernel
+    }
+
+    /// The kernel `arena`'s `root` is, carrying `buffers`: the arena as it
+    /// stands is the one [`Kernel::parts`] hands out, node for node.
+    fn adopt(
+        arena: ExprArena,
+        root: ExprId,
+        buffers: BTreeMap<BufferIdentity, Arc<[f32]>>,
+    ) -> Self {
+        let (rooted, env) = from_arena(&arena, root);
         Self {
             inner: Arc::new(KernelData {
                 rooted,
                 env,
                 legacy: (arena, root),
-                buffers: BTreeMap::new(),
+                buffers,
             }),
         }
     }
@@ -494,10 +491,12 @@ impl Kernel {
     pub fn round(&self) -> Self {
         self.map(OpKind::Round)
     }
-    /// The fractional part, `self - ⌊self⌋`. Library, not a primitive.
+    /// The fractional part, `self - ⌊self⌋`. Library, not a primitive:
+    /// [`library::fract`], the one definition `kernel!`'s `.fract()` builds
+    /// too.
     #[must_use]
     pub fn fract(&self) -> Self {
-        self.sub(&self.floor())
+        library::fract(&mut Values, self.clone())
     }
 
     // ───────────────────── transcendentals ────────────────────────
@@ -566,9 +565,11 @@ impl Kernel {
     /// `√(self² + other²)` — the length of `(self, other)`. Library, not a
     /// primitive: no hardware computes it, so a `Hypot` node bought nothing
     /// but a decomposition each backend had to write for itself.
+    /// [`library::hypot`], the one definition `kernel!`'s `.hypot()` builds
+    /// too.
     #[must_use]
     pub fn hypot(&self, other: &Kernel) -> Self {
-        self.mul(self).add(&other.mul(other)).sqrt()
+        library::hypot(&mut Values, [self.clone(), other.clone()])
     }
 
     // ─────────────────────── comparisons / masks ──────────────────
@@ -632,15 +633,16 @@ impl Kernel {
     }
     /// `clamp(self, lo, hi)` = `min(max(self, lo), hi)`.
     ///
-    /// Library, not a primitive: this builds the composition it denotes, so
-    /// there is exactly one definition of clamping and every tier evaluates
-    /// the same nodes. (It used to be an IR node that three backends and the
-    /// e-graph's derivative rule each re-decomposed by hand, and they
-    /// disagreed on degenerate `lo > hi` bounds.) Passing `lo > hi` yields
-    /// `hi`, as the composition says.
+    /// Library, not a primitive: this builds the composition it denotes,
+    /// [`library::clamp`], so there is exactly one definition of clamping —
+    /// `kernel!`'s `.clamp()` and the integrals' closed forms build it too —
+    /// and every tier evaluates the same nodes. (It used to be an IR node
+    /// that three backends and the e-graph's derivative rule each
+    /// re-decomposed by hand, and they disagreed on degenerate `lo > hi`
+    /// bounds.) Passing `lo > hi` yields `hi`, as the composition says.
     #[must_use]
     pub fn clamp(&self, lo: &Kernel, hi: &Kernel) -> Self {
-        self.max(lo).min(hi)
+        library::clamp(&mut Values, self.clone(), [lo.clone(), hi.clone()])
     }
 
     // ───────────────────────── composition ────────────────────────
@@ -729,7 +731,9 @@ impl Kernel {
     ///
     /// # Panics
     ///
-    /// Panics if `range` runs backwards.
+    /// Panics unless [`RangeFold::admits`](crate::RangeFold::admits) `range`:
+    /// if it runs backwards, or ends past 2²⁴, where an `f32` index stops
+    /// naming every integer.
     ///
     /// ```ignore
     /// // Σ_d q(d)·k(d) — a contraction over the shared index.
@@ -770,13 +774,7 @@ impl Kernel {
     /// the kernel reaches a backend (`passes::resolve`).
     #[must_use]
     pub fn area(&self) -> Self {
-        let pixel = |binder| {
-            Fold::Interval(IntervalFold::new(
-                binder,
-                -PIXEL_HALF_WIDTH,
-                PIXEL_HALF_WIDTH,
-            ))
-        };
+        let pixel = |binder| Fold::Interval(IntervalFold::pixel(binder));
         Self::bind_fresh(pixel, |u_y| {
             Self::bind_fresh(pixel, |u_x| {
                 self.at(&Self::x().add(u_x), &Self::y().add(u_y))
@@ -788,36 +786,41 @@ impl Kernel {
     /// folded by whatever `fold_at` makes of the slot that index lands in.
     ///
     /// The slot is chosen only after the body exists, which is why the fold
-    /// is a function of it rather than a value — see the comments below.
+    /// is a function of it rather than a value: the body is built against a
+    /// placeholder, and [`ExprArena::close_over`] — the one definition of
+    /// the choice and the rename, which `kernel!`'s lowering closes its
+    /// folds through too — picks the slot and renames it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the body already binds every slot, i.e. one fold deeper
+    /// than the index space.
     fn bind_fresh(
         fold_at: impl FnOnce(Binder) -> Fold,
         body: impl FnOnce(&Kernel) -> Kernel,
     ) -> Self {
-        // Build the body against a placeholder index unique to this binder,
-        // then rename it to a real slot once we can see which slots the body
-        // already binds. Choosing the slot up-front is impossible: the body
-        // (and therefore its inner binders) does not exist yet.
         let scope = BinderScope::enter();
         let index = {
             let mut b = Builder::new();
-            let r = b.push_var(scope.placeholder());
+            let r = b.push_var(scope.placeholder.var());
             Self::wrap(b.finish(&[r]), Environment::new(), BTreeMap::new())
         };
         let body = body(&index);
-
-        let mut b = Builder::new();
-        let env = body.inner.env.clone();
-        let binder = lowest_free_binder(body.dag());
-        let renamed = b.push_var(binder.var());
-        let body_root = substitute_vars(&mut b, body.root(), &[(scope.placeholder(), renamed)]);
-        // One typed node. The encoding this replaced pushed three `Const`
-        // children — combiner index, binder slot, extent — and left every
-        // reader to recover them by position and by asking a float whether
-        // it was really a small integer.
-        let root = b.push_reduce(fold_at(binder), body_root);
+        let (arena, root) = body.parts();
+        let closed = arena.close_over(root, scope.placeholder, |binder| {
+            Ok::<_, Infallible>(fold_at(binder))
+        });
+        let (arena, root) = match closed {
+            Ok(closed) => closed,
+            Err(Unclosed::IndexSpaceFull) => panic!(
+                "more than {} live nested reductions: the index space is full",
+                Binder::COUNT
+            ),
+            Err(Unclosed::Refused(never)) => match never {},
+        };
         // Only `body`'s own graph is used above — no other kernel is spliced
         // in — so its buffer table carries forward unchanged.
-        Self::wrap(b.finish(&[root]), env, body.inner.buffers.clone())
+        Self::adopt(arena, root, body.inner.buffers.clone())
     }
 
     /// `Σ_{i ∈ 0..extent} body(i)` — contraction, projection, and every other
@@ -898,32 +901,32 @@ impl Kernel {
     /// Panics unless `var` names a coordinate axis.
     #[must_use]
     pub fn dwrt(&self, var: u8) -> Self {
-        assert!(
-            (var as usize) < crate::arena::COORD_AXES,
-            "Kernel::dwrt: no axis {var}; a lattice has {} \
-             (0 = X, 1 = Y)",
-            crate::arena::COORD_AXES
-        );
-        let mut b = Builder::new();
-        let r = copy_subgraph(&mut b, self.root());
-        let v = b.push_const(f32::from(var));
-        let root = b.push_binary(OpKind::Dwrt, r, v);
-        Self::wrap(
-            b.finish(&[root]),
-            self.inner.env.clone(),
-            self.inner.buffers.clone(),
-        )
+        let Some(&axis) = Axis::ALL.get(usize::from(var)) else {
+            panic!(
+                "Kernel::dwrt: no axis {var}; a lattice has {} \
+                 (0 = X, 1 = Y)",
+                crate::arena::COORD_AXES
+            );
+        };
+        self.derivative(axis)
     }
 
     /// `∂self/∂X`.
     #[must_use]
     pub fn dx(&self) -> Self {
-        self.dwrt(0)
+        self.derivative(Axis::X)
     }
     /// `∂self/∂Y`.
     #[must_use]
     pub fn dy(&self) -> Self {
-        self.dwrt(1)
+        self.derivative(Axis::Y)
+    }
+
+    /// `∂self/∂axis`: [`library::derivative`], the one definition of the
+    /// `Dwrt` encoding, which `kernel!`'s `DX`, `DY` and the Hessian family
+    /// build too.
+    fn derivative(&self, axis: Axis) -> Self {
+        library::derivative(&mut Values, self.clone(), axis)
     }
 
     // ───────────────────────── back end ───────────────────────────
@@ -989,7 +992,7 @@ impl Kernel {
     #[must_use]
     pub fn by_ref(&self) -> Self {
         let (arena, root) = self.parts();
-        let open = arena.free_var_at_or_above(root, PLACEHOLDER_BASE as u8);
+        let open = arena.free_var_at_or_above(root, crate::fold::PLACEHOLDER_BASE);
         assert!(
             open.is_none(),
             "Kernel::by_ref: this kernel holds Var({}), a reduction binder's \
@@ -1158,6 +1161,8 @@ impl Bits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arena::ExprNode;
+    use crate::fold::RangeFold;
 
     /// The count is still checked at runtime; the OPERAND no longer needs
     /// checking, because `Kernel::x().shl(32)` does not compile at all now —
@@ -1166,6 +1171,47 @@ mod tests {
     #[should_panic(expected = "32-bit lane")]
     fn shl_past_the_lane_is_refused() {
         let _refused = Kernel::x().trunc_to_int().shl(32);
+    }
+
+    /// The builder refuses a fold past 2²⁴ as `kernel!` does: both build
+    /// through `RangeFold`, which holds the one bound. Before, `kernel!`
+    /// refused and this summed the wrong terms without a word
+    /// (docs/BACKLOG.md, C8).
+    #[test]
+    #[should_panic(expected = "ends at most at 16777216 (2^24)")]
+    fn a_fold_past_the_exact_bound_is_refused_by_the_builder_too() {
+        let past = RangeFold::EXACT_BOUND + 1;
+        let _refused = Kernel::over(Monoid::SUM, 16_777_100..past, |i| i.clone());
+    }
+
+    /// A fold is laid out as the builder always laid one out — the binder's
+    /// index first, then the body copied from its root, last child first,
+    /// then the fold — now that it is closed by `ExprArena::close_over`, the
+    /// definition `kernel!`'s lowering closes through too. A layout, not a
+    /// meaning: pinned because a compile is not promised to be blind to it,
+    /// and B5 moved the construction without moving a node.
+    #[test]
+    fn a_fold_is_laid_out_as_the_builder_always_laid_it_out() {
+        let fold = Kernel::sum_over(4, |i| Kernel::x().mul(i).add(&Kernel::y()));
+        let (arena, root) = fold.parts();
+        let binder = Binder::from_slot(0).expect("slot 0");
+        let nodes: Vec<ExprNode> = arena.nodes().map(|(_, node)| node).collect();
+        assert_eq!(
+            nodes,
+            [
+                ExprNode::Var(binder.var()),
+                ExprNode::Var(Axis::Y.var()),
+                ExprNode::Var(Axis::X.var()),
+                ExprNode::Binary(OpKind::Mul, ExprId(2), ExprId(0)),
+                ExprNode::Binary(OpKind::Add, ExprId(3), ExprId(1)),
+                ExprNode::Reduce {
+                    fold: Fold::new(Monoid::SUM, binder, 0..4),
+                    body: ExprId(4),
+                },
+            ],
+            "{}",
+            arena.display(root)
+        );
     }
 
     /// A hand-built arena that names the retired Z axis is refused where it

@@ -54,13 +54,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode, UniformId};
 use pixelflow_ir::optimize::Optimize;
-use pixelflow_ir::{Binder, OpKind};
+use pixelflow_ir::{Binder, OpKind, RangeFold};
 use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
 use syn::Ident;
 
 use crate::ast::{ConstItem, FnItem, Param, RecordItem, Role, Spelling};
-use crate::lower::{self, EXACT_INDEX_BOUND, Families, Holes, Lowered};
+use crate::lower::{self, Families, Holes, Lowered};
 use crate::sema::{AnalyzedKernel, ConstValue, Parameter, Scalar};
 
 /// Emit arena-backend code for an analyzed kernel.
@@ -494,9 +494,11 @@ fn emit_const(item: &ConstItem, value: ConstValue) -> TokenStream {
 
 /// An open fold's range, evaluated when the host function is instantiated:
 /// in a `const` block, so rustc checks each operation of the bounds as it
-/// checks any `const`, and refuses — per instantiation — the ranges
-/// lowering refuses of a known one: one that runs backwards, and one past
-/// [`EXACT_INDEX_BOUND`], the last bound a fold's index names exactly.
+/// checks any `const`, and refuses — per instantiation — the ranges the IR
+/// refuses ([`RangeFold::admits`]): one that runs backwards, and one past
+/// [`RangeFold::EXACT_BOUND`], the last bound a fold's index names exactly.
+/// The bound is the IR's, imported; what the `const` block adds is that the
+/// refusal is rustc's rather than `Fold::new`'s panic.
 ///
 /// The refusal is rustc's at monomorphization, which `cargo build` reaches
 /// and `cargo check` (so clippy) does not: a bad instantiation checks clean
@@ -504,7 +506,7 @@ fn emit_const(item: &ConstItem, value: ConstValue) -> TokenStream {
 /// a run-time panic.
 fn instantiated_range(range: &crate::sema::StructuralRange) -> TokenStream {
     let (lo, hi) = (&range.lo, &range.hi);
-    let bound = proc_macro2::Literal::u64_unsuffixed(EXACT_INDEX_BOUND);
+    let bound = proc_macro2::Literal::u32_unsuffixed(RangeFold::EXACT_BOUND);
     let backwards = format!(
         "kernel!: the range `{}` runs backwards at this instantiation",
         range.text()

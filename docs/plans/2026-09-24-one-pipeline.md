@@ -590,7 +590,7 @@ plan still owns from the front end:
 
 | # | delete | where (F) | replaced by |
 |---|---|---|---|
-| F1 | `lower.rs`'s second copies of `fract`, `hypot`, `clamp` and the `Dwrt` encoding | `lower.rs:187-208` | lowering calls `pixelflow-ir`'s one set of definitions (the-language-is-kernel B5) |
+| F1 | `lower.rs`'s second copies of `fract`, `hypot`, `clamp` and the `Dwrt` encoding | `lower.rs:187-208` | lowering calls `pixelflow-ir`'s one set of definitions (the-language-is-kernel B5, done) |
 | F4 | the `Param` family, about 120 references in 40 files, including the dead Dag-side `substitute_params` | `arena.rs:58`, `:1276+`, `:1357-1361`; `expr.rs:280-330` | parameters are uniforms or structural (the-language-is-kernel §1.4) |
 | F7 | `pixelflow-compiler → pixelflow-codegen` | — | unused since `fa4ed36d` (#1172). The edge to `pixelflow-search` stays: the macro runs `P` for declared instances |
 | F8 | stale docs | Appendix B | — |

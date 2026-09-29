@@ -241,6 +241,62 @@ impl Binder {
     }
 }
 
+/// The first `Var` index a [`Placeholder`] takes: past the whole index space
+/// a [`Binder`] can name ([`Variance::VARIABLES`]), so renaming a placeholder
+/// can never reach a binder an inner fold has already chosen.
+///
+/// [`Variance::VARIABLES`]: crate::Variance::VARIABLES
+pub(crate) const PLACEHOLDER_BASE: u8 = crate::variance::Variance::VARIABLES;
+
+/// A fold's index while its body is built, before its [`Binder`] is chosen.
+///
+/// The binder is chosen after the body exists — the lowest slot no fold in
+/// the body binds — so the body is built against a placeholder `Var` and
+/// the placeholder renamed once the slot is known
+/// ([`ExprArena::close_over`], the one place that is done). A placeholder
+/// must be unique among the binders being built *at once*: a nested fold
+/// renames every occurrence of its own, so if it shared one with the fold
+/// enclosing it, it would capture the outer index — `Σ_i Σ_j f(i, j)` would
+/// become `Σ_i Σ_j f(j, j)`. How one is kept unique is the builder's: a
+/// `Kernel` claims one from a set shared across threads, `kernel!`'s
+/// lowering takes one per fold it has open.
+///
+/// A type rather than a `Var` index so that closing over anything else — an
+/// `X`, which would bind the coordinate — is unrepresentable.
+///
+/// [`ExprArena::close_over`]: crate::ExprArena::close_over
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Placeholder(u8);
+
+impl Placeholder {
+    /// How many binders may be under construction at once, across every
+    /// builder: the placeholders past the binders' index space a `u64` set can
+    /// track, which is more than the [`Binder::COUNT`] a program can nest.
+    pub const COUNT: usize = u64::BITS as usize;
+
+    /// The `n`th placeholder, or `None` past [`Placeholder::COUNT`].
+    #[must_use]
+    pub fn nth(n: usize) -> Option<Self> {
+        if n >= Self::COUNT {
+            return None;
+        }
+        PLACEHOLDER_BASE
+            .checked_add(u8::try_from(n).ok()?)
+            .map(Self)
+    }
+
+    /// The `Var` index a body reads this placeholder through.
+    #[must_use]
+    pub fn var(self) -> u8 {
+        self.0
+    }
+}
+
+// A program nests at most `Binder::COUNT` folds, so a builder that takes one
+// placeholder per fold it has open never runs out before the index space
+// does.
+const _: () = assert!(Placeholder::COUNT >= Binder::COUNT);
+
 /// The fold a [`Reduce`] performs: the index it binds, and the domain that
 /// index ranges over — integers under a monoid, or a real interval under `Σ`.
 ///
@@ -293,7 +349,8 @@ impl Fold {
     ///
     /// # Panics
     ///
-    /// Panics if `range` is reversed.
+    /// Panics unless [`RangeFold::admits`] `range`: if it is reversed, or
+    /// ends past [`RangeFold::EXACT_BOUND`].
     #[must_use]
     pub fn new(monoid: Monoid, binder: Binder, range: Range<u32>) -> Self {
         Self::Range(RangeFold::new(monoid, binder, range))
@@ -306,8 +363,8 @@ impl Fold {
     ///
     /// # Panics
     ///
-    /// Panics if `range` is reversed, `stride` is `0`, or `stride` does not
-    /// divide `range.end - range.start` exactly — the invariant
+    /// Panics unless [`RangeFold::admits`] `range`, or if `stride` is `0` or
+    /// does not divide `range.end - range.start` exactly — the invariant
     /// [`RangeFold::len`] and [`Fold::from_bits`] both rely on.
     #[must_use]
     pub fn strided(monoid: Monoid, binder: Binder, range: Range<u32>, stride: u32) -> Self {
@@ -394,8 +451,9 @@ impl Fold {
     /// The fold [`Fold::to_bits`] wrote, or `None` if the bits do not name
     /// one — an unknown domain tag, or a payload its domain refuses:
     /// [`RangeFold`]'s (an op that generates no algebra, an index outside
-    /// the binder space, a reversed range, a zero stride, or a stride that
-    /// does not divide `hi - lo` exactly) or [`IntervalFold`]'s (anything in
+    /// the binder space, a range [`RangeFold::admits`] does not — reversed,
+    /// or ending past [`RangeFold::EXACT_BOUND`] — a zero stride, or a
+    /// stride that does not divide `hi - lo` exactly) or [`IntervalFold`]'s (anything in
     /// the monoid or stride fields, a non-finite endpoint, the `-0.0` bit
     /// pattern, `lo >= hi`, or a length that overflows).
     ///
@@ -489,12 +547,43 @@ pub struct RangeFold {
 }
 
 impl RangeFold {
+    /// The largest end a range may have: 2²⁴, the last integer to which an
+    /// `f32` names every integer.
+    ///
+    /// A fold's index is an `f32` lane — the binder's `Var`, and the counter
+    /// the JIT steps by adding `1.0` and compares against the end, both
+    /// loaded as `f32` — so past 2²⁴ neighbouring indices round together
+    /// and the fold is not the one written. Measured through `kernel!`
+    /// before `kernel!` refused such a bound:
+    /// `(16777100..16777300).map(|i| ((i as f32) - 16777000.0) * X).sum()`
+    /// gave 39890 at `X = 1`, where rustc gives 39900; below 2²⁴ the two
+    /// agree. It is refused here, beside the reversed range, so that every
+    /// constructor — `Kernel::over` as much as `kernel!`'s lowering — is
+    /// refused alike.
+    ///
+    /// The ends stay `u32`, the width [`RangeFold::range`] speaks: the lane
+    /// is the narrower of the two, and widening the ends (A5 of
+    /// docs/plans/2026-09-25-the-language-is-kernel.md) would not lift it.
+    pub const EXACT_BOUND: u32 = 1 << f32::MANTISSA_DIGITS;
+
+    /// Whether `range` is a domain a fold may range over: forwards, and
+    /// ending at or before [`RangeFold::EXACT_BOUND`], so that every index
+    /// it names, and its end, is an exact `f32`.
+    ///
+    /// The one statement of the contract: the constructors panic where it
+    /// fails, [`Fold::from_bits`] refuses where it fails, and a front end
+    /// asks it to refuse a range with its own words before building one.
+    #[must_use]
+    pub fn admits(range: &Range<u32>) -> bool {
+        range.start <= range.end && range.end <= Self::EXACT_BOUND
+    }
+
     /// The fold of `monoid` over `range`, binding `binder`, visiting every
     /// index in it — [`Fold::strided`] with a stride of `1`.
     ///
     /// # Panics
     ///
-    /// Panics if `range` is reversed.
+    /// Panics unless [`RangeFold::admits`] `range`.
     #[must_use]
     pub fn new(monoid: Monoid, binder: Binder, range: Range<u32>) -> Self {
         Self::strided(monoid, binder, range, 1)
@@ -506,6 +595,12 @@ impl RangeFold {
         assert!(
             range.start <= range.end,
             "a fold's range runs forwards: {range:?}"
+        );
+        assert!(
+            Self::admits(&range),
+            "a fold's range ends at most at {} (2^24): {range:?} — its index is an `f32` \
+             lane, which names every integer only that far",
+            Self::EXACT_BOUND
         );
         assert!(stride != 0, "a fold's stride must be nonzero");
         assert!(
@@ -689,13 +784,15 @@ impl RangeFold {
         let binder = Binder::from_slot(((bits >> 64) & 0xff) as u8)?;
         let lo = ((bits >> 32) & 0xffff_ffff) as u32;
         let hi = (bits & 0xffff_ffff) as u32;
-        (lo <= hi && stride != 0 && (hi - lo).is_multiple_of(stride)).then_some(Self {
-            monoid,
-            binder,
-            lo,
-            hi,
-            stride,
-        })
+        (Self::admits(&(lo..hi)) && stride != 0 && (hi - lo).is_multiple_of(stride)).then_some(
+            Self {
+                monoid,
+                binder,
+                lo,
+                hi,
+                stride,
+            },
+        )
     }
 }
 
@@ -814,6 +911,22 @@ impl IntervalFold {
             lo,
             hi,
         })
+    }
+
+    /// `∫_{-H}^{H}`, binding `binder`, `H` being
+    /// [`PIXEL_HALF_WIDTH`](crate::kernel::PIXEL_HALF_WIDTH): one axis of the
+    /// pixel centred on the sample.
+    ///
+    /// The one definition of the pixel's interval: [`Kernel::area`] folds
+    /// over it on each axis, and so does `kernel!`'s `area(|u, v| e)`, so a
+    /// pixel built with the builder and one written in the syntax are one
+    /// program.
+    ///
+    /// [`Kernel::area`]: crate::Kernel::area
+    #[must_use]
+    pub fn pixel(binder: Binder) -> Self {
+        use crate::kernel::PIXEL_HALF_WIDTH;
+        Self::new(binder, -PIXEL_HALF_WIDTH, PIXEL_HALF_WIDTH)
     }
 
     /// The index this fold binds — [`Fold::binder`] is the public spelling.
@@ -973,6 +1086,63 @@ mod tests {
         // range, and the point here is the *constructor's* refusal.
         let (lo, hi) = (7u32, 3u32);
         assert!(RangeFold::new(Monoid::SUM, b, lo..hi).is_empty());
+    }
+
+    /// A range ends at most at 2²⁴, where an `f32` index stops naming every
+    /// integer: `16777216` is the last end admitted, forwards only, and an
+    /// empty range past it is refused too — its end is loaded as an `f32`
+    /// like any other's.
+    #[test]
+    fn a_range_ends_at_most_at_the_exact_bound() {
+        let bound = RangeFold::EXACT_BOUND;
+        assert_eq!(bound, 16_777_216);
+        assert_eq!(bound as f32 as u32, bound, "the bound itself is exact");
+        assert_ne!((bound + 1) as f32 as u32, bound + 1, "and one past is not");
+        for admitted in [0..0, 0..bound, bound - 1..bound, bound..bound] {
+            assert!(RangeFold::admits(&admitted), "{admitted:?}");
+        }
+        let (lo, hi) = (7u32, 3u32);
+        for refused in [0..bound + 1, bound + 1..bound + 1, 0..u32::MAX, lo..hi] {
+            assert!(!RangeFold::admits(&refused), "{refused:?}");
+        }
+    }
+
+    /// `Kernel::over`'s constructor refuses a range past the bound, as
+    /// `kernel!` refuses one: the builder is covered by the same contract.
+    #[test]
+    #[should_panic(expected = "ends at most at 16777216 (2^24)")]
+    fn a_range_past_the_exact_bound_is_refused() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        let past = RangeFold::EXACT_BOUND + 1;
+        assert!(!RangeFold::new(Monoid::SUM, b, 16_777_100..past).is_empty());
+    }
+
+    /// Bits naming a range past the bound name no fold: a corrupt key is a
+    /// `None` at the boundary, not a fold whose index rounds.
+    #[test]
+    fn from_bits_refuses_a_range_past_the_exact_bound() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        let bits = Fold::new(Monoid::SUM, b, 0..4).to_bits();
+        let past = (bits & !0xffff_ffffu128) | u128::from(RangeFold::EXACT_BOUND + 1);
+        assert_eq!(Fold::from_bits(past), None);
+        let at = (bits & !0xffff_ffffu128) | u128::from(RangeFold::EXACT_BOUND);
+        assert!(Fold::from_bits(at).is_some());
+    }
+
+    /// Every placeholder is past every binder — a rename of one never
+    /// reaches a slot an inner fold chose — and there are as many as a
+    /// `u64` set tracks.
+    #[test]
+    fn a_placeholder_is_past_every_binder() {
+        let first = Placeholder::nth(0).expect("a placeholder");
+        assert_eq!(first.var(), crate::Variance::VARIABLES);
+        assert!(Binder::all().all(|binder| binder.var() < first.var()));
+        let last = Placeholder::nth(Placeholder::COUNT - 1).expect("the last placeholder");
+        assert_eq!(
+            usize::from(last.var() - first.var()),
+            Placeholder::COUNT - 1
+        );
+        assert_eq!(Placeholder::nth(Placeholder::COUNT), None);
     }
 
     /// A trip count past what a `u16` held. A surviving fold is a loop, so
@@ -1279,6 +1449,15 @@ mod tests {
             IntervalFold::new(b, -1.0, -0.0),
             IntervalFold::new(b, -1.0, 0.0)
         );
+    }
+
+    /// `IntervalFold::pixel` is the pixel centred on the sample,
+    /// `[-½, ½)`, at the binder it is given.
+    #[test]
+    fn the_pixel_is_centred_on_the_sample() {
+        for b in Binder::all() {
+            assert_eq!(IntervalFold::pixel(b), pixel(b));
+        }
     }
 
     /// The centred pixel, the corner cell, and the one-term range over the
