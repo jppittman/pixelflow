@@ -565,6 +565,11 @@ and no digests are committed (one-pipeline §5, gate policy).
   recompiles.
   - Measure the frame against today's before switching: 80×24 and 200×60,
     at 16 and 32 px.
+  - The unpinned classical cap (`7aba74a7`) costs the family shape: a
+    `glyph::<64>` bakes in 376 → 897 ms on AVX-512 (415 → 806 ms on AVX2),
+    code +15–20%, for an extraction within 1.2e-7 of the fold's. The
+    per-cell program pays that once per `N` per zoom; measure it with the
+    frame.
 - **C3.** The glyph's tests move onto `kernel!`.
 - **C4.** `text()` and `run` (Q3).
 
