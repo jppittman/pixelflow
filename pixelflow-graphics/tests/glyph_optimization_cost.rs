@@ -85,7 +85,17 @@ const SPREAD: [char; 3] = ['A', 'O', '8'];
 /// Measured 100 nodes when the glyph became one fold of an integral, plus
 /// ~10% (it was 165 with the winding and distance folds, against a ceiling
 /// of 3200 set when the e-graph was handed the unrolled program).
-const EGRAPH_INPUT_CEILING: usize = 110;
+///
+/// Raised 2026-09-29 to 152 measured plus ~10% (110 → 167), when each
+/// piece's term became its area written in closed form
+/// (`fonts/loop_blinn.rs`, `RisingArc::pixel_area`) rather than the two
+/// interval folds of `area(χ)` that saturation closed. The closed form is
+/// what saturation used to derive, so the e-graph is handed the formula
+/// instead of the integrand — 52 nodes more, the same for `A`, `O` and `8`
+/// — and emits the same 142 nodes it did (the ceilings above do not move).
+/// Still a scaling claim, not a size one: the count is the body's, and the
+/// piece count is data.
+const EGRAPH_INPUT_CEILING: usize = 167;
 
 fn reachable(arena: &ExprArena, root: ExprId) -> usize {
     let mut seen = vec![false; arena.len()];
