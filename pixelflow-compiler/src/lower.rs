@@ -19,24 +19,14 @@
 //! `Kernel`'s methods build through; the coordinates are [`Axis`]'s; a
 //! fold's binder is chosen and its placeholder renamed by
 //! [`ExprArena::close_over`], as `Kernel::over`'s are; a range is one
-//! [`RangeFold::admits`]; the pixel is [`IntervalFold::pixel`]. So each
-//! construction written here and the same one built with the builder are
-//! one program (`tests/the_library_is_the_builders.rs`,
-//! `tests/fold_is_kernel_over.rs`, `tests/integral_is_kernel_area.rs`).
+//! [`Fold::admits`]. So each construction written here and the same one
+//! built with the builder are one program
+//! (`tests/the_library_is_the_builders.rs`, `tests/fold_is_kernel_over.rs`).
 //!
-//! A fold lowers to one `Reduce` node over a [`Fold::Range`], built as
+//! A fold lowers to one `Reduce` node over its [`Fold`], built as
 //! `Kernel::over` builds it: the body against a [`Placeholder`], then closed
 //! over it. Nothing here unrolls: that is the e-graph's (`HalveFold`,
 //! `PeelFold`), when the kernel is baked.
-//!
-//! An integral lowers the same way to one `Reduce` over a
-//! [`Fold::Interval`], its interval built by [`IntervalFold::try_new`], and
-//! `area`'s pair over the IR's own pixel, so an `area` written here and
-//! `Kernel::area` are one arena. Nothing here integrates: closing an
-//! integral is the e-graph's (`FactorFold`, `NarrowInterval`, `ArcMoment`),
-//! and one left open is legalized by quadrature (`passes::resolve`).
-//! `monotone_root` lowers to [`integral::monotone_root`], the one definition
-//! the rule that closes an arc's integral reads back.
 //!
 //! An entry's parameters are its uniforms
 //! (docs/plans/2026-09-25-the-language-is-kernel.md §1.4): each scalar — an
@@ -61,19 +51,16 @@
 
 use crate::PLAN;
 use crate::ast::{
-    BinaryOp, BlockExpr, CastExpr, Expr, FamilyExpr, FieldExpr, FnItem, FoldExpr, IntegralBounds,
-    IntegralExpr, LetStmt, MONOTONE_ROOT, RecordId, Reduction, Role, Stmt, UnaryOp,
+    BinaryOp, BlockExpr, CastExpr, Expr, FamilyExpr, FieldExpr, FnItem, FoldExpr, LetStmt,
+    RecordId, Reduction, Role, Stmt, UnaryOp,
 };
-use crate::sema::{
-    AnalyzedKernel, Bounds, ConstValue, RangeScope, StructuralRange, interval_bounds, range_bounds,
-};
+use crate::sema::{AnalyzedKernel, Bounds, ConstValue, RangeScope, StructuralRange, range_bounds};
 use crate::symbol::Scopes;
 use pixelflow_ir::arena::{
-    Axis, ExprArena, ExprId, ExprNode, Unclosed, UniformDecl, UniformIdentity,
+    Axis, ExprArena, ExprId, ExprNode, IndexSpaceFull, UniformDecl, UniformIdentity,
 };
-use pixelflow_ir::integral::{self, ROOT_FLOOR, Rise, RootFloor};
 use pixelflow_ir::library;
-use pixelflow_ir::{Binder, Fold, IntervalFold, Monoid, OpKind, Placeholder, RangeFold};
+use pixelflow_ir::{Binder, Fold, Monoid, OpKind, Placeholder};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
@@ -164,16 +151,6 @@ struct FamilyParameter {
     record: Option<RecordId>,
 }
 
-/// What a fold or an integral binds, and the body it binds it in: the name
-/// the body reads, what the name is there, and the body.
-struct Abstraction<'e> {
-    name: &'e syn::Ident,
-    /// A fold's index is a [`Binding::Index`]; an integral's variable, an
-    /// `f32` a body computes with, is a [`Binding::Value`].
-    reads_as: fn(ExprId) -> Binding,
-    body: &'e Expr,
-}
-
 /// The monoid a fold's spelling names — and a family's iteration's, which
 /// emission carries to the program by value ([`Monoid::marshal`]).
 pub(crate) fn monoid(reduction: Reduction) -> Monoid {
@@ -187,12 +164,12 @@ pub(crate) fn monoid(reduction: Reduction) -> Monoid {
     }
 }
 
-/// A known fold's bounds at the IR's width, if [`RangeFold::admits`] them.
+/// A known fold's bounds at the IR's width, if [`Fold::admits`] them.
 ///
 /// `sema` holds a bound in 64 bits, as the control plane is, and has
 /// refused a range that runs backwards. The IR narrows a bound twice: its
 /// ends are `u32` today (widening them is A5 of the plan, deprioritized),
-/// and its index is an `f32` lane, exact to [`RangeFold::EXACT_BOUND`]. The
+/// and its index is an `f32` lane, exact to [`Fold::EXACT_BOUND`]. The
 /// lane is the tighter of the two, the one A5 would not lift, and the IR's
 /// to state; lowering asks it before building the body, so the refusal
 /// names the bounds, in the words of both narrowings.
@@ -201,13 +178,13 @@ fn known_range(lo: u64, hi: u64) -> Result<Range<u32>, String> {
         (Ok(lo), Ok(hi)) => Some(lo..hi),
         _ => None,
     };
-    range.filter(RangeFold::admits).ok_or_else(|| {
-        let bound = RangeFold::EXACT_BOUND;
+    range.filter(Fold::admits).ok_or_else(|| {
+        let bound = Fold::EXACT_BOUND;
         format!(
             "the range `{lo}..{hi}` reaches past {bound} (2^24): a fold's index is an `f32` \
              lane, which names every integer only that far, so past it indices would round \
-             together and the fold would not be the one written (`RangeFold::EXACT_BOUND`)\n\
-             note: a fold's ends are also `u32` in the IR today (`RangeFold`); 64-bit fold ends \
+             together and the fold would not be the one written (`Fold::EXACT_BOUND`)\n\
+             note: a fold's ends are also `u32` in the IR today (`Fold`); 64-bit fold ends \
              are A5 of {PLAN}, deprioritized, and would not widen the lane"
         )
     })
@@ -237,7 +214,7 @@ const HOLE_STRIDE: u32 = 2;
 ///
 /// An open fold is built as any fold is, over [`OPEN_RANGE`] strided by
 /// [`HOLE_STRIDE`]` + k` for the `k`th distinct range text: the ends of a
-/// range [`RangeFold::admits`] have no room for a placeholder, and its
+/// range [`Fold::admits`] have no room for a placeholder, and its
 /// stride does. Two folds over one range text, of one monoid and one body,
 /// are one fold, and are interned as one; two over different ranges never
 /// are. The range text lives in the fold's bits rather than beside a node
@@ -279,10 +256,7 @@ impl Holes {
     /// On a placeholder stride no hole names — one from another template.
     /// Emitted as it stands it would be an empty fold, its monoid's
     /// identity, with plausible pixels.
-    pub fn range_of(&self, fold: Fold) -> Option<&StructuralRange> {
-        let Fold::Range(range) = fold else {
-            return None;
-        };
+    pub fn range_of(&self, range: Fold) -> Option<&StructuralRange> {
         if range.range() != OPEN_RANGE {
             return None;
         }
@@ -461,8 +435,8 @@ struct Lowering<'a> {
     program: Program<'a>,
     frame: Frame<'a>,
     arena: &'a mut ExprArena,
-    /// How many folds' and integrals' bodies are being built, across
-    /// inlined helpers too: the depth that picks the next one's placeholder.
+    /// How many folds' bodies are being built, across inlined helpers too:
+    /// the depth that picks the next one's placeholder.
     open_folds: usize,
     /// What a template leaves open: the ranges of its folds over structural
     /// parameters.
@@ -571,9 +545,6 @@ impl Lowering<'_> {
                 if let Some(helper) = self.program.helpers.get(&func).copied() {
                     return self.inline(helper, &call.args);
                 }
-                if func == MONOTONE_ROOT {
-                    return self.lower_monotone_root(&call.args);
-                }
                 self.lower_projection(&func, &call.args)
             }
 
@@ -590,8 +561,6 @@ impl Lowering<'_> {
 
             Expr::Family(family) => self.lower_family(family),
 
-            Expr::Integral(integral) => self.lower_integral(integral),
-
             Expr::Cast(cast) => self.lower_cast(cast),
 
             Expr::Field(field) => self.lower_field(field),
@@ -603,7 +572,7 @@ impl Lowering<'_> {
         }
     }
 
-    /// `⊕_{i ∈ [lo, hi)} body` as one `Reduce` over a [`Fold::Range`]: a
+    /// `⊕_{i ∈ [lo, hi)} body` as one `Reduce` over its [`Fold`]: a
     /// known range, or a template's open one ([`Holes`]).
     fn lower_fold(&mut self, fold: &FoldExpr) -> Result<ExprId, String> {
         let scope = RangeScope {
@@ -612,20 +581,15 @@ impl Lowering<'_> {
         };
         let bounds = range_bounds(&fold.range, scope).map_err(|e| e.to_string())?;
         let monoid = monoid(fold.reduction);
-        let index = Abstraction {
-            name: &fold.binder,
-            reads_as: Binding::Index,
-            body: &fold.body,
-        };
         match bounds {
             Bounds::Known(lo, hi) => {
                 let range = known_range(lo, hi)?;
-                self.lower_abstraction(index, |binder| Ok(Fold::new(monoid, binder, range)))
+                self.close_fold(fold, |binder| Fold::new(monoid, binder, range))
             }
             Bounds::Structural(range) => {
                 let stride = self.holes.stride(range)?;
-                self.lower_abstraction(index, |binder| {
-                    Ok(Fold::strided(monoid, binder, OPEN_RANGE, stride))
+                self.close_fold(fold, |binder| {
+                    Fold::strided(monoid, binder, OPEN_RANGE, stride)
                 })
             }
         }
@@ -681,37 +645,7 @@ impl Lowering<'_> {
         (decl.id, self.arena.push_uniform(slot))
     }
 
-    /// `∫_{u ∈ [lo, hi)} body` as one `Reduce` over a [`Fold::Interval`]:
-    /// the interval written, or [`IntervalFold::pixel`], each of the two
-    /// `area` is.
-    ///
-    /// A written interval is built by [`IntervalFold::try_new`], the IR's
-    /// own contract. `sema` refused the bounds it does not admit, with a
-    /// span; lowering refuses them too rather than rely on that, as it
-    /// refuses an index where a value is expected.
-    fn lower_integral(&mut self, integral: &IntegralExpr) -> Result<ExprId, String> {
-        let variable = Abstraction {
-            name: &integral.variable,
-            reads_as: Binding::Value,
-            body: &integral.body,
-        };
-        match &integral.bounds {
-            IntegralBounds::Written(range) => {
-                let (lo, hi) = interval_bounds(range, &self.program.analyzed.consts)
-                    .map_err(|e| e.to_string())?;
-                self.lower_abstraction(variable, |binder| {
-                    IntervalFold::try_new(binder, lo, hi)
-                        .map(Fold::Interval)
-                        .ok_or_else(|| format!("`{lo:?}..{hi:?}` is not an interval the IR admits"))
-                })
-            }
-            IntegralBounds::Pixel => self.lower_abstraction(variable, |binder| {
-                Ok(Fold::Interval(IntervalFold::pixel(binder)))
-            }),
-        }
-    }
-
-    /// A fold or an integral: `fold_at`'s fold of the abstraction's body,
+    /// A fold: `fold_at`'s fold of `fold`'s body,
     /// closed by [`ExprArena::close_over`] — the one definition of how a
     /// binder is chosen and a placeholder renamed, which `Kernel`'s folds
     /// are built through too.
@@ -722,10 +656,10 @@ impl Lowering<'_> {
     /// with it, so the arena this emits holds only the program. Every id
     /// bound before the fold means the same node in the copy, which is what
     /// lets the body read them.
-    fn lower_abstraction(
+    fn close_fold(
         &mut self,
-        abstraction: Abstraction,
-        fold_at: impl FnOnce(Binder) -> Result<Fold, String>,
+        fold: &FoldExpr,
+        fold_at: impl FnOnce(Binder) -> Fold,
     ) -> Result<ExprId, String> {
         // One placeholder per fold open at once, the `n`th for `n` open, so a
         // nested fold's rename never reaches its enclosing fold's index. No
@@ -736,65 +670,40 @@ impl Lowering<'_> {
             Placeholder::nth(self.open_folds).filter(|_| self.open_folds < Binder::COUNT)
         else {
             return Err(format!(
-                "folds and integrals nested more than {} deep: the IR binds at most that many \
-                 indices and variables at once (`Binder::COUNT`)",
+                "folds nested more than {} deep: the IR binds at most that many indices at \
+                 once (`Binder::COUNT`)",
                 Binder::COUNT
             ));
         };
         let copy = self.arena.clone();
         let enclosing = std::mem::replace(&mut *self.arena, copy);
-        let body = self.lower_open(abstraction, placeholder);
+        let body = self.lower_open(fold, placeholder);
         let copy = std::mem::replace(&mut *self.arena, enclosing);
-        let (closed, root) = copy
-            .close_over(body?, placeholder, fold_at)
-            .map_err(|unclosed| match unclosed {
-                Unclosed::IndexSpaceFull => format!(
-                    "a fold whose body already binds all {} of the IR's indices \
+        let (closed, root) =
+            copy.close_over(body?, placeholder, fold_at)
+                .map_err(|IndexSpaceFull| {
+                    format!(
+                        "a fold whose body already binds all {} of the IR's indices \
                      (`Binder::COUNT`)",
-                    Binder::COUNT
-                ),
-                Unclosed::Refused(why) => why,
-            })?;
+                        Binder::COUNT
+                    )
+                })?;
         Ok(self.arena.splice(&closed, root))
     }
 
-    /// [`Self::lower_abstraction`]'s body, built in the arena it swapped in,
-    /// with the name bound to `placeholder`'s `Var`.
-    fn lower_open(
-        &mut self,
-        abstraction: Abstraction,
-        placeholder: Placeholder,
-    ) -> Result<ExprId, String> {
+    /// [`Self::close_fold`]'s body, built in the arena it swapped in, with
+    /// the fold's index bound to `placeholder`'s `Var`.
+    fn lower_open(&mut self, fold: &FoldExpr, placeholder: Placeholder) -> Result<ExprId, String> {
         let index = self.arena.push_var(placeholder.var());
         self.frame.locals.push_scope();
         self.frame
             .locals
-            .bind(abstraction.name.to_string(), (abstraction.reads_as)(index));
+            .bind(fold.binder.to_string(), Binding::Index(index));
         self.open_folds += 1;
-        let body = self.lower(abstraction.body);
+        let body = self.lower(&fold.body);
         self.open_folds -= 1;
         self.frame.locals.pop_scope();
         body
-    }
-
-    /// `monotone_root(δ, step, bend)`: [`integral::monotone_root`], the one
-    /// definition, under the floor an author writes, [`ROOT_FLOOR`] — as
-    /// the glyph's builder does (`fonts/loop_blinn.rs`).
-    fn lower_monotone_root(&mut self, args: &[Expr]) -> Result<ExprId, String> {
-        let [delta, step, bend] = args else {
-            return Err(format!(
-                "`{MONOTONE_ROOT}` takes `(delta, step, bend)`, but {} arguments were supplied",
-                args.len()
-            ));
-        };
-        let delta = self.lower(delta)?;
-        let rise = Rise {
-            step: self.lower(step)?,
-            bend: self.lower(bend)?,
-        };
-        let floor = RootFloor::new(ROOT_FLOOR)
-            .ok_or("`ROOT_FLOOR` is not a floor `RootFloor` admits".to_string())?;
-        Ok(integral::monotone_root(self.arena, delta, rise, floor))
     }
 
     /// `i as f32`. A fold's index is an `f32` lane already, so its
@@ -1051,7 +960,6 @@ mod tests {
     use crate::parser::parse;
     use crate::sema::Ty;
     use pixelflow_ir::arena::{ExprNode, UniformId};
-    use pixelflow_ir::kernel::PIXEL_HALF_WIDTH;
     use quote::quote;
 
     /// Lower a block straight from the parser, with no `sema` in front: what
@@ -1325,11 +1233,8 @@ mod tests {
     #[test]
     fn a_fold_lowers_to_one_reduce_and_leaves_nothing_behind() {
         let (arena, root) = lowered(quote! { || (2..6).map(|i| X * (i as f32)).sum() });
-        let ExprNode::Reduce { fold, body } = arena.node(root) else {
+        let ExprNode::Reduce { fold: range, body } = arena.node(root) else {
             panic!("expected a fold, got {}", arena.display(root));
-        };
-        let Fold::Range(range) = fold else {
-            panic!("a fold over a range, got {fold}");
         };
         assert_eq!(range.range(), 2..6);
         assert_eq!(range.monoid(), Monoid::SUM);
@@ -1415,50 +1320,29 @@ mod tests {
             );
         }
         let (arena, root) = lowered(quote! { || (16777215..16777216).map(|i| i as f32).sum() });
-        let ExprNode::Reduce {
-            fold: Fold::Range(range),
-            ..
-        } = arena.node(root)
-        else {
+        let ExprNode::Reduce { fold: range, .. } = arena.node(root) else {
             panic!("expected a fold, got {}", arena.display(root));
         };
         assert_eq!(range.range(), 16_777_215..16_777_216);
     }
 
     /// Folds nest as deep as the IR has binders, and no deeper: one more is
-    /// refused, not a panic. An integral takes a binder as a fold does, so
-    /// integrals count toward the depth, alone or among folds.
+    /// refused, not a panic.
     #[test]
     fn folds_nest_as_deep_as_the_ir_has_binders() {
         use proc_macro2::TokenStream;
         let fold = |body: TokenStream| quote! { (0..1).map(|i| #body).sum::<f32>() };
-        let integral = |body: TokenStream| quote! { integral(0.0..1.0, |u| #body) };
-        let nest = |depth: usize, around: &dyn Fn(TokenStream) -> TokenStream| {
-            (0..depth).fold(quote! { X }, |body, _| around(body))
-        };
+        let nest = |depth: usize| (0..depth).fold(quote! { X }, |body, _| fold(body));
         let closure = |body: TokenStream| quote! { || #body };
-        for around in [&fold as &dyn Fn(TokenStream) -> TokenStream, &integral] {
-            let (arena, root) = lowered(closure(nest(Binder::COUNT, around)));
-            let ExprNode::Reduce { fold: outer, .. } = arena.node(root) else {
-                panic!("expected a fold or an integral");
-            };
-            assert_eq!(usize::from(outer.binder().slot()), Binder::COUNT - 1);
-        }
-        let too_deep = [
-            closure(nest(Binder::COUNT + 1, &fold)),
-            closure(nest(Binder::COUNT + 1, &integral)),
-            closure(integral(nest(Binder::COUNT, &fold))),
-            closure(fold(nest(Binder::COUNT, &integral))),
-        ];
-        for input in too_deep {
-            let Err(err) = lower_unanalyzed(input) else {
-                panic!("one binder deeper than the IR has");
-            };
-            assert!(
-                err.contains("folds and integrals nested more than"),
-                "got: {err}"
-            );
-        }
+        let (arena, root) = lowered(closure(nest(Binder::COUNT)));
+        let ExprNode::Reduce { fold: outer, .. } = arena.node(root) else {
+            panic!("expected a fold");
+        };
+        assert_eq!(usize::from(outer.binder().slot()), Binder::COUNT - 1);
+        let Err(err) = lower_unanalyzed(closure(nest(Binder::COUNT + 1))) else {
+            panic!("one binder deeper than the IR has");
+        };
+        assert!(err.contains("folds nested more than"), "got: {err}");
     }
 
     // ───────────────────────────── families ─────────────────────────────
@@ -1524,9 +1408,9 @@ mod tests {
     }
 
     /// A family's body is a subterm like any other to the folds around it
-    /// and in it: a fold around an iteration binds past the integral in the
-    /// body, and the body reads the fold's index — renamed from its
-    /// placeholder through the family's node — and the integral's variable.
+    /// and in it: a fold around an iteration binds past the fold in the
+    /// body, and the body reads the outer fold's index — renamed from its
+    /// placeholder through the family's node — and the inner one's.
     #[test]
     fn a_fold_around_a_familys_iteration_reaches_into_its_body() {
         let Lowered {
@@ -1537,7 +1421,7 @@ mod tests {
         } = lowered_entry(quote! {
             pub fn f(v: [f32; 2]) -> f32 {
                 (0..3)
-                    .map(|i| v.into_iter().map(|e| integral(0.0..1.0, |u| u * e + i as f32)).sum::<f32>())
+                    .map(|i| v.into_iter().map(|e| (0..2).map(|j| (j as f32) * e + i as f32).sum::<f32>()).sum::<f32>())
                     .sum()
             }
         });
@@ -1550,11 +1434,11 @@ mod tests {
             body: integrand,
         } = arena.node(family_body)
         else {
-            panic!("the integral, got {}", arena.display(family_body));
+            panic!("the inner fold, got {}", arena.display(family_body));
         };
         assert_eq!((outer.binder().slot(), inner.binder().slot()), (1, 0));
         let ExprNode::Binary(OpKind::Add, _, index) = arena.node(integrand) else {
-            panic!("`u * e + i`, got {}", arena.display(integrand));
+            panic!("`j * e + i`, got {}", arena.display(integrand));
         };
         assert!(
             matches!(arena.node(index), ExprNode::Var(v) if v == outer.binder().var()),
@@ -1598,98 +1482,13 @@ mod tests {
         assert!(matches!(arena.node(c), ExprNode::Var(0)));
     }
 
-    // ─────────────────────────── integrals ───────────────────────────
-
-    /// The interval fold `IntervalFold::try_new` builds over `lo..hi` at
-    /// binder `slot`.
-    fn interval(slot: u8, lo: f32, hi: f32) -> Fold {
-        let binder = Binder::from_slot(slot).expect("a binder slot");
-        Fold::Interval(IntervalFold::try_new(binder, lo, hi).expect("an interval"))
-    }
-
-    /// An integral is one `Reduce` over its interval, its body reading the
-    /// binder's `Var` as a value, and the arena holds nothing else.
+    /// A value is not converted: `h as f32` of a `let` is refused here, as
+    /// in `sema`, without relying on it — `as f32` converts a `usize`.
     #[test]
-    fn an_integral_lowers_to_one_reduce_and_leaves_nothing_behind() {
-        let (arena, root) = lowered(quote! { || integral(0.25..2.0, |u| X * u) });
-        let ExprNode::Reduce { fold, body } = arena.node(root) else {
-            panic!("expected an integral, got {}", arena.display(root));
+    fn a_value_is_not_converted() {
+        let Err(err) = lower_unanalyzed(quote! { || { let h = X; h as f32 } }) else {
+            panic!("`h` is a value");
         };
-        assert_eq!(fold, interval(0, 0.25, 2.0));
-        let ExprNode::Binary(OpKind::Mul, x, u) = arena.node(body) else {
-            panic!("expected the product, got {}", arena.display(body));
-        };
-        assert!(matches!(arena.node(x), ExprNode::Var(0)));
-        assert!(matches!(arena.node(u), ExprNode::Var(v) if v == fold.binder().var()));
-        assert!(!holds_a_placeholder(&arena));
-        assert_eq!(arena.len(), 4, "X, u, the product, the integral");
-    }
-
-    /// `area` is two integrals over the IR's pixel, `[-PIXEL_HALF_WIDTH,
-    /// PIXEL_HALF_WIDTH)`: the inner one, `u`'s, at slot 0, and the outer,
-    /// `v`'s, at slot 1 — `Kernel::area`'s construction.
-    #[test]
-    fn area_lowers_to_two_integrals_over_the_irs_pixel() {
-        let (arena, root) = lowered(quote! { || area(|u, v| (X + u) * (Y + v)) });
-        let ExprNode::Reduce { fold: outer, body } = arena.node(root) else {
-            panic!("expected the outer integral, got {}", arena.display(root));
-        };
-        let ExprNode::Reduce { fold: inner, body } = arena.node(body) else {
-            panic!("expected the inner integral, got {}", arena.display(body));
-        };
-        assert_eq!(outer, interval(1, -PIXEL_HALF_WIDTH, PIXEL_HALF_WIDTH));
-        assert_eq!(inner, interval(0, -PIXEL_HALF_WIDTH, PIXEL_HALF_WIDTH));
-        let ExprNode::Binary(OpKind::Mul, x_side, y_side) = arena.node(body) else {
-            panic!("expected the product, got {}", arena.display(body));
-        };
-        let shifted = |side: ExprId, axis: u8, by: u8| {
-            matches!(arena.node(side), ExprNode::Binary(OpKind::Add, a, b)
-                if arena.node(a) == ExprNode::Var(axis) && arena.node(b) == ExprNode::Var(by))
-        };
-        assert!(shifted(x_side, 0, inner.binder().var()), "X + u");
-        assert!(shifted(y_side, 1, outer.binder().var()), "Y + v");
-        assert!(!holds_a_placeholder(&arena));
-    }
-
-    /// Lowering refuses an interval the IR does not admit, as `sema` does,
-    /// without relying on it.
-    #[test]
-    fn an_interval_the_ir_refuses_is_refused_here_too() {
-        let Err(err) = lower_unanalyzed(quote! { || integral(1.0..0.0, |u| u) }) else {
-            panic!("`1.0..0.0` runs backwards");
-        };
-        assert!(err.contains("runs backwards"), "got: {err}");
-    }
-
-    /// An integral's variable is a value, and not a `usize`: `u as f32`
-    /// converts nothing, here as in `sema`.
-    #[test]
-    fn an_integrals_variable_is_a_value() {
-        let Err(err) = lower_unanalyzed(quote! { || integral(0.0..1.0, |u| u as f32) }) else {
-            panic!("`u` is a value");
-        };
-        assert!(err.contains("`u` is a value"), "got: {err}");
-    }
-
-    /// `monotone_root(δ, step, bend)` is `integral::monotone_root` on the
-    /// three operands under `ROOT_FLOOR`: its output ends in `δ·(1/d)`, the
-    /// floor a literal of the denominator.
-    #[test]
-    fn monotone_root_lowers_to_the_one_definition() {
-        let (arena, root) = lowered(quote! { || monotone_root(Y, X, 0.5) });
-        let ExprNode::Binary(OpKind::Mul, delta, reciprocal) = arena.node(root) else {
-            panic!("expected δ·(1/d), got {}", arena.display(root));
-        };
-        assert!(matches!(arena.node(delta), ExprNode::Var(1)));
-        let ExprNode::Binary(OpKind::Div, _, denominator) = arena.node(reciprocal) else {
-            panic!("expected 1/d, got {}", arena.display(reciprocal));
-        };
-        let ExprNode::Binary(OpKind::Max, _, floor) = arena.node(denominator) else {
-            panic!(
-                "expected the floored denominator, got {}",
-                arena.display(denominator)
-            );
-        };
-        assert!(matches!(arena.node(floor), ExprNode::Const(v) if v == ROOT_FLOOR));
+        assert!(err.contains("`h` is a value"), "got: {err}");
     }
 }

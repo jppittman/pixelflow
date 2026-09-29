@@ -227,10 +227,7 @@ fn a_family_at_three_is_three_pieces_summed_by_hand() {
     assert_eq!(values(&family_form), values(&summed_form));
 
     let found = folds(family_arena, family_root);
-    assert!(
-        found.is_empty(),
-        "no integral and no fold for the family: {found:?}"
-    );
+    assert!(found.is_empty(), "no fold for the family: {found:?}");
 
     let the_family_through_kernel_raw = by_hand::glyph::<3>(
         [as_raw(p0), as_raw(p1), as_raw(p2)],

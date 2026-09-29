@@ -13,7 +13,6 @@
 //! | Const      | Expansion time      | `Const(v)`, or a count | PI, N |
 //! | Local      | Expression scope    | A shared `ExprId`, or a record's fields | dx, q |
 //! | Index      | A fold's body       | The fold's binder `Var` | i    |
-//! | Variable   | An integral's body  | The integral's binder `Var` | u |
 //! | Element    | A family's body, once per element | Its element's `Uniform`s, per copy | p |
 //!
 //! A family (`pieces: [Row; N]`) is a parameter too, of an entry only: `N`
@@ -87,10 +86,6 @@ pub enum SymbolKind {
     /// A fold's index, the closure's parameter: a `usize`, scoped to the
     /// fold's body.
     Index,
-
-    /// An integral's variable, the closure's parameter: an `f32`, scoped to
-    /// the integral's body.
-    Variable,
 
     /// A family's element, the closure's parameter: a record or an `f32`,
     /// scoped to the iteration's body, a different element in each copy.
@@ -215,12 +210,6 @@ impl SymbolTable {
     /// scope the fold's body is typed in.
     pub fn register_index(&mut self, name: &str) {
         self.bind(name, SymbolKind::Index, Ty::Usize);
-    }
-
-    /// Register an integral's variable, an `f32`, in the innermost scope:
-    /// the scope the integral's body is typed in.
-    pub fn register_variable(&mut self, name: &str) {
-        self.bind(name, SymbolKind::Variable, Ty::F32);
     }
 
     /// Register a family's element, of the family's element type, in the

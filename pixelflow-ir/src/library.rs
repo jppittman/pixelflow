@@ -13,9 +13,7 @@
 //! kernel values — so `X.fract()` in the syntax and `Kernel::x().fract()`
 //! are one program (pinned by canonical key in
 //! `pixelflow-compiler/tests/the_library_is_the_builders.rs`), and a change
-//! to a definition reaches both. The integrals' closed forms build their
-//! clamps through [`clamp`] too, so a closed form's clamp is the term an
-//! author's is.
+//! to a definition reaches both.
 //!
 //! Why generic, and not an arena function a `Kernel` round-trips through:
 //! a `Kernel` builds one node at a time, each operand copied where it is

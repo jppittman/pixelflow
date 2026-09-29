@@ -1,5 +1,16 @@
 # A glyph is a formula
 
+> **Superseded in part (2026-09-29).** A glyph is still a formula — each
+> piece's area, one fold with one body — but the formula is no longer
+> derived. §1 built it as an integral (`area` over the pixel, amended by
+> [an-integral-is-a-fold](2026-09-23-an-integral-is-a-fold.md)) that the
+> e-graph closed by `FactorFold`, `NarrowInterval` and `ArcMoment`, and
+> under the flat class cap large glyphs silently fell back to one-point
+> quadrature. The piece's term is now written in closed form
+> (`fonts/loop_blinn.rs`, `RisingArc::pixel_area`), and the integral
+> machinery is deleted. JP: *"just do b. delete all the integral stuff.
+> other languages don't try this. probably for good reason."*
+
 ## Metadata
 - **Author**: JP (direction), Claude (draft)
 - **Status**: §1 `Built`, §4.2–§4.4 not. The denotation was proposed

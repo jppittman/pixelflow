@@ -12,6 +12,20 @@
   over scalar uniforms, and the measured `U_band` is that program
   (the-language-is-kernel §1.6–§1.8). The frame (§1.6, Q3) is superseded:
   a cell is one call.
+- **The closing phase is superseded** (2026-09-29): `closing_R`, the
+  integration family `saturate_bounded` ran to a fixpoint before the rest
+  of the rule set, is deleted with the integral it closed, and with it
+  M16's quadrature and Appendix A's integrals that stop closing past N ≥ 37.
+  A glyph writes each piece's area in closed form, and the plan's
+  `saturate_R` becomes `folds_R ∘ main_(R∖folds)` (still proposed; today
+  one loop runs every rule). JP: *"just do b. delete all the integral
+  stuff. other languages don't try this. probably for good reason."* The
+  gates below that name `glyph_is_closed` and the area and arc oracles
+  (CL6, CL8, CL9, CL10) went with the integral; read them as their
+  successors: `glyph_exact_area`, `fonts::loop_blinn::adversarial`, and
+  `glyph_optimizes_estimate_free`, which keeps the every-glyph and
+  94-glyph-run pins (the tier takes the glyph, and leaves no estimate). An
+  open integral, and a quadrature, are unrepresentable.
 - **Created**: 2026-09-24; revised 2026-09-25
 - **Verified against**: `8b7b75a`. The inputs were:
   - four maps (optimizer, front end, backend and artifact, bound buffers);

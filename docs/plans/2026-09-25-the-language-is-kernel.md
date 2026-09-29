@@ -6,6 +6,11 @@
   there are no tables, the control points are uniforms, a glyph's program
   is the kernel for its number of control points, and `select` is renamed
   `if` (§1.6, §1.7). Phase A is in progress.
+- **Integrals deleted** (2026-09-29). JP: *"just do b. delete all the
+  integral stuff. other languages don't try this. probably for good
+  reason."* The language has no integral: §1.5's `integral`, `area` and
+  `monotone_root` rows, B4's integral half, B6 and D19 are withdrawn, and a
+  glyph writes each piece's area in closed form (§1.7).
 - **Created**: 2026-09-25
 - **Verified against**: `8b7b75a`, in two rounds.
   - A four-way inventory of every use of the `Kernel` builder, a
@@ -99,8 +104,8 @@ template ──instantiate(structural values)──▶ program ──P(·, s, t)
 - **One lowering.** It calls `pixelflow-ir`'s one set of definitions. There
   is no second copy of `fract`, `hypot`, `clamp` or the derivative encoding
   (`pixelflow_ir::library`), of the binder's choice and rename
-  (`ExprArena::close_over`), of a range's bound (`RangeFold::admits`) or of
-  the pixel (`IntervalFold::pixel`). Until B5, `lower.rs` restated each.
+  (`ExprArena::close_over`) or of a range's bound (`Fold::admits`). Until
+  B5, `lower.rs` restated each.
 - **One pipeline:** `P`, owned by one-pipeline.
 - **Binding time decides where `P` runs, not a tier.**
   - A program whose structural parameters and shape are declared at build
@@ -176,14 +181,26 @@ a mask. F: probe p16 gives 5. After this plan it is a type error.
     (`UniformBlock<A>`, made by compiling that entry's kernel), or a
     per-entry token the kernel carries and `write_into` checks.
 
-### 1.5 Folds and integrals
+### 1.5 Folds
 
 | spelling | denotation | IR |
 |---|---|---|
-| `(a..b).map(\|i\| e).sum()`, `.product()`, `.any(\|i\| m)`, `.all(\|i\| m)`, `.fold(f32::INFINITY, f32::min)`, `.fold(f32::NEG_INFINITY, f32::max)` | ⊕ over `i ∈ [a, b)`; the identity if empty | `Reduce(Fold::Range(RangeFold{monoid, binder, a..b}), e)` |
-| `integral(lo..hi, \|u\| e)` | ∫ from lo to hi of e du; lo and hi constant `f32` | `Reduce(Fold::Interval(…), e)` |
-| `area(\|u, v\| e)`, a prelude function | `integral(-0.5..0.5, \|v\| integral(-0.5..0.5, \|u\| e))` | two interval folds, as `Kernel::area` builds them (`kernel.rs:778-792`) |
-| `monotone_root(δ, step, bend)`, an intrinsic | τ(δ) | `integral::monotone_root`, the one definition (`integral.rs:325-360`) |
+| `(a..b).map(\|i\| e).sum()`, `.product()`, `.any(\|i\| m)`, `.all(\|i\| m)`, `.fold(f32::INFINITY, f32::min)`, `.fold(f32::NEG_INFINITY, f32::max)` | ⊕ over `i ∈ [a, b)`; the identity if empty | `Reduce(Fold{monoid, binder, a..b}, e)` |
+
+**There are no integrals.** JP, 2026-09-29: *"just do b. delete all the
+integral stuff. other languages don't try this. probably for good
+reason."* The table had three more rows, landed by B4 (`d9d759a4`):
+`integral(lo..hi, |u| e)` over an interval fold, `area(|u, v| e)` as two
+of them over the pixel, and the intrinsic `monotone_root(δ, step, bend)`. They were deleted with everything
+that gave them meaning — the IR's interval domain (`Fold::Interval`), the
+builder's `Kernel::area`, the e-graph's integration rules and their closing
+phase, and the quadrature that legalized what the rules left open. The
+e-graph derived each piece's closed form by rewriting, so a glyph was
+correct only as far as its saturation budget reached: under the flat class
+cap a `kernel!` glyph of 189 pieces had every integral quadratured, its
+coverage off by up to 0.92, and no test failed. A glyph writes the closed
+form itself (§1.7), and so defines its own `monotone_root`, a helper like
+any other.
 
 - **Ranges are constant** (JP): `a` and `b` are expressions over literals and
   structural parameters.
@@ -249,12 +266,21 @@ kernel! {
     const PIXEL_CENTER: f32 = 0.5;
     const PIXEL_HALF: f32 = 0.5;
     const ONE_THIRD: f32 = 1.0 / 3.0;
+    const ROOT_FLOOR: f32 = 1.0 / 1_267_650_600_228_229_401_496_703_205_376.0;
     const COVERAGE_SNAP: f32 = 1.0 / 1024.0;
     const NEARLY_ONE: f32 = 1.0 - COVERAGE_SNAP;
 
     fn coverage(f: f32) -> f32 {
         let c = f.abs().min(1.0);
         if c >= NEARLY_ONE { 1.0 } else if c <= COVERAGE_SNAP { 0.0 } else { c }
+    }
+
+    /// `τ(δ) = δ / max(step + √max(step² + bend·δ, 0), ROOT_FLOOR)`: the
+    /// parameter at which the rise `t·(2·step + bend·t)` reaches the height
+    /// `δ`, the reciprocal exact — `fonts/loop_blinn.rs`'s
+    /// `Rise::monotone_root`, which carries its law.
+    fn monotone_root(delta: f32, step: f32, bend: f32) -> f32 {
+        delta * (1.0 / (step + (step * step + bend * delta).max(0.0).sqrt()).max(ROOT_FLOOR))
     }
 
     /// `2·step + bend·s`: a rise `q(t) = t·(2·step + bend·t)` is `t` times
@@ -330,7 +356,9 @@ quadrature legalized whatever was left, with nothing to notice. `piece_area`
 is the area itself; the builder's glyph (`fonts/loop_blinn.rs`) was
 rewritten to the same closed form first, and its `piece_term` and this
 block's are one canonical key (F, `fonts/loop_blinn/kernel_copy.rs`, which
-also bakes real glyphs through both).
+also bakes real glyphs through both). The integral itself was then deleted
+from the language, the IR and the e-graph (§1.5), and `monotone_root`, the
+intrinsic the block used to call, with it: the block defines it.
 
 **What stays host Rust.** None of this is program; it produces the
 per-call uniforms and the count `N`.
@@ -362,7 +390,8 @@ stays distinct from a missing one, as the atlas's slot layout does today
 Three problems, none of which touches the language:
 
 1. **Every piece is its own integral.** *Moot since each piece's term is
-   written as its closed form (§1.7): there is no integral to close.* A
+   written as its closed form (§1.7), and withdrawn with the integral
+   (§1.5): there is no integral to close, and no rule to close one.* A
    glyph has up to 189 pieces (F, Noto). Integrals written separately stop
    closing past about 37 in one e-graph, because each pays for its own
    derivation under a shared class cap (F, one-pipeline Appendix A).
@@ -399,9 +428,9 @@ Three problems, none of which touches the language:
   not, has a template the size of the body whatever `N` is. A body that
   does holds the table of the arena it is copied into and its inner
   iteration's copies, `N` of them, so its template grows with `N` and is
-  one instantiation's. B6 closes each template as it is built, before its
-  copies, so an enclosing template holds closed inner copies rather than
-  `N` open integrals (the shape the first problem above stops closing).
+  one instantiation's. (B6 would have closed each template as it was
+  built, so an enclosing template held closed inner copies rather than `N`
+  open integrals; it went with the integrals.)
 - No optimization runs at expansion unless the instance is declared (Phase
   E).
 
@@ -431,7 +460,7 @@ The evidence and JP's rulings settle these. JP can overturn any.
 | D16 | public surface | an opaque `Kernel`; `Uniform`, `Scalar`, `Monoid` and `Bits` leave. `__macro` narrows to what expansions name. Only compiler crates depend on `pixelflow-ir`, enforced by CI |
 | D17 | the second parser | `training/factored.rs`'s `parse_kernel_code_arena` and its printer are deleted with the corpus tool that uses them, or routed through the one parser if that tool is still needed |
 | D18 | `Select` | renamed `If` everywhere (§1.6; JP) |
-| D19 | helpers | a helper is a unit of optimization: an integral in it is closed once with its parameters abstract, then instantiated per copy (§1.8) |
+| D19 | helpers | **withdrawn** with the integrals (§1.5): it existed to close a helper's integral once, with its parameters abstract, and a helper holds none |
 
 ---
 
@@ -466,7 +495,7 @@ and no digests are committed (one-pipeline §5, gate policy).
 - **Deprioritized.** 64-bit fold ends (A5) have no driver in this plan.
   Likewise the caps A4 leaves beside the uniform chain, so the remaining
   widths stay visible: `push_nary` and the key's `Nary` child count at
-  `u16::MAX`, `RangeFold`'s `u32` ends, `BufferId(u16)` /
+  `u16::MAX`, `Fold`'s `u32` ends, `BufferId(u16)` /
   `BufferIdentity(u32)` (§1.6: buffers are leaving),
   `ScheduledOp::Context(u16)`, `ExprId(u32)` and `Binder(u8)`.
 
@@ -481,16 +510,22 @@ and no digests are committed (one-pipeline §5, gate policy).
   `Args` in `f002fb6a`; families and tuple `let`s in `e65a72e3` (B3's
   second half).
 - **B4.** `integral`, `area` and `monotone_root`. **Done** in `d9d759a4`,
-  with review follow-ups in `68781e16`.
+  with review follow-ups in `68781e16`, and **deleted** with the integral
+  (2026-09-29, §1.5): the syntax, its `sema` and lowering, the reserved
+  names and `F32Scope` (which existed so a bound could be evaluated like an
+  `f32` const) are gone, and so is `ExprArena::close_over`'s refusal of a
+  fold its caller declined.
 - **B5.** Lowering calls `pixelflow-ir`'s definitions, and `lower.rs`'s
   copies go. **Done** (this commit): `library`'s `fract`, `hypot`, `clamp`
   and `derivative`, written once over the sites a term is built in and
   built through by `Kernel`'s methods, lowering and the integrals' closed
   forms; `Axis`; `ExprArena::close_over` and `Placeholder`; the 2²⁴ bound
   in `RangeFold` (docs/BACKLOG.md C8); `IntervalFold::pixel`. Keys and
-  bytes unchanged.
-- **B6.** Helpers as optimization units (D19): a helper's integral is closed
-  once and instantiated.
+  bytes unchanged. (`RangeFold` is `Fold` again, and `IntervalFold` is
+  gone, since the integral's deletion.)
+- **B6.** **Withdrawn** with the integrals (§1.5, D19). It was: helpers as
+  optimization units, a helper's integral closed once and instantiated.
+  What it found about templates stands for whatever next optimizes one:
   - Two units are closed, both through `ExprArena::splice_with`: a
     helper's template over its parameters, and a family's template over
     its shared terms and its element. For §1.7's glyph they coincide: the
@@ -519,8 +554,11 @@ and no digests are committed (one-pipeline §5, gate policy).
 
 - **C1.** The §1.7 block: one program per `N` per tile extent, the glyph
   its uniforms.
-  - The gates are `glyph_is_closed`, `glyph_exact_area`,
-    `glyph_area_edge_cases`, `freetype_oracle` and the goldens.
+  - The gates are `glyph_exact_area`, `glyph_area_edge_cases`,
+    `freetype_oracle`, `glyph_optimizes_estimate_free` and the goldens.
+    (`glyph_is_closed` also pinned that no glyph held an integral, which
+    the IR can no longer express; the rest of it is
+    `glyph_optimizes_estimate_free`.)
   - Re-baselined pins go in their own commit.
 - **C2.** The frame calls `glyph::<N>` per cell. The atlas,
   `CachedGlyph`/`CachedText` and `BilinearSampler` go (D10). A zoom
@@ -576,7 +614,6 @@ bounding; recompile on zoom; caching later (§1.6–§1.8).
   and has no `.sum()`;
 - `if` as the only choice;
 - `const` parameters as structural;
-- `integral` and `area`;
 - `DX(e)`.
 
 **Q3. `text()` and `run`** (no production caller). **Recommendation:**
@@ -606,4 +643,15 @@ Phase D proposes the edits.
   `RangeFold` accepted any `u32` end, so a builder fold past 2²⁴ summed the
   wrong terms without a word, while `kernel!` refused such a bound at
   lowering. B5 moved the refusal into `RangeFold` (`RangeFold::admits`),
-  which both front ends build through (docs/BACKLOG.md, C8).
+  which both front ends build through (docs/BACKLOG.md, C8); it is
+  `Fold::admits` since `RangeFold` folded back into `Fold` with the
+  integral's deletion.
+- **The integral closed only under budget (F).** A glyph written as the
+  integral it is was correct only as far as saturation reached: the rules
+  that derived each piece's closed form shared the flat class cap, and
+  quadrature legalized, silently, whatever they left open. A `kernel!`
+  glyph at 189 pieces had every integral quadratured, coverage off by up
+  to 0.92, with no test failing. JP: *"just do b. delete all the
+  integral stuff. other languages don't try this. probably for good
+  reason."* The glyph writes its closed form (§1.7), and the integral is
+  deleted (§1.5).

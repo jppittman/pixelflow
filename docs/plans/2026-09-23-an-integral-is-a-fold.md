@@ -1,5 +1,22 @@
 # An integral is a fold
 
+> **Superseded (2026-09-29).** JP: *"just do b. delete all the integral
+> stuff. other languages don't try this. probably for good reason."*
+> Everything this plan built for the integral is deleted: the IR's interval
+> fold (`Fold::Interval`, `IntervalFold`) and its closed forms, the
+> builder's `Kernel::area`, the e-graph's integration rules
+> (`NarrowInterval`, `ClampMoment`, `ArcMoment`) and the closing phase that
+> ran them first, quadrature legalization (`passes::resolve`), and
+> `kernel!`'s `integral`, `area` and `monotone_root`. The e-graph derived
+> each piece's closed form by rewriting, so a glyph was correct only as far
+> as the saturation budget reached: under the flat class cap a `kernel!`
+> glyph of 189 pieces had every integral quadratured, its coverage off by up
+> to 0.92, and no test failed. A glyph now writes each piece's area in
+> closed form (`fonts/loop_blinn.rs`, `RisingArc::pixel_area`). What this
+> plan built that is not the integral stays: the class variance fact,
+> `FactorFold` on range folds, and the fold price in a guarded arm. The rest
+> of this document is the record of what was tried.
+
 ## Metadata
 - **Author**: JP (direction), Claude (draft)
 - **Status**: `Built through step 6` (§8). The denotation was proposed

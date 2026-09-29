@@ -10,8 +10,7 @@
 //! written twice, in `kernel!`'s lowering and in `Kernel`'s method, and a
 //! copy is a future divergence (CLAUDE.md). `kernel_raw!` keeps the lowered
 //! shape, so each comparison is the front end's word and not the
-//! optimizer's. `fold_is_kernel_over.rs` and `integral_is_kernel_area.rs`
-//! pin the folds and the pixel the same way.
+//! optimizer's. `fold_is_kernel_over.rs` pins the folds the same way.
 
 use pixelflow_compiler::kernel_raw;
 use pixelflow_core::Kernel;

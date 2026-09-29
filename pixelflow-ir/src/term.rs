@@ -118,11 +118,10 @@ pub enum Shape<'a, R> {
     Ref(KernelKey),
     /// An operation over `children`.
     Op(OpKind, Children<'a, R>),
-    /// A fold: `⊕_{k} body[fold.binder() := k]` over a range's visited
-    /// indices, or the integral of `body` over an interval (see
-    /// [`Fold`](crate::Fold)'s doc).
+    /// A fold: `⊕_{k} body[fold.binder() := k]` over its range's visited
+    /// indices (see [`Fold`](crate::Fold)'s doc).
     ///
-    /// Deliberately *not* a [`Shape::Op`]. A fold's algebra, binder and domain
+    /// Deliberately *not* a [`Shape::Op`]. A fold's algebra, binder and range
     /// are metadata, not operands: handing them to a walker as children is
     /// what let the combiner's `Const` share an e-class with any literal of
     /// the same value, and put a trip count within reach of every arithmetic

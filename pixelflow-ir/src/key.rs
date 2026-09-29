@@ -612,33 +612,35 @@ mod tests {
         );
     }
 
-    /// One piece of a glyph in its uniform form: `σ·area(x < e)` over its
-    /// own two instances.
+    /// A piece in its uniform form, `σ·Σ_j Σ_i [X + i < e + j]` over its own
+    /// two instances: two nested folds whose bodies read leaves every piece
+    /// shares (the literals, the axis).
     fn piece() -> crate::Kernel {
         use crate::{Kernel, Uniform};
         let (zero, one) = (Kernel::constant(0.0), Kernel::constant(1.0));
         let edge = Uniform::new(0.5).kernel();
         let sigma = Uniform::new(1.0).kernel();
-        let left = Kernel::x().lt(&edge).select(&one, &zero);
-        sigma.mul(&left.area())
+        let folds = Kernel::sum_over(2, |j| {
+            Kernel::sum_over(3, |i| {
+                Kernel::x().add(i).lt(&edge.add(j)).select(&one, &zero)
+            })
+        });
+        sigma.mul(&folds)
     }
 
-    /// Every interval fold reachable in `arena`, by id.
-    fn interval_folds(arena: &ExprArena) -> Vec<ExprId> {
+    /// Every fold reachable in `arena`, by id.
+    fn folds(arena: &ExprArena) -> Vec<ExprId> {
         arena
             .nodes()
             .filter_map(|(id, node)| match node {
-                ExprNode::Reduce {
-                    fold: crate::Fold::Interval(_),
-                    ..
-                } => Some(id),
+                ExprNode::Reduce { .. } => Some(id),
                 _ => None,
             })
             .collect()
     }
 
-    /// N pieces summed by `Kernel::sum`: every instance's interval folds have
-    /// the one canonical form the piece has on its own. This is the measured
+    /// N pieces summed by `Kernel::sum`: every instance's folds have the one
+    /// canonical form the piece has on its own. This is the measured
     /// failure: `sum` copies its head and splices its tail, so every leaf the
     /// pieces share is interned at the head's position, which sorted it to
     /// the front of each spliced piece's ascending-id walk and not the
@@ -648,11 +650,11 @@ mod tests {
         const PIECES: usize = 3;
         let pieces: Vec<crate::Kernel> = (0..PIECES).map(|_| piece()).collect();
         let (alone, _) = pieces[0].parts();
-        let alone_folds: Vec<Vec<u8>> = interval_folds(alone)
+        let alone_folds: Vec<Vec<u8>> = folds(alone)
             .into_iter()
             .map(|id| canonical(alone, id).key)
             .collect();
-        assert_eq!(alone_folds.len(), 2, "`area` is two nested interval folds");
+        assert_eq!(alone_folds.len(), 2, "the piece is two nested folds");
         assert_ne!(alone_folds[0], alone_folds[1], "the inner and the outer");
 
         let sum = crate::Kernel::sum(&pieces);
@@ -661,7 +663,7 @@ mod tests {
             arena.len() < PIECES * alone.len(),
             "the sum really shares leaves between its pieces"
         );
-        let summed_folds: Vec<Vec<u8>> = interval_folds(arena)
+        let summed_folds: Vec<Vec<u8>> = folds(arena)
             .into_iter()
             .map(|id| canonical(arena, id).key)
             .collect();

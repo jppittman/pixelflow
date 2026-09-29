@@ -175,25 +175,20 @@ impl RuleSet {
         Self::new(super::all_rules())
     }
 
-    /// [`RuleSet::production`] plus the bounded-fold decompositions and the
-    /// integration rules.
+    /// [`RuleSet::production`] plus the bounded-fold decompositions.
     ///
-    /// The runtime tier's set, and only its: `kernel!` has no syntax that
-    /// builds a fold, so at the macro tier these rules can never fire. The
-    /// integration rules come last and match nothing but an integral, so a
-    /// kernel without one saturates exactly as it did before they existed;
-    /// with one, the graph runs them first ([`super::integral`]).
-    /// Adding them to [`super::all_rules`] instead would leave them inert
-    /// there while perturbing the pinned rule-set grids that
-    /// `crate::math::inflate`'s inflation study measures against — a changed
-    /// baseline for no measurement's sake. Which rules a tier holds is
+    /// The runtime tier's set, and only its: the macro tier's set holds no
+    /// fold rule, so a `kernel!` fold reaches the runtime tier as the one
+    /// `Reduce` it lowered to, and is unrolled or factored there, at bake
+    /// time. Adding them to [`super::all_rules`] instead would perturb the
+    /// pinned rule-set grids that `crate::math::inflate`'s inflation study
+    /// measures against — a changed baseline for no measurement's sake. Which rules a tier holds is
     /// already a place the tiers differ (so is the vocabulary, and so is
     /// whether extraction is priced against a lattice).
     #[must_use]
     pub fn runtime() -> Self {
         let mut rules = super::all_rules();
         rules.extend(super::fold_rules::fold_rules());
-        rules.extend(super::integral::integral_rules());
         Self::new(rules)
     }
 

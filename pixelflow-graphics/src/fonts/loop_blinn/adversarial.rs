@@ -2,12 +2,12 @@
 //! floating point is thinnest**, and judged piece by piece by a reference
 //! that shares nothing with it.
 //!
-//! The cases are `pixelflow-core/tests/arc_adversarial.rs`'s and
-//! `area_adversarial.rs`'s, which attacked the integral a piece was written
-//! as and the rules that closed it. The integral is gone from the glyph
-//! (the module docs), so the same arcs and chords are pointed at what
-//! replaced it, [`piece_term`] — cut, reflected and signed as the fold sums
-//! it:
+//! The cases were `pixelflow-core`'s `arc_adversarial` and
+//! `area_adversarial` tests, which attacked the integral a piece was written
+//! as and the rules that closed it, and went with them. The integral is gone
+//! from the glyph and from the IR (the module docs), so the same arcs and
+//! chords are pointed at what replaced it, [`piece_term`] — cut, reflected
+//! and signed as the fold sums it:
 //!
 //! - **Every direction, anywhere, any length.** Monotone quadratics in the
 //!   four diagonal directions, frames to `±1000`, spans to `600` pixels, a
@@ -22,7 +22,7 @@
 //!   integral's closing — each root's denominator stopped varying, and
 //!   `δ/d` extracted as a hoisted `δ·recip(d)`, `3.9e-2` of coverage wrong
 //!   at AVX2 — is the one the closed form's quotients are spelled against
-//!   (`integral::monotone_root`, "Emitted as `δ·(1/d)`").
+//!   (`Rise::monotone_root`, "Emitted as `δ·(1/d)`").
 //! - **A glyph is one fold over a table**, of closed contours whose pieces
 //!   are hundreds of pixels long, and of lines read through one step column.
 //! - **Chords.** Lines of slope `0` to `10⁸` either way, through bands
@@ -46,11 +46,14 @@
 //! form, and no polygon. The row is what the kernel is asked to integrate,
 //! so the reference reads the row: the host's rounding of an outline into
 //! rows is `tests/glyph_exact_area.rs`'s to judge, not this file's.
+//! [`the_reference_is_greens_theorem`] checks the reference against a
+//! rectangle's overlap, computed by hand.
 //!
 //! Dropped with their subjects: the spellings (an author's way of writing
 //! the integrand, which the rule read or declined — a closed form has one
-//! spelling), floors other than `ROOT_FLOOR` (`RootFloor`'s admission, an
-//! IR type pinned in its own crate), clamps into bands other than
+//! spelling), floors other than `ROOT_FLOOR` (which floors the rule
+//! admitted from an author — the glyph writes its own), clamps into bands
+//! other than
 //! `[0, 1]` and integrals over intervals other than the pixel (the
 //! integration rules' generality). A crossing wholly right of the pixel
 //! was pinned bit for bit to `σ·h` there, a property of the clamp
@@ -180,6 +183,41 @@ impl Quad {
             high - v.iter().copied().fold(f64::MAX, f64::min)
         };
         span(0).max(span(1))
+    }
+}
+
+/// How far the reference may miss a rectangle's overlap: three-point
+/// Gauss–Legendre is exact on a line's linear integrand, so what is left is
+/// `f64` rounding.
+const GREEN_TOLERANCE: f64 = 1e-14;
+
+/// **The reference is Green's theorem.** A rectangle's four edges, run
+/// counter-clockwise, sum over a pixel to the rectangle's overlap with it —
+/// the product of two interval overlaps, by hand — and clockwise to its
+/// negation.
+#[test]
+fn the_reference_is_greens_theorem() {
+    let overlap = |[a, b]: [f64; 2], [c, d]: [f64; 2]| (b.min(d) - a.max(c)).max(0.0);
+    let (x, y) = ([0.3, 4.7], [-1.25, 2.6]);
+    let corners = [[x[0], y[0]], [x[1], y[0]], [x[1], y[1]], [x[0], y[1]]];
+    let edge = |k: usize| Quad::line(corners[k], corners[(k + 1) % 4]);
+    let reversed = |k: usize| Quad::line(corners[(k + 1) % 4], corners[k]);
+    let pixel = |c: f64| [c - 0.5, c + 0.5];
+    for i in -2..7 {
+        for j in -3..4 {
+            let centre = [f64::from(i) + 0.25, f64::from(j) + 0.5];
+            let want = overlap(x, pixel(centre[0])) * overlap(y, pixel(centre[1]));
+            let ccw: f64 = (0..4).map(|k| edge(k).share(centre)).sum();
+            let cw: f64 = (0..4).map(|k| reversed(k).share(centre)).sum();
+            assert!(
+                (ccw - want).abs() < GREEN_TOLERANCE,
+                "{centre:?}: {ccw} vs {want}"
+            );
+            assert!(
+                (cw + want).abs() < GREEN_TOLERANCE,
+                "{centre:?}: {cw} vs {want}"
+            );
+        }
     }
 }
 
@@ -1111,8 +1149,7 @@ fn every_chord_is_its_rows_share() {
 /// was a regression of the integral's closing: a provably zero slope made
 /// a sweep provably zero, a quotient by it let the algebra merge it with
 /// arbitrary classes, and a chord's whole area extracted as the constant
-/// `0` (`mean_of_clamp`, "The divisor"). The closed form divides only by a
-/// root's floored denominator.
+/// `0`. The closed form divides only by a root's floored denominator.
 #[test]
 fn a_literal_slope_is_its_rows_share() {
     let slopes: [f32; 12] = [

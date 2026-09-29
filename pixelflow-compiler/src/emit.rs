@@ -54,7 +54,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode, UniformId};
 use pixelflow_ir::optimize::Optimize;
-use pixelflow_ir::{Binder, OpKind, RangeFold};
+use pixelflow_ir::{Binder, Fold, OpKind};
 use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
 use syn::Ident;
@@ -495,8 +495,8 @@ fn emit_const(item: &ConstItem, value: ConstValue) -> TokenStream {
 /// An open fold's range, evaluated when the host function is instantiated:
 /// in a `const` block, so rustc checks each operation of the bounds as it
 /// checks any `const`, and refuses — per instantiation — the ranges the IR
-/// refuses ([`RangeFold::admits`]): one that runs backwards, and one past
-/// [`RangeFold::EXACT_BOUND`], the last bound a fold's index names exactly.
+/// refuses ([`Fold::admits`]): one that runs backwards, and one past
+/// [`Fold::EXACT_BOUND`], the last bound a fold's index names exactly.
 /// The bound is the IR's, imported; what the `const` block adds is that the
 /// refusal is rustc's rather than `Fold::new`'s panic.
 ///
@@ -506,7 +506,7 @@ fn emit_const(item: &ConstItem, value: ConstValue) -> TokenStream {
 /// a run-time panic.
 fn instantiated_range(range: &crate::sema::StructuralRange) -> TokenStream {
     let (lo, hi) = (&range.lo, &range.hi);
-    let bound = proc_macro2::Literal::u32_unsuffixed(RangeFold::EXACT_BOUND);
+    let bound = proc_macro2::Literal::u32_unsuffixed(Fold::EXACT_BOUND);
     let backwards = format!(
         "kernel!: the range `{}` runs backwards at this instantiation",
         range.text()
@@ -663,8 +663,8 @@ struct Scope {
     declared: HashSet<u64>,
 }
 
-/// What a node reads that the program binds inside itself — a fold's or an
-/// integral's index, or a field of a family's abstract element — so that a
+/// What a node reads that the program binds inside itself — a fold's index,
+/// or a field of a family's abstract element — so that a
 /// term reading none of what an iteration binds is the same in every copy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Bound {
@@ -1478,10 +1478,10 @@ mod tests {
     /// binder the template holds — checked against the IR's statement of
     /// the scoping rule, `compute_arena_variance`, beside `N as f32`, a
     /// hole the variance counts as reading every binder. Taken from the
-    /// variance, the iteration's node would seem to read the fold's `j` and
-    /// the integral's `u` from outside, and `j·r` and `u·r` would be inputs
-    /// standing for terms under the binders that bind them. Exactly, `r`
-    /// is the one input.
+    /// variance, the iteration's node would seem to read the folds' `j` and
+    /// `k` from outside, and `j·r` and `k·r` would be inputs standing for
+    /// terms under the binders that bind them. Exactly, `r` is the one
+    /// input.
     #[test]
     fn an_input_reads_no_binder_its_template_holds() {
         let analyzed = analyze(
@@ -1492,7 +1492,7 @@ mod tests {
                         .into_iter()
                         .map(|p| {
                             (0..2).map(|j| (j as f32) * r + p.a).sum::<f32>() * (N as f32)
-                                + integral(0.0..1.0, |u| u * r + p.b)
+                                + (0..3).map(|k| (k as f32) * r + p.b).sum::<f32>()
                         })
                         .sum()
                 }
@@ -1523,7 +1523,7 @@ mod tests {
             let held = binders_held(&arena, body);
             assert!(
                 held.depends_on_binder(),
-                "the body binds `j` and `u`: {held:?}"
+                "the body binds `j` and `k`: {held:?}"
             );
             for &input in inputs {
                 assert!(

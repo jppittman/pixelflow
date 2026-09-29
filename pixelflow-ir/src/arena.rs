@@ -129,16 +129,11 @@ impl Axis {
     }
 }
 
-/// Why [`ExprArena::close_over`] built no fold.
+/// Why [`ExprArena::close_over`] built no fold: the body already binds every
+/// [`Binder`], so the fold would be one deeper than the index space
+/// ([`Binder::COUNT`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Unclosed<E> {
-    /// The body already binds every [`Binder`]: the fold would be one deeper
-    /// than the index space ([`Binder::COUNT`]).
-    IndexSpaceFull,
-    /// The fold built on the binder chosen was refused: its domain is not
-    /// one the IR admits.
-    Refused(E),
-}
+pub struct IndexSpaceFull;
 
 /// The `Var` indices Z and W had. Reserved, never reissued: a reduction
 /// binder taking one of them would make an arena written before the change
@@ -374,11 +369,8 @@ pub enum ExprNode {
     /// N-ary node. Its children's location is private storage detail — see
     /// [`NaryChildren`] — and comes back through [`ExprArena::children`].
     Nary(OpKind, NaryChildren),
-    /// A fold: `⊕_{k} body[fold.binder() := k]` over a range's visited
-    /// indices (`lo`, `lo+stride`, …, [`RangeFold::len`] of them), or
-    /// `∫ body[fold.binder() := u] du` over an interval — see [`Fold`].
-    ///
-    /// [`RangeFold::len`]: crate::fold::RangeFold::len
+    /// A fold: `⊕_{k} body[fold.binder() := k]` over its range's visited
+    /// indices (`lo`, `lo+stride`, …, [`Fold::len`] of them) — see [`Fold`].
     ///
     /// The only node that *binds* — the binder is not free in the result — and
     /// the only one whose metadata is part of its identity rather than a
@@ -873,11 +865,10 @@ impl ExprArena {
         self.push_ternary(OpKind::Gather, buf, x, y)
     }
 
-    /// Push the fold `fold` performs over `body` — a `⊕` over a range, or an
-    /// `∫` over an interval.
+    /// Push the fold `fold` performs over `body` — a `⊕` over a range.
     ///
     /// Two arguments, because [`Fold`] is the metadata: which algebra, which
-    /// index, which domain. Every one of those was an assertion here — a
+    /// index, which range. Every one of those was an assertion here — a
     /// combiner that is a monoid, a var index inside the binder space, a trip
     /// count that fits — and each is now a thing the type will not build.
     /// `expand_reduce` lowers a survivor to an unrolled accumulation.
@@ -1522,8 +1513,8 @@ impl ExprArena {
     /// slots the body binds decides it — the reason a body is built against
     /// a placeholder at all.
     ///
-    /// The one definition of that rule and of the rename: `Kernel::over`,
-    /// `Kernel::area` and `kernel!`'s lowering each build a fold through it,
+    /// The one definition of that rule and of the rename: `Kernel::over`
+    /// and `kernel!`'s lowering each build a fold through it,
     /// so a fold written in the syntax and the same fold built with the
     /// builder are one program.
     ///
@@ -1540,19 +1531,15 @@ impl ExprArena {
     ///
     /// # Errors
     ///
-    /// [`Unclosed::IndexSpaceFull`] when the body binds every binder, and
-    /// [`Unclosed::Refused`] with `fold_at`'s refusal of the binder it was
-    /// offered.
-    pub fn close_over<E>(
+    /// [`IndexSpaceFull`] when the body binds every binder.
+    pub fn close_over(
         &self,
         body: ExprId,
         placeholder: Placeholder,
-        fold_at: impl FnOnce(Binder) -> Result<Fold, E>,
-    ) -> Result<(ExprArena, ExprId), Unclosed<E>> {
-        let binder = self
-            .lowest_free_binder(body)
-            .ok_or(Unclosed::IndexSpaceFull)?;
-        let fold = fold_at(binder).map_err(Unclosed::Refused)?;
+        fold_at: impl FnOnce(Binder) -> Fold,
+    ) -> Result<(ExprArena, ExprId), IndexSpaceFull> {
+        let binder = self.lowest_free_binder(body).ok_or(IndexSpaceFull)?;
+        let fold = fold_at(binder);
 
         use crate::expr::{ExprBuilderExt, from_arena, substitute_vars, to_arena};
         let (open, tables) = from_arena(self, body);
@@ -2162,7 +2149,7 @@ mod tests {
 
         let (closed, root) = a
             .close_over(body, placeholder, |binder| {
-                Ok::<_, ()>(Fold::new(Monoid::SUM, binder, 0..4))
+                Fold::new(Monoid::SUM, binder, 0..4)
             })
             .expect("a free binder");
         let ExprNode::Reduce { fold, body } = closed.node(root) else {
@@ -2189,7 +2176,7 @@ mod tests {
         a.declare_uniform(unread);
         let (closed, _) = a
             .close_over(body, placeholder, |binder| {
-                Ok::<_, ()>(Fold::new(Monoid::MAX, binder, 0..2))
+                Fold::new(Monoid::MAX, binder, 0..2)
             })
             .expect("a free binder");
         assert_eq!(closed.uniforms(), [unread]);
@@ -2204,18 +2191,9 @@ mod tests {
             body = a.push_reduce(Fold::new(Monoid::SUM, binder, 0..1), body);
         }
         let unclosed = a.close_over(body, placeholder, |binder| {
-            Ok::<_, ()>(Fold::new(Monoid::SUM, binder, 0..1))
+            Fold::new(Monoid::SUM, binder, 0..1)
         });
-        assert_eq!(unclosed.err(), Some(Unclosed::IndexSpaceFull));
-    }
-
-    /// A fold refused on the binder chosen is the caller's refusal, as it
-    /// was given.
-    #[test]
-    fn close_over_passes_a_refused_fold_through() {
-        let (a, body, placeholder) = open_body(0);
-        let unclosed = a.close_over(body, placeholder, |_| Err::<Fold, _>("no interval"));
-        assert_eq!(unclosed.err(), Some(Unclosed::Refused("no interval")));
+        assert_eq!(unclosed.err(), Some(IndexSpaceFull));
     }
 
     // 1. test_push_and_access

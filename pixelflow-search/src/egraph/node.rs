@@ -62,12 +62,11 @@ pub enum ENode {
         op: &'static dyn Op,
         children: Vec<EClassId>,
     },
-    /// A fold: `⊕_{k} body[fold.binder() := k]` over a range's visited
-    /// indices, or `∫ body[fold.binder() := u] du` over an interval (see
-    /// `Fold`'s doc, in `pixelflow-ir`).
+    /// A bounded fold: `⊕_{k} body[fold.binder() := k]`, `k` ranging over
+    /// `fold`'s own visited indices (see `Fold`'s doc, in `pixelflow-ir`).
     ///
     /// The one node in the graph that *binds*, and the reason it can be in
-    /// the graph at all: its algebra, binder and domain live in the node's
+    /// the graph at all: its algebra, binder and range live in the node's
     /// identity rather than in three `Const` children. As children they were
     /// e-classes like any other — the `Const(4.0)` naming the `Add` combiner
     /// was the same class as any literal `4.0` in the kernel, and every
@@ -75,8 +74,7 @@ pub enum ENode {
     /// simply lowered before insertion and the e-graph never saw a fold.
     ///
     /// Hash-consing therefore does what it should: two folds are one node iff
-    /// they fold the same body, under the same algebra, over the same domain
-    /// — a range and an interval never, whatever their bounds.
+    /// they fold the same body, under the same algebra, over the same range.
     Reduce { fold: Fold, body: EClassId },
 }
 

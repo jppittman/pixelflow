@@ -524,7 +524,7 @@ fn the_renderer_and_the_reference_share_a_pixel() {
 /// ≤ 0.00095) and its slack is that width again, so a change that moved
 /// every texel of every glyph by up to `9·10⁻⁴` — a reciprocal estimate in
 /// the closed form (`2⁻¹²` relative), a divisor re-derived apart from its
-/// numerator (`mean_of_clamp`, "Floating point") — would pass it
+/// numerator — would pass it
 /// (measured: scaling coverage by `0.9998` fails only this test in the
 /// file). This bound is per texel, derived rather than measured, and the
 /// renderer sits well inside it: on the AVX-512 and AVX2 tiers alike, the

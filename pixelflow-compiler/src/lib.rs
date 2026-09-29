@@ -128,14 +128,6 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 ///             .map(|i| if dist(X, Y, 0.0, 0.0) < (i as f32) + UNIT { UNIT } else { 0.0 })
 ///             .sum()
 ///     }
-///
-///     /// How much of the pixel about the sample lies left of the line
-///     /// `x = c`: the area of the half-plane's indicator, `u` and `v` the
-///     /// offsets across the pixel. The e-graph closes it to
-///     /// `clamp(c − X + ½, 0, 1)` when it is baked.
-///     pub fn left_of(c: f32) -> f32 {
-///         area(|u, v| if X + u < c { UNIT } else { 0.0 })
-///     }
 /// }
 ///
 /// let unit_circle: Kernel = circle(0.0, 0.0, UNIT);
@@ -161,23 +153,8 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 /// — and the index `i` is a `usize`, which a body reads only as `i as f32`:
 /// there is no arithmetic on an index and nothing to index. A fold lowers to
 /// one `Reduce`, the node `Kernel::over` builds; unrolling it is the
-/// e-graph's choice, at bake time. A closure is the body of a fold or an
-/// integral and appears nowhere else.
-///
-/// # Integrals
-///
-/// `integral(lo..hi, |u| e)` is ∫ of `e` over `u ∈ [lo, hi)`. The bounds are
-/// constant `f32`s, evaluated at expansion as an `f32` const is, and must be
-/// an interval: finite, `lo < hi`. The variable `u` is an `f32` the body
-/// computes with, in scope in the body only. `area(|u, v| e)` is the pixel
-/// about the sample: exactly `integral(-H..H, |v| integral(-H..H, |u| e))`,
-/// `H` being `pixelflow_ir::kernel::PIXEL_HALF_WIDTH`. The body writes the
-/// shift, so `area(|u, v| f(X + u, Y + v))` is the builder's `f.area()`,
-/// one program with it. `monotone_root(δ, step, bend)` is the parameter at
-/// which a certified rise reaches the height `δ`
-/// (`pixelflow_ir::integral::monotone_root`). Each integral lowers to one
-/// `Reduce` over an interval; whether it closes is the e-graph's, at bake
-/// time, and one it leaves open is legalized by quadrature.
+/// e-graph's choice, at bake time. A closure is the body of a fold or of a
+/// family's iteration and appears nowhere else.
 ///
 /// `if` is the choice. `.select(a, b)` still lowers to the same node this
 /// phase, and Phase B of the plan removes it.
