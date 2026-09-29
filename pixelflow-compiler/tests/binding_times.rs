@@ -14,7 +14,7 @@
 //! `rustc_is_the_oracle.rs`; the refusals are `sema`'s and the parser's unit
 //! tests. This file pins the binding: keys, positions and rebinding.
 
-use pixelflow_compiler::kernel;
+use pixelflow_compiler::{kernel, kernel_raw};
 use pixelflow_core::{ArityMismatch, Kernel, Lattice, Manifold, Uniform};
 use pixelflow_ir::key::canonical;
 
@@ -119,6 +119,74 @@ fn every_call_of_an_entry_at_one_instantiation_is_one_program() {
         program_key(&ramp::<4>(1.0)),
         program_key(&ramp::<5>(1.0)),
         "a structural value is its own program"
+    );
+}
+
+kernel_raw! {
+    const TWO: usize = 2;
+    const FIVE: usize = 5;
+
+    /// Two ranges over structural parameters, one inside the other — `M`
+    /// rows of `N` terms — and `N` as a value.
+    pub fn grid<const M: usize, const N: usize>() -> f32 {
+        (0..M)
+            .map(|i| (0..N).map(|j| X * (i as f32) + Y * (j as f32)).sum::<f32>())
+            .sum::<f32>()
+            + (N as f32)
+    }
+
+    /// `grid::<2, 5>`, written over ranges known at expansion.
+    pub fn grid_two_by_five() -> f32 {
+        (0..TWO)
+            .map(|i| (0..FIVE).map(|j| X * (i as f32) + Y * (j as f32)).sum::<f32>())
+            .sum::<f32>()
+            + (FIVE as f32)
+    }
+}
+
+/// Each distinct range over structural parameters is a hole of its own. A
+/// template with two, instantiated at `M = 2, N = 5`, is the program written
+/// over `0..2` and `0..5`; at `M = 5, N = 2` it is another. Both are
+/// `kernel_raw!`, so neither key is an optimizer's. Two ranges sharing one
+/// hole would compile a program over one of them twice, with plausible
+/// pixels.
+#[test]
+fn each_structural_range_is_a_hole_of_its_own() {
+    assert_eq!(
+        program_key(&grid::<2, 5>()),
+        program_key(&grid_two_by_five())
+    );
+    assert_ne!(
+        program_key(&grid::<5, 2>()),
+        program_key(&grid::<2, 5>()),
+        "the rows and the terms are not interchangeable"
+    );
+}
+
+/// Structural parameters spelled as the emitted range's bounds once were,
+/// in a module of their own so that the lint their spelling trips is
+/// allowed for them alone.
+#[allow(non_upper_case_globals)]
+mod lower_case {
+    use pixelflow_compiler::kernel;
+
+    kernel! {
+        /// A sum over `[lo, hi)`: the names the emission binds are its own.
+        pub fn span<const lo: usize, const hi: usize>() -> f32 {
+            (lo..hi).map(|i| i as f32).sum::<f32>()
+        }
+    }
+}
+
+/// An open fold's range is evaluated in code the entry's own names cannot
+/// reach: a structural parameter named `lo` or `hi` is the range's bound,
+/// not a pattern the evaluation's binding reads as it.
+#[test]
+fn a_structural_parameter_named_as_the_emissions_locals_is_its_own() {
+    assert_eq!(
+        Lattice::eval_at(&lower_case::span::<2, 5>(), 0.0, 0.0),
+        9.0,
+        "2 + 3 + 4"
     );
 }
 
@@ -288,9 +356,21 @@ fn the_entrys_args_rebind_a_kernel_it_is_composed_into() {
     );
 }
 
+/// How far a quotient may sit from its value, relative, at every ISA tier.
+///
+/// The optimizer may divide through `Recip`, which is an estimate whose
+/// accuracy is the tier's (CLAUDE.md, "Floating point at the edges"):
+/// `rcpps`, AVX2's, is good to about 1.5·2⁻¹² and gives `3 / 4` as
+/// `0.7498169`; AVX-512's `vrcp14ps` happens to be exact on `1/4`; NEON's
+/// `FRECPE` plus one `FRECPS` step is closer than `rcpps`. A quotient pinned
+/// bit for bit is a pin on one tier. 2⁻¹¹ admits every tier's estimate and
+/// is far inside the gap between one ring count and the next.
+const RECIP_RELATIVE_TOLERANCE: f32 = 1.0 / 2048.0;
+
 /// The macro doc's binding-times example: one call baked, and the program
 /// compiled once and rebound from `Args` with another call's values, which
-/// gives that call's pixels.
+/// gives that call's pixels — exactly, since both run one program at one
+/// tier.
 #[test]
 fn the_macro_docs_example_bakes_and_rebinds() {
     let lattice = Lattice::frame(FRAME.0, FRAME.1);
@@ -301,10 +381,11 @@ fn the_macro_docs_example_bakes_and_rebinds() {
         y1: 5.0,
     };
     let once = lattice.bake(&rings::<4>(b, 1.0, 0.0));
-    assert_eq!(
-        once.buffer()[0],
-        0.75,
-        "(0, 0) is inside, √2 from the corner: within three of the four rings"
+    let corner = once.buffer()[0];
+    assert!(
+        (corner - 0.75).abs() <= 0.75 * RECIP_RELATIVE_TOLERANCE,
+        "(0, 0) is inside, √2 from the corner: within three of the four rings, so 3/4 \
+         up to the tier's reciprocal; got {corner}"
     );
 
     let program = Manifold::compile(&rings::<4>(b, 1.0, 0.0), lattice.extent);

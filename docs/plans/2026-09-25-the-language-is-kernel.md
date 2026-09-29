@@ -164,6 +164,15 @@ a mask. F: probe p16 gives 5. After this plan it is a type error.
   `&Args`, and "every argument supplied" is a type rather than a runtime
   assert. It replaces `Uniform` handles, `UniformBlock::set`'s linear search
   (`manifold.rs:113-125`), and the refusal at `packed.rs:185-196`.
+  - **Which program is not yet a type (F, B3's first half).** `write_into`
+    streams the values by position into any `UniformBlock`
+    (`set_declared`), and the one check is the count (`ArityMismatch`). One
+    entry's `Args` written into a block of another program that declares as
+    many scalars binds without a word and draws plausible wrong pixels, a
+    confusion the identity-keyed `set` could not make. The follow-up ties a
+    block to the entry it was compiled from: a block typed by the entry
+    (`UniformBlock<A>`, made by compiling that entry's kernel), or a
+    per-entry token the kernel carries and `write_into` checks.
 
 ### 1.5 Folds and integrals
 

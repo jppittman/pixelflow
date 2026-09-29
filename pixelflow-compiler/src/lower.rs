@@ -1002,12 +1002,14 @@ mod tests {
 
     /// A template's `N as f32` is its structural parameter's `Param` hole,
     /// and a fold over a range naming one is built over a placeholder its
-    /// holes map back to the range; a known fold is not a hole.
+    /// holes map back to the range — two different ranges to two different
+    /// holes; a known fold is not a hole.
     #[test]
     fn a_structural_parameter_leaves_the_template_open() {
         let def = parse(quote! {
             pub fn f<const N: usize, const M: usize>() -> f32 {
                 (0..M * 2).map(|i| X * (i as f32)).sum::<f32>()
+                    + (0..N).map(|i| Y * (i as f32)).sum::<f32>()
                     + (0..3).map(|i| i as f32).sum::<f32>()
                     + (M as f32)
             }
@@ -1029,7 +1031,8 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(open, ["0..(M * 2)"]);
+        open.sort();
+        assert_eq!(open, ["0..(M * 2)", "0..N"], "each range is its own hole");
         assert_eq!(
             known.len(),
             1,
