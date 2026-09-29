@@ -128,25 +128,6 @@ pub fn all_rules() -> Vec<Box<dyn Rewrite>> {
     rules
 }
 
-/// Core arithmetic rules only (fast, always applicable).
-///
-/// Use this for quick optimization passes where trig/exp rules
-/// aren't needed.
-pub fn core_rules() -> Vec<Box<dyn Rewrite>> {
-    algebra_rules()
-}
-
-/// Transcendental function rules (trig, exp, log).
-///
-/// Use this when optimizing expressions with transcendental functions.
-pub fn transcendental_rules() -> Vec<Box<dyn Rewrite>> {
-    let mut rules = Vec::new();
-    rules.extend(parity_rules());
-    rules.extend(trig_rules());
-    rules.extend(exp_rules());
-    rules
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

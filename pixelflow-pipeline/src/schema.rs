@@ -21,25 +21,12 @@ use std::io;
 /// FNV-1a 64, as a `const fn` so [`SchemaIdentity::SCHEMA_IDENTITY`] can be
 /// derived at compile time from `SCHEMA`'s bytes.
 ///
-/// The one hash implementation every content identity in `pixelflow-pipeline`
-/// is built from — schema identities here, the mint sidecar's
-/// `weights_identity`, and the journal's corpus/diff/config identities. Three
-/// independent copies of this exact algorithm existed before this
-/// consolidation, which is precisely the "one definition, imported, not
-/// restated" violation the domain-model plan calls out.
-#[must_use]
-pub const fn fnv1a64_const(bytes: &[u8]) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    let mut i = 0;
-    while i < bytes.len() {
-        hash ^= bytes[i] as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-        i += 1;
-    }
-    hash
-}
+/// The one hash every content identity in `pixelflow-pipeline` is built
+/// from — schema identities here, the mint sidecar's `weights_identity`, and
+/// the journal's corpus/diff/config identities — and the same function the
+/// byte-identity probes digest emitted code with: it is
+/// `pixelflow_codegen::fnv1a64`, imported, not restated.
+pub use pixelflow_codegen::fnv1a64 as fnv1a64_const;
 
 /// [`fnv1a64_const`], hex-formatted, for runtime content hashes (weight
 /// bytes, corpus bytes, diff text) that are not compile-time constants.

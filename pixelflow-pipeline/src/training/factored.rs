@@ -3,12 +3,13 @@
 //! Provides parsers for two expression syntaxes:
 //! - **S-expression**: `Add(Mul(Var(0), Var(1)), Var(2))` (test-only repro format)
 //! - **Kernel code**: `(X * Y) + Z` (human-readable, round-trips with
-//!   `parse_kernel_code_arena`/`arena_to_kernel_code`)
+//!   `parse_kernel_code_arena`/`arena_to_kernel_code`; the printer spells
+//!   every op as a method, `((X).mul(Y)).add(Z)`, which the parser also takes)
 
 use std::collections::HashMap;
 
 use pixelflow_ir::arena::ExprNode;
-use pixelflow_ir::{EmitStyle, ExprArena, ExprId, OpKind};
+use pixelflow_ir::{ExprArena, ExprId, OpKind};
 
 // ============================================================================
 // Expression Parsing (for loading training data)
@@ -646,28 +647,15 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
         .unwrap_or_else(|| panic!("arena_to_kernel_code: empty result stack"))
 }
 
-/// Emit an operation in kernel code syntax, dispatching through `emit_style()`.
+/// Emit an operation in kernel code syntax: a method on its first operand,
+/// spelled by [`OpKind::name`]. The parser resolves a method through
+/// [`OpKind::from_name`], so every op this prints parses back to itself —
+/// `+`, `-`, `*`, `/` and prefix `-` included, as `.add(..)` and `.neg()`.
 fn emit_op_kc(op: OpKind, args: &[String]) -> String {
-    match (op.emit_style(), args) {
-        (EmitStyle::UnaryPrefix, [a]) => format!("(-{})", a),
-        (EmitStyle::UnaryMethod, [a]) => format!("({}).{}()", a, op.name()),
-        (EmitStyle::BinaryInfix(sym), [a, b]) => format!("({} {} {})", a, sym, b),
-        (EmitStyle::BinaryMethod, [a, b]) => format!("({}).{}({})", a, op.name(), b),
-        (EmitStyle::BinaryMethodNamed(method), [a, b]) => format!("({}).{}({})", a, method, b),
-        (EmitStyle::TernaryMethod, [a, b, c]) => {
-            format!("({}).{}({}, {})", a, op.name(), b, c)
-        }
-        (EmitStyle::Special, _) => panic!(
-            "emit_op_kc: Special ops (Var/Const/Tuple) must be handled by caller, got {}",
-            op.name()
-        ),
-        (style, args) => panic!(
-            "emit_op_kc: arity mismatch for {}: {:?} expects different arg count, got {}",
-            op.name(),
-            style,
-            args.len()
-        ),
-    }
+    let (receiver, rest) = args
+        .split_first()
+        .unwrap_or_else(|| panic!("emit_op_kc: {} has no operand to call it on", op.name()));
+    format!("({receiver}).{}({})", op.name(), rest.join(", "))
 }
 
 /// Format a constant for kernel code syntax.
@@ -828,6 +816,38 @@ mod tests {
             arena.len() >= 7,
             "expected method-heavy parse to build a real DAG"
         );
+    }
+
+    /// The printer spells an op by [`OpKind::name`] and the parser resolves a
+    /// method by [`OpKind::from_name`], so every op with operands must print
+    /// to text that parses back to that op over the same operands — the four
+    /// arithmetic operators and prefix `-` included, which print as methods.
+    #[test]
+    fn every_op_prints_as_a_method_that_parses_back_to_itself() {
+        const OPERAND_AXES: [u8; 3] = [0, 1, 2];
+        for op in OpKind::all().filter(|op| (1..=OPERAND_AXES.len()).contains(&op.arity())) {
+            let axes = &OPERAND_AXES[..op.arity()];
+            let mut arena = ExprArena::new();
+            let operands: Vec<ExprId> = axes.iter().map(|&i| arena.push_var(i)).collect();
+            let root = match operands[..] {
+                [a] => arena.push_unary(op, a),
+                [a, b] => arena.push_binary(op, a, b),
+                [a, b, c] => arena.push_ternary(op, a, b, c),
+                _ => panic!("{op:?}: arity {} was filtered out", op.arity()),
+            };
+
+            let code = arena_to_kernel_code(&arena, root);
+            let (reparsed, reparsed_root) = parse_kernel_code_arena(&code)
+                .unwrap_or_else(|| panic!("{op:?} printed as {code:?}, which does not parse"));
+
+            assert_eq!(reparsed.kind(reparsed_root), op, "{code:?}");
+            let children: Vec<ExprNode> = reparsed
+                .children(reparsed_root)
+                .map(|c| reparsed.node(c))
+                .collect();
+            let expected: Vec<ExprNode> = axes.iter().map(|&i| ExprNode::Var(i)).collect();
+            assert_eq!(children, expected, "{code:?}");
+        }
     }
 
     // ========================================================================

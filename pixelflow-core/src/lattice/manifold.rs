@@ -174,22 +174,10 @@ impl UniformBlock {
         self.offset(u).map(|i| self.values[i])
     }
 
-    /// The values in link order — what the kernel reads. An `&[f32]` in
-    /// *this* order is not what the oracle takes; see [`Self::entries`].
+    /// The values in link order — what the kernel reads.
     #[must_use]
     pub fn values(&self) -> &[f32] {
         &self.values
-    }
-
-    /// Every argument with its value, by identity — the order-free form,
-    /// and the one to hand `BindingTable::bind_uniforms` so the oracle and
-    /// the kernel read the same block.
-    pub fn entries(&self) -> impl Iterator<Item = (UniformIdentity, f32)> + '_ {
-        self.link
-            .decls
-            .iter()
-            .map(|d| d.id)
-            .zip(self.values.iter().copied())
     }
 }
 

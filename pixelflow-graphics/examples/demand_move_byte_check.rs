@@ -25,20 +25,11 @@
 //! cargo run -p pixelflow-graphics --example demand_move_byte_check
 //! ```
 
-use pixelflow_codegen::jit_cache;
+use pixelflow_codegen::{fnv1a64, jit_cache};
 use pixelflow_graphics::fonts::Font;
 use pixelflow_ir::{Kernel, LatticeShape};
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
 
 /// `If(x < y, sqrt(x), abs(y))`: a guardable `If` whose arms are each
 /// cheap enough to schedule but distinct in cost, so a real branch is on

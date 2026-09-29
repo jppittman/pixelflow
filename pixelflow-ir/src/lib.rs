@@ -2,9 +2,6 @@
 //!
 //! The shared Intermediate Representation (IR).
 //!
-//! - **Traits**: `Op` trait defines behavior, `EmitStyle` for codegen.
-//! - **Ops**: Unit structs (`Add`, `Mul`) implement `Op`.
-//!
 //! A SIMD backend abstraction (`Backend`/`SimdOps`) lived here, then moved to
 //! `pixelflow-core` on 2026-08-02 (it was not IR and not codegen — it lived
 //! beside `Field`, which it backed). It backed a per-batch "combinator"
@@ -43,7 +40,6 @@ pub use fold::{Binder, Fold, IntervalFold, Monoid, RangeFold};
 pub mod integral;
 
 pub mod kind;
-pub mod traits;
 pub mod variance;
 
 pub use variance::{LatticeShape, Variance};
@@ -120,15 +116,11 @@ pub use term::{Children, Ir, Shape};
 pub mod optimize;
 pub use optimize::{Identity, Optimize, Rewritten, Then};
 
-pub mod binding;
-pub use binding::{BindError, BindingTable};
-
 pub mod kernel;
 pub use kernel::{Bits, Kernel, Scalar, Uniform};
 
 pub use kind::OpKind;
 pub use kind::known_method_names;
-pub use traits::EmitStyle;
 
 /// Fixture builders for this crate's own `benches/`/`tests/` binaries and
 /// one `pixelflow-search` unit test — the only callers still allowed to

@@ -10,7 +10,6 @@ use alloc::vec::Vec;
 use crate::arena::{BufferDecl, BufferId, RETIRED_COORD_AXES, UniformDecl, UniformId};
 use crate::dag::{Builder, Dag, Id, Node, SideTable};
 use crate::fold::Fold;
-use crate::kernel::Scalar;
 use crate::key::KernelKey;
 use crate::kind::OpKind;
 
@@ -262,61 +261,6 @@ pub(crate) fn substitute_vars(
         } else {
             stack.push((node, true));
             if !matches!(*node, ExprData::Var(_)) {
-                for child in node.children() {
-                    if table[child].is_none() {
-                        stack.push((child, false));
-                    }
-                }
-            }
-        }
-    }
-    table[root].expect("root must have been copied")
-}
-
-/// Copy subgraph, replacing macro parameters with values.
-///
-/// Not yet called: `Kernel`'s parameter substitution still goes through the
-/// legacy `ExprArena` path (`pixelflow-compiler/src/emit.rs`); this is the
-/// `Dag`-native replacement staged for that, per
-/// `docs/plans/2026-09-09-exprarena-on-dag.md`'s Stage C. `pub(crate)`
-/// rather than `pub` made the gap visible (a `pub` fn is dead-code-exempt on
-/// the assumption an external crate might call it, which none ever did) —
-/// `#[allow(dead_code)]` because deleting or wiring this in isn't this
-/// change's call to make.
-#[allow(dead_code)]
-pub(crate) fn substitute_params(
-    builder: &mut Builder<ExprData>,
-    root: Node<'_, ExprData>,
-    params: &[Scalar],
-    uniform_slots: &[UniformId],
-) -> Id {
-    let mut table = root.dag().side_table(None);
-    let mut stack = alloc::vec![(root, false)];
-    while let Some((node, expanded)) = stack.pop() {
-        if table[node].is_some() {
-            continue;
-        }
-        if expanded {
-            let id = if let ExprData::Param(idx) = *node {
-                match params.get(idx as usize) {
-                    Some(Scalar::Const(v)) => builder.push_const(*v),
-                    Some(Scalar::Uniform(_)) => {
-                        let u_id = uniform_slots[idx as usize];
-                        builder.push_uniform(u_id)
-                    }
-                    None => panic!("missing parameter substitution for slot {idx}"),
-                }
-            } else {
-                let child_ids: Vec<Id> = node
-                    .children()
-                    .map(|c| table[c].expect("child must have been copied"))
-                    .collect();
-                builder.push_unique(*node, &child_ids)
-            };
-            table[node] = Some(id);
-        } else {
-            stack.push((node, true));
-            if !matches!(*node, ExprData::Param(_)) {
                 for child in node.children() {
                     if table[child].is_none() {
                         stack.push((child, false));

@@ -1302,7 +1302,6 @@ pub fn experimental_rules() -> Vec<Box<dyn Rewrite>> {
 mod tests {
     use super::*;
     use pixelflow_ir::Uniform;
-    use pixelflow_ir::binding::BindingTable;
 
     /// Well-conditioned sample points, seeded and fixed: finite, moderate
     /// magnitude, no zeros (avoids `Recip`/`Rsqrt` poles), all-positive
