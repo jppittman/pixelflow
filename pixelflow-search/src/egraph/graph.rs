@@ -472,8 +472,10 @@ pub struct SaturationStats {
 /// leaves every class the graph does hold correct, which is what
 /// truncation has always meant here.
 ///
-/// Two orders of magnitude above the production caps (500/2000/5000, see
-/// `SaturationConfig`), so no shipping configuration meets it.
+/// Twice the classical cap's ceiling (`CLASSICAL_CLASS_CEILING`, 50,000),
+/// and two orders of magnitude above the floors every shipped kernel keeps
+/// (500/2,000/5,000, see `SaturationConfig`), so no shipping configuration
+/// meets it.
 ///
 /// It bounds the graph *approximately*: a sweep estimates the classes a
 /// pending action will mint (`RewriteAction::Union` 0, `Create` 1, every
@@ -1243,8 +1245,8 @@ impl EGraph {
     /// returning `false`: `false` already means "the rule did not fire",
     /// and a budget exhaustion that is indistinguishable from a non-match
     /// is the silent failure this ceiling exists to prevent. No production
-    /// path calls this, and the production caps are two orders of
-    /// magnitude below the limit.
+    /// path calls this, and the production caps stay below the limit (the
+    /// classical ceiling is half of it).
     pub fn apply_single_rule(&mut self, rule_idx: usize, class_id: EClassId, tag: ENodeId) -> bool {
         assert!(
             self.classes.len() < HARD_CLASS_LIMIT,

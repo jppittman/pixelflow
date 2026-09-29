@@ -131,8 +131,9 @@ pub enum Budget {
     /// input's sizes, exactly as
     /// [`config_for_input`](super::saturate::config_for_input) picks them
     /// (≤10 nodes → 20 rounds / 500 classes; 11–50 → 50 / 2 000; 51+ →
-    /// 100 rounds and a class cap of 10 per inserted class, clamped to
-    /// 5 000..=50 000).
+    /// 100 rounds and a class cap of
+    /// [`CLASSICAL_CLASSES_PER_INSERTED_CLASS`](super::saturate::CLASSICAL_CLASSES_PER_INSERTED_CLASS)
+    /// per inserted class, clamped to 5 000..=50 000).
     Production,
     /// A fixed number of rule applications, with production's round and
     /// class caps as backstops. The budget the research arms compare under,
