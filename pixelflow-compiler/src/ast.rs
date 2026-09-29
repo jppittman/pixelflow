@@ -16,12 +16,14 @@
 //! ```text
 //! KernelDef
 //!   ├── spelling: Closure | Items     // how the macro's value is spelled
+//!   ├── records: [RecordItem, ...]    // `struct R { a: f32, b: f32 }`
 //!   ├── consts: [ConstItem, ...]      // `const NAME: f32 = expr;`
 //!   └── fns: [FnItem, ...]            // `pub fn` entries and private helpers
 //!
 //! FnItem
 //!   ├── vis                           // `pub` makes an entry; private is a helper
-//!   ├── params: [(name, type), ...]   // scalar parameters
+//!   ├── structural: [name, ...]       // an entry's `const N: usize` parameters
+//!   ├── params: [(name, type), ...]   // scalar and record parameters
 //!   ├── ret: type                     // declared; absent only for the closure sugar
 //!   └── body: Expr
 //!
@@ -36,11 +38,13 @@
 //!   ├── Fold(reduction, range, binder, body) // (0..N).map(|i| e).sum()
 //!   ├── Integral(bounds, variable, body)     // integral(lo..hi, |u| e); area(|u, v| e)
 //!   ├── Cast(operand)                  // i as f32
+//!   ├── Field(base, member)            // p.x0, a record's field
 //!   ├── Block(stmts, expr)             // { let dx = ...; dx * dx }
 //!   └── Paren(inner)                   // (a + b)
 //! ```
 
 use proc_macro2::Span;
+use syn::ext::IdentExt;
 use syn::{Ident, Type};
 
 /// A complete kernel definition: the items of a `kernel!` block.
@@ -52,21 +56,85 @@ use syn::{Ident, Type};
 pub struct KernelDef {
     /// How the macro's value is spelled.
     pub spelling: Spelling,
+    /// The block's records, in declaration order: [`RecordId`] indexes this.
+    pub records: Vec<RecordItem>,
     /// The block's `const` items, in declaration order.
     pub consts: Vec<ConstItem>,
     /// The block's `fn` items — entries and helpers — in declaration order.
     pub fns: Vec<FnItem>,
 }
 
+impl KernelDef {
+    /// The record a declared type names, if it names one of the block's.
+    ///
+    /// The one resolution of a record's name: `sema` types a parameter by
+    /// it, and lowering and emission lay a record parameter out by it, so no
+    /// two stages can disagree about which record a type is.
+    pub fn record_named(&self, ty: &Type) -> Option<RecordId> {
+        let Type::Path(path) = ty else {
+            return None;
+        };
+        if path.qself.is_some() {
+            return None;
+        }
+        let ident = path.path.get_ident()?;
+        self.records
+            .iter()
+            .position(|record| record.name == *ident)
+            .map(RecordId)
+    }
+
+    /// The record `id` names.
+    pub fn record(&self, id: RecordId) -> &RecordItem {
+        &self.records[id.0]
+    }
+}
+
+/// Which of the block's records a type is: an index into
+/// [`KernelDef::records`], in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecordId(pub usize);
+
+/// `struct R { a: f32, b: f32 }`: a record of named `f32` fields
+/// (docs/plans/2026-09-25-the-language-is-kernel.md §1.3).
+///
+/// Emitted as a host `#[repr(C)]` struct of the same name, fields and
+/// visibility. In a body a record is its fields: an entry's record parameter
+/// is one uniform per field, in field order, and a helper's is its
+/// argument's fields.
+#[derive(Debug, Clone)]
+pub struct RecordItem {
+    /// Its attributes (any but `repr` and `cfg`), re-emitted on the host
+    /// struct.
+    pub attrs: Vec<syn::Attribute>,
+    pub vis: syn::Visibility,
+    pub name: Ident,
+    /// The fields, in declaration order: the order a record parameter's
+    /// uniforms are declared in.
+    pub fields: Vec<RecordField>,
+}
+
+/// One named field of a record. `sema` requires its type to be `f32`.
+#[derive(Debug, Clone)]
+pub struct RecordField {
+    /// Its attributes (any but `repr` and `cfg`), re-emitted on the host
+    /// struct's field.
+    pub attrs: Vec<syn::Attribute>,
+    pub vis: syn::Visibility,
+    pub name: Ident,
+    pub ty: Type,
+}
+
 /// How a `kernel!` invocation spells its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spelling {
     /// `kernel!(|a: f32, …| e)`: one entry, and the expansion is an
-    /// expression — a `Kernel` with no parameters, a builder closure with
-    /// some.
+    /// expression — a `Kernel` with no parameters, a closure over their
+    /// `f32`s with some, each one a uniform.
     Closure,
-    /// `kernel! { const …; fn …; pub fn … }`: the expansion is items, one
-    /// host `fn` per entry and one host `const` per `pub const`.
+    /// `kernel! { struct …; const …; fn …; pub fn … }`: the expansion is
+    /// items — a host struct per record, a host `const` per `pub const`, and
+    /// per entry a host `fn` and, when it has parameters, its `Args` record.
     Items,
 }
 
@@ -93,6 +161,11 @@ pub struct FnItem {
     /// private `fn` is a helper, inlined at each call.
     pub vis: syn::Visibility,
     pub name: Ident,
+    /// An entry's structural parameters, its `const N: usize` generics, in
+    /// declaration order (plan §1.4). Each value is its own program: the
+    /// host function is generic over them, and a body reads one as a count,
+    /// in a range's bounds or as `N as f32`. A helper has none.
+    pub structural: Vec<Ident>,
     pub params: Vec<Param>,
     /// The declared return type. `None` only for the closure sugar, whose
     /// type is inferred.
@@ -119,14 +192,36 @@ impl FnItem {
             _ => Role::Entry,
         }
     }
+
+    /// The name of an entry's `Args` record: the entry's name in
+    /// UpperCamelCase, then `Args` — `shifted_radius` has
+    /// `ShiftedRadiusArgs` (plan §1.4). `sema` refuses one that collides,
+    /// and emission names the record by it.
+    pub fn args_record(&self) -> Ident {
+        let camel: String = self
+            .name
+            .unraw()
+            .to_string()
+            .split('_')
+            .flat_map(|word| {
+                let mut letters = word.chars();
+                letters
+                    .next()
+                    .map(|first| first.to_uppercase().chain(letters))
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
+        Ident::new(&format!("{camel}Args"), self.name.span())
+    }
 }
 
-/// A declared scalar parameter.
+/// A declared parameter: a scalar, or one of the block's records.
 #[derive(Debug, Clone)]
 pub struct Param {
     /// Parameter name.
     pub name: Ident,
-    /// The declared type (`f32`; `bool` in a helper).
+    /// The declared type (`f32` or a record; `bool` in a helper).
     pub ty: Box<Type>,
 }
 
@@ -169,6 +264,9 @@ pub enum Expr {
     /// A conversion: `i as f32`.
     Cast(CastExpr),
 
+    /// A record's field: `p.x0`.
+    Field(FieldExpr),
+
     /// A block expression ({ let dx = ...; dx * dx }).
     Block(BlockExpr),
 
@@ -191,10 +289,34 @@ impl Expr {
             Expr::Fold(e) => e.span,
             Expr::Integral(e) => e.span,
             Expr::Cast(e) => e.span,
+            Expr::Field(e) => e.span,
             Expr::Block(e) => e.span,
             Expr::Paren(inner) => inner.span(),
         }
     }
+
+    /// The name this expression is, through any parentheses, or `None` if
+    /// it is not a name. A `usize` and a record are both written only by
+    /// name: nothing in a body computes a count (plan §1.6) or builds a
+    /// record (Phase D, D7).
+    pub fn named(&self) -> Option<&Ident> {
+        match self {
+            Expr::Paren(inner) => inner.named(),
+            Expr::Ident(ident) => Some(&ident.name),
+            _ => None,
+        }
+    }
+}
+
+/// `base.member`: one field of a record. The base is a record by name — a
+/// parameter or a `let` alias of one — which `sema` checks, with the
+/// member one of the record's fields.
+#[derive(Debug, Clone)]
+pub struct FieldExpr {
+    pub base: Box<Expr>,
+    pub member: Ident,
+    /// The member's span.
+    pub span: Span,
 }
 
 /// An identifier expression.
@@ -471,8 +593,8 @@ pub const LANGUAGE_FUNCTIONS: [&str; 3] = [INTEGRAL, AREA, MONOTONE_ROOT];
 
 /// `operand as f32`, the language's one conversion. The target is always
 /// `f32` — the parser refuses any other — so it is not stored. `sema`
-/// accepts one operand: a `usize`, by name, a fold's index or a `usize`
-/// const.
+/// accepts one operand: a `usize`, by name, a fold's index, a `usize` const
+/// or an entry's structural parameter.
 #[derive(Debug, Clone)]
 pub struct CastExpr {
     pub operand: Box<Expr>,
@@ -484,16 +606,9 @@ impl CastExpr {
     /// The name being converted, through any parentheses, or `None` if the
     /// operand is not a name. Only a name can be a `usize`: nothing in a
     /// body computes one (plan §1.6), so a `usize` expression is always a
-    /// fold's index or a `usize` const.
+    /// fold's index, a `usize` const or a structural parameter.
     pub fn named(&self) -> Option<&Ident> {
-        let mut operand = &*self.operand;
-        while let Expr::Paren(inner) = operand {
-            operand = inner;
-        }
-        match operand {
-            Expr::Ident(ident) => Some(&ident.name),
-            _ => None,
-        }
+        self.operand.named()
     }
 }
 
@@ -604,5 +719,31 @@ mod tests {
         let not: syn::UnOp = syn::parse_quote!(!);
         assert_eq!(UnaryOp::from_syn(&neg), Some(UnaryOp::Neg));
         assert_eq!(UnaryOp::from_syn(&not), None);
+    }
+
+    /// An entry's `Args` record is its name in UpperCamelCase, then `Args`;
+    /// a raw identifier is named by what it spells.
+    #[test]
+    fn an_entrys_args_record_is_its_name_in_upper_camel_case() {
+        for (entry, args) in [
+            ("circle", "CircleArgs"),
+            ("shifted_radius2", "ShiftedRadius2Args"),
+            ("a__b_", "ABArgs"),
+            ("r#type", "TypeArgs"),
+        ] {
+            let item: FnItem = FnItem {
+                attrs: Vec::new(),
+                vis: syn::parse_quote!(pub),
+                name: syn::parse_str(entry).expect("an identifier"),
+                structural: Vec::new(),
+                params: Vec::new(),
+                ret: None,
+                body: Expr::Paren(Box::new(Expr::Ident(IdentExpr {
+                    name: syn::parse_quote!(X),
+                    span: Span::call_site(),
+                }))),
+            };
+            assert_eq!(item.args_record().to_string(), args, "{entry}");
+        }
     }
 }

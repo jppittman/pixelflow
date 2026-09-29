@@ -76,6 +76,7 @@ fn binding_and_collapsing_allocate_nothing_per_frame() {
         assert_eq!(&out[..4], &[2.5, 4.5, 6.5, 8.5]);
     }
     setting_a_sole_holders_block_allocates_nothing();
+    rebinding_a_sole_holders_block_by_position_allocates_nothing();
 }
 
 /// Setting a value while no frame holds the previous ones writes in place:
@@ -109,5 +110,37 @@ fn setting_a_sole_holders_block_allocates_nothing() {
         });
         assert_eq!(allocations, 0, "frame {frame} allocated");
         assert_eq!(out, [1.0 + frame as f32; 4]);
+    }
+}
+
+/// The per-call path of a program compiled once (a `kernel!` entry's `Args`,
+/// docs/plans/2026-09-25-the-language-is-kernel.md §1.4): every declared
+/// argument set by position into a block the caller keeps, which allocates
+/// nothing once the block is the sole holder of its values — one call per
+/// cell per frame is the shape a text frame takes.
+fn rebinding_a_sole_holders_block_by_position_allocates_nothing() {
+    let buffer = BufferIdentity::mint();
+    let (scale, offset) = (Uniform::new(1.0), Uniform::new(0.0));
+    let k = DiscreteManifold::kernel_for(buffer, 4, 1)
+        .at(&Kernel::x(), &Kernel::constant(0.0))
+        .mul(&scale.kernel())
+        .add(&offset.kernel());
+    let program = Manifold::compile(&k, [4, 1]);
+    let mut block = program.block();
+    let data = Arc::new(vec![1.0f32; 4]);
+    let mut out = vec![0.0f32; 4];
+    block.set_declared([1.0, 0.0]).expect("scale and offset");
+    for call in 0..3 {
+        let allocations = allocations_during(|| {
+            block
+                .set_declared([2.0, call as f32])
+                .expect("scale and offset");
+            program
+                .bind(&[(buffer, Arc::clone(&data))])
+                .with_uniforms(&block)
+                .collapse_rows(PlaneRegion::rows(4, 0, 1), &mut out, 4);
+        });
+        assert_eq!(allocations, 0, "call {call} allocated");
+        assert_eq!(out, [2.0 + call as f32; 4]);
     }
 }

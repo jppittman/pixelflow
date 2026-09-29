@@ -159,7 +159,7 @@ fn is_transcendental_binary(op: OpKind) -> bool {
 /// Shared subexpressions are rebuilt once (`id_map` dedups), so a DAG stays a
 /// DAG. This is the single skeleton behind [`expand_transcendentals`],
 /// [`expand_gather`], and [`expand_reduce`]; each supplies only its `lower`
-/// hook. Mirrors [`ExprArena::substitute_params`].
+/// hook. Mirrors [`ExprArena::substitute_vars_with`].
 fn rebuild_arena<F>(arena: &mut ExprArena, root: ExprId, mut lower: F) -> ExprId
 where
     F: FnMut(&mut ExprArena, &ExprNode, &dyn Fn(ExprId) -> ExprId) -> Option<ExprId>,

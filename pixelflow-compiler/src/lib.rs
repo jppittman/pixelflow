@@ -71,22 +71,30 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 ///
 /// # The items form
 ///
-/// A block of `const` items and `fn` items
+/// A block of records, `const` items and `fn` items
 /// (docs/plans/2026-09-25-the-language-is-kernel.md §1.2):
 ///
 /// - A `pub fn name(params) -> f32 { body }` is an **entry**: the macro
-///   emits a host `pub fn name(params) -> Kernel`. Its parameters are bound
-///   exactly as a builder's are, through `Into<Scalar>` (see below).
+///   emits a host `pub fn name(params) -> Kernel`, taking its parameters by
+///   their declared types, and — when it has parameters — its `Args` record
+///   (see *Binding times* below).
 /// - A private `fn` is a **helper**: type-checked once, inlined at each call.
 ///   Helpers may call helpers; a cycle is refused, because the language is a
 ///   DAG. `X` and `Y` appear only in entries — a helper takes its
 ///   coordinates as arguments, so that applying it to a shifted coordinate
 ///   warps it.
+/// - A `struct R { a: f32, b: f32 }` is a **record** (§1.3): named `f32`
+///   fields, emitted as a host `#[repr(C)]` struct of the same name and
+///   visibility, its attributes kept. A record is the type of an entry's or
+///   a helper's parameter; a body reads a field, `p.a`, aliases a record,
+///   `let q = p;`, and passes one on by name. Building, returning, choosing
+///   between or computing with whole records is Phase D (D7), and refused.
 /// - A `const NAME: f32 = expr;` is evaluated at expansion, per operation in
 ///   `f32`, from literals, other consts, `+ - * /`, unary `-` and
 ///   parentheses. A `const NAME: usize = expr;` is a count, evaluated from
 ///   integers, other `usize` consts and `+ - * /`, each operation checked. A
-///   `pub const` is also emitted as a host `pub const`.
+///   `pub const` is also emitted as a host `pub const`. A constant of a
+///   program is spelled this way, and no other.
 ///
 /// ```ignore
 /// use pixelflow_compiler::kernel;
@@ -149,12 +157,12 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 /// `.fold(f32::INFINITY, f32::min)` and `.fold(f32::NEG_INFINITY, f32::max)`
 /// are Π, min and max, and `(a..b).any(|i| m)` and `.all(|i| m)` are ∃ and ∀
 /// of `bool`s. An empty range gives the monoid's identity. The bounds are
-/// constant — integers and `usize` consts, evaluated at expansion — and the
-/// index `i` is a `usize`, which a body reads only as `i as f32`: there is no
-/// arithmetic on an index and nothing to index. A fold lowers to one
-/// `Reduce`, the node `Kernel::over` builds; unrolling it is the e-graph's
-/// choice, at bake time. A closure is the body of a fold or an integral and
-/// appears nowhere else.
+/// constant — integers, `usize` consts and an entry's structural parameters
+/// — and the index `i` is a `usize`, which a body reads only as `i as f32`:
+/// there is no arithmetic on an index and nothing to index. A fold lowers to
+/// one `Reduce`, the node `Kernel::over` builds; unrolling it is the
+/// e-graph's choice, at bake time. A closure is the body of a fold or an
+/// integral and appears nowhere else.
 ///
 /// # Integrals
 ///
@@ -184,8 +192,9 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 /// expansion is an expression rather than an item:
 ///
 /// - Zero params → a `Kernel` value.
-/// - N params → a builder closure `move |p0: f32, ...| -> Kernel` that
-///   constant-folds its arguments into the fragment.
+/// - N params → a closure `move |p0: f32, ...| -> Kernel`, every parameter a
+///   uniform, as an entry's are. It has no `Args` record: a program compiled
+///   from it is rebound by position, `block.set_declared([p0, ...])`.
 ///
 /// ```ignore
 /// let circle = kernel!(|cx: f32, cy: f32, r: f32| {
@@ -203,24 +212,55 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 /// symbolic `Dwrt` nodes, resolved by the e-graph here when it can and by
 /// codegen otherwise.
 ///
-/// # Parameters
+/// # Binding times
 ///
-/// An entry's arguments (a builder's too) are anything `Into<Scalar>`, and
-/// the type at the call site decides what the parameter is. An `f32` is
-/// folded into the fragment as a constant, so `circle(0.0, 0.0, 1.0)` is the
-/// same kernel it always was. A [`Uniform`](pixelflow_core::Uniform) handle
-/// makes the parameter an *argument* of the compiled kernel instead —
-/// invariant across the lattice, bound per call from a `UniformBlock`, never
-/// folded — so a scene transform or a cursor position moves without a
-/// recompile:
+/// Every value a program reads is bound at one of two times (§1.4):
+///
+/// - **Structural**: an entry's `const N: usize` generics. The host function
+///   is generic over them, and each value is its own program — a count in a
+///   fold's range, or `N as f32`. A helper takes none; it reads its entry's
+///   through an argument.
+/// - **Uniform**: every parameter. An `f32` is one uniform and a record is
+///   one per field; the kernel an entry returns declares them in that order,
+///   each with the call's value as its default, and baking it draws the
+///   call. The value is an argument of the program, never folded into it, so
+///   every call of an entry is one program: compiled once, and rebound per
+///   call from the entry's `Args` record — `<Entry in UpperCamelCase>Args`,
+///   its parameters as fields, written into a block the program made with
+///   `write_into`, which allocates nothing once the block is the caller's
+///   alone. A kernel the entry's is composed into still rebinds from it, its
+///   declarations the entry's in order beside argument-free kernels; beside
+///   other arguments the count differs, and `write_into` refuses. A
+///   constant is a `const` item.
 ///
 /// ```ignore
-/// let cx = Uniform::new(0.0);
-/// let moving = circle(cx, 0.0, 1.0);   // cx is an argument; cy and r are folded
-/// ```
+/// use pixelflow_compiler::kernel;
+/// use pixelflow_core::{Lattice, Manifold};
 ///
-/// Each `let` binding of a builder is one signature: the same binding cannot
-/// be called with an `f32` and a `Uniform` in the same position.
+/// kernel! {
+///     /// An axis-aligned box: a record.
+///     pub struct Bounds { pub x0: f32, pub y0: f32, pub x1: f32, pub y1: f32 }
+///
+///     /// `N` rings about the box's corner, `fg` on `bg`.
+///     pub fn rings<const N: usize>(b: Bounds, fg: f32, bg: f32) -> f32 {
+///         let dx = X - b.x0;
+///         let dy = Y - b.y0;
+///         let r = (dx * dx + dy * dy).sqrt();
+///         let within = (X <= b.x1) & (Y <= b.y1);
+///         let n: f32 = (0..N).map(|i| if r < (i as f32) + 1.0 { 1.0 } else { 0.0 }).sum();
+///         if within { fg * n / (N as f32) } else { bg }
+///     }
+/// }
+///
+/// let lattice = Lattice::frame(64, 64);
+/// let b = Bounds { x0: 8.0, y0: 8.0, x1: 40.0, y1: 40.0 };
+/// let once = lattice.bake(&rings::<4>(b, 1.0, 0.0));            // one call, baked
+///
+/// let program = Manifold::compile(&rings::<4>(b, 1.0, 0.0), lattice.extent);
+/// let mut block = program.block();
+/// RingsArgs::<4> { b, fg: 0.5, bg: 0.25 }.write_into(&mut block)?;
+/// let again = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
+/// ```
 ///
 /// # Pipeline
 ///
@@ -228,11 +268,14 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 /// 2. **Semantic analysis**: symbol resolution, types, `const` evaluation,
 ///    the call graph
 /// 3. **Arena lowering**: each entry's body becomes an `ExprArena`, helpers
-///    inlined
+///    inlined, its parameters declared as uniforms
 /// 4. **Optimization**: e-graph saturation + latency-prior extraction, on
 ///    the arena. A kernel carrying a `Dwrt` declines here and is optimized
-///    at bake time instead, so composition still gets the chain rule.
-/// 5. **Emission**: the arena becomes code that rebuilds it at load time
+///    at bake time instead, so composition still gets the chain rule; so is
+///    an entry with structural parameters, a template until it is
+///    instantiated.
+/// 5. **Emission**: the arena becomes code that rebuilds it at load time,
+///    the call's values as its uniforms' defaults
 #[proc_macro]
 pub fn kernel(input: TokenStream) -> TokenStream {
     expand(input, &mut macro_tier())

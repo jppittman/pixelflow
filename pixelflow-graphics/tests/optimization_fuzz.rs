@@ -13,6 +13,14 @@
 //!    entry there is
 //! 3. Use proptest to generate random inputs
 //! 4. Assert the baked value matches scalar `f32` within epsilon
+//!
+//! A kernel's parameters are its uniforms (§1.4 of
+//! docs/plans/2026-09-25-the-language-is-kernel.md), never constants folded
+//! into it, so a property with parameters (`|c: f32| X * Y + c`) is one
+//! compiled program, and its random parameters fuzz that program's
+//! arguments, not the rewrites a particular constant would enable. Before,
+//! each case was a program of its own. The constant-specific rewrites are
+//! the properties that spell their constant in the body (`X * 1.0`).
 
 use pixelflow_compiler::kernel;
 use pixelflow_core::{Kernel, Lattice};

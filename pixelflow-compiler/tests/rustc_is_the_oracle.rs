@@ -582,3 +582,108 @@ fn a_range_from_consts_folds_as_rustcs_does() {
     }
     assert_eq!(bake(&k), 9.0, "3 · (2 + 3 + 4) / 3");
 }
+
+// ─────────────── B3: records, and structural counts ───────────────
+//
+// A record (docs/plans/2026-09-25-the-language-is-kernel.md §1.3) is a Rust
+// struct of `f32` fields, and the macro emits it as one: so the oracle for a
+// record's field arithmetic is the same tokens over the host struct itself.
+// A structural parameter (§1.4) is a Rust const generic, and the oracle for
+// a range over one is the same iterator in a host `fn` generic over it.
+
+kernel! {
+    /// An affine map of the plane.
+    pub struct Affine { pub a: f32, pub b: f32, pub c: f32 }
+
+    fn apply(m: Affine, x: f32, y: f32) -> f32 { m.a * x + m.b * y + m.c }
+
+    /// A record passed on to a helper through an alias, and a field of the
+    /// alias read beside it.
+    pub fn affine_less(m: Affine, d: f32) -> f32 {
+        let n = m;
+        apply(n, X, Y) - n.c * d
+    }
+}
+
+fn rust_apply(m: Affine, x: f32, y: f32) -> f32 {
+    m.a * x + m.b * y + m.c
+}
+
+/// A record's fields mean what the host struct's fields mean, through an
+/// alias and a helper: every value below is a quarter, so each product and
+/// sum is exact and the comparison is bit for bit.
+#[test]
+fn a_records_field_arithmetic_is_rustcs() {
+    let maps = [
+        Affine {
+            a: 1.0,
+            b: -2.0,
+            c: 0.5,
+        },
+        Affine {
+            a: 0.25,
+            b: 3.0,
+            c: -1.75,
+        },
+    ];
+    for m in maps {
+        for d in [0.0, 2.0, -0.5] {
+            let k = affine_less(m, d);
+            let rust = |x: f32, y: f32| {
+                let n = m;
+                rust_apply(n, x, y) - n.c * d
+            };
+            for (x, y) in FOLD_SAMPLES {
+                assert_eq!(
+                    Lattice::eval_at(&k, x, y),
+                    rust(x, y),
+                    "{m:?}, d = {d}, at ({x}, {y})"
+                );
+            }
+        }
+    }
+}
+
+kernel! {
+    const FIRST: usize = 1;
+
+    /// A helper reads its entry's structural parameter as an argument.
+    fn per(n: f32, total: f32) -> f32 { total / n }
+
+    /// The mean of `X·i` over `i ∈ [FIRST, FIRST + N)`: `N` in a range's
+    /// const arithmetic, and as a value.
+    pub fn mean_index<const N: usize>() -> f32 {
+        per(N as f32, (FIRST..FIRST + N).map(|i| X * (i as f32)).sum::<f32>())
+    }
+}
+
+fn rust_mean_index<const N: usize>(x: f32) -> f32 {
+    const RUST_FIRST: usize = 1;
+    (RUST_FIRST..RUST_FIRST + N)
+        .map(|i| x * (i as f32))
+        .sum::<f32>()
+        / (N as f32)
+}
+
+/// A range over a structural parameter, and the parameter as a value, mean
+/// what the same tokens in a host `fn` generic over it mean, at each
+/// instantiation: each is its own program, and each sum is exact.
+#[test]
+fn a_structural_count_folds_as_rustcs_const_generic_does() {
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(
+            Lattice::eval_at(&mean_index::<1>(), x, y),
+            rust_mean_index::<1>(x)
+        );
+        assert_eq!(
+            Lattice::eval_at(&mean_index::<3>(), x, y),
+            rust_mean_index::<3>(x)
+        );
+        assert_eq!(
+            Lattice::eval_at(&mean_index::<4>(), x, y),
+            rust_mean_index::<4>(x)
+        );
+    }
+    // X = 3: (1 + 2 + 3 + 4) · 3 / 4.
+    assert_eq!(bake(&mean_index::<4>()), 7.5);
+}

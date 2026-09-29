@@ -1,11 +1,11 @@
-//! A builder closure takes as many scalar parameters as the kernel declares.
+//! A closure takes as many scalar parameters as the kernel declares.
 //!
 //! The old combinator tier bound parameters with nested `Let`s and fell over
-//! the trait solver past four; the arena backend numbers them `Param(0..n)`
-//! and folds each in when the builder runs, so the count is a `u8` and
-//! nothing about it is quadratic. These check both halves: that the
-//! expansion compiles at 5..8, and that every argument reaches the arena in
-//! declaration order.
+//! the trait solver past four; the arena backend declares each as a uniform,
+//! in declaration order, with the call's value as its default — the uniform
+//! table is 64 bits wide, and nothing about it is quadratic. These check
+//! both halves: that the expansion compiles at 5..8, and that every argument
+//! reaches the kernel in declaration order.
 
 use pixelflow_compiler::kernel;
 use pixelflow_core::{Kernel, Lattice};

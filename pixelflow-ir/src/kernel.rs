@@ -134,11 +134,11 @@ fn lowest_free_binder(dag: &Dag<ExprData>) -> Binder {
 ///
 /// Creating one mints an identity; the handle is the only way to set the
 /// value later, so a kernel's arguments are exactly the handles its author
-/// kept. It composes as a leaf ([`Uniform::kernel`]) or stands in for a
-/// builder's scalar parameter ([`Scalar`]); either way the value is invariant
+/// kept. It composes as a leaf ([`Uniform::kernel`]); the value is invariant
 /// across the lattice and unknown until the call, so the compiler hoists
 /// everything that depends only on it into the per-call prologue and never
-/// folds it.
+/// folds it. (A `kernel!` entry's parameters are uniforms too, declared by
+/// its expansion and bound by position rather than through a handle.)
 ///
 /// Two handles from two `new` calls are two arguments, even with equal
 /// defaults; one handle read from twenty places is one argument.
@@ -185,31 +185,6 @@ impl Uniform {
         let slot = env.slot_for_uniform(self.decl);
         let r = b.push_uniform(slot);
         Kernel::wrap(b.finish(&[r]), env, BTreeMap::new())
-    }
-}
-
-/// What a builder accepts for a scalar parameter. The *type* decides whether
-/// the value is folded into the fragment as a constant or declared as a
-/// uniform slot: an `f32` folds, so every call site that passes one keeps its
-/// meaning, and a [`Uniform`] handle makes the parameter an argument of the
-/// compiled kernel instead.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Scalar {
-    /// Folded in: part of the kernel.
-    Const(f32),
-    /// Bound per call: an argument of the kernel.
-    Uniform(Uniform),
-}
-
-impl From<f32> for Scalar {
-    fn from(v: f32) -> Self {
-        Self::Const(v)
-    }
-}
-
-impl From<Uniform> for Scalar {
-    fn from(u: Uniform) -> Self {
-        Self::Uniform(u)
     }
 }
 
@@ -322,7 +297,11 @@ impl Kernel {
         &self.inner.env.buffers
     }
 
-    /// Uniform declarations.
+    /// Uniform declarations, in declaration order — the order a positional
+    /// binding supplies them in. A composition declares its receiver's, then
+    /// each operand's in turn, each in that operand's own order and read or
+    /// not; one instance composed twice is declared once, where it first
+    /// appears.
     #[must_use]
     pub fn uniforms(&self) -> &[UniformDecl] {
         &self.inner.env.uniforms
@@ -1205,10 +1184,9 @@ mod tests {
     }
 
     #[test]
-    fn scalar_is_chosen_by_type() {
+    fn two_uniform_instances_are_two_arguments() {
         let u = Uniform::new(0.0);
-        assert!(matches!(Scalar::from(1.5), Scalar::Const(v) if v == 1.5));
-        assert!(matches!(Scalar::from(u), Scalar::Uniform(h) if h == u));
+        assert_eq!(u, u, "one instance is one argument");
         assert_ne!(
             Uniform::new(0.0),
             Uniform::new(0.0),

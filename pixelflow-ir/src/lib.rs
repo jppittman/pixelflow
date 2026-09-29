@@ -117,7 +117,7 @@ pub mod optimize;
 pub use optimize::{Identity, Optimize, Rewritten, Then};
 
 pub mod kernel;
-pub use kernel::{Bits, Kernel, Scalar, Uniform};
+pub use kernel::{Bits, Kernel, Uniform};
 
 pub use kind::OpKind;
 pub use kind::known_method_names;

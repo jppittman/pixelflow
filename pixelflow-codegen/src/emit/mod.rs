@@ -2764,8 +2764,9 @@ fn arena_to_schedule_from(
             },
             ExprNode::Const(v) => ScheduledOp::Const(v),
             ExprNode::Param(i) => panic!(
-                "ExprNode::Param({}) reached the JIT emitter -- \
-                 call substitute_params before compile()",
+                "ExprNode::Param({}) reached the JIT emitter -- a template's slot (a `kernel!` \
+                 template's structural hole, a rewrite rule's metavariable) is filled before \
+                 a Kernel exists",
                 i
             ),
             // A buffer's base pointer: the `k`-th context entry, a pointer

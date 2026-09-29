@@ -23,22 +23,36 @@
 //! here, never a pixelflow evaluator.
 
 use pixelflow_compiler::{kernel, kernel_raw};
-use pixelflow_core::{Kernel, Lattice};
+use pixelflow_core::{Kernel, Lattice, Uniform};
+use pixelflow_ir::arena::UniformDecl;
 use pixelflow_ir::integral::{self, ROOT_FLOOR, Rise, RootFloor};
 use pixelflow_ir::key::canonical;
 use pixelflow_ir::{ExprArena, ExprId, ExprNode, Fold, LatticeShape};
 use pixelflow_search::runtime::{optimize_runtime_arena, unclosed_integrals};
 
-/// Whether two kernels are one program: the same canonical key.
+/// Whether two kernels are one program: the same canonical key, the shape
+/// the JIT compiles under, with its uniforms numbered by first occurrence —
+/// and the same value in each uniform's slot. A uniform's identity is minted
+/// per call, so two calls' kernels differ in it and nothing else.
 fn assert_same_program(written: &Kernel, built: &Kernel) {
     let (written_arena, written_root) = written.parts();
     let (built_arena, built_root) = built.parts();
+    let written_form = canonical(written_arena, written_root);
+    let built_form = canonical(built_arena, built_root);
     assert_eq!(
-        canonical(written_arena, written_root),
-        canonical(built_arena, built_root),
+        written_form.key,
+        built_form.key,
         "written: {}\nbuilt:   {}",
         written_arena.display(written_root),
         built_arena.display(built_root),
+    );
+    let values = |uniforms: &[UniformDecl]| -> Vec<f32> {
+        uniforms.iter().map(|uniform| uniform.default).collect()
+    };
+    assert_eq!(
+        values(&written_form.uniforms),
+        values(&built_form.uniforms),
+        "each uniform slot holds the same value"
     );
 }
 
@@ -104,11 +118,14 @@ fn the_area_of_a_half_plane_is_kernel_area() {
 
 /// The disc `[(X − cx)² + (Y − cy)² < r²]` over the pixel is `Kernel::area`
 /// of it: `v` shifts `Y`, `u` shifts `X`, and the `v` integral is outermost.
+/// An entry's parameters are its uniforms (plan §1.4), so the builder's
+/// disc reads `cx`, `cy` and `r` as uniforms too.
 #[test]
 fn the_area_of_a_disc_is_kernel_area() {
     let (cx, cy) = (1.5, -0.75);
-    let (dx, dy) = (x().sub(&constant(cx)), y().sub(&constant(cy)));
-    let r = constant(RADIUS);
+    let uniform = |value: f32| Uniform::new(value).kernel();
+    let (dx, dy) = (x().sub(&uniform(cx)), y().sub(&uniform(cy)));
+    let r = uniform(RADIUS);
     let built = indicator(&dx.mul(&dx).add(&dy.mul(&dy)).lt(&r.mul(&r))).area();
     assert_same_program(&disc_area(cx, cy, RADIUS), &built);
 
@@ -118,8 +135,8 @@ fn the_area_of_a_disc_is_kernel_area() {
     let (written, written_root) = transposed.parts();
     let (built, built_root) = built.parts();
     assert_ne!(
-        canonical(written, written_root),
-        canonical(built, built_root)
+        canonical(written, written_root).key,
+        canonical(built, built_root).key
     );
 }
 
@@ -305,6 +322,30 @@ fn integrals_and_folds_bind_distinct_slots() {
         kernel_raw!(|| integral(0.0..1.0, |u| (0..3).map(|i| u * (i as f32)).sum()));
     let (arena, root) = integral_of_folds.parts();
     assert_eq!(binders(arena, root), [5, 4]);
+}
+
+kernel_raw! {
+    /// Integrals in a fold over a structural range: a template, whose range
+    /// its host function fills in per instantiation (§1.4).
+    pub fn integrals_over_n<const N: usize>() -> f32 {
+        (0..N).map(|i| integral(0.0..1.0, |u| u * (i as f32) + X)).sum()
+    }
+
+    /// The same, over a range known at expansion.
+    pub fn integrals_over_three() -> f32 {
+        (0..3).map(|i| integral(0.0..1.0, |u| u * (i as f32) + X)).sum()
+    }
+}
+
+/// An integral inside a template's open fold is the integral a known
+/// range's fold holds: instantiated at `N = 3`, the template is the program
+/// written over `0..3`, the interval and both slots included.
+#[test]
+fn an_integral_in_a_template_is_the_integral_of_its_instance() {
+    let instance = integrals_over_n::<3>();
+    assert_same_program(&instance, &integrals_over_three());
+    let (arena, root) = instance.parts();
+    assert_eq!(binders(arena, root), [5, 4], "the fold at slot 1, u at 0");
 }
 
 // ─────────────────────────── what it means ───────────────────────────
