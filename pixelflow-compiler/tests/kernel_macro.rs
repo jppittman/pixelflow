@@ -361,35 +361,56 @@ fn macro_acos() {
 }
 
 // ============================================================================
-// Builders choose fold or uniform by the argument's type
+// Every parameter is a uniform; a constant is a `const` item
+// (docs/plans/2026-09-25-the-language-is-kernel.md §1.4)
 // ============================================================================
 
-/// `f32` folds, exactly as it always has: the built kernel declares no
-/// argument.
+kernel! {
+    const CX: f32 = 1.0;
+    const R: f32 = 2.0;
+    /// The closure below with its values spelled as constants of the program.
+    pub fn folded() -> f32 { (X - CX) * R }
+}
+
+/// A constant is spelled as a `const` item, and it folds: the kernel declares
+/// no argument. An `f32` argument no longer does, whatever the call site
+/// passes: it is a uniform with the call's value as its default, and a bake
+/// reads that value. This test used to pin the opposite — that an `f32`
+/// argument folded — which is the call-site-type rule §1.4 retires.
 #[test]
-fn an_f32_argument_still_folds() {
+fn a_const_item_folds_and_an_f32_argument_is_a_uniform() {
+    let folded = folded();
+    assert!(folded.uniforms().is_empty());
+    assert!((eval1(&folded, 5.0) - 8.0).abs() < 1e-5);
+
     let k = kernel!(|cx: f32, r: f32| (X - cx) * r)(1.0, 2.0);
-    assert!(k.parts().0.uniforms().is_empty());
+    let defaults: Vec<f32> = k.uniforms().iter().map(|u| u.default).collect();
+    assert_eq!(defaults, [1.0, 2.0], "each parameter is an argument");
     assert!((eval1(&k, 5.0) - 8.0).abs() < 1e-5);
 }
 
-/// A `Uniform` handle makes the same parameter an argument of the compiled
-/// kernel: the bake reads its default, a block moves it, and one handle
-/// passed twice is one argument.
+/// A parameter is an argument of the compiled kernel: the bake reads the
+/// call's value, a block moves it, and a parameter read twice is one
+/// argument. The closure form has no `Args` record, so its program is
+/// rebound by position, through the one core method; this test used to set
+/// the argument through a `Uniform` handle passed at the call site.
 #[test]
 fn a_uniform_argument_is_bound_per_call() {
-    use pixelflow_core::{Manifold, Uniform};
-    let cx = Uniform::new(1.0);
-    let k = kernel!(|cx: f32, r: f32| (X - cx) * r)(cx, 2.0);
-    assert_eq!(k.parts().0.uniforms(), &[cx.decl()]);
+    use pixelflow_core::Manifold;
+    let k = kernel!(|cx: f32, r: f32| (X - cx) * r)(1.0, 2.0);
     assert!((eval1(&k, 5.0) - 8.0).abs() < 1e-5, "default cx = 1");
 
     let program = Manifold::compile(&k, [1, 1]);
     let mut block = program.block();
-    block.set(cx, 3.0).expect("cx is the argument");
+    block.set_declared([3.0, 2.0]).expect("cx and r");
     let moved = program.bind(&[]).with_uniforms(&block).eval_at(5.0, 0.0);
     assert!((moved - 4.0).abs() < 1e-5, "(5 − 3)·2");
 
-    let twice = kernel!(|a: f32, b: f32| a * b)(cx, cx);
-    assert_eq!(twice.parts().0.uniforms().len(), 1);
+    let squared = kernel!(|a: f32| a * a)(3.0);
+    assert_eq!(
+        squared.uniforms().len(),
+        1,
+        "one parameter read twice is one argument"
+    );
+    assert_eq!(eval1(&squared, 0.0), 9.0);
 }

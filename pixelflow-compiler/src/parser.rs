@@ -12,13 +12,21 @@
 //! ```text
 //! kernel  ::= item*                          -- the items form
 //!           | '|' params '|' expr            -- sugar: one entry, its type inferred
-//! item    ::= 'pub'? 'const' IDENT ':' 'f32' '=' cexpr ';'
-//!           | 'pub'? 'const' IDENT ':' 'usize' '=' iexpr ';'
-//!           | 'pub'? 'fn' IDENT '(' params ')' '->' type block
-//!                                            -- `pub`: an entry; private: a helper
+//! item    ::= VIS? 'struct' RECORD '{' (field (',' field)* ','?)? '}'
+//!                                            -- a record of `f32` fields
+//!           | VIS? 'const' IDENT ':' 'f32' '=' cexpr ';'
+//!           | VIS? 'const' IDENT ':' 'usize' '=' iexpr ';'
+//!           | VIS 'fn' IDENT structural? '(' params ')' '->' type block
+//!                                            -- an entry
+//!           | 'fn' IDENT '(' params ')' '->' type block
+//!                                            -- a helper: private, no generics
+//! field   ::= VIS? IDENT ':' 'f32'
+//! structural ::= '<' 'const' IDENT ':' 'usize' (',' 'const' IDENT ':' 'usize')* ','? '>'
+//!                                            -- an entry's structural parameters
 //! params  ::= (param (',' param)* ','?)?
 //! param   ::= IDENT ':' type
-//! type    ::= 'f32' | 'bool'                 -- an entry's parameters are `f32`
+//! type    ::= 'f32' | 'bool' | RECORD        -- an entry's parameters are `f32`s
+//!                                            -- and records: its uniforms
 //!
 //! cexpr   ::= cexpr ('+' | '-' | '*' | '/') cexpr   -- an `f32` const's initializer
 //!           | '-' cexpr | '(' cexpr ')'            -- or an integral's bounds,
@@ -26,21 +34,26 @@
 //!           | IDENT | LITERAL                      -- per operation in f32
 //! iexpr   ::= iexpr ('+' | '-' | '*' | '/') iexpr   -- a `usize`: a range's bounds
 //!           | '(' iexpr ')'                        -- or a `usize` const's
-//!           | IDENT | INTEGER                      -- initializer, evaluated at
-//!                                                  -- expansion, each operation
-//!                                                  -- checked as rustc checks it
+//!           | IDENT | INTEGER                      -- initializer; each operation
+//!                                                  -- checked as rustc checks it,
+//!                                                  -- at expansion, or when the
+//!                                                  -- host fn is instantiated if
+//!                                                  -- it names a structural
+//!                                                  -- parameter
 //!
 //! expr    ::= expr binop expr
 //!           | '-' expr
 //!           | expr '.' METHOD '(' (expr (',' expr)*)? ')'
+//!           | expr '.' IDENT                       -- a record's field
 //!           | PROJECTION '(' expr ')'
 //!           | IDENT '(' (expr (',' expr)*)? ')'    -- a helper, inlined
 //!           | 'if' expr block 'else' (block | 'if' …)   -- the choice
 //!           | fold
 //!           | integral
 //!           | 'monotone_root' '(' expr ',' expr ',' expr ')'   -- τ(δ), from (δ, step, bend)
-//!           | IDENT 'as' 'f32'         -- a `usize` (a fold's index or a
-//!                                      -- `usize` const) as a value
+//!           | IDENT 'as' 'f32'         -- a `usize` (a fold's index, a `usize`
+//!                                      -- const or a structural parameter) as
+//!                                      -- a value
 //!           | '(' expr ')'
 //!           | block
 //!           | IDENT                    -- X, Y (in an entry), a parameter, an
@@ -70,6 +83,8 @@
 //! stmt    ::= 'let' IDENT (':' type)? '=' expr ';'
 //!           | expr ';'
 //!
+//! VIS        -- `pub`, `pub(crate)`, …: a visibility, kept on the host item
+//! RECORD     -- the name of one of the block's records
 //! METHOD     -- an `OpKind` method, a `LIBRARY_METHODS` composition, or `clone`
 //! PROJECTION -- V, DX, DY, DXX, DXY, DYY
 //! ```
@@ -77,61 +92,81 @@
 //! A `let` is scoped as Rust scopes it (`crate::symbol`), and so is a fold's
 //! index: its body sees the enclosing bindings, an enclosing fold's index
 //! among them; so is an integral's variable. Nothing shadows `X`, `Y`, a
-//! `const` or a `fn`: a parameter, a `let`, an index or a variable of that
-//! name is refused. `X` and `Y` appear only in an entry; a helper takes its
-//! coordinates as arguments
+//! `const`, a structural parameter or a `fn`: a parameter, a `let`, an index
+//! or a variable of that name is refused. `X` and `Y` appear only in an
+//! entry; a helper takes its coordinates as arguments
 //! (docs/plans/2026-09-25-the-language-is-kernel.md §1.2). A fold
 //! (plan §1.5) denotes ⊕ of its body over `i ∈ [a, b)`, and its monoid's
 //! identity when the range is empty; the syntax never unrolls it. An
 //! integral denotes ∫ of its body over `u ∈ [lo, hi)`; whether it closes is
 //! the e-graph's, and one it leaves open is legalized by quadrature.
 //! `integral`, `area` and `monotone_root` are the language's: a call to one
-//! always means it, and no `const` or `fn` takes one of their names.
+//! always means it, and no `const`, `fn` or record takes one of their names.
 //!
-//! Refused here, with a span, at the token: an item that is not a `const` or
-//! a `fn` (records are B3 of the plan above), generics on either (B3), a
-//! parameter typed as a closure (Phase D), a `fn` without a declared return
-//! type, an `if` without an `else` or an `if let`, `loop`/`while`/`for`,
-//! assignment, `return`, a closure anywhere but a fold's or an integral's, a
-//! tuple (D7, B3), a field access (B3), a range anywhere but a fold's or an
-//! integral's, an `integral` or an `area` of any other shape than the two
-//! above (an argument missing or extra, the interval not a range, the
-//! closure's parameters not one plain name for `integral` and two for
-//! `area`, a parameter with a type, a qualified closure or one with a return
-//! type), an inclusive or open-ended range, a method on a range or a mapped
-//! range that is not one of the fold's spellings, `.map`, `.any` or `.all`
-//! over anything but a range (iterating a family of records is B3), a
-//! `.fold` whose arguments are not one of the two above, a fold's closure
+//! Binding times (plan §1.4). An entry's `const N: usize` generics are
+//! **structural**: each value is its own program, and a body reads one only
+//! as a count. Every parameter is a **uniform**: an `f32` is one, a record is
+//! one per field, and the host function's arguments are their values for
+//! that call — never constants folded in. A record is written by name: a
+//! parameter, a `let` alias of one (`let q = p;`), an argument passed on, or
+//! the base of a field read.
+//!
+//! A record and its fields keep their attributes, re-emitted on the host
+//! struct; every other item keeps only its doc comments.
+//!
+//! Refused here, with a span, at the token: an item that is not a `struct`, a
+//! `const` or a `fn`; a record that is generic, a tuple struct or a unit
+//! struct, and a `repr` or a `cfg` on a record or its field (§1.3); an
+//! attribute other than a doc comment on a `const` or a `fn`; generics on a
+//! helper (B3) and on a `const`, and any generic of an entry but a
+//! `const N: usize` without a default; a parameter typed as a closure
+//! (Phase D); a `fn` without a declared return type; an `if` without an
+//! `else` or an `if let`; `loop`/`while`/`for`; assignment; `return`; a
+//! closure anywhere but a fold's or an integral's; a tuple and a tuple field
+//! (B3, D7's front half); a record literal (Phase D, D7); a range anywhere
+//! but a fold's or an integral's; an `integral` or an `area` of any other
+//! shape than the two above (an argument missing or extra, the interval not
+//! a range, the closure's parameters not one plain name for `integral` and
+//! two for `area`, a parameter with a type, a qualified closure or one with
+//! a return type); an inclusive or open-ended range; a method on a range or
+//! a mapped range that is not one of the fold's spellings; `.map`, `.any` or
+//! `.all` over anything but a range (iterating a family of records is B3); a
+//! `.fold` whose arguments are not one of the two above; a fold's closure
 //! with a type annotation, a pattern, more than one parameter, a return type
-//! or a qualifier, type arguments on a method (`::<f32>` on `.sum` and
-//! `.product` excepted), an `as` to any type but `f32`, a path or a call
-//! from outside the block, `%` and `!` (no IR op), a `let` whose pattern is
-//! not a plain name (`mut`, `ref`, `@`; destructuring is B3), a `let`
-//! without an initializer, `let … else`, an item or a macro inside a block,
-//! an operator not in the table above, a literal that is not a number, a
-//! literal suffixed with a type other than `f32`, an integer past `u128`, a
-//! float past `f32`'s range, and any other Rust expression syntax, named in
+//! or a qualifier; type arguments on a method (`::<f32>` on `.sum` and
+//! `.product` excepted); an `as` to any type but `f32`; a path or a call
+//! from outside the block; `%` and `!` (no IR op); a `let` whose pattern is
+//! not a plain name (`mut`, `ref`, `@`; destructuring is B3); a `let`
+//! without an initializer; `let … else`; an item or a macro inside a block;
+//! an operator not in the table above; a literal that is not a number; a
+//! literal suffixed with a type other than `f32`; an integer past `u128`; a
+//! float past `f32`'s range; and any other Rust expression syntax, named in
 //! the refusal. Nothing is passed through for a later stage to refuse: the
 //! AST holds only what the language means.
 //!
-//! Parsed, and refused by `sema`: an unbound or retired name, a coordinate in
-//! a helper, a call to an entry or to an unknown function, `monotone_root`
-//! with other than three `f32`s, a `const` or `fn` named `integral`, `area`
-//! or `monotone_root`, recursion, an unknown method or a known one at the
-//! wrong arity, a type error (every expression is an `f32` or a `bool`; a
-//! `usize` is used only as `i as f32`; an integrand is an `f32`), an `as` of
-//! anything but a `usize` name, an integer an `f32` does not hold exactly
-//! where a value is expected, a `const` whose initializer is not a `cexpr`
-//! or an `iexpr`, a negated `usize`, a range whose bounds are not constant
-//! or that runs backwards, an integral whose bounds are not constant or are
-//! not an interval the IR admits (`IntervalFold::try_new`: finite, `lo <
-//! hi`, a finite length), `.at()`, `.constant()`, `.collapse()`, and a block
-//! with no final expression.
+//! Parsed, and refused by `sema`: an unbound or retired name; a coordinate in
+//! a helper; a call to an entry or to an unknown function; `monotone_root`
+//! with other than three `f32`s; a `const`, `fn` or record named
+//! `integral`, `area` or `monotone_root`; recursion; an unknown method or a
+//! known one at the wrong arity; a type error (every expression is an `f32`
+//! or a `bool`; a `usize` is used only as `i as f32`; a record only by name;
+//! an integrand is an `f32`); a record's field that is not an `f32` (§1.3); a
+//! record returned, built, chosen by an `if`, or used in arithmetic or a
+//! comparison (Phase D, D7); an unknown field; an `as` of anything but a
+//! `usize` name; an integer an `f32` does not hold exactly where a value is
+//! expected; a `const` whose initializer is not a `cexpr` or an `iexpr`; a
+//! negated `usize`; a range whose bounds are not constant or that runs
+//! backwards; an integral whose bounds are not constant (a structural
+//! parameter among them) or are not an interval the IR admits
+//! (`IntervalFold::try_new`: finite, `lo < hi`, a finite length); `.at()`,
+//! `.constant()`, `.collapse()`; a block with no final expression; and an
+//! `Args` record's name taken twice.
 //!
 //! Refused by lowering, where the language meets the IR's widths: a range
 //! bound past 2²⁴, the last integer bound a fold's index — an `f32` lane —
 //! names exactly, and folds and integrals nested deeper than the IR has
-//! binders.
+//! binders. A range over a structural parameter is refused the same ways
+//! when its host function is instantiated, by rustc, in a `const` block.
 //!
 //! ## Implementation Note
 //!
@@ -141,9 +176,10 @@
 
 use crate::PLAN;
 use crate::ast::{
-    AREA, BinaryExpr, BinaryOp, BlockExpr, CallExpr, CastExpr, ConstItem, Expr, FnItem, FoldExpr,
-    INTEGRAL, IdentExpr, IfExpr, IntegralBounds, IntegralExpr, KernelDef, LetStmt, Literal,
-    LiteralExpr, MethodCallExpr, Param, RangeExpr, Reduction, Spelling, Stmt, UnaryExpr, UnaryOp,
+    AREA, BinaryExpr, BinaryOp, BlockExpr, CallExpr, CastExpr, ConstItem, Expr, FieldExpr, FnItem,
+    FoldExpr, INTEGRAL, IdentExpr, IfExpr, IntegralBounds, IntegralExpr, KernelDef, LetStmt,
+    Literal, LiteralExpr, MethodCallExpr, Param, RangeExpr, RecordField, RecordItem, Reduction,
+    Spelling, Stmt, UnaryExpr, UnaryOp,
 };
 use proc_macro2::{Span, TokenStream};
 use syn::parse::{Parse, ParseStream};
@@ -214,18 +250,20 @@ fn parse_closure(input: ParseStream) -> syn::Result<KernelDef> {
         attrs: Vec::new(),
         vis: syn::Visibility::Public(Default::default()),
         name: syn::Ident::new(SUGAR_ENTRY, Span::call_site()),
+        structural: Vec::new(),
         params,
         ret: None,
         body,
     };
     Ok(KernelDef {
         spelling: Spelling::Closure,
+        records: Vec::new(),
         consts: Vec::new(),
         fns: vec![entry],
     })
 }
 
-/// The items form: `const`s and `fn`s, as a `syn::File`.
+/// The items form: records, `const`s and `fn`s, as a `syn::File`.
 fn parse_items(input: ParseStream) -> syn::Result<KernelDef> {
     let file: syn::File = input.parse()?;
     if let Some(attr) = file.attrs.first() {
@@ -236,11 +274,13 @@ fn parse_items(input: ParseStream) -> syn::Result<KernelDef> {
     }
     let mut def = KernelDef {
         spelling: Spelling::Items,
+        records: Vec::new(),
         consts: Vec::new(),
         fns: Vec::new(),
     };
     for item in file.items {
         match item {
+            syn::Item::Struct(item) => def.records.push(convert_record(item)?),
             syn::Item::Const(item) => def.consts.push(convert_const(item)?),
             syn::Item::Fn(item) => def.fns.push(convert_fn(item)?),
             other => return Err(refuse_item(&other)),
@@ -249,11 +289,9 @@ fn parse_items(input: ParseStream) -> syn::Result<KernelDef> {
     Ok(def)
 }
 
-/// An item that is neither a `const` nor a `fn`, named by its kind so the
-/// message can say which phase brings it.
+/// An item that is not a record, a `const` or a `fn`, named by its kind.
 fn refuse_item(item: &syn::Item) -> syn::Error {
     let kind = match item {
-        syn::Item::Struct(_) => "struct",
         syn::Item::Enum(_) => "enum",
         syn::Item::Static(_) => "static",
         syn::Item::Type(_) => "type",
@@ -269,11 +307,80 @@ fn refuse_item(item: &syn::Item) -> syn::Error {
         format!(
             "a `{kind}` in a `kernel!` block\n\
              \n\
-             note: a `kernel!` block holds `const` items and `fn` items: a `pub fn` is an \
-             entry, a private `fn` is a helper\n\
-             note: records (`struct`) are B3 of {PLAN}"
+             note: a `kernel!` block holds records (`struct`s of `f32` fields), `const` \
+             items and `fn` items: a `pub fn` is an entry, a private `fn` is a helper"
         ),
     )
+}
+
+/// `struct R { a: f32, b: f32 }`. A record's shape — named fields, no
+/// generics — is checked here; that each field is an `f32` is `sema`'s
+/// question, since a field typed as another record needs the block's
+/// records to say so.
+fn convert_record(item: syn::ItemStruct) -> syn::Result<RecordItem> {
+    refuse_layout_attributes(&item.attrs)?;
+    if let Some(param) = item.generics.params.first() {
+        return Err(syn::Error::new_spanned(
+            param,
+            format!(
+                "a generic record\n\
+                 \n\
+                 note: a record is named `f32` fields, and nothing else (§1.3 of {PLAN})"
+            ),
+        ));
+    }
+    if let Some(where_clause) = &item.generics.where_clause {
+        return Err(syn::Error::new_spanned(
+            where_clause,
+            "a `where` clause on a record: there are no generics to bound",
+        ));
+    }
+    let named = match item.fields {
+        syn::Fields::Named(named) => named,
+        syn::Fields::Unnamed(unnamed) => {
+            return Err(syn::Error::new_spanned(
+                unnamed,
+                format!(
+                    "a tuple struct in a `kernel!` block\n\
+                     \n\
+                     note: a record's fields have names, `struct {} {{ x: f32, y: f32 }}` \
+                     (§1.3 of {PLAN})",
+                    item.ident
+                ),
+            ));
+        }
+        syn::Fields::Unit => {
+            return Err(syn::Error::new_spanned(
+                &item.ident,
+                format!(
+                    "a unit struct in a `kernel!` block\n\
+                     \n\
+                     note: a record is named `f32` fields, `struct {} {{ x: f32 }}` (§1.3 of \
+                     {PLAN})",
+                    item.ident
+                ),
+            ));
+        }
+    };
+    let mut fields = Vec::with_capacity(named.named.len());
+    for field in named.named {
+        refuse_layout_attributes(&field.attrs)?;
+        let name = field
+            .ident
+            .expect("a field of a struct with named fields has a name");
+        fields.push(RecordField {
+            attrs: field.attrs,
+            vis: field.vis,
+            name,
+            ty: field.ty,
+        });
+    }
+    Ok(RecordItem {
+        attrs: item.attrs,
+        vis: item.vis,
+        name: item.ident,
+        fields,
+    })
 }
 
 /// `const NAME: f32 = expr;`. The initializer is parsed as any body is and
@@ -326,7 +433,13 @@ fn convert_fn(item: syn::ItemFn) -> syn::Result<FnItem> {
             "a variadic parameter list has no meaning in a kernel",
         ));
     }
-    refuse_generics(&sig.generics)?;
+    let structural = match item.vis {
+        syn::Visibility::Inherited => {
+            refuse_a_helpers_generics(&sig.generics)?;
+            Vec::new()
+        }
+        _ => structural_parameters(&sig.generics)?,
+    };
 
     let mut params = Vec::with_capacity(sig.inputs.len());
     for input in sig.inputs {
@@ -353,10 +466,74 @@ fn convert_fn(item: syn::ItemFn) -> syn::Result<FnItem> {
         attrs: item.attrs,
         vis: item.vis,
         name: sig.ident,
+        structural,
         params,
         ret: Some(ret),
         body: Expr::Block(convert_block(*item.block)?),
     })
+}
+
+/// An entry's structural parameters: its generics, each `const N: usize`
+/// (plan §1.4). A type or lifetime parameter, a const of another type, a
+/// default and a `where` clause are refused: the language's one value bound
+/// when its program is compiled is a count.
+fn structural_parameters(generics: &syn::Generics) -> syn::Result<Vec<syn::Ident>> {
+    if let Some(where_clause) = &generics.where_clause {
+        return Err(syn::Error::new_spanned(
+            where_clause,
+            "a `where` clause in a `kernel!` block: a structural parameter is a `usize`, and \
+             there is nothing to bound",
+        ));
+    }
+    let mut structural = Vec::with_capacity(generics.params.len());
+    for param in &generics.params {
+        let syn::GenericParam::Const(count) = param else {
+            return Err(syn::Error::new_spanned(
+                param,
+                format!(
+                    "a type or lifetime parameter on an entry\n\
+                     \n\
+                     note: an entry's generics are its structural parameters, `const N: usize`, \
+                     and each value is its own program (§1.4 and B3 of {PLAN})"
+                ),
+            ));
+        };
+        refuse_attributes(&count.attrs)?;
+        if !is_usize(&count.ty) {
+            return Err(syn::Error::new_spanned(
+                &count.ty,
+                "a structural parameter is a `usize`: a count, which sizes a program's shape",
+            ));
+        }
+        if let Some(default) = &count.default {
+            return Err(syn::Error::new_spanned(
+                default,
+                "a default for a structural parameter: a call names the program it wants, \
+                 `entry::<4>(…)`",
+            ));
+        }
+        structural.push(count.ident.clone());
+    }
+    Ok(structural)
+}
+
+/// A helper takes no generics: it is inlined into an entry, and reads the
+/// entry's structural parameters only through its arguments.
+fn refuse_a_helpers_generics(generics: &syn::Generics) -> syn::Result<()> {
+    if let Some(param) = generics.params.first() {
+        return Err(syn::Error::new_spanned(
+            param,
+            format!(
+                "generics on a helper\n\
+                 \n\
+                 note: a helper is inlined into an entry, and reads the entry's structural \
+                 parameters through its arguments: pass `n as f32`\n\
+                 note: structural parameters are an entry's, `pub fn f<const N: usize>`; a \
+                 helper's are B3 of {PLAN}"
+            ),
+        ));
+    }
+    refuse_generics(generics)
 }
 
 /// A `fn` parameter: a plain name and a scalar type.
@@ -395,7 +572,7 @@ fn convert_param(input: syn::FnArg) -> syn::Result<Param> {
                     "a kernel-typed parameter\n\
                      \n\
                      note: passing a function to a kernel `fn` is Phase D of {PLAN}; this \
-                     parameter is a scalar, `f32` or `bool`"
+                     parameter is an `f32`, a `bool` or one of the block's records"
                 ),
             ));
         }
@@ -418,8 +595,31 @@ fn refuse_attributes(attrs: &[syn::Attribute]) -> syn::Result<()> {
     }
 }
 
-/// Generics and const generics are the structural parameters of B3; until
-/// then a `fn` or a `const` takes none.
+/// A record keeps its attributes, and a field its own, on its host twin — a
+/// derive, a lint level, a `cfg_attr` — as rustc reads them there; a derive
+/// the twin already has is rustc's conflicting impl. Two are refused because
+/// they would make the twin disagree with the program: `repr`, since the
+/// layout is the language's (`#[repr(C)]`, the fields in order), and `cfg`,
+/// since a record's fields are its entries' uniforms on every
+/// configuration.
+fn refuse_layout_attributes(attrs: &[syn::Attribute]) -> syn::Result<()> {
+    let layout = |attr: &&syn::Attribute| ["repr", "cfg"].iter().any(|n| attr.path().is_ident(n));
+    match attrs.iter().find(layout) {
+        Some(attr) => Err(syn::Error::new_spanned(
+            attr,
+            format!(
+                "a `repr` or a `cfg` on a record\n\
+                 \n\
+                 note: a record is `#[repr(C)]`, its fields in order, and its fields are its \
+                 entries' uniforms on every configuration (§1.3 of {PLAN}); any other \
+                 attribute is kept"
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// A `const` takes no generics: it is one value, evaluated at expansion.
 fn refuse_generics(generics: &syn::Generics) -> syn::Result<()> {
     if let Some(param) = generics.params.first() {
         return Err(syn::Error::new_spanned(
@@ -427,7 +627,7 @@ fn refuse_generics(generics: &syn::Generics) -> syn::Result<()> {
             format!(
                 "generics in a `kernel!` block\n\
                  \n\
-                 note: structural parameters (`const N: usize`) are B3 of {PLAN}"
+                 note: structural parameters, `const N: usize`, are an entry's (§1.4 of {PLAN})"
             ),
         ));
     }
@@ -578,27 +778,34 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
             Ok(Expr::Paren(Box::new(inner)))
         }
 
-        // A value with parts. Records and tuples are flattened in the front
-        // end (D7), which is B3.
+        // A value with parts, built in a body. A record enters a kernel as a
+        // parameter and is read by field; a tuple is flattened in the front
+        // end as a record is (D7's front half, B3), and a record built or
+        // returned is Phase D (D7).
         syn::Expr::Tuple(expr_tuple) => Err(syn::Error::new(
             expr_tuple.paren_token.span.join(),
             format!(
                 "a tuple in a kernel body\n\
                  \n\
-                 note: every value in a kernel body is an `f32` or a `bool`\n\
-                 note: records and tuples are flattened in the front end (D7 of {PLAN}), \
-                 which is B3"
+                 note: every value in a kernel body is an `f32` or a `bool`; a record \
+                 parameter is read by field, `p.x0`\n\
+                 note: tuples are flattened in the front end as records are (D7's front \
+                 half), which is B3 of {PLAN}"
             ),
         )),
 
-        syn::Expr::Field(expr_field) => Err(syn::Error::new_spanned(
-            expr_field,
+        syn::Expr::Struct(expr_struct) => Err(syn::Error::new_spanned(
+            &expr_struct.path,
             format!(
-                "a field access in a kernel body\n\
+                "a record literal in a kernel body\n\
                  \n\
-                 note: records and their fields are B3 of {PLAN}"
+                 note: a record enters a kernel as a parameter, one uniform per field, and a \
+                 body reads its fields, `p.x0`\n\
+                 note: building a record, and returning one, are Phase D (D7 of {PLAN})"
             ),
         )),
+
+        syn::Expr::Field(expr_field) => convert_field(expr_field),
 
         syn::Expr::Range(expr_range) => Err(syn::Error::new_spanned(
             expr_range,
@@ -667,6 +874,31 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
             ),
         )),
     }
+}
+
+/// `p.x0`: a named field. Which record `p` is, and whether it has the field,
+/// are `sema`'s questions. A tuple's field, `p.0`, is refused: a record's
+/// fields have names.
+fn convert_field(expr_field: syn::ExprField) -> syn::Result<Expr> {
+    let member = match expr_field.member {
+        syn::Member::Named(member) => member,
+        syn::Member::Unnamed(index) => {
+            return Err(syn::Error::new_spanned(
+                index,
+                format!(
+                    "a tuple's field in a kernel body\n\
+                     \n\
+                     note: a record's fields have names, `p.x0`; tuples are B3 (D7's front \
+                     half) of {PLAN}"
+                ),
+            ));
+        }
+    };
+    Ok(Expr::Field(FieldExpr {
+        base: Box::new(convert_expr(*expr_field.base)?),
+        span: member.span(),
+        member,
+    }))
 }
 
 /// `if c { a } else { b }`, and `else if` chains. The `else` is required —
@@ -877,6 +1109,11 @@ fn sum_or_product(call: &syn::ExprMethodCall, reduction: Reduction) -> syn::Resu
 /// conversion's target, may name.
 fn is_f32(ty: &Type) -> bool {
     matches!(ty, Type::Path(path) if path.qself.is_none() && path.path.is_ident("f32"))
+}
+
+/// Whether `ty` is exactly `usize`: the one type a structural parameter has.
+fn is_usize(ty: &Type) -> bool {
+    matches!(ty, Type::Path(path) if path.qself.is_none() && path.path.is_ident("usize"))
 }
 
 /// `operand as f32`. The conversion's target is always `f32`, so any other
@@ -1414,16 +1651,17 @@ fn convert_block(block: syn::Block) -> syn::Result<BlockExpr> {
 }
 
 /// A `let` whose pattern is not a name — `let (x, y) = …`, `let Row { x0, .. }
-/// = …` — takes a value apart, and a kernel value has no parts yet.
+/// = …` — takes a value apart; a record's fields are read by name instead.
 fn refuse_let_pattern(pattern: &Pat) -> syn::Error {
     syn::Error::new_spanned(
         pattern,
         format!(
             "a pattern in a kernel `let`\n\
              \n\
-             note: a kernel `let` binds a plain name: every value in a kernel body is an \
-             `f32` or a `bool`\n\
-             note: records and their fields are B3 of {PLAN}"
+             note: a kernel `let` binds a plain name: an `f32`, a `bool`, or a record, which \
+             it aliases (`let q = p;`) and whose fields are read by name (`q.x0`)\n\
+             note: destructuring is flattened in the front end as a record is (D7's front \
+             half), which is B3 of {PLAN}"
         ),
     )
 }
@@ -1648,27 +1886,54 @@ mod tests {
         assert!(err.contains("a qualified call"), "got: {err}");
     }
 
-    /// A value with parts is refused where it is written, naming the phase
-    /// that brings records: a `let` pattern, a field access, a tuple.
+    /// A value with parts built or taken apart in a body is refused where it
+    /// is written: a `let` pattern, a tuple and a tuple's field naming B3,
+    /// where tuples are flattened in the front end as records are (D7's
+    /// front half, which §1.7's glyph needs for `let (x, y) = …`); a record
+    /// literal naming Phase D (D7).
     #[test]
-    fn a_pattern_a_field_and_a_tuple_are_refused_naming_b3() {
-        let cases: [(TokenStream, &str); 5] = [
-            (quote! { || { let (a, b) = (X, Y); a } }, "a pattern"),
+    fn a_pattern_a_tuple_and_a_record_literal_are_refused_naming_their_phase() {
+        let cases: [(TokenStream, &str, &str); 6] = [
+            (quote! { || { let (a, b) = (X, Y); a } }, "a pattern", "B3"),
             (
                 quote! { || { let (a, b): (f32, f32) = (X, Y); a } },
                 "a pattern",
+                "B3",
             ),
-            (quote! { |p: f32| p.e0y }, "a field access"),
-            (quote! { || (X, Y) }, "a tuple"),
-            (quote! { || (X, Y) }, "D7"),
+            (
+                quote! { || { let Row { x0, .. } = p; x0 } },
+                "a pattern",
+                "B3",
+            ),
+            (quote! { || (X, Y) }, "a tuple in a kernel body", "B3"),
+            (quote! { |p: f32| p.0 }, "a tuple's field", "B3"),
+            (quote! { || Row { x0: X }.x0 }, "a record literal", "D7"),
         ];
-        for (input, expected) in cases {
+        for (input, expected, phase) in cases {
             let err = refusal(input);
             assert!(
-                err.contains(expected) && err.contains("B3"),
-                "expected `{expected}` and `B3`, got: {err}"
+                err.contains(expected) && err.contains(phase),
+                "expected `{expected}` and `{phase}`, got: {err}"
             );
         }
+    }
+
+    /// `p.x0` parses as a field of whatever `p` is; which record, and
+    /// whether it has the field, are `sema`'s questions.
+    #[test]
+    fn a_named_field_parses_as_a_field_read() {
+        let def = parse(quote! { |p: f32| (p).x0 + 1.0 }).expect("parses");
+        let Expr::Binary(sum) = &entry(&def).body else {
+            panic!("expected the sum, got {:?}", entry(&def).body);
+        };
+        let Expr::Field(field) = &*sum.lhs else {
+            panic!("expected a field, got {:?}", sum.lhs);
+        };
+        assert_eq!(field.member.to_string(), "x0");
+        assert_eq!(
+            field.base.named().map(ToString::to_string),
+            Some("p".into())
+        );
     }
 
     /// A range anywhere but a fold's or an integral's names the spellings of
@@ -1994,17 +2259,122 @@ mod tests {
         assert!(err.contains("`!` has no IR op"), "got: {err}");
     }
 
-    /// An item the block has no meaning for names the phase that brings it.
+    /// A record parses with its visibility, its doc comments and its fields
+    /// in declaration order, each field's own visibility and docs kept.
     #[test]
-    fn a_struct_item_is_refused_naming_b3() {
+    fn a_record_parses_with_its_fields_and_docs() {
+        let def = parse(quote! {
+            /// One arc piece.
+            pub struct Row {
+                /// Where it starts.
+                pub x0: f32,
+                sigma: f32,
+            }
+            pub fn f(p: Row) -> f32 { p.x0 }
+        })
+        .expect("parses");
+        let [row] = def.records.as_slice() else {
+            panic!("one record, got {:?}", def.records);
+        };
+        assert_eq!(row.name.to_string(), "Row");
+        assert!(matches!(row.vis, syn::Visibility::Public(_)));
+        assert_eq!(row.attrs.len(), 1, "the record's doc comment is kept");
+        let names: Vec<String> = row.fields.iter().map(|f| f.name.to_string()).collect();
+        assert_eq!(names, ["x0", "sigma"]);
+        assert_eq!(
+            row.fields[0].attrs.len(),
+            1,
+            "a field's doc comment is kept"
+        );
+        assert!(matches!(row.fields[1].vis, syn::Visibility::Inherited));
+    }
+
+    /// A record is named `f32` fields: a tuple struct, a unit struct and a
+    /// generic record are refused where they are written, naming §1.3; any
+    /// other item names what the block holds.
+    #[test]
+    fn a_record_that_is_not_named_fields_is_refused_naming_its_section() {
+        let cases: [(TokenStream, &str); 3] = [
+            (quote! { struct Row(f32, f32); }, "a tuple struct"),
+            (quote! { struct Row; }, "a unit struct"),
+            (quote! { struct Row<T> { x: T } }, "a generic record"),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(quote! { #input pub fn f() -> f32 { X } });
+            assert!(
+                err.contains(expected) && err.contains("§1.3"),
+                "expected `{expected}` and `§1.3`, got: {err}"
+            );
+        }
         let err = refusal(quote! {
-            struct Row { x: f32 }
+            enum Row { A }
             pub fn f() -> f32 { X }
         });
         assert!(
-            err.contains("a `struct`") && err.contains("B3"),
+            err.contains("a `enum`") && err.contains("records (`struct`s of `f32` fields)"),
             "got: {err}"
         );
+        for attr in [quote!(#[repr(packed)]), quote!(#[cfg(any())])] {
+            let err = refusal(quote! {
+                #attr
+                struct Row { x: f32 }
+                pub fn f() -> f32 { X }
+            });
+            assert!(
+                err.contains("a `repr` or a `cfg` on a record"),
+                "got: {err}"
+            );
+            let err = refusal(quote! {
+                struct Row { #attr x: f32 }
+                pub fn f() -> f32 { X }
+            });
+            assert!(
+                err.contains("a `repr` or a `cfg` on a record"),
+                "got: {err}"
+            );
+        }
+    }
+
+    /// A record's other attributes, and its fields', are kept for its host
+    /// twin: rustc reads them there.
+    #[test]
+    fn a_records_attributes_are_kept() {
+        let def = parse(quote! {
+            /// A row.
+            #[allow(dead_code)]
+            #[cfg_attr(any(), derive(Eq))]
+            pub struct Row { #[allow(unused)] pub x0: f32 }
+            pub fn f() -> f32 { X }
+        })
+        .expect("parses");
+        let [row] = def.records.as_slice() else {
+            panic!("one record, got {}", def.records.len());
+        };
+        let paths: Vec<String> = row
+            .attrs
+            .iter()
+            .map(|attr| attr.path().get_ident().expect("a plain path").to_string())
+            .collect();
+        assert_eq!(paths, ["doc", "allow", "cfg_attr"]);
+        assert_eq!(row.fields[0].attrs.len(), 1, "the field's `allow`");
+    }
+
+    /// An entry's generics are its structural parameters, in declaration
+    /// order; a helper has none.
+    #[test]
+    fn an_entrys_const_generics_are_its_structural_parameters() {
+        let def = parse(quote! {
+            fn h(x: f32) -> f32 { x }
+            pub fn f<const N: usize, const M: usize>(r: f32) -> f32 { h(r) }
+        })
+        .expect("parses");
+        let names: Vec<String> = def.fns[1]
+            .structural
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(names, ["N", "M"]);
+        assert!(def.fns[0].structural.is_empty());
     }
 
     // ───────────────────────────── folds ─────────────────────────────
@@ -2208,12 +2578,30 @@ mod tests {
         }
     }
 
-    /// A `fn` signature carries nothing the language cannot honor.
+    /// A `fn` signature carries nothing the language cannot honor: an
+    /// entry's generics are `const N: usize` and nothing else, and a
+    /// helper's are B3.
     #[test]
     fn a_fn_signature_is_plain() {
-        let cases: [(TokenStream, &str); 6] = [
-            (quote! { pub fn f<const N: usize>() -> f32 { X } }, "B3"),
+        let cases: [(TokenStream, &str); 10] = [
+            (
+                quote! { fn h<const N: usize>(x: f32) -> f32 { x } pub fn f() -> f32 { X } },
+                "generics on a helper",
+            ),
+            (
+                quote! { fn h<const N: usize>(x: f32) -> f32 { x } pub fn f() -> f32 { X } },
+                "B3",
+            ),
             (quote! { pub fn f<T>() -> f32 { X } }, "B3"),
+            (quote! { pub fn f<'a>() -> f32 { X } }, "lifetime parameter"),
+            (
+                quote! { pub fn f<const N: u32>() -> f32 { X } },
+                "a structural parameter is a `usize`",
+            ),
+            (
+                quote! { pub fn f<const N: usize = 4>() -> f32 { X } },
+                "a default for a structural parameter",
+            ),
             (quote! { pub fn f() { X } }, "declares no return type"),
             (quote! { pub fn f(mut x: f32) -> f32 { x } }, "plain name"),
             (

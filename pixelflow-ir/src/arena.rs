@@ -27,7 +27,6 @@ use core::fmt;
 
 use crate::dag::{Builder, Id, Memo, Node};
 use crate::fold::{Binder, Fold};
-use crate::kernel::Scalar;
 use crate::key::KernelKey;
 use crate::kind::OpKind;
 
@@ -1315,169 +1314,6 @@ impl ExprArena {
         count
     }
 
-    /// Replace every `Param(i)` node with what `params[i]` says it is: a
-    /// `Const` folded into the fragment, or a `Uniform` slot declared for the
-    /// handle's identity (one slot per identity, however many placeholders
-    /// name it).
-    ///
-    /// Returns the new root [`ExprId`] in the **same** arena. Old nodes become
-    /// unreachable garbage — that is fine for an append-only arena.
-    ///
-    /// # Panics
-    ///
-    /// Panics if any `Param(i)` has `i >= params.len()`.
-    pub fn substitute_params(&mut self, root: ExprId, params: &[Scalar]) -> ExprId {
-        // Iterative post-order: map old ExprId -> new ExprId.
-        // We use a Vec as a dense map since IDs are contiguous 0..n.
-        enum Task {
-            Descend(ExprId),
-            Emit(ExprId),
-        }
-
-        // We'll build a mapping: old_id -> new_id.
-        // Initialize with sentinel values.
-        let old_len = self.len();
-        let mut id_map: Vec<Option<ExprId>> = Vec::new();
-        id_map.resize(old_len, None);
-
-        let mut work: Vec<Task> = vec![Task::Descend(root)];
-
-        while let Some(task) = work.pop() {
-            match task {
-                Task::Descend(id) => {
-                    // If already mapped (shared subtree), skip.
-                    if id_map[id.0 as usize].is_some() {
-                        continue;
-                    }
-                    work.push(Task::Emit(id));
-                    match &self.node(id) {
-                        ExprNode::Var(_)
-                        | ExprNode::Const(_)
-                        | ExprNode::Param(_)
-                        | ExprNode::Buffer(_)
-                        | ExprNode::Uniform(_)
-                        | ExprNode::Ref(_) => {}
-                        ExprNode::Unary(_, a) => {
-                            work.push(Task::Descend(*a));
-                        }
-                        ExprNode::Binary(_, a, b) => {
-                            work.push(Task::Descend(*b));
-                            work.push(Task::Descend(*a));
-                        }
-                        ExprNode::Ternary(_, a, b, c) => {
-                            work.push(Task::Descend(*c));
-                            work.push(Task::Descend(*b));
-                            work.push(Task::Descend(*a));
-                        }
-                        ExprNode::Nary(_, range) => {
-                            let s = range.start as usize;
-                            let l = range.len as usize;
-                            for child in self.nary_children[s..s + l].iter().rev() {
-                                work.push(Task::Descend(*child));
-                            }
-                        }
-                        ExprNode::Reduce { body, .. } => work.push(Task::Descend(*body)),
-                        ExprNode::Guard { mask, .. } => work.push(Task::Descend(*mask)),
-                        ExprNode::Write { value, .. } => work.push(Task::Descend(*value)),
-                    }
-                }
-                Task::Emit(id) => {
-                    // Skip if already emitted (can happen with shared subtrees).
-                    if id_map[id.0 as usize].is_some() {
-                        continue;
-                    }
-                    let new_id = match self.node(id) {
-                        ExprNode::Param(i) => {
-                            let idx = i as usize;
-                            assert!(
-                                idx < params.len(),
-                                "substitute_params: param index {} out of range (have {} params)",
-                                idx,
-                                params.len()
-                            );
-                            match params[idx] {
-                                Scalar::Const(v) => self.push_const(v),
-                                Scalar::Uniform(u) => {
-                                    let slot = self.uniform_slot_for(u.decl());
-                                    self.push_uniform(slot)
-                                }
-                            }
-                        }
-                        ExprNode::Var(i) => self.push_var(i),
-                        ExprNode::Const(v) => self.push_const(v),
-                        // Buffer and uniform ids stay valid: the tables live
-                        // in this arena.
-                        ExprNode::Buffer(b) => self.push_buffer(b),
-                        ExprNode::Uniform(u) => self.push_uniform(u),
-                        // A key is arena-independent, so a reference copies
-                        // across as itself.
-                        ExprNode::Ref(k) => self.push_ref(k),
-                        ExprNode::Unary(op, a) => {
-                            let na = id_map[a.0 as usize]
-                                .expect("substitute_params: child not yet mapped for Unary");
-                            self.push_unary(op, na)
-                        }
-                        ExprNode::Binary(op, a, b) => {
-                            let na = id_map[a.0 as usize]
-                                .expect("substitute_params: child a not yet mapped for Binary");
-                            let nb = id_map[b.0 as usize]
-                                .expect("substitute_params: child b not yet mapped for Binary");
-                            self.push_binary(op, na, nb)
-                        }
-                        ExprNode::Ternary(op, a, b, c) => {
-                            let na = id_map[a.0 as usize]
-                                .expect("substitute_params: child a not yet mapped for Ternary");
-                            let nb = id_map[b.0 as usize]
-                                .expect("substitute_params: child b not yet mapped for Ternary");
-                            let nc = id_map[c.0 as usize]
-                                .expect("substitute_params: child c not yet mapped for Ternary");
-                            self.push_ternary(op, na, nb, nc)
-                        }
-                        ExprNode::Nary(op, range) => {
-                            let s = range.start as usize;
-                            let l = range.len as usize;
-                            let child_ids: Vec<ExprId> = self.nary_children[s..s + l]
-                                .iter()
-                                .map(|old_child| {
-                                    id_map[old_child.0 as usize]
-                                        .expect("substitute_params: nary child not yet mapped")
-                                })
-                                .collect();
-                            self.push_nary(op, &child_ids)
-                        }
-                        ExprNode::Reduce { fold, body } => {
-                            let body = id_map[body.0 as usize]
-                                .expect("substitute_params: reduce body not yet mapped");
-                            self.push_reduce(fold, body)
-                        }
-                        // Same reasoning as `Ref` just above: `on`/`off` are
-                        // arena-independent names, so they copy across as
-                        // themselves. Only the mask — a real child, in this
-                        // arena — can hold a `Param` and is rebuilt.
-                        ExprNode::Guard { mask, on, off } => {
-                            let mask = id_map[mask.0 as usize]
-                                .expect("substitute_params: guard mask not yet mapped");
-                            self.push_guard(mask, on, off)
-                        }
-                        ExprNode::Write {
-                            row,
-                            col,
-                            lane,
-                            value,
-                        } => {
-                            let value = id_map[value.0 as usize]
-                                .expect("substitute_params: write value not yet mapped");
-                            self.push_write(row, col, lane, value)
-                        }
-                    };
-                    id_map[id.0 as usize] = Some(new_id);
-                }
-            }
-        }
-
-        id_map[root.0 as usize].expect("substitute_params: root was never mapped")
-    }
-
     // ───────────────────── composition (P4: arena splicing) ─────────────────
 
     /// Copy the fragment reachable from `root` in `other` into this arena,
@@ -1621,8 +1457,8 @@ impl ExprArena {
     ///
     /// Entries must reference nodes already in this arena (e.g. from
     /// [`ExprArena::splice`]). Unlisted variables are preserved. Returns the
-    /// new root in the same arena; old nodes become unreachable garbage, as
-    /// with [`ExprArena::substitute_params`].
+    /// new root in the same arena; old nodes become unreachable garbage,
+    /// which is fine for an append-only arena.
     pub fn substitute_vars_with(&mut self, root: ExprId, subs: &[(u8, ExprId)]) -> ExprId {
         let lookup = |i: u8| subs.iter().find(|(v, _)| *v == i).map(|(_, id)| *id);
 
@@ -2282,25 +2118,6 @@ mod tests {
         assert_eq!(arena.len(), 1);
     }
 
-    // 7. test_substitute_params
-    #[test]
-    fn verify_substitute_params() {
-        let mut arena = ExprArena::new();
-        let p0 = arena.push_param(0);
-        let p1 = arena.push_param(1);
-        let root = arena.push_binary(OpKind::Add, p0, p1);
-
-        let new_root = arena.substitute_params(root, &[Scalar::Const(10.0), Scalar::Const(20.0)]);
-
-        match arena.node(new_root) {
-            ExprNode::Binary(OpKind::Add, a, b) => {
-                assert!(matches!(arena.node(a), ExprNode::Const(v) if (v - 10.0).abs() < 1e-6));
-                assert!(matches!(arena.node(b), ExprNode::Const(v) if (v - 20.0).abs() < 1e-6));
-            }
-            other => panic!("expected Binary(Add, ...), got {:?}", other),
-        }
-    }
-
     #[test]
     fn push_gather_should_create_node_when_valid() {
         let mut arena = ExprArena::new();
@@ -2588,7 +2405,6 @@ mod guard_tests {
 #[cfg(test)]
 mod composition_tests {
     use super::*;
-    use crate::kind::OpKind;
 
     // ───────────────────────── uniforms ─────────────────────────
 
@@ -2615,31 +2431,6 @@ mod composition_tests {
         let mut host = ExprArena::new();
         let _ = host.declare_uniform(UniformDecl { id, default: 2.0 });
         let _ = host.splice(&donor, r);
-    }
-
-    #[test]
-    fn f32_arguments_substitute_to_the_same_arena_as_before() {
-        // The fold path is byte-for-byte what it was: `f32` keeps its meaning.
-        let build = || {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let p = a.push_param(0);
-            let root = a.push_binary(OpKind::Mul, x, p);
-            (a, root)
-        };
-        let (mut folded, root) = build();
-        let folded_root = folded.substitute_params(root, &[Scalar::from(2.5)]);
-        let (mut by_hand, root) = build();
-        let x = by_hand.push_var(0);
-        let c = by_hand.push_const(2.5);
-        let hand_root = by_hand.push_binary(OpKind::Mul, x, c);
-        let _ = root;
-        assert_eq!(
-            folded.nodes().map(|(_, n)| n).collect::<Vec<_>>(),
-            by_hand.nodes().map(|(_, n)| n).collect::<Vec<_>>()
-        );
-        assert_eq!(folded_root, hand_root);
-        assert!(folded.uniforms().is_empty());
     }
 
     #[test]

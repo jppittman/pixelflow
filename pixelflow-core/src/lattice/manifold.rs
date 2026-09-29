@@ -107,10 +107,19 @@ pub struct UniformBlock {
 struct Link {
     decls: Vec<UniformDecl>,
     offsets: HashMap<UniformIdentity, usize>,
+    /// Where each argument the kernel *declared* sits in the block, in
+    /// declaration order (`Kernel::uniforms`): its offset, or `None` for one
+    /// the compiled code never reads. The permutation
+    /// [`UniformBlock::set_declared`] applies, computed once, here, so that
+    /// rebinding a program per call is a walk rather than a lookup per
+    /// value.
+    declared: Vec<Option<usize>>,
 }
 
 impl Link {
-    fn new(decls: Vec<UniformDecl>) -> Self {
+    /// The link of `decls`, the compiled code's arguments in block order,
+    /// for a kernel that declared `declared`.
+    fn new(decls: Vec<UniformDecl>, declared: &[UniformDecl]) -> Self {
         let offsets: HashMap<UniformIdentity, usize> = decls
             .iter()
             .enumerate()
@@ -124,13 +133,53 @@ impl Link {
             decls.len(),
             "Manifold: a link names an argument at two offsets"
         );
-        Self { decls, offsets }
+        let declared = declared
+            .iter()
+            .map(|decl| offsets.get(&decl.id).copied())
+            .collect();
+        Self {
+            decls,
+            offsets,
+            declared,
+        }
     }
 
     fn offset(&self, id: UniformIdentity) -> Result<usize, UnknownUniform> {
         self.offsets.get(&id).copied().ok_or(UnknownUniform(id))
     }
 }
+
+/// Values for a compiled kernel's arguments, by position, that are not one
+/// per argument it declares.
+///
+/// An error rather than a truncation or a padding with defaults, because the
+/// pixels would be plausible: values meant for one program, bound
+/// positionally to another, shift every argument after the first
+/// difference. It is a check of the count only. A kernel's declarations are
+/// its own and then each composed operand's, each in its own order
+/// (`Kernel::uniforms`), so an entry's `Args` rebinds a program the entry's
+/// kernel was composed into beside argument-free kernels, and meets this
+/// error beside any other arguments; but values of another program that
+/// happens to declare as many arguments bind without a word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArityMismatch {
+    /// How many arguments the kernel declares (`Kernel::uniforms`).
+    pub declared: usize,
+    /// How many values were supplied.
+    pub supplied: usize,
+}
+
+impl core::fmt::Display for ArityMismatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} values supplied for a compiled kernel that declares {} arguments",
+            self.supplied, self.declared
+        )
+    }
+}
+
+impl core::error::Error for ArityMismatch {}
 
 /// A handle that is not one of the program's arguments.
 ///
@@ -163,6 +212,59 @@ impl UniformBlock {
         let i = self.offset(u)?;
         Arc::make_mut(&mut self.values)[i] = v;
         Ok(())
+    }
+
+    /// Bind every argument the compiled kernel declared from `values`, in
+    /// its declaration order (`Kernel::uniforms`) — which is a `kernel!`
+    /// entry's parameters in order, a record's fields in field order, and
+    /// what its `Args` record writes
+    /// (docs/plans/2026-09-25-the-language-is-kernel.md §1.4).
+    ///
+    /// A program is compiled once and rebound per call this way, with no
+    /// handles: the declaration order was matched to the block's once, when
+    /// the manifold compiled, so this is a walk over `values` with no lookup.
+    /// An argument the compiled code never reads takes its value and drops
+    /// it, so a parameter a body leaves unread still holds its position; an
+    /// argument the code reads that the kernel did not declare itself (a
+    /// referenced kernel's) is not among `values`, and keeps what the block
+    /// holds. Written in place while this block is the sole holder of its
+    /// values, as [`UniformBlock::set`] is, so a block reused call after
+    /// call allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ArityMismatch`] when `values` does not hold one value per declared
+    /// argument. An iterator that knows its length — an array's, a slice's,
+    /// a chain of them — is refused before anything is written; one that
+    /// does not is found out as it is walked, and the block then holds the
+    /// values up to that point.
+    pub fn set_declared(
+        &mut self,
+        values: impl IntoIterator<Item = f32>,
+    ) -> Result<(), ArityMismatch> {
+        let declared = &self.link.declared;
+        let mut values = values.into_iter();
+        let mismatch = |supplied| ArityMismatch {
+            declared: declared.len(),
+            supplied,
+        };
+        match values.size_hint() {
+            (known, Some(upper)) if known == upper && known != declared.len() => {
+                return Err(mismatch(known));
+            }
+            _ => {}
+        }
+        let block = Arc::make_mut(&mut self.values);
+        for (supplied, offset) in declared.iter().enumerate() {
+            let value = values.next().ok_or_else(|| mismatch(supplied))?;
+            if let Some(offset) = *offset {
+                block[offset] = value;
+            }
+        }
+        match values.count() {
+            0 => Ok(()),
+            beyond => Err(mismatch(declared.len() + beyond)),
+        }
     }
 
     /// The value currently bound to the argument `u` names.
@@ -366,7 +468,7 @@ impl Manifold {
             .map(|(id, data)| (id, Arc::clone(data)))
             .collect();
         let slots: Arc<[BufferDecl]> = linked.buffers.into();
-        let link = Arc::new(Link::new(linked.uniforms));
+        let link = Arc::new(Link::new(linked.uniforms, kernel.uniforms()));
         Self {
             jit: Arc::clone(&linked.kernel),
             codes: Arc::new(Codes {
@@ -943,7 +1045,8 @@ mod tests {
     fn a_block_past_the_old_u16_width_lays_out_and_fills() {
         const ARGUMENTS: usize = u16::MAX as usize + 1_000;
         let handles: Vec<Uniform> = (0..ARGUMENTS).map(|i| Uniform::new(i as f32)).collect();
-        let link = Arc::new(Link::new(handles.iter().map(|u| u.decl()).collect()));
+        let decls: Vec<UniformDecl> = handles.iter().map(|u| u.decl()).collect();
+        let link = Arc::new(Link::new(decls.clone(), &decls));
         let defaults: Vec<f32> = link.decls.iter().map(|d| d.default).collect();
         let mut block = UniformBlock {
             values: Arc::new(defaults),
@@ -969,6 +1072,99 @@ mod tests {
             block.set(stranger, 1.0),
             Err(UnknownUniform(stranger.identity())),
             "a handle that is not an argument is refused, not found by luck"
+        );
+    }
+
+    /// A kernel whose arena declares `a, b, c` in that order and reads `c`
+    /// and `a`: a program whose block holds only what it reads, in the
+    /// order the link walked them.
+    fn declared_three_read_two() -> Kernel {
+        use pixelflow_ir::OpKind;
+        use pixelflow_ir::arena::{ExprArena, UniformIdentity};
+        let mut arena = ExprArena::new();
+        let [a, _b, c] = [1.0, 2.0, 3.0].map(|default| {
+            arena.declare_uniform(UniformDecl {
+                id: UniformIdentity::mint(),
+                default,
+            })
+        });
+        let (a, c) = (arena.push_uniform(a), arena.push_uniform(c));
+        let ten = arena.push_const(10.0);
+        let tens = arena.push_binary(OpKind::Mul, c, ten);
+        let root = arena.push_binary(OpKind::Add, tens, a);
+        Kernel::from_parts(arena, root)
+    }
+
+    /// Values bound by declaration position land on the arguments they
+    /// were declared as, whatever order the link reads them in, and an
+    /// unread argument takes its value without shifting the rest.
+    #[test]
+    fn values_set_by_declaration_position_bind_the_declared_arguments() {
+        let kernel = declared_three_read_two();
+        let program = Manifold::compile(&kernel, [1, 1]);
+        assert_eq!(kernel.uniforms().len(), 3);
+        assert_eq!(program.uniforms().len(), 2, "the code reads a and c");
+        let bound = program.bind(&[]);
+        assert_eq!(bound.eval_at(0.5, 0.5), 31.0, "defaults: 3·10 + 1");
+        let mut block = program.block();
+        block.set_declared([4.0, 99.0, 7.0]).expect("three values");
+        assert_eq!(
+            bound.clone().with_uniforms(&block).eval_at(0.5, 0.5),
+            74.0,
+            "c = 7, a = 4, and b's 99 is read by nothing"
+        );
+        block
+            .set_declared([0.5, 0.0, 2.0])
+            .expect("the same block, again");
+        assert_eq!(bound.with_uniforms(&block).eval_at(0.5, 0.5), 20.5);
+    }
+
+    /// Values that are not one per declared argument are refused, with both
+    /// counts, and nothing is written: never truncated, never padded.
+    #[test]
+    fn the_wrong_number_of_values_is_refused_and_writes_nothing() {
+        let program = Manifold::compile(&declared_three_read_two(), [1, 1]);
+        let mut block = program.block();
+        for supplied in [0, 2, 4] {
+            let values = vec![5.0; supplied];
+            assert_eq!(
+                block.set_declared(values.iter().copied()),
+                Err(ArityMismatch {
+                    declared: 3,
+                    supplied
+                })
+            );
+            assert_eq!(
+                block.values(),
+                program.block().values(),
+                "{supplied} values"
+            );
+        }
+    }
+
+    /// An iterator that does not know its length is counted as it is
+    /// walked: short or long, it is refused with the count it yielded.
+    #[test]
+    fn an_iterator_of_unknown_length_is_counted_as_it_is_walked() {
+        let program = Manifold::compile(&declared_three_read_two(), [1, 1]);
+        let mut block = program.block();
+        for supplied in [2, 5] {
+            let unknown = (0..supplied).filter(|_| true).map(|i| i as f32);
+            assert_eq!(unknown.size_hint(), (0, Some(supplied)), "not known");
+            assert_eq!(
+                block.set_declared(unknown),
+                Err(ArityMismatch {
+                    declared: 3,
+                    supplied
+                })
+            );
+        }
+        let unknown = (0..3).filter(|_| true).map(|i| i as f32);
+        block.set_declared(unknown).expect("three values");
+        assert_eq!(
+            program.bind(&[]).with_uniforms(&block).eval_at(0.5, 0.5),
+            20.0,
+            "a = 0, b = 1 unread, c = 2"
         );
     }
 

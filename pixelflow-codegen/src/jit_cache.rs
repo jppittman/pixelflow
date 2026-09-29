@@ -17,7 +17,7 @@
 //! resize recompiles, by decision — plus the **canonical form of the
 //! reachable subgraph**: a post-order walk from the root with structurally
 //! equal subterms hash-consed, so neither construction garbage (dead nodes
-//! left behind by `substitute_params` / splicing rebuilds) nor the order a
+//! left behind by `substitute_vars_with` / splicing rebuilds) nor the order a
 //! builder pushed the live nodes in perturbs the key, and logically
 //! identical kernels hit regardless of build history. Keys are compared by
 //! full equality — a hash collision can cause a wasted probe, never wrong

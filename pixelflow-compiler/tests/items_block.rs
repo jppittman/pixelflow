@@ -3,11 +3,12 @@
 //!
 //! What a body *means* is pinned against rustc in `rustc_is_the_oracle.rs`.
 //! This file pins the block's shape: several entries sharing a helper, a
-//! helper applied to shifted coordinates, an entry's parameters bound as a
-//! builder's are, and `if` and `.select` lowering to one node.
+//! helper applied to shifted coordinates, an entry's parameters as its
+//! uniforms, and `if` and `.select` lowering to one node. Records and the
+//! binding times are `binding_times.rs`'s.
 
 use pixelflow_compiler::{kernel, kernel_raw};
-use pixelflow_core::{Kernel, Lattice, Manifold, Uniform};
+use pixelflow_core::{Kernel, Lattice, Manifold};
 use pixelflow_ir::key::canonical;
 
 /// The sample every entry is read at: `X = 3`, `Y = 5`.
@@ -59,21 +60,23 @@ fn applying_a_helper_to_a_shifted_coordinate_warps_it() {
     assert_eq!(bake(&shifted_radius2(0.0, 0.0)), 32.0);
 }
 
-/// An entry's parameters are bound exactly as a builder's are: an `f32`
-/// folds, a `Uniform` handle is an argument of the compiled kernel.
+/// An entry's parameters are its uniforms (plan §1.4): the kernel declares
+/// one per parameter, the call's values its defaults, and a program compiled
+/// once is rebound per call from the entry's `Args` record. This used to
+/// pin the call-site-type rule — an `f32` folded, a `Uniform` handle bound
+/// — and moved its argument through the handle; the handle is gone, and the
+/// assertion is kept, through `Args`.
 #[test]
-fn an_entrys_parameters_bind_as_a_builders_do() {
-    let folded = radius2(1.0, 2.0);
-    assert!(folded.parts().0.uniforms().is_empty());
-
-    let cx = Uniform::new(1.0);
-    let k = radius2(cx, 2.0);
-    assert_eq!(k.parts().0.uniforms(), &[cx.decl()]);
+fn an_entrys_parameters_are_uniforms_rebound_through_args() {
+    let k = radius2(1.0, 2.0);
+    assert_eq!(k.uniforms().len(), 2, "cx and cy");
     assert_eq!(bake(&k), 13.0, "default cx = 1");
 
     let program = Manifold::compile(&k, [1, 1]);
     let mut block = program.block();
-    block.set(cx, 3.0).expect("cx is the argument");
+    Radius2Args { cx: 3.0, cy: 2.0 }
+        .write_into(&mut block)
+        .expect("radius2's arguments");
     let moved = program.bind(&[]).with_uniforms(&block).eval_at(AT.0, AT.1);
     assert_eq!(moved, 9.0, "(3 − 3)² + (5 − 2)²");
 }

@@ -467,6 +467,17 @@ impl Environment {
 
 /// Splicing: copy donor subgraph into `builder`, remapping buffer and uniform
 /// slots into `env` by identity.
+///
+/// Every uniform the donor *declares* joins `env`, in the donor's
+/// declaration order, before any node is copied — read or not, and whatever
+/// order the walk would first reach them in. A kernel's declaration order is
+/// the positional binding of its arguments (`UniformBlock::set_declared`, a
+/// `kernel!` entry's `Args`), so a composition must keep it: the
+/// receiver's declarations, then each operand's, each in its own order. Had
+/// the walk declared them, `c + entry(..)` would hold the entry's arguments
+/// permuted and its unread ones dropped — the same count, bound to the
+/// wrong places. Buffers bind by identity, never by position, so they are
+/// declared as the walk reaches them.
 pub(crate) fn splice(
     builder: &mut Builder<ExprData>,
     env: &mut Environment,
@@ -475,7 +486,11 @@ pub(crate) fn splice(
 ) -> Id {
     let mut table = root.dag().side_table(None);
     let mut buf_map: Vec<Option<BufferId>> = alloc::vec![None; donor_env.buffers.len()];
-    let mut uni_map: Vec<Option<UniformId>> = alloc::vec![None; donor_env.uniforms.len()];
+    let uni_map: Vec<UniformId> = donor_env
+        .uniforms
+        .iter()
+        .map(|decl| env.slot_for_uniform(*decl))
+        .collect();
 
     let mut stack = alloc::vec![(root, false)];
     while let Some((node, expanded)) = stack.pop() {
@@ -495,17 +510,7 @@ pub(crate) fn splice(
                     };
                     ExprData::Buffer(slot)
                 }
-                ExprData::Uniform(u) => {
-                    let slot = match uni_map[u.0 as usize] {
-                        Some(s) => s,
-                        None => {
-                            let s = env.slot_for_uniform(donor_env.uniforms[u.0 as usize]);
-                            uni_map[u.0 as usize] = Some(s);
-                            s
-                        }
-                    };
-                    ExprData::Uniform(slot)
-                }
+                ExprData::Uniform(u) => ExprData::Uniform(uni_map[u.0 as usize]),
                 other => other,
             };
             let child_ids: Vec<Id> = node
@@ -715,6 +720,33 @@ mod tests {
         assert_eq!(target_env.uniforms[0], u_decl);
         let r = target_rooted.entry();
         assert_eq!(r.op(), Some(OpKind::Add));
+    }
+
+    /// A spliced operand's uniforms follow the receiver's in the operand's
+    /// own declaration order — not the order the walk reaches them in, and
+    /// not only the ones it reads — because that order is how arguments
+    /// are bound by position.
+    #[test]
+    fn splice_keeps_the_donors_declaration_order() {
+        let [r, a, b, c] = [1.0, 2.0, 3.0, 4.0].map(|v| crate::Uniform::new(v).decl());
+        let mut donor_b = Builder::new();
+        let mut donor_env = Environment::new();
+        let [sa, _sb, sc] = [a, b, c].map(|decl| donor_env.slot_for_uniform(decl));
+        // `c` is reached first, `a` second, and `b` never.
+        let (uc, ua) = (donor_b.push_uniform(sc), donor_b.push_uniform(sa));
+        let donor_root = donor_b.push_binary(OpKind::Sub, uc, ua);
+        let donor_rooted = donor_b.finish(&[donor_root]);
+
+        let mut target_b = Builder::new();
+        let mut target_env = Environment::new();
+        target_env.slot_for_uniform(r);
+        splice(
+            &mut target_b,
+            &mut target_env,
+            donor_rooted.entry(),
+            &donor_env,
+        );
+        assert_eq!(target_env.uniforms, [r, a, b, c]);
     }
 
     #[test]

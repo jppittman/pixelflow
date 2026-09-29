@@ -84,7 +84,7 @@ pub mod lattice;
 // ============================================================================
 
 pub use fastmath::FastMathGuard;
-pub use pixelflow_ir::{Bits, Kernel, Monoid, Scalar, Uniform};
+pub use pixelflow_ir::{Bits, Kernel, Monoid, Uniform};
 
 // Lattice types: the compiled object, what binding it produces, the domain,
 // and the buffer a collapse fills.
@@ -97,7 +97,8 @@ pub use lattice::cell_grid::{
 };
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub use lattice::manifold::{
-    BoundManifold, MAX_BOUND_BUFFERS, Manifold, PlaneRegion, UniformBlock, UnknownUniform,
+    ArityMismatch, BoundManifold, MAX_BOUND_BUFFERS, Manifold, PlaneRegion, UniformBlock,
+    UnknownUniform,
 };
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub use lattice::union::IndexRange;

@@ -30,21 +30,37 @@
 //! [`integral::monotone_root`], the one definition the rule that closes an
 //! arc's integral reads back.
 //!
+//! An entry's parameters are its uniforms
+//! (docs/plans/2026-09-25-the-language-is-kernel.md §1.4): each scalar — an
+//! `f32` parameter, or one field of a record parameter — is declared as a
+//! uniform, in [`AnalyzedKernel::parameters`]' order, and read through its
+//! `Uniform` leaf. Nothing a call passes is a constant of the program, so
+//! every call of an entry is one program. A declaration here holds a
+//! placeholder default; emission declares each with the call's value.
+//!
+//! An entry with structural parameters lowers to a *template*: its folds
+//! over a range that names one, and its `N as f32`s, are left open
+//! ([`Holes`]) and filled when its host function is instantiated.
+//!
 //! Emission — arena to the `TokenStream` that rebuilds it — is [`crate::emit`].
 
 use crate::PLAN;
 use crate::ast::{
-    BinaryOp, BlockExpr, CastExpr, Expr, FnItem, FoldExpr, IntegralBounds, IntegralExpr,
-    MONOTONE_ROOT, Reduction, Role, Stmt, UnaryOp,
+    BinaryOp, BlockExpr, CastExpr, Expr, FieldExpr, FnItem, FoldExpr, IntegralBounds, IntegralExpr,
+    MONOTONE_ROOT, RecordId, Reduction, Role, Stmt, UnaryOp,
 };
-use crate::sema::{AnalyzedKernel, ConstValue, interval_bounds, range_bounds};
+use crate::sema::{
+    AnalyzedKernel, Bounds, ConstValue, RangeScope, StructuralRange, interval_bounds, range_bounds,
+};
 use crate::symbol::Scopes;
-use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode, UniformDecl, UniformIdentity};
 use pixelflow_ir::integral::{self, ROOT_FLOOR, Rise, RootFloor};
 use pixelflow_ir::kernel::PIXEL_HALF_WIDTH;
 use pixelflow_ir::{Binder, Fold, IntervalFold, Monoid, OpKind, Variance};
 use std::collections::HashMap;
 use std::ops::Range;
+use std::rc::Rc;
+use syn::Ident;
 
 /// DSL method calls that denote a fixed composition of primitive ops rather
 /// than a single [`OpKind`] — `(name, arg_count)`, `arg_count` excluding the
@@ -105,14 +121,18 @@ const AXIS_Y: u8 = 1;
 const PLACEHOLDER_BASE: usize = Variance::VARIABLES as usize;
 
 /// A name in scope while a body is lowered.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Binding {
-    /// A value: a `let`'s node, or a helper's parameter bound to its
-    /// argument's node.
+    /// A value: a `let`'s node, an entry's parameter's uniform, or a
+    /// helper's parameter bound to its argument's node.
     Value(ExprId),
     /// A fold's index, a `usize`: its placeholder `Var` while the fold's
     /// body is built. A body reads it only as `i as f32`.
     Index(ExprId),
+    /// A record: its fields' nodes, in field order — an entry's record
+    /// parameter's uniforms, a helper's record argument, or a `let` alias of
+    /// either. A record has no node of its own.
+    Record(RecordId, Rc<[ExprId]>),
 }
 
 /// What a fold or an integral binds, and the body it binds it in: the name
@@ -145,7 +165,7 @@ fn monoid(reduction: Reduction) -> Monoid {
 /// not the one written. Measured before this bound:
 /// `(16777100..16777300).map(|i| ((i as f32) - 16777000.0) * X).sum()` gave
 /// 39890 at `X = 1`, where rustc gives 39900; below 2²⁴ the two agree.
-const EXACT_INDEX_BOUND: u64 = 1 << f32::MANTISSA_DIGITS;
+pub(crate) const EXACT_INDEX_BOUND: u64 = 1 << f32::MANTISSA_DIGITS;
 
 /// A fold's bounds at the IR's width. `sema` holds a bound in 64 bits, as
 /// the control plane is. The IR narrows it twice: `RangeFold`'s ends are
@@ -203,39 +223,98 @@ fn lowest_free_binder(arena: &ExprArena, body: ExprId) -> Result<Binder, String>
         })
 }
 
-/// Build a `param_name → index` map over the params of an entry.
+/// The default a uniform is declared with here, where no call has supplied
+/// one. Nothing at expansion reads it — a uniform is never folded, and
+/// emission declares each with the call's value — so it is a NaN, which
+/// would poison whatever read it by mistake rather than pass for a number.
+const UNBOUND: f32 = f32::NAN;
+
+/// The first placeholder range end of a template's open fold ([`Holes`]).
+/// Past every bound a known fold can have — [`ir_range`] refuses one past
+/// [`EXACT_INDEX_BOUND`] — so no known fold interns with an open one.
+const HOLE_BASE: u32 = EXACT_INDEX_BOUND as u32 + 1;
+
+/// What a structural entry's template leaves open, for its host function to
+/// fill per instantiation (plan §1.4): each fold whose range names a
+/// structural parameter, and — as `Param(k)` leaves — each `N as f32`,
+/// `k` the parameter's position.
 ///
-/// Indices are dense in declaration order: each becomes a `Param(i)` arena
-/// node, substituted by `substitute_params` with the host function's
-/// arguments in the same order. `Param` holds a `u8`, so more parameters
-/// than it counts is a refusal, not a wrap.
-fn param_indices(entry: &FnItem) -> Result<HashMap<String, u8>, String> {
-    entry
-        .params
-        .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let index = u8::try_from(i).map_err(|_| {
-                format!(
-                    "`{}` declares {} parameters; an entry takes at most {}",
-                    entry.name,
-                    entry.params.len(),
-                    usize::from(u8::MAX) + 1
-                )
-            })?;
-            Ok((p.name.to_string(), index))
-        })
-        .collect()
+/// An open fold is built as any fold is, over the empty placeholder range
+/// `h..h`, `h = HOLE_BASE + k` for the `k`th distinct range text. Two folds
+/// over one range text, of one monoid and one body, are one fold, and are
+/// interned as one; two over different ranges never are. The range lives in
+/// the fold's bits rather than beside a node id because lowering splices a
+/// fold's arena into its enclosing one, which renumbers every id.
+#[derive(Debug, Default)]
+pub struct Holes {
+    ranges: Vec<StructuralRange>,
 }
 
-/// Lower an entry's body into `arena`, inlining the block's helpers and
-/// folding its `const`s. Children are recursed first so that parent nodes
-/// always reference already-interned [`ExprId`]s.
-pub fn lower_entry(
-    entry: &FnItem,
-    analyzed: &AnalyzedKernel,
-    arena: &mut ExprArena,
-) -> Result<ExprId, String> {
+impl Holes {
+    /// The placeholder range an open fold over `range` is built with.
+    fn placeholder(&mut self, range: StructuralRange) -> Result<Range<u32>, String> {
+        let text = range.text();
+        let index = match self.ranges.iter().position(|r| r.text() == text) {
+            Some(index) => index,
+            None => {
+                self.ranges.push(range);
+                self.ranges.len() - 1
+            }
+        };
+        let end = u32::try_from(index)
+            .ok()
+            .and_then(|index| HOLE_BASE.checked_add(index))
+            .ok_or_else(|| {
+                format!(
+                    "more distinct ranges over structural parameters than a placeholder can \
+                     name ({index})"
+                )
+            })?;
+        Ok(end..end)
+    }
+
+    /// The range an open fold of this template is over, or `None` if `fold`
+    /// is a known one.
+    ///
+    /// # Panics
+    ///
+    /// On a placeholder range no hole names — one from another template, or
+    /// a fold a pass rebuilt. Emitted as it stands it would be an empty
+    /// fold, its monoid's identity, with plausible pixels.
+    pub fn range_of(&self, fold: Fold) -> Option<&StructuralRange> {
+        let Fold::Range(range) = fold else {
+            return None;
+        };
+        let index = range.range().start.checked_sub(HOLE_BASE)?;
+        let hole = usize::try_from(index)
+            .ok()
+            .and_then(|index| self.ranges.get(index));
+        Some(hole.unwrap_or_else(|| {
+            panic!(
+                "kernel!: a fold over the placeholder range {:?} that no structural range of \
+                 this entry names",
+                range.range()
+            )
+        }))
+    }
+}
+
+/// An entry lowered: its arena and root, and what the arena leaves open if
+/// it is a template.
+pub struct Lowered {
+    pub arena: ExprArena,
+    pub root: ExprId,
+    pub holes: Holes,
+}
+
+/// Lower an entry's body, inlining the block's helpers and folding its
+/// `const`s. Its parameters are declared first, as uniforms, in
+/// [`AnalyzedKernel::parameters`]' order, so the arena's uniform table is
+/// the entry's declaration order — every scalar, read or not, so that a
+/// positional binding cannot shift when a parameter goes unread. Children
+/// are recursed first so that parent nodes always reference
+/// already-interned [`ExprId`]s.
+pub fn lower_entry(entry: &FnItem, analyzed: &AnalyzedKernel) -> Result<Lowered, String> {
     let helpers = analyzed
         .def
         .fns
@@ -243,47 +322,69 @@ pub fn lower_entry(
         .filter(|f| f.role() == Role::Helper)
         .map(|f| (f.name.to_string(), f))
         .collect();
+    let mut arena = ExprArena::new();
+    let mut locals = Scopes::default();
+    for parameter in analyzed.parameters(entry) {
+        let mut uniforms = parameter.scalars().map(|_| {
+            let slot = arena.declare_uniform(UniformDecl {
+                id: UniformIdentity::mint(),
+                default: UNBOUND,
+            });
+            arena.push_uniform(slot)
+        });
+        let binding = match parameter.record {
+            Some((record, _)) => Binding::Record(record, uniforms.collect()),
+            None => Binding::Value(uniforms.next().expect("a scalar parameter is one uniform")),
+        };
+        locals.bind(parameter.name.to_string(), binding);
+    }
     let mut lowering = Lowering {
-        program: Program {
-            consts: &analyzed.consts,
-            helpers,
-        },
+        program: Program { analyzed, helpers },
         frame: Frame {
             role: entry.role(),
-            params: param_indices(entry)?,
-            locals: Scopes::default(),
+            structural: &entry.structural,
+            locals,
         },
-        arena,
+        arena: &mut arena,
         open_folds: 0,
+        holes: Holes::default(),
     };
-    lowering.lower(&entry.body)
+    let root = lowering.lower(&entry.body)?;
+    let holes = lowering.holes;
+    Ok(Lowered { arena, root, holes })
 }
 
 /// The block's items: what every body can name besides its own scope.
 struct Program<'a> {
-    consts: &'a HashMap<String, ConstValue>,
+    /// The block, analyzed: its records and its `const`s' values.
+    analyzed: &'a AnalyzedKernel,
     helpers: HashMap<String, &'a FnItem>,
 }
 
-/// The function being lowered: an entry's parameters by index, and the
+/// The function being lowered: its structural parameters, and the bindings
+/// in scope — its parameters in the function's own scope, then the
 /// `let`-bound locals and fold indices of the blocks being walked (one scope
 /// per block, and one per fold body, with Rust's lexical scoping). An
-/// inlined helper's parameters are locals of its own frame, bound to the
-/// argument nodes.
-struct Frame {
+/// entry's parameters are bound to their uniforms; an inlined helper's, to
+/// its argument nodes.
+struct Frame<'a> {
     role: Role,
-    params: HashMap<String, u8>,
+    /// An entry's structural parameters; a helper has none.
+    structural: &'a [Ident],
     locals: Scopes<Binding>,
 }
 
 /// State threaded through the AST → arena walk.
 struct Lowering<'a> {
     program: Program<'a>,
-    frame: Frame,
+    frame: Frame<'a>,
     arena: &'a mut ExprArena,
     /// How many folds' and integrals' bodies are being built, across
     /// inlined helpers too: the depth that picks the next one's placeholder.
     open_folds: usize,
+    /// What a template leaves open: the ranges of its folds over structural
+    /// parameters.
+    holes: Holes,
 }
 
 impl Lowering<'_> {
@@ -417,6 +518,8 @@ impl Lowering<'_> {
 
             Expr::Cast(cast) => self.lower_cast(cast),
 
+            Expr::Field(field) => self.lower_field(field),
+
             // Parentheses are transparent - just recurse into the inner expression
             Expr::Paren(inner) => self.lower(inner),
 
@@ -426,8 +529,14 @@ impl Lowering<'_> {
 
     /// `⊕_{i ∈ [lo, hi)} body` as one `Reduce` over a [`Fold::Range`].
     fn lower_fold(&mut self, fold: &FoldExpr) -> Result<ExprId, String> {
-        let (lo, hi) = range_bounds(&fold.range, self.program.consts).map_err(|e| e.to_string())?;
-        let range = ir_range(lo, hi)?;
+        let scope = RangeScope {
+            consts: &self.program.analyzed.consts,
+            structural: self.frame.structural,
+        };
+        let range = match range_bounds(&fold.range, scope).map_err(|e| e.to_string())? {
+            Bounds::Known(lo, hi) => ir_range(lo, hi)?,
+            Bounds::Structural(range) => self.holes.placeholder(range)?,
+        };
         let monoid = monoid(fold.reduction);
         let index = Abstraction {
             name: &fold.binder,
@@ -448,7 +557,7 @@ impl Lowering<'_> {
     fn lower_integral(&mut self, integral: &IntegralExpr) -> Result<ExprId, String> {
         let (lo, hi) = match &integral.bounds {
             IntegralBounds::Written(range) => {
-                interval_bounds(range, self.program.consts).map_err(|e| e.to_string())?
+                interval_bounds(range, &self.program.analyzed.consts).map_err(|e| e.to_string())?
             }
             IntegralBounds::Pixel => (-PIXEL_HALF_WIDTH, PIXEL_HALF_WIDTH),
         };
@@ -547,23 +656,71 @@ impl Lowering<'_> {
 
     /// `i as f32`. A fold's index is an `f32` lane already, so its
     /// conversion is its binder's `Var`; a `usize` const is its value's
-    /// `f32`, rounded as Rust's `as` rounds it.
+    /// `f32`, rounded as Rust's `as` rounds it; a structural parameter is a
+    /// template's `Param` hole, which its host function fills with the same
+    /// `N as f32`.
     fn lower_cast(&mut self, cast: &CastExpr) -> Result<ExprId, String> {
         let Some(name) = cast.named() else {
             return Err("`as f32` converts a `usize`, which is a name".to_string());
         };
-        let name = name.to_string();
-        if let Some(&binding) = self.frame.locals.lookup(&name) {
+        if let Some(binding) = self.frame.locals.lookup(&name.to_string()) {
             return match binding {
-                Binding::Index(index) => Ok(index),
-                Binding::Value(_) => Err(format!(
+                Binding::Index(index) => Ok(*index),
+                Binding::Value(_) | Binding::Record(..) => Err(format!(
                     "`{name} as f32`: `{name}` is a value, and `as f32` converts a `usize`"
                 )),
             };
         }
-        match self.program.consts.get(&name) {
+        if let Some(position) = self.frame.structural.iter().position(|n| n == name) {
+            // Borrowed: `Param(u8)` is a rewrite rule's metavariable too, and
+            // a `u8` is narrower than the control plane allows. It is loud
+            // past 256 rather than wrapping, and it goes with `Param` when
+            // D2 of the plan deletes it — a structural hole wants a leaf of
+            // its own then.
+            let hole = u8::try_from(position).map_err(|_| {
+                format!(
+                    "`{name} as f32`: an entry reads at most {} structural parameters as values, \
+                     the width of the IR's `Param` leaf",
+                    usize::from(u8::MAX) + 1
+                )
+            })?;
+            return Ok(self.arena.push_param(hole));
+        }
+        match self.program.analyzed.consts.get(&name.to_string()) {
             Some(&ConstValue::Usize(count)) => Ok(self.arena.push_const(count as f32)),
             _ => Err(format!("`{name} as f32`: `{name}` is not a `usize`")),
+        }
+    }
+
+    /// `p.x0`: the node of one field of a record binding.
+    fn lower_field(&mut self, field: &FieldExpr) -> Result<ExprId, String> {
+        let (record, fields) = self.record(&field.base)?;
+        let def = self.program.analyzed.def.record(record);
+        def.fields
+            .iter()
+            .position(|f| f.name == field.member)
+            .map(|index| fields[index])
+            .ok_or_else(|| format!("no field `{}` on the record `{}`", field.member, def.name))
+    }
+
+    /// The record `expr` names, through any parentheses: a record is only
+    /// ever written by name (`sema` refuses anything else).
+    fn record(&self, expr: &Expr) -> Result<(RecordId, Rc<[ExprId]>), String> {
+        match self.record_named(expr) {
+            Some(record) => Ok(record),
+            None => Err(format!(
+                "a record, by name, where the body has `{}`",
+                expr.named()
+                    .map_or_else(|| "an expression".to_string(), ToString::to_string)
+            )),
+        }
+    }
+
+    /// The record binding `expr` names, if it names one.
+    fn record_named(&self, expr: &Expr) -> Option<(RecordId, Rc<[ExprId]>)> {
+        match self.frame.locals.lookup(&expr.named()?.to_string())? {
+            Binding::Record(record, fields) => Some((*record, Rc::clone(fields))),
+            Binding::Value(_) | Binding::Index(_) => None,
         }
     }
 
@@ -601,12 +758,13 @@ impl Lowering<'_> {
     }
 
     /// β-reduction: `helper(args)` is the helper's body with each parameter
-    /// bound to its argument's node.
+    /// bound to its argument's node, or to a record argument's fields.
     ///
     /// The arguments are lowered in the caller's frame, once each, so an
     /// argument used twice in the body is one node. The body is lowered in a
     /// frame of its own: the helper's parameters are its base scope, and
-    /// nothing of the caller's — no local, no entry parameter — is visible.
+    /// nothing of the caller's — no local, no entry parameter, no structural
+    /// parameter — is visible.
     fn inline(&mut self, helper: &FnItem, args: &[Expr]) -> Result<ExprId, String> {
         if args.len() != helper.params.len() {
             return Err(format!(
@@ -618,12 +776,15 @@ impl Lowering<'_> {
         }
         let mut locals = Scopes::default();
         for (param, arg) in helper.params.iter().zip(args) {
-            let id = self.lower(arg)?;
-            locals.bind(param.name.to_string(), Binding::Value(id));
+            let binding = match self.record_named(arg) {
+                Some((record, fields)) => Binding::Record(record, fields),
+                None => Binding::Value(self.lower(arg)?),
+            };
+            locals.bind(param.name.to_string(), binding);
         }
         let callee = Frame {
             role: Role::Helper,
-            params: HashMap::new(),
+            structural: &[],
             locals,
         };
         // The frame is swapped and the fold depth is not: a helper's fold
@@ -636,8 +797,9 @@ impl Lowering<'_> {
         body
     }
 
-    /// The node a name refers to: the innermost `let` binding of it in scope,
-    /// else a parameter, else a `const`, else a coordinate.
+    /// The node a name refers to: the innermost binding of it in scope — a
+    /// `let`, a fold's index, a parameter — else a `const`, else a
+    /// coordinate.
     ///
     /// Bindings come first because that is what lexical scoping means. `sema`
     /// refuses a `let` named X or Y, so today the order only decides a
@@ -647,23 +809,24 @@ impl Lowering<'_> {
     /// input is one refactor away from that bug again. For the same reason a
     /// coordinate in a helper is refused here too, not only in `sema`.
     fn resolve(&mut self, name: &str) -> Result<ExprId, String> {
-        if let Some(&binding) = self.frame.locals.lookup(name) {
+        if let Some(binding) = self.frame.locals.lookup(name) {
             return match binding {
-                Binding::Value(id) => Ok(id),
+                Binding::Value(id) => Ok(*id),
                 Binding::Index(_) => Err(format!(
                     "`{name}` is a fold's index, a `usize`, where a value is expected: \
                      `{name} as f32`"
                 )),
+                Binding::Record(..) => Err(format!(
+                    "`{name}` is a record, where a value is expected: read a field, \
+                     `{name}.x0`"
+                )),
             };
         }
-        // The same order sema documents: a binding, then a parameter, then
-        // a const, then the coordinates. Sema refuses a parameter named X or
-        // Y, so the two stages agree without one relying on the other's
-        // refusal.
-        if let Some(&idx) = self.frame.params.get(name) {
-            return Ok(self.arena.push_param(idx));
-        }
-        match self.program.consts.get(name) {
+        // The same order sema documents: a binding, then a const, then a
+        // structural parameter, then the coordinates. Sema refuses a
+        // parameter named X or Y, so the two stages agree without one
+        // relying on the other's refusal.
+        match self.program.analyzed.consts.get(name) {
             Some(&ConstValue::F32(value)) => return Ok(self.arena.push_const(value)),
             Some(ConstValue::Usize(_)) => {
                 return Err(format!(
@@ -671,6 +834,12 @@ impl Lowering<'_> {
                 ));
             }
             None => {}
+        }
+        if self.frame.structural.iter().any(|n| n == name) {
+            return Err(format!(
+                "`{name}` is a structural parameter, a `usize`, where a value is expected: \
+                 `{name} as f32`"
+            ));
         }
         let axis = match name {
             "X" => AXIS_X,
@@ -699,12 +868,14 @@ impl Lowering<'_> {
         for stmt in &block.stmts {
             match stmt {
                 // The initializer is lowered before the binding exists, so it
-                // sees whatever the name meant before: `let a = a + 1.0;`.
+                // sees whatever the name meant before: `let a = a + 1.0;`. A
+                // record is aliased: the new name binds the same fields.
                 Stmt::Let(let_stmt) => {
-                    let id = self.lower(&let_stmt.init)?;
-                    self.frame
-                        .locals
-                        .bind(let_stmt.name.to_string(), Binding::Value(id));
+                    let binding = match self.record_named(&let_stmt.init) {
+                        Some((record, fields)) => Binding::Record(record, fields),
+                        None => Binding::Value(self.lower(&let_stmt.init)?),
+                    };
+                    self.frame.locals.bind(let_stmt.name.to_string(), binding);
                 }
                 // A non-binding statement has no value to thread; lower it so
                 // any nested error surfaces, then discard the id.
@@ -732,7 +903,7 @@ mod tests {
     use super::*;
     use crate::parser::parse;
     use crate::sema::Ty;
-    use pixelflow_ir::arena::ExprNode;
+    use pixelflow_ir::arena::{ExprNode, UniformId};
     use quote::quote;
 
     /// Lower a block straight from the parser, with no `sema` in front: what
@@ -763,8 +934,7 @@ mod tests {
             .iter()
             .find(|f| f.role() == Role::Entry)
             .expect("one entry");
-        let mut arena = ExprArena::new();
-        let root = lower_entry(entry, &unanalyzed, &mut arena)?;
+        let Lowered { arena, root, .. } = lower_entry(entry, &unanalyzed)?;
         Ok((arena, root))
     }
 
@@ -799,9 +969,84 @@ mod tests {
             "inner `r` is X"
         );
         assert!(
-            matches!(arena.node(outer), ExprNode::Param(0)),
-            "outer `r` is the parameter"
+            matches!(arena.node(outer), ExprNode::Uniform(UniformId(0))),
+            "outer `r` is the parameter's uniform"
         );
+    }
+
+    /// Every parameter is a uniform, declared in order — a record's fields
+    /// in field order — whether or not the body reads it; a field read is
+    /// its field's uniform, through a `let` alias and a helper's record
+    /// parameter alike.
+    #[test]
+    fn every_parameter_is_a_uniform_declared_in_order() {
+        let (arena, root) = lowered(quote! {
+            struct Pair { a: f32, b: f32 }
+            fn second(p: Pair) -> f32 { p.b }
+            pub fn f(unread: f32, p: Pair, r: f32) -> f32 { let q = p; second(q) * r }
+        });
+        assert_eq!(
+            arena.uniforms().len(),
+            4,
+            "unread, p.a, p.b, r: every scalar is declared"
+        );
+        let ExprNode::Binary(OpKind::Mul, field, r) = arena.node(root) else {
+            panic!("expected the product, got {}", arena.display(root));
+        };
+        assert!(
+            matches!(arena.node(field), ExprNode::Uniform(UniformId(2))),
+            "`second(q)` is p.b, the third scalar"
+        );
+        assert!(matches!(arena.node(r), ExprNode::Uniform(UniformId(3))));
+    }
+
+    /// A template's `N as f32` is its structural parameter's `Param` hole,
+    /// and a fold over a range naming one is built over a placeholder its
+    /// holes map back to the range; a known fold is not a hole.
+    #[test]
+    fn a_structural_parameter_leaves_the_template_open() {
+        let def = parse(quote! {
+            pub fn f<const N: usize, const M: usize>() -> f32 {
+                (0..M * 2).map(|i| X * (i as f32)).sum::<f32>()
+                    + (0..3).map(|i| i as f32).sum::<f32>()
+                    + (M as f32)
+            }
+        })
+        .expect("parses");
+        let analyzed = crate::sema::analyze(def).expect("analyzes");
+        let Lowered { arena, root, holes } =
+            lower_entry(&analyzed.def.fns[0], &analyzed).expect("lowers");
+        let mut open = Vec::new();
+        let mut known = Vec::new();
+        let mut params = Vec::new();
+        for (_, node) in arena.nodes() {
+            match node {
+                ExprNode::Reduce { fold, .. } => match holes.range_of(fold) {
+                    Some(range) => open.push(range.text()),
+                    None => known.push(fold),
+                },
+                ExprNode::Param(k) => params.push(k),
+                _ => {}
+            }
+        }
+        assert_eq!(open, ["0..(M * 2)"]);
+        assert_eq!(
+            known.len(),
+            1,
+            "`0..3` is known here: {}",
+            arena.display(root)
+        );
+        assert_eq!(params, [1], "`M` is the second structural parameter");
+    }
+
+    /// A placeholder range no hole names is a front-end bug, never a known
+    /// fold: emitted as it stands it would be empty, its monoid's identity.
+    #[test]
+    #[should_panic(expected = "no structural range of this entry names")]
+    fn a_placeholder_no_hole_names_is_refused() {
+        let binder = Binder::all().next().expect("a binder");
+        let stray = Fold::new(Monoid::SUM, binder, HOLE_BASE..HOLE_BASE);
+        let _unreachable = Holes::default().range_of(stray);
     }
 
     /// A literal lowers to the value the parser gave it, bit for bit.

@@ -8,15 +8,17 @@
 //! | Class      | Binding Time        | Arena Representation | Example |
 //! |------------|---------------------|----------------------|---------|
 //! | Intrinsic  | Collapse time       | `Var(0)`, `Var(1)`   | X, Y    |
-//! | Parameter  | Construction time   | `Param(i)`           | cx, r   |
+//! | Parameter  | Per call (uniform)  | `Uniform(slot)`, one per record field | cx, p |
+//! | Structural | Instantiation       | a count; `N as f32` is `Const(N)` | N |
 //! | Const      | Expansion time      | `Const(v)`, or a count | PI, N |
-//! | Local      | Expression scope    | A shared `ExprId`    | dx, dy  |
+//! | Local      | Expression scope    | A shared `ExprId`, or a record's fields | dx, q |
 //! | Index      | A fold's body       | The fold's binder `Var` | i    |
 //! | Variable   | An integral's body  | The integral's binder `Var` | u |
 //!
-//! A helper's parameters are a fourth thing at lowering — the argument's own
-//! node, bound by name where the helper is inlined — but to `sema` they are
-//! parameters like any other: a name with a type.
+//! A helper's parameters are a further thing at lowering — the argument's
+//! own node, or a record argument's fields, bound by name where the helper
+//! is inlined — but to `sema` they are parameters like any other: a name
+//! with a type.
 //!
 //! ## Intrinsic Coordinates
 //!
@@ -28,10 +30,14 @@
 //!
 //! ## Parameter Symbols
 //!
-//! An entry's parameters become the host function's arguments: `|cx: f32,
-//! cy: f32|` produces `move |cx: f32, cy: f32| -> Kernel`, and each reference
-//! in the body is a `Param(i)` arena node the builder substitutes with the
-//! argument.
+//! An entry's parameters are its uniforms
+//! (docs/plans/2026-09-25-the-language-is-kernel.md §1.4): `|cx: f32, cy:
+//! f32|` produces `move |cx: f32, cy: f32| -> Kernel`, whose kernel declares
+//! one uniform per parameter with the call's value as its default, and a
+//! reference in the body is that uniform's `Uniform` leaf. A record
+//! parameter is one uniform per field. An entry's structural parameters
+//! (`const N: usize`) are counts, fixed per instantiation of its host
+//! function.
 //!
 //! ## Scoping
 //!
@@ -64,6 +70,10 @@ pub enum SymbolKind {
 
     /// A `const` item, evaluated at expansion.
     Const,
+
+    /// An entry's structural parameter (`const N: usize`): a count, fixed
+    /// when its host function is instantiated.
+    Structural,
 
     /// Local variable introduced by `let`.
     /// Scoped to the containing block.
@@ -180,6 +190,11 @@ impl SymbolTable {
     /// Register a `const` item: an `f32`, or a `usize` count.
     pub fn register_const(&mut self, name: &str, ty: Ty) {
         self.bind(name, SymbolKind::Const, ty);
+    }
+
+    /// Register an entry's structural parameter, a `usize` count.
+    pub fn register_structural(&mut self, name: &str) {
+        self.bind(name, SymbolKind::Structural, Ty::Usize);
     }
 
     /// Register a local variable in the innermost scope.
