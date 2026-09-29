@@ -436,10 +436,8 @@ const ROUNDOFFS: f64 = 8.0;
 /// integral is `∫_{1/3}^{1} (3u/2 − ½) du = ⅓`. `ClampMoment` closes it;
 /// the one-point quadrature that legalizes an open integral would read the
 /// ramp at the midpoint, `¼`, so `⅓` is the closed form's alone. (`∫₀¹ u²`
-/// would say the same, and closes by no rule the e-graph has: the power
-/// moment waits for a kernel that needs it, `pixelflow-search`'s
-/// `egraph/integral.rs`. Measured: its extraction keeps the integral, and
-/// the bake reads `0.25`.)
+/// would say the same, and closes by no rule the e-graph has:
+/// `the_power_moment_is_open_and_baked_by_quadrature_today` pins it open.)
 #[test]
 fn the_integral_of_a_ramp_is_a_third() {
     let (slope, offset, lo, hi) = (1.5_f64, -0.5_f64, 0.0_f64, 1.0_f64);
@@ -464,6 +462,44 @@ fn the_integral_of_a_ramp_is_a_third() {
             assert!(
                 error <= tolerance,
                 "{name}: texel {index} is {texel}, error {error:e} > {tolerance:e}"
+            );
+        }
+    }
+}
+
+/// `∫₀¹ u² du = ⅓` does not close today, and this pins that it does not.
+/// No rule the e-graph has closes a power moment — `pixelflow-search`'s
+/// `egraph/integral.rs` says the power-moment rule waits for a kernel that
+/// needs it — so extraction keeps the integral (`unclosed_integrals` is
+/// `Some(1)`, the predicate `assert_closed` reads), and the bake reads the
+/// one-point quadrature that legalizes an open integral: the integrand at
+/// the interval's midpoint times its length, `(½)² · 1 = ¼`, exactly.
+///
+/// That is the language as specified, not a wrong answer: whether an
+/// integral closes is the e-graph's, and quadrature is what an open one
+/// bakes to. It is pinned so it cannot change unseen. **A power-moment rule
+/// landing fails this test on purpose**: then change it to assert
+/// `assert_closed` and `⅓` to the area oracle's tolerance, as
+/// `the_integral_of_a_ramp_is_a_third` does.
+#[test]
+fn the_power_moment_is_open_and_baked_by_quadrature_today() {
+    let midpoint_quadrature = 0.5_f32 * 0.5 * 1.0;
+    for (name, k) in [
+        ("kernel_raw!", kernel_raw!(|| integral(0.0..1.0, |u| u * u))),
+        ("kernel!", kernel!(|| integral(0.0..1.0, |u| u * u))),
+    ] {
+        let (arena, root) = k.parts();
+        assert_eq!(integrals(arena, root), 1, "{name}: one integral written");
+        assert_eq!(
+            unclosed_integrals(arena, root, frame_shape()),
+            Some(1),
+            "{name}: a power moment closed; assert `⅓` here now (see this test's doc)"
+        );
+        let baked = Lattice::frame(FRAME.0, FRAME.1).bake(&k);
+        for (index, &texel) in baked.buffer().iter().enumerate() {
+            assert_eq!(
+                texel, midpoint_quadrature,
+                "{name}: texel {index} is not the midpoint quadrature `¼`"
             );
         }
     }

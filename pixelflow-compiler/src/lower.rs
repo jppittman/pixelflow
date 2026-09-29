@@ -605,8 +605,8 @@ impl Lowering<'_> {
     ) -> Result<ExprId, String> {
         if self.open_folds >= Binder::COUNT {
             return Err(format!(
-                "folds nested more than {} deep: the IR binds at most that many indices at once \
-                 (`Binder::COUNT`)",
+                "folds and integrals nested more than {} deep: the IR binds at most that many \
+                 indices and variables at once (`Binder::COUNT`)",
                 Binder::COUNT
             ));
         }
@@ -1259,25 +1259,39 @@ mod tests {
     }
 
     /// Folds nest as deep as the IR has binders, and no deeper: one more is
-    /// refused, not a panic.
+    /// refused, not a panic. An integral takes a binder as a fold does, so
+    /// integrals count toward the depth, alone or among folds.
     #[test]
     fn folds_nest_as_deep_as_the_ir_has_binders() {
-        let nest = |depth: usize| {
-            let mut body = quote! { X };
-            for _ in 0..depth {
-                body = quote! { (0..1).map(|i| #body).sum::<f32>() };
-            }
-            quote! { || #body }
+        use proc_macro2::TokenStream;
+        let fold = |body: TokenStream| quote! { (0..1).map(|i| #body).sum::<f32>() };
+        let integral = |body: TokenStream| quote! { integral(0.0..1.0, |u| #body) };
+        let nest = |depth: usize, around: &dyn Fn(TokenStream) -> TokenStream| {
+            (0..depth).fold(quote! { X }, |body, _| around(body))
         };
-        let (arena, root) = lowered(nest(Binder::COUNT));
-        let ExprNode::Reduce { fold, .. } = arena.node(root) else {
-            panic!("expected a fold");
-        };
-        assert_eq!(usize::from(fold.binder().slot()), Binder::COUNT - 1);
-        let Err(err) = lower_unanalyzed(nest(Binder::COUNT + 1)) else {
-            panic!("one fold deeper than the index space");
-        };
-        assert!(err.contains("nested more than"), "got: {err}");
+        let closure = |body: TokenStream| quote! { || #body };
+        for around in [&fold as &dyn Fn(TokenStream) -> TokenStream, &integral] {
+            let (arena, root) = lowered(closure(nest(Binder::COUNT, around)));
+            let ExprNode::Reduce { fold: outer, .. } = arena.node(root) else {
+                panic!("expected a fold or an integral");
+            };
+            assert_eq!(usize::from(outer.binder().slot()), Binder::COUNT - 1);
+        }
+        let too_deep = [
+            closure(nest(Binder::COUNT + 1, &fold)),
+            closure(nest(Binder::COUNT + 1, &integral)),
+            closure(integral(nest(Binder::COUNT, &fold))),
+            closure(fold(nest(Binder::COUNT, &integral))),
+        ];
+        for input in too_deep {
+            let Err(err) = lower_unanalyzed(input) else {
+                panic!("one binder deeper than the IR has");
+            };
+            assert!(
+                err.contains("folds and integrals nested more than"),
+                "got: {err}"
+            );
+        }
     }
 
     /// Helpers calling helpers: each call is its own inlining, over its own
