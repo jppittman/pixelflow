@@ -28,12 +28,22 @@ macro_rules! section_1_7 {
             const PIXEL_CENTER: f32 = 0.5;
             const PIXEL_HALF: f32 = 0.5;
             const ONE_THIRD: f32 = 1.0 / 3.0;
+            const ROOT_FLOOR: f32 = 1.0 / 1_267_650_600_228_229_401_496_703_205_376.0;
             const COVERAGE_SNAP: f32 = 1.0 / 1024.0;
             const NEARLY_ONE: f32 = 1.0 - COVERAGE_SNAP;
 
             fn coverage(f: f32) -> f32 {
                 let c = f.abs().min(1.0);
                 if c >= NEARLY_ONE { 1.0 } else if c <= COVERAGE_SNAP { 0.0 } else { c }
+            }
+
+            /// `τ(δ) = δ / max(step + √max(step² + bend·δ, 0), ROOT_FLOOR)`:
+            /// the parameter at which the rise `t·(2·step + bend·t)` reaches
+            /// the height `δ`, the reciprocal exact —
+            /// `fonts/loop_blinn.rs`'s `Rise::monotone_root`, which carries
+            /// its law.
+            fn monotone_root(delta: f32, step: f32, bend: f32) -> f32 {
+                delta * (1.0 / (step + (step * step + bend * delta).max(0.0).sqrt()).max(ROOT_FLOOR))
             }
 
             /// `2·step + bend·s`: a rise `q(t) = t·(2·step + bend·t)` is

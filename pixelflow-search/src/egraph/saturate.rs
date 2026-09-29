@@ -237,9 +237,8 @@ pub const CLASSICAL_CLASS_FLOOR: usize = 5_000;
 /// is a closed-form area with no discriminant
 /// (`docs/results/2026-09-23-glyph-is-a-formula.md`) — and the calibration
 /// went with it: the sweep's `'8'` inserted 3,405 classes where a glyph now
-/// inserts 103, and none of its kernels carried an integral for the closing
-/// phase to spend the cap on. The ceiling moves when the sweep is
-/// re-run on today's kernels, not before.
+/// inserts 103. The ceiling moves when the sweep is re-run on today's
+/// kernels, not before.
 pub const CLASSICAL_CLASS_CEILING: usize = CLASSICAL_CLASS_FLOOR;
 
 /// The ceiling the 2026-09-08 sweep calibrated the rule under — measured on

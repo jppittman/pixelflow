@@ -158,8 +158,7 @@ pub enum RewriteAction {
     DiffOfSquares { a: EClassId, b: EClassId },
     /// Build a right-hand side the rule planned, and union it with the
     /// matched class: every fold rule's action (`PeelFold`, `HalveFold`,
-    /// `FactorFold`) and every integration rule's (`NarrowInterval`,
-    /// `ClampMoment`, `ArcMoment`).
+    /// `FactorFold`).
     ///
     /// A plan of nodes carrying their own resolved `Op`s rather than an
     /// arena template, because what these rules build is, in part, a copy of

@@ -221,20 +221,9 @@ pub struct EGraph {
 /// 1-hop scheme would silently never re-check it — under-saturation that no
 /// correctness test can see, only a comparison against the un-skipped
 /// extraction cost can. The runtime tier's `FactorFold` (outside
-/// `all_rules`, in `fold_rules`) is depth 2 as well for the product at a
-/// body's top: it reads a fold's body class and then its operands' variance
-/// facts, and a fact changes only when its own class is unioned, which bumps
-/// that class's `last_changed`.
-///
-/// The integration rules (`integral`) and `FactorFold`'s n-ary flattening
-/// read deeper — a fold, its body's factors, an indicator's comparison, the
-/// comparison's affine operands. Audited by this doc's own method on the
-/// area oracle's kernels (`pixelflow-core/tests/area_oracle.rs`): with every
-/// class dirty for every rule, the same integrals close and every texel's
-/// error is unchanged, because each of their triggers is a class the
-/// derivation itself just created, or a class one hop below a fold.
-/// Anything this tracker misses deeper is an opportunity missed, never a
-/// wrong rewrite.
+/// `all_rules`, in `fold_rules`) is depth 2 as well: it reads a fold's body
+/// class and then its operands' variance facts, and a fact changes only when
+/// its own class is unioned, which bumps that class's `last_changed`.
 ///
 /// This is a single, uniform, crate-wide constant rather than a per-rule
 /// depth precisely so a future rule cannot silently exceed it the way a
@@ -450,20 +439,6 @@ pub enum SaturationStop {
     /// means the same thing to every ordering policy, and so the one a
     /// research arm can hold two policies to.
     ApplicationBudget,
-}
-
-/// The limits every phase of one saturation run shares: rounds, classes,
-/// and the wall-clock ceiling measured from the run's start. A later phase
-/// gets the rounds an earlier one left (`EGraph::saturate_bounded`), so a
-/// run never reports more rounds than its caller allowed. The application
-/// budget is the graph's own (`EGraph::application_cap`), so it is shared by
-/// construction.
-#[derive(Clone, Copy)]
-struct RoundLimits {
-    max_iters: usize,
-    max_classes: usize,
-    start: std::time::Instant,
-    timeout: Option<std::time::Duration>,
 }
 
 /// Result of one [`EGraph::saturate_with_limits`] run: how many rounds it
@@ -1382,21 +1357,6 @@ impl EGraph {
     /// The one rewrite-until-budget-exhausted loop. Every saturation entry
     /// point in this crate funnels here rather than re-deciding, in a second
     /// copy, when to stop.
-    ///
-    /// **Integrals close first.** When the graph holds an integral, the
-    /// integration family (`integral::closes_integrals`) runs to a fixpoint
-    /// before the whole rule set does, under the same limits — rounds, classes,
-    /// applications, clock — the derivation of a closed form is three rounds
-    /// of that family and nothing else, and a graph that reaches its class
-    /// cap in the first round of the full set would otherwise stop it
-    /// half-closed. The phase is decided by the graph and the rule set alone,
-    /// so it is as deterministic as the rest of the run; a graph with no
-    /// integral skips it, and saturates exactly as it did before it existed.
-    /// Its rounds and unions are reported with the run's, and a budget it
-    /// exhausts ends the run there. The rounds it takes come out of
-    /// `max_iters`, as its applications come out of `max_applications`: a
-    /// caller that asked for `n` rounds is told of at most `n`, which is what
-    /// an accountant of rounds across calls (`run_anytime_curve`) subtracts.
     fn saturate_bounded(
         &mut self,
         max_iters: usize,
@@ -1411,89 +1371,25 @@ impl EGraph {
         // the shared loop rather than in `saturate_with_limits`, so
         // `saturate_budgeted` — and therefore every production tier — is
         // held to it too.
-        let limits = RoundLimits {
-            max_iters,
-            max_classes: max_classes.min(HARD_CLASS_LIMIT),
-            start: std::time::Instant::now(),
-            timeout,
-        };
+        let max_classes = max_classes.min(HARD_CLASS_LIMIT);
+        let start = std::time::Instant::now();
+        // `Instant + Duration::MAX` panics, so the deadline is optional
+        // rather than "infinitely far away".
+        let deadline = timeout.map(|t| start + t);
         // The cap is enforced deep inside the scan, where an application is
         // about to commit — the only place that can stop mid-round without
         // letting the round decide how far past the budget to go.
         let previous_cap = self.application_cap;
         self.application_cap = max_applications.map(|n| self.applications.saturating_add(n));
-
-        let closing = self.integral_closure_rules();
-        let closed = (!closing.is_empty()).then(|| self.rounds(&closing, &limits));
-        let stats = match closed {
-            // A budget or a ceiling the closing phase ran into ends the run:
-            // the full rule set would meet it on its first check.
-            Some(closed)
-                if !matches!(
-                    closed.stop,
-                    SaturationStop::Quiesced | SaturationStop::IterationCeiling
-                ) =>
-            {
-                closed
-            }
-            _ => {
-                let every: Vec<usize> = (0..self.rules.len()).collect();
-                let spent = closed.map_or(0, |closed| closed.iterations);
-                let left = RoundLimits {
-                    max_iters: limits.max_iters.saturating_sub(spent),
-                    ..limits
-                };
-                let main = self.rounds(&every, &left);
-                match closed {
-                    Some(closed) => SaturationStats {
-                        iterations: closed.iterations + main.iterations,
-                        total_unions: closed.total_unions + main.total_unions,
-                        stop: main.stop,
-                    },
-                    None => main,
-                }
-            }
-        };
-
-        self.application_cap = previous_cap;
-        stats
-    }
-
-    /// The rule indices of the integration family when the graph holds an
-    /// integral, and none otherwise — `saturate_bounded`'s closing phase.
-    pub(crate) fn integral_closure_rules(&self) -> Vec<usize> {
-        let holds_integral = self
-            .classes
-            .iter()
-            .any(|class| class.nodes.iter().any(super::fold_rules::is_integral));
-        if !holds_integral {
-            return Vec::new();
-        }
-        (0..self.rules.len())
-            .filter(|&idx| {
-                self.rule_ids
-                    .get(idx)
-                    .is_some_and(|&id| super::integral::closes_integrals(id))
-            })
-            .collect()
-    }
-
-    /// Rewrite rounds of `rules`, in order, until a limit or a sweep that
-    /// changes nothing stops them.
-    fn rounds(&mut self, rules: &[usize], limits: &RoundLimits) -> SaturationStats {
-        // `Instant + Duration::MAX` panics, so the deadline is optional
-        // rather than "infinitely far away".
-        let deadline = limits.timeout.map(|t| limits.start + t);
-        let max_classes = limits.max_classes;
         let mut iterations = 0;
         let mut total_unions = 0;
         // Recorded at the point the loop decides to stop — never inferred
         // afterwards from the counters.
         let mut stop = SaturationStop::IterationCeiling;
 
-        for _ in 0..limits.max_iters {
-            if let Some(t) = limits.timeout {
-                if limits.start.elapsed() >= t {
+        for _ in 0..max_iters {
+            if let Some(t) = timeout {
+                if start.elapsed() >= t {
                     stop = SaturationStop::Timeout;
                     break;
                 }
@@ -1519,9 +1415,10 @@ impl EGraph {
             // Apply all rules in a single batch — one rebuild per iteration
             let (unions, sweep) = {
                 let mut batch = self.batch();
+                let n_rules = batch.graph.rules.len();
                 let mut total = 0;
                 let mut sweep = ScanStop::Completed;
-                for &rule_idx in rules {
+                for rule_idx in 0..n_rules {
                     if batch.node_count() > max_classes {
                         sweep = ScanStop::ClassCap;
                         break;
@@ -1588,6 +1485,8 @@ impl EGraph {
                 }
             }
         }
+
+        self.application_cap = previous_cap;
 
         SaturationStats {
             iterations,

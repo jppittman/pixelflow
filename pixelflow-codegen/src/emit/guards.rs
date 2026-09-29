@@ -1379,8 +1379,8 @@ mod tests {
     /// A four-trip fold; the scope its body was carved into is not what
     /// these tests look at, so the body names a hole.
     fn reduce() -> ScheduledOp {
-        use pixelflow_ir::fold::{Binder, Monoid, RangeFold};
-        let fold = RangeFold::new(
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        let fold = Fold::new(
             Monoid::SUM,
             Binder::from_slot(0).expect("slot 0 exists"),
             0..4,
@@ -1502,15 +1502,15 @@ mod tests {
     const ARM_TRIPS: u32 = 64;
 
     /// A sum of `trips` terms binding `slot`.
-    fn sum_over(slot: u8, trips: u32) -> pixelflow_ir::fold::RangeFold {
-        use pixelflow_ir::fold::{Binder, Monoid, RangeFold};
+    fn sum_over(slot: u8, trips: u32) -> pixelflow_ir::fold::Fold {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
         let binder = Binder::from_slot(slot).expect("a live binder slot");
-        RangeFold::new(Monoid::SUM, binder, 0..trips)
+        Fold::new(Monoid::SUM, binder, 0..trips)
     }
 
     /// `select(X < 20, F, 0) + Y`, with `F` the `Reduce` def `fold` opening
     /// at position 3 — the true arm's only entry of its own.
-    fn if_over_a_fold(fold: pixelflow_ir::fold::RangeFold, body_root: u32) -> Vec<Def> {
+    fn if_over_a_fold(fold: pixelflow_ir::fold::Fold, body_root: u32) -> Vec<Def> {
         alloc::vec![
             def(0, ScheduledOp::Var(0)),
             def(1, ScheduledOp::Const(20.0)),
@@ -1529,7 +1529,7 @@ mod tests {
     /// `|x − j|` per trip, `j` the binder of `fold` and `x` read from the
     /// enclosing scope as `ValueId(0)`; the ids from `first` up are the
     /// body's own.
-    fn distance_body(fold: pixelflow_ir::fold::RangeFold, first: u32) -> Vec<Def> {
+    fn distance_body(fold: pixelflow_ir::fold::Fold, first: u32) -> Vec<Def> {
         let (j, diff, abs) = (first, first + 1, first + 2);
         alloc::vec![
             def(0, ScheduledOp::Var(0)),

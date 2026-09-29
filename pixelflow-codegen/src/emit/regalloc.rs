@@ -1893,7 +1893,7 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
             Scope::GuardArm(_) => unreachable!("plan_carries never asks about a guard arm"),
         }
     };
-    let meta_of = |j: usize| -> &pixelflow_ir::fold::RangeFold {
+    let meta_of = |j: usize| -> &pixelflow_ir::fold::Fold {
         let fold = &nest.folds[j];
         let def = &schedule_of(fold.parent)[fold.at];
         let ScheduledOp::Reduce(meta, _) = &def.op else {
@@ -5494,9 +5494,9 @@ mod tests {
     }
 
     /// A four-trip fold, the metadata every fixture below hangs a scope off.
-    fn fold_meta() -> pixelflow_ir::fold::RangeFold {
-        use pixelflow_ir::fold::{Binder, Monoid, RangeFold};
-        RangeFold::new(
+    fn fold_meta() -> pixelflow_ir::fold::Fold {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        Fold::new(
             Monoid::SUM,
             Binder::from_slot(0).expect("slot 0 exists"),
             0..4,

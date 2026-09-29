@@ -16,20 +16,15 @@
 
 use super::node::ENode;
 use pixelflow_ir::kind::OpMap;
-use pixelflow_ir::{Fold, OpKind, RangeFold};
+use pixelflow_ir::{Fold, OpKind};
 
 /// The price of a node only legalization can remove: a `Dwrt` the chain rule
-/// did not reach, and an integral no rule closed. One number for both,
-/// because they are the same situation — the term is correct, the calculus
-/// left it symbolic, and `pixelflow_ir::passes::resolve` will lower it after
-/// extraction by a fixed rule.
+/// did not reach. The term is correct, the calculus left it symbolic, and
+/// `pixelflow_ir::passes::lower_dwrt` will lower it after extraction.
 ///
 /// **A legalization price, never an accuracy knob.** It decides one thing:
-/// that extraction takes any right-hand side a rule derived — a chain rule's
-/// derivative, an integral's closed form — over the symbolic node, which it
-/// must be dear enough to do. It does not choose how an unclosed integral is
-/// approximated; that is `IntervalFold::quadrature`'s, and changing this
-/// number changes no emitted sample.
+/// that extraction takes any derivative the chain rule derived over the
+/// symbolic node, which it must be dear enough to do.
 ///
 /// Finite rather than a sentinel, for the reason [`CostModel::node_op_cost`]
 /// gives at its `Dwrt` arm: extraction must be able to *keep* the node and
@@ -379,23 +374,12 @@ impl CostModel {
             //
             // An unpriceable monoid keeps the sentinel: extraction must not
             // choose a fold whose combiner has no operation to emit.
-            ENode::Reduce {
-                fold: Fold::Range(range),
-                ..
-            } => match super::fold_rules::combiner_op(range.monoid()) {
-                Some(_) => self.fold_cost(*range, 0),
-                None => usize::MAX / 4,
-            },
-            // **An integral no rule closed costs what a surviving `Dwrt`
-            // does**, for the same reason: legalization lowers it after
-            // extraction (quadrature), so it must be keepable, and it must
-            // lose to every closed form a rule derived. The quadrature's own
-            // samples are the body's price, multiplied in by
-            // `fold_body_multiple` like a range's trip count.
-            ENode::Reduce {
-                fold: Fold::Interval(_),
-                ..
-            } => LEGALIZATION_PRICE,
+            ENode::Reduce { fold: range, .. } => {
+                match super::fold_rules::combiner_op(range.monoid()) {
+                    Some(_) => self.fold_cost(*range, 0),
+                    None => usize::MAX / 4,
+                }
+            }
         }
     }
 
@@ -416,7 +400,7 @@ impl CostModel {
     /// Saturating: a nest of long folds over an expensive body is a price
     /// past any budget, not an overflow.
     #[must_use]
-    pub fn fold_cost(&self, fold: RangeFold, body: usize) -> usize {
+    pub fn fold_cost(&self, fold: Fold, body: usize) -> usize {
         let trips = fold.len() as usize;
         let combines = trips.saturating_sub(1);
         trips
@@ -736,11 +720,11 @@ mod cost_model_accessors {
         use crate::egraph::extract::extract;
         use crate::egraph::{Vocabulary, insert};
         use pixelflow_ir::ExprArena;
-        use pixelflow_ir::fold::{Binder, Fold, Monoid, RangeFold};
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
 
         let binder = Binder::from_slot(0).expect("a live binder");
-        let range = RangeFold::new(Monoid::SUM, binder, 0..40);
-        let fold = Fold::Range(range);
+        let fold = Fold::new(Monoid::SUM, binder, 0..40);
+        let range = fold;
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let j = a.push_var(binder.var());

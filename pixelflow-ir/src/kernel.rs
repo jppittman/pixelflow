@@ -16,18 +16,18 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::convert::Infallible;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arena::{
-    Axis, BufferDecl, BufferIdentity, ExprArena, ExprId, Unclosed, UniformDecl, UniformIdentity,
+    Axis, BufferDecl, BufferIdentity, ExprArena, ExprId, IndexSpaceFull, UniformDecl,
+    UniformIdentity,
 };
 use crate::dag::{Builder, Dag, Node, Rooted};
 use crate::expr::{
     Environment, ExprBuilderExt, ExprData, copy_subgraph, from_arena, splice, substitute_vars,
     to_arena,
 };
-use crate::fold::{Binder, Chain, Fold, IntervalFold, Monoid, Placeholder};
+use crate::fold::{Binder, Chain, Fold, Monoid, Placeholder};
 use crate::kind::OpKind;
 use crate::library::{self, Terms};
 
@@ -81,15 +81,6 @@ impl Drop for BinderScope {
         PLACEHOLDERS_IN_USE.fetch_and(!(1 << self.bit), Ordering::Relaxed);
     }
 }
-
-/// Half the side of the pixel [`Kernel::area`] integrates over: the pixel
-/// is `[-½, ½)` on each axis about the sample, so its midpoint is the point
-/// every unintegrated kernel samples.
-///
-/// The one definition of the pixel: `kernel!`'s `area(|u, v| e)` integrates
-/// over the same interval, so a pixel written in the syntax and one built
-/// here are one program.
-pub const PIXEL_HALF_WIDTH: f32 = 0.5;
 
 /// A named scalar argument of a kernel: the JIT tier's spelling of a
 /// builder's struct field.
@@ -635,8 +626,8 @@ impl Kernel {
     ///
     /// Library, not a primitive: this builds the composition it denotes,
     /// [`library::clamp`], so there is exactly one definition of clamping —
-    /// `kernel!`'s `.clamp()` and the integrals' closed forms build it too —
-    /// and every tier evaluates the same nodes. (It used to be an IR node
+    /// `kernel!`'s `.clamp()` builds it too — and every tier evaluates the
+    /// same nodes. (It used to be an IR node
     /// that three backends and the e-graph's derivative rule each
     /// re-decomposed by hand, and they disagreed on degenerate `lo > hi`
     /// bounds.) Passing `lo > hi` yields `hi`, as the composition says.
@@ -729,11 +720,17 @@ impl Kernel {
     /// reserved index space): each fold takes the lowest index slot its body
     /// does not already bind.
     ///
+    /// The slot is chosen only after the body exists: the body is built
+    /// against a placeholder, and [`ExprArena::close_over`] — the one
+    /// definition of the choice and the rename, which `kernel!`'s lowering
+    /// closes its folds through too — picks the slot and renames it.
+    ///
     /// # Panics
     ///
-    /// Panics unless [`RangeFold::admits`](crate::RangeFold::admits) `range`:
-    /// if it runs backwards, or ends past 2²⁴, where an `f32` index stops
-    /// naming every integer.
+    /// Panics unless [`Fold::admits`] `range`: if it runs backwards, or ends
+    /// past 2²⁴, where an `f32` index stops naming every integer. Panics too
+    /// when the body already binds every slot, i.e. one fold deeper than the
+    /// index space.
     ///
     /// ```ignore
     /// // Σ_d q(d)·k(d) — a contraction over the shared index.
@@ -745,60 +742,6 @@ impl Kernel {
         range: core::ops::Range<u32>,
         body: impl FnOnce(&Kernel) -> Kernel,
     ) -> Self {
-        Self::bind_fresh(|binder| Fold::new(monoid, binder, range), body)
-    }
-
-    /// `∫∫` of `self` over the pixel: `∫_{u_y ∈ [-½, ½)} ∫_{u_x ∈ [-½, ½)}
-    /// self(X + u_x, Y + u_y)` — the area integral antialiasing is, as two
-    /// folds over intervals, each binding a fresh index.
-    ///
-    /// `X` and `Y` appear here and nowhere else: the IR sees two ordinary
-    /// folds, and which coordinate an interval perturbs is a fact about its
-    /// body, not a field of the fold
-    /// (docs/plans/2026-09-23-an-integral-is-a-fold.md §2). The pixel is
-    /// centred on the sample, so the midpoint of the integral is the point
-    /// every other kernel computes.
-    ///
-    /// **Bound at construction, like every fold.** [`Kernel::at`] afterwards
-    /// substitutes the *result's* coordinates and never the bound indices, so
-    /// the order of composition says which pixel is meant:
-    ///
-    /// - `k.at(σ).area()` is the screen pixel under the warped shape — what a
-    ///   glyph wants, `area` the last thing before a lattice collapses it;
-    /// - `k.area().at(σ)` is the warped pixel: `k`'s own unit cell, carried to
-    ///   the screen by `σ`.
-    ///
-    /// They agree for a translation and differ once `σ` scales or bends.
-    ///
-    /// An integral no rewrite rule closes is legalized by quadrature before
-    /// the kernel reaches a backend (`passes::resolve`).
-    #[must_use]
-    pub fn area(&self) -> Self {
-        let pixel = |binder| Fold::Interval(IntervalFold::pixel(binder));
-        Self::bind_fresh(pixel, |u_y| {
-            Self::bind_fresh(pixel, |u_x| {
-                self.at(&Self::x().add(u_x), &Self::y().add(u_y))
-            })
-        })
-    }
-
-    /// The binder every fold is built with: `body` against a fresh index,
-    /// folded by whatever `fold_at` makes of the slot that index lands in.
-    ///
-    /// The slot is chosen only after the body exists, which is why the fold
-    /// is a function of it rather than a value: the body is built against a
-    /// placeholder, and [`ExprArena::close_over`] — the one definition of
-    /// the choice and the rename, which `kernel!`'s lowering closes its
-    /// folds through too — picks the slot and renames it.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the body already binds every slot, i.e. one fold deeper
-    /// than the index space.
-    fn bind_fresh(
-        fold_at: impl FnOnce(Binder) -> Fold,
-        body: impl FnOnce(&Kernel) -> Kernel,
-    ) -> Self {
         let scope = BinderScope::enter();
         let index = {
             let mut b = Builder::new();
@@ -808,16 +751,14 @@ impl Kernel {
         let body = body(&index);
         let (arena, root) = body.parts();
         let closed = arena.close_over(root, scope.placeholder, |binder| {
-            Ok::<_, Infallible>(fold_at(binder))
+            Fold::new(monoid, binder, range)
         });
-        let (arena, root) = match closed {
-            Ok(closed) => closed,
-            Err(Unclosed::IndexSpaceFull) => panic!(
+        let (arena, root) = closed.unwrap_or_else(|IndexSpaceFull| {
+            panic!(
                 "more than {} live nested reductions: the index space is full",
                 Binder::COUNT
-            ),
-            Err(Unclosed::Refused(never)) => match never {},
-        };
+            )
+        });
         // Only `body`'s own graph is used above — no other kernel is spliced
         // in — so its buffer table carries forward unchanged.
         Self::adopt(arena, root, body.inner.buffers.clone())
@@ -1162,7 +1103,7 @@ impl Bits {
 mod tests {
     use super::*;
     use crate::arena::ExprNode;
-    use crate::fold::RangeFold;
+    use crate::fold::Fold;
 
     /// The count is still checked at runtime; the OPERAND no longer needs
     /// checking, because `Kernel::x().shl(32)` does not compile at all now —
@@ -1174,13 +1115,13 @@ mod tests {
     }
 
     /// The builder refuses a fold past 2²⁴ as `kernel!` does: both build
-    /// through `RangeFold`, which holds the one bound. Before, `kernel!`
+    /// through `Fold`, which holds the one bound. Before, `kernel!`
     /// refused and this summed the wrong terms without a word
     /// (docs/BACKLOG.md, C8).
     #[test]
     #[should_panic(expected = "ends at most at 16777216 (2^24)")]
     fn a_fold_past_the_exact_bound_is_refused_by_the_builder_too() {
-        let past = RangeFold::EXACT_BOUND + 1;
+        let past = Fold::EXACT_BOUND + 1;
         let _refused = Kernel::over(Monoid::SUM, 16_777_100..past, |i| i.clone());
     }
 
@@ -1323,94 +1264,6 @@ mod tests {
 
         let merged = left.add(&right);
         assert_eq!(merged.buffer_data().count(), 1);
-    }
-
-    /// Whether `var` is read anywhere under `root`.
-    fn reads(arena: &ExprArena, root: ExprId, var: u8) -> bool {
-        let mut seen = alloc::vec![false; arena.len()];
-        let mut stack = alloc::vec![root];
-        while let Some(id) = stack.pop() {
-            if core::mem::replace(&mut seen[id.0 as usize], true) {
-                continue;
-            }
-            if arena.node(id) == crate::arena::ExprNode::Var(var) {
-                return true;
-            }
-            stack.extend(arena.children(id));
-        }
-        false
-    }
-
-    /// `area`'s two folds: `(outer, inner, integrand)`.
-    fn pixel_folds(
-        kernel: &Kernel,
-    ) -> (
-        crate::fold::IntervalFold,
-        crate::fold::IntervalFold,
-        ExprArena,
-        ExprId,
-    ) {
-        use crate::arena::ExprNode;
-        let (arena, root) = kernel.parts();
-        let ExprNode::Reduce {
-            fold: Fold::Interval(outer),
-            body,
-        } = arena.node(root)
-        else {
-            panic!("area's root is an integral: {:?}", arena.node(root));
-        };
-        let ExprNode::Reduce {
-            fold: Fold::Interval(inner),
-            body,
-        } = arena.node(body)
-        else {
-            panic!("and so is its body: {:?}", arena.node(body));
-        };
-        (outer, inner, arena.clone(), body)
-    }
-
-    /// **`area` is two pixel intervals over the kernel at `(X + u_x, Y + u_y)`.**
-    /// Distinct slots, both `[-½, ½)`, and the integrand is the kernel with
-    /// `X` read as `X + u_x` and `Y` as `Y + u_y` — the inner fold's binder
-    /// perturbing `X`, the outer's `Y`.
-    #[test]
-    fn area_is_two_pixel_intervals_over_the_shifted_kernel() {
-        use crate::arena::ExprNode;
-        let (outer, inner, arena, integrand) = pixel_folds(&Kernel::x().mul(&Kernel::y()).area());
-        assert_ne!(outer.binder(), inner.binder());
-        for fold in [outer, inner] {
-            assert_eq!(
-                (fold.lo(), fold.hi()),
-                (-PIXEL_HALF_WIDTH, PIXEL_HALF_WIDTH)
-            );
-        }
-        let ExprNode::Binary(OpKind::Mul, x_side, y_side) = arena.node(integrand) else {
-            panic!("the integrand is X·Y, shifted: {:?}", arena.node(integrand));
-        };
-        let shifted = |side: ExprId, axis: u8, by: u8| {
-            matches!(arena.node(side), ExprNode::Binary(OpKind::Add, a, b)
-                if arena.node(a) == ExprNode::Var(axis) && arena.node(b) == ExprNode::Var(by))
-        };
-        assert!(shifted(x_side, 0, inner.binder().var()), "X + u_x");
-        assert!(shifted(y_side, 1, outer.binder().var()), "Y + u_y");
-    }
-
-    /// **`at` never reaches a bound index.** `area(k).at(2X, 3Y)` keeps both
-    /// folds exactly — same slots, same pixel — and the integrand still reads
-    /// each binder: the warp substituted the result's `X` and `Y`, which are
-    /// the only coordinates the integral leaves free.
-    #[test]
-    fn a_warp_of_an_area_keeps_its_binders() {
-        let k = Kernel::x().mul(&Kernel::y());
-        let (outer, inner, _, _) = pixel_folds(&k.area());
-        let warped = k.area().at(
-            &Kernel::x().mul(&Kernel::constant(2.0)),
-            &Kernel::y().mul(&Kernel::constant(3.0)),
-        );
-        let (warped_outer, warped_inner, arena, integrand) = pixel_folds(&warped);
-        assert_eq!((warped_outer, warped_inner), (outer, inner));
-        assert!(reads(&arena, integrand, inner.binder().var()));
-        assert!(reads(&arena, integrand, outer.binder().var()));
     }
 
     /// The other side of that merge: two DIFFERENT tabulations claiming the

@@ -42,10 +42,11 @@
 //! 94-glyph run read up to 0.43 off before its folds shared one body
 //! (docs/results/2026-09-23-glyph-is-a-formula.md, §3). A closed form has
 //! no such dependence: whatever saturation does or does not reach, it
-//! rewrites an area into an equal area. No interval fold is in a glyph's
-//! arena (`tests/glyph_is_closed.rs`).
+//! rewrites an area into an equal area. The integral, the rules and the
+//! quadrature have since been deleted from the IR and the e-graph: there is
+//! nothing left to write a glyph with but its formula.
 //!
-//! `τ` is [`pixelflow_ir::integral::monotone_root`], the one definition.
+//! `τ` is [`Rise::monotone_root`], the one definition.
 //! Each control-polygon step is floored at `0` in the kernel — the
 //! certificate that makes the arc rise for *any* number a table holds, so
 //! the closed form's case analysis holds whatever the row. The host's split
@@ -88,7 +89,6 @@ use super::monotone::MonotoneQuad;
 use super::outline::{Outline, Point, Segment};
 use pixelflow_core::{BoundManifold, DiscreteManifold, Kernel, Lattice, Manifold, Monoid, Uniform};
 use pixelflow_ir::arena::BufferIdentity;
-use pixelflow_ir::integral::{self, RootFloor, ROOT_FLOOR};
 use pixelflow_ir::{library, ExprArena, ExprId, OpKind};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -127,6 +127,32 @@ const PIXEL_HALF: f32 = 0.5;
 /// it, never a quotient by `3` (see [`RisingArc::pixel_area`], "Floating
 /// point").
 const ONE_THIRD: f32 = 1.0 / 3.0;
+
+/// What [`Rise::monotone_root`] floors its radicand at: `√max(r, 0)`.
+///
+/// Part of the root's definition, not a tunable: below zero `√` is NaN, and
+/// above it the floor would move the root wherever the radicand is small
+/// but real.
+const RADICAND_FLOOR: f32 = 0.0;
+
+/// `2⁻¹⁰⁰`: what [`Rise::monotone_root`] floors its denominator at.
+///
+/// Where the floor is active the root is not the rise's inverse, and the
+/// heights that happens at are at most the floor above the arc's start, so
+/// the root is exact everywhere a pixel can resolve.
+///
+/// **Normal**, not merely positive. A subnormal floor is zero wherever a
+/// kernel runs with denormals-are-zero — which the renderer's workers do
+/// (`FastMathGuard`) — and there `δ/max(0, floor)` is `0/0`. From `2⁻¹²⁸`
+/// down its reciprocal also overflows `f32`, so the exact `1/floor` the root
+/// multiplies by cannot be a finite literal. Measured before the bound: a
+/// vertical line under the subnormal floor `2⁻¹³⁶` read `1` for `0` along
+/// the pixel edge it starts on.
+const ROOT_FLOOR: f32 = 1.0 / 1_267_650_600_228_229_401_496_703_205_376.0;
+
+// The contract above, checked where the literal is written: normal, and
+// exactly 2⁻¹⁰⁰.
+const _: () = assert!(ROOT_FLOOR.is_normal() && ROOT_FLOOR == f32::from_bits(0x0d80_0000));
 
 // ═══════════════════════════════════════════════════════════════════════════
 // The glyph, and the box outside which it is exactly zero
@@ -686,17 +712,68 @@ impl Rise {
     }
 
     /// `clamp(τ(δ), lo, hi)`: where the rise reaches `δ`, held to
-    /// `[lo, hi]` — `τ` being [`integral::monotone_root`], the one
-    /// definition.
+    /// `[lo, hi]` — `τ` being [`Rise::monotone_root`].
     fn reaches(self, arena: &mut ExprArena, delta: ExprId, bounds: [ExprId; 2]) -> ExprId {
-        let rise = integral::Rise {
-            step: self.step,
-            bend: self.bend,
-        };
-        let floor =
-            RootFloor::new(ROOT_FLOOR).expect("ROOT_FLOOR is the largest floor RootFloor admits");
-        let root = integral::monotone_root(arena, delta, rise, floor);
+        let root = self.monotone_root(arena, delta);
         library::clamp(arena, root, bounds)
+    }
+
+    /// `τ(δ) = δ / max(step + √max(step² + bend·δ, 0), ROOT_FLOOR)`: the
+    /// parameter at which the rise reaches `δ` — the one definition, which
+    /// `kernel!`'s copy of the glyph writes out
+    /// (`pixelflow-compiler/tests/common/section_1_7.rs`).
+    ///
+    /// **Law.** `q(t) = δ` is `bend·t² + 2·step·t − δ = 0`, whose increasing
+    /// root `(√(step² + bend·δ) − step)/bend` is, rationalized, `τ(δ)` — a
+    /// form that holds at `bend = 0` too, and loses nothing to cancellation.
+    /// For a certified rise, and up to the floor below:
+    /// - on `[0, q(1)]`, `τ` is `q`'s inverse, so `τ(q(t)) = t`;
+    /// - below it `τ < 0` (a negative numerator over a positive
+    ///   denominator), and above it `τ > 1` — past the arc's end the
+    ///   increasing root is past `1`, and past the height a falling parabola
+    ///   (`bend < 0`) peaks at, the radicand's floor leaves `δ/step`, which is
+    ///   past `1` there because the peak, at `t = −step/bend ≥ 1`, is at least
+    ///   `step` high;
+    /// - so `[0 ≤ τ(δ) < 1]` is `[0 ≤ δ < q(1)]`: the arc's band.
+    ///
+    /// **The floors.** The radicand's ([`RADICAND_FLOOR`]) is active only
+    /// off the band, where no real root exists. The denominator's,
+    /// [`ROOT_FLOOR`], is active only where `step + √(step² + bend·δ)` is
+    /// below it; inside the band the true root `t*` is then at least
+    /// `δ/ROOT_FLOOR`, so `δ ≤ ROOT_FLOOR`. The root is exact at every height
+    /// the band holds but a sliver of `2⁻¹⁰⁰` at its start, and never divides
+    /// by zero.
+    ///
+    /// **Floating point.** The product, the sum, the square root, the
+    /// reciprocal and the product by it each round once, so `τ` is good to a
+    /// few ulps of itself away from the band's start; the parameter's
+    /// absolute resolution is `2⁻²⁴` near `1`, which is what an arc's length
+    /// multiplies ([`RisingArc::pixel_area`]). The floor is normal, so
+    /// `1/denominator ≤ 2¹²⁶` is finite and `δ` times it is never `0·∞`.
+    ///
+    /// **Emitted as `δ·(1/d)`**, the reciprocal an exact `Div`, not as `δ/d`.
+    /// Where `d` does not vary — the bend is zero, so the radicand drops `δ` —
+    /// the e-graph's `MulRecip` canonicalization turns `δ/d` into
+    /// `δ·recip(d)`, computed once and priced below a quotient per sample;
+    /// and `recip` is an *estimate* (CLAUDE.md, "Floating point at the
+    /// edges"). Spelled with `1/d`, the reciprocal's class holds the exact
+    /// quotient too, which the latency prior prices below `Recip`, so the one
+    /// computed once is exact. Measured, a line read through one step column
+    /// with `δ/d` extracted a `recip`: `3.9e-2` of coverage wrong at AVX2,
+    /// `3.5e-3` at AVX-512 (`adversarial`'s one-step-column case pins it).
+    fn monotone_root(self, arena: &mut ExprArena, delta: ExprId) -> ExprId {
+        let square = arena.push_binary(OpKind::Mul, self.step, self.step);
+        let reach = arena.push_binary(OpKind::Mul, self.bend, delta);
+        let radicand = arena.push_binary(OpKind::Add, square, reach);
+        let real = arena.push_const(RADICAND_FLOOR);
+        let radicand = arena.push_binary(OpKind::Max, radicand, real);
+        let root = arena.push_unary(OpKind::Sqrt, radicand);
+        let denominator = arena.push_binary(OpKind::Add, self.step, root);
+        let floor = arena.push_const(ROOT_FLOOR);
+        let denominator = arena.push_binary(OpKind::Max, denominator, floor);
+        let one = arena.push_const(1.0);
+        let reciprocal = arena.push_binary(OpKind::Div, one, denominator);
+        arena.push_binary(OpKind::Mul, delta, reciprocal)
     }
 }
 
@@ -729,7 +806,7 @@ impl RisingArc {
     /// t₀ = clamp(τ_y(y − ½ − y₀), 0, 1)      t₁ = clamp(τ_y(y + ½ − y₀), 0, 1)
     /// ```
     ///
-    /// `τ` is a rise's inverse ([`integral::monotone_root`]), so `t₀` and
+    /// `τ` is a rise's inverse ([`Rise::monotone_root`]), so `t₀` and
     /// `t₁` are where the arc enters and leaves the pixel's rows, held to
     /// the arc. `x` rises, so the clamp is `0` until the arc reaches the
     /// pixel's left edge, `1` once it has passed the right one, and
@@ -780,7 +857,7 @@ impl RisingArc {
     ///   coordinates, exact when they are close, rather than a rounded edge
     ///   less a coordinate.
     /// - The only quotients are the roots', `δ·(1/d)` with `d` floored at a
-    ///   positive literal ([`integral::monotone_root`], "Emitted as
+    ///   positive literal ([`Rise::monotone_root`], "Emitted as
     ///   `δ·(1/d)`"): never a `Recip` estimate, whatever the algebra proves
     ///   about `d`. `⅓` and `½` are products by literals.
     /// - The parameters resolve to about `2⁻²⁴`, and a parameter moved by

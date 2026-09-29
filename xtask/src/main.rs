@@ -721,9 +721,9 @@ impl IsaExecutionMode {
     /// they hold a glyph piece's closed form to an `f64` reference arc by arc,
     /// and what they pin is a tier's: spelled `δ/d`, a root's quotient became
     /// a hoisted `recip` estimate, `3.9e-2` of coverage wrong at AVX2 and a
-    /// tenth of that at AVX-512. They are `pixelflow-core`'s arc and chord
-    /// adversarial cases, moved there when the glyph stopped being written
-    /// as an integral.
+    /// tenth of that at AVX-512. They are the arc and chord adversarial cases
+    /// `pixelflow-core` held while the glyph was written as an integral, and
+    /// the only copy since the integral was deleted.
     #[cfg(target_arch = "x86_64")]
     fn test_commands(&self) -> Option<&'static [&'static [&'static str]]> {
         match self {

@@ -10,7 +10,7 @@
 //! fixed budget per piece.
 //!
 //! These tests count surviving operations through the runtime pipeline
-//! (`optimize_runtime_arena`, which saturates, extracts and resolves) — the
+//! (`optimize_runtime_arena`, which saturates, extracts and lowers) — the
 //! exact stages `Lattice::bake` runs — so a regression in CSE or extraction
 //! shows up as a hard number, not a benchmark whisper.
 
