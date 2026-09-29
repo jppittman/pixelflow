@@ -69,12 +69,14 @@
 //!           | range '.all' '(' binder expr ')'                           -- ∀, of bools
 //! range   ::= '(' iexpr '..' iexpr ')'     -- half-open, constant, forwards
 //! binder  ::= '|' IDENT '|'                -- the index: a `usize`
-//! integral ::= 'integral' '(' cexpr '..' cexpr ',' '|' IDENT '|' expr ')'
+//! integral ::= 'integral' '(' interval ',' '|' IDENT '|' expr ')'
 //!                                          -- ∫ over [lo, hi); the variable an `f32`
 //!           | 'area' '(' '|' IDENT ',' IDENT '|' expr ')'
 //!                                          -- the pixel: integral(-H..H, |v|
 //!                                          -- integral(-H..H, |u| expr)), H the IR's
-//!                                          -- PIXEL_HALF_WIDTH
+//!                                          -- PIXEL_HALF_WIDTH; two distinct names
+//! interval ::= cexpr '..' cexpr | '(' interval ')'
+//!                                          -- half-open, constant; parentheses optional
 //! F32     ::= '::' '<' 'f32' '>'
 //! binop   ::= '+' | '-' | '*' | '/'
 //!           | '<' | '<=' | '>' | '>=' | '==' | '!='    -- a comparison: a bool
@@ -127,22 +129,22 @@
 //! but a fold's or an integral's; an `integral` or an `area` of any other
 //! shape than the two above (an argument missing or extra, the interval not
 //! a range, the closure's parameters not one plain name for `integral` and
-//! two for `area`, a parameter with a type, a qualified closure or one with
-//! a return type); an inclusive or open-ended range; a method on a range or
-//! a mapped range that is not one of the fold's spellings; `.map`, `.any` or
-//! `.all` over anything but a range (iterating a family of records is B3); a
-//! `.fold` whose arguments are not one of the two above; a fold's closure
-//! with a type annotation, a pattern, more than one parameter, a return type
-//! or a qualifier; type arguments on a method (`::<f32>` on `.sum` and
-//! `.product` excepted); an `as` to any type but `f32`; a path or a call
-//! from outside the block; `%` and `!` (no IR op); a `let` whose pattern is
-//! not a plain name (`mut`, `ref`, `@`; destructuring is B3); a `let`
-//! without an initializer; `let … else`; an item or a macro inside a block;
-//! an operator not in the table above; a literal that is not a number; a
-//! literal suffixed with a type other than `f32`; an integer past `u128`; a
-//! float past `f32`'s range; and any other Rust expression syntax, named in
-//! the refusal. Nothing is passed through for a later stage to refuse: the
-//! AST holds only what the language means.
+//! two distinct ones for `area`, a parameter with a type, a qualified
+//! closure or one with a return type); an inclusive or open-ended range; a
+//! method on a range or a mapped range that is not one of the fold's
+//! spellings; `.map`, `.any` or `.all` over anything but a range (iterating
+//! a family of records is B3); a `.fold` whose arguments are not one of the
+//! two above; a fold's closure with a type annotation, a pattern, more than
+//! one parameter, a return type or a qualifier; type arguments on a method
+//! (`::<f32>` on `.sum` and `.product` excepted); an `as` to any type but
+//! `f32`; a path or a call from outside the block; `%` and `!` (no IR op);
+//! a `let` whose pattern is not a plain name (`mut`, `ref`, `@`;
+//! destructuring is B3); a `let` without an initializer; `let … else`; an
+//! item or a macro inside a block; an operator not in the table above; a
+//! literal that is not a number; a literal suffixed with a type other than
+//! `f32`; an integer past `u128`; a float past `f32`'s range; and any other
+//! Rust expression syntax, named in the refusal. Nothing is passed through
+//! for a later stage to refuse: the AST holds only what the language means.
 //!
 //! Parsed, and refused by `sema`: an unbound or retired name; a coordinate in
 //! a helper; a call to an entry or to an unknown function; `monotone_root`
@@ -1447,12 +1449,30 @@ fn integral_closure<const N: usize>(
         };
         variables.push(variable);
     }
-    let variables = variables.try_into().map_err(|_| {
+    let variables: [syn::Ident; N] = variables.try_into().map_err(|_| {
         syn::Error::new(
             closure.or1_token.span(),
             format!("`{function}`'s closure takes {parameters}: `{spelling}`"),
         )
     })?;
+    // `area(|u, u| e)` would integrate twice over one name, the inner
+    // variable shadowing the outer, so the body could never read the
+    // other: rustc refuses a closure binding a name twice (E0415).
+    for (position, variable) in variables.iter().enumerate() {
+        if variables[..position].contains(variable) {
+            return Err(syn::Error::new(
+                variable.span(),
+                format!(
+                    "identifier `{variable}` is bound more than once in `{function}`'s closure\n\
+                     \n\
+                     note: `{function}`'s closure takes {parameters}, `{spelling}`, each a \
+                     variable of its own; rustc refuses a closure that binds a name twice \
+                     (E0415)\n\
+                     help: rename one of them"
+                ),
+            ));
+        }
+    }
     Ok((variables, convert_expr((*closure.body).clone())?))
 }
 
@@ -2670,10 +2690,11 @@ mod tests {
 
     /// An integral or an `area` spelled any other way is refused where it
     /// is written, naming its one spelling: `area` with one parameter
-    /// among them.
+    /// among them, and `area` binding one name twice, which rustc refuses
+    /// of any closure (E0415).
     #[test]
     fn an_integral_spelled_any_other_way_is_refused() {
-        let cases: [(TokenStream, &str); 15] = [
+        let cases: [(TokenStream, &str); 16] = [
             (quote! { || integral(0.0..1.0) }, "takes two arguments"),
             (
                 quote! { || integral(0.0..1.0, |u| u, 2.0) },
@@ -2716,6 +2737,10 @@ mod tests {
             (
                 quote! { || area(|u, v, w| X) },
                 "`area`'s closure takes two parameters",
+            ),
+            (
+                quote! { || area(|u, u| X + u) },
+                "identifier `u` is bound more than once in `area`'s closure",
             ),
             (quote! { || area(X) }, "`area` takes one argument"),
             (
