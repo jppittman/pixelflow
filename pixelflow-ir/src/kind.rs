@@ -7,7 +7,6 @@
 //! A bare array makes each consumer responsible for turning an op into a
 //! subscript, and every consumer that did got it wrong the same way.
 
-use crate::traits::EmitStyle;
 use core::ops::{Index, IndexMut};
 
 /// The op table: the single place an operation is declared.
@@ -591,13 +590,14 @@ impl OpKind {
     /// True for ops a kernel body may call as `.method(args)` — the surface
     /// set [`OpKind::from_method_call`] resolves into.
     ///
-    /// Stricter than "not [`EmitStyle::Special`]": [`Self::Add`]/[`Self::Sub`]/
-    /// [`Self::Mul`]/[`Self::Div`] are real, non-special ops but are spelled
-    /// `+ - * /`, never `.add(y)`, and [`Self::TruncToInt`]/[`Self::IAdd`]/
-    /// [`Self::Shl`]/[`Self::Shr`]/[`Self::BitAnd`]/[`Self::BitOr`]/
-    /// [`Self::IntToFloat`] are primitives that only ever arise from lowering
-    /// passes (`Gather`/`Reduce` expansion), never from surface syntax a
-    /// kernel body writes directly.
+    /// Stricter than "not structural". The structural ops — leaves, memory,
+    /// binders, `Dwrt` and `Seq` — have no method spelling at all; beyond
+    /// them, [`Self::Add`]/[`Self::Sub`]/[`Self::Mul`]/[`Self::Div`] are real
+    /// ops but are spelled `+ - * /`, never `.add(y)`, and
+    /// [`Self::TruncToInt`]/[`Self::IAdd`]/[`Self::Shl`]/[`Self::Shr`]/
+    /// [`Self::BitAnd`]/[`Self::BitOr`]/[`Self::IntToFloat`] are primitives
+    /// that only ever arise from lowering passes (`Gather`/`Reduce`
+    /// expansion), never from surface syntax a kernel body writes directly.
     #[must_use]
     const fn is_dsl_method(self) -> bool {
         matches!(
@@ -793,79 +793,6 @@ impl OpKind {
                 | Self::Param
                 | Self::Seq
         )
-    }
-
-    /// Get the emit style for code generation.
-    #[must_use]
-    pub const fn emit_style(self) -> EmitStyle {
-        match self {
-            // Special cases handled separately
-            Self::Var | Self::Const | Self::Tuple | Self::Param => EmitStyle::Special,
-
-            // Unary prefix: (-a)
-            Self::Neg => EmitStyle::UnaryPrefix,
-
-            // Unary method: (a).sqrt()
-            Self::Sqrt
-            | Self::Rsqrt
-            | Self::Abs
-            | Self::Recip
-            | Self::Floor
-            | Self::Ceil
-            | Self::Round
-            | Self::Sin
-            | Self::Cos
-            | Self::Tan
-            | Self::Asin
-            | Self::Acos
-            | Self::Atan
-            | Self::Exp
-            | Self::Exp2
-            | Self::Ln
-            | Self::Log2
-            | Self::Log10
-            | Self::TruncToInt
-            | Self::IntToFloat => EmitStyle::UnaryMethod,
-
-            // Binary infix: (a + b)
-            Self::Add => EmitStyle::BinaryInfix("+"),
-            Self::Sub => EmitStyle::BinaryInfix("-"),
-            Self::Mul => EmitStyle::BinaryInfix("*"),
-            Self::Div => EmitStyle::BinaryInfix("/"),
-
-            // Binary method: (a).min(b)
-            Self::Min
-            | Self::Max
-            | Self::Atan2
-            | Self::Pow
-            | Self::Lt
-            | Self::Le
-            | Self::Gt
-            | Self::Ge
-            | Self::Eq
-            | Self::Ne
-            | Self::IAdd
-            | Self::Shl
-            | Self::Shr
-            | Self::BitAnd
-            | Self::BitOr => EmitStyle::BinaryMethod,
-
-            // Differentiation: never emitted (rewritten away in the e-graph).
-            Self::Dwrt => EmitStyle::Special,
-
-            // Memory ops and uniforms: emitted by the JIT binding path, not
-            // as method calls.
-            Self::Buffer | Self::Gather | Self::RawGather | Self::Uniform => EmitStyle::Special,
-
-            // Reduction: lowered to unrolled arithmetic before codegen.
-            Self::Reduce => EmitStyle::Special,
-
-            // Sequencing: an effect no kernel body spells.
-            Self::Seq => EmitStyle::Special,
-
-            // Ternary method: (a).mul_add(b, c)
-            Self::MulAdd | Self::If => EmitStyle::TernaryMethod,
-        }
     }
 
     /// Evaluate a unary operation on a constant argument.
@@ -1239,16 +1166,14 @@ impl<T> IndexMut<OpKind> for OpMap<T> {
     }
 }
 
-// EmitStyle is imported from crate::traits - single source of truth
-
 /// Every op name the surface language accepts as a method — see
 /// [`OpKind::is_dsl_method`] for exactly which ops that is and why it is
-/// narrower than "not `Special`".
+/// narrower than "not structural".
 ///
 /// This used to walk a parallel array of one zero-sized type per op, each
 /// implementing an `OpMeta`/`Op`/arity-marker trait family, purely to answer
-/// this question. `OpKind` already knows every op's name and emit style, so
-/// the family and its 230-line module are gone.
+/// this question. `OpKind` already knows every op's name, so the family and
+/// its 230-line module are gone.
 pub fn known_method_names() -> impl Iterator<Item = &'static str> {
     OpKind::all()
         .filter(|op| op.is_dsl_method())
@@ -1375,7 +1300,7 @@ mod op_map {
 
 #[cfg(test)]
 mod method_names {
-    use super::{EmitStyle, OpKind, known_method_names};
+    use super::{OpKind, known_method_names};
 
     /// Every advertised name must resolve. Not every advertised name is its
     /// own canonical spelling — `from_name` is deliberately non-injective, and
@@ -1407,17 +1332,29 @@ mod method_names {
         }
     }
 
+    /// Leaves, memory, binders and effects: no kernel body spells one as
+    /// `.method(args)`.
     #[test]
-    fn excludes_every_op_whose_emit_style_is_special() {
+    fn excludes_every_structural_op() {
         let names: std::collections::HashSet<&str> = known_method_names().collect();
 
-        for op in OpKind::all() {
-            if matches!(op.emit_style(), EmitStyle::Special) {
-                assert!(
-                    !names.contains(op.name()),
-                    "{op:?} has EmitStyle::Special and must not have a method spelling"
-                );
-            }
+        for op in [
+            OpKind::Var,
+            OpKind::Const,
+            OpKind::Tuple,
+            OpKind::Param,
+            OpKind::Dwrt,
+            OpKind::Buffer,
+            OpKind::Gather,
+            OpKind::RawGather,
+            OpKind::Uniform,
+            OpKind::Reduce,
+            OpKind::Seq,
+        ] {
+            assert!(
+                !names.contains(op.name()),
+                "{op:?} is structural and must not have a method spelling"
+            );
         }
     }
 
@@ -1426,7 +1363,7 @@ mod method_names {
         let names: Vec<&str> = known_method_names().collect();
         assert!(
             names.contains(&"min"),
-            "Min is not EmitStyle::Special and should surface as a known method"
+            "Min is an ordinary binary op and should surface as a known method"
         );
     }
 
@@ -1482,7 +1419,7 @@ mod from_method_call {
     }
 
     #[test]
-    fn resolves_neg_as_a_method_despite_its_operator_emit_style() {
+    fn resolves_neg_as_a_method_despite_its_prefix_operator_spelling() {
         assert_eq!(OpKind::from_method_call("neg", 0), Some(OpKind::Neg));
     }
 
@@ -1786,12 +1723,11 @@ mod from_name {
     use super::OpKind;
 
     #[test]
-    fn round_trip_every_ops_own_name_including_special_emit_style_ops() {
-        // `method_names::every_returned_name_round_trips_through_from_name`
-        // only walks `known_method_names()`, which deliberately excludes
-        // every `EmitStyle::Special` op (Var/Const/Tuple/Dwrt/Buffer/Gather/
-        // RawGather/Reduce) — so those ops' `from_name` arms need their own
-        // coverage here.
+    fn round_trip_every_ops_own_name_including_structural_ops() {
+        // `method_names::every_returned_name_resolves` only walks
+        // `known_method_names()`, which deliberately excludes every
+        // structural op (`method_names::excludes_every_structural_op`) — so
+        // those ops' `from_name` arms need their own coverage here.
         for op in OpKind::all() {
             assert_eq!(
                 OpKind::from_name(op.name()),

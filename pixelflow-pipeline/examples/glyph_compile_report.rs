@@ -28,6 +28,7 @@
 
 use std::time::Instant;
 
+use pixelflow_codegen::fnv1a64;
 use pixelflow_graphics::fonts::{Font, GlyphAtlas};
 use pixelflow_pipeline::collapse_bench::compile_as_baked;
 
@@ -59,14 +60,6 @@ fn mode() -> Mode {
         Err(std::env::VarError::NotPresent) => Mode::Kernels,
         Err(e) => panic!("{MODE_VAR}: {e}"),
     }
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    bytes
-        .iter()
-        .fold(OFFSET, |h, &b| (h ^ u64::from(b)).wrapping_mul(PRIME))
 }
 
 fn tile_for(density: f32) -> u32 {

@@ -39,9 +39,6 @@ use pixelflow_ir::LatticeShape;
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, ExprNode, UniformDecl};
 use pixelflow_ir::key::{Canonical, canonical};
-use pixelflow_ir::optimize::{Identity, Optimize};
-use pixelflow_ir::passes::{ExpandRefs, Resolve};
-use pixelflow_ir::pipeline;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -120,9 +117,6 @@ pub fn optimize_runtime_arena(
     root: ExprId,
     shape: LatticeShape,
 ) -> Option<Arc<(ExprArena, ExprId)>> {
-    if saturation_switch() == SaturationSwitch::Off {
-        return without_saturation(arena, root).map(Arc::new);
-    }
     let mut expanded = None;
     let (arena, root) = with_refs_expanded(arena, root, &mut expanded);
     let canon = canonical(arena, root);
@@ -138,24 +132,11 @@ fn optimize_runtime_arena_uncached(
     root: ExprId,
     shape: LatticeShape,
 ) -> Option<(ExprArena, ExprId)> {
-    if saturation_switch() == SaturationSwitch::Off {
-        return without_saturation(arena, root);
-    }
     let mut expanded = None;
     let (arena, root) = with_refs_expanded(arena, root, &mut expanded);
     let canon = canonical(arena, root);
     let saturated = saturate(&canon, arena, root, shape)?;
     extract_for(&saturated, &canon, arena, root, shape)
-}
-
-/// The `Identity` path: the same legalizing tail, no saturation. What
-/// `Lattice::bake` would emit if the e-graph did not exist — the "F" column
-/// of docs/plans/2026-09-06-egraph-at-production-scale.md §7, measured by
-/// docs/results/2026-09-07-egraph-off-vs-on-real-shaders.md.
-fn without_saturation(arena: &ExprArena, root: ExprId) -> Option<(ExprArena, ExprId)> {
-    pipeline![ExpandRefs, Identity, Resolve]
-        .optimize(arena, root)
-        .into_changed()
 }
 
 /// References first: every step of optimization reads structure, and a name
@@ -382,47 +363,6 @@ fn saturate(
     })
 }
 
-/// Whether the runtime tier saturates at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-enum SaturationSwitch {
-    Off = 0,
-    On = 1,
-}
-
-/// The one place `PIXELFLOW_SATURATION` is read.
-///
-/// `off` selects the `Identity` path above; `on` or unset selects
-/// saturation; any other value is a hard error. The variable is honoured
-/// only under the `saturation-switch` cargo feature (a measurement build:
-/// `pixelflow-pipeline`'s `egraph_off_on` harness). A build without the
-/// feature panics if the variable is set at all, so an `export
-/// PIXELFLOW_SATURATION=off` left behind in a shell can never quietly ship
-/// unoptimized kernels — the switch is not leavable-on by accident.
-fn saturation_switch() -> SaturationSwitch {
-    static SWITCH: OnceLock<SaturationSwitch> = OnceLock::new();
-    *SWITCH.get_or_init(|| {
-        let var = std::env::var("PIXELFLOW_SATURATION");
-        #[cfg(not(feature = "saturation-switch"))]
-        {
-            assert!(
-                matches!(var, Err(std::env::VarError::NotPresent)),
-                "PIXELFLOW_SATURATION is set ({var:?}) but this build has no \
-                 `saturation-switch` feature (pixelflow-search); the variable is a \
-                 measurement switch and a production build refuses to guess what \
-                 it means. Unset it."
-            );
-            SaturationSwitch::On
-        }
-        #[cfg(feature = "saturation-switch")]
-        match var.as_deref() {
-            Err(std::env::VarError::NotPresent) | Ok("on") => SaturationSwitch::On,
-            Ok("off") => SaturationSwitch::Off,
-            other => panic!("PIXELFLOW_SATURATION must be `on` or `off` (or unset), got {other:?}"),
-        }
-    })
-}
-
 /// Whether the runtime tier can represent `kind` in its e-graph — i.e.,
 /// whether an arena containing it still optimizes rather than bailing.
 /// Test hook for the representability guards; the semantics live in
@@ -437,24 +377,7 @@ mod tests {
     use super::*;
     use pixelflow_ir::OpKind;
     use pixelflow_ir::arena::BufferDecl;
-    use pixelflow_ir::binding::BindingTable;
     use pixelflow_ir::fold::{Binder, Fold, Monoid};
-
-    #[test]
-    fn saturation_switch_follows_the_variable() {
-        use super::SaturationSwitch;
-        // Without the feature a set variable is a panic (loud, in the call
-        // below); with it, the mapping is the contract.
-        #[cfg(not(feature = "saturation-switch"))]
-        let expected = SaturationSwitch::On;
-        #[cfg(feature = "saturation-switch")]
-        let expected = match std::env::var("PIXELFLOW_SATURATION").as_deref() {
-            Err(_) | Ok("on") => SaturationSwitch::On,
-            Ok("off") => SaturationSwitch::Off,
-            Ok(other) => panic!("unexpected PIXELFLOW_SATURATION={other:?} in a test process"),
-        };
-        assert_eq!(super::saturation_switch(), expected);
-    }
 
     #[test]
     fn repeated_bake_of_the_same_kernel_hits_the_cache() {
@@ -549,27 +472,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-
-    /// Bind slices to an arena by buffer *identity*, not slot order: the
-    /// optimizer redeclares buffers in extraction-traversal order, so the
-    /// optimized arena's slot numbering can differ from the input's.
-    fn bind_by_identity<'a>(
-        arena: &ExprArena,
-        by_id: &[(pixelflow_ir::arena::BufferIdentity, &'a [f32])],
-    ) -> BindingTable<'a> {
-        let slices: Vec<&[f32]> = arena
-            .buffers()
-            .iter()
-            .map(|d| {
-                by_id
-                    .iter()
-                    .find(|(id, _)| *id == d.id)
-                    .unwrap_or_else(|| panic!("no slice for buffer identity {:?}", d.id))
-                    .1
-            })
-            .collect();
-        BindingTable::bind(arena, &slices).expect("bind_by_identity")
     }
 
     /// Slot order is the binding ABI: the JIT loads slot i's base pointer

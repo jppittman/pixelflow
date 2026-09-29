@@ -27,18 +27,8 @@
 //! is what covers those.
 
 use pixelflow_codegen::emit::compile;
+use pixelflow_codegen::fnv1a64;
 use pixelflow_ir::{ExprArena, ExprId, OpKind};
-
-/// FNV-1a, because the only property needed is that different bytes give
-/// different digests, and a dependency for that would be silly.
-fn fnv(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
-}
 
 fn xy(a: &mut ExprArena) -> (ExprId, ExprId) {
     (a.push_var(0), a.push_var(1))
@@ -151,7 +141,7 @@ fn main() {
                 println!(
                     "{name:<14} len={:<6} fnv={:016x} spills={} hoisted={}",
                     bytes.len(),
-                    fnv(bytes),
+                    fnv1a64(bytes),
                     r.spill_count,
                     r.hoisted_values
                 );

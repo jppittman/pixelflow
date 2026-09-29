@@ -138,12 +138,10 @@ pub use crate::math::{
     // Rule collections
     all_math_rules,
     basic_algebra_rules,
-    core_rules,
     exp_rules,
     fusion_rules,
     inverse_pair_rules,
     parity_rules,
-    transcendental_rules,
     trig_rules,
 };
 
