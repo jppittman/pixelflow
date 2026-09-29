@@ -100,9 +100,11 @@ fn a_piece_is_one_term_through_either_definition() {
 /// but a fold over a table and a sum of copies over uniforms are two
 /// programs, and the optimizer is free to extract them differently — the
 /// sum's association, which products fuse, what a batch hoists. Measured:
-/// they differ in the last bits of some texels, by at most `4.2·10⁻⁷` on
+/// they differ in the low bits of some texels, by at most `1.9·10⁻⁶` on
 /// the AVX-512 and AVX2 tiers alike, where the bound here is `1.6·10⁻⁵` at
-/// its smallest.
+/// its smallest. (`4.2·10⁻⁷` while the classical class cap was pinned at
+/// its floor: the 32 copies insert 3,324 classes, and the input-sized cap
+/// gives them 26,592 and a second round of rewrites.)
 #[test]
 fn real_glyphs_bake_the_same_pixels_through_either_definition() {
     let font = Font::parse(FONT_DATA).expect("parse font");
