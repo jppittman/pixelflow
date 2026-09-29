@@ -24,7 +24,7 @@ use crate::expr::{
     Environment, ExprBuilderExt, ExprData, copy_subgraph, from_arena, splice, substitute_vars,
     to_arena,
 };
-use crate::fold::{Binder, Fold, IntervalFold, Monoid};
+use crate::fold::{Binder, Chain, Fold, IntervalFold, Monoid};
 use crate::kind::OpKind;
 
 /// One bit per placeholder index, set while that index is claimed by a binder
@@ -677,21 +677,29 @@ impl Kernel {
     ///
     /// Note this is the **fixed-arity** fold over a slice of distinct terms,
     /// not [`Kernel::over`], which folds one body over a bounded index.
+    ///
+    /// Its shape is [`Chain`]'s, the one a fold of distinct terms has —
+    /// `((k₀ ⊕ k₁) ⊕ k₂) ⊕ …` — which a `kernel!` family's instantiation
+    /// builds through too.
     #[must_use]
     pub fn fold(monoid: Monoid, kernels: &[Kernel]) -> Self {
-        let op = monoid.op();
         let Some((head, tail)) = kernels.split_first() else {
             return Self::constant(monoid.identity());
         };
         let mut b = Builder::new();
         let mut env = head.inner.env.clone();
-        let mut root = copy_subgraph(&mut b, head.root());
         let mut buffers = head.inner.buffers.clone();
+        let mut chain = Chain::new(monoid);
+        // The first term's tables are the fold's, so its subgraph is copied
+        // as it stands; each later term is spliced against them.
+        let first = copy_subgraph(&mut b, head.root());
+        chain.push(first, |op, folded, term| b.push_binary(op, folded, term));
         for k in tail {
-            let rhs = splice(&mut b, &mut env, k.root(), &k.inner.env);
-            root = b.push_binary(op, root, rhs);
+            let term = splice(&mut b, &mut env, k.root(), &k.inner.env);
+            chain.push(term, |op, folded, term| b.push_binary(op, folded, term));
             merge_buffer_data(&mut buffers, &k.inner.buffers);
         }
+        let root = chain.finish(|identity| b.push_const(identity));
         Self::wrap(b.finish(&[root]), env, buffers)
     }
 

@@ -1329,11 +1329,34 @@ impl ExprArena {
     /// places still binds one pointer. Uniforms merge the same way, by
     /// [`UniformIdentity`]: one instance read from twenty places is one slot,
     /// and two instances of one builder stay two.
+    ///
+    /// [`splice_with`](Self::splice_with)'s case that places each uniform
+    /// by identity.
     pub fn splice(&mut self, other: &ExprArena, root: ExprId) -> ExprId {
+        self.splice_with(other, root, |arena, slot| {
+            let found = arena.uniform_slot_for(other.uniforms[slot.0 as usize]);
+            arena.push_uniform(found)
+        })
+    }
+
+    /// [`splice`](Self::splice), with `other`'s uniforms placed by the
+    /// caller: each uniform slot of `other` the fragment reads becomes the
+    /// node `input` builds for it here, built once however often the slot is
+    /// read. So `other` can be a function of its uniforms — a `kernel!`
+    /// family's template, over an abstract element and the terms it shares
+    /// with its program — and each splice one application of it, with no
+    /// table rewritten and no identity searched for.
+    ///
+    /// Buffers merge by identity, as [`splice`](Self::splice)'s do.
+    pub fn splice_with<F>(&mut self, other: &ExprArena, root: ExprId, mut input: F) -> ExprId
+    where
+        F: FnMut(&mut ExprArena, UniformId) -> ExprId,
+    {
         let mut id_map: Vec<Option<ExprId>> = vec![None; other.len()];
         // Fragment-local BufferId -> this arena's slot, filled lazily.
         let mut buf_map: Vec<Option<BufferId>> = vec![None; other.buffers.len()];
-        let mut uni_map: Vec<Option<UniformId>> = vec![None; other.uniforms.len()];
+        // Fragment-local UniformId -> the node `input` built for it.
+        let mut uni_map: Vec<Option<ExprId>> = vec![None; other.uniforms.len()];
 
         enum Task {
             Descend(ExprId),
@@ -1390,17 +1413,14 @@ impl ExprArena {
                             };
                             self.push_buffer(slot)
                         }
-                        ExprNode::Uniform(u) => {
-                            let slot = match uni_map[u.0 as usize] {
-                                Some(slot) => slot,
-                                None => {
-                                    let slot = self.uniform_slot_for(other.uniforms[u.0 as usize]);
-                                    uni_map[u.0 as usize] = Some(slot);
-                                    slot
-                                }
-                            };
-                            self.push_uniform(slot)
-                        }
+                        ExprNode::Uniform(u) => match uni_map[u.0 as usize] {
+                            Some(node) => node,
+                            None => {
+                                let node = input(self, u);
+                                uni_map[u.0 as usize] = Some(node);
+                                node
+                            }
+                        },
                         ExprNode::Unary(op, a) => {
                             let a = m(a);
                             self.push_unary(op, a)
@@ -2439,5 +2459,52 @@ mod composition_tests {
         let (b, rb) = uniform_fragment(uniform_decl(1.0));
         assert!(a.subtree_eq(ra, &a, ra));
         assert!(!a.subtree_eq(ra, &b, rb), "same slot, different instance");
+    }
+
+    /// A fragment spliced with its uniforms placed by the caller is one
+    /// application of a function of them: `u·s + X` over an input `u` and
+    /// a shared term `s`, applied at two of the host's uniforms, is the two
+    /// terms written in the host by hand — each input built once however
+    /// often it is read, the shared term one node, and nothing declared.
+    #[test]
+    fn splicing_with_placed_uniforms_applies_the_fragment() {
+        let mut template = ExprArena::new();
+        let [u, s] = [0, 1].map(|_| template.declare_uniform(uniform_decl(f32::NAN)));
+        let (u, s) = (template.push_uniform(u), template.push_uniform(s));
+        let x = template.push_var(0);
+        let us = template.push_binary(OpKind::Mul, u, s);
+        let uu = template.push_binary(OpKind::Mul, u, u);
+        let body = template.push_binary(OpKind::Add, us, x);
+        let body = template.push_binary(OpKind::Sub, body, uu);
+
+        let mut host = ExprArena::new();
+        let slots = [1.0, 2.0].map(|v| host.declare_uniform(uniform_decl(v)));
+        let x = host.push_var(0);
+        let shared = host.push_unary(OpKind::Sqrt, x);
+        let mut built = 0;
+        let copies = slots.map(|slot| {
+            host.splice_with(&template, body, |arena, input| {
+                built += 1;
+                match input.0 {
+                    0 => arena.push_uniform(slot),
+                    _ => shared,
+                }
+            })
+        });
+        assert_eq!(
+            built, 4,
+            "each input built once per copy, though `u` is read thrice"
+        );
+        assert_eq!(host.uniforms().len(), 2, "nothing declared");
+
+        let by_hand = slots.map(|slot| {
+            let u = host.push_uniform(slot);
+            let us = host.push_binary(OpKind::Mul, u, shared);
+            let uu = host.push_binary(OpKind::Mul, u, u);
+            let term = host.push_binary(OpKind::Add, us, x);
+            host.push_binary(OpKind::Sub, term, uu)
+        });
+        assert_eq!(copies, by_hand, "hash-consed onto the same nodes");
+        assert_ne!(copies[0], copies[1]);
     }
 }

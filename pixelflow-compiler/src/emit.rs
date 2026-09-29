@@ -32,18 +32,33 @@
 //! usize`) are the host function's const generics, and each value is its
 //! own program.
 //!
+//! **Families** (plan §1.6). A family `pieces: [Row; N]` is `N` elements'
+//! uniforms, declared by the host function element-major, and an iteration
+//! of it is its body's copies, one per element, made when the host function
+//! runs: the body is emitted once, as an arena of its own — a *template*,
+//! which Phase B6 will close once, a function of an abstract element and
+//! of the terms every copy shares, which are built once, outside it — and
+//! each copy is that template spliced in with the element's uniforms and
+//! the shared terms in its inputs' places, combined under the monoid as
+//! [`Chain`] combines distinct terms. So the instantiation builds
+//! `O(N·|body|)` nodes and allocates only arenas, and the program it builds
+//! has no fold, no binder and no index for the family.
+//!
 //! [`Kernel`]: pixelflow_core::Kernel
+//! [`Chain`]: pixelflow_ir::Chain
 
-use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode, UniformId};
 use pixelflow_ir::optimize::Optimize;
-use proc_macro2::TokenStream;
+use pixelflow_ir::{Binder, OpKind};
+use proc_macro2::{Literal, TokenStream};
 use quote::{format_ident, quote};
 use syn::Ident;
 
-use crate::ast::{ConstItem, FnItem, RecordItem, Role, Spelling};
-use crate::lower::{self, EXACT_INDEX_BOUND, Holes, Lowered};
-use crate::sema::{AnalyzedKernel, ConstValue, Scalar};
+use crate::ast::{ConstItem, FnItem, Param, RecordItem, Role, Spelling};
+use crate::lower::{self, EXACT_INDEX_BOUND, Families, Holes, Iteration, Lowered};
+use crate::sema::{AnalyzedKernel, ConstValue, Parameter, Scalar};
 
 /// Emit arena-backend code for an analyzed kernel.
 ///
@@ -81,7 +96,7 @@ pub fn emit_kernel(
                 unreachable!("the closure form parses to exactly one entry");
             };
             let arena_code = entry_arena(entry, analyzed, optimizer)?;
-            Ok(emit_closure(entry, &arena_code))
+            Ok(emit_closure(entry, analyzed, &arena_code))
         }
         Spelling::Items => {
             let mut items = TokenStream::new();
@@ -93,7 +108,7 @@ pub fn emit_kernel(
             }
             for entry in analyzed.def.fns.iter().filter(|f| f.role() == Role::Entry) {
                 let arena_code = entry_arena(entry, analyzed, optimizer)?;
-                items.extend(emit_entry(entry, &arena_code));
+                items.extend(emit_entry(entry, analyzed, &arena_code));
                 items.extend(emit_args(entry, analyzed));
             }
             Ok(items)
@@ -112,24 +127,30 @@ fn is_pub(vis: &syn::Visibility) -> bool {
 /// placeholder ranges a rewrite would read as ranges (an empty one, to
 /// `EmptyFold`), so it is emitted as lowered and optimized when its
 /// instantiation is baked — "no optimization runs at expansion unless the
-/// instance is declared" (plan §1.8, Phase E).
+/// instance is declared" (plan §1.8, Phase E). So is an entry with a
+/// family, whose count is structural whatever it is written as: its
+/// iterations' copies are made when its host function runs, and a family's
+/// node read as a program is the NaN [`Families`] documents.
 fn entry_arena(
     entry: &FnItem,
     analyzed: &AnalyzedKernel,
     optimizer: &mut dyn Optimize,
 ) -> Result<TokenStream, String> {
-    let Lowered { arena, root, holes } = lower::lower_entry(entry, analyzed)?;
+    let Lowered {
+        arena,
+        root,
+        holes,
+        families,
+    } = lower::lower_entry(entry, analyzed)?;
+    let parameters = analyzed.parameters(entry);
     let template = Template {
-        arguments: analyzed
-            .parameters(entry)
-            .into_iter()
-            .flat_map(|parameter| parameter.scalars())
-            .map(argument)
-            .collect(),
+        declarations: parameters.iter().map(declaration).collect(),
         structural: &entry.structural,
         holes: &holes,
+        families: &families,
     };
-    if !entry.structural.is_empty() {
+    let has_a_family = parameters.iter().any(|p| p.family.is_some());
+    if !entry.structural.is_empty() || has_a_family {
         return Ok(arena_to_tokens(&arena, root, &template));
     }
 
@@ -159,17 +180,77 @@ fn argument(scalar: Scalar<'_>) -> TokenStream {
     }
 }
 
-/// What an entry's arena is emitted against: the argument each declared
-/// uniform defaults to, in declaration order, and — for a template — the
-/// structural parameters and open ranges its holes are filled from.
-pub struct Template<'a> {
-    arguments: Vec<TokenStream>,
-    structural: &'a [Ident],
-    holes: &'a Holes,
+/// What a scalar of a family's element is, for the element `__element` the
+/// host function's declaration walks: `*__element`, or `__element.field`.
+fn element_argument(scalar: Scalar<'_>) -> TokenStream {
+    match scalar.field {
+        None => quote!(*__element),
+        Some(field) => quote!(__element.#field),
+    }
 }
 
-/// The closure form's expansion: a `Kernel`, or a closure over `f32`s.
-fn emit_closure(entry: &FnItem, arena_code: &TokenStream) -> TokenStream {
+/// What one of an entry's parameters declares, in the host function, in
+/// declaration order.
+enum Declaration {
+    /// One value's scalars: each one's value in the host function.
+    Value(Vec<TokenStream>),
+    /// A family's: `N` elements' scalars, element-major, each element's in
+    /// field order.
+    Family {
+        /// The host function's array.
+        array: Ident,
+        /// How many elements, as the host type counts them.
+        count: TokenStream,
+        /// One element's scalars, on `__element` ([`element_argument`]).
+        fields: Vec<TokenStream>,
+    },
+}
+
+/// The declaration of `parameter`: [`AnalyzedKernel::parameters`]' order,
+/// which is the one definition of it.
+fn declaration(parameter: &Parameter<'_>) -> Declaration {
+    match &parameter.family {
+        None => Declaration::Value(parameter.scalars().map(argument).collect()),
+        Some(count) => Declaration::Family {
+            array: parameter.name.clone(),
+            count: count.tokens(),
+            fields: parameter.scalars().map(element_argument).collect(),
+        },
+    }
+}
+
+/// What an entry's arena is emitted against: what each parameter declares,
+/// in declaration order, and — for a template — the structural parameters
+/// and open ranges its holes are filled from, and its families' iterations.
+pub struct Template<'a> {
+    declarations: Vec<Declaration>,
+    structural: &'a [Ident],
+    holes: &'a Holes,
+    families: &'a Families,
+}
+
+/// A parameter's type in the host function: as written, or, for a family,
+/// `[element; count]` with the count its evaluated one — a structural
+/// parameter's name, or the number a literal or a `const` is, since a
+/// private `const` is no host item.
+fn host_type(param: &Param, parameter: &Parameter<'_>) -> TokenStream {
+    let written = param.ty.written();
+    match &parameter.family {
+        None => quote!(#written),
+        Some(count) => {
+            let count = count.tokens();
+            quote!([#written; #count])
+        }
+    }
+}
+
+/// The closure form's expansion: a `Kernel`, or a closure over `f32`s and
+/// families of them.
+fn emit_closure(
+    entry: &FnItem,
+    analyzed: &AnalyzedKernel,
+    arena_code: &TokenStream,
+) -> TokenStream {
     let body = quote! {
         let (__arena, __root) = #arena_code;
         ::pixelflow_core::Kernel::from_parts(__arena, __root)
@@ -177,26 +258,38 @@ fn emit_closure(entry: &FnItem, arena_code: &TokenStream) -> TokenStream {
     if entry.params.is_empty() {
         return quote! {{ #body }};
     }
-    // Every parameter is an `f32`: the closure sugar has no records, and
-    // `sema` refuses a `bool` parameter of an entry.
-    let names = entry.params.iter().map(|p| &p.name);
+    // The closure sugar has no records, and `sema` refuses a `bool`
+    // parameter of an entry: every parameter is an `f32` or a family of
+    // them.
+    let params = entry
+        .params
+        .iter()
+        .zip(analyzed.parameters(entry))
+        .map(|(param, parameter)| {
+            let (name, ty) = (&param.name, host_type(param, &parameter));
+            quote!(#name: #ty)
+        });
     quote! {
-        move | #( #names: f32 ),* | -> ::pixelflow_core::Kernel { #body }
+        move | #( #params ),* | -> ::pixelflow_core::Kernel { #body }
     }
 }
 
 /// An entry's expansion: a host function returning a `Kernel`, generic over
 /// its structural parameters and taking its parameters by their declared
 /// types, with the entry's visibility and doc comments.
-fn emit_entry(entry: &FnItem, arena_code: &TokenStream) -> TokenStream {
+fn emit_entry(entry: &FnItem, analyzed: &AnalyzedKernel, arena_code: &TokenStream) -> TokenStream {
     let attrs = &entry.attrs;
     let vis = &entry.vis;
     let name = &entry.name;
     let (generics, _) = structural_generics(&entry.structural);
-    let params = entry.params.iter().map(|p| {
-        let (name, ty) = (&p.name, &p.ty);
-        quote!(#name: #ty)
-    });
+    let params = entry
+        .params
+        .iter()
+        .zip(analyzed.parameters(entry))
+        .map(|(param, parameter)| {
+            let (name, ty) = (&param.name, host_type(param, &parameter));
+            quote!(#name: #ty)
+        });
     quote! {
         #(#attrs)*
         #[must_use]
@@ -213,12 +306,14 @@ fn emit_entry(entry: &FnItem, arena_code: &TokenStream) -> TokenStream {
 /// into a block by the entry's declaration order
 /// (`UniformBlock::set_declared`). An entry with no parameters has none.
 ///
-/// The values are streamed — an array literal today, whose length rustc
-/// counts, never a declared `[f32; K]` — and the record derives no
-/// `Default`, so that a field whose scalar count depends on a structural
-/// parameter (a family, `[Row; N]`, B3's second half) needs neither a
-/// generic const expression nor a `Default` for `[Row; N]`, and neither is
-/// stable Rust: it can join the stream as a chained slice.
+/// The values are streamed — never a declared `[f32; K]` — and the record
+/// derives no `Default`, so that a family's field, `[Row; N]`, needs neither
+/// a generic const expression nor a `Default` for `[Row; N]`, and neither is
+/// stable Rust. With no family the stream is an array literal, whose length
+/// rustc counts; with one it is a chain of iterators, each family's
+/// elements flat-mapped to their fields — element-major, as the host
+/// function declares them — with no allocation, and a length the iterator
+/// knows, so a wrong count is refused before anything is written.
 fn emit_args(entry: &FnItem, analyzed: &AnalyzedKernel) -> TokenStream {
     if entry.params.is_empty() {
         return TokenStream::new();
@@ -231,22 +326,20 @@ fn emit_args(entry: &FnItem, analyzed: &AnalyzedKernel) -> TokenStream {
         "The arguments of `{entry_name}`: a program compiled from its kernel is rebound per \
          call from one of these, with [`{args}::write_into`]."
     );
-    let fields = entry.params.iter().map(|p| {
-        let (name, ty) = (&p.name, &p.ty);
-        let doc = format!("The argument `{name}` of `{entry_name}`.");
-        quote! {
-            #[doc = #doc]
-            #vis #name: #ty,
-        }
-    });
-    let values = analyzed
-        .parameters(entry)
-        .into_iter()
-        .flat_map(|parameter| parameter.scalars())
-        .map(|scalar| {
-            let value = argument(scalar);
-            quote!(self.#value)
+    let parameters = analyzed.parameters(entry);
+    let fields = entry
+        .params
+        .iter()
+        .zip(&parameters)
+        .map(|(param, parameter)| {
+            let (name, ty) = (&param.name, host_type(param, parameter));
+            let doc = format!("The argument `{name}` of `{entry_name}`.");
+            quote! {
+                #[doc = #doc]
+                #vis #name: #ty,
+            }
         });
+    let values = argument_stream(&parameters);
     quote! {
         #[doc = #record_doc]
         #[derive(Clone, Copy, Debug, PartialEq)]
@@ -273,10 +366,54 @@ fn emit_args(entry: &FnItem, analyzed: &AnalyzedKernel) -> TokenStream {
                 &self,
                 block: &mut ::pixelflow_core::UniformBlock,
             ) -> ::core::result::Result<(), ::pixelflow_core::ArityMismatch> {
-                block.set_declared([ #(#values),* ])
+                block.set_declared(#values)
             }
         }
     }
+}
+
+/// An `Args` record's scalars, in declaration order, as `write_into`
+/// streams them: an array literal of its values when it has no family, and
+/// otherwise a chain — each run of values an array, each family its
+/// elements flat-mapped to their fields (an `f32` family's elements copied
+/// out), a family of field-less records nothing.
+fn argument_stream(parameters: &[Parameter<'_>]) -> TokenStream {
+    let value = |scalar: Scalar<'_>| {
+        let value = argument(scalar);
+        quote!(self.#value)
+    };
+    if parameters
+        .iter()
+        .all(|parameter| parameter.family.is_none())
+    {
+        let values = parameters.iter().flat_map(|p| p.scalars()).map(value);
+        return quote!([ #(#values),* ]);
+    }
+    let mut segments: Vec<TokenStream> = Vec::with_capacity(parameters.len());
+    let mut run: Vec<TokenStream> = Vec::new();
+    for parameter in parameters {
+        if parameter.family.is_none() {
+            run.extend(parameter.scalars().map(value));
+            continue;
+        }
+        if !run.is_empty() {
+            segments.push(quote!([ #(#run),* ]));
+            run.clear();
+        }
+        let array = parameter.name;
+        let fields: Vec<TokenStream> = parameter.scalars().map(element_argument).collect();
+        match (parameter.record, fields.as_slice()) {
+            (_, []) => {}
+            (None, _) => segments.push(quote!(self.#array.iter().copied())),
+            (Some(_), _) => segments.push(quote! {
+                self.#array.iter().flat_map(|__element| [ #(#fields),* ])
+            }),
+        }
+    }
+    if !run.is_empty() {
+        segments.push(quote!([ #(#run),* ]));
+    }
+    quote!(::core::iter::empty::<f32>() #( .chain(#segments) )*)
 }
 
 /// An entry's structural parameters as generics: their declaration,
@@ -378,7 +515,8 @@ fn instantiated_range(range: &crate::sema::StructuralRange) -> TokenStream {
     }
 }
 
-/// Emit the arena, node for node, as code that rebuilds it at load time.
+/// Emit the arena as code that rebuilds it at load time: every node the
+/// root reaches, in the arena's order, children before parents.
 ///
 /// `Dwrt` nodes are emitted as they were built and resolved at bake time, by
 /// the one `LowerDwrt` pass in the runtime pipeline. Resolving them at
@@ -391,46 +529,427 @@ fn instantiated_range(range: &crate::sema::StructuralRange) -> TokenStream {
 ///
 /// See docs/plans/2026-09-08-macro-tier-is-arena-native.md.
 ///
-/// The arena's uniform table is declared first, one per argument of
-/// `template`, in order: each with an identity minted per call and the
-/// call's value as its default, so the kernel's arguments are that call's
-/// and its program is every call's. A template's holes are filled from the
-/// host function's structural parameters: a `Param(k)` is the `k`th one as
-/// an `f32`, and an open fold's range is evaluated per instantiation
-/// ([`instantiated_range`]).
+/// The program's uniforms are declared first, in `template`'s declaration
+/// order: each with an identity minted per call and the call's value as its
+/// default, so the kernel's arguments are that call's and its program is
+/// every call's — a family's, `N` elements of them, element-major, by the
+/// host function as it runs. A template's holes are filled from the host
+/// function's structural parameters: a `Param(k)` is the `k`th one as an
+/// `f32`, and an open fold's range is evaluated per instantiation
+/// ([`instantiated_range`]). A family's iteration is its copies
+/// ([`Emission::instantiation`]).
 ///
 /// # Panics
 ///
-/// If the arena's uniform table is not `template`'s arguments one for one:
-/// lowering declares one uniform per argument, and a relink restores the
-/// table after optimization, so a mismatch is a front-end bug, not a
-/// kernel's.
+/// If the arena's uniforms other than its families' are not `template`'s
+/// scalars one for one: lowering declares one uniform per scalar, and a
+/// relink restores the table after optimization, so a mismatch is a
+/// front-end bug, not a kernel's.
 pub fn arena_to_tokens(arena: &ExprArena, root: ExprId, template: &Template) -> TokenStream {
+    // The arguments are the uniforms lowering declared first, in
+    // declaration order; the rest are its families' abstract elements and
+    // markers, which no host function declares.
+    let arguments: Vec<u64> = arena
+        .uniforms()
+        .iter()
+        .enumerate()
+        .filter(|(_, decl)| !template.families.holds(decl.id))
+        .map(|(slot, _)| slot as u64)
+        .collect();
+    let values: Vec<&TokenStream> = template
+        .declarations
+        .iter()
+        .flat_map(|declaration| match declaration {
+            Declaration::Value(values) => values.as_slice(),
+            Declaration::Family { .. } => &[],
+        })
+        .collect();
     assert_eq!(
-        arena.uniforms().len(),
-        template.arguments.len(),
+        arguments.len(),
+        values.len(),
         "kernel! declared {} uniforms for {} arguments",
-        arena.uniforms().len(),
-        template.arguments.len()
+        arguments.len(),
+        values.len()
     );
-    let decls = template.arguments.iter().enumerate().map(|(slot, value)| {
-        let slot = format_ident!("__u{}", slot);
-        quote! {
-            let #slot = __arena.declare_uniform(::pixelflow_core::__macro::ir::arena::UniformDecl {
-                id: ::pixelflow_core::__macro::ir::arena::UniformIdentity::mint(),
-                default: #value,
-            });
-        }
-    });
-    let mut stmts: Vec<TokenStream> = decls.collect();
-    let n = arena.len();
-    for idx in 0..n {
-        let id = ExprId(idx as u32);
-        let ident = format_ident!("__e{}", idx);
-        let expr = match arena.node(id) {
-            pixelflow_ir::arena::ExprNode::Var(i) => {
-                quote! { __arena.push_var(#i) }
+    let mut slots = arguments.iter().copied();
+    let mut stmts: Vec<TokenStream> = Vec::with_capacity(template.declarations.len());
+    for (position, declaration) in template.declarations.iter().enumerate() {
+        match declaration {
+            Declaration::Value(values) => {
+                for value in values {
+                    let slot = uniform_var(slots.next().expect("one slot per argument"));
+                    stmts.push(quote! {
+                        let #slot = __arena.declare_uniform(::pixelflow_core::__macro::ir::arena::UniformDecl {
+                            id: ::pixelflow_core::__macro::ir::arena::UniformIdentity::mint(),
+                            default: #value,
+                        });
+                    });
+                }
             }
+            Declaration::Family { array, fields, .. } => {
+                let base = family_base(position);
+                stmts.push(quote! {
+                    let #base = __arena.uniforms().len() as u64;
+                    for __element in &#array {
+                        #(
+                            __arena.declare_uniform(::pixelflow_core::__macro::ir::arena::UniformDecl {
+                                id: ::pixelflow_core::__macro::ir::arena::UniformIdentity::mint(),
+                                default: #fields,
+                            });
+                        )*
+                    }
+                });
+            }
+        }
+    }
+    let program = Scope {
+        arena: format_ident!("__arena"),
+        depth: 0,
+        declared: arguments.into_iter().collect(),
+    };
+    let emission = Emission::new(arena, template);
+    let nodes = emission.nodes(&emission.reached(root, &[]), &program);
+    let root_ident = node_var(root);
+    quote! {{
+        let mut __arena = ::pixelflow_core::__macro::ir::arena::ExprArena::new();
+        #(#stmts)*
+        #(#nodes)*
+        (__arena, #root_ident)
+    }}
+}
+
+/// The variable holding a lowered uniform slot's `UniformId` in the arena
+/// being built where it is declared.
+fn uniform_var(slot: u64) -> Ident {
+    format_ident!("__u{slot}")
+}
+
+/// The variable holding a node's id in the arena being built.
+fn node_var(id: ExprId) -> Ident {
+    format_ident!("__e{}", id.0)
+}
+
+/// The variable holding the first slot of the family declared `position`th
+/// among the entry's parameters: element `k`'s field `f` is that plus
+/// `k·width + f`, as the host function declares them.
+fn family_base(position: usize) -> Ident {
+    format_ident!("__family{position}")
+}
+
+/// Where emitted code builds: the program's arena, or a family's template
+/// inside it.
+struct Scope {
+    /// The variable holding the arena being built.
+    arena: Ident,
+    /// How many templates deep: the program is `0`.
+    depth: usize,
+    /// The lowered uniform slots declared in this arena: a node may read
+    /// these and no others.
+    declared: HashSet<u64>,
+}
+
+/// What a node reads that the program binds inside itself — a fold's or an
+/// integral's index, or a field of a family's abstract element — so that a
+/// term reading none of what an iteration binds is the same in every copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Bound {
+    /// The index a `Reduce` binds.
+    Index(Binder),
+    /// A field of an abstract element, by its lowered slot.
+    Field(UniformId),
+}
+
+/// One lowered arena, emitted: the nodes each scope reaches, a family's
+/// iteration as its copies.
+struct Emission<'a> {
+    arena: &'a ExprArena,
+    template: &'a Template<'a>,
+    /// Per node, what it reads free of what the program binds: its
+    /// children's, less what it binds itself — a `Reduce` its index, an
+    /// iteration its element's fields.
+    free: Vec<BTreeSet<Bound>>,
+    /// Per iteration's node, the terms its copies share: its template's
+    /// inputs, in arena order ([`Emission::shared_terms`]).
+    shared: HashMap<ExprId, Vec<ExprId>>,
+}
+
+impl<'a> Emission<'a> {
+    fn new(arena: &'a ExprArena, template: &'a Template<'a>) -> Self {
+        let mut emission = Self {
+            arena,
+            template,
+            free: Vec::with_capacity(arena.len()),
+            shared: HashMap::new(),
+        };
+        for index in 0..arena.len() {
+            let free = emission.free_in(ExprId(index as u32));
+            emission.free.push(free);
+        }
+        for index in 0..arena.len() {
+            let id = ExprId(index as u32);
+            if let Some((_, body)) = template.families.node(arena, id) {
+                let shared = emission.shared_terms(id, body);
+                emission.shared.insert(id, shared);
+            }
+        }
+        emission
+    }
+
+    /// What `id` reads free of what the program binds, its children's
+    /// already known: the arena lists children before parents.
+    fn free_in(&self, id: ExprId) -> BTreeSet<Bound> {
+        let without = |child: ExprId, bound: &[Bound]| -> BTreeSet<Bound> {
+            let free = &self.free[child.0 as usize];
+            free.iter()
+                .filter(|b| !bound.contains(b))
+                .copied()
+                .collect()
+        };
+        if let Some((iteration, body)) = self.template.families.node(self.arena, id) {
+            let element: Vec<Bound> = iteration
+                .element
+                .iter()
+                .filter_map(|field| self.slot_of(*field))
+                .map(|slot| Bound::Field(UniformId(slot)))
+                .collect();
+            return without(body, &element);
+        }
+        match self.arena.node(id) {
+            ExprNode::Var(i) => Binder::from_var(i).map(Bound::Index).into_iter().collect(),
+            ExprNode::Uniform(slot)
+                if self
+                    .template
+                    .families
+                    .holds(self.arena.uniform_decl(slot).id) =>
+            {
+                BTreeSet::from([Bound::Field(slot)])
+            }
+            ExprNode::Reduce { fold, body } => without(body, &[Bound::Index(fold.binder())]),
+            _ => self
+                .arena
+                .children(id)
+                .flat_map(|child| self.free[child.0 as usize].iter().copied())
+                .collect(),
+        }
+    }
+
+    /// The terms an iteration's copies share: the largest subterms of its
+    /// body that read nothing its body binds — not its element, not an
+    /// index or an element bound inside it — reached through the iterations
+    /// nested in it too, since their copies are its template's. Each is the
+    /// same in every copy, so it is built once, where the iteration is, and
+    /// is one of its template's inputs: `x = X + ½`, an argument, another
+    /// family's iteration. A constant, a coordinate or an index bound
+    /// outside is a leaf every arena builds alike, and stays in the
+    /// template.
+    fn shared_terms(&self, node: ExprId, body: ExprId) -> Vec<ExprId> {
+        let outside = &self.free[node.0 as usize];
+        let mut seen = vec![false; self.arena.len()];
+        let mut stack = vec![body];
+        let mut shared = Vec::new();
+        while let Some(id) = stack.pop() {
+            if std::mem::replace(&mut seen[id.0 as usize], true) {
+                continue;
+            }
+            if self.free[id.0 as usize].is_subset(outside) {
+                let rebuilt_alike = matches!(
+                    self.arena.node(id),
+                    ExprNode::Const(_) | ExprNode::Var(_) | ExprNode::Param(_)
+                );
+                if !rebuilt_alike {
+                    shared.push(id);
+                }
+                continue;
+            }
+            match self.template.families.node(self.arena, id) {
+                Some((_, nested)) => stack.push(nested),
+                None => stack.extend(self.arena.children(id)),
+            }
+        }
+        shared.sort_unstable();
+        shared
+    }
+
+    /// The nodes a scope builds to reach `root`, in the arena's order,
+    /// children before parents: not `inputs` (sorted), which the scope reads
+    /// as its template's uniforms, and, for a family's node, the terms its
+    /// copies share rather than its body, which is its template's.
+    fn reached(&self, root: ExprId, inputs: &[ExprId]) -> Vec<ExprId> {
+        let mut reached = vec![false; self.arena.len()];
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if inputs.binary_search(&id).is_ok()
+                || std::mem::replace(&mut reached[id.0 as usize], true)
+            {
+                continue;
+            }
+            match self.shared.get(&id) {
+                Some(shared) => stack.extend(shared),
+                None => stack.extend(self.arena.children(id)),
+            }
+        }
+        (0..self.arena.len())
+            .filter(|index| reached[*index])
+            .map(|index| ExprId(index as u32))
+            .collect()
+    }
+
+    /// The statements building `reached` in `scope`'s arena, each bound to
+    /// its [`node_var`]; a family's node is its instantiation.
+    fn nodes(&self, reached: &[ExprId], scope: &Scope) -> Vec<TokenStream> {
+        reached
+            .iter()
+            .map(|&id| {
+                let expr = match self.template.families.node(self.arena, id) {
+                    Some((iteration, body)) => self.instantiation(id, iteration, body, scope),
+                    None => self.node(id, scope),
+                };
+                let var = node_var(id);
+                quote! {
+                    let #var = #expr;
+                }
+            })
+            .collect()
+    }
+
+    /// The lowered slot holding `id`, if the arena declares it: an abstract
+    /// element's field the body never reads may not be declared at all.
+    fn slot_of(&self, id: pixelflow_ir::arena::UniformIdentity) -> Option<u64> {
+        self.arena
+            .uniforms()
+            .iter()
+            .position(|decl| decl.id == id)
+            .map(|slot| slot as u64)
+    }
+
+    /// A family's iteration at `node`, instantiated in `scope`'s arena.
+    ///
+    /// Its body is built once, as an arena of its own — the *template*, a
+    /// function of its uniforms: first the program's table when the body
+    /// iterates a family itself, so that iteration's copies find their
+    /// elements where the host function declared them; then one input per
+    /// term the copies share ([`Emission::shared_terms`]); then the
+    /// abstract element's fields. Each copy is that template spliced into
+    /// `scope`'s arena with its uniforms placed (`ExprArena::splice_with`):
+    /// a program slot where it is, a shared term as the node `scope` built
+    /// once, and the element's fields as element `k`'s — the family's first
+    /// slot plus `k·width` — the copies combined as [`pixelflow_ir::Chain`]
+    /// combines distinct terms, under the monoid lowering chose, carried by
+    /// value. Nothing is rebuilt per copy but the body, and nothing is
+    /// allocated but the arenas.
+    fn instantiation(
+        &self,
+        node: ExprId,
+        iteration: &Iteration,
+        body: ExprId,
+        scope: &Scope,
+    ) -> TokenStream {
+        let Some(Declaration::Family { count, fields, .. }) =
+            self.template.declarations.get(iteration.parameter)
+        else {
+            panic!("kernel! iterated a family that is not one of the entry's parameters");
+        };
+        let ir = quote!(::pixelflow_core::__macro::ir);
+        let outer = &scope.arena;
+        let depth = scope.depth + 1;
+        let arena = format_ident!("__arena{depth}");
+        let shared = &self.shared[&node];
+        let reached = self.reached(body, shared);
+        let element: Vec<Option<u64>> = iteration
+            .element
+            .iter()
+            .map(|id| self.slot_of(*id))
+            .collect();
+        let inner = Scope {
+            arena: arena.clone(),
+            depth,
+            declared: element.iter().flatten().copied().collect(),
+        };
+        let nodes = self.nodes(&reached, &inner);
+        let root = node_var(body);
+
+        let abstract_uniform = quote! {
+            #arena.declare_uniform(#ir::arena::UniformDecl {
+                id: #ir::arena::UniformIdentity::mint(),
+                default: f32::NAN,
+            })
+        };
+        let iterates_a_family = reached
+            .iter()
+            .any(|id| self.template.families.node(self.arena, *id).is_some());
+        let (mirrored, program_table) = if iterates_a_family {
+            (
+                quote!(__arena.uniforms().len() as u64),
+                quote! {
+                    for __decl in __arena.uniforms() {
+                        #arena.declare_uniform(*__decl);
+                    }
+                },
+            )
+        } else {
+            (quote!(0), TokenStream::new())
+        };
+        let shared_vars: Vec<Ident> = shared.iter().map(|id| node_var(*id)).collect();
+        let shared_count = Literal::usize_unsuffixed(shared.len());
+        let shared_inputs = Literal::u64_unsuffixed(shared.len() as u64);
+        let element_fields = element.iter().map(|slot| match slot {
+            Some(slot) => {
+                let var = uniform_var(*slot);
+                quote!(let #var = #abstract_uniform;)
+            }
+            None => quote!(#abstract_uniform;),
+        });
+        let base = family_base(iteration.parameter);
+        let width = Literal::usize_unsuffixed(fields.len());
+        let monoid = lower::monoid(iteration.reduction).marshal().to_bytes();
+        quote! {{
+            let __mirrored: u64 = #mirrored;
+            let __shared: [#ir::arena::ExprId; #shared_count] = [ #(#shared_vars),* ];
+            let (__template, __template_root) = {
+                let mut #arena = #ir::arena::ExprArena::new();
+                #program_table
+                #(
+                    let #shared_vars = {
+                        let __slot = #abstract_uniform;
+                        #arena.push_uniform(__slot)
+                    };
+                )*
+                #( #element_fields )*
+                #( #nodes )*
+                (#arena, #root)
+            };
+            let mut __chain = #ir::Chain::new(
+                #ir::Monoid::unmarshal(#ir::kind::OpCode::from_bytes([ #(#monoid),* ]))
+                    .expect("kernel! emitted a monoid"),
+            );
+            for __k in 0..#count {
+                let __first = #base + (__k * #width) as u64;
+                let __copy = #outer.splice_with(&__template, __template_root, |__into, __slot| {
+                    match __slot.0.checked_sub(__mirrored) {
+                        // The program's own slot: a nested iteration's element.
+                        None => __into.push_uniform(__slot),
+                        Some(__input) => match __shared.get(__input as usize) {
+                            Some(&__term) => __term,
+                            // The element's fields, last: element `k`'s.
+                            None => __into.push_uniform(#ir::arena::UniformId(
+                                __first + (__input - #shared_inputs),
+                            )),
+                        },
+                    }
+                });
+                __chain.push(__copy, |__op, __folded, __term| {
+                    #outer.push_binary(__op, __folded, __term)
+                });
+            }
+            __chain.finish(|__identity| #outer.push_const(__identity))
+        }}
+    }
+
+    /// One node, built in `scope`'s arena.
+    fn node(&self, id: ExprId, scope: &Scope) -> TokenStream {
+        let arena = &scope.arena;
+        match self.arena.node(id) {
+            ExprNode::Var(i) => quote! { #arena.push_var(#i) },
             // By bit pattern, not as a decimal literal: `quote`'s `f32`
             // impl goes through `Literal::f32_suffixed`, which asserts
             // `is_finite()` — and non-finite constants are ordinary here. A
@@ -438,86 +957,91 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId, template: &Template) -> 
             // `BitAnd`'s monoid identity and therefore `all_over`'s seed, and
             // the folder now produces those. Bits also roundtrip exactly, with
             // no decimal-formatting question to get wrong.
-            pixelflow_ir::arena::ExprNode::Const(v) => {
+            ExprNode::Const(v) => {
                 let bits = v.to_bits();
-                quote! { __arena.push_const(f32::from_bits(#bits)) }
+                quote! { #arena.push_const(f32::from_bits(#bits)) }
             }
             // A template's hole: the structural parameter, as its `f32`, as
             // Rust's `as` rounds it — which is `N as f32` in the body.
-            pixelflow_ir::arena::ExprNode::Param(k) => {
-                let count = template.structural.get(usize::from(k)).unwrap_or_else(|| {
-                    panic!(
-                        "kernel! produced ExprNode::Param({k}) outside a template's structural \
-                         parameters"
-                    )
-                });
-                quote! { __arena.push_const(#count as f32) }
+            ExprNode::Param(k) => {
+                let count = self
+                    .template
+                    .structural
+                    .get(usize::from(k))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "kernel! produced ExprNode::Param({k}) outside a template's \
+                             structural parameters"
+                        )
+                    });
+                quote! { #arena.push_const(#count as f32) }
             }
             // The `kernel!` macro has no buffer surface yet, so this is
             // unreachable in practice; fail loud rather than emit a node that
             // references a buffer table `from_raw` does not reconstruct.
-            pixelflow_ir::arena::ExprNode::Buffer(b) => {
+            ExprNode::Buffer(b) => {
                 panic!(
                     "kernel! produced ExprNode::Buffer({}) — lattice parameters are not wired \
                      into the compiler yet (KERNELS_AND_LATTICES.md M4)",
                     b.0
                 )
             }
-            // An argument: the slot declared above for it.
-            pixelflow_ir::arena::ExprNode::Uniform(u) => {
-                let slot = format_ident!("__u{}", u.0);
-                quote! { __arena.push_uniform(#slot) }
+            // An argument, or an abstract element's field: the slot this
+            // arena declared for it. Any other is a family's, read outside
+            // its iteration — a front-end bug, never a program.
+            ExprNode::Uniform(u) => {
+                assert!(
+                    scope.declared.contains(&u.0),
+                    "kernel! read uniform slot {} where no arena being built declares it",
+                    u.0
+                );
+                let slot = uniform_var(u.0);
+                quote! { #arena.push_uniform(#slot) }
             }
             // And a reference is minted by `Kernel::by_ref` at composition
             // time — a runtime value, and the key it carries names a store
             // in the *build host's* process, which the compiled program is
             // not. Emitting one would name nothing.
-            pixelflow_ir::arena::ExprNode::Ref(k) => {
+            ExprNode::Ref(k) => {
                 panic!(
                     "kernel! produced ExprNode::Ref({k:?}) — a reference names a kernel \
                      interned in this process, which the emitted program does not share"
                 )
             }
-            pixelflow_ir::arena::ExprNode::Unary(op, child) => {
+            ExprNode::Unary(op, child) => {
                 let op_code = opkind_to_tokens(op);
-                let child_ident = format_ident!("__e{}", child.0);
-                quote! { __arena.push_unary(#op_code, #child_ident) }
+                let child = node_var(child);
+                quote! { #arena.push_unary(#op_code, #child) }
             }
-            pixelflow_ir::arena::ExprNode::Binary(op, a, b) => {
+            ExprNode::Binary(op, a, b) => {
                 let op_code = opkind_to_tokens(op);
-                let a_ident = format_ident!("__e{}", a.0);
-                let b_ident = format_ident!("__e{}", b.0);
-                quote! { __arena.push_binary(#op_code, #a_ident, #b_ident) }
+                let (a, b) = (node_var(a), node_var(b));
+                quote! { #arena.push_binary(#op_code, #a, #b) }
             }
-            pixelflow_ir::arena::ExprNode::Ternary(op, a, b, c) => {
+            ExprNode::Ternary(op, a, b, c) => {
                 let op_code = opkind_to_tokens(op);
-                let a_ident = format_ident!("__e{}", a.0);
-                let b_ident = format_ident!("__e{}", b.0);
-                let c_ident = format_ident!("__e{}", c.0);
-                quote! { __arena.push_ternary(#op_code, #a_ident, #b_ident, #c_ident) }
+                let (a, b, c) = (node_var(a), node_var(b), node_var(c));
+                quote! { #arena.push_ternary(#op_code, #a, #b, #c) }
             }
-            pixelflow_ir::arena::ExprNode::Nary(op, ..) => {
+            ExprNode::Nary(op, ..) => {
                 let op_code = opkind_to_tokens(op);
-                let child_idents: Vec<_> = arena
-                    .children(id)
-                    .map(|c| format_ident!("__e{}", c.0))
-                    .collect();
-                quote! { __arena.push_nary(#op_code, &[#(#child_idents),*]) }
+                let children: Vec<Ident> = self.arena.children(id).map(node_var).collect();
+                quote! { #arena.push_nary(#op_code, &[#(#children),*]) }
             }
             // A fold's metadata is a `Fold`, whose fields are private
             // precisely so no caller can assemble one that means nothing —
             // so it travels the way the two cache keys carry it, as bits
             // with a total inverse on the far side.
-            pixelflow_ir::arena::ExprNode::Reduce { fold, body } => {
+            ExprNode::Reduce { fold, body } => {
                 let bits = fold.to_bits();
-                let body_ident = format_ident!("__e{}", body.0);
+                let body = node_var(body);
                 let decoded = quote! {
                     ::pixelflow_core::__macro::ir::fold::Fold::from_bits(#bits)
                         .expect("kernel! emitted a well-formed fold")
                 };
                 // An open fold keeps its monoid and binder, which are
                 // structure, and takes its range from this instantiation.
-                let emitted = match template.holes.range_of(fold) {
+                let emitted = match self.template.holes.range_of(fold) {
                     None => decoded,
                     Some(range) => {
                         let range = instantiated_range(range);
@@ -531,7 +1055,7 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId, template: &Template) -> 
                         }}
                     }
                 };
-                quote! { __arena.push_reduce(#emitted, #body_ident) }
+                quote! { #arena.push_reduce(#emitted, #body) }
             }
             // Unreachable for the same reason `Ref` is: there is no
             // `kernel!` surface syntax for a hard branch. `Guard` is built
@@ -540,7 +1064,7 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId, template: &Template) -> 
             // `off` keys would name kernels interned in the *build host's*
             // process, which the emitted program does not share, exactly as
             // `Ref`'s panic says.
-            pixelflow_ir::arena::ExprNode::Guard { mask, on, off } => {
+            ExprNode::Guard { mask, on, off } => {
                 panic!(
                     "kernel! produced ExprNode::Guard(mask={mask:?}, on={on:?}, off={off:?}) \
                      — there is no surface syntax for a hard branch yet; it is built directly \
@@ -550,24 +1074,14 @@ pub fn arena_to_tokens(arena: &ExprArena, root: ExprId, template: &Template) -> 
             // A store is post-legalize vocabulary: the passes that wrap a
             // kernel in the lattice's folds build one, after extraction,
             // and no kernel! body can spell it.
-            pixelflow_ir::arena::ExprNode::Write { .. } => {
+            ExprNode::Write { .. } => {
                 panic!(
                     "kernel! produced ExprNode::Write — a store has no surface syntax; \
                      the legalize passes build one after extraction"
                 )
             }
-        };
-        stmts.push(quote! {
-            let #ident = #expr;
-        });
+        }
     }
-
-    let root_ident = format_ident!("__e{}", root.0);
-    quote! {{
-        let mut __arena = ::pixelflow_core::__macro::ir::arena::ExprArena::new();
-        #(#stmts)*
-        (__arena, #root_ident)
-    }}
 }
 
 /// The path naming `kind` in generated code.
@@ -722,5 +1236,142 @@ mod tests {
         );
         assert!(code.contains("__hi <= 16777216"), "{code}");
         assert!(code.contains("push_const (N as f32)"), "{code}");
+    }
+
+    /// A family is its host type, `[R; N]`, in the host function and the
+    /// `Args` record; its `N` elements' uniforms are declared as the host
+    /// function runs, element-major; an iteration is its body's template,
+    /// its shared terms (here `r`) its inputs, spliced per element with the
+    /// element's uniforms in its fields' places and combined by the IR's
+    /// `Chain` under the monoid, carried by value — and no fold; and
+    /// `write_into` streams the family's fields flat-mapped, then the rest.
+    #[test]
+    fn a_familys_iteration_expands_to_its_copies_at_instantiation() {
+        let code = expansion(quote! {
+            pub struct Pair { pub a: f32, pub b: f32 }
+            pub fn f<const N: usize>(pairs: [Pair; N], r: f32) -> f32 {
+                pairs.into_iter().map(|p| p.b * X + r).sum()
+            }
+        });
+        let monoid = |monoid: pixelflow_ir::Monoid| {
+            let [byte] = monoid.marshal().to_bytes();
+            format!(
+                "Monoid :: unmarshal (:: pixelflow_core :: __macro :: ir :: kind :: OpCode :: \
+                 from_bytes ([{byte}u8]))"
+            )
+        };
+        for expected in [
+            "pub fn f < const N : usize > (pairs : [Pair ; N] , r : f32)",
+            "pub pairs : [Pair ; N] ,",
+            "let __family0 = __arena . uniforms () . len () as u64 ; for __element in & pairs {",
+            "default : __element . a",
+            "default : __element . b",
+            "let __mirrored : u64 = 0 ;",
+            "ExprId ; 1] = [__e",
+            "for __k in 0 .. N {",
+            "let __first = __family0 + (__k * 2) as u64 ;",
+            "__arena . splice_with (& __template , __template_root , | __into , __slot |",
+            &monoid(pixelflow_ir::Monoid::SUM),
+            "set_declared (:: core :: iter :: empty :: < f32 > () . chain (self . pairs . iter () \
+             . flat_map (| __element | [__element . a , __element . b])) . chain ([self . r]))",
+        ] {
+            assert!(code.contains(expected), "expected `{expected}` in: {code}");
+        }
+        assert!(!code.contains("push_reduce"), "no fold: {code}");
+        assert!(
+            !code.contains("::std"),
+            "no `::std` path, so a `no_std` crate expands it: {code}"
+        );
+
+        let code = expansion(quote! { |v: [f32; 3]| v.into_iter().any(|e| X < e) });
+        for expected in [
+            "move | v : [f32 ; 3] | -> :: pixelflow_core :: Kernel",
+            "default : * __element",
+            "ExprId ; 0] = [] ;",
+            "for __k in 0 .. 3 {",
+            &monoid(pixelflow_ir::Monoid::ANY),
+        ] {
+            assert!(code.contains(expected), "expected `{expected}` in: {code}");
+        }
+    }
+
+    /// An optimizer that counts the arenas it is offered, and declines each.
+    struct Offered(usize);
+
+    impl Optimize for Offered {
+        fn optimize(&mut self, _arena: &ExprArena, _root: ExprId) -> pixelflow_ir::Rewritten {
+            self.0 += 1;
+            pixelflow_ir::Rewritten::Declined
+        }
+    }
+
+    /// No optimizer sees an entry with a family. Its lowered arena holds each
+    /// iteration as `body + marker`, which is only that iteration while no
+    /// rule rewrites it: reassociated, `t + (body + marker)` would read as an
+    /// iteration of `t + body`, `t` copied `N` times. So it is emitted as
+    /// lowered, as a structural entry is, whatever its count is written as,
+    /// and an entry without one is offered as before.
+    #[test]
+    fn an_entry_with_a_family_is_offered_to_no_optimizer() {
+        let analyzed = analyze(
+            parse(quote! {
+                pub fn counted(v: [f32; 2], r: f32) -> f32 {
+                    r + v.into_iter().map(|e| e * X).sum::<f32>()
+                }
+                pub fn plain(r: f32) -> f32 { r + X }
+            })
+            .expect("parses"),
+        )
+        .expect("analyzes");
+        let mut offered = Offered(0);
+        emit_kernel(&analyzed, &mut offered).expect("emits");
+        assert_eq!(offered.0, 1, "`plain` alone");
+    }
+
+    /// What an iteration's copies share is built once, where the iteration
+    /// is, and is its template's input — not rebuilt in the template and
+    /// spliced per copy. So an iteration whose body reads another's result
+    /// takes it as an input: the first family's copies are made once, in the
+    /// program, and the second's template holds its own body alone — no
+    /// template inside it, and nothing spliced into one — where rebuilding
+    /// it made `N` copies of the first body inside the second's template.
+    /// A body that does iterate a family itself holds the program's table
+    /// first, so that iteration finds its elements where the host declared
+    /// them.
+    #[test]
+    fn what_the_copies_share_is_built_once_as_an_input() {
+        let code = expansion(quote! {
+            pub struct Pair { pub a: f32, pub b: f32 }
+            pub fn weights<const N: usize>(pairs: [Pair; N]) -> f32 {
+                let f: f32 = pairs.into_iter().map(|p| p.a * X).sum();
+                pairs.into_iter().map(|p| p.b * f).sum()
+            }
+        });
+        assert_eq!(
+            code.matches("for __k in 0 .. N").count(),
+            2,
+            "two iterations: {code}"
+        );
+        assert!(
+            !code.contains("__arena2") && !code.contains("__arena1 . splice_with"),
+            "no iteration is instantiated inside another's template: {code}"
+        );
+        assert!(
+            !code.contains("for __decl in __arena . uniforms ()"),
+            "neither body iterates a family: {code}"
+        );
+
+        let code = expansion(quote! {
+            pub fn deep<const N: usize>(a: [f32; N], r: f32) -> f32 {
+                a.into_iter().map(|p| p + a.into_iter().map(|q| p * q + r).sum::<f32>()).sum()
+            }
+        });
+        for expected in [
+            "let __mirrored : u64 = __arena . uniforms () . len () as u64 ;",
+            "for __decl in __arena . uniforms () { __arena1 . declare_uniform (* __decl) ; }",
+            "__arena1 . splice_with (& __template , __template_root",
+        ] {
+            assert!(code.contains(expected), "expected `{expected}` in: {code}");
+        }
     }
 }
