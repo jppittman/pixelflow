@@ -84,7 +84,9 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 ///   warps it.
 /// - A `const NAME: f32 = expr;` is evaluated at expansion, per operation in
 ///   `f32`, from literals, other consts, `+ - * /`, unary `-` and
-///   parentheses. A `pub const` is also emitted as a host `pub const`.
+///   parentheses. A `const NAME: usize = expr;` is a count, evaluated from
+///   integers, other `usize` consts and `+ - * /`, each operation checked. A
+///   `pub const` is also emitted as a host `pub const`.
 ///
 /// ```ignore
 /// use pixelflow_compiler::kernel;
@@ -92,6 +94,7 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 ///
 /// kernel! {
 ///     pub const UNIT: f32 = 1.0;
+///     const RINGS: usize = 4;
 ///
 ///     /// The distance from `(cx, cy)`; a function of its arguments.
 ///     fn dist(x: f32, y: f32, cx: f32, cy: f32) -> f32 {
@@ -109,6 +112,14 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 ///     pub fn disc(cx: f32, cy: f32) -> f32 {
 ///         if dist(X, Y, cx, cy) < UNIT { UNIT } else { 0.0 }
 ///     }
+///
+///     /// How many of the discs about the origin of radii 1 to `RINGS`
+///     /// contain the sample: a fold, Σ over `i ∈ [0, RINGS)`.
+///     pub fn rings() -> f32 {
+///         (0..RINGS)
+///             .map(|i| if dist(X, Y, 0.0, 0.0) < (i as f32) + UNIT { UNIT } else { 0.0 })
+///             .sum()
+///     }
 /// }
 ///
 /// let unit_circle: Kernel = circle(0.0, 0.0, UNIT);
@@ -123,6 +134,18 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 /// A `bool` where an `f32` is expected, or the reverse, is a type error at
 /// expansion: `X.select(Y, 7.0)` used to blend a number as a mask. The IR
 /// keeps one lane for both; the type lives in the front end.
+///
+/// # Folds
+///
+/// `(a..b).map(|i| e).sum()` is Σ of `e` over `i ∈ [a, b)`; `.product()`,
+/// `.fold(f32::INFINITY, f32::min)` and `.fold(f32::NEG_INFINITY, f32::max)`
+/// are Π, min and max, and `(a..b).any(|i| m)` and `.all(|i| m)` are ∃ and ∀
+/// of `bool`s. An empty range gives the monoid's identity. The bounds are
+/// constant — integers and `usize` consts, evaluated at expansion — and the
+/// index `i` is a `usize`, which a body reads only as `i as f32`: there is no
+/// arithmetic on an index and nothing to index. A fold lowers to one
+/// `Reduce`, the node `Kernel::over` builds; unrolling it is the e-graph's
+/// choice, at bake time. A closure is a fold's body and appears nowhere else.
 ///
 /// `if` is the choice. `.select(a, b)` still lowers to the same node this
 /// phase, and Phase B of the plan removes it.

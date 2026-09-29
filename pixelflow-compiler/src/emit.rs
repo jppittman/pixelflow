@@ -30,7 +30,7 @@ use quote::{format_ident, quote};
 
 use crate::ast::{ConstItem, FnItem, Role, Spelling};
 use crate::lower;
-use crate::sema::AnalyzedKernel;
+use crate::sema::{AnalyzedKernel, ConstValue};
 
 /// Emit arena-backend code for an analyzed kernel.
 ///
@@ -210,18 +210,29 @@ fn bind_params<'a>(entry: &'a FnItem, arena_code: &TokenStream) -> Bound<'a> {
     }
 }
 
-/// A `pub const`'s host twin, holding the value `sema` evaluated. By bit
-/// pattern, for the reason [`arena_to_tokens`] gives: it is exact, and a
-/// const may be non-finite (`1.0 / 0.0`), which a decimal literal cannot
-/// spell.
-fn emit_const(item: &ConstItem, value: f32) -> TokenStream {
+/// A `pub const`'s host twin, holding the value `sema` evaluated. An `f32`
+/// by bit pattern, for the reason [`arena_to_tokens`] gives: it is exact,
+/// and a const may be non-finite (`1.0 / 0.0`), which a decimal literal
+/// cannot spell. A `usize` as the integer it is.
+fn emit_const(item: &ConstItem, value: ConstValue) -> TokenStream {
     let attrs = &item.attrs;
     let vis = &item.vis;
     let name = &item.name;
-    let bits = value.to_bits();
-    quote! {
-        #(#attrs)*
-        #vis const #name: f32 = f32::from_bits(#bits);
+    match value {
+        ConstValue::F32(value) => {
+            let bits = value.to_bits();
+            quote! {
+                #(#attrs)*
+                #vis const #name: f32 = f32::from_bits(#bits);
+            }
+        }
+        ConstValue::Usize(count) => {
+            let count = proc_macro2::Literal::u64_unsuffixed(count);
+            quote! {
+                #(#attrs)*
+                #vis const #name: usize = #count;
+            }
+        }
     }
 }
 

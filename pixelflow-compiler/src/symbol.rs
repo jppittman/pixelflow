@@ -9,8 +9,9 @@
 //! |------------|---------------------|----------------------|---------|
 //! | Intrinsic  | Collapse time       | `Var(0)`, `Var(1)`   | X, Y    |
 //! | Parameter  | Construction time   | `Param(i)`           | cx, r   |
-//! | Const      | Expansion time      | `Const(v)`           | PI      |
+//! | Const      | Expansion time      | `Const(v)`, or a count | PI, N |
 //! | Local      | Expression scope    | A shared `ExprId`    | dx, dy  |
+//! | Index      | A fold's body       | The fold's binder `Var` | i    |
 //!
 //! A helper's parameters are a fourth thing at lowering — the argument's own
 //! node, bound by name where the helper is inlined — but to `sema` they are
@@ -66,6 +67,10 @@ pub enum SymbolKind {
     /// Local variable introduced by `let`.
     /// Scoped to the containing block.
     Local,
+
+    /// A fold's index, the closure's parameter: a `usize`, scoped to the
+    /// fold's body.
+    Index,
 }
 
 /// A symbol in the symbol table.
@@ -167,14 +172,20 @@ impl SymbolTable {
         self.bind(name, SymbolKind::Parameter, ty);
     }
 
-    /// Register a `const` item. Every const is an `f32`.
-    pub fn register_const(&mut self, name: &str) {
-        self.bind(name, SymbolKind::Const, Ty::F32);
+    /// Register a `const` item: an `f32`, or a `usize` count.
+    pub fn register_const(&mut self, name: &str, ty: Ty) {
+        self.bind(name, SymbolKind::Const, ty);
     }
 
     /// Register a local variable in the innermost scope.
     pub fn register_local(&mut self, name: &str, ty: Ty) {
         self.bind(name, SymbolKind::Local, ty);
+    }
+
+    /// Register a fold's index, a `usize`, in the innermost scope: the
+    /// scope the fold's body is typed in.
+    pub fn register_index(&mut self, name: &str) {
+        self.bind(name, SymbolKind::Index, Ty::Usize);
     }
 
     fn bind(&mut self, name: &str, kind: SymbolKind, ty: Ty) {
