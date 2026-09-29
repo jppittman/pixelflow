@@ -186,8 +186,8 @@ that greedy settling order alone can explain.
 
 ## What changed in production, and the one thing to hand back
 
-At the shipped classical budget (`CLASSICAL_CLASS_CEILING` is pinned at the
-5,000 floor, so the cap-5,000 rows are what ships):
+At the shipped classical budget (`CLASSICAL_CLASS_CEILING` was pinned at the
+5,000 floor until 2026-09-29, so the cap-5,000 rows are what shipped):
 
 | family | kernels | terms changed | Σ `dag_cost` | Σ arena `dag_cost` (unweighted) |
 |---|---:|---:|---:|---:|

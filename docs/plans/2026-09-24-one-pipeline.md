@@ -369,7 +369,9 @@ with `ConstantFold`, each to a fixpoint.
    - The unroll alone needs 5,662 / 10,724 / 20,843 classes (16 / 32 / 64
      pieces). An e-graph keeps every intermediate stride.
    - The cap's ceiling equals its floor (`saturate.rs:227`, `:243`), and a
-     glyph inserts about 102 classes whatever its size.
+     glyph inserts about 102 classes whatever its size. (The ceiling is
+     50,000 since 2026-09-29; a glyph, at 154 inserted classes since its
+     closed form, still gets the floor, 8 × 154 being under 5,000.)
 2. **Pricing.**
    - The arbiter chooses between the extractor's two arms on the `dag`
      column (`extract.rs:1976`). `dag` adds each node's own cost with no
@@ -549,7 +551,7 @@ Under the loop splits, when a loop is built was mistaken for what it is.
 | `MAX_BOUND_BUFFERS = 4` | `3cc56272` #1175 | the ctx array lives on the stack | F: a `CachedText` of 5 distinct glyphs panics |
 | `expand_reduce` | `eeec0ce5` #974 | a caller that wants an unrolled form | `HalveFold` reaches the identical shape in the graph (`fold_rules.rs:21-25`); since #1268 (`bc53ea22`, the re-land of #1252) no production path calls it |
 | `dag += own`, trip-blind | `eb7a1c5d` #1117 | "this type carries neither the binder's trip count nor where codegen places its fold" | since #1268 a fold survives extraction on purpose, so its trips are its price |
-| a flat class cap | `e70737ef` #1229 | the ceiling pinned at the floor until a sweep is re-run | the fold rules' growth scales with trips, not with inserted classes |
+| a flat class cap | `e70737ef` #1229 | the ceiling pinned at the floor until a sweep is re-run | the fold rules' growth scales with trips, not with inserted classes (the pin itself went 2026-09-29) |
 
 ---
 
