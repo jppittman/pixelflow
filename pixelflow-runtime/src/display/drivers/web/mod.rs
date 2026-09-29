@@ -201,27 +201,21 @@ impl WebState {
                     }
                     DriverCommand::SetTitle { .. } => {
                         // Not supported in worker context
-                        let _ = engine_tx.send(EngineCommand::DriverAck);
                     }
                     DriverCommand::SetSize { .. } => {
                         // Not supported in worker context
-                        let _ = engine_tx.send(EngineCommand::DriverAck);
                     }
                     DriverCommand::CopyToClipboard(_) => {
                         // Not supported in worker context
-                        let _ = engine_tx.send(EngineCommand::DriverAck);
                     }
                     DriverCommand::RequestPaste => {
                         // Not supported in worker context
-                        let _ = engine_tx.send(EngineCommand::DriverAck);
                     }
                     DriverCommand::Bell => {
                         // Not supported in worker context
-                        let _ = engine_tx.send(EngineCommand::DriverAck);
                     }
                     DriverCommand::SetCursorIcon { .. } => {
                         // Not supported in worker context
-                        let _ = engine_tx.send(EngineCommand::DriverAck);
                     }
                 }
             }

@@ -175,10 +175,14 @@ impl RuleSet {
         Self::new(super::all_rules())
     }
 
-    /// [`RuleSet::production`] plus the bounded-fold decompositions.
+    /// [`RuleSet::production`] plus the bounded-fold decompositions and the
+    /// integration rules.
     ///
     /// The runtime tier's set, and only its: `kernel!` has no syntax that
-    /// builds a fold, so at the macro tier these rules can never fire.
+    /// builds a fold, so at the macro tier these rules can never fire. The
+    /// integration rules come last and match nothing but an integral, so a
+    /// kernel without one saturates exactly as it did before they existed;
+    /// with one, the graph runs them first ([`super::integral`]).
     /// Adding them to [`super::all_rules`] instead would leave them inert
     /// there while perturbing the pinned rule-set grids that
     /// `crate::math::inflate`'s inflation study measures against — a changed
@@ -189,6 +193,7 @@ impl RuleSet {
     pub fn runtime() -> Self {
         let mut rules = super::all_rules();
         rules.extend(super::fold_rules::fold_rules());
+        rules.extend(super::integral::integral_rules());
         Self::new(rules)
     }
 

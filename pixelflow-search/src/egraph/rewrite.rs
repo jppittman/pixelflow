@@ -156,55 +156,21 @@ pub enum RewriteAction {
     ExpandSquare { a: EClassId, b: EClassId },
     /// DiffOfSquares: a² - b² -> (a+b)(a-b)
     DiffOfSquares { a: EClassId, b: EClassId },
-    /// Peel one term off a bounded fold:
-    /// `⊕_{[lo,hi)} f  ->  f(lo) ⊕ ⊕_{[lo+1,hi)} f`.
+    /// Build a right-hand side the rule planned, and union it with the
+    /// matched class: every fold rule's action (`PeelFold`, `HalveFold`,
+    /// `FactorFold`) and every integration rule's (`NarrowInterval`,
+    /// `ClampMoment`, `ArcMoment`).
     ///
-    /// `head` is `f(lo)` — the body with the binder substituted, already
-    /// computed by the rule, which is the half that needs to *read* the
-    /// graph. It travels as a plan of nodes carrying their own resolved
-    /// `Op`s rather than as an arena template, because a peeled body is a
-    /// copy of a term the graph already holds and may contain any op the
-    /// graph holds — while the arena-template path resolves through
-    /// `op_from_kind`, which deliberately admits only what a *rewrite rule*
-    /// may name and so refuses a `Gather` or a mask.
-    ///
-    /// `rest` and `body` are the tail, which shares the original body's
-    /// e-class unchanged — the whole reason a fold carries a *range* rather
-    /// than an extent.
-    PeelFold {
-        /// `f(lo)`, in build order.
-        head: alloc::vec::Vec<super::fold_rules::HeadNode>,
-        /// Which entry of `head` — or which existing class — is the peeled
-        /// term. A body that never mentions the binder plans nothing at all
-        /// and its head *is* the body's class.
-        head_root: super::fold_rules::HeadRef,
-        /// The fold over everything after the peeled index.
-        rest: pixelflow_ir::Fold,
-        /// The body both folds share.
-        body: EClassId,
-    },
-
-    /// Double a fold's body and halve its trip count:
-    /// `⊕_{[lo,hi) step s} f  ->  ⊕_{[lo,hi) step 2s} (f ⊕ f[binder:=binder+s])`.
-    ///
-    /// `shift` is `f[binder := binder+s]` — `f` with every leaf occurrence of
-    /// the binder rebuilt as `binder+s`, an *expression*, not a literal:
-    /// unlike `PeelFold`'s `head`, the binder must stay live in the result,
-    /// because the doubled body this builds is the new body of a `Reduce`,
-    /// not a value that has left one. It travels as a plan for the same
-    /// reason `PeelFold`'s `head` does: a copy of a term the graph already
-    /// holds, which may contain any op the graph holds.
-    HalveFold {
-        /// `f[binder := binder + s]`, in build order.
-        shift: alloc::vec::Vec<super::fold_rules::HeadNode>,
-        /// Which entry of `shift` — or which existing class — is the shifted
-        /// body's root.
-        shift_root: super::fold_rules::HeadRef,
-        /// The new fold: same bounds, doubled stride.
-        halved: pixelflow_ir::Fold,
-        /// The body being doubled, unshifted.
-        body: EClassId,
-    },
+    /// A plan of nodes carrying their own resolved `Op`s rather than an
+    /// arena template, because what these rules build is, in part, a copy of
+    /// a term the graph already holds — a substituted body — and may contain
+    /// any op the graph holds, while the arena-template path resolves
+    /// through `op_from_kind`, which deliberately admits only what a
+    /// *rewrite rule* may name and so refuses a `Gather` or a mask. One
+    /// variant for all of them, replayed by one function, so predicting a
+    /// rule's growth and committing it cannot drift apart per rule. See
+    /// [`Plan`](super::fold_rules::Plan).
+    Plan(super::fold_rules::Plan),
 
     /// Differentiate: expand `Dwrt(inner, var)` one chain-rule step.
     ///

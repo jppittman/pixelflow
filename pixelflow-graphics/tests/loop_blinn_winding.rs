@@ -1,20 +1,25 @@
-//! The Loop–Blinn glyph kernel against an independent winding-number oracle.
+//! The glyph kernel against an independent winding-number oracle.
 //!
-//! `loop_blinn` computes the winding number of an outline as a sum of
-//! per-segment terms relative to a reference point, with Loop–Blinn's
-//! implicit for the curved slivers. The oracle here is the *other*
-//! formulation — a horizontal ray cast in `f64`, intersecting each quadratic
-//! by solving its `y(t)` — written from scratch and sharing no code or
-//! constants with the kernel. Where both are defined and away from the
-//! antialiasing ramp, they must agree exactly: coverage there is an exact
-//! integer, 0 or 1, and a kernel that gets it wrong has the wrong winding,
-//! not the wrong rounding.
+//! `loop_blinn` computes each pixel's area under ink: the non-zero rule's
+//! winding number integrated over the pixel, one term per monotone arc,
+//! closed by the compiler. The oracle here is the winding number itself at
+//! the pixel's centre — a horizontal ray cast in `f64`, intersecting each
+//! quadratic by solving its `y(t)` — written from scratch and sharing no
+//! code or constants with the kernel. Away from the outline the two must
+//! agree exactly: a pixel whose centre is farther from every edge than the
+//! pixel's half-diagonal lies wholly inside or wholly outside, so its area
+//! is the winding there clamped, an exact 0 or 1 once the kernel snaps its
+//! ends — and a kernel that gets it wrong has the wrong winding, not the
+//! wrong rounding. ("The ramp" below is that band about the outline, where
+//! a pixel is partly covered and this oracle does not judge.)
 //!
 //! What this suite covers, and what it does not: it pins the *winding*
 //! (interior/exterior classification, holes, self-intersections, contour
 //! direction, compound placement) and the exactness of the support. The
-//! antialiasing ramp's shape is pinned by `font_antialiasing.rs`, and where
-//! the ink is against a second rasterizer by `freetype_oracle.rs`.
+//! partly covered pixels are judged against their exact area by
+//! `glyph_exact_area.rs` and `glyph_area_edge_cases.rs`, the edge's
+//! transition by `font_antialiasing.rs`, and where the ink is against a
+//! second rasterizer by `freetype_oracle.rs`.
 
 use std::ops::RangeInclusive;
 
@@ -27,8 +32,10 @@ const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf")
 const CENTER: f32 = 0.5;
 
 /// Samples closer than this to the outline are in the antialiasing ramp
-/// (half a pixel wide on each side) and are not the oracle's to judge. A
-/// little past the ramp's half-pixel, for the fast `sqrt`'s estimate error.
+/// and are not the oracle's to judge: a pixel reaches `√2/2 ≈ 0.707` from
+/// its centre, so one centred farther than this from every edge is wholly
+/// in or wholly out. The margin past `0.707` covers the flattened
+/// outline's distance ([`DISTANCE_PIECES`]).
 const RAMP_CLEARANCE: f64 = 0.75;
 
 /// Pieces each curve is cut into when measuring distance to the outline.

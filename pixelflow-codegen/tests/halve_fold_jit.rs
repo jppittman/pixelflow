@@ -17,12 +17,12 @@
 //! Every [`Monoid`](pixelflow_ir::Monoid) this crate has (`SUM`, `PRODUCT`,
 //! `MIN`, `MAX`, the two mask quantifiers) is commutative, so this cannot
 //! exercise the property that actually distinguishes the stride-2
-//! decomposition `Fold::halve` implements from the rejected
+//! decomposition `RangeFold::halve` implements from the rejected
 //! "halve-and-offset" alternative (interleaving terms, which needs
 //! commutativity that stride-2 does not rely on): a numeric total cannot
 //! tell "terms combined out of order" apart from "terms combined in order"
 //! when the combiner does not care about order either way. What *is*
-//! checked, and is the real risk in the code, is that `Fold::halve` and
+//! checked, and is the real risk in the code, is that `RangeFold::halve` and
 //! `HalveFold`'s bookkeeping visit every index exactly once and produce the
 //! sum the terms actually have — a duplicated or dropped index would show up
 //! as a wrong total even though the monoid is commutative.

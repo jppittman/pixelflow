@@ -31,11 +31,9 @@
 //! which nothing in the render path currently holds.
 //!
 //! Run: `cargo run --release -p pixelflow-pipeline --example horner_vs_estrin`
-//! At other ISA levels (whether `MulAdd` is one instruction or two is most of
-//! the question): `RUSTFLAGS="-C llvm-args=-fp-contract=fast -C
-//! target-feature=+avx2,+fma" cargo run --release ...`
+//! At another ISA tier the host can execute: `PIXELFLOW_ISA=avx2 cargo run
+//! --release ...` (the tier is decided at startup, not by build flags).
 
-use pixelflow_codegen::JIT_VECTOR_BYTES;
 use pixelflow_codegen::emit::compile;
 use pixelflow_core::FastMathGuard;
 use pixelflow_ir::passes::{ATAN_MINIMAX, EXP2_POLY, LOG2_POLY, SIN_CHEB};
@@ -44,7 +42,10 @@ use pixelflow_pipeline::jit_bench::{BenchMode, BenchSession};
 use pixelflow_pipeline::poly::{PolyForm, build, critical_path};
 use pixelflow_search::egraph::CostModel;
 
-const LANES: usize = JIT_VECTOR_BYTES / 4;
+/// Lanes in one batch at the tier the JIT selected for this host.
+fn lanes() -> usize {
+    pixelflow_codegen::jit_vector_bytes() / 4
+}
 
 /// Degrees swept. Starts below the production polynomials (`ATAN_MINIMAX` is
 /// 4 coefficients) and runs well past them, so a crossover is bracketed rather
@@ -311,7 +312,7 @@ fn bench_one(
         // Spills and code size describe the kernel that was TIMED; the
         // accuracy kernel below is a different (unclamped) argument generator
         // and would report a different frame.
-        let timed = evaluate(&arena, root, LANES);
+        let timed = evaluate(&arena, root, lanes());
         row.spills[f] = timed.spills;
         row.bytes[f] = timed.bytes;
         for (m, &mode) in MODES.iter().enumerate() {
@@ -383,7 +384,7 @@ fn print_row(row: &Row) {
 /// not care.
 ///
 /// Reported per CALL, not per lane: the quantity being compared is one more
-/// instruction in the kernel, and a kernel instruction serves all `LANES`.
+/// instruction in the kernel, and a kernel instruction serves all `lanes()`.
 fn slope_ns_per_degree(
     session: &mut BenchSession,
     form: PolyForm,
@@ -396,7 +397,7 @@ fn slope_ns_per_degree(
         measure(session, &arena, root, mode).0
     };
     let (ns_lo, ns_hi) = (at(lo), at(hi));
-    (ns_hi - ns_lo) * LANES as f64 / (hi - lo) as f64
+    (ns_hi - ns_lo) * lanes() as f64 / (hi - lo) as f64
 }
 
 /// Degrees the slope is differenced across. `SLOPE_LO` is above the point
@@ -417,10 +418,10 @@ fn production_polys() -> [(&'static str, &'static [f32]); 4] {
 
 fn main() {
     println!(
-        "# horner vs estrin — JIT_VECTOR_BYTES={JIT_VECTOR_BYTES} (LANES={LANES}), \
-         arch={}, host fma={}",
+        "# horner vs estrin — tier={} (LANES={}), arch={}",
+        pixelflow_codegen::isa::detect().name(),
+        lanes(),
         std::env::consts::ARCH,
-        cfg!(target_feature = "fma"),
     );
 
     let model = CostModel::latency_prior();

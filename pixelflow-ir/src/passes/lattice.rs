@@ -2,9 +2,10 @@
 //!
 //! `collapse(extent)` wraps a kernel in the row/column/lane folds a
 //! collapse *is*; `pack(lanes)` strip-mines the column fold to a target's
-//! lane width. Both are arena-level transforms a caller runs directly — see
-//! [`super`]'s module doc for where they sit in the full pass order and why
-//! [`legalize`](super::legalize) does not call them yet.
+//! lane width. Both are arena-level transforms, and
+//! [`legalize`](super::legalize) runs them between `lower_dwrt` and
+//! `expand_gather` — see [`super`]'s module doc for why they sit there in the
+//! full pass order.
 //!
 //! ```text
 //! collapse(f) = fold_{j∈[0,h)} fold_{i∈[0,w)} fold_{l∈[0,1)}
@@ -26,7 +27,7 @@
 //! (docs/plans/2026-09-16-collapse-is-a-fold.md §2.1–§2.4).
 
 use crate::arena::{COORD_AXES, ExprArena, ExprId, ExprNode, UniformDecl};
-use crate::fold::{Binder, Fold, Monoid};
+use crate::fold::{Binder, Fold, Monoid, RangeFold};
 use crate::kind::OpKind;
 use crate::variance::LatticeShape;
 
@@ -72,14 +73,17 @@ pub struct Domain {
 ///
 /// # Panics
 ///
-/// - If a `Ref`, a `Guard`, or a `Dwrt` (any arity) is reachable from
-///   `root`. A `Ref`/`Guard` is a name:
+/// - If a `Ref`, a `Guard`, a `Dwrt` (any arity), or an interval fold is
+///   reachable from `root`. A `Ref`/`Guard` is a name:
 ///   [`substitute_vars_with`](ExprArena::substitute_vars_with) copies it
 ///   through without reaching the referent's `Var(0)`, so the warp below
 ///   would silently never reach it. A `Dwrt` must be taken with respect to
 ///   `Var(0)` before this pass substitutes that variable away, or the
-///   chain-rule factor it needs is gone. Run `expand_refs` then `lower_dwrt`
-///   first — see [`legalize`](super::legalize) for the order.
+///   chain-rule factor it needs is gone. An interval fold is an integral,
+///   and an integral is not a loop: nothing downstream can run one, so it
+///   must already have been replaced by its quadrature. Run `expand_refs`,
+///   then [`resolve`](super::resolve) (intervals, then `Dwrt`), first — see
+///   [`legalize`](super::legalize) for the order.
 /// - If fewer than three binder slots are free — neither bound by a
 ///   reachable `Reduce` nor read by a reachable `Var` in the binder range: a
 ///   kernel already nesting three folds of its own leaves nothing for the
@@ -128,14 +132,14 @@ pub fn collapse(arena: &mut ExprArena, root: ExprId, domain: Domain) -> ExprId {
 
 /// The full pass order, named once so every panic message in this file spells
 /// it identically.
-const PASS_ORDER: &str =
-    "expand_refs -> lower_dwrt -> collapse -> pack -> expand_gather -> expand_transcendentals";
+const PASS_ORDER: &str = "expand_refs -> expand_intervals -> lower_dwrt -> collapse -> pack \
+     -> expand_gather -> expand_transcendentals";
 
 /// Which binder slots [`collapse`] must not choose — bound by a reachable
 /// `Reduce`, or read by a reachable `Var` in the binder range — found in one
 /// walk of `root`'s reachable subgraph that also refuses, by panicking and
-/// naming [`PASS_ORDER`], any reachable `Ref`, `Guard`, or `Dwrt` (see
-/// [`collapse`]'s own doc for why each is refused).
+/// naming [`PASS_ORDER`], any reachable `Ref`, `Guard`, `Dwrt`, or interval
+/// fold (see [`collapse`]'s own doc for why each is refused).
 fn reachable_taken_binders(arena: &ExprArena, root: ExprId) -> [bool; Binder::COUNT] {
     let mut taken = [false; Binder::COUNT];
     let mut seen = alloc::vec![false; arena.len()];
@@ -165,6 +169,16 @@ fn reachable_taken_binders(arena: &ExprArena, root: ExprId) -> [bool; Binder::CO
                 "collapse: a Dwrt is reachable from root — it must be taken \
                  with respect to Var(0) before this pass substitutes that \
                  variable away; run lower_dwrt first ({PASS_ORDER})"
+            ),
+            ExprNode::Reduce {
+                fold: Fold::Interval(interval),
+                ..
+            } => panic!(
+                "collapse: an interval fold ({}) is reachable from root — an \
+                 integral, which no loop nest can run; it must be closed by \
+                 a rule or replaced by its quadrature before the lattice \
+                 wraps the kernel; run expand_intervals first ({PASS_ORDER})",
+                Fold::Interval(interval)
             ),
             ExprNode::Var(i) => {
                 if let Some(b) = Binder::from_var(i) {
@@ -232,34 +246,36 @@ pub fn pack(arena: &mut ExprArena, root: ExprId, lanes: u32) -> ExprId {
 
 /// Read [`collapse`]'s three folds and its shared `Write` back out of `root`,
 /// or panic naming the shape `pack` expects — see [`pack`]'s own doc.
-fn collapse_shape(arena: &ExprArena, root: ExprId) -> (Fold, Fold, Fold, ExprId) {
+fn collapse_shape(arena: &ExprArena, root: ExprId) -> (RangeFold, RangeFold, RangeFold, ExprId) {
     const SHAPE: &str = "pack expects collapse's shape: three nested Reduces \
         over Monoid::SEQ — row, then col, then a lane fold over [0,1) — \
         wrapping a Write whose row/col/lane equal the three folds' binders, \
         in that order";
 
+    // A range, each of them: `collapse` built them, and it refuses an
+    // interval anywhere below.
     let ExprNode::Reduce {
-        fold: row_fold,
+        fold: Fold::Range(row_fold),
         body: col_id,
     } = arena.node(root)
     else {
-        panic!("{SHAPE} (root is not a Reduce)");
+        panic!("{SHAPE} (root is not a range Reduce)");
     };
 
     let ExprNode::Reduce {
-        fold: col_fold,
+        fold: Fold::Range(col_fold),
         body: lane_id,
     } = arena.node(col_id)
     else {
-        panic!("{SHAPE} (the row fold's body is not a Reduce)");
+        panic!("{SHAPE} (the row fold's body is not a range Reduce)");
     };
 
     let ExprNode::Reduce {
-        fold: lane_fold,
+        fold: Fold::Range(lane_fold),
         body: write,
     } = arena.node(lane_id)
     else {
-        panic!("{SHAPE} (the col fold's body is not a Reduce)");
+        panic!("{SHAPE} (the col fold's body is not a range Reduce)");
     };
 
     let ExprNode::Write {
@@ -377,7 +393,7 @@ mod tests {
         let new_root = collapse(&mut arena, root, domain);
 
         let ExprNode::Reduce {
-            fold: row_fold,
+            fold: Fold::Range(row_fold),
             body: col_id,
         } = arena.node(new_root)
         else {
@@ -387,7 +403,7 @@ mod tests {
         assert_eq!(row_fold.range(), 0..3);
 
         let ExprNode::Reduce {
-            fold: col_fold,
+            fold: Fold::Range(col_fold),
             body: lane_id,
         } = arena.node(col_id)
         else {
@@ -397,7 +413,7 @@ mod tests {
         assert_eq!(col_fold.range(), 0..5);
 
         let ExprNode::Reduce {
-            fold: lane_fold,
+            fold: Fold::Range(lane_fold),
             body: write,
         } = arena.node(lane_id)
         else {
@@ -615,7 +631,7 @@ mod tests {
         let packed = pack(&mut arena, collapsed, 4);
 
         let ExprNode::Reduce {
-            fold: row_fold,
+            fold: Fold::Range(row_fold),
             body: row_body,
         } = arena.node(packed)
         else {
@@ -625,7 +641,7 @@ mod tests {
         assert_eq!(row_fold.range(), 0..3);
 
         let ExprNode::Reduce {
-            fold: col_fold,
+            fold: Fold::Range(col_fold),
             body: lane_id,
         } = arena.node(row_body)
         else {
@@ -636,7 +652,7 @@ mod tests {
         assert_eq!(col_fold.len(), 2);
 
         let ExprNode::Reduce {
-            fold: lane_fold,
+            fold: Fold::Range(lane_fold),
             body: write,
         } = arena.node(lane_id)
         else {
@@ -667,7 +683,7 @@ mod tests {
         let packed = pack(&mut arena, collapsed, 4);
 
         let ExprNode::Reduce {
-            fold: row_fold,
+            fold: Fold::Range(row_fold),
             body: row_body,
         } = arena.node(packed)
         else {
@@ -680,7 +696,7 @@ mod tests {
         };
 
         let ExprNode::Reduce {
-            fold: main_col,
+            fold: Fold::Range(main_col),
             body: main_lane_id,
         } = arena.node(main)
         else {
@@ -689,7 +705,7 @@ mod tests {
         assert_eq!(main_col.range(), 0..8);
         assert_eq!(main_col.stride(), 4);
         let ExprNode::Reduce {
-            fold: main_lane,
+            fold: Fold::Range(main_lane),
             body: main_write,
         } = arena.node(main_lane_id)
         else {
@@ -698,7 +714,7 @@ mod tests {
         assert_eq!(main_lane.range(), 0..4);
 
         let ExprNode::Reduce {
-            fold: rem_col,
+            fold: Fold::Range(rem_col),
             body: rem_lane_id,
         } = arena.node(rem)
         else {
@@ -707,7 +723,7 @@ mod tests {
         assert_eq!(rem_col.range(), 8..9);
         assert_eq!(rem_col.stride(), 1);
         let ExprNode::Reduce {
-            fold: rem_lane,
+            fold: Fold::Range(rem_lane),
             body: rem_write,
         } = arena.node(rem_lane_id)
         else {
@@ -749,7 +765,11 @@ mod tests {
             panic!("even an all-remainder row sequences main then remainder");
         };
 
-        let ExprNode::Reduce { fold: main_col, .. } = arena.node(main) else {
+        let ExprNode::Reduce {
+            fold: Fold::Range(main_col),
+            ..
+        } = arena.node(main)
+        else {
             panic!("main must be a Reduce");
         };
         assert!(main_col.is_empty());
@@ -757,14 +777,18 @@ mod tests {
         assert_eq!(main_col.stride(), 4);
 
         let ExprNode::Reduce {
-            fold: rem_col,
+            fold: Fold::Range(rem_col),
             body: rem_lane_id,
         } = arena.node(rem)
         else {
             panic!("rem must be a Reduce");
         };
         assert_eq!(rem_col.range(), 0..1);
-        let ExprNode::Reduce { fold: rem_lane, .. } = arena.node(rem_lane_id) else {
+        let ExprNode::Reduce {
+            fold: Fold::Range(rem_lane),
+            ..
+        } = arena.node(rem_lane_id)
+        else {
             panic!("rem's body must be the lane fold");
         };
         assert_eq!(rem_lane.range(), 0..3);
@@ -812,6 +836,22 @@ mod tests {
         let wrt = arena.push_const(0.0);
         let root = arena.push_binary(OpKind::Dwrt, x, wrt);
 
+        let domain = Domain {
+            shape: LatticeShape::new([2, 2]),
+            origin: mint_origin(),
+        };
+        let _ = collapse(&mut arena, root, domain);
+    }
+
+    /// An integral is not a loop, so there is nothing for the lattice to
+    /// wrap: `legalize` replaces every one by its quadrature before this
+    /// pass, and one reaching it is a caller that skipped `resolve`.
+    #[test]
+    #[should_panic(expected = "an interval fold")]
+    fn collapse_refuses_an_interval() {
+        let area = Kernel::x().area();
+        let (arena, root) = area.parts();
+        let mut arena = arena.clone();
         let domain = Domain {
             shape: LatticeShape::new([2, 2]),
             origin: mint_origin(),

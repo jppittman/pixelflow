@@ -229,25 +229,22 @@ pub const CLASSICAL_CLASS_FLOOR: usize = 5_000;
 /// The classical cap's ceiling — **pinned at the floor, which switches the
 /// input-sized cap off.**
 ///
-/// The rule is calibrated and measured (8 per inserted class, ceiling 50,000:
+/// The rule was calibrated (8 per inserted class, ceiling 50,000:
 /// `docs/results/2026-09-08-class-cap-sweep.md`, −16.7% Σ `dag_cost` on the
-/// 44 DEJaVu glyphs it raises, none dearer) and it is blocked by a rendering
-/// defect it exposes: raising `'8'` off the floor changes which fusion the
-/// extractor picks for its quadratic solver, `disc >= 0` at the waist's
-/// tangency lands on the other side of exact zero, and a half-covered smear
-/// appears along the waist at 13–21 px where FreeType has no ink
-/// (`pixelflow-graphics/tests/freetype_oracle.rs`, the optimized arm — the
-/// `'8'` defect the raw arm's oracle found in 2026-09, back by the route its
-/// own comment predicted). The knife edge is the glyph kernel's
-/// (`quad_tangency_winding.rs`), not the optimizer's, and it has to be fixed
-/// there first. When it is, this constant becomes 50,000 — a 50,000-class
-/// e-graph peaks near 25 MB of live heap on the sweep's glyphs and the
-/// extraction pass's reach sets stay under 2 MB there — and nothing else
-/// changes.
+/// 44 DejaVu glyphs it raised, none dearer) and was blocked by a knife edge
+/// in the glyph it measured: `'8'`'s `disc >= 0` at its waist's tangency
+/// flipped with the extractor's fusion choice. That glyph is gone — coverage
+/// is a closed-form area with no discriminant
+/// (`docs/results/2026-09-23-glyph-is-a-formula.md`) — and the calibration
+/// went with it: the sweep's `'8'` inserted 3,405 classes where a glyph now
+/// inserts 103, and none of its kernels carried an integral for the closing
+/// phase to spend the cap on. The ceiling moves when the sweep is
+/// re-run on today's kernels, not before.
 pub const CLASSICAL_CLASS_CEILING: usize = CLASSICAL_CLASS_FLOOR;
 
-/// What [`CLASSICAL_CLASS_CEILING`] becomes when the `'8'` tangency is fixed:
-/// the ceiling the sweep calibrated the rule under.
+/// The ceiling the 2026-09-08 sweep calibrated the rule under — measured on
+/// a glyph kernel since replaced, so the bound a re-run starts from rather
+/// than its answer.
 pub const CLASSICAL_CLASS_CEILING_CALIBRATED: usize = 50_000;
 
 // The saturation loop clamps every cap to `HARD_CLASS_LIMIT`; a ceiling above

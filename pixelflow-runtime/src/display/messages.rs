@@ -1,6 +1,6 @@
 pub use crate::api::private::WindowId;
 use crate::api::public::{CursorIcon, WindowDescriptor};
-use crate::input::{KeySymbol, Modifiers};
+use crate::input::{KeySymbol, Modifiers, Selection};
 use crate::pixel::PlatformPixel;
 use pixelflow_graphics::render::Frame;
 
@@ -335,30 +335,38 @@ pub enum DisplayControl {
     ///
     /// # Contract
     ///
-    /// **Sender**: Provides text to copy.
+    /// **Sender**: Provides text to copy and the selection it goes to.
     ///
-    /// **Receiver**: Stores the text in the system clipboard. Overwrites previous
-    /// clipboard content. Other applications can read it via standard paste.
+    /// **Receiver**: Stores the text in that selection, overwriting what it
+    /// held. Other applications can read it via standard paste. A platform
+    /// with no primary selection ignores a copy to `Primary`, rather than
+    /// overwriting its clipboard every time text is highlighted.
     ///
     /// # Arguments
     ///
+    /// - `selection`: Which selection to set
     /// - `text`: UTF-8 text to copy
-    Copy { text: String },
+    Copy { selection: Selection, text: String },
 
     /// Request clipboard paste.
     ///
     /// # Contract
     ///
-    /// **Sender**: Requests the current clipboard content.
+    /// **Sender**: Requests the content of a selection.
     ///
-    /// **Receiver**: Reads the system clipboard and emits a `DisplayEvent::PasteData`
-    /// with the content. If clipboard is empty or unavailable, may emit no event.
+    /// **Receiver**: Reads that selection and emits exactly one
+    /// `DisplayEvent::PasteData` naming it — with empty text when the
+    /// selection is empty or unavailable, so every request is answered. A
+    /// platform with no primary selection reads its clipboard for `Primary`.
     ///
     /// # Example Use
     ///
     /// Terminal emulator receives Ctrl+V, sends `RequestPaste`, and receives the
     /// pasted text via `DisplayEvent::PasteData`.
-    RequestPaste,
+    RequestPaste { selection: Selection },
+
+    /// Enter full screen, or leave it.
+    ToggleFullscreen { id: WindowId },
 }
 
 /// Management messages for the display driver (lifecycle operations).
@@ -433,8 +441,7 @@ pub enum DisplayMgmt {
     ///
     /// **Sender**: Specifies a window ID to close.
     ///
-    /// **Receiver**: Closes the window and emits a `DisplayEvent::WindowDestroyed` event.
-    /// After this event, any messages for that window ID are invalid.
+    /// **Receiver**: Closes the window. After this, any message for that window ID is invalid.
     ///
     /// # Arguments
     ///
@@ -450,7 +457,6 @@ pub enum DisplayMgmt {
     ///
     /// ```ignore
     /// tx.send(Message::Management(DisplayMgmt::Destroy { id: window_id }))?;
-    /// // ... wait for DisplayEvent::WindowDestroyed ...
     /// ```
     Destroy { id: WindowId },
 }
@@ -465,9 +471,6 @@ pub enum DisplayEvent {
     /// event always actually was — the platform reporting the size it chose.
     WindowCreated {
         surface: Surface,
-    },
-    WindowDestroyed {
-        id: WindowId,
     },
     /// Window was resized (by user or programmatically).
     ///
@@ -521,10 +524,11 @@ pub enum DisplayEvent {
     FocusLost {
         id: WindowId,
     },
+    /// The answer to one `DisplayControl::RequestPaste`.
     PasteData {
+        selection: Selection,
         text: String,
     },
-    ClipboardDataRequested,
     CloseRequested {
         id: WindowId,
     },

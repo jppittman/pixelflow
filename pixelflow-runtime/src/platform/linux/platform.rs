@@ -93,23 +93,24 @@ impl PlatformOps for LinuxOps {
                 DisplayControl::SetSize { width, height, .. } => {
                     window.set_size(width, height);
                 }
-                DisplayControl::Copy { text } => {
-                    window.copy_to_clipboard(&text);
+                DisplayControl::Copy { selection, text } => {
+                    window.copy(selection, text);
                 }
-                DisplayControl::RequestPaste => {
-                    window.request_paste();
+                DisplayControl::RequestPaste { selection } => {
+                    window.request_paste(selection);
                 }
+                DisplayControl::ToggleFullscreen { .. } => window.toggle_fullscreen(),
                 DisplayControl::SetCursor { cursor, .. } => {
                     window.set_cursor(cursor);
                 }
                 DisplayControl::Bell => {
                     window.bell();
                 }
-                DisplayControl::ShowWindow { .. }
-                | DisplayControl::HideWindow { .. }
-                | DisplayControl::RequestRedraw { .. } => {
-                    // Not implemented for Linux yet
-                }
+                DisplayControl::ShowWindow { .. } => window.show(),
+                DisplayControl::HideWindow { .. } => window.hide(),
+                // X11 retains nothing to repaint: every present uploads a whole frame, so
+                // the next present is the redraw.
+                DisplayControl::RequestRedraw { .. } => {}
             }
         }
         Ok(())

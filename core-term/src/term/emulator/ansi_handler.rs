@@ -25,19 +25,13 @@ pub(super) fn process_ansi_command(
     emulator: &mut TerminalEmulator,
     command: AnsiCommand,
 ) -> Option<EmulatorAction> {
-    if !matches!(command, AnsiCommand::Print(_)) {
-        emulator.cursor_wrap_next = false;
-    }
+    emulator.cursor_wrap_next = false;
 
     match command {
         AnsiCommand::C0Control(c0) => handle_c0_control(emulator, c0),
         AnsiCommand::Esc(esc_cmd) => handle_esc_command(emulator, esc_cmd),
         AnsiCommand::Csi(csi) => handle_csi_command(emulator, csi),
         AnsiCommand::Osc(data) => emulator.handle_osc(data),
-        AnsiCommand::Print(ch) => {
-            emulator.print_char(ch);
-            None
-        }
         _ => {
             debug!(
                 "Unhandled ANSI command type in TerminalEmulator: {:?}",
@@ -130,7 +124,10 @@ fn handle_esc_command(
             emulator.designate_character_set(g_idx, CharacterSet::from_char(final_char));
             None
         }
-        EscCommand::ResetToInitialState => emulator.reset(),
+        EscCommand::ResetToInitialState => {
+            emulator.reset();
+            None
+        }
         _ => {
             debug!("Unhandled Esc command: {:?}", esc_cmd);
             None
@@ -293,7 +290,10 @@ fn handle_csi_command(emulator: &mut TerminalEmulator, csi: CsiCommand) -> Optio
             emulator.screen.set_tabstop(cursor_x);
             None
         }
-        CsiCommand::Reset => emulator.reset(),
+        CsiCommand::Reset => {
+            emulator.reset();
+            None
+        }
         CsiCommand::Unsupported(intermediates, final_byte_opt) => {
             warn!(
                 "TerminalEmulator received CsiCommand::Unsupported: intermediates={:?}, final={:?}. This is usually an error from the parser.",

@@ -31,7 +31,7 @@
 //! - **Invariants**: Constraints that must always hold
 
 use crate::keys::{KeySymbol, Modifiers};
-use crate::term::cursor_visibility::CursorVisibility;
+pub use pixelflow_runtime::input::Selection;
 use serde::{Deserialize, Serialize};
 
 // --- User Input Actions ---
@@ -179,9 +179,10 @@ pub enum UserInputAction {
     /// **Precondition**: User released mouse button or completed selection gesture.
     ///
     /// **Emulator**:
-    /// - If selection is non-empty: finalizes it (text is now selectable for copy)
-    /// - If selection is empty (click without drag): clears any previous selection
-    /// - Queues `RequestRedraw` to refresh selection appearance
+    /// - If selection is non-empty: finalizes it and generates `Copy` to the
+    ///   primary selection (text is also available to `InitiateCopy`)
+    /// - If selection is empty (click without drag): clears any previous
+    ///   selection and queues `RequestRedraw`
     ///
     /// **Postcondition**: Selection is finalized or cleared
     ///
@@ -384,6 +385,35 @@ pub enum ControlEvent {
 
 // --- Emulator Actions (Signaled to Orchestrator) ---
 
+/// An OSC 52 query awaiting the content of the selection it asked for.
+///
+/// Holds the reply's form; the orchestrator supplies the content once the
+/// platform has read it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectionReport {
+    /// The `Pc` the program asked with, echoed in the reply.
+    targets: String,
+}
+
+impl SelectionReport {
+    pub(crate) fn new(targets: &str) -> Self {
+        Self {
+            targets: targets.to_string(),
+        }
+    }
+
+    /// The bytes that answer the query: `OSC 52 ; Pc ; base64(content) ST`.
+    #[must_use]
+    pub fn reply(&self, content: &str) -> Vec<u8> {
+        format!(
+            "\x1b]52;{};{}\x1b\\",
+            self.targets,
+            super::base64::encode(content.as_bytes())
+        )
+        .into_bytes()
+    }
+}
+
 /// Actions that the terminal emulator signals to the orchestrator.
 ///
 /// After processing user input or control events, the emulator generates
@@ -496,45 +526,18 @@ pub enum EmulatorAction {
     /// - Selection is modified → RequestRedraw
     RequestRedraw,
 
-    /// Set the visibility of the cursor.
-    ///
-    /// # Contract
-    ///
-    /// **Emulator**: Generated in response to ANSI cursor visibility sequences.
-    ///
-    /// **Orchestrator**:
-    /// 1. Updates the cursor visibility state
-    /// 2. May control a native OS cursor or a rendered cursor
-    /// 3. Affects the next redraw
-    ///
-    /// **Postcondition**: Cursor visibility is updated
-    ///
-    /// # Examples
-    ///
-    /// - ANSI: `\x1b[?25h` (show cursor) → `SetCursorVisibility(Visible)`
-    /// - ANSI: `\x1b[?25l` (hide cursor) → `SetCursorVisibility(Hidden)`
-    SetCursorVisibility(CursorVisibility),
-
-    /// Copy text to the system clipboard.
+    /// Put text in a selection, for other applications to paste.
     ///
     /// # Contract
     ///
     /// **Emulator**: Generated when:
-    /// 1. User selects text and presses copy command (Ctrl+Shift+C)
-    /// 2. ANSI escape sequence requests clipboard write (OSC 52)
+    /// 1. User selects text and presses copy command (Ctrl+Shift+C) → `Clipboard`
+    /// 2. User finishes highlighting text with the mouse → `Primary`
     ///
-    /// **Orchestrator**:
-    /// 1. Stores the text in the system clipboard
-    /// 2. May update primary selection (X11)
-    /// 3. Other applications can now paste this text
+    /// **Orchestrator**: Asks the platform to set that selection.
     ///
-    /// **Postcondition**: Clipboard contains the text
-    ///
-    /// # Example
-    ///
-    /// User selects "$ hello world" and presses Ctrl+Shift+C
-    /// → `CopyToClipboard("$ hello world")`
-    CopyToClipboard(String),
+    /// **Postcondition**: The selection holds the text
+    Copy { selection: Selection, text: String },
 
     /// Request the orchestrator to fetch clipboard content.
     ///
@@ -559,7 +562,24 @@ pub enum EmulatorAction {
     /// # Note
     ///
     /// This is asynchronous—the emulator doesn't block waiting for the response.
-    RequestClipboardContent,
+    RequestClipboardContent(Selection),
+
+    /// Answer a program's OSC 52 query with the content of a selection.
+    ///
+    /// # Contract
+    ///
+    /// **Emulator**: A program asked for the selection's content.
+    ///
+    /// **Orchestrator**: Reads the selection and writes
+    /// `report.reply(content)` to the PTY — or, if clipboard reads are not
+    /// allowed, does nothing, which programs treat as no answer.
+    ReportSelection {
+        selection: Selection,
+        report: SelectionReport,
+    },
+
+    /// Enter full screen, or leave it.
+    ToggleFullscreen,
 
     /// Resize the pseudo-terminal to match the terminal grid.
     ///

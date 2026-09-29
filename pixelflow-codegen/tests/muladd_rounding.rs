@@ -1,15 +1,17 @@
 //! `MulAdd`'s rounding form, asserted through compiled code.
 //!
 //! CLAUDE.md's platform-divergence table has a `MulAdd` row: one rounding
-//! where the hardware has an FMA, two where it does not, and the two disagree
-//! on inputs like `mul_add(1.0000001, 4097.0, 4097.0)`. That is a precision
-//! difference the language puts on the table, not a divergence — the folder
-//! and the oracle round once and never refuse an input over it. It is still
-//! the entire reason the emitter carries two shapes for one op —
-//! `ResolvedOp::FusedMulAdd` and `ResolvedOp::DecomposedMulAdd` — and which
-//! one a node gets is decided by register pressure alone.
+//! from the hardware's FMA — every tier has one, now that the floor is
+//! AVX2+FMA — and two when the emitter decomposes the op under register
+//! pressure, and the two disagree on inputs like
+//! `mul_add(1.0000001, 4097.0, 4097.0)`. That is a precision difference the
+//! language puts on the table, not a divergence — the folder rounds once and
+//! never refuses an input over it. It is still the entire reason the emitter
+//! carries two shapes for one op — `ResolvedOp::FusedMulAdd` and
+//! `ResolvedOp::DecomposedMulAdd` — and which one a node gets is decided by
+//! register pressure alone.
 //!
-//! Every other JIT-vs-interpreter test in this crate compares within a
+//! Every other JIT-vs-reference test in this crate compares within a
 //! tolerance (`spill_pressure`'s 4 ULP, `oracle_reference`'s per-op
 //! `Tolerance`), and one-rounding vs. two is a last-bit difference: it fits
 //! inside all of them. So a backend that silently emitted the wrong shape —
@@ -120,12 +122,10 @@ fn the_reference_forms_disagree_on_these_inputs() {
 }
 
 /// An unspilled `MulAdd(X, Y, Z)` reaches the backend as `FusedMulAdd`, and
-/// what that compiles to is exactly what the target's hardware offers: one
-/// rounding wherever there is an FMA, two on the SSE2 baseline, whose
-/// `FusedMulAdd` arm is a `movaps`/`mulps`/`addps` stand-in because that is
-/// all SSE2 has.
+/// what that compiles to is the hardware's FMA: one rounding, on every tier
+/// the JIT can select (AVX2 requires FMA3; AVX-512 has it; NEON has `FMLA`).
 #[test]
-fn an_unspilled_muladd_rounds_the_way_this_target_does() {
+fn an_unspilled_muladd_rounds_once() {
     let mut a = ExprArena::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
@@ -147,18 +147,10 @@ fn an_unspilled_muladd_rounds_the_way_this_target_does() {
     // The property this test actually needs — that the multiplicands reach
     // the backend live in registers rather than reloaded — is what the bit
     // check below proves: only the fused, single-rounding form produces
-    // `fused(A, B, C)`/its SSE2 stand-in.
+    // `fused(A, B, C)`.
     let jit = CompiledKernel::new(result.code, pixelflow_ir::LatticeShape::POINT);
     let got = eval_point(&jit, A, B, &[C]);
-
-    #[cfg(target_feature = "fma")]
-    assert_bits("fused MulAdd on an FMA target", got, fused(A, B, C));
-    #[cfg(not(target_feature = "fma"))]
-    assert_bits(
-        "fused MulAdd on the SSE2 baseline",
-        got,
-        decomposed(A, B, C),
-    );
+    assert_bits("fused MulAdd", got, fused(A, B, C));
 }
 
 /// Under enough register pressure that `a` and `b` cannot both stay in
@@ -167,11 +159,11 @@ fn an_unspilled_muladd_rounds_the_way_this_target_does() {
 /// with an FMA.
 ///
 /// This is the arm AVX-512 had no test for at all: `spill_pressure.rs`'s
-/// scenarios are sized for the six-register SSE2 pool and stop spilling
-/// against AVX-512's nineteen, so that whole file is `cfg`'d off there.
-/// Shrinking the pool explicitly — `EmitCtx::with_max_regs`, which its own
-/// doc calls "how a caller forces spilling deliberately" — reaches it at
-/// every width instead of at whichever one the scenario happened to suit.
+/// scenarios were sized for the six-register SSE2 pool and stopped spilling
+/// against AVX-512's nineteen. Shrinking the pool explicitly —
+/// `EmitCtx::with_max_regs`, which its own doc calls "how a caller forces
+/// spilling deliberately" — reaches it at every width instead of at
+/// whichever one the scenario happened to suit.
 ///
 /// Three things the scenario has to get right, and each has been the reason
 /// an earlier version of it quietly tested the fused arm instead:

@@ -1,51 +1,40 @@
 //! x86-64 AVX2 (VEX.256) JIT encoder — 256-bit, 8-lane `ymm` kernels.
 //!
-//! The middle width between the SSE2 leaf encoders (`x86_64.rs`, 128-bit) and
-//! the AVX-512 EVEX encoders (`avx512.rs`, 512-bit). Register numbering is
-//! identical to SSE2 (ymm0-15, no extended file — AVX2 has no REX2/EVEX), so
-//! this backend reuses the register file `X86Backend` declares and only the
-//! instruction *encoding* changes.
+//! The floor of the x86-64 tiers (`crate::isa`), below the AVX-512 EVEX
+//! encoders (`avx512.rs`, 512-bit). Sixteen registers, `ymm0-15` — AVX2 has
+//! no extended file — and the general-register half of every kernel (the
+//! loop nest, the store's address, the pointer class, the constant pool) is
+//! `x86_64.rs`'s, shared with AVX-512; only the vector *encoding* is this
+//! file's.
 //!
-//! Unlike legacy SSE2, VEX is 3-operand and non-destructive — same property
-//! AVX-512's EVEX has — so there is no two-operand hazard to route around
-//! (the SSE2 tier's two-operand form has no such freedom).
+//! VEX is 3-operand and non-destructive — the same property AVX-512's EVEX
+//! has — so an operand may alias the destination in every encoding here.
 //! Comparisons are simpler here than on AVX-512: `vcmpps` writes an ordinary
 //! all-ones/all-zeros `ymm` directly (no k-register, no mask-to-vector
-//! conversion) — the same representation NEON and SSE2 already use.
+//! conversion) — the same representation NEON uses.
 //!
 //! Spills use a real stack frame, not the red zone: mirrors `avx512.rs`'s
 //! reasoning (a `ymm` slot is 32 bytes; keeping the red-zone arithmetic exact
 //! for two different slot widths is not worth it for a bit of frame reuse on
 //! tiny kernels).
 //!
-//! Gather has no direct AVX2 hardware analogue reused here: `vgatherdps`'s
-//! VSIB + vector-mask-with-clearing semantics are a bigger lift than this
-//! backend's scope warrants, so — like `X86Backend` — a gather is assembled
-//! from scalar loads via the existing 128-bit lane-insert sequence
-//! (`x86_64::emit_gather_scalar`), run once per 128-bit half and combined
-//! with `vinsertf128`.
+//! A gather is the hardware's: `vgatherdps ymm, [base + ymm*4], ymm` reads
+//! one element per lane through a VSIB, under a vector mask the instruction
+//! clears as it completes lanes — so each gather sets its mask to all-ones
+//! first, from a register the allocator reserved for it, the way the
+//! AVX-512 tier resets `k1`.
 
 use super::x86_64;
-use super::x86_64::{Disp, Imm8, Imm32, Mem, MovLoadPtr, NoDisp, ptr};
+use super::x86_64::{Disp, Imm32, Mem, NoDisp, frame_slot, ptr};
 use super::{AsmProgram, EncodedInst, Gpr, PtrReg, Reg, SourceOperand, assemble, unimplemented_op};
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
 
-// The AVX2 tier requires FMA3. No shipping x86-64 CPU has ever offered AVX2
-// without it (Intel: both since Haswell; AMD: FMA3 predates AVX2 by a
-// generation) — the industry itself codifies the pairing as x86-64-v3. A
-// hypothetical AVX2-without-FMA build is not a smaller tier, it is a paper
-// configuration: it forked `emit_fmadd_c_in_dst` into a value-semantics
-// variant (one rounding vs. two, see CLAUDE.md's `MulAdd` platform-divergence
-// table) that no real machine ever exercised, and that fork was directly
-// responsible for a P2 (two materially different kernels sharing one
-// environment fingerprint — see `pixelflow-pipeline/src/journal.rs`). Fail
-// loudly at compile time rather than silently degrading precision.
-#[cfg(all(target_feature = "avx2", not(target_feature = "fma")))]
-compile_error!(
-    "the AVX2 backend requires FMA3 (no shipping CPU has AVX2 without it); \
-     build with `-C target-feature=+avx2,+fma` or `-C target-cpu=x86-64-v3`"
-);
+// The AVX2 tier requires FMA3, and `crate::isa` refuses a host without it:
+// AVX2-without-FMA is not a narrower tier but a paper configuration, and the
+// probe's doc says why (no shipping CPU has one without the other, and the
+// two-rounding fork it once forced on `emit_fmadd_c_in_dst` put two
+// materially different kernels under one environment fingerprint).
 
 // =============================================================================
 // VEX.256 encoder
@@ -172,6 +161,43 @@ impl Vex {
         inst.push(((self.w as u8) << 7) | (0xF << 3) | ((self.l256 as u8) << 2) | self.pp as u8); // vvvv unused
         inst.push(self.opcode);
         x86_64::mem_operand_into(&mut inst, reg, addr);
+        inst
+    }
+
+    /// `op reg, [base + index*4]` — the SIB form with a scaled index, which
+    /// a broadcast load reads one element of a plane through. X carries the
+    /// index's high bit, inverted like R and B.
+    fn rm_scaled4(self, reg: u8, base: Gpr, index: Gpr) -> EncodedInst {
+        let mut inst = EncodedInst::new();
+        let rbit = if reg >= 8 { 0x00 } else { 0x80 };
+        let xbit = if index.0 >= 8 { 0x00 } else { 0x40 };
+        let bbit = if base.0 >= 8 { 0x00 } else { 0x20 };
+        inst.push(0xC4);
+        inst.push(rbit | xbit | bbit | self.map as u8);
+        inst.push(((self.w as u8) << 7) | (0xF << 3) | ((self.l256 as u8) << 2) | self.pp as u8); // vvvv unused
+        inst.push(self.opcode);
+        x86_64::scaled4_operand_into(&mut inst, reg, base, index);
+        inst
+    }
+
+    /// `op reg, [base + ymmINDEX*4], vvvv` — the VSIB form, whose index is
+    /// a *vector* register: one address per lane, scale 4, no displacement.
+    /// X carries the index's high bit exactly as it does for a GPR index;
+    /// the SIB tail is the same bytes with a vector number in the index
+    /// field (`x86_64::vsib4_operand_into`, which knows `ymm4`/`ymm12` are
+    /// not `rsp`/`r12`). `vvvv` is the gather's mask.
+    fn vsib_scaled4(self, reg: u8, vvvv: u8, base: Gpr, index: Reg) -> EncodedInst {
+        let mut inst = EncodedInst::new();
+        let rbit = if reg >= 8 { 0x00 } else { 0x80 };
+        let xbit = if index.0 >= 8 { 0x00 } else { 0x40 };
+        let bbit = if base.0 >= 8 { 0x00 } else { 0x20 };
+        inst.push(0xC4);
+        inst.push(rbit | xbit | bbit | self.map as u8);
+        inst.push(
+            ((self.w as u8) << 7) | ((!vvvv & 0xF) << 3) | ((self.l256 as u8) << 2) | self.pp as u8,
+        );
+        inst.push(self.opcode);
+        x86_64::vsib4_operand_into(&mut inst, reg, base, index);
         inst
     }
 
@@ -327,13 +353,15 @@ fn vpslld_imm(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
 fn vpsrld_imm(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
     assemble(c, [Vex::m0f_66(0x72).imm(imm).rrr(2, d, s)]); // /2
 }
-
-// --- lane insert/extract between 256-bit and 128-bit (0F3A, 66 prefix, W0) ---
-/// `vinsertf128 ymmDST, ymmSRC1, xmmSRC2, imm8[0]` — copy `src1`, then place
-/// `src2` into the low (`imm=0`) or high (`imm=1`) 128 bits.
-fn vinsertf128(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8, imm: u8) {
-    assemble(c, [Vex::m0f3a_66(0x18).imm(imm).rrr(d, s1, s2)]);
+/// `vpcmpeqd ymmD, ymmS1, ymmS2` — `VEX.256.66.0F.WIG 76 /r`. With every
+/// operand the same register it is the idiom for all-ones: what a gather's
+/// mask has to be before the gather.
+#[must_use]
+fn vpcmpeqd(d: Reg, s1: Reg, s2: Reg) -> EncodedInst {
+    Vex::m0f_66(0x76).rrr(d.0, s1.0, s2.0)
 }
+
+// --- lane extract from 256-bit to 128-bit (0F3A, 66 prefix, W0) ---
 /// `vextractf128 xmmDST, ymmSRC, imm8[0]` — extract the low (`imm=0`) or high
 /// (`imm=1`) 128 bits of `src` into `dst`.
 fn vextractf128(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
@@ -350,62 +378,40 @@ pub fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     assemble(code, [Vex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0)]);
 }
 
-/// A slot in the allocated spill frame. AVX2 kernels are leaves with no base
-/// pointer, so a slot *is* `rsp + offset`.
-const fn frame_slot(offset: u32) -> Mem<Imm32> {
-    Mem {
-        base: ptr::RSP,
-        disp: Imm32(offset as i32),
-    }
-}
-
-/// Where [`emit_const`] stages an f32 before broadcasting it: four bytes of
-/// red zone below `rsp`, never touched by a spill frame (which lives at
-/// `[rsp .. rsp+N)`).
-const RED_ZONE_CONST: Mem<Imm8> = Mem {
-    base: ptr::RSP,
-    disp: Imm8(-4),
-};
-
-/// Broadcast an f32 constant to all 8 lanes of `dst` via the stack (red zone,
-/// `[rsp-4]`; never affected by a spill frame, which lives at `[rsp..rsp+N)`).
-pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32) {
+/// `dst = splat(val)`: `vbroadcastss ymm, [pool]` (VEX.256.66.0F38.W0 18 /r),
+/// one instruction from the kernel's constant pool. Zero is `vxorps`.
+pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::ConstPool) {
     let bits = val.to_bits();
     if bits == 0 {
         vxorps(code, dst.0, dst.0, dst.0);
         return;
     }
-    // mov dword [rsp-4], imm32
-    code.extend_from_slice(&[0xC7, 0x44, 0x24, 0xFC]);
-    code.extend_from_slice(&bits.to_le_bytes());
-    // vbroadcastss ymm, [rsp-4]  (VEX.256.66.0F38.W0 18 /r)
-    assemble(code, [Vex::m0f38_66(0x18).rm(dst.0, RED_ZONE_CONST)]);
+    assemble(code, [Vex::m0f38_66(0x18).rm(dst.0, pool.operand(bits))]);
 }
 
-/// `dst = splat(block[offset])` at 256 bits: `mov base, [ctx + ctx_slot*8]`
-/// then `vbroadcastss ymm<dst>, [base + 4*offset]` (VEX.256.66.0F38.W0 18
-/// /r). See `x86_64::emit_uniform_load` for the register contract.
-pub fn emit_uniform_load(
-    code: &mut Vec<u8>,
-    dst: Reg,
-    load: super::UniformLoad,
-    base: PtrReg,
-    ctx: PtrReg,
-) {
+/// `dst = splat(base[offset])` at 256 bits: `vbroadcastss ymm<dst>, [base +
+/// 4*offset]` (VEX.256.66.0F38.W0 18 /r). `base` is the block's address,
+/// wherever the allocator keeps that pointer value.
+pub fn emit_uniform_load(code: &mut Vec<u8>, dst: Reg, base: PtrReg, offset: u16) {
+    AsmProgram::from([Vex::m0f38_66(0x18).rm(
+        dst.0,
+        Mem {
+            base,
+            disp: Imm32(i32::from(offset) * 4),
+        },
+    )])
+    .assemble(code);
+}
+
+/// `dst = splat(base[idx])` at 256 bits, the index being the same in every
+/// lane of `idx`: `vcvttss2si index, xmm<idx>`, `vbroadcastss ymm<dst>,
+/// [base + index*4]` (VEX.256.66.0F38.W0 18 /r). See
+/// [`x86_64::BroadcastGprs`] for the register contract; `dst` may alias
+/// `idx`, since the index is in a GPR before `dst` is written.
+pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64::BroadcastGprs) {
     AsmProgram::from([
-        MovLoadPtr {
-            dst: base,
-            base: ctx,
-            disp: i32::from(load.ctx_slot) * 8,
-        }
-        .encode(),
-        Vex::m0f38_66(0x18).rm(
-            dst.0,
-            Mem {
-                base,
-                disp: Imm32(i32::from(load.offset) * 4),
-            },
-        ),
+        vcvttss2si_xmm(gprs.index, idx),
+        Vex::m0f38_66(0x18).rm_scaled4(dst.0, gprs.base.as_gpr(), gprs.index),
     ])
     .assemble(code);
 }
@@ -443,21 +449,23 @@ pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Re
 
 /// `dst = op(src)`.
 ///
-/// `temp` is the allocator's temp for this instruction; only `Neg` and `Abs`
-/// use it, to hold the sign mask they XOR or AND with.
-pub fn emit_unary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, temp: Option<Reg>) {
+/// The temp is the allocator's for this instruction; only `Neg` and `Abs`
+/// use it, to hold the sign mask they XOR or AND with, which comes from the
+/// kernel's constant pool like any other constant.
+pub fn emit_unary(code: &mut Vec<u8>, unary: super::Unary, pool: &mut x86_64::ConstPool) {
+    let super::Unary { op, dst, src, temp } = unary;
     match op {
         OpKind::Sqrt => vsqrtps(code, dst.0, src.0),
         OpKind::Rsqrt => vrsqrtps(code, dst.0, src.0),
         OpKind::Recip => vrcpps(code, dst.0, src.0),
         OpKind::Neg => {
             let mask = super::declared_temp(temp);
-            emit_const(code, mask, f32::from_bits(0x8000_0000));
+            emit_const(code, mask, f32::from_bits(0x8000_0000), pool);
             vxorps(code, dst.0, src.0, mask.0);
         }
         OpKind::Abs => {
             let mask = super::declared_temp(temp);
-            emit_const(code, mask, f32::from_bits(0x7FFF_FFFF));
+            emit_const(code, mask, f32::from_bits(0x7FFF_FFFF), pool);
             vandps(code, dst.0, src.0, mask.0);
         }
         // imm8: bits[3:0] = rounding mode (0=nearest, 1=floor, 2=ceil).
@@ -479,10 +487,9 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
     match op {
         ScheduledOp::Unary(OpKind::Neg | OpKind::Abs, _) => 1,
         ScheduledOp::Ternary(OpKind::Select, ..) => 1,
-        // A 256-bit gather is two 128-bit halves: the half-sequence's own
-        // index and value registers, plus one of each to carry the high half
-        // while the low one is assembled in `dst`.
-        ScheduledOp::Gather(..) => 4,
+        // The gather's truncated-index lanes and its all-ones mask, which the
+        // instruction requires distinct from each other and from `dst`.
+        ScheduledOp::Gather(..) => 2,
         // A surviving fold's own loop: two transient registers for the trip
         // test and the accumulate — see `emit_scope`'s `Reduce` arm. The
         // binder and the accumulator are the fold's roots, placed by the
@@ -493,6 +500,24 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
         // reads them straight out of the value, and a full batch is one
         // `vmovups`.
         ScheduledOp::Write { lanes, .. } if *lanes > 4 && *lanes < 8 => 1,
+        _ => 0,
+    }
+}
+
+/// How many GPRs this backend's encoding of `op` needs beyond
+/// [`regalloc::RegisterFile::gpr_ctx`].
+///
+/// `Gather` and `Uniform` need none: the base each addresses is a pointer
+/// value the allocator carries, and `vgatherdps` takes its indices as a
+/// vector. `Broadcast` needs one for its index, since it addresses the
+/// element through a SIB. A `Write` converts its row and column into one
+/// each before combining them into the address; the iota carries its eight
+/// bytes in through one.
+pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
+    use super::ScheduledOp;
+    match op {
+        ScheduledOp::Write { .. } => 2,
+        ScheduledOp::Broadcast(..) | ScheduledOp::Lanes(_) => 1,
         _ => 0,
     }
 }
@@ -550,7 +575,7 @@ pub fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount
 }
 
 /// `dst = mask ? if_true : if_false` (bit-select; mask already in `dst`, same
-/// convention as SSE2/AVX-512).
+/// convention as AVX-512 and NEON).
 ///
 /// `tmp` is the allocator's temp for this instruction, which it picks disjoint
 /// from every operand — the `debug_assert` restates that here, where the
@@ -579,31 +604,26 @@ pub fn emit_cmp_al_imm8(code: &mut Vec<u8>, imm: u8) {
 
 /// `vfmadd231ps ymmD, ymmA, ymmB` — `dst = a*b + dst` (231 form: dst is the
 /// addend going in, `a`/`b` the product). VEX.256.66.0F38.W0 B8 /r, same
-/// opcode as `avx512.rs`'s EVEX form, just VEX-encoded at 256 bits.
-/// `target_feature = "fma"` (FMA3) is not implied by `avx2` alone in rustc's
-/// feature model, which is why this file's own `compile_error!` pins the two
-/// together for this backend — see the module-top comment.
+/// opcode as `avx512.rs`'s EVEX form, just VEX-encoded at 256 bits. FMA3 is
+/// not implied by AVX2 in CPUID, which is why `crate::isa`'s x86-64 probe
+/// asks for both before this backend can be selected.
 fn vfmadd231ps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
     assemble(c, [Vex::m0f38_66(0xB8).rrr(d, s1, s2)]);
 }
 
 /// Fused multiply-add: `dst` already holds `c`; computes `dst = a*b + dst`.
 ///
-/// Always real hardware FMA: the AVX2 tier requires `+fma` (see the
-/// module-top `compile_error!`), so there is no software mul+add fallback to
-/// choose between here. This rounds once, exactly matching the reference
-/// interpreter under `fp-contract=fast` — `eval_scalar`'s scalar `a*b+c` gets
-/// contracted to an `fma` instruction by LLVM under `+fma` too, so a
-/// software two-step mul-then-add would round twice and disagree in the last
-/// bit.
+/// Always real hardware FMA: the AVX2 tier requires FMA3 (`crate::isa`
+/// refuses a host without it), so there is no software mul+add fallback to
+/// choose between here. This rounds once, as the folder does
+/// (`libm::fmaf`); a software two-step mul-then-add would round twice and
+/// disagree in the last bit.
 ///
-/// The two-roundings case still exists, just not in *this* function. It is
-/// the SSE2 baseline's only option — `x86_64.rs`'s own `FusedMulAdd` arm is a
-/// `movaps`/`mulps`/`addps` stand-in, as is `pixelflow-core`'s x86 backend —
-/// and it is also what `DecomposedMulAdd` does on every tier, this one
-/// included, whenever register pressure pulls `a` and `b` apart from `c`.
-/// Both are pinned as bytes by `emit::tests::muladd_encoding` and as values
-/// by `tests/muladd_rounding.rs`.
+/// The two-roundings case still exists, just not in *this* function: it is
+/// what `DecomposedMulAdd` does on every tier, this one included, whenever
+/// register pressure pulls `a` and `b` apart from `c`. Both are pinned as
+/// bytes by `emit::tests::muladd_encoding` and as values by
+/// `tests/muladd_rounding.rs`.
 pub fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
     vfmadd231ps(code, dst.0, a.0, b.0);
 }
@@ -611,44 +631,55 @@ pub fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
 // =============================================================================
 // Bound-memory gather (RawGather lowering target)
 //
-// No native vgatherdps here (see the module doc): truncate all 8 lanes at
-// once, split into two 128-bit halves, run the existing SSE2/AVX scalar-load
-// sequence (`x86_64::emit_gather_scalar`) on each half (it only ever touches
-// the low 128 bits of whatever register it's given — ymm0's low 128 IS
-// xmm0), then recombine with vinsertf128.
+// `vgatherdps ymmDST, [base + ymmIDX*4], ymmMASK` reads one f32 per lane from
+// a bound buffer. The lowered index is a float (`clamp(floor(x))·1 + …`), so
+// it is first truncated to signed int32 lanes with `vcvttps2dq`. The mask
+// must have every lane's sign bit set going in — the instruction clears the
+// lanes it completes — so it is set to all-ones before every gather.
 // =============================================================================
 
-/// Scratch the 256-bit gather clobbers: the 128-bit sequence's own scratch,
-/// which both halves reuse, plus the two vector registers that carry the high
-/// half while the low half is being assembled. All of it must be distinct from
-/// the gather's `dst` and `idx`.
+/// The two registers a gather destroys beside its destination: the
+/// truncated indices and the all-ones mask. The instruction `#UD`s unless
+/// all three are distinct, and the allocator's temps are disjoint from
+/// the destination and each other by construction.
 #[derive(Clone, Copy)]
-pub struct GatherScratch {
-    /// Scratch for one 128-bit half — see [`x86_64::GatherScratch`].
-    pub half: x86_64::GatherScratch,
-    /// Vector register receiving lanes 4..8 of the float indices.
-    pub idx_hi: Reg,
-    /// Vector register receiving the high half's gathered values.
-    pub res_hi: Reg,
+pub struct GatherTemps {
+    /// Vector register for the truncated integer indices.
+    pub idx_int: Reg,
+    /// Vector register for the mask, all-ones going in and cleared on exit.
+    pub mask: Reg,
 }
 
-/// `dst = buffer[slot][idx_lane]` for 8 lanes. `idx` holds FLOAT indices
-/// (already clamped in range by the `Gather` lowering — `x86_64::emit_gather_scalar`
-/// does its own float->int truncation per half, so `idx` must not be
-/// pre-truncated here). Clobbers everything in `s`.
-pub fn emit_gather_scalar(code: &mut Vec<u8>, dst: Reg, idx: Reg, slot: u16, s: GatherScratch) {
-    // idx's low 128 already holds lanes 0..4 (float); split off lanes 4..8
-    // into idx_hi before either gather call touches idx/dst (which may alias).
-    vextractf128(code, s.idx_hi.0, idx.0, 1);
+/// `vgatherdps ymmDST, [baseGPR + ymmINDEX*4], ymmMASK` —
+/// `VEX.256.66.0F38.W0 92 /r /vsib`, scale 4: one f32 per lane at
+/// `base + index_lane*4`, for every lane whose `mask` sign bit is set. The
+/// caller has truncated the indices and set the mask; `base` is never
+/// `rbp`/`r13` (the pointer pool is `r9`–`r11`, so the SIB's no-base
+/// encoding is unreachable).
+#[must_use]
+pub fn gather(dst: Reg, base: PtrReg, index: Reg, mask: Reg) -> EncodedInst {
+    debug_assert!(
+        dst != index && dst != mask && index != mask,
+        "vgatherdps: dst, index and mask must be three registers"
+    );
+    Vex::m0f38_66(0x92).vsib_scaled4(dst.0, mask.0, base.as_gpr(), index)
+}
 
-    // Low half: lanes 0..4. May write dst == idx (the callee handles that:
-    // it converts idx to int in scratch before ever writing dst).
-    x86_64::emit_gather_scalar(code, dst, idx, slot, s.half);
-    // High half: lanes 4..8, into res_hi (a 128-bit scratch distinct from dst).
-    x86_64::emit_gather_scalar(code, s.res_hi, s.idx_hi, slot, s.half);
-
-    // Recombine: dst[0..4] already holds the low half; splice in the high.
-    vinsertf128(code, dst.0, dst.0, s.res_hi.0, 1);
+/// `dst = base[idx_lane]` for 8 lanes — the whole gather sequence. `idx`
+/// holds the *float* indices (the lowering already clamped them in range);
+/// `base` the buffer's address. `dst` may alias `idx`: the indices are
+/// truncated into `t.idx_int` before the first write to `dst`.
+pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx: Reg, base: PtrReg, t: GatherTemps) {
+    debug_assert!(
+        t.idx_int != idx,
+        "the truncated indices must not overwrite the float ones"
+    );
+    AsmProgram::from([
+        Vex::m0f_f3(0x5B).rrr(t.idx_int.0, UNUSED_VVVV, idx.0),
+        vpcmpeqd(t.mask, t.mask, t.mask),
+        gather(dst, base, t.idx_int, t.mask),
+    ])
+    .assemble(code);
 }
 
 #[cfg(test)]
@@ -684,10 +715,17 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]
+    /// Executes the bytes on this host's CPU, so every test first asks
+    /// whether it can (`skip_unless_host_runs!`); the encodings themselves
+    /// are pinned bytewise on every host by the tests above. The `extern
+    /// "C"` kernels take `ymm` values, which the ABI only lets a caller
+    /// compiled with AVX pass — hence `#[target_feature]` on the functions
+    /// that call them, and nowhere else.
+    #[cfg(target_arch = "x86_64")]
     mod runtime {
         use super::super::*;
         use crate::emit::executable::ExecutableCode;
+        use crate::isa::{Isa, skip_unless_host_runs};
         use core::arch::x86_64::*;
 
         #[allow(improper_ctypes_definitions)]
@@ -696,7 +734,36 @@ mod tests {
         fn run(body: &[u8], xs: [f32; 8], ys: [f32; 8], zs: [f32; 8]) -> [f32; 8] {
             let mut code = body.to_vec();
             crate::emit::x86_64::ret(&mut code);
-            let exec = unsafe { ExecutableCode::from_code(&code).expect("mmap") };
+            // SAFETY: every caller is a test that checked the host runs AVX2.
+            unsafe { run_code(&code, xs, ys, zs) }
+        }
+
+        /// `run`, for a body that read constants from `pool`: the anchor
+        /// ahead of it and the pool behind its `ret`, as the driver lays a
+        /// kernel out.
+        fn run_pooled(
+            body: &[u8],
+            pool: &x86_64::ConstPool,
+            xs: [f32; 8],
+            ys: [f32; 8],
+            zs: [f32; 8],
+        ) -> [f32; 8] {
+            let mut asm = crate::emit::Assembly::default();
+            x86_64::anchor(&mut asm);
+            asm.code.extend_from_slice(body);
+            crate::emit::x86_64::ret(&mut asm.code);
+            pool.finish(&mut asm);
+            // SAFETY: every caller is a test that checked the host runs AVX2.
+            unsafe { run_code(&asm.finish(), xs, ys, zs) }
+        }
+
+        /// # Safety
+        ///
+        /// The host must execute AVX2: `code` is `ymm` code, and this function
+        /// is compiled with AVX enabled to be allowed to pass `ymm` values.
+        #[target_feature(enable = "avx2")]
+        unsafe fn run_code(code: &[u8], xs: [f32; 8], ys: [f32; 8], zs: [f32; 8]) -> [f32; 8] {
+            let exec = unsafe { ExecutableCode::from_code(code).expect("mmap") };
             unsafe {
                 let f: K = exec.as_fn();
                 let r = f(
@@ -758,6 +825,7 @@ mod tests {
 
         #[test]
         fn emit_binary_matches_the_scalar_reference_for_every_arithmetic_op() {
+            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let cases: &[BinaryCase] = &[
                 (OpKind::Add, |a, b| a + b),
@@ -776,6 +844,7 @@ mod tests {
 
         #[test]
         fn emit_binary_produces_an_all_ones_mask_when_lt_holds() {
+            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Lt, X, X, Y);
@@ -788,10 +857,15 @@ mod tests {
 
         #[test]
         fn emit_movmskps_eax_gathers_the_lanewise_compare_mask_sign_bits() {
+            skip_unless_host_runs!(Isa::Avx2);
             #[allow(improper_ctypes_definitions)]
             type MaskCheck = unsafe extern "C" fn(__m256, __m256) -> i32;
 
-            fn run_mask(body: &[u8], xs: [f32; 8], ys: [f32; 8]) -> i32 {
+            /// # Safety
+            ///
+            /// The host must execute AVX2 (checked above).
+            #[target_feature(enable = "avx2")]
+            unsafe fn run_mask(body: &[u8], xs: [f32; 8], ys: [f32; 8]) -> i32 {
                 let mut code = body.to_vec();
                 crate::emit::x86_64::ret(&mut code);
                 let exec = unsafe { ExecutableCode::from_code(&code).expect("mmap") };
@@ -808,34 +882,49 @@ mod tests {
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Lt, X, X, Y);
             emit_movmskps_eax(&mut c, X);
-            assert_eq!(run_mask(&c, xs, ys), 0b0000_1111, "lt mask, lanes 0-3 true");
+            // SAFETY: the host runs AVX2, checked at the top of this test.
+            let got = unsafe { run_mask(&c, xs, ys) };
+            assert_eq!(got, 0b0000_1111, "lt mask, lanes 0-3 true");
 
             // The complementary comparison, to pin the other half of eax
             // independently of the first assertion.
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Gt, X, X, Y);
             emit_movmskps_eax(&mut c, X);
-            assert_eq!(run_mask(&c, xs, ys), 0b1111_0000, "gt mask, lanes 4-7 true");
+            // SAFETY: as above.
+            let got = unsafe { run_mask(&c, xs, ys) };
+            assert_eq!(got, 0b1111_0000, "gt mask, lanes 4-7 true");
         }
 
         #[test]
         fn emit_unary_computes_sqrt_neg_and_abs_per_lane() {
+            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
+            let unary = |op, src, temp| crate::emit::Unary {
+                op,
+                dst: X,
+                src,
+                temp,
+            };
+            let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
-            emit_unary(&mut c, OpKind::Sqrt, X, Y, None);
-            check(run(&c, xs, ys, zs), |i| ys[i].sqrt(), "sqrt");
+            emit_unary(&mut c, unary(OpKind::Sqrt, Y, None), &mut pool);
+            check(run_pooled(&c, &pool, xs, ys, zs), |i| ys[i].sqrt(), "sqrt");
 
+            let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
-            emit_unary(&mut c, OpKind::Neg, X, X, Some(TEMP));
-            check(run(&c, xs, ys, zs), |i| -xs[i], "neg");
+            emit_unary(&mut c, unary(OpKind::Neg, X, Some(TEMP)), &mut pool);
+            check(run_pooled(&c, &pool, xs, ys, zs), |i| -xs[i], "neg");
 
+            let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
-            emit_unary(&mut c, OpKind::Abs, X, X, Some(TEMP));
-            check(run(&c, xs, ys, zs), |i| xs[i].abs(), "abs");
+            emit_unary(&mut c, unary(OpKind::Abs, X, Some(TEMP)), &mut pool);
+            check(run_pooled(&c, &pool, xs, ys, zs), |i| xs[i].abs(), "abs");
         }
 
         #[test]
         fn emit_select_blends_if_true_and_if_false_by_the_mask() {
+            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Lt, Reg(5), X, Y); // mask
@@ -849,17 +938,30 @@ mod tests {
             );
         }
 
+        /// Two constants, the first read twice: the pool holds each once, and
+        /// every read is one broadcast from it.
         #[test]
         fn emit_const_broadcasts_and_adds_to_every_lane() {
+            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
+            let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
-            emit_const(&mut c, Reg(5), 2.5);
+            emit_const(&mut c, Reg(5), 2.5, &mut pool);
             emit_binary(&mut c, OpKind::Add, X, X, Reg(5));
-            check(run(&c, xs, ys, zs), |i| xs[i] + 2.5, "const+add");
+            emit_const(&mut c, Reg(6), -1.0, &mut pool);
+            emit_binary(&mut c, OpKind::Add, X, X, Reg(6));
+            emit_const(&mut c, Reg(5), 2.5, &mut pool);
+            emit_binary(&mut c, OpKind::Add, X, X, Reg(5));
+            check(
+                run_pooled(&c, &pool, xs, ys, zs),
+                |i| xs[i] + 4.0,
+                "const+add",
+            );
         }
 
         #[test]
         fn emit_fmadd_c_in_dst_computes_the_fused_multiply_add() {
+            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_mov(&mut c, Reg(5), Z);
@@ -878,6 +980,7 @@ mod tests {
         /// forms genuinely disagree, and this asserts the bits.
         #[test]
         fn emit_fmadd_c_in_dst_rounds_once_not_twice() {
+            skip_unless_host_runs!(Isa::Avx2);
             let xs = [1.000_000_1f32; 8];
             let ys = [4097.0f32; 8];
             let zs = [4097.0f32; 8];
@@ -906,6 +1009,7 @@ mod tests {
 
         #[test]
         fn emit_load_after_emit_store_recovers_the_spilled_value() {
+            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             AsmProgram::from([crate::emit::x86_64::Inst::SubImm32 {
@@ -925,56 +1029,132 @@ mod tests {
             check(run(&c, xs, ys, zs), |i| xs[i] * ys[i], "spill roundtrip");
         }
 
+        /// The gather sequence executes: `dst` may alias the float index
+        /// register, and every lane reads its own element. Matches the
+        /// production ABI (mod.rs's `ResolvedOp::Gather`): the base is a
+        /// pointer register the allocator placed — here the first argument,
+        /// `rdi`, holding the buffer's own address.
         #[test]
-        fn emit_gather_scalar_reads_the_value_at_each_lanes_index() {
-            // Matches the production ABI (mod.rs's ResolvedOp::Gather): the
-            // first arg is a context pointer to an ARRAY of buffer base
-            // pointers (one per slot), not a buffer pointer directly —
-            // `x86_64::emit_gather_scalar` loads `[ctx_gpr + slot*8]` to get
-            // the real base. `emit_load_ptr_from_ctx`'s doc calls this out.
+        fn emit_gather_reads_the_value_at_each_lanes_index() {
+            skip_unless_host_runs!(Isa::Avx2);
             #[allow(improper_ctypes_definitions)]
-            type G = unsafe extern "C" fn(*const *const f32, __m256) -> __m256;
+            type G = unsafe extern "C" fn(*const f32, __m256) -> __m256;
 
-            let mut c = Vec::new();
-            // idx (zmm/ymm0) -> int truncate happens inside emit_gather_scalar.
-            let s = x86_64::GatherScratch {
-                base_gpr: 0,  // rax
-                index_gpr: 1, // rcx
-                ctx_gpr: 7,   // rdi
-                idx_lanes: Reg(13),
-                value: Reg(14),
-            };
-            emit_gather_scalar(
-                &mut c,
-                Reg(0),
-                Reg(0),
-                0,
-                GatherScratch {
-                    half: s,
-                    idx_hi: Reg(9),
-                    res_hi: Reg(8),
-                },
-            );
-            crate::emit::x86_64::ret(&mut c);
+            /// # Safety
+            ///
+            /// The host must execute AVX2 (checked above).
+            #[target_feature(enable = "avx2")]
+            unsafe fn run_gather(
+                exec: &ExecutableCode,
+                base: *const f32,
+                idx: [f32; 8],
+            ) -> [f32; 8] {
+                unsafe {
+                    let f: G = exec.as_fn();
+                    let r = f(base, _mm256_loadu_ps(idx.as_ptr()));
+                    let mut out = [0.0f32; 8];
+                    _mm256_storeu_ps(out.as_mut_ptr(), r);
+                    out
+                }
+            }
 
             let buf: Vec<f32> = (0..64).map(|i| (i as f32) * 1.5 + 0.25).collect();
             let idx: [f32; 8] = [0.0, 63.0, 1.0, 2.0, 10.0, 5.0, 32.0, 7.0];
-            let ctx: [*const f32; 1] = [buf.as_ptr()];
+            // Twice: into a register of its own, and over the float index.
+            for dst in [Reg(5), Reg(0)] {
+                let mut c = Vec::new();
+                emit_gather(
+                    &mut c,
+                    dst,
+                    Reg(0),
+                    x86_64::ptr::RDI,
+                    GatherTemps {
+                        idx_int: Reg(13),
+                        mask: Reg(14),
+                    },
+                );
+                if dst != Reg(0) {
+                    emit_mov(&mut c, Reg(0), dst);
+                }
+                crate::emit::x86_64::ret(&mut c);
 
-            let exec = unsafe { ExecutableCode::from_code(&c).expect("mmap") };
-            let out = unsafe {
-                let f: G = exec.as_fn();
-                let r = f(ctx.as_ptr(), _mm256_loadu_ps(idx.as_ptr()));
-                let mut out = [0.0f32; 8];
-                _mm256_storeu_ps(out.as_mut_ptr(), r);
-                out
-            };
-
-            for i in 0..8 {
-                let want = buf[idx[i] as usize];
-                assert_eq!(out[i], want, "gather lane {i}: idx {}", idx[i]);
+                let exec = unsafe { ExecutableCode::from_code(&c).expect("mmap") };
+                // SAFETY: the host runs AVX2, checked at the top of this test.
+                let out = unsafe { run_gather(&exec, buf.as_ptr(), idx) };
+                for i in 0..8 {
+                    let want = buf[idx[i] as usize];
+                    assert_eq!(
+                        out[i], want,
+                        "gather into {dst:?}, lane {i}: idx {}",
+                        idx[i]
+                    );
+                }
             }
         }
+    }
+
+    /// The gather's bytes against `objdump -M intel` (binutils 2.42) and
+    /// `llvm-mc`: `vpcmpeqd ymm7, ymm7, ymm7`, `vcvttps2dq ymm6, ymm0`,
+    /// then `vgatherdps ymm5, [r9 + ymm6*4], ymm7`. VEX.R, X and B each
+    /// carry one operand's high bit — the destination's, the vector
+    /// index's and the base's — pinned by the all-high and mixed forms.
+    #[test]
+    fn the_gather_encodes_as_the_manual_says() {
+        let mut c = Vec::new();
+        emit_gather(
+            &mut c,
+            Reg(5),
+            Reg(0),
+            PtrReg(9),
+            GatherTemps {
+                idx_int: Reg(6),
+                mask: Reg(7),
+            },
+        );
+        assert_eq!(
+            c,
+            [
+                0xC4, 0xE1, 0x7E, 0x5B, 0xF0, // vcvttps2dq ymm6, ymm0
+                0xC4, 0xE1, 0x45, 0x76, 0xFF, // vpcmpeqd ymm7, ymm7, ymm7
+                0xC4, 0xC2, 0x45, 0x92, 0x2C, 0xB1, // vgatherdps ymm5, [r9+ymm6*4], ymm7
+            ]
+        );
+        let mut c = Vec::new();
+        AsmProgram::from([
+            gather(Reg(13), PtrReg(11), Reg(14), Reg(15)),
+            gather(Reg(0), x86_64::ptr::RDI, Reg(13), Reg(14)),
+        ])
+        .assemble(&mut c);
+        assert_eq!(
+            c,
+            [
+                0xC4, 0x02, 0x05, 0x92, 0x2C, 0xB3, // vgatherdps ymm13, [r11+ymm14*4], ymm15
+                0xC4, 0xA2, 0x0D, 0x92, 0x04, 0xAF, // vgatherdps ymm0, [rdi+ymm13*4], ymm14
+            ]
+        );
+    }
+
+    /// A VSIB index of `ymm4` or `ymm12` puts `100` in the SIB's index
+    /// field — which for a GPR index would mean `rsp`, "no index", and is
+    /// refused there. As a vector number it is just a register, and the
+    /// cell grid's gathers are indexed by whichever the allocator picked.
+    /// The bytes are `objdump`'s: `vgatherdps ymm5, [r9 + ymm4*4], ymm7` and
+    /// the same through `ymm12`, which differ only in the prefix's X bit.
+    #[test]
+    fn a_vsib_index_may_be_the_fourth_or_twelfth_register() {
+        let mut c = Vec::new();
+        AsmProgram::from([
+            gather(Reg(5), PtrReg(9), Reg(4), Reg(7)),
+            gather(Reg(5), PtrReg(9), Reg(12), Reg(7)),
+        ])
+        .assemble(&mut c);
+        assert_eq!(
+            c,
+            [
+                0xC4, 0xC2, 0x45, 0x92, 0x2C, 0xA1, // vgatherdps ymm5, [r9+ymm4*4], ymm7
+                0xC4, 0x82, 0x45, 0x92, 0x2C, 0xA1, // vgatherdps ymm5, [r9+ymm12*4], ymm7
+            ]
+        );
     }
 }
 
@@ -987,27 +1167,14 @@ mod tests {
 /// **This file is where AVX2-specific bugs live, and the only place they
 /// can.** Emission is a pure function into `Vec<u8>`, so everything here
 /// compiles, typechecks and is swept for op coverage on every host, whatever
-/// CPU it has. Only [`Native`](super::super::Native) decides which backend a
-/// build instantiates, and only [`executable`](super::super::executable) needs
-/// the matching hardware.
+/// CPU it has. Only `compile_native` in `emit` decides which backend a
+/// process instantiates — from the tier `crate::isa` read off the CPU — and
+/// only [`executable`](super::super::executable) needs the matching hardware.
 ///
 /// The consequence worth stating: a change that does not touch an ISA file
 /// cannot introduce a platform-specific bug. That is the bargain `unsafe`
 /// makes — confine what cannot be checked, so the rest is checked by
 /// construction.
-///
-/// Dead only in a build that selected a *different* `Native`. The condition
-/// mirrors this backend's `Native` alias, so a genuinely unused item in the
-/// backend this build actually compiles still trips `dead_code`; an
-/// unconditional allow here would hide it from CI's `clippy -D warnings`.
-#[cfg_attr(
-    not(all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        not(target_feature = "avx512f")
-    )),
-    allow(dead_code)
-)]
 pub(crate) mod driver {
     use super::super::*;
     use super::{
@@ -1015,48 +1182,81 @@ pub(crate) mod driver {
         vcvttss2si_xmm, vextractf128, vextractps_store, vmovq_xmm_r64, vpmovzxbd,
     };
     use crate::emit::x86_64 as x86;
-    use crate::emit::x86_64::driver::{Convert, SSE2_FILE, write_address};
+    use crate::emit::x86_64::{Convert, write_address};
     use crate::error::CompileError;
     use alloc::vec::Vec;
     use pixelflow_ir::kind::OpKind;
 
     /// The AVX2 register file (ymm, 256-bit).
     ///
-    /// The same sixteen registers as SSE2's at twice the width. The gather
-    /// borrows four of them across its own sequence (the high half's index
-    /// and result beside the low half's pair), the sign mask and the select
-    /// blend borrow one — all reservations the allocator makes for one
-    /// instruction, so all of them are its the rest of the time.
+    /// SysV has no callee-saved vector registers and the collapse ABI passes
+    /// no vector, so every one of the sixteen is the allocator's. The gather
+    /// borrows two of them across its own sequence (the truncated indices
+    /// and the mask), the sign mask and the select blend borrow one — all
+    /// reservations the allocator makes for one instruction, so all of them
+    /// are its the rest of the time.
     const AVX2_FILE: regalloc::RegisterFile = regalloc::RegisterFile {
         scratch: regalloc::RegSet::range(0, 16),
+        // Nothing: every register an encoding destroys is a `temps_for`
+        // reservation for that one instruction.
         fixed: &[],
         temps_for: super::temps_for,
+        // A guard reduces its mask with `vmovmskps` into the flags, which
+        // costs no vector register at all.
+        guard_temps: 0,
         vector_bytes: 32,
-        ..SSE2_FILE
+        // SysV's first three integer arguments, in the ABI's order: the
+        // context (the array of buffer base pointers, then the uniform and
+        // origin blocks), the output plane, its pitch. Declared here so
+        // `checked` proves `gpr_scratch` misses all three, rather than a
+        // comment asserting the constants never collide.
+        gpr_ctx: Some(x86::gpr::RDI),
+        gpr_out: Some(x86::gpr::RSI),
+        gpr_pitch: Some(x86::gpr::RDX),
+        // rax/rcx: the broadcast's index, the store's row and column, the
+        // iota's bytes — `Scratch` reservations like every vector temp.
+        // `vgatherdps` addresses through a vector index, so the gather needs
+        // none.
+        gpr_scratch: regalloc::GprSet::of(&[x86::gpr::RAX, x86::gpr::RCX]),
+        gpr_temps_for: super::gpr_temps_for,
+        // r9-r11: the caller-saved GPRs SysV leaves after the three
+        // arguments, the two scratch and `r8` (the constant pool's anchor).
+        // The pointer class's pool — buffer bases and block addresses are
+        // carried here across the loops that read them
+        // (docs/plans/2026-09-22-a-pointer-is-a-value.md). The callee-saved
+        // six would double it at the price of a prologue; not yet measured.
+        pointers: regalloc::GprSet::of(&[x86::gpr::R9, x86::gpr::R10, x86::gpr::R11]),
+        // No mask-register file on this tier: masks are ordinary vectors.
+        mask_scratch: regalloc::MaskSet::EMPTY,
+        mask_temps_for: regalloc::no_temps,
+        mask_guard_temps: 0,
     }
     .checked();
 
     /// AVX2 implementation of the shared driver's leaf operations.
     pub(crate) struct Avx2Backend {
+        consts: x86::ConstPool,
         file: regalloc::RegisterFile,
     }
 
     impl Avx2Backend {
         pub(crate) fn new(ctx: EmitCtx) -> Self {
             Self {
+                consts: x86::ConstPool::default(),
                 file: AVX2_FILE.capped(ctx.max_regs),
             }
         }
 
-        fn reload(code: &mut Vec<u8>, reload: &Reload) {
+        fn reload(&mut self, code: &mut Vec<u8>, reload: &Reload) {
             match reload {
                 Reload::FromStack { target, slot } => {
                     AsmProgram::from([Vex::m0f(0x10).rm(target.0, frame_slot(slot.offset()))])
                         .assemble(code);
                 }
                 Reload::Const { target, val_bits } => {
-                    super::emit_const(code, *target, f32::from_bits(*val_bits));
+                    super::emit_const(code, *target, f32::from_bits(*val_bits), &mut self.consts);
                 }
+                Reload::Ptr { target, slot } => self.ptr_load(code, *target, slot.offset()),
             }
         }
     }
@@ -1070,8 +1270,9 @@ pub(crate) mod driver {
             self.file
         }
 
+        /// Nothing to seed: the pool fills as constants are emitted.
         fn begin(&mut self, _schedule: &[regalloc::Def]) -> Result<(), CompileError> {
-            Ok(()) // const broadcast is self-contained; no pool.
+            Ok(())
         }
 
         fn emit_plan(
@@ -1080,7 +1281,7 @@ pub(crate) mod driver {
             plan: &InstructionPlan,
         ) -> Result<(), CompileError> {
             for r in &plan.reloads {
-                Self::reload(code, r);
+                self.reload(code, r);
             }
             if let Some((dst, src)) = plan.setup_mov
                 && dst != src
@@ -1090,7 +1291,7 @@ pub(crate) mod driver {
             match &plan.op {
                 ResolvedOp::Nop => {}
                 ResolvedOp::LoadConst { dst, val_bits } => {
-                    super::emit_const(code, *dst, f32::from_bits(*val_bits));
+                    super::emit_const(code, *dst, f32::from_bits(*val_bits), &mut self.consts);
                 }
                 // The iota: the bytes `0..8` in through a GPR, widened to
                 // dwords, converted. No vector temp — `dst` is every stage's.
@@ -1105,7 +1306,13 @@ pub(crate) mod driver {
                     .assemble(code);
                 }
                 ResolvedOp::Unary { op, dst, src } => {
-                    super::emit_unary(code, *op, *dst, *src, plan.scratch.temp(0));
+                    let unary = Unary {
+                        op: *op,
+                        dst: *dst,
+                        src: *src,
+                        temp: plan.scratch.temp(0),
+                    };
+                    super::emit_unary(code, unary, &mut self.consts);
                 }
                 ResolvedOp::ShiftImm {
                     op,
@@ -1115,47 +1322,48 @@ pub(crate) mod driver {
                 } => {
                     super::emit_shift_imm(code, *op, *dst, *src, *amount);
                 }
-                ResolvedOp::Gather { dst, idx, slot } => {
-                    // Context pointer (array of buffer base pointers) arrives
-                    // in `AVX2_FILE.gpr_ctx` (rdi); arithmetic/const emit
-                    // never touches it, so it survives to here. The base
-                    // pointer and index GPRs are `AVX2_FILE.gpr_scratch`'s
-                    // allocated reservations; the four vector temps are the
-                    // two halves' index and value registers (see
-                    // `super::emit_gather_scalar`).
-                    let ctx_gpr = self
-                        .file
-                        .gpr_ctx
-                        .expect("AVX2's gather needs a GPR context input");
-                    super::emit_gather_scalar(
+                ResolvedOp::Gather { dst, idx, base } => {
+                    // dst = base[idx]: `vgatherdps` under an all-ones mask,
+                    // `base` being the buffer's address wherever the
+                    // allocator keeps it; the two vector temps are this
+                    // instruction's reservations (`super::temps_for`).
+                    super::emit_gather(
                         code,
                         *dst,
                         *idx,
-                        *slot,
-                        super::GatherScratch {
-                            half: x86_64::GatherScratch {
-                                base_gpr: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0))
-                                    .0,
-                                index_gpr: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(1))
-                                    .0,
-                                ctx_gpr: ctx_gpr.0,
-                                idx_lanes: crate::emit::declared_temp(plan.scratch.temp(0)),
-                                value: crate::emit::declared_temp(plan.scratch.temp(1)),
-                            },
-                            idx_hi: crate::emit::declared_temp(plan.scratch.temp(2)),
-                            res_hi: crate::emit::declared_temp(plan.scratch.temp(3)),
+                        *base,
+                        super::GatherTemps {
+                            idx_int: crate::emit::declared_temp(plan.scratch.temp(0)),
+                            mask: crate::emit::declared_temp(plan.scratch.temp(1)),
                         },
                     );
                 }
-                ResolvedOp::Uniform { dst, load } => {
-                    let base = PtrReg(crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)).0);
-                    let ctx = PtrReg(
-                        self.file
-                            .gpr_ctx
-                            .expect("AVX2's uniform load needs a GPR context input")
-                            .0,
+                ResolvedOp::Broadcast { dst, idx, base } => {
+                    super::emit_broadcast_load(
+                        code,
+                        *dst,
+                        *idx,
+                        x86::BroadcastGprs {
+                            base: *base,
+                            index: crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0)),
+                        },
                     );
-                    super::emit_uniform_load(code, *dst, *load, base, ctx);
+                }
+                ResolvedOp::Uniform { dst, base, offset } => {
+                    super::emit_uniform_load(code, *dst, *base, *offset);
+                }
+                ResolvedOp::Context { dst, slot } => {
+                    let ctx = self
+                        .file
+                        .gpr_ctx
+                        .expect("x86's context read needs the GPR context input");
+                    AsmProgram::from([x86::MovLoadPtr {
+                        dst: *dst,
+                        base: PtrReg(ctx.0),
+                        disp: i32::from(*slot) * x86::PTR_BYTES,
+                    }
+                    .encode()])
+                    .assemble(code);
                 }
                 ResolvedOp::Binary {
                     op,
@@ -1163,7 +1371,7 @@ pub(crate) mod driver {
                     left,
                     right,
                 } => {
-                    // VEX 3-operand: no two-operand hazard, emit directly.
+                    // VEX 3-operand: either source may alias `dst`.
                     super::emit_binary(code, *op, *dst, *left, *right);
                 }
                 ResolvedOp::FusedMulAdd { dst, a, b } => {
@@ -1183,7 +1391,7 @@ pub(crate) mod driver {
                                 .assemble(code);
                         }
                         Some(DeferredReload::Const(bits)) => {
-                            super::emit_const(code, *c, f32::from_bits(*bits));
+                            super::emit_const(code, *c, f32::from_bits(*bits), &mut self.consts);
                         }
                         None => {}
                     }
@@ -1227,7 +1435,7 @@ pub(crate) mod driver {
             match location_of(locs, vid) {
                 Binding::Loc(Loc::Reg(reg)) => reg,
                 Binding::Remat(bits) => {
-                    super::emit_const(code, target, f32::from_bits(bits));
+                    super::emit_const(code, target, f32::from_bits(bits), &mut self.consts);
                     target
                 }
                 Binding::Loc(Loc::Slot(slot)) => {
@@ -1235,13 +1443,48 @@ pub(crate) mod driver {
                         .assemble(code);
                     target
                 }
+                Binding::Loc(Loc::Ptr(p)) => {
+                    unreachable!("{vid:?} is an address in {p:?}; the pointer class resolves it")
+                }
             }
         }
 
-        // Select short-circuit guards: vmovmskps -> eax[7:0], same shape as
-        // X86Backend's MOVMSKPS guards but 8 lanes wide (al == 0xFF for
-        // all-true, not 0x0F — see `super::emit_cmp_al_imm8`'s doc for why the
-        // sign-extending `cmp eax, imm8` X86Backend uses doesn't work here).
+        fn ptr_store(&mut self, code: &mut Vec<u8>, src: PtrReg, offset: u32) {
+            AsmProgram::from([x86::MovStorePtr {
+                src,
+                base: x86::ptr::RSP,
+                disp: offset as i32,
+            }
+            .encode()])
+            .assemble(code);
+        }
+
+        fn ptr_load(&mut self, code: &mut Vec<u8>, dst: PtrReg, offset: u32) {
+            AsmProgram::from([x86::MovLoadPtr {
+                dst,
+                base: x86::ptr::RSP,
+                disp: offset as i32,
+            }
+            .encode()])
+            .assemble(code);
+        }
+
+        fn ptr_mov(&mut self, code: &mut Vec<u8>, dst: PtrReg, src: PtrReg) {
+            x86::mov(code, dst.as_gpr(), src.as_gpr());
+        }
+
+        fn anchor(&mut self, asm: &mut Assembly) {
+            x86::anchor(asm);
+        }
+
+        fn finish(&mut self, asm: &mut Assembly) {
+            self.consts.finish(asm);
+        }
+
+        // Select short-circuit guards: vmovmskps -> eax[7:0], then a test
+        // of the low byte (al == 0xFF for all-true — see
+        // `super::emit_cmp_al_imm8`'s doc for why the sign-extending
+        // `cmp eax, imm8` would not do).
         /// [`MaskTest::scratch`] and [`MaskTest::mask_scratch`] are both
         /// unused: this tier reduces the mask with `movmskps` into the
         /// flags, needing neither a vector nor a mask register.
@@ -1281,12 +1524,12 @@ pub(crate) mod driver {
         }
 
         fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
-            super::emit_const(code, scratch, scalar);
+            super::emit_const(code, scratch, scalar, &mut self.consts);
             super::emit_binary(code, OpKind::Add, dst, dst, scratch);
         }
 
         fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
-            super::emit_const(code, dst, val);
+            super::emit_const(code, dst, val, &mut self.consts);
         }
 
         fn alu(&mut self, code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2]) {

@@ -184,8 +184,7 @@ pub type KernelFn = extern "C" fn(*const *const f32, *mut f32, usize);
 /// Page preparation, independent of ISA level and architecture.
 ///
 /// Ungated on purpose: `CodePages`, `page_size` and `sync_instruction_cache`
-/// are exercised by every build, not just the SSE2 one the module below is
-/// limited to.
+/// are exercised by every build, whatever tier the host runs.
 #[cfg(all(test, unix))]
 mod page_tests {
     use super::*;

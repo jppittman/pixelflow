@@ -2,9 +2,10 @@
 //!
 //! A string is a scan (prefix sum) over character advances with each glyph's
 //! outline placed at its pen position. **A laid-out string is one glyph**,
-//! and its coverage is the winding number of all those contours together —
-//! the same non-zero rule TrueType already specifies *within* a glyph, which
-//! is what fills a `B` drawn as two overlapping shapes.
+//! and its coverage is the area under the winding number of all those
+//! contours together — the same non-zero rule TrueType already specifies
+//! *within* a glyph, which is what fills a `B` drawn as two overlapping
+//! shapes.
 //!
 //! That one rule is load-bearing, because **coverage is not additive**.
 //! Summing per-glyph coverages reaches 2 where two glyphs' ink overlaps, and
@@ -15,8 +16,8 @@
 //! An earlier version drew the wrong conclusion from that and merged every
 //! character's contours into a single [`Outline`] before building any
 //! kernel. The premise rules out combining *coverages*; it says nothing
-//! about combining *windings*, which are additive and which vanish outside
-//! a closed contour. [`loop_blinn::run`] folds each character separately and
+//! about combining *signed areas*, which are additive and which vanish
+//! outside a closed contour. [`loop_blinn::run`] folds each character separately and
 //! combines those instead, so each character keeps its own bounding box and a
 //! sample only pays for the characters whose box contains it — the binning is
 //! exact, and it is what the merge threw away
@@ -36,8 +37,8 @@ use super::ttf::Font;
 /// glyph space.
 ///
 /// Advance-based (kerning-free) layout: each glyph is scaled to `size` and
-/// placed at the accumulated advance. Antialiasing comes from the kernel's
-/// `Dwrt` ramps at bake.
+/// placed at the accumulated advance. Coverage is the exact area of each
+/// pixel under ink, closed by the compiler at bake.
 ///
 /// This is the denotation — the function a laid-out string *is*. Like any
 /// other glyph kernel, it carries no coordinate frame: a caller wanting

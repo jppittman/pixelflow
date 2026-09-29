@@ -8,7 +8,7 @@
 
 ### Core Philosophy
 1.  **Pull-based Rendering:** Pixels are sampled, not pushed. The system asks "what color is this pixel?", eliminating overdraw and complex rasterization state.
-2.  **SIMD as Algebra:** `Field` — one SIMD batch (AVX-512, SSE2, NEON) — is `pub(crate)` inside `pixelflow-core` and is never named outside it. Users write algebraic equations as `Kernel` values; the compiler owns the loop nest and emits vectorized assembly.
+2.  **SIMD as Algebra:** there is no vector type in the language or in `pixelflow-core`; the JIT's ISA tier (AVX2+FMA or AVX-512 on x86-64, NEON on aarch64) is decided at process startup by the CPU. Users write algebraic equations as `Kernel` values; the compiler owns the loop nest and emits vectorized assembly.
 3.  **The Kernel/Lattice Abstraction:** A `Kernel` is an immutable handle to an `ExprArena` fragment — the language's one runtime value, JIT-first from the start. `Manifold::compile` specializes a `Kernel` at a lattice's shape, and `Lattice::collapse` is the one verb that produces numbers. There is no type-level combinator tier to write by hand any more — that tier (manifolds as zero-sized expression templates evaluated one SIMD batch at a time) was retired by [A Kernel with a Lattice](docs/plans/2026-09-06-kernel-with-a-lattice.md). The intended way to write PixelFlow code is the `kernel!` macro, which compiles expressions through an e-graph optimizer and codegen pipeline.
 4.  **Zero Allocations:** The rendering loop is designed to have zero heap allocations per frame.
 
@@ -17,7 +17,7 @@
 The project is a Rust workspace with the following key members:
 
 *   **`core-term`**: The terminal emulator application. (First consumer)
-*   **`pixelflow-core`**: Lattices, the compiled `Manifold`, `collapse`, and the cell grid. `no_std`, SIMD backend implementations (`Field` is `pub(crate)`, never named outside this crate).
+*   **`pixelflow-core`**: Lattices, the compiled `Manifold`, `collapse`, and the cell grid. `no_std`, and holds no vector code: the ISA tier is the JIT's.
 *   **`pixelflow-compiler`**: Proc-macro compiler for the `kernel!` macro (lexer, parser, sema, codegen).
 *   **`pixelflow-ir`**: Shared IR (`ExprArena`, `OpKind`, backend execution traits, the `Kernel` value/AST).
 *   **`pixelflow-codegen`**: Per-ISA emitters (x86-64, aarch64), register allocation, executable memory, and the JIT compile cache — expression graphs to machine code.

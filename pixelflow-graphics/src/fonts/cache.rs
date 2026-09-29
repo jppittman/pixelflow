@@ -5,14 +5,14 @@
 //! ## Categorical Semantics
 //!
 //! Caching is a **morphism between evaluation strategies**:
-//! - a glyph `Kernel` evaluates mathematically (winding numbers, infinite
-//!   resolution)
+//! - a glyph `Kernel` evaluates mathematically (the exact area of each
+//!   pixel under ink, infinite resolution)
 //! - `CachedGlyph` evaluates from a baked lattice (SIMD gather, fixed
 //!   resolution)
 //!
 //! The bake JIT-compiles the fused glyph kernel once (`Lattice::bake`,
 //! global compile cache) and tabulates it; antialiasing is intrinsic to the
-//! kernel (symbolic `Dwrt` crossing ramps resolved at compile time). The
+//! kernel (each pixel's area, its integrals closed at compile time). The
 //! read-back is a [`BilinearSampler`] — a JIT'd 4-tap gather kernel bound to
 //! the baked buffer. Texels therefore store *antialiased* coverage — no
 //! post-hoc filtering of hard 0/1 samples.
@@ -77,7 +77,7 @@ use super::PIXEL_CENTER;
 /// A glyph baked to a coverage lattice.
 ///
 /// This is the output of the caching morphism: a glyph whose kernel reads
-/// coverage from memory rather than computing winding numbers. The lattice stores f32
+/// coverage from memory rather than computing areas. The lattice stores f32
 /// *antialiased* coverage values (0.0 to 1.0) — no u8 quantization roundtrip
 /// — sampled back via SIMD gather with bilinear interpolation.
 ///
@@ -131,14 +131,14 @@ impl CachedGlyph {
     /// Create a cached glyph by baking a glyph coverage [`Kernel`]
     /// ([`Font::glyph_kernel_scaled`] → one fused arena, compiled once
     /// through the global cache, tabulated over a [`Lattice`]).
-    /// Antialiasing comes from the kernel's symbolic `Dwrt` ramps resolved
-    /// at compile time. The JIT-vs-interpreter goldens
+    /// Antialiasing is the kernel's own: each texel is its pixel's area
+    /// under ink. The JIT-vs-interpreter goldens
     /// (tests/kernel_glyph_golden.rs) guard this path. The kernel's outline
     /// must be scaled to `size × density` pixels; texels sample at centers,
     /// and the result takes point-space coordinates.
     ///
     /// Takes the whole [`Glyph`], not a bare [`Kernel`], to match
-    /// [`Glyph::bake`]'s own shape; the winding sum's piece table travels
+    /// [`Glyph::bake`]'s own shape; the glyph's piece table travels
     /// with `glyph.kernel()` itself (`Kernel::with_buffer_data`, seeded by
     /// [`loop_blinn::glyph`](super::loop_blinn::glyph)), so — unlike
     /// before — there is no second value that must come from the same call.
@@ -160,7 +160,7 @@ impl CachedGlyph {
         let lattice = Lattice {
             extent: [px as u32, px as u32],
         };
-        // `Glyph::bake` needs no explicit binding: the winding table the
+        // `Glyph::bake` needs no explicit binding: the piece table the
         // kernel declares (S1a) travels with it, and a glyph with no
         // outline declares no buffer at all — both bake the same way.
         let baked = glyph.bake(&centered, lattice);
@@ -651,7 +651,7 @@ mod tests {
 
         // Direct analytical tabulation at pixel centers (the rasterizer's
         // sampling convention), as a contramap over a plain index lattice.
-        // The winding sum reads a bound piece table (S1a), so bind it
+        // The area fold reads a bound piece table (S1a), so bind it
         // rather than a bare `Lattice::bake`.
         let centered = glyph.kernel().at(
             &Kernel::x().add(&Kernel::constant(0.5)),
@@ -824,9 +824,9 @@ mod tests {
     #[test]
     fn density_two_resamples_sharper_edges() {
         // The whole point of density: a 2x bake must re-sample the analytic
-        // outline, not upscale the 1x lattice. The AA crossing ramp is ~1
-        // texel wide, so in point space it is ~1 point at density 1 but only
-        // ~0.5 points at density 2 — scanning a stem edge at sub-point steps
+        // outline, not upscale the 1x lattice. An edge's transition is one
+        // texel wide, so in point space it is one point at density 1 but
+        // half a point at density 2 — scanning a stem edge at sub-point steps
         // must find a strictly narrower transition zone.
         let font = Font::parse(FONT_DATA).unwrap();
         let mut cache = GlyphCache::new();

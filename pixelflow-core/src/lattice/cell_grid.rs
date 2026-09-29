@@ -593,8 +593,7 @@ impl CellGridProgram {
     ///
     /// # Panics
     ///
-    /// Panics on a degenerate shape (zero cells, empty atlas), when this
-    /// build's `Field` width does not match the JIT's emitted width, or if
+    /// Panics on a degenerate shape (zero cells, empty atlas), or if
     /// compilation fails.
     #[must_use]
     pub fn compile(shape: CellGridShape, default_bg: [f32; 4]) -> Self {

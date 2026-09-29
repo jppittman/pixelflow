@@ -42,6 +42,14 @@ pub fn nsstring_to_string(ns_str: Id) -> String {
     }
 }
 
+/// Plays the system alert sound.
+pub fn beep() {
+    unsafe { sys::ns_beep() }
+}
+
+/// The pasteboard type for UTF-8 plain text.
+const PLAIN_TEXT_TYPE: &str = "public.utf8-plain-text";
+
 // --- Structs ---
 
 /// Wrapper for NSPasteboard
@@ -71,13 +79,27 @@ impl NSPasteboard {
             // It's usually "public.utf8-plain-text" or similar in modern macOS.
             // Or just use the old "NSStringPboardType".
             // Let's use string literal.
-            let type_str = make_nsstring("public.utf8-plain-text");
+            let type_str = make_nsstring(PLAIN_TEXT_TYPE);
 
             sys::send_2::<(), Id, Id>(self.0, sys::sel(b"setString:forType:\0"), ns_str, type_str);
 
             // Release temp strings
             sys::send::<()>(ns_str, sys::sel(b"release\0"));
             sys::send::<()>(type_str, sys::sel(b"release\0"));
+        }
+    }
+
+    /// The pasteboard's plain-text contents, or `None` when it holds no text.
+    pub fn string(&self) -> Option<String> {
+        unsafe {
+            let type_str = make_nsstring(PLAIN_TEXT_TYPE);
+            // Autoreleased and not ours: read it, don't release it.
+            let ns_str: Id = sys::send_1(self.0, sys::sel(b"stringForType:\0"), type_str);
+            sys::send::<()>(type_str, sys::sel(b"release\0"));
+            match ns_str.is_null() {
+                true => None,
+                false => Some(nsstring_to_string(ns_str)),
+            }
         }
     }
 }

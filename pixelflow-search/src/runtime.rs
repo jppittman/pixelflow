@@ -40,7 +40,7 @@ use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, ExprNode, UniformDecl};
 use pixelflow_ir::key::{Canonical, canonical};
 use pixelflow_ir::optimize::{Identity, Optimize};
-use pixelflow_ir::passes::{ExpandRefs, LowerDwrt};
+use pixelflow_ir::passes::{ExpandRefs, Resolve};
 use pixelflow_ir::pipeline;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -153,7 +153,7 @@ fn optimize_runtime_arena_uncached(
 /// of docs/plans/2026-09-06-egraph-at-production-scale.md §7, measured by
 /// docs/results/2026-09-07-egraph-off-vs-on-real-shaders.md.
 fn without_saturation(arena: &ExprArena, root: ExprId) -> Option<(ExprArena, ExprId)> {
-    pipeline![ExpandRefs, Identity, LowerDwrt]
+    pipeline![ExpandRefs, Identity, Resolve]
         .optimize(arena, root)
         .into_changed()
 }
@@ -174,6 +174,63 @@ fn with_refs_expanded<'a>(
     (owned, *owned_root)
 }
 
+/// How many integrals the runtime tier's extraction of `root` at `shape`
+/// leaves for legalization to approximate: `0` when a rule closed every one.
+/// `None` when the e-graph declines the term.
+///
+/// A test hook for the closure gate. [`optimize_runtime_arena`] legalizes
+/// what it returns — a surviving integral becomes its quadrature there — so
+/// its output cannot say whether a closed form was reached; this counts the
+/// interval folds reachable in the extracted term, before `resolve`.
+#[must_use]
+pub fn unclosed_integrals(arena: &ExprArena, root: ExprId, shape: LatticeShape) -> Option<usize> {
+    let mut expanded = None;
+    let (arena, root) = with_refs_expanded(arena, root, &mut expanded);
+    let canon = canonical(arena, root);
+    let saturated = saturated_for(&canon, arena, root, shape)?;
+    let (extracted, extracted_root) = extracted(&saturated, &canon, arena, shape);
+    let mut seen = vec![false; extracted.len()];
+    let mut stack = vec![extracted_root];
+    let mut integrals = 0;
+    while let Some(id) = stack.pop() {
+        if std::mem::replace(&mut seen[id.0 as usize], true) {
+            continue;
+        }
+        if matches!(
+            extracted.node(id),
+            ExprNode::Reduce {
+                fold: pixelflow_ir::Fold::Interval(_),
+                ..
+            }
+        ) {
+            integrals += 1;
+        }
+        stack.extend(extracted.children(id));
+    }
+    Some(integrals)
+}
+
+/// Extract `saturated` for `shape`, in `arena`'s own names and slot order —
+/// the term as the e-graph chose it, before legalization.
+fn extracted(
+    saturated: &Saturated,
+    canon: &Canonical,
+    arena: &ExprArena,
+    shape: LatticeShape,
+) -> (ExprArena, ExprId) {
+    let optimizer = runtime_optimizer(shape);
+    let optimized = optimizer.extract(&saturated.egraph, saturated.root, saturated.stats.clone());
+    let (extracted, extracted_root) = optimized.to_arena(&saturated.egraph, saturated.root);
+
+    // Names. The graph's are the saturating composition's, in extraction
+    // order; this caller's go in their slots, in this caller's own order.
+    let (in_canonical_order, extracted_root) =
+        extracted.relink(extracted_root, &saturated.buffers, &saturated.uniforms);
+    in_canonical_order
+        .with_tables(canon.buffers.clone(), canon.uniforms.clone())
+        .relink(extracted_root, arena.buffers(), arena.uniforms())
+}
+
 /// Extract `saturated` for `shape` and hand the term back in `arena`'s own
 /// names and slot order, lowered.
 fn extract_for(
@@ -183,29 +240,23 @@ fn extract_for(
     root: ExprId,
     shape: LatticeShape,
 ) -> Option<(ExprArena, ExprId)> {
-    let optimizer = runtime_optimizer(shape);
-    let optimized = optimizer.extract(&saturated.egraph, saturated.root, saturated.stats.clone());
-    let (extracted, extracted_root) = optimized.to_arena(&saturated.egraph, saturated.root);
-
-    // Names. The graph's are the saturating composition's, in extraction
-    // order; this caller's go in their slots, in this caller's own order.
-    let (in_canonical_order, extracted_root) =
-        extracted.relink(extracted_root, &saturated.buffers, &saturated.uniforms);
-    let (in_callers_order, extracted_root) = in_canonical_order
-        .with_tables(canon.buffers.clone(), canon.uniforms.clone())
-        .relink(extracted_root, arena.buffers(), arena.uniforms());
+    let (in_callers_order, extracted_root) = extracted(saturated, canon, arena, shape);
     let _ = root;
 
-    // `LowerDwrt` last, and that is the whole point: legalization is the
-    // *fallback*, taking whatever illegal shape survived saturation — a
-    // `Dwrt` the chain rule did not reach — and making it emittable. It owns
-    // nothing the graph does not also know, so running it first only takes
-    // choices away. A `Reduce` is not illegal, nested or not: codegen emits
-    // a surviving fold as a loop, and a fold inside a fold as a loop inside
-    // a loop, so every fold stays folded all the way to the assembler.
-    // Mirrors `pixelflow-ir::passes::legalize`, which says the same thing at
-    // the other compile entry.
-    pixelflow_ir::passes::lower_dwrt_owned(&in_callers_order, extracted_root).ok()
+    // `resolve` last, and that is the whole point: legalization is the
+    // *fallback*, taking whatever illegal shape survived saturation — an
+    // integral no rule closed, a `Dwrt` the chain rule did not reach — and
+    // making it emittable. It owns nothing the graph does not also know, so
+    // running it first only takes choices away. `resolve` and not
+    // `lower_dwrt` alone: a `Dwrt` over an integral survives saturation (the
+    // chain rule does not pass through a fold), and `lower_dwrt` refuses a
+    // `Reduce`, so lowering it without quadrature first would decline and
+    // throw the whole saturation away. A *range* `Reduce` is not illegal,
+    // nested or not: codegen emits a surviving fold as a loop, and a fold
+    // inside a fold as a loop inside a loop, so every range stays folded all
+    // the way to the assembler. `pixelflow-ir::passes::legalize` calls the
+    // same `resolve` at the other compile entry.
+    pixelflow_ir::passes::resolve(&in_callers_order, extracted_root).ok()
 }
 
 /// How many terms this process has saturated.

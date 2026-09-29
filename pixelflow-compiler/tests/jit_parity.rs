@@ -200,12 +200,9 @@ fn jit_sin_cos() {
     );
 }
 
-/// `exp` is not yet lowered (it needs float↔int bit-manip primitives, the next
-/// slice), so it still reaches the backend as an `Exp` op. The 128-bit path has
-/// an asm emitter; the AVX-512 backend rejects it. Gate off `+avx512f` until
-/// exp/log lowering lands.
+/// `exp` lowers to the integer bit-manipulation atoms every backend encodes,
+/// so it runs on whichever tier the host selected.
 #[test]
-#[cfg(not(target_feature = "avx512f"))]
 fn jit_exp() {
     jit_truth!(
         "exp",

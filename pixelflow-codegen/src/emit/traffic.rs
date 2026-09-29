@@ -22,7 +22,7 @@
 //! than a silently dropped term.
 
 use super::regalloc::{Scope, ValueId};
-use super::{Binding, InstructionPlan, IsaBackend, Loc, Reg, Reload, WritePlan};
+use super::{Binding, InstructionPlan, IsaBackend, Loc, PtrReg, Reg, Reload, WritePlan};
 use crate::error::CompileError;
 use alloc::vec::Vec;
 
@@ -52,9 +52,10 @@ pub struct ScopeTraffic {
     /// always did — an `InstructionPlan`'s reloads serve one instruction by
     /// definition.
     pub loads_kept: u32,
-    /// Constants re-emitted instead of loaded. Not a memory operation on x86,
-    /// where the immediate is inline; on aarch64 it may reach the constant
-    /// pool, which is why it is counted apart from both.
+    /// Constants brought into a register from the kernel's constant pool (or
+    /// an immediate, where the ISA encodes one) rather than from the frame:
+    /// a load, but not of a slot this kernel wrote, which is why it is
+    /// counted apart from both the loads and the stores.
     pub remats: u32,
     /// Stack stores emitted: spills, parks, a fold's slot-held roots.
     pub stores: u32,
@@ -92,11 +93,11 @@ pub struct EmitTraffic {
     /// allocations — recorded separately rather than folded into a scope so
     /// that stays visible.
     pub scaffold: ScopeTraffic,
-    /// Bytes after the return: aarch64's constant pool and the padding that
-    /// aligns it, nothing on x86. The pool is the kernel's; the padding
-    /// follows the code's length, so this is the one count that can differ
-    /// between two allocations of a kernel with no instruction differing, by
-    /// less than [`CONST_POOL_ALIGN`](super::aarch64::CONST_POOL_ALIGN).
+    /// Bytes after the return: the constant pool and the padding that aligns
+    /// it. The pool is the kernel's; the padding follows the code's length,
+    /// so this is the one count that can differ between two allocations of a
+    /// kernel with no instruction differing, by less than
+    /// [`CONST_POOL_ALIGN`](super::CONST_POOL_ALIGN).
     pub trailing: u32,
     /// Bytes one spilled register occupies: the backend's vector width.
     pub vector_bytes: u32,
@@ -250,7 +251,7 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         current.instructions += 1;
         for reload in &plan.reloads {
             match reload {
-                Reload::FromStack { .. } => current.loads_transient += 1,
+                Reload::FromStack { .. } | Reload::Ptr { .. } => current.loads_transient += 1,
                 Reload::Const { .. } => current.remats += 1,
             }
         }
@@ -285,9 +286,26 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
             Some(Binding::Loc(Loc::Slot(_))) => self.current().loads_kept += 1,
             Some(Binding::Remat(_)) => self.current().remats += 1,
             // Already in a register, or not placed at all: nothing is emitted.
-            Some(Binding::Loc(Loc::Reg(_))) | None => {}
+            Some(Binding::Loc(Loc::Reg(_) | Loc::Ptr(_))) | None => {}
         }
         self.inner.emit_resolve(code, vid, target, locs)
+    }
+
+    // The pointer class's traffic is traffic: a stored address is a store, a
+    // reloaded one a kept load (it is read for the whole scope that follows,
+    // like a vector root's), a copy between registers nothing.
+    fn ptr_store(&mut self, code: &mut Vec<u8>, src: PtrReg, offset: u32) {
+        self.current().stores += 1;
+        self.inner.ptr_store(code, src, offset);
+    }
+
+    fn ptr_load(&mut self, code: &mut Vec<u8>, dst: PtrReg, offset: u32) {
+        self.current().loads_kept += 1;
+        self.inner.ptr_load(code, dst, offset);
+    }
+
+    fn ptr_mov(&mut self, code: &mut Vec<u8>, dst: PtrReg, src: PtrReg) {
+        self.inner.ptr_mov(code, dst, src);
     }
 
     fn branch_if_arm_is_dead(
@@ -397,7 +415,7 @@ mod tests {
     use super::super::regalloc::{self, Scope};
     use super::super::storage::Slot;
     use super::super::{
-        Assembly, Binding, InstructionPlan, IsaBackend, Label, Loc, MaskTest, Reg, Reload,
+        Assembly, Binding, InstructionPlan, IsaBackend, Label, Loc, MaskTest, PtrReg, Reg, Reload,
         ResolvedOp, WritePlan,
     };
     use super::{Counting, EmitTraffic, ScopeTraffic};
@@ -462,6 +480,12 @@ mod tests {
         ) -> Reg {
             target
         }
+
+        fn ptr_store(&mut self, _code: &mut Vec<u8>, _src: PtrReg, _offset: u32) {}
+
+        fn ptr_load(&mut self, _code: &mut Vec<u8>, _dst: PtrReg, _offset: u32) {}
+
+        fn ptr_mov(&mut self, _code: &mut Vec<u8>, _dst: PtrReg, _src: PtrReg) {}
 
         fn branch_if_arm_is_dead(&mut self, _asm: &mut Assembly, _test: MaskTest, _label: Label) {}
 
@@ -814,7 +838,7 @@ mod tests {
             .zip(&t.trips)
             .map(|(s, trips)| u64::from(s.writes) * trips)
             .sum();
-        let lanes = u64::from(crate::JIT_VECTOR_BYTES as u32 / 4);
+        let lanes = crate::isa::jit_vector_bytes() as u64 / 4;
         let [width, rows] = SHAPE.extent().map(u64::from);
         assert_eq!(dynamic_writes, rows * width.div_ceil(lanes));
     }
@@ -824,15 +848,16 @@ mod tests {
     /// difference between two allocations must not be able to hide there.
     ///
     /// Every backend, from this host, since each emits its own frame. What
-    /// trails the return is counted apart again: aarch64's constant pool is
-    /// the kernel's, but the padding that aligns it follows the code's
-    /// length, so that count may move with the budget by less than one
-    /// alignment — and it is the only count that may.
+    /// trails the return is counted apart again: the constant pool is the
+    /// kernel's, but the padding that aligns it follows the code's length, so
+    /// that count may move with the budget by less than one alignment — and
+    /// it is the only count that may.
     #[test]
     fn the_scaffolds_traffic_does_not_move_with_the_pool() {
         use crate::emit::tests::schedule_for;
         use crate::emit::{
-            BYTES_PER_LANE, IsaBackend, aarch64, avx2, avx512, compile_via_backend, x86_64,
+            BYTES_PER_LANE, CONST_POOL_ALIGN, IsaBackend, aarch64, avx2, avx512,
+            compile_via_backend,
         };
 
         fn traffic<B: IsaBackend>(mut backend: B, arena: &ExprArena, root: ExprId) -> EmitTraffic {
@@ -852,11 +877,6 @@ mod tests {
                 traffic(aarch64::driver::Aarch64Backend::new(loose()), &arena, root),
             ),
             (
-                "SSE2",
-                traffic(x86_64::driver::X86Backend::new(tight()), &arena, root),
-                traffic(x86_64::driver::X86Backend::new(loose()), &arena, root),
-            ),
-            (
                 "AVX2",
                 traffic(avx2::driver::Avx2Backend::new(tight()), &arena, root),
                 traffic(avx2::driver::Avx2Backend::new(loose()), &arena, root),
@@ -873,7 +893,7 @@ mod tests {
                 "{name}: the scaffold changed with the register budget"
             );
             assert!(
-                t.trailing.abs_diff(l.trailing) < aarch64::CONST_POOL_ALIGN as u32,
+                t.trailing.abs_diff(l.trailing) < CONST_POOL_ALIGN as u32,
                 "{name}: what trails the return changed with the register budget by more \
                  than the pool's alignment: {} vs {} bytes",
                 t.trailing,

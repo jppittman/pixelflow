@@ -1,7 +1,12 @@
 use super::*;
-use crate::PARALLELISM;
 use crate::lattice::manifold::Manifold;
 use pixelflow_ir::Kernel;
+
+/// Lanes in one batch at the tier the JIT selected for this host — the only
+/// width there is, and it is the JIT's, not this crate's.
+fn parallelism() -> usize {
+    pixelflow_codegen::jit_vector_bytes() / core::mem::size_of::<f32>()
+}
 
 /// Read one sample of a bound-memory kernel: compile it at a one-sample
 /// lattice, bind the buffer it declares, collapse. A test owns its loop; this
@@ -183,12 +188,12 @@ fn index_of_collapse_is_the_kernel_everywhere() {
     }
 }
 
-// ---- Tail handling (non-multiple-of-PARALLELISM width) ----
+// ---- Tail handling (a width that is not a multiple of the batch) ----
 
 #[test]
 fn frame_bake_non_aligned_width() {
-    // Width that's not a multiple of PARALLELISM.
-    let width = PARALLELISM + 1;
+    // Width that's not a multiple of the batch.
+    let width = parallelism() + 1;
     let lattice = Lattice::frame(width, 2);
     let discrete = lattice.bake(&x_only());
 

@@ -1,6 +1,6 @@
 //! Integration tests: ANSI commands → Terminal grid
 //!
-//! These tests inject ANSI commands directly into the terminal emulator
+//! These tests inject text and ANSI commands directly into the terminal emulator
 //! and verify that the grid state is updated correctly.
 
 mod support;
@@ -13,7 +13,7 @@ fn it_should_place_a_printed_character_at_the_cursor_and_advance_the_cursor() {
     let mut harness = MinimalTestHarness::new();
 
     // TEST: Print a single character
-    harness.inject_ansi(AnsiCommand::Print('a'));
+    harness.print_text("a");
 
     // VERIFY: Grid has the character at (0, 0)
     let snapshot = harness
@@ -38,13 +38,7 @@ fn it_should_print_a_sequence_of_characters_left_to_right() {
     let mut harness = MinimalTestHarness::new();
 
     // TEST: Print multiple characters
-    harness.inject_ansi_batch(vec![
-        AnsiCommand::Print('H'),
-        AnsiCommand::Print('e'),
-        AnsiCommand::Print('l'),
-        AnsiCommand::Print('l'),
-        AnsiCommand::Print('o'),
-    ]);
+    harness.print_text("Hello");
 
     // VERIFY: Grid has "Hello"
     let snapshot = harness.get_snapshot().unwrap();
@@ -64,11 +58,9 @@ fn it_should_advance_to_the_next_grid_row_on_line_feed() {
     let mut harness = MinimalTestHarness::new();
 
     // TEST: Print, newline, print again
-    harness.inject_ansi_batch(vec![
-        AnsiCommand::Print('A'),
-        AnsiCommand::C0Control(C0Control::LF),
-        AnsiCommand::Print('B'),
-    ]);
+    harness.print_text("A");
+    harness.inject_ansi(AnsiCommand::C0Control(C0Control::LF));
+    harness.print_text("B");
 
     // VERIFY: 'A' on row 0, 'B' on row 1
     let snapshot = harness.get_snapshot().unwrap();
@@ -82,10 +74,8 @@ fn it_should_move_the_cursor_to_the_position_specified_by_cup() {
     let mut harness = MinimalTestHarness::new();
 
     // TEST: Move cursor to (5, 10), then print
-    harness.inject_ansi_batch(vec![
-        AnsiCommand::Csi(CsiCommand::CursorPosition(5, 10)),
-        AnsiCommand::Print('X'),
-    ]);
+    harness.inject_ansi(AnsiCommand::Csi(CsiCommand::CursorPosition(5, 10)));
+    harness.print_text("X");
 
     // VERIFY: 'X' at position (9, 4) [0-indexed]
     let snapshot = harness.get_snapshot().unwrap();
@@ -105,7 +95,7 @@ fn it_should_wrap_to_a_new_grid_line_on_each_lf_cr_pair() {
             harness.inject_ansi(AnsiCommand::C0Control(C0Control::LF));
             harness.inject_ansi(AnsiCommand::C0Control(C0Control::CR));
         } else {
-            harness.inject_ansi(AnsiCommand::Print(ch));
+            harness.print_text(ch.encode_utf8(&mut [0; 4]));
         }
     }
 
@@ -150,7 +140,7 @@ fn it_should_change_the_grid_checksum_after_each_of_several_prints() {
     let checksum1 = harness.compute_grid_checksum();
 
     // Print a character
-    harness.inject_ansi(AnsiCommand::Print('a'));
+    harness.print_text("a");
     let checksum2 = harness.compute_grid_checksum();
 
     // Checksums should be DIFFERENT
@@ -160,7 +150,7 @@ fn it_should_change_the_grid_checksum_after_each_of_several_prints() {
     );
 
     // Print another character
-    harness.inject_ansi(AnsiCommand::Print('b'));
+    harness.print_text("b");
     let checksum3 = harness.compute_grid_checksum();
 
     // Checksum should change again
@@ -178,7 +168,7 @@ fn it_should_report_the_same_checksum_when_the_grid_is_unchanged() {
     let mut harness = MinimalTestHarness::new();
 
     // Print a character
-    harness.inject_ansi(AnsiCommand::Print('x'));
+    harness.print_text("x");
 
     // Get checksum twice without changes
     let checksum1 = harness.compute_grid_checksum();
@@ -199,7 +189,7 @@ fn it_should_change_the_grid_checksum_after_each_character_printed() {
 
     // Print "Hello" one character at a time, checking checksum after each
     for ch in "Hello".chars() {
-        harness.inject_ansi(AnsiCommand::Print(ch));
+        harness.print_text(ch.encode_utf8(&mut [0; 4]));
         checksums.push(harness.compute_grid_checksum());
     }
 

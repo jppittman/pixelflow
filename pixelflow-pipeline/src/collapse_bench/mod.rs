@@ -63,8 +63,11 @@ use corpus::{CollapseKernel, Trips};
 pub use row::Stat;
 use row::{Measurement, Row, ScopeRow, StaticFeatures};
 
-/// Lanes in one batch for this build's vector width.
-pub const LANES: usize = pixelflow_codegen::JIT_VECTOR_BYTES / 4;
+/// Lanes in one batch at the tier the JIT selected for this host.
+#[must_use]
+pub fn lanes() -> usize {
+    pixelflow_codegen::jit_vector_bytes() / 4
+}
 
 /// Timed samples per kernel. The reported figure is the median; the brief's
 /// floor is 7, and the extra samples cost microseconds.
@@ -101,34 +104,12 @@ const SENTINEL_WINDOW: usize = 3;
 /// corpus, so its cost moves only when the machine does.
 const SENTINEL_EXTENT: [u32; 2] = [256, 32];
 
-/// Which ISA level this binary was built for, read off the target features the
-/// backend selection itself keys on.
+/// Which ISA tier this process emits for: the one the JIT selected at
+/// startup from the CPU (or `PIXELFLOW_ISA`), which is what a row's timings
+/// belong to.
 #[must_use]
 pub fn tier() -> &'static str {
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-    {
-        "avx512"
-    }
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        not(target_feature = "avx512f")
-    ))]
-    {
-        "avx2"
-    }
-    #[cfg(all(
-        target_arch = "x86_64",
-        not(target_feature = "avx2"),
-        not(target_feature = "avx512f")
-    ))]
-    {
-        "sse2"
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        "neon"
-    }
+    pixelflow_codegen::isa::detect().name()
 }
 
 /// Compile a corpus kernel the way `Lattice::bake` does — runtime
@@ -249,7 +230,7 @@ impl CollapseSession {
         // batches this extent holds at this tier's lane width) — it no
         // longer drives the call: the compiled kernel fills `kernel.extent`
         // in full, remainder included, in the one call below.
-        let trips = Trips::of(kernel.extent, LANES as u32);
+        let trips = Trips::of(kernel.extent, lanes() as u32);
         let result = compile_as_baked(&kernel.arena, kernel.root, kernel.extent);
         let mut buffer = output_buffer(kernel.extent);
         let (buffers, uniforms) = dummy_context(&kernel.name, &kernel.arena, &kernel.buffer_data);
@@ -271,7 +252,7 @@ impl CollapseSession {
             kernel: kernel.name.clone(),
             family: kernel.family.clone(),
             extent: kernel.extent,
-            lanes: LANES as u32,
+            lanes: lanes() as u32,
             rows: trips.rows,
             groups: trips.groups,
             measured: Measurement {

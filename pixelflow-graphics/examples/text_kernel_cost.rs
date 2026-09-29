@@ -31,9 +31,9 @@ use pixelflow_ir::LatticeShape;
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
-/// The piece table both folds read has this many columns per piece
+/// The piece table the fold reads has this many columns per piece
 /// (`loop_blinn::PIECE_ROW_COLS`, private to that module).
-const PIECE_ROW_COLS: usize = 22;
+const PIECE_ROW_COLS: usize = 10;
 
 /// The lattice `legalize` wraps the kernel for, held fixed across every
 /// string length: this file measures how node counts scale with the piece
@@ -85,7 +85,7 @@ fn main() {
                 shape: MEASURE_SHAPE,
                 origin: pixelflow_codegen::emit::origin(),
             },
-            lanes: (pixelflow_codegen::JIT_VECTOR_BYTES / 4) as u32,
+            lanes: (pixelflow_codegen::jit_vector_bytes() / 4) as u32,
         };
         let (legal, legal_root) = legalize(arena, root, &collapse).expect("legalize");
         let legalize_t = t1.elapsed();

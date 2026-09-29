@@ -1,21 +1,18 @@
 //! Optimization-quality guards for the glyph coverage kernels.
 //!
 //! A glyph kernel is the hottest runtime-composed arena in the system (every
-//! bake evaluates every reachable node per pixel), and its cost is dominated
-//! by the antialiasing ramps: every edge function `d` is normalised by
-//! `‖∇d‖ = √(DX(d)² + DY(d)²)`, once per piece per estimate.
-//!
-//! A glyph is now **two folds over one coefficient table** — a `sum_over`
-//! for the winding and a `min_over` for the distance, each with one fixed
-//! body reading its numbers by column at its own reduce binder. So the two
-//! things worth pinning are that the built arena does not grow with the
-//! outline, and that the optimizer's output grows exactly linearly in the
-//! piece count with a fixed budget per piece.
+//! bake evaluates every reachable node per pixel). A glyph is **one fold
+//! over one coefficient table** — a `sum_over` of each piece's area term,
+//! one fixed body reading its numbers by column at the fold's binder — and
+//! the body is written as an integral the e-graph closes
+//! (`fonts/loop_blinn.rs`). So the two things worth pinning are that the
+//! built arena does not grow with the outline, and that the closed body the
+//! optimizer hands the emitter has a fixed budget per piece.
 //!
 //! These tests count surviving operations through the runtime pipeline
-//! (`optimize_runtime_arena` → `lower_dwrt`) — the exact stages
-//! `Lattice::bake` runs — so a regression in derivative lowering or CSE
-//! shows up as a hard number, not a benchmark whisper.
+//! (`optimize_runtime_arena`, which saturates, extracts and resolves) — the
+//! exact stages `Lattice::bake` runs — so a regression in closure, CSE or
+//! extraction shows up as a hard number, not a benchmark whisper.
 
 use pixelflow_graphics::fonts::{loop_blinn, Contour, Font, Outline, Segment};
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
@@ -55,38 +52,38 @@ fn total_reachable(arena: &ExprArena, root: ExprId) -> usize {
     count_reachable(arena, root, |_| true)
 }
 
-/// Run the same optimization stages `Lattice::bake` runs, then lower any
-/// residual `Dwrt` exactly as the compile entries do, and report the final
-/// (arena, root) the emitter would actually schedule. Prints per-stage
-/// counts so a failure localizes to the stage that dropped the ball.
+/// The same optimization stages `Lattice::bake` runs, and the (arena, root)
+/// the emitter would actually schedule.
+///
+/// # Panics
+///
+/// When the runtime tier declines the glyph. That used to fall back to the
+/// arena as written — which is exactly what a bake would compile then, a
+/// glyph whose integrals are left to one-point quadrature, so a fallback
+/// here measured the failure and passed.
 fn bake_pipeline(arena: &ExprArena, root: ExprId, shape: [u32; 2]) -> (ExprArena, ExprId) {
     let optimized = pixelflow_search::runtime::optimize_runtime_arena(
         arena,
         root,
         pixelflow_ir::LatticeShape::new(shape),
-    );
-    let (a, r) = optimized
-        .as_deref()
-        .map(|(a, r)| (a.clone(), *r))
-        .unwrap_or_else(|| (arena.clone(), root));
+    )
+    .unwrap_or_else(|| {
+        panic!("the runtime tier declined the glyph; a bake would compile it unoptimized")
+    });
+    let (a, r) = &*optimized;
     eprintln!(
-        "  post-egraph: total={} sqrt={} dwrt={}",
-        total_reachable(&a, r),
-        count_op(&a, r, OpKind::Sqrt),
-        count_op(&a, r, OpKind::Dwrt),
+        "  post-egraph: total={} sqrt={} div={} recip={} dwrt={}",
+        total_reachable(a, *r),
+        count_op(a, *r, OpKind::Sqrt),
+        count_op(a, *r, OpKind::Div),
+        count_op(a, *r, OpKind::Recip),
+        count_op(a, *r, OpKind::Dwrt),
     );
-    let (dl, dr) =
-        lower_dwrt_owned(arena, root).expect("dwrt lowering must succeed on glyph kernels");
-    eprintln!(
-        "  lower_dwrt-only baseline: total={} sqrt={}",
-        total_reachable(&dl, dr),
-        count_op(&dl, dr, OpKind::Sqrt),
-    );
-    lower_dwrt_owned(&a, r).expect("dwrt lowering must succeed on glyph kernels")
+    (a.clone(), *r)
 }
 
-/// A closed polygon of `n` straight edges: no curves, so every piece's
-/// sliver columns are zero and its implicit is the identity.
+/// A closed polygon of `n` straight edges: no curves, so every piece's bend
+/// is zero.
 fn polygon(points: &[[f32; 2]]) -> Outline {
     let segments = (0..points.len())
         .map(|i| Segment::Line {
@@ -111,43 +108,31 @@ fn regular_polygon(n: usize) -> Outline {
     polygon(&points)
 }
 
-/// One `sqrt` per piece for the capsule distance `√(d² + t²)`, and one for
-/// each of the three gradient normalisations a piece's distance needs — the
-/// chord's across and along projections, and the implicit's own `‖∇f‖`.
+/// The closed body's square roots: one per root of the arc's rise the
+/// closed form evaluates — where the pixel's band starts and ends on the
+/// arc, and where the arc enters and leaves the pixel's column
+/// (`pixelflow_ir::IntervalFold::arc_moment`).
 const SQRT_PER_PIECE: usize = 4;
 
 /// **A glyph is one body, and the fold says how many times it runs.**
 ///
-/// This test used to assert the opposite property: that every affine edge
-/// function's gradient `√(DX² + DY²)` folded to a compile-time constant,
-/// leaving one `sqrt` per edge, the capsule distance. That property is
-/// *given up* deliberately (S1b of
-/// docs/plans/2026-09-09-glyph-as-a-fold-execution.md). An edge function's
-/// coefficients are table reads now, so `‖∇d‖` is a value rather than a
-/// literal and no folding can reach it — and folding it back by
-/// precomputing the magnitude on the host would put the distance in the
-/// outline's units instead of the lattice's, which is wrong under a
-/// magnifying `Kernel::at`.
+/// - The arena a glyph **builds** is the same size whatever the outline is
+///   — one body, not one fragment per edge, so construction stops being a
+///   function of the piece count.
+/// - The arena the optimizer **hands the emitter** is one closed body too:
+///   the fold stays a loop to the assembler, so its body is counted once,
+///   and a rewrite that multiplied work per pixel shows up as a hard
+///   number. [`SQRT_PER_PIECE`] square roots and not one more; no `Dwrt`
+///   (a glyph writes none any more); and no `Recip` — the closed form's
+///   quotients are exact divides, and an estimate would cost `2⁻¹²` of the
+///   area.
 ///
-/// What replaces it is the property the fold buys, which the per-edge form
-/// could not have stated at all:
-///
-/// - the arena a glyph **builds** is the same size whatever the outline is
-///   — one body per fold, not one fragment per edge, so construction stops
-///   being a function of the piece count;
-/// - the optimizer's output stays **linear** in the fold's trip count with a
-///   fixed budget of [`SQRT_PER_PIECE`] per row, so a rewrite that
-///   multiplied work per pixel still shows up as a hard number. The trip
-///   count is the piece count rounded up to a bucket, not the piece count
-///   itself (`docs/plans/2026-09-09-glyph-as-a-fold-execution.md` §S3), so a
-///   `5`-gon budgets against `8` rows and an `11`-gon against `16` — the
-///   padding rows are exact identities of both folds (their own gate is
-///   `loop_blinn::tests::a_padding_row_is_an_exact_identity_of_both_folds`)
-///   but they are still rows the fold runs and this budget still counts;
-/// - and `Dwrt` is still fully resolved, which now also covers
-///   `passes::lower_dwrt`'s rule that a table read whose index does not move
-///   with the differentiation variable is a constant. Without that rule this
-///   kernel does not lower at all.
+/// The trip count is the piece count rounded up to a bucket
+/// (`docs/plans/2026-09-09-glyph-as-a-fold-execution.md` §S3), so a `5`-gon
+/// and an `11`-gon run `8` and `16` rows — the padding rows are exact
+/// identities of the fold (their gate is
+/// `loop_blinn::tests::a_padding_row_is_an_exact_identity_of_the_fold`), and
+/// neither the count nor the body depends on it.
 #[test]
 fn a_glyph_is_one_body_and_a_fixed_budget_per_piece() {
     let (small, large) = (5usize, 11usize);
@@ -160,17 +145,15 @@ fn a_glyph_is_one_body_and_a_fixed_budget_per_piece() {
     let (many, many_root) = build(large);
 
     // The body is one. A different piece count changes the fold's extent
-    // (a `Const`) and the table's height, never the arena's shape.
+    // and the table's height, never the arena's shape.
     assert_eq!(
         (
             total_reachable(&few, few_root),
             count_op(&few, few_root, OpKind::Sqrt),
-            count_op(&few, few_root, OpKind::Dwrt),
         ),
         (
             total_reachable(&many, many_root),
             count_op(&many, many_root, OpKind::Sqrt),
-            count_op(&many, many_root, OpKind::Dwrt),
         ),
         "a {small}-gon and a {large}-gon must build the same arena: the piece \
          count is data in a table, not structure in the graph"
@@ -179,27 +162,28 @@ fn a_glyph_is_one_body_and_a_fixed_budget_per_piece() {
     for (n, arena, root) in [(small, &few, few_root), (large, &many, many_root)] {
         let (opt, opt_root) = bake_pipeline(arena, root, [32, 32]);
         let opt_sqrt = count_op(&opt, opt_root, OpKind::Sqrt);
-        let opt_dwrt = count_op(&opt, opt_root, OpKind::Dwrt);
         eprintln!(
-            "{n}-gon: raw total={} sqrt={} dwrt={} -> optimized total={} sqrt={opt_sqrt} \
-             dwrt={opt_dwrt}",
+            "{n}-gon: raw total={} sqrt={} -> optimized total={} sqrt={opt_sqrt}",
             total_reachable(arena, root),
             count_op(arena, root, OpKind::Sqrt),
-            count_op(arena, root, OpKind::Dwrt),
             total_reachable(&opt, opt_root),
         );
-        assert_eq!(opt_dwrt, 0, "Dwrt must be fully resolved by bake time");
-        // The fold's trip count is `n` rounded up to a bucket
-        // (`loop_blinn::bucketed_trip_count`, mirrored here rather than
-        // exposed: it is `u32::next_power_of_two`, not a bespoke rule), not
-        // `n` itself — see the budget's own doc above.
-        let bucketed_rows = (n as u32).next_power_of_two() as usize;
-        assert!(
-            opt_sqrt <= SQRT_PER_PIECE * bucketed_rows,
-            "a {n}-gon's unrolled kernel (bucketed to {bucketed_rows} rows) may \
-             keep {SQRT_PER_PIECE} sqrt per row (the capsule distance and three \
-             gradient normalisations); {opt_sqrt} survived, so something is \
-             computing a root per pixel that the one body does not ask for"
+        assert_eq!(
+            count_op(&opt, opt_root, OpKind::Dwrt),
+            0,
+            "{n}-gon: a Dwrt reached the emitter"
+        );
+        for estimate in [OpKind::Recip, OpKind::Rsqrt] {
+            assert_eq!(
+                count_op(&opt, opt_root, estimate),
+                0,
+                "{n}-gon: the closed body holds a {estimate:?} estimate"
+            );
+        }
+        assert_eq!(
+            opt_sqrt, SQRT_PER_PIECE,
+            "a {n}-gon's closed body keeps {SQRT_PER_PIECE} sqrt — the four \
+             roots of the arc's closed form; {opt_sqrt} survived"
         );
     }
 }

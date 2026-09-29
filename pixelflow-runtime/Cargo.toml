@@ -19,6 +19,9 @@ serde = { version = "1.0", features = ["derive"] }
 # Workspace dependencies
 pixelflow-core = { path = "../pixelflow-core" }
 pixelflow-graphics = { path = "../pixelflow-graphics", features = ["serde"] }
+# For `isa::detect` at engine startup: an unsupported CPU is refused before a
+# window opens, not by the first frame's kernel faulting.
+pixelflow-codegen = { path = "../pixelflow-codegen" }
 
 [dependencies.actor-scheduler]
 path = "../actor-scheduler"
@@ -82,4 +85,3 @@ default = []
 [dev-dependencies]
 anyhow = "1.0"
 env_logger = "0.11"
-pixelflow-codegen = { path = "../pixelflow-codegen" }

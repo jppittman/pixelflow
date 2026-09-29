@@ -91,11 +91,11 @@ const SENTINEL_REGIME_CHANGE_FRAC: f64 = 0.50;
 ///
 /// **This is a per-CALL bound**: "4 SIMD ops/cycle" counts whole vector
 /// instructions, and one collapse call (`code.call`) executes each of the
-/// expression's ops once for all [`LANES`] lanes at once. The measurement it is compared
+/// expression's ops once for all [`lanes`] lanes at once. The measurement it is compared
 /// against is per-LANE — both modes divide the timed total by
 /// `INPUT_TUPLES * repeat_batches` while performing
-/// `INPUT_VECTORS * repeat_batches` calls, and `INPUT_TUPLES == INPUT_VECTORS
-/// * LANES`. So the floor must be divided by `LANES` before comparison; see
+/// `input_vectors * repeat_batches` calls, and `INPUT_TUPLES == input_vectors
+/// * lanes()`. So the floor must be divided by `lanes()` before comparison; see
 /// [`plausibility_floor_ns`].
 const MIN_NS_PER_OP: f64 = 0.05;
 
@@ -265,9 +265,9 @@ fn sentinel_drift_exceeded(calibration_ns: f64, measured_ns: f64, max_drift_frac
 /// `op_count` compute ops (audit M4).
 ///
 /// `op_count * MIN_NS_PER_OP` is what executing those ops costs for one
-/// collapse call, which computes all [`LANES`] lanes at once. Reported
+/// collapse call, which computes all [`lanes`] lanes at once. Reported
 /// measurements are per lane (see [`MIN_NS_PER_OP`]), so the per-call bound
-/// is divided by `LANES` to be compared against one.
+/// is divided by `lanes()` to be compared against one.
 ///
 /// Getting this wrong does not make the floor merely conservative — it makes
 /// it *false*, firing on correct measurements. Undivided, it asserted that a
@@ -279,7 +279,7 @@ fn sentinel_drift_exceeded(calibration_ns: f64, measured_ns: f64, max_drift_frac
 /// small enough to stay under it. The first unoptimized arenas (`Identity` as
 /// an `Optimize` arm) were the first inputs big enough to cross it.
 fn plausibility_floor_ns(op_count: usize) -> f64 {
-    op_count as f64 * MIN_NS_PER_OP / LANES as f64
+    op_count as f64 * MIN_NS_PER_OP / lanes() as f64
 }
 
 /// Panic if a RAW per-eval measurement is below the dependency-chain floor
@@ -409,8 +409,8 @@ fn input_tuples() -> &'static [[f32; 2]; INPUT_TUPLES] {
 /// docs/plans/2026-09-16-collapse-is-a-fold.md.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BenchMode {
-    /// Independent back-to-back calls, each filling one [`LANES`]-wide batch
-    /// ([`shape_for`]'s `[LANES, 1]`): the CPU overlaps them, measuring
+    /// Independent back-to-back calls, each filling one [`lanes`]-wide batch
+    /// ([`shape_for`]'s `[lanes(), 1]`): the CPU overlaps them, measuring
     /// throughput under perfect ILP. This is the historical behavior and the
     /// default for un-migrated callers.
     Throughput,
@@ -422,7 +422,7 @@ pub enum BenchMode {
     /// never read `Var(0)` — with a single fed coordinate their chain
     /// silently breaks and the "latency" label is an ILP-overlapped
     /// throughput number (the exact audit-H3 under-billing this mode exists
-    /// to close). Compiled at the same `[LANES, 1]` shape as
+    /// to close). Compiled at the same `[lanes(), 1]` shape as
     /// [`BenchMode::Throughput`] — every lane of a call is still evaluated
     /// (the cost of a real batch), only lane 0's result is carried forward,
     /// so the serialized chain is the SIMD instruction sequence's own
@@ -435,7 +435,7 @@ pub enum BenchMode {
     /// equals its throughput.
     Latency,
     /// One call fills a whole [`SCANLINE_GROUPS`]-group row
-    /// ([`shape_for`]'s `[SCANLINE_GROUPS * LANES, 1]`): the kernel's own
+    /// ([`shape_for`]'s `[SCANLINE_GROUPS * lanes(), 1]`): the kernel's own
     /// emitted loop nest supplies the independent evaluations, and call/ret
     /// is amortized over all of them.
     ///
@@ -460,14 +460,14 @@ pub enum BenchMode {
 /// The [`LatticeShape`] a mode's compiled kernel is baked at.
 ///
 /// [`BenchMode::Throughput`] and [`BenchMode::Latency`] share one shape (one
-/// [`LANES`]-wide batch), so [`BenchSession::benchmark_arena_both`] compiles
+/// [`lanes`]-wide batch), so [`BenchSession::benchmark_arena_both`] compiles
 /// once and measures both; [`BenchMode::Scanline`] compiles separately at the
 /// wider row shape.
 #[must_use]
 fn shape_for(mode: BenchMode) -> LatticeShape {
     match mode {
-        BenchMode::Throughput | BenchMode::Latency => LatticeShape::new([LANES as u32, 1]),
-        BenchMode::Scanline => LatticeShape::new([(SCANLINE_GROUPS * LANES) as u32, 1]),
+        BenchMode::Throughput | BenchMode::Latency => LatticeShape::new([lanes() as u32, 1]),
+        BenchMode::Scanline => LatticeShape::new([(SCANLINE_GROUPS * lanes()) as u32, 1]),
     }
 }
 
@@ -831,7 +831,10 @@ struct RawMeasurement {
     outputs: Vec<[f32; 4]>,
 }
 
-const LANES: usize = pixelflow_codegen::JIT_VECTOR_BYTES / 4;
+/// Lanes in one batch at the tier the JIT selected for this host.
+fn lanes() -> usize {
+    pixelflow_codegen::jit_vector_bytes() / 4
+}
 
 /// Run `exec_code` once, filling `out` (one row, whose width is `out.len()`)
 /// starting from `origin`: `x = origin[0] + col`, `y = origin[1] + row` for
@@ -898,25 +901,23 @@ fn measure_exec_code(
     start_batches: usize,
     mode: BenchMode,
 ) -> Result<RawMeasurement, BenchError> {
-    const INPUT_VECTORS: usize = INPUT_TUPLES / LANES;
+    let lanes = lanes();
+    let input_vectors = INPUT_TUPLES / lanes;
     let tuples = input_tuples();
 
-    // `INPUT_VECTORS` distinct starting points (audit H3): one call's columns
+    // `input_vectors` distinct starting points (audit H3): one call's columns
     // are no longer independently settable per lane — a coordinate is a
     // lattice position now, `x = x0 + col`, not a free variable (CLAUDE.md
     // "collapse is a fold") — so diversity comes from cycling the ORIGIN a
-    // call starts at, one per group of `LANES` consecutive tuples, rather
+    // call starts at, one per group of `lanes` consecutive tuples, rather
     // than from setting every lane independently within one call.
-    let mut origins = [[0.0f32; 2]; INPUT_VECTORS];
-    for (v, origin) in origins.iter_mut().enumerate() {
-        *origin = tuples[v * LANES];
-    }
+    let origins: Vec<[f32; 2]> = (0..input_vectors).map(|v| tuples[v * lanes]).collect();
 
     // The width `exec_code` was compiled for (`shape_for(mode)`'s extent):
     // one batch for Throughput/Latency, the whole scanline for Scanline.
     let width = match mode {
-        BenchMode::Throughput | BenchMode::Latency => LANES,
-        BenchMode::Scanline => SCANLINE_GROUPS * LANES,
+        BenchMode::Throughput | BenchMode::Latency => lanes,
+        BenchMode::Scanline => SCANLINE_GROUPS * lanes,
     };
     let mut out_buf = vec![0.0f32; width];
 
@@ -966,7 +967,7 @@ fn measure_exec_code(
                     let mut prev = [out_buf[0], out_buf[0]];
                     let start = nanos_now();
                     for _ in 0..repeat_batches {
-                        for _ in 0..INPUT_VECTORS {
+                        for _ in 0..input_vectors {
                             latency_chain_step(exec_code, &mut prev, &mut out_buf);
                         }
                     }
@@ -993,9 +994,9 @@ fn measure_exec_code(
             continue;
         }
 
-        // Every mode performs `INPUT_VECTORS` calls per batch, each `width`
-        // evals wide; `INPUT_VECTORS * LANES == INPUT_TUPLES` by
-        // construction (`LANES` divides `INPUT_TUPLES`), so this is the same
+        // Every mode performs `input_vectors` calls per batch, each `width`
+        // evals wide; `input_vectors * lanes == INPUT_TUPLES` by
+        // construction (`lanes` divides `INPUT_TUPLES`), so this is the same
         // arithmetic as before the collapse-ABI port, just derived from
         // `width` instead of restated per mode.
         let evals_per_batch = match mode {
@@ -1699,10 +1700,10 @@ mod tests {
     #[should_panic(expected = "plausibility failure")]
     fn plausibility_floor_fires_below_floor() {
         // Derived from the floor, never restated as a literal: the floor
-        // divides by `LANES`, which is `JIT_VECTOR_BYTES / 4` and therefore
-        // 4, 8 or 16 depending on the ISA level the test is built for. A
-        // constant here would encode one level's answer and silently stop
-        // testing anything at the other two.
+        // divides by `lanes()`, which is `jit_vector_bytes() / 4` and
+        // therefore 4, 8 or 16 depending on the ISA tier the process runs. A
+        // constant here would encode one tier's answer and silently stop
+        // testing anything at the others.
         assert_plausible(plausibility_floor_ns(10) / 2.0, 10);
     }
 
@@ -2120,21 +2121,22 @@ mod tests {
     /// false, and it rejects correct measurements of large expressions.
     ///
     /// Asserted against the floor's own premise rather than its formula (a
-    /// formula test would restate the bug): 4 SIMD ops/cycle on a `LANES`-wide
-    /// unit is `4 * LANES` lane-ops per cycle, so a per-lane floor must sit
-    /// below one lane-op per cycle at any plausible clock.
+    /// formula test would restate the bug): 4 SIMD ops/cycle on a
+    /// `lanes()`-wide unit is `4 * lanes()` lane-ops per cycle, so a per-lane
+    /// floor must sit below one lane-op per cycle at any plausible clock.
     #[test]
     fn plausibility_floor_is_per_lane_not_per_call() {
         // Fastest clock worth defending against, in ns per cycle.
         const NS_PER_CYCLE_AT_6GHZ: f64 = 1.0 / 6.0;
+        let lanes = lanes();
         for ops in [1usize, 32, 137, 512] {
             let per_lane_floor = plausibility_floor_ns(ops) / ops as f64;
             assert!(
                 per_lane_floor < NS_PER_CYCLE_AT_6GHZ,
                 "floor demands {per_lane_floor:.4}ns per lane-op for a {ops}-op expression, \
-                 which exceeds one cycle at 6GHz — a {LANES}-wide unit retires \
+                 which exceeds one cycle at 6GHz — a {lanes}-wide unit retires \
                  {} lane-ops per cycle, so this rejects correct measurements",
-                4 * LANES,
+                4 * lanes,
             );
         }
     }
@@ -2196,7 +2198,7 @@ mod tests {
         // `next != 2*prev` on the very first iteration.
         //
         // (It used to check every SIMD lane too, feeding an entire
-        // `[f32; LANES]` per axis. That is not a property the language still
+        // `[f32; lanes()]` per axis. That is not a property the language still
         // has — a coordinate is a lattice position now, `x = x0 + col`, not a
         // free per-lane variable — so what survives is the property that was
         // load-bearing: a non-X coordinate is chained.)
@@ -2207,7 +2209,7 @@ mod tests {
             compile(&arena, root, shape_for(BenchMode::Latency)).expect("y+y must JIT-compile");
 
         let mut prev = [0.25f32, 0.25f32]; // nonzero seed so doubling is observable.
-        let mut scratch = vec![0.0f32; LANES];
+        let mut scratch = vec![0.0f32; lanes()];
         for step in 0..8 {
             let before = prev;
             latency_chain_step(&compiled.code, &mut prev, &mut scratch);

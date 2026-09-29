@@ -466,6 +466,12 @@ impl Troupe {
     /// dedicated OS thread of its own. The one thread this bootstrap still spawns for vsync is
     /// the [`Timer`] clock — a green actor may not block, and a clock has to wait.
     pub fn with_config(config: EngineConfig) -> Result<Self, RuntimeError> {
+        // The JIT's ISA tier is decided here, once, before any window opens: a
+        // CPU below the floor is refused now, naming the feature it lacks,
+        // rather than by the first frame's kernel faulting on an instruction
+        // it cannot execute.
+        log::info!("JIT ISA tier: {}", pixelflow_codegen::isa::detect().name());
+
         // Create troupe with platform-specific waker for the main (driver) actor
         #[cfg(target_os = "macos")]
         let mut troupe = {

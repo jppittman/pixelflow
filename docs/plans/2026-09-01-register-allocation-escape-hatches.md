@@ -797,7 +797,10 @@ quickly.
 > traffic before distance — a constant (rematerialized), then a value whose
 > slot is already valid (no store), then one that needs a store — with
 > Belady breaking ties inside a tier and "read by this very instruction"
-> above everything. The store for a spilled value goes at its **definition**,
+> above everything. (The constant tier is gone as of 2026-09-20: a constant
+> is a value whose slot is valid from birth, ranked by distance with the
+> rest, re-kept, and parked — collapse-is-a-fold §5, step 5½.) The store for
+> a spilled value goes at its **definition**,
 > which a guard cannot skip without skipping every read; that is what the
 > earlier attempt got wrong by storing at the eviction, and it is why the
 > guarded-region hole above does not reappear. A kept range inside a

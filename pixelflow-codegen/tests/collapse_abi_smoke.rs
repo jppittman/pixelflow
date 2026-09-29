@@ -17,18 +17,25 @@
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
-use pixelflow_codegen::JIT_VECTOR_BYTES;
 use pixelflow_codegen::emit::compile;
+use pixelflow_codegen::jit_vector_bytes;
 use pixelflow_ir::arena::ExprArena;
 use pixelflow_ir::{LatticeShape, OpKind};
 
-const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
+/// Lanes in one batch at the tier this host selected.
+fn lanes() -> usize {
+    jit_vector_bytes() / core::mem::size_of::<f32>()
+}
 /// Three full batches and a remainder of every width below a batch.
-const WIDTH: usize = 3 * LANES + LANES - 1;
+fn width() -> usize {
+    3 * lanes() + lanes() - 1
+}
 const ROWS: usize = 2;
 /// Wider than the extent: the rows are not contiguous, so a store that
 /// stepped by the width rather than the pitch would land in the wrong row.
-const PITCH: usize = WIDTH + 5;
+fn pitch() -> usize {
+    width() + 5
+}
 const BIAS: f32 = 1.75;
 const ORIGIN: [f32; 2] = [0.5, 0.5];
 
@@ -47,26 +54,27 @@ fn kernel() -> (ExprArena, pixelflow_ir::arena::ExprId) {
 
 #[test]
 fn one_call_fills_the_plane() {
+    let (width, pitch) = (width(), pitch());
     let (arena, root) = kernel();
-    let shape = LatticeShape::new([WIDTH as u32, ROWS as u32]);
+    let shape = LatticeShape::new([width as u32, ROWS as u32]);
     let code = compile(&arena, root, shape).expect("the smoke kernel must compile");
 
     const UNWRITTEN: f32 = -1000.0;
-    let mut out = vec![UNWRITTEN; ROWS * PITCH];
+    let mut out = vec![UNWRITTEN; ROWS * pitch];
     // This kernel declares neither a buffer nor a uniform, so the context is
     // the origin block alone at the slot after the (empty) buffer table and
     // the (absent) uniform block.
     let origin = ORIGIN;
     let ctx: [*const f32; 2] = [core::ptr::null(), origin.as_ptr()];
     unsafe {
-        code.code.call(ctx.as_ptr(), out.as_mut_ptr(), PITCH);
+        code.code.call(ctx.as_ptr(), out.as_mut_ptr(), pitch);
     }
 
     for row in 0..ROWS {
         let y = ORIGIN[1] + row as f32;
-        for col in 0..PITCH {
-            let got = out[row * PITCH + col];
-            if col < WIDTH {
+        for col in 0..pitch {
+            let got = out[row * pitch + col];
+            if col < width {
                 let want = (ORIGIN[0] + col as f32) * y + BIAS;
                 assert!(
                     (got - want).abs() <= 1e-4,

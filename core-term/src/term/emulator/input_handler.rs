@@ -2,7 +2,8 @@
 
 use super::{key_translator, FocusState, TerminalEmulator};
 use crate::term::{
-    action::{EmulatorAction, UserInputAction},
+    action::{EmulatorAction, Selection, UserInputAction},
+    layout::Zoom,
     snapshot::{Point, SelectionMode},
     ControlEvent, MIN_GRID_DIMENSION,
 };
@@ -10,6 +11,9 @@ use log::{debug, trace};
 
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+/// Focus reports (DEC mode 1004): the window gained or lost focus.
+const FOCUS_IN_REPORT: &[u8] = b"\x1b[I";
+const FOCUS_OUT_REPORT: &[u8] = b"\x1b[O";
 
 struct KeyInput {
     symbol: pixelflow_runtime::input::KeySymbol,
@@ -26,11 +30,11 @@ pub(super) fn process_user_input_action(
     match action {
         UserInputAction::FocusLost => {
             emulator.focus_state = FocusState::Unfocused;
-            None
+            report_focus(emulator, FOCUS_OUT_REPORT)
         }
         UserInputAction::FocusGained => {
             emulator.focus_state = FocusState::Focused;
-            None
+            report_focus(emulator, FOCUS_IN_REPORT)
         }
         UserInputAction::KeyInput {
             symbol,
@@ -52,30 +56,90 @@ pub(super) fn process_user_input_action(
         }
         UserInputAction::ApplySelectionClear => {
             emulator.apply_selection_clear();
-            Some(EmulatorAction::RequestRedraw)
+            // Highlighted text becomes the primary selection, for a
+            // middle-click paste here or anywhere else.
+            match emulator.get_selected_text().filter(|text| !text.is_empty()) {
+                Some(text) => Some(EmulatorAction::Copy {
+                    selection: Selection::Primary,
+                    text,
+                }),
+                None => Some(EmulatorAction::RequestRedraw),
+            }
         }
-        UserInputAction::RequestClipboardPaste => {
-            debug!(
-                "UserInputAction: RequestClipboardPaste received. Requesting clipboard content."
-            );
-            Some(EmulatorAction::RequestClipboardContent)
-        }
+        UserInputAction::RequestClipboardPaste => Some(EmulatorAction::RequestClipboardContent(
+            Selection::Clipboard,
+        )),
         UserInputAction::RequestPrimaryPaste => {
-            debug!("UserInputAction: RequestPrimaryPaste received. (Currently not fully implemented, forwarding to RequestClipboardContent)");
-            Some(EmulatorAction::RequestClipboardContent)
+            Some(EmulatorAction::RequestClipboardContent(Selection::Primary))
         }
+        UserInputAction::RequestToggleFullscreen => Some(EmulatorAction::ToggleFullscreen),
         UserInputAction::InitiateCopy => handle_initiate_copy(emulator),
         UserInputAction::PasteText(text_to_paste) => handle_paste_text(emulator, &text_to_paste),
         UserInputAction::RequestQuit => Some(EmulatorAction::Quit),
-        // Add catch-all for other UserInputAction variants to satisfy exhaustiveness
-        _ => {
-            log::debug!(
-                "Unhandled UserInputAction variant in input_handler: {:?}",
-                action
-            );
-            None
-        }
+        UserInputAction::RequestZoomIn => zoom(emulator, Zoom::In),
+        UserInputAction::RequestZoomOut => zoom(emulator, Zoom::Out),
+        UserInputAction::RequestZoomReset => zoom(emulator, Zoom::Reset),
+        UserInputAction::RequestScrollLineUp => scroll(emulator, 1),
+        UserInputAction::RequestScrollLineDown => scroll(emulator, -1),
+        UserInputAction::RequestScrollPageUp => scroll(emulator, page(emulator)),
+        UserInputAction::RequestScrollPageDown => scroll(emulator, -page(emulator)),
+        UserInputAction::RequestScrollToTop => scroll(emulator, i32::MAX),
+        UserInputAction::RequestScrollToBottom => scroll(emulator, i32::MIN),
     }
+}
+
+/// Resizes the grid to fill a window of the given logical size at the
+/// current cell size, and has the PTY follow so the program hears SIGWINCH.
+fn fit_to_window(emulator: &mut TerminalEmulator, width_px: u16, height_px: u16) -> EmulatorAction {
+    let (cols, rows) = emulator.layout.grid_for_window(width_px, height_px);
+    let cols = cols.max(MIN_GRID_DIMENSION);
+    let rows = rows.max(MIN_GRID_DIMENSION);
+    trace!(
+        "TerminalEmulator: fitting {}x{} cells to {}x{} logical px",
+        cols,
+        rows,
+        width_px,
+        height_px
+    );
+    emulator.resize(cols, rows);
+    EmulatorAction::ResizePty {
+        cols: cols as u16,
+        rows: rows as u16,
+    }
+}
+
+/// Changes the cell size and refits the grid to the window at the new size.
+fn zoom(emulator: &mut TerminalEmulator, change: Zoom) -> Option<EmulatorAction> {
+    if !emulator.layout.zoom(change) {
+        return None;
+    }
+    match emulator.layout.window_px() {
+        Some((width_px, height_px)) => Some(fit_to_window(emulator, width_px, height_px)),
+        // No window yet: nothing to refit; the first resize will use the new size.
+        None => Some(EmulatorAction::RequestRedraw),
+    }
+}
+
+/// Tells the program about a focus change, if it asked to hear about them.
+fn report_focus(emulator: &TerminalEmulator, report: &[u8]) -> Option<EmulatorAction> {
+    match emulator.dec_modes.focus_event_mode {
+        true => Some(EmulatorAction::WritePty(report.to_vec())),
+        false => None,
+    }
+}
+
+/// Moves the scrollback viewport; positive is into history.
+fn scroll(emulator: &mut TerminalEmulator, lines: i32) -> Option<EmulatorAction> {
+    match emulator.scroll_viewport(lines) {
+        true => Some(EmulatorAction::RequestRedraw),
+        false => None,
+    }
+}
+
+/// One screenful of lines.
+fn page(emulator: &TerminalEmulator) -> i32 {
+    let (_, rows) = emulator.dimensions();
+    i32::try_from(rows).unwrap_or(i32::MAX)
 }
 
 fn handle_key_input(emulator: &mut TerminalEmulator, input: KeyInput) -> Option<EmulatorAction> {
@@ -121,34 +185,32 @@ fn handle_extend_selection(
 fn handle_initiate_copy(emulator: &mut TerminalEmulator) -> Option<EmulatorAction> {
     if let Some(text) = emulator.get_selected_text() {
         if !text.is_empty() {
-            return Some(EmulatorAction::CopyToClipboard(text));
+            return Some(EmulatorAction::Copy {
+                selection: Selection::Clipboard,
+                text,
+            });
         }
     }
     debug!("UserInputAction: InitiateCopy called but no text selected or selection empty.");
     None
 }
 
-/// Handles text paste operations, respecting bracketed paste mode.
+/// Sends pasted text to the program, bracketed when it asked for that
+/// (DEC mode 2004) so it can tell a paste from typing.
 fn handle_paste_text(
     emulator: &mut TerminalEmulator,
     text_to_paste: &str,
 ) -> Option<EmulatorAction> {
-    if emulator.dec_modes.bracketed_paste_mode {
-        log::debug!("InputHandler: Bracketed paste mode ON. Wrapping and sending to PTY.");
-        let text_bytes = text_to_paste.as_bytes();
-        let capacity = BRACKETED_PASTE_START.len() + text_bytes.len() + BRACKETED_PASTE_END.len();
-        let mut pasted_bytes = Vec::with_capacity(capacity);
-        pasted_bytes.extend_from_slice(BRACKETED_PASTE_START);
-        pasted_bytes.extend_from_slice(text_bytes);
-        pasted_bytes.extend_from_slice(BRACKETED_PASTE_END);
-        Some(EmulatorAction::WritePty(pasted_bytes))
-    } else {
-        log::debug!("InputHandler: Bracketed paste mode OFF. Calling emulator.paste_text.");
-        for char_val in text_to_paste.chars() {
-            emulator.print_char(char_val);
-        }
-        Some(EmulatorAction::RequestRedraw)
+    let text_bytes = text_to_paste.as_bytes();
+    if !emulator.dec_modes.bracketed_paste_mode {
+        return Some(EmulatorAction::WritePty(text_bytes.to_vec()));
     }
+    let capacity = BRACKETED_PASTE_START.len() + text_bytes.len() + BRACKETED_PASTE_END.len();
+    let mut pasted_bytes = Vec::with_capacity(capacity);
+    pasted_bytes.extend_from_slice(BRACKETED_PASTE_START);
+    pasted_bytes.extend_from_slice(text_bytes);
+    pasted_bytes.extend_from_slice(BRACKETED_PASTE_END);
+    Some(EmulatorAction::WritePty(pasted_bytes))
 }
 
 pub(super) fn process_control_event(
@@ -166,26 +228,8 @@ pub(super) fn process_control_event(
             height_px,
         } => {
             // width_px and height_px are in logical pixels (engine handles scaling)
-            // Calculate cols/rows using the emulator's Layout
-            let cols = ((width_px as f64 / emulator.layout.cell_width_px.max(1) as f64) as usize)
-                .max(MIN_GRID_DIMENSION);
-            let rows = ((height_px as f64 / emulator.layout.cell_height_px.max(1) as f64) as usize)
-                .max(MIN_GRID_DIMENSION);
-
-            trace!(
-                "TerminalEmulator: ControlEvent::Resize to {}x{} cells ({}x{} logical px)",
-                cols,
-                rows,
-                width_px,
-                height_px
-            );
-            emulator.resize(cols, rows);
-
-            // Signal orchestrator to resize the PTY so shell receives SIGWINCH
-            Some(EmulatorAction::ResizePty {
-                cols: cols as u16,
-                rows: rows as u16,
-            })
+            emulator.layout.set_window_px(width_px, height_px);
+            Some(fit_to_window(emulator, width_px, height_px))
         }
         ControlEvent::PtyDataReady => {
             // Orchestrator wake-up signal, ignored by emulator
@@ -225,55 +269,17 @@ mod tests {
     }
 
     #[test]
-    fn it_should_print_pasted_text_directly_to_the_grid_when_bracketed_paste_mode_is_off() {
+    fn it_should_send_pasted_text_to_the_pty_unwrapped_when_bracketed_paste_mode_is_off() {
         let mut emu = create_test_emu_for_input();
-        assert!(!emu.dec_modes.bracketed_paste_mode);
 
-        let text_to_paste = "Hello\nWorld".to_string();
-        let action = UserInputAction::PasteText(text_to_paste.clone());
+        let result = emu.interpret_input(EmulatorInput::User(UserInputAction::PasteText(
+            "Hello\nWorld".to_string(),
+        )));
 
-        let result = emu.interpret_input(EmulatorInput::User(action));
-        assert_eq!(result, Some(EmulatorAction::RequestRedraw));
-
-        let snapshot_option = emu.get_render_snapshot();
-        let snapshot = snapshot_option.as_ref().expect("Snapshot was None");
-
-        match snapshot.lines[0].cells[0] {
-            crate::glyph::Glyph::Single(cell) | crate::glyph::Glyph::WidePrimary(cell) => {
-                assert_eq!(cell.c, 'H')
-            }
-            _ => panic!("Expected H at [0][0]"),
-        }
-        match snapshot.lines[0].cells[1] {
-            crate::glyph::Glyph::Single(cell) | crate::glyph::Glyph::WidePrimary(cell) => {
-                assert_eq!(cell.c, 'e')
-            }
-            _ => panic!("Expected e at [0][1]"),
-        }
-        match snapshot.lines[0].cells[2] {
-            crate::glyph::Glyph::Single(cell) | crate::glyph::Glyph::WidePrimary(cell) => {
-                assert_eq!(cell.c, 'l')
-            }
-            _ => panic!("Expected l at [0][2]"),
-        }
-        match snapshot.lines[0].cells[3] {
-            crate::glyph::Glyph::Single(cell) | crate::glyph::Glyph::WidePrimary(cell) => {
-                assert_eq!(cell.c, 'l')
-            }
-            _ => panic!("Expected l at [0][3]"),
-        }
-        match snapshot.lines[0].cells[4] {
-            crate::glyph::Glyph::Single(cell) | crate::glyph::Glyph::WidePrimary(cell) => {
-                assert_eq!(cell.c, 'o')
-            }
-            _ => panic!("Expected o at [0][4]"),
-        }
-        match snapshot.lines[1].cells[0] {
-            crate::glyph::Glyph::Single(cell) | crate::glyph::Glyph::WidePrimary(cell) => {
-                assert_eq!(cell.c, 'W')
-            }
-            _ => panic!("Expected W at [1][0]"),
-        }
+        assert_eq!(
+            result,
+            Some(EmulatorAction::WritePty(b"Hello\nWorld".to_vec()))
+        );
     }
 
     #[test]
@@ -379,6 +385,123 @@ mod tests {
             }
             other => panic!("Expected ResizePty action, got {:?}", other),
         }
+    }
+
+    fn enable_mode(emu: &mut TerminalEmulator, mode: crate::term::modes::DecModeConstant) {
+        use crate::ansi::commands::CsiCommand;
+        emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+            CsiCommand::SetModePrivate(mode as u16),
+        )));
+    }
+
+    #[test]
+    fn focus_changes_are_reported_only_when_the_program_asked_for_them() {
+        let mut emu = create_test_emu_for_input();
+        let focus_in = || EmulatorInput::User(UserInputAction::FocusGained);
+        let focus_out = || EmulatorInput::User(UserInputAction::FocusLost);
+
+        assert_eq!(emu.interpret_input(focus_out()), None);
+
+        enable_mode(&mut emu, crate::term::modes::DecModeConstant::FocusEvent);
+        assert_eq!(
+            emu.interpret_input(focus_out()),
+            Some(EmulatorAction::WritePty(b"\x1b[O".to_vec()))
+        );
+        assert_eq!(
+            emu.interpret_input(focus_in()),
+            Some(EmulatorAction::WritePty(b"\x1b[I".to_vec()))
+        );
+    }
+
+    #[test]
+    fn scroll_actions_move_the_viewport_through_history_and_back() {
+        let mut emu = TerminalEmulator::new(10, 3);
+        // Ten lines through a three-row screen leaves seven in history.
+        for _ in 0..10 {
+            emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(
+                crate::ansi::commands::C0Control::LF,
+            )));
+        }
+        let scroll =
+            |emu: &mut TerminalEmulator, action| emu.interpret_input(EmulatorInput::User(action));
+        let redraw = Some(EmulatorAction::RequestRedraw);
+
+        assert_eq!(
+            scroll(&mut emu, UserInputAction::RequestScrollToBottom),
+            None
+        );
+        assert_eq!(
+            scroll(&mut emu, UserInputAction::RequestScrollLineUp),
+            redraw
+        );
+        assert_eq!(
+            scroll(&mut emu, UserInputAction::RequestScrollPageUp),
+            redraw
+        );
+        assert_eq!(
+            scroll(&mut emu, UserInputAction::RequestScrollToTop),
+            redraw
+        );
+        assert_eq!(scroll(&mut emu, UserInputAction::RequestScrollToTop), None);
+        assert_eq!(
+            scroll(&mut emu, UserInputAction::RequestScrollPageDown),
+            redraw
+        );
+        assert_eq!(
+            scroll(&mut emu, UserInputAction::RequestScrollLineDown),
+            redraw
+        );
+        assert_eq!(
+            scroll(&mut emu, UserInputAction::RequestScrollToBottom),
+            redraw
+        );
+        assert_eq!(
+            scroll(&mut emu, UserInputAction::RequestScrollLineDown),
+            None
+        );
+    }
+
+    #[test]
+    fn zoom_scales_the_cells_and_refits_the_grid_to_the_window() {
+        let mut emu = create_test_emu_for_input();
+        let resize = EmulatorInput::Control(ControlEvent::Resize {
+            width_px: 800,
+            height_px: 480,
+        });
+        let before = emu.interpret_input(resize);
+        let cell = |emu: &mut TerminalEmulator| {
+            let snapshot = emu.get_render_snapshot().expect("snapshot");
+            (snapshot.cell_width_px, snapshot.cell_height_px)
+        };
+        let base = cell(&mut emu);
+
+        let zoomed = emu.interpret_input(EmulatorInput::User(UserInputAction::RequestZoomIn));
+        let (width, height) = cell(&mut emu);
+        assert!(width > base.0 && height > base.1, "zoom in grows the cell");
+        assert_eq!(
+            zoomed,
+            Some(EmulatorAction::ResizePty {
+                cols: (800 / width) as u16,
+                rows: (480 / height) as u16,
+            }),
+            "the grid refits the same window at the new size"
+        );
+
+        let reset = emu.interpret_input(EmulatorInput::User(UserInputAction::RequestZoomReset));
+        assert_eq!(cell(&mut emu), base);
+        assert_eq!(reset, before, "reset is the grid the window had before");
+    }
+
+    #[test]
+    fn zoom_stops_at_its_limits() {
+        let mut emu = create_test_emu_for_input();
+        let zoom_out = || EmulatorInput::User(UserInputAction::RequestZoomOut);
+        let steps = std::iter::repeat_with(|| emu.interpret_input(zoom_out()))
+            .take(100)
+            .take_while(Option::is_some)
+            .count();
+        assert!(steps < 100, "zooming out stops changing the cell size");
+        assert_eq!(emu.interpret_input(zoom_out()), None);
     }
 
     #[test]

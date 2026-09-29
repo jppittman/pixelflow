@@ -168,14 +168,14 @@ impl TerminalEmulator {
                 // Delegate to control event handler
                 input_handler::process_control_event(self, event)
             }
-            EmulatorInput::RawChar(ch) => {
-                // Reset viewport to live screen when receiving PTY output
-                self.viewport_offset = 0;
-                // Delegate to raw character processor
-                self.print_char(ch);
-                None
-            }
         }
+    }
+
+    /// Prints a run of PTY text.
+    pub fn print_text(&mut self, run: &str) {
+        // Reset viewport to live screen when receiving PTY output
+        self.viewport_offset = 0;
+        self.print_str(run);
     }
 
     /// Creates a fresh snapshot of the terminal's current visible state.
@@ -313,6 +313,17 @@ impl TerminalEmulator {
         })
     }
 
+    /// The cell under a point in the window, in logical points. The cell size
+    /// is the emulator's — zoom changes it — so hit-testing asks here.
+    #[must_use]
+    pub fn cell_at(&self, x_px: u32, y_px: u32) -> (usize, usize) {
+        let cell_px = |size: usize| u32::try_from(size.max(1)).unwrap_or(u32::MAX);
+        (
+            (x_px / cell_px(self.layout.cell_width_px)) as usize,
+            (y_px / cell_px(self.layout.cell_height_px)) as usize,
+        )
+    }
+
     // --- Scrollback Navigation Methods ---
 
     /// Scroll the viewport by the given number of lines.
@@ -322,14 +333,16 @@ impl TerminalEmulator {
         let old_offset = self.viewport_offset;
         let max_offset = self.screen.scrollback.len();
 
-        if lines > 0 {
+        let distance = lines.unsigned_abs() as usize;
+        self.viewport_offset = match lines > 0 {
             // Scroll up into history
-            self.viewport_offset = (self.viewport_offset + lines as usize).min(max_offset);
-        } else if lines < 0 {
+            true => self
+                .viewport_offset
+                .saturating_add(distance)
+                .min(max_offset),
             // Scroll down toward live screen
-            let abs_lines = (-lines) as usize;
-            self.viewport_offset = self.viewport_offset.saturating_sub(abs_lines);
-        }
+            false => self.viewport_offset.saturating_sub(distance),
+        };
 
         // Mark all lines dirty if viewport changed
         if self.viewport_offset != old_offset {
@@ -442,22 +455,5 @@ impl TerminalEmulator {
     #[must_use]
     pub fn reports_button_motion(&self) -> bool {
         self.dec_modes.mouse_button_event_mode || self.dec_modes.mouse_any_event_mode
-    }
-
-    pub fn paste_text(&mut self, text: String) {
-        if self.dec_modes.bracketed_paste_mode {
-            log::warn!("TerminalEmulator::paste_text called with bracketed paste mode ON. This mode should be handled by the caller (input_handler) by wrapping the text and sending it as WritePty. Processing char by char as fallback.");
-            for ch in text.chars() {
-                self.print_char(ch);
-            }
-        } else {
-            log::debug!(
-                "TerminalEmulator::paste_text - Bracketed Paste Mode OFF. Processing {} chars.",
-                text.len()
-            );
-            for ch in text.chars() {
-                self.print_char(ch);
-            }
-        }
     }
 }

@@ -1,9 +1,22 @@
-use core_term::ansi::{AnsiParser, AnsiProcessor};
+use core_term::ansi::{AnsiCommand, AnsiParser, AnsiProcessor, AnsiSink};
 use core_term::io::pty::{NixPty, PtyConfig};
 use core_term::term::{EmulatorInput, TerminalEmulator};
 use std::io::{ErrorKind, Read};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Feeds a batch to the emulator the way the app does.
+struct Emulator<'a>(&'a mut TerminalEmulator);
+
+impl AnsiSink for Emulator<'_> {
+    fn text(&mut self, run: &str) {
+        self.0.print_text(run);
+    }
+
+    fn command(&mut self, command: AnsiCommand) {
+        drop(self.0.interpret_input(EmulatorInput::Ansi(command)));
+    }
+}
 
 #[test]
 fn clear_command_emits_an_erase_sequence_when_parent_term_is_dumb() {
@@ -16,6 +29,7 @@ fn clear_command_emits_an_erase_sequence_when_parent_term_is_dumb() {
         args: &[],
         initial_cols: 80,
         initial_rows: 24,
+        working_directory: None,
     };
     let mut pty =
         NixPty::spawn_with_config(&config).expect("failed to spawn clear in CoreTerm PTY");
@@ -45,9 +59,9 @@ fn clear_command_emits_an_erase_sequence_when_parent_term_is_dumb() {
 
     let mut parser = AnsiProcessor::new();
     let mut emulator = TerminalEmulator::new(80, 24);
-    for command in parser.process_bytes(b"visible text") {
-        drop(emulator.interpret_input(EmulatorInput::Ansi(command)));
-    }
+    parser
+        .process_bytes(b"visible text")
+        .drain_into(&mut Emulator(&mut emulator));
     assert_eq!(
         emulator
             .get_render_snapshot()
@@ -58,9 +72,9 @@ fn clear_command_emits_an_erase_sequence_when_parent_term_is_dumb() {
         'v'
     );
 
-    for command in parser.process_bytes(&output) {
-        drop(emulator.interpret_input(EmulatorInput::Ansi(command)));
-    }
+    parser
+        .process_bytes(&output)
+        .drain_into(&mut Emulator(&mut emulator));
     let snapshot = emulator
         .get_render_snapshot()
         .expect("clear did not produce a terminal snapshot");

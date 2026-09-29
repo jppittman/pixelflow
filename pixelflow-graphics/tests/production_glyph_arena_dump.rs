@@ -90,7 +90,7 @@ fn dump_production_glyph_arenas() {
                     shape: LatticeShape::new([tile_px as u32, tile_px as u32]),
                     origin: pixelflow_codegen::emit::origin(),
                 },
-                lanes: (pixelflow_codegen::JIT_VECTOR_BYTES / 4) as u32,
+                lanes: (pixelflow_codegen::jit_vector_bytes() / 4) as u32,
             };
             let (arena, root) = pixelflow_ir::passes::legalize(arena, root, &collapse)
                 .expect("legalize glyph arena");

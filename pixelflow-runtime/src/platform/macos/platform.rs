@@ -2,6 +2,7 @@ use crate::api::private::WindowId;
 use crate::display::messages::{DisplayControl, DisplayData, DisplayEvent, DisplayMgmt, Surface};
 use crate::display::ops::{DriverOut, PlatformOps};
 use crate::error::RuntimeError;
+use crate::input::Selection;
 use crate::platform::macos::cocoa::{self, event_type, NSApplication, NSPasteboard};
 use crate::platform::macos::events;
 use crate::platform::macos::sys;
@@ -76,7 +77,7 @@ impl PlatformOps for MetalOps {
         Ok(())
     }
 
-    fn handle_control(&mut self, msg: DisplayControl, _out: &mut DriverOut) -> HandlerResult {
+    fn handle_control(&mut self, msg: DisplayControl, out: &mut DriverOut) -> HandlerResult {
         match msg {
             DisplayControl::SetTitle { id, title } => {
                 if let Some(win) = self.windows.get_mut(&id) {
@@ -108,16 +109,30 @@ impl PlatformOps for MetalOps {
                     win.request_redraw();
                 }
             }
-            DisplayControl::Bell => {
-                // NSBeep()
-            }
-            DisplayControl::Copy { text } => {
+            DisplayControl::Bell => cocoa::beep(),
+            DisplayControl::Copy {
+                selection: Selection::Clipboard,
+                text,
+            } => {
                 let pb = NSPasteboard::general();
                 pb.clear_contents();
                 pb.set_string(&text);
             }
-            DisplayControl::RequestPaste => {
-                // Implementation pending
+            // No primary selection on macOS; highlighting must not clobber the
+            // pasteboard.
+            DisplayControl::Copy {
+                selection: Selection::Primary,
+                ..
+            } => {}
+            DisplayControl::ToggleFullscreen { id } => {
+                if let Some(win) = self.windows.get_mut(&id) {
+                    win.toggle_fullscreen();
+                }
+            }
+            // macOS has no primary selection; both read the pasteboard.
+            DisplayControl::RequestPaste { selection } => {
+                let text = NSPasteboard::general().string().unwrap_or_default();
+                out.event(DisplayEvent::PasteData { selection, text });
             }
         }
         Ok(())

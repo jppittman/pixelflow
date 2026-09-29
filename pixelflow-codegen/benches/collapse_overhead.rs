@@ -21,8 +21,8 @@ use pixelflow_ir::arena::ExprArena;
 use pixelflow_ir::{LatticeShape, OpKind};
 
 /// A 256×64 plane — the height a full-frame collapse measured before, and a
-/// width that divides every lane width this build might select (16, 32 or
-/// 64), so this shape's story does not change with `JIT_VECTOR_BYTES`.
+/// width that divides every vector width the host might select (16, 32 or
+/// 64 bytes), so this shape's story does not change with `jit_vector_bytes()`.
 const WIDTH: usize = 256;
 const HEIGHT: usize = 64;
 
