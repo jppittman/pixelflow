@@ -1,5 +1,5 @@
 //! Coverage of an outline as a [`Kernel`]: **the exact area of the pixel
-//! under ink**, written as a formula and closed by the compiler.
+//! under ink**, written in closed form.
 //!
 //! ## The formula
 //!
@@ -7,48 +7,50 @@
 //! on neither axis. Its coverage at the pixel about the sample `s` is
 //!
 //! ```text
-//! F(s)     = Σ_p σ_p · area(χ_p)(s)          the pixel's signed area under ink
+//! F(s)     = Σ_p σ_p · A_p(s)          the pixel's signed area under ink
 //! coverage = min(|F|, 1)
 //! ```
 //!
-//! `χ_p` is the indicator of the region left of piece `p` within the piece's
-//! own band of rows, and `σ_p` the direction it runs, `+1` toward `+Y`. The
-//! sum is the winding number integrated over the pixel — Green's theorem,
-//! one piece at a time — so a pixel deep inside reads `1`, one outside `0`,
-//! and one on an edge the fraction of it the ink covers: the area, not a
-//! ramp on a distance. Where contours overlap, `|F|` reaches 2 and the clamp
-//! folds it, which is FreeType's approximation and accepted as such: a pixel
-//! where two edges of two overlapping contours cross reads the overlap of
-//! two fractions as one.
+//! `A_p` is the area of the pixel left of piece `p` within the piece's own
+//! band of rows, and `σ_p` the direction it runs, `+1` toward `+Y`. The sum
+//! is the winding number integrated over the pixel — Green's theorem, one
+//! piece at a time — so a pixel deep inside reads `1`, one outside `0`, and
+//! one on an edge the fraction of it the ink covers: the area, not a ramp on
+//! a distance. Where contours overlap, `|F|` reaches 2 and the clamp folds
+//! it, which is FreeType's approximation and accepted as such: a pixel where
+//! two edges of two overlapping contours cross reads the overlap of two
+//! fractions as one.
 //!
-//! ## The author writes the integrand; the e-graph integrates
+//! ## Each term is written as its closed form
 //!
-//! Nothing here computes an area. Each piece's term is written as the thing
-//! it means (docs/plans/2026-09-23-a-glyph-is-a-formula.md,
-//! docs/plans/2026-09-23-an-integral-is-a-fold.md): the arc as a graph over
-//! `y` through its own parameter,
+//! `A_p` is a polynomial in the arc's own parameter, read between four
+//! square roots: where the arc enters and leaves the pixel's rows, and
+//! where it reaches the pixel's left and right edges
+//! (`RisingArc::pixel_area`, which carries the derivation). It is the
+//! trapezoid-and-cover accumulation of FreeType and font-rs, per pixel and
+//! exact on a curve. A line is the arc whose bend is zero, so every piece
+//! has the same term, and a glyph is **one fold with one body** over a table
+//! of rows.
 //!
-//! ```text
-//! T(y) = τ(y − y₀)                          the parameter at which the arc reaches y
-//! χ    = [0 ≤ T] · [T < 1] · [x < x₀ + T·(2β + α·T)]
-//! term = σ · area(χ).at(X, S·Y)
-//! ```
+//! The term is written, not derived. It used to be written as the integral
+//! it is — `σ·area(χ).at(X, S·Y)`, `χ` the region left of the arc — and
+//! closed by e-graph rules, which made a glyph's correctness a property of
+//! the saturation budget. Under the flat class cap the rules stopped
+//! closing past a few dozen integrals in one graph, and the one-point
+//! quadrature legalized in their place point-sampled every edge it
+//! reached, with coverage still in range and ink still where it was: a
+//! 94-glyph run read up to 0.43 off before its folds shared one body
+//! (docs/results/2026-09-23-glyph-is-a-formula.md, §3). A closed form has
+//! no such dependence: whatever saturation does or does not reach, it
+//! rewrites an area into an equal area. No interval fold is in a glyph's
+//! arena (`tests/glyph_is_closed.rs`).
 //!
-//! and saturation does the calculus. `FactorFold` takes the band out of the
-//! inner integral, `NarrowInterval` closes that to a clamp — Green's step —
-//! and `ArcMoment` closes the outer one: the substitution `y = y(t)` and a
-//! cubic moment. A line is the arc whose bend is zero, so every piece has
-//! the same integrand, and a glyph is **one fold with one body** over a
-//! table of rows. Whatever the rules leave unclosed would be legalized by
-//! one-point quadrature before it reached the emitter; for a glyph nothing
-//! is (`tests/glyph_is_closed.rs`).
-//!
-//! `τ` is [`pixelflow_ir::integral::monotone_root`], the one definition the
-//! rule reads back. Each control-polygon step is floored at `0` in the
-//! kernel — the certificate that makes the arc rise for *any* number a table
-//! holds, so the rule is an identity rather than a condition on data the
-//! e-graph cannot see. The host's split (`MonotoneQuad`, in
-//! `fonts/monotone.rs`) is what makes the certified arc the glyph's arc.
+//! `τ` is [`pixelflow_ir::integral::monotone_root`], the one definition.
+//! Each control-polygon step is floored at `0` in the kernel — the
+//! certificate that makes the arc rise for *any* number a table holds, so
+//! the closed form's case analysis holds whatever the row. The host's split
+//! (`MonotoneQuad`, in `fonts/monotone.rs`) is what makes the certified arc
+//! the glyph's arc.
 //!
 //! ## The host orients every piece
 //!
@@ -85,8 +87,11 @@
 use super::monotone::MonotoneQuad;
 use super::outline::{Outline, Point, Segment};
 use pixelflow_core::{BoundManifold, DiscreteManifold, Kernel, Lattice, Manifold, Monoid, Uniform};
-use pixelflow_ir::integral::{self, Rise, RootFloor, ROOT_FLOOR};
-use pixelflow_ir::ExprArena;
+use pixelflow_ir::arena::BufferIdentity;
+use pixelflow_ir::integral::{self, RootFloor, ROOT_FLOOR};
+use pixelflow_ir::{library, ExprArena, ExprId, OpKind};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// How far coverage can reach past the outline, in the frame the kernel is
 /// built in. The pixel is a unit square about the sample, so half a unit is
@@ -112,9 +117,16 @@ pub const COVERAGE_SNAP: f32 = 1.0 / 1024.0;
 /// rounding.
 const ZERO_LENGTH: f64 = 1e-6;
 
-/// The pixel's half-height: a term is zero wherever the pixel's rows miss
-/// the piece's band, so the band is dilated by this before it is stored.
-const PIXEL_HALF: f64 = 0.5;
+/// Half the pixel's side: the pixel about `(X, Y)` is
+/// `[X − ½, X + ½) × [Y − ½, Y + ½)`. A term is zero wherever the pixel's
+/// rows miss the piece's band, so the band is dilated by this before it is
+/// stored.
+const PIXEL_HALF: f32 = 0.5;
+
+/// `⅓`, rounded once: the closed form's cubic coefficient is a product by
+/// it, never a quotient by `3` (see [`RisingArc::pixel_area`], "Floating
+/// point").
+const ONE_THIRD: f32 = 1.0 / 3.0;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // The glyph, and the box outside which it is exactly zero
@@ -331,11 +343,12 @@ pub fn glyph(outline: &Outline) -> Glyph {
 ///
 /// **One body, not one per outline.** Where an outline's rows start is its
 /// fold's range, not an offset inside the body, so every outline's fold
-/// reads `table[i]` through the same body and the e-graph closes the run's
-/// integrals once. With the offset in the body each outline was an integral
-/// of its own, and past about thirty characters the closing phase ran into
-/// the saturation's class cap and left the rest to one-point quadrature —
-/// point-sampled, aliased glyphs (`tests/glyph_is_closed.rs`).
+/// reads `table[i]` through the same body, and the e-graph holds that body
+/// once however long the run is. With the offset in the body each outline's
+/// term was a body of its own — and while a term was an integral the rules
+/// closed, past about thirty characters the closing phase ran into the
+/// saturation's class cap and left the rest to one-point quadrature:
+/// point-sampled, aliased glyphs.
 ///
 /// [`glyph`] is this at one outline.
 #[must_use]
@@ -499,13 +512,6 @@ fn constant(v: f32) -> Kernel {
     Kernel::constant(v)
 }
 
-/// `[mask]`: `1` where the mask holds, else `0` — the one place a mask
-/// becomes a number. A mask is a bit pattern, not a number (CLAUDE.md,
-/// "Floating point at the edges"), so it is never multiplied: it selects.
-fn indicator(mask: &Kernel) -> Kernel {
-    mask.select(&constant(1.0), &constant(0.0))
-}
-
 /// **The signed area of the pixel under ink**: the winding number
 /// integrated over the pixel, summed from every piece's term.
 ///
@@ -593,59 +599,276 @@ fn row_at<'a>(table: &'a Kernel, i: &'a Kernel) -> impl Fn(usize) -> Kernel + 'a
     move |k| table.at(&Kernel::constant(k as f32), i)
 }
 
-/// `τ(δ)`, the parameter at which a certified rise reaches `δ` —
-/// [`integral::monotone_root`], the one definition, which the rule that
-/// closes the integral reads back. It is written over an arena, so the
-/// operands are spliced into one and the root read out as a kernel.
-fn monotone_root(delta: &Kernel, step: &Kernel, bend: &Kernel) -> Kernel {
-    fn graft(arena: &mut ExprArena, k: &Kernel) -> pixelflow_ir::ExprId {
-        let (from, root) = k.parts();
-        arena.splice(from, root)
-    }
-    let mut arena = ExprArena::new();
-    let delta = graft(&mut arena, delta);
-    let rise = Rise {
-        step: graft(&mut arena, step),
-        bend: graft(&mut arena, bend),
-    };
-    let floor =
-        RootFloor::new(ROOT_FLOOR).expect("ROOT_FLOOR is the largest floor RootFloor admits");
-    let root = integral::monotone_root(&mut arena, delta, rise, floor);
-    Kernel::from_parts(arena, root)
+/// A term built node by node in one arena, from kernels grafted into it,
+/// carrying the tabulations those kernels carry — so the finished kernel
+/// binds what they bound, as a composition of kernel values would.
+///
+/// A piece's term is built here and not through [`Kernel`]'s methods
+/// because each of those copies its operands' whole graph, so a term built
+/// a method at a time costs the square of its size. The closed form is
+/// about 150 nodes: built by methods, the printable ASCII glyphs at 16 px
+/// took 260–320 ms to build (release, before compiling any), and 50–55 ms
+/// built here — against 70–110 ms for the integral they replace.
+#[derive(Default)]
+struct Grafted {
+    arena: ExprArena,
+    tables: BTreeMap<BufferIdentity, Arc<[f32]>>,
 }
 
-/// **One piece's term**: `σ·area(χ).at(X, S·Y)` where the pixel's rows reach
-/// the piece, `0` where they do not.
+impl Grafted {
+    /// `kernel` spliced into the arena.
+    fn graft(&mut self, kernel: &Kernel) -> ExprId {
+        for (id, data) in kernel.buffer_data() {
+            self.tables.insert(id, Arc::clone(data));
+        }
+        let (from, root) = kernel.parts();
+        self.arena.splice(from, root)
+    }
+
+    /// The kernel rooted at `root`.
+    fn finish(self, root: ExprId) -> Kernel {
+        let kernel = Kernel::from_parts(self.arena, root);
+        self.tables.into_iter().fold(kernel, |kernel, (id, data)| {
+            kernel.with_buffer_data(id, data)
+        })
+    }
+}
+
+/// One coordinate of a piece's arc, measured from its start:
+/// `q(t) = t·(2·step + bend·t)` for `t ∈ [0, 1]`, with `step = p₁ − p₀` and
+/// `bend = (p₂ − p₁) − step` along that axis.
 ///
-/// `χ` is the region left of the arc within its band: the arc reaches
-/// height `y` at `T = τ(y − y₀)`, lies in the band where `0 ≤ T < 1`, and
-/// sits at `x₀ + T·(2β + α·T)` there — `β` the first step and `α` the bend,
-/// in `x`, as `b` and `a` are in `y`. Every step is floored at `0`, the
-/// certificate that makes both coordinates rise whatever the row holds (the
-/// module docs).
+/// **Certified to rise.** Both control-polygon steps are floored at `0`
+/// ([`Rise::certified`]), so `q′(t) = 2·((1 − t)·step + t·(step + bend))`
+/// is never negative, whatever number a row holds. The closed form's case
+/// analysis stands on that — the arc crosses each row and each column of
+/// the pixel at most once — and the host's orientation
+/// ([`Piece::oriented`]) is what makes the certified arc the glyph's arc:
+/// for a real row the floor moves nothing.
+#[derive(Clone, Copy)]
+struct Rise {
+    step: ExprId,
+    bend: ExprId,
+}
+
+impl Rise {
+    /// The rise whose control-polygon steps are `first` and `second`, each
+    /// floored at `0`.
+    fn certified(arena: &mut ExprArena, [first, second]: [ExprId; 2]) -> Self {
+        let zero = arena.push_const(0.0);
+        let step = arena.push_binary(OpKind::Max, first, zero);
+        let second = arena.push_binary(OpKind::Max, second, zero);
+        let bend = arena.push_binary(OpKind::Sub, second, step);
+        Self { step, bend }
+    }
+
+    /// `2·step + bend·s`: the factor [`Rise::at`] and [`Rise::climb`] share.
+    fn slope_through(self, arena: &mut ExprArena, s: ExprId) -> ExprId {
+        let twice = arena.push_binary(OpKind::Add, self.step, self.step);
+        let bent = arena.push_binary(OpKind::Mul, self.bend, s);
+        arena.push_binary(OpKind::Add, twice, bent)
+    }
+
+    /// `q(t)`.
+    fn at(self, arena: &mut ExprArena, t: ExprId) -> ExprId {
+        let slope = self.slope_through(arena, t);
+        arena.push_binary(OpKind::Mul, t, slope)
+    }
+
+    /// `Δ(s, t) = q(t) − q(s) = (t − s)·(2·step + bend·(s + t))`: how far
+    /// the rise climbs from `s` to `t`, as one product, so an empty span is
+    /// exactly `0`.
+    fn climb(self, arena: &mut ExprArena, [s, t]: [ExprId; 2]) -> ExprId {
+        let width = arena.push_binary(OpKind::Sub, t, s);
+        let span = arena.push_binary(OpKind::Add, s, t);
+        let slope = self.slope_through(arena, span);
+        arena.push_binary(OpKind::Mul, width, slope)
+    }
+
+    /// `clamp(τ(δ), lo, hi)`: where the rise reaches `δ`, held to
+    /// `[lo, hi]` — `τ` being [`integral::monotone_root`], the one
+    /// definition.
+    fn reaches(self, arena: &mut ExprArena, delta: ExprId, bounds: [ExprId; 2]) -> ExprId {
+        let rise = integral::Rise {
+            step: self.step,
+            bend: self.bend,
+        };
+        let floor =
+            RootFloor::new(ROOT_FLOOR).expect("ROOT_FLOOR is the largest floor RootFloor admits");
+        let root = integral::monotone_root(arena, delta, rise, floor);
+        library::clamp(arena, root, bounds)
+    }
+}
+
+/// One piece's arc as the kernel reads it: from `(x₀, y₀)`, rising in both
+/// coordinates.
+struct RisingArc {
+    x0: ExprId,
+    y0: ExprId,
+    x: Rise,
+    y: Rise,
+}
+
+impl RisingArc {
+    /// **The area of the pixel about `(x, y)` left of the arc, within the
+    /// arc's band of rows**, in closed form.
+    ///
+    /// ## Derivation
+    ///
+    /// The arc is `x(t) = x₀ + q_x(t)`, `y(t) = y₀ + q_y(t)` for
+    /// `t ∈ [0, 1]`, both rising ([`Rise`]). The pixel is
+    /// `[L, L + 1) × [y − ½, y + ½)`, `L = x − ½`. Each of its rows the arc
+    /// crosses is ink from `L` to the arc, `clamp(x_arc − L, 0, 1)` of the
+    /// row, and a row the arc does not cross holds none of this piece's
+    /// ink. So the area is an integral over the rows the pixel and the band
+    /// share, and with `v = y(t)`, `dv = y′(t)·dt` it runs along the arc:
+    ///
+    /// ```text
+    /// A = ∫_{t₀}^{t₁} clamp(x(t) − L, 0, 1)·y′(t) dt
+    ///
+    /// t₀ = clamp(τ_y(y − ½ − y₀), 0, 1)      t₁ = clamp(τ_y(y + ½ − y₀), 0, 1)
+    /// ```
+    ///
+    /// `τ` is a rise's inverse ([`integral::monotone_root`]), so `t₀` and
+    /// `t₁` are where the arc enters and leaves the pixel's rows, held to
+    /// the arc. `x` rises, so the clamp is `0` until the arc reaches the
+    /// pixel's left edge, `1` once it has passed the right one, and
+    /// `x(t) − L` between — three pieces:
+    ///
+    /// ```text
+    /// t_L = clamp(τ_x(L − x₀), t₀, t₁)      t_R = clamp(τ_x(L + 1 − x₀), t₀, t₁)
+    ///
+    /// A = ∫_{t_R}^{t₁} y′(t) dt + ∫_{t_L}^{t_R} (x(t) − L)·y′(t) dt
+    ///   = Δ_y(t_R, t₁)          + F(t_R) − F(t_L)
+    /// ```
+    ///
+    /// `Δ_y(s, t) = q_y(t) − q_y(s)` is the rows the arc climbs from `s` to
+    /// `t`: the first term is the rows where the arc is right of the pixel,
+    /// wholly inked. `F` is an antiderivative of `(x(t) − L)·y′(t)`, a
+    /// quartic, and `F(t_R) − F(t_L)` is not evaluated as two values and
+    /// their difference — each is the size of the arc's whole moment about
+    /// `L`, which its extent sets, while the difference is at most a
+    /// pixel — but as what it is, the area left of the sub-arc from `t_L`
+    /// to `t_R` over the rows it climbs: its chord's trapezoid, plus the
+    /// region between the sub-arc and its chord, which for a quadratic
+    /// depends on nothing but the span `w = t_R − t_L`, its second
+    /// derivative being the same everywhere:
+    ///
+    /// ```text
+    /// F(t_R) − F(t_L) = ½·(x̂(t_L) + x̂(t_R))·Δ_y(t_L, t_R) + K·w³
+    ///
+    /// x̂(t) = x(t) − L = q_x(t) − (L − x₀)      K = (β·a − b·α)/3
+    /// ```
+    ///
+    /// with `b`, `a` the `y` rise's step and bend and `β`, `α` the `x`
+    /// rise's. Expanded in `w` about `t_L`, the two sides agree in `w`, `w²`
+    /// and `w⁴`; in `w³` they differ by `(x′(t_L)·a − α·y′(t_L))/6`, which
+    /// is `2·(β·a − b·α)/6` wherever `t_L` is.
+    ///
+    /// No case needs an arm of its own. An arc left of the pixel has
+    /// `t_L = t_R = t₁`, one right of it `t_L = t_R = t₀`, and a band that
+    /// misses the pixel's rows `t₀ = t₁`; a horizontal arc (`b = a = 0`)
+    /// climbs nothing, and a vertical one (`β = α = 0`) divides by the
+    /// root's floor and saturates to `t₀` or `t₁`. Each lands on the
+    /// formula through a clamp, and where its area is `0` it is exactly `0`:
+    /// every term is then a product with an empty span's `t − s`.
+    ///
+    /// ## Floating point
+    ///
+    /// - `x − x₀` and `y − y₀` are taken before the pixel's `±½`, so where
+    ///   the pixel is relative to the arc is a difference of the two
+    ///   coordinates, exact when they are close, rather than a rounded edge
+    ///   less a coordinate.
+    /// - The only quotients are the roots', `δ·(1/d)` with `d` floored at a
+    ///   positive literal ([`integral::monotone_root`], "Emitted as
+    ///   `δ·(1/d)`"): never a `Recip` estimate, whatever the algebra proves
+    ///   about `d`. `⅓` and `½` are products by literals.
+    /// - The parameters resolve to about `2⁻²⁴`, and a parameter moved by
+    ///   `ε` moves a height by at most `ε·y′`: the error grows with the
+    ///   arc's extent, and a pixel wholly inside a region sums to `1` only
+    ///   to a few ulps ([`COVERAGE_SNAP`]). Measured within
+    ///   `2⁻²²·(1 + |X| + |Y| + 2·extent)` per texel of a glyph
+    ///   (`tests/glyph_exact_area.rs`, `tests/glyph_area_edge_cases.rs`),
+    ///   and within `2⁻²⁰·(1 + extent)` arc by arc (this module's
+    ///   `adversarial` tests, which use a quarter of it).
+    fn pixel_area(&self, arena: &mut ExprArena, [x, y]: [ExprId; 2]) -> ExprId {
+        let zero = arena.push_const(0.0);
+        let one = arena.push_const(1.0);
+        let half = arena.push_const(PIXEL_HALF);
+        let across = arena.push_binary(OpKind::Sub, x, self.x0);
+        let up = arena.push_binary(OpKind::Sub, y, self.y0);
+        // `L − x₀` and `L + 1 − x₀`: the pixel's left and right edges, and
+        // its lowest and highest rows, measured from the arc's start.
+        let left = arena.push_binary(OpKind::Sub, across, half);
+        let right = arena.push_binary(OpKind::Add, across, half);
+        let lowest = arena.push_binary(OpKind::Sub, up, half);
+        let highest = arena.push_binary(OpKind::Add, up, half);
+
+        let t0 = self.y.reaches(arena, lowest, [zero, one]);
+        let t1 = self.y.reaches(arena, highest, [zero, one]);
+        let t_left = self.x.reaches(arena, left, [t0, t1]);
+        let t_right = self.x.reaches(arena, right, [t0, t1]);
+
+        let right_of_the_pixel = self.y.climb(arena, [t_right, t1]);
+
+        let x_left = self.x.at(arena, t_left);
+        let x_left = arena.push_binary(OpKind::Sub, x_left, left);
+        let x_right = self.x.at(arena, t_right);
+        let x_right = arena.push_binary(OpKind::Sub, x_right, left);
+        let ends = arena.push_binary(OpKind::Add, x_left, x_right);
+        let mean = arena.push_binary(OpKind::Mul, half, ends);
+        let rise = self.y.climb(arena, [t_left, t_right]);
+        let trapezoid = arena.push_binary(OpKind::Mul, mean, rise);
+
+        let x_over_y = arena.push_binary(OpKind::Mul, self.x.step, self.y.bend);
+        let y_over_x = arena.push_binary(OpKind::Mul, self.y.step, self.x.bend);
+        let twist = arena.push_binary(OpKind::Sub, x_over_y, y_over_x);
+        let third = arena.push_const(ONE_THIRD);
+        let k = arena.push_binary(OpKind::Mul, third, twist);
+        let w = arena.push_binary(OpKind::Sub, t_right, t_left);
+        let square = arena.push_binary(OpKind::Mul, w, w);
+        let cube = arena.push_binary(OpKind::Mul, square, w);
+        let bow = arena.push_binary(OpKind::Mul, k, cube);
+
+        let between = arena.push_binary(OpKind::Add, trapezoid, bow);
+        arena.push_binary(OpKind::Add, right_of_the_pixel, between)
+    }
+}
+
+/// **One piece's term**: `σ·A(X, S·Y)` where the pixel's rows reach the
+/// piece, `0` where they do not — `A` the area of the pixel left of the arc
+/// within its band ([`RisingArc::pixel_area`]).
 ///
-/// `area` is taken before the reflection, so the integrals' variables keep
-/// the literal coefficient `1` the rules read; the pixel is symmetric, so
-/// `area(χ).at(X, S·Y)` is the pixel about `(X, Y)` either way.
+/// The arc is read reflected, at `S·Y`; the pixel is symmetric, so the
+/// pixel about `(X, S·Y)` in the reflected frame is the pixel about
+/// `(X, Y)` on the screen.
 ///
 /// The cut to the rows is an identity — outside them the term is exactly
 /// `0` — and its mask depends on the row and the piece alone, uniform over
 /// a batch: an `If` a guard may lower to a jump over the whole body.
 fn piece_term(c: Coeff) -> Kernel {
-    let (zero, one) = (constant(0.0), constant(1.0));
-    let certified = |step: usize| c(step).max(&zero);
-    let (b, bx) = (certified(COL_E0Y), certified(COL_E0X));
-    let (a, ax) = (certified(COL_E1Y).sub(&b), certified(COL_E1X).sub(&bx));
-    let t = monotone_root(&Kernel::y().sub(&c(COL_Y0)), &b, &a);
-    let x_at_t = c(COL_X0).add(&t.mul(&bx.add(&bx).add(&ax.mul(&t))));
-    let left_of_the_arc = indicator(&zero.le(&t))
-        .mul(&indicator(&t.lt(&one)))
-        .mul(&indicator(&Kernel::x().lt(&x_at_t)));
-    let reflected = c(COL_S).mul(&Kernel::y());
-    let term = c(COL_SIGMA).mul(&left_of_the_arc.area().at(&Kernel::x(), &reflected));
-    let y = Kernel::y();
-    let reaches = y.gt(&c(COL_ROWS_LO)).and(&y.lt(&c(COL_ROWS_HI)));
-    reaches.select(&term, &zero)
+    let mut term = Grafted::default();
+    let row: [ExprId; PIECE_ROW_COLS] = core::array::from_fn(|k| term.graft(&c(k)));
+    let x = term.graft(&Kernel::x());
+    let y = term.graft(&Kernel::y());
+    let arena = &mut term.arena;
+
+    let arc = RisingArc {
+        x0: row[COL_X0],
+        y0: row[COL_Y0],
+        x: Rise::certified(arena, [row[COL_E0X], row[COL_E1X]]),
+        y: Rise::certified(arena, [row[COL_E0Y], row[COL_E1Y]]),
+    };
+    let reflected = arena.push_binary(OpKind::Mul, row[COL_S], y);
+    let area = arc.pixel_area(arena, [x, reflected]);
+    let signed = arena.push_binary(OpKind::Mul, row[COL_SIGMA], area);
+
+    let above = arena.push_binary(OpKind::Gt, y, row[COL_ROWS_LO]);
+    let below = arena.push_binary(OpKind::Lt, y, row[COL_ROWS_HI]);
+    let reaches = arena.push_binary(OpKind::BitAnd, above, below);
+    let zero = arena.push_const(0.0);
+    let cut = arena.push_ternary(OpKind::If, reaches, signed, zero);
+    term.finish(cut)
 }
 
 /// `value` rounded to `f32` toward `−∞`.
@@ -681,8 +904,8 @@ fn piece_row(piece: Piece) -> [f32; PIECE_ROW_COLS] {
     row[COL_E1Y] = piece.second[1] as f32;
     row[COL_SIGMA] = piece.sigma as f32;
     row[COL_S] = piece.reflect as f32;
-    row[COL_ROWS_LO] = f32_down(piece.rows[0] - PIXEL_HALF);
-    row[COL_ROWS_HI] = f32_up(piece.rows[1] + PIXEL_HALF);
+    row[COL_ROWS_LO] = f32_down(piece.rows[0] - f64::from(PIXEL_HALF));
+    row[COL_ROWS_HI] = f32_up(piece.rows[1] + f64::from(PIXEL_HALF));
     debug_assert!(
         row.iter().all(|v| v.is_finite()),
         "a piece row holds a non-finite column: {row:?} from {piece:?}"
@@ -734,6 +957,12 @@ fn bucketed_trip_count(pieces: u32) -> u32 {
 fn padding_row() -> [f32; PIECE_ROW_COLS] {
     [0.0f32; PIECE_ROW_COLS]
 }
+
+#[cfg(test)]
+mod adversarial;
+
+#[cfg(test)]
+mod kernel_copy;
 
 #[cfg(test)]
 mod tests {

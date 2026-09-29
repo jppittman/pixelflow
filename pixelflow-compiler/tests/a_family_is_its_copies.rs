@@ -17,85 +17,24 @@
 //! binder's name alone. They are α-equivalent and compute the same pixels;
 //! the cost is one degenerate program compiled twice, never a value.
 //!
-//! The block below is §1.7's, as the plan writes it, with the iteration
-//! spelled as it was chosen (§4 Q2): it expands, bakes, keys and rebinds.
-//! What an iteration *means* is pinned against rustc in
-//! `rustc_is_the_oracle.rs`; the refusals are the parser's and `sema`'s
-//! unit tests.
+//! The block (`common/section_1_7.rs`) is §1.7's, as the plan writes it,
+//! with the iteration spelled as it was chosen (§4 Q2) and each piece's
+//! term its area in closed form: it expands, bakes, keys and rebinds. What
+//! an iteration *means* is pinned against rustc in `rustc_is_the_oracle.rs`;
+//! the refusals are the parser's and `sema`'s unit tests.
 
 use pixelflow_compiler::{kernel, kernel_raw};
 use pixelflow_core::{ArityMismatch, Kernel, Lattice, Manifold};
 use pixelflow_ir::key::canonical;
 use pixelflow_ir::{ExprArena, ExprId, ExprNode, Fold};
 
-/// §1.7's block, written once and expanded by both macros: `kernel!` below,
-/// and `kernel_raw!` in [`by_hand`], so that neither key compared is an
-/// optimizer's. Beside the glyph, the same program with its three pieces as
-/// three record parameters, summed by hand.
-macro_rules! section_1_7 {
-    ($expand:ident) => {
-        $expand! {
-            /// One oriented monotone arc piece.
-            pub struct Row {
-                pub x0: f32, pub e0x: f32, pub e1x: f32,
-                pub y0: f32, pub e0y: f32, pub e1y: f32,
-                pub sigma: f32, pub s: f32,
-                pub lo: f32, pub hi: f32,
-            }
-            pub struct Bounds { pub x0: f32, pub y0: f32, pub x1: f32, pub y1: f32 }
-
-            const PIXEL_CENTER: f32 = 0.5;
-            const COVERAGE_SNAP: f32 = 1.0 / 1024.0;
-            const NEARLY_ONE: f32 = 1.0 - COVERAGE_SNAP;
-
-            fn coverage(f: f32) -> f32 {
-                let c = f.abs().min(1.0);
-                if c >= NEARLY_ONE { 1.0 } else if c <= COVERAGE_SNAP { 0.0 } else { c }
-            }
-
-            fn indicator(m: bool) -> f32 { if m { 1.0 } else { 0.0 } }
-
-            /// χ: the region left of the arc, within its band.
-            fn left_of_the_arc(p: Row, x: f32, y: f32) -> f32 {
-                let b = p.e0y.max(0.0);
-                let bx = p.e0x.max(0.0);
-                let a = p.e1y.max(0.0) - b;
-                let ax = p.e1x.max(0.0) - bx;
-                let t = monotone_root(y - p.y0, b, a);
-                let x_at_t = p.x0 + t * (bx + bx + ax * t);
-                indicator(0.0 <= t) * indicator(t < 1.0) * indicator(x < x_at_t)
-            }
-
-            /// σ·∫∫χ over the pixel about (x, S·y), cut to the rows the piece
-            /// reaches.
-            fn piece_term(p: Row, x: f32, y: f32) -> f32 {
-                let term = p.sigma * area(|u, v| left_of_the_arc(p, x + u, p.s * y + v));
-                if (y > p.lo) & (y < p.hi) { term } else { 0.0 }
-            }
-
-            fn inside(b: Bounds, x: f32, y: f32) -> bool {
-                (x >= b.x0) & (x <= b.x1) & (y >= b.y0) & (y <= b.y1)
-            }
-
-            /// The glyph with N pieces. Texel (i, j) holds coverage at
-            /// (i+½, j+½). The pieces and the box are uniforms; N is the
-            /// program.
-            pub fn glyph<const N: usize>(pieces: [Row; N], bounds: Bounds) -> f32 {
-                let (x, y) = (X + PIXEL_CENTER, Y + PIXEL_CENTER);
-                let f: f32 = pieces.into_iter().map(|p| piece_term(p, x, y)).sum();
-                if inside(bounds, x, y) { coverage(f) } else { 0.0 }
-            }
-
-            /// The glyph at `N = 3`, its pieces three record parameters
-            /// summed by hand.
-            pub fn three_pieces(p0: Row, p1: Row, p2: Row, bounds: Bounds) -> f32 {
-                let (x, y) = (X + PIXEL_CENTER, Y + PIXEL_CENTER);
-                let f: f32 = piece_term(p0, x, y) + piece_term(p1, x, y) + piece_term(p2, x, y);
-                if inside(bounds, x, y) { coverage(f) } else { 0.0 }
-            }
-        }
-    };
-}
+// §1.7's block, written once and expanded by both macros: `kernel!` below,
+// and `kernel_raw!` in [`by_hand`], so that neither key compared is an
+// optimizer's. Beside the glyph, the same program with its three pieces as
+// three record parameters, summed by hand. The block is its own file
+// because `pixelflow-graphics` expands it too, to pin its `piece_term`
+// against the font's.
+include!("common/section_1_7.rs");
 
 section_1_7!(kernel);
 
@@ -246,8 +185,8 @@ fn the_glyph_bakes_at_zero_one_and_three_pieces() {
 /// A family is its copies: `glyph::<3>` is the program with three record
 /// parameters summed by hand, `piece_term(p0, x, y) + piece_term(p1, x, y) +
 /// piece_term(p2, x, y)` — one canonical key, and the same value in each
-/// uniform slot. It holds the six integrals of its three `area`s and no
-/// other fold: the family left no fold, binder or index behind.
+/// uniform slot. It holds no fold at all: each piece's area is written in
+/// closed form, and the family left no fold, binder or index behind.
 #[test]
 fn a_family_at_three_is_three_pieces_summed_by_hand() {
     let [p0, p1, p2] = square();
@@ -288,10 +227,9 @@ fn a_family_at_three_is_three_pieces_summed_by_hand() {
     assert_eq!(values(&family_form), values(&summed_form));
 
     let found = folds(family_arena, family_root);
-    assert_eq!(found.len(), 6, "two integrals per piece: {found:?}");
     assert!(
-        found.iter().all(|fold| matches!(fold, Fold::Interval(_))),
-        "an area's integrals, and no fold for the family: {found:?}"
+        found.is_empty(),
+        "no integral and no fold for the family: {found:?}"
     );
 
     let the_family_through_kernel_raw = by_hand::glyph::<3>(

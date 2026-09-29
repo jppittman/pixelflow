@@ -2,7 +2,7 @@
 //!
 //! `loop_blinn` computes each pixel's area under ink: the non-zero rule's
 //! winding number integrated over the pixel, one term per monotone arc,
-//! closed by the compiler. The oracle here is the winding number itself at
+//! each in closed form. The oracle here is the winding number itself at
 //! the pixel's centre — a horizontal ray cast in `f64`, intersecting each
 //! quadratic by solving its `y(t)` — written from scratch and sharing no
 //! code or constants with the kernel. Away from the outline the two must

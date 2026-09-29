@@ -4,15 +4,15 @@
 //! bake evaluates every reachable node per pixel). A glyph is **one fold
 //! over one coefficient table** — a `sum_over` of each piece's area term,
 //! one fixed body reading its numbers by column at the fold's binder — and
-//! the body is written as an integral the e-graph closes
-//! (`fonts/loop_blinn.rs`). So the two things worth pinning are that the
-//! built arena does not grow with the outline, and that the closed body the
-//! optimizer hands the emitter has a fixed budget per piece.
+//! the body is each piece's area in closed form (`fonts/loop_blinn.rs`). So
+//! the two things worth pinning are that the built arena does not grow with
+//! the outline, and that the body the optimizer hands the emitter has a
+//! fixed budget per piece.
 //!
 //! These tests count surviving operations through the runtime pipeline
 //! (`optimize_runtime_arena`, which saturates, extracts and resolves) — the
-//! exact stages `Lattice::bake` runs — so a regression in closure, CSE or
-//! extraction shows up as a hard number, not a benchmark whisper.
+//! exact stages `Lattice::bake` runs — so a regression in CSE or extraction
+//! shows up as a hard number, not a benchmark whisper.
 
 use pixelflow_graphics::fonts::{loop_blinn, Contour, Font, Outline, Segment};
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
@@ -58,9 +58,8 @@ fn total_reachable(arena: &ExprArena, root: ExprId) -> usize {
 /// # Panics
 ///
 /// When the runtime tier declines the glyph. That used to fall back to the
-/// arena as written — which is exactly what a bake would compile then, a
-/// glyph whose integrals are left to one-point quadrature, so a fallback
-/// here measured the failure and passed.
+/// arena as written — which is exactly what a bake would compile then, so a
+/// fallback here measured the unoptimized glyph and passed.
 fn bake_pipeline(arena: &ExprArena, root: ExprId, shape: [u32; 2]) -> (ExprArena, ExprId) {
     let optimized = pixelflow_search::runtime::optimize_runtime_arena(
         arena,
@@ -109,9 +108,9 @@ fn regular_polygon(n: usize) -> Outline {
 }
 
 /// The closed body's square roots: one per root of the arc's rise the
-/// closed form evaluates — where the pixel's band starts and ends on the
-/// arc, and where the arc enters and leaves the pixel's column
-/// (`pixelflow_ir::IntervalFold::arc_moment`).
+/// closed form evaluates — where the arc enters and leaves the pixel's
+/// rows, and where it reaches the pixel's left and right edges
+/// (`fonts/loop_blinn.rs`, `RisingArc::pixel_area`).
 const SQRT_PER_PIECE: usize = 4;
 
 /// **A glyph is one body, and the fold says how many times it runs.**
