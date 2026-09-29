@@ -97,8 +97,10 @@ template ──instantiate(structural values)──▶ program ──P(·, s, t)
 - **One parser:** `pixelflow-compiler`'s, run inside the macro. Nothing
   parses at runtime.
 - **One lowering.** It calls `pixelflow-ir`'s one set of definitions. There
-  is no second copy of `fract`, `hypot`, `clamp` or the derivative encoding;
-  today `lower.rs:187-208` restates `kernel.rs:516`, `:587` and `:656`.
+  is no second copy of `fract`, `hypot`, `clamp` or the derivative encoding
+  (`pixelflow_ir::library`), of the binder's choice and rename
+  (`ExprArena::close_over`), of a range's bound (`RangeFold::admits`) or of
+  the pixel (`IntervalFold::pixel`). Until B5, `lower.rs` restated each.
 - **One pipeline:** `P`, owned by one-pipeline.
 - **Binding time decides where `P` runs, not a tier.**
   - A program whose structural parameters and shape are declared at build
@@ -186,7 +188,8 @@ a mask. F: probe p16 gives 5. After this plan it is a type error.
 - **Ranges are constant** (JP): `a` and `b` are expressions over literals and
   structural parameters.
 - **Binder slots** are assigned inside-out, the lowest slot free in the body,
-  as `bind_fresh` does (`kernel.rs:797-826`).
+  by `ExprArena::close_over`, which `Kernel::over` and `kernel!`'s lowering
+  both close a fold through (B5).
 - **Unrolling is the e-graph's** (`HalveFold`, `PeelFold`, `EmptyFold`;
   one-pipeline §1.4). The syntax never unrolls.
 - **A fold's body reads nothing indexed by its binder except the binder's own
@@ -446,7 +449,12 @@ and no digests are committed (one-pipeline §5, gate policy).
 - **B4.** `integral`, `area` and `monotone_root`. **Done** in `d9d759a4`,
   with review follow-ups in `68781e16`.
 - **B5.** Lowering calls `pixelflow-ir`'s definitions, and `lower.rs`'s
-  copies go.
+  copies go. **Done** (this commit): `library`'s `fract`, `hypot`, `clamp`
+  and `derivative`, written once over the sites a term is built in and
+  built through by `Kernel`'s methods, lowering and the integrals' closed
+  forms; `Axis`; `ExprArena::close_over` and `Placeholder`; the 2²⁴ bound
+  in `RangeFold` (docs/BACKLOG.md C8); `IntervalFold::pixel`. Keys and
+  bytes unchanged.
 - **B6.** Helpers as optimization units (D19): a helper's integral is closed
   once and instantiated.
   - Two units are closed, both through `ExprArena::splice_with`: a
@@ -561,6 +569,7 @@ Phase D proposes the edits.
 - **A second parser (F).** `pixelflow-pipeline/src/training/factored.rs:542`
   parses kernel code for `validate_corpus` (D17).
 - **A fold's index is exact only to 2²⁴ (F, B2).** It is an `f32` lane, and
-  `RangeFold` accepts any `u32` end, so a builder fold past 2²⁴ sums the
-  wrong terms without a word. `kernel!` refuses such a bound at lowering;
-  the refusal belongs in `RangeFold` (docs/BACKLOG.md, C8).
+  `RangeFold` accepted any `u32` end, so a builder fold past 2²⁴ summed the
+  wrong terms without a word, while `kernel!` refused such a bound at
+  lowering. B5 moved the refusal into `RangeFold` (`RangeFold::admits`),
+  which both front ends build through (docs/BACKLOG.md, C8).

@@ -26,7 +26,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::dag::{Builder, Id, Memo, Node};
-use crate::fold::{Binder, Fold};
+use crate::fold::{Binder, Fold, Placeholder};
 use crate::key::KernelKey;
 use crate::kind::OpKind;
 
@@ -102,6 +102,43 @@ fn dag_children(n: Node<'_, NodeData>) -> impl Iterator<Item = ExprId> + '_ {
 /// scalars they carried became [`UniformDecl`]s
 /// (docs/plans/2026-09-06-lattice-is-the-index.md).
 pub const COORD_AXES: usize = 2;
+
+/// One of the [`COORD_AXES`]: the `Var` a kernel reads a coordinate
+/// through, and the axis a derivative is taken along.
+///
+/// The one numbering of the axes: `Kernel::x`/`y` and `kernel!`'s `X`/`Y`
+/// read them by it, and a derivative names its axis by it
+/// ([`library::derivative`](crate::library::derivative)).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum Axis {
+    /// `Var(0)`: the column.
+    X = 0,
+    /// `Var(1)`: the row.
+    Y = 1,
+}
+
+impl Axis {
+    /// Every axis, in `Var` order: axis `i` is `ALL[i]`.
+    pub(crate) const ALL: [Self; COORD_AXES] = [Self::X, Self::Y];
+
+    /// The `Var` index this axis is read through.
+    #[must_use]
+    pub const fn var(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Why [`ExprArena::close_over`] built no fold.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unclosed<E> {
+    /// The body already binds every [`Binder`]: the fold would be one deeper
+    /// than the index space ([`Binder::COUNT`]).
+    IndexSpaceFull,
+    /// The fold built on the binder chosen was refused: its domain is not
+    /// one the IR admits.
+    Refused(E),
+}
 
 /// The `Var` indices Z and W had. Reserved, never reissued: a reduction
 /// binder taking one of them would make an arena written before the change
@@ -1474,6 +1511,81 @@ impl ExprArena {
         id_map[root.0 as usize].expect("splice: root was never copied")
     }
 
+    /// This arena's `body`, built against `placeholder`, closed into a fold:
+    /// `Reduce(fold_at(b), body[placeholder := Var(b)])`, as an arena of its
+    /// own.
+    ///
+    /// `b` is the lowest [`Binder`] no fold reachable from `body` binds. So
+    /// binders are chosen inside-out: a fold sees every inner fold's slot
+    /// and takes the next free one, and distinct live binders never share
+    /// an index. It is chosen here, after the body exists, because which
+    /// slots the body binds decides it — the reason a body is built against
+    /// a placeholder at all.
+    ///
+    /// The one definition of that rule and of the rename: `Kernel::over`,
+    /// `Kernel::area` and `kernel!`'s lowering each build a fold through it,
+    /// so a fold written in the syntax and the same fold built with the
+    /// builder are one program.
+    ///
+    /// The arena returned holds this arena's buffer and uniform tables, slot
+    /// for slot — every declaration, read or not, since a positional binding
+    /// supplies them in that order — then the binder's `Var`, then the body,
+    /// then the fold, and nothing else: what the placeholder read, and what
+    /// renaming it left behind, stay in this arena. The body is copied as a
+    /// `Kernel` copies a term, through its DAG, from the root and last child
+    /// first: the layout a `Kernel` has always given a fold, so that one
+    /// built through here moves no node of its arena (a copy first child
+    /// first moved a sum's operands, measured: one term, one key, a
+    /// different arena).
+    ///
+    /// # Errors
+    ///
+    /// [`Unclosed::IndexSpaceFull`] when the body binds every binder, and
+    /// [`Unclosed::Refused`] with `fold_at`'s refusal of the binder it was
+    /// offered.
+    pub fn close_over<E>(
+        &self,
+        body: ExprId,
+        placeholder: Placeholder,
+        fold_at: impl FnOnce(Binder) -> Result<Fold, E>,
+    ) -> Result<(ExprArena, ExprId), Unclosed<E>> {
+        let binder = self
+            .lowest_free_binder(body)
+            .ok_or(Unclosed::IndexSpaceFull)?;
+        let fold = fold_at(binder).map_err(Unclosed::Refused)?;
+
+        use crate::expr::{ExprBuilderExt, from_arena, substitute_vars, to_arena};
+        let (open, tables) = from_arena(self, body);
+        let mut closed = Builder::new();
+        let index = closed.push_var(binder.var());
+        let body = substitute_vars(&mut closed, open.entry(), &[(placeholder.var(), index)]);
+        let root = closed.push_reduce(fold, body);
+        let closed = closed.finish(&[root]);
+        Ok(to_arena(closed.entry(), &tables))
+    }
+
+    /// The lowest binder no `Reduce` reachable from `body` binds, or `None`
+    /// when every one is bound: [`ExprArena::close_over`]'s choice.
+    fn lowest_free_binder(&self, body: ExprId) -> Option<Binder> {
+        let mut bound = [false; Binder::COUNT];
+        let mut seen = vec![false; self.len()];
+        let mut stack = vec![body];
+        while let Some(id) = stack.pop() {
+            if core::mem::replace(&mut seen[id.0 as usize], true) {
+                continue;
+            }
+            // `ExprNode::Reduce`'s `Fold` is why this is one line. Read off
+            // a `Const` child it was a float, tested against `floorf` and a
+            // magic range, and asked again by every pass that wanted a
+            // binder.
+            if let ExprNode::Reduce { fold, .. } = self.node(id) {
+                bound[usize::from(fold.binder().slot())] = true;
+            }
+            stack.extend(self.children(id));
+        }
+        Binder::all().find(|binder| !bound[usize::from(binder.slot())])
+    }
+
     /// Rebuild the subgraph at `root`, replacing every `Var(i)` for which
     /// `subs` has an entry with the given (already existing) node — the
     /// generic contramap: a coordinate warp substitutes `Var(0..4)` with
@@ -2013,6 +2125,98 @@ mod tests {
     use super::*;
     use crate::fold::{Binder, Monoid};
     use alloc::format;
+
+    // ───────────────────────── close_over ─────────────────────────
+
+    /// A body `X·p + Y` over the `n`th placeholder `p`, and the arena it is
+    /// built in.
+    fn open_body(n: usize) -> (ExprArena, ExprId, Placeholder) {
+        let placeholder = Placeholder::nth(n).expect("a placeholder");
+        let mut a = ExprArena::new();
+        let (x, y) = (a.push_var(Axis::X.var()), a.push_var(Axis::Y.var()));
+        let p = a.push_var(placeholder.var());
+        let xp = a.push_binary(OpKind::Mul, x, p);
+        let body = a.push_binary(OpKind::Add, xp, y);
+        (a, body, placeholder)
+    }
+
+    /// Whether a `Var` at or past the first placeholder is anywhere in `a`.
+    fn holds_a_placeholder(a: &ExprArena) -> bool {
+        let first = Placeholder::nth(0).expect("a placeholder").var();
+        a.nodes()
+            .any(|(_, node)| matches!(node, ExprNode::Var(v) if v >= first))
+    }
+
+    /// `close_over` binds the lowest slot the body leaves free, renames the
+    /// placeholder to it, and hands back only the fold: here, over a body
+    /// already holding a fold at slot 0, slot 1.
+    #[test]
+    fn close_over_binds_the_lowest_free_binder_and_renames_the_placeholder() {
+        let placeholder = Placeholder::nth(0).expect("a placeholder");
+        let mut a = ExprArena::new();
+        let x = a.push_var(Axis::X.var());
+        let slot0 = Binder::from_slot(0).expect("slot 0");
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, slot0, 0..3), x);
+        let p = a.push_var(placeholder.var());
+        let body = a.push_binary(OpKind::Mul, inner, p);
+
+        let (closed, root) = a
+            .close_over(body, placeholder, |binder| {
+                Ok::<_, ()>(Fold::new(Monoid::SUM, binder, 0..4))
+            })
+            .expect("a free binder");
+        let ExprNode::Reduce { fold, body } = closed.node(root) else {
+            panic!("a fold, got {}", closed.display(root));
+        };
+        assert_eq!(fold.binder().slot(), 1, "slot 0 is bound inside");
+        let ExprNode::Binary(OpKind::Mul, _, index) = closed.node(body) else {
+            panic!("the product, got {}", closed.display(body));
+        };
+        assert_eq!(closed.node(index), ExprNode::Var(fold.binder().var()));
+        assert!(!holds_a_placeholder(&closed), "{}", closed.display(root));
+    }
+
+    /// The closed arena keeps every declaration of the one the body was
+    /// built in, read or not and in order, since a positional binding
+    /// supplies them so.
+    #[test]
+    fn close_over_keeps_every_declaration_in_order() {
+        let (mut a, body, placeholder) = open_body(3);
+        let unread = UniformDecl {
+            id: UniformIdentity::mint(),
+            default: 1.0,
+        };
+        a.declare_uniform(unread);
+        let (closed, _) = a
+            .close_over(body, placeholder, |binder| {
+                Ok::<_, ()>(Fold::new(Monoid::MAX, binder, 0..2))
+            })
+            .expect("a free binder");
+        assert_eq!(closed.uniforms(), [unread]);
+    }
+
+    /// A body binding every slot has none left: the fold would be one
+    /// deeper than the index space.
+    #[test]
+    fn close_over_refuses_a_body_that_binds_every_binder() {
+        let (mut a, mut body, placeholder) = open_body(0);
+        for binder in Binder::all() {
+            body = a.push_reduce(Fold::new(Monoid::SUM, binder, 0..1), body);
+        }
+        let unclosed = a.close_over(body, placeholder, |binder| {
+            Ok::<_, ()>(Fold::new(Monoid::SUM, binder, 0..1))
+        });
+        assert_eq!(unclosed.err(), Some(Unclosed::IndexSpaceFull));
+    }
+
+    /// A fold refused on the binder chosen is the caller's refusal, as it
+    /// was given.
+    #[test]
+    fn close_over_passes_a_refused_fold_through() {
+        let (a, body, placeholder) = open_body(0);
+        let unclosed = a.close_over(body, placeholder, |_| Err::<Fold, _>("no interval"));
+        assert_eq!(unclosed.err(), Some(Unclosed::Refused("no interval")));
+    }
 
     // 1. test_push_and_access
     #[test]

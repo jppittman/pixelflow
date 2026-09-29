@@ -32,7 +32,7 @@ pub mod dyadic;
 /// binds, and the domain that index runs over. See the module docs for why
 /// those are a type rather than three `Const` children.
 pub mod fold;
-pub use fold::{Binder, Fold, IntervalFold, Monoid, RangeFold};
+pub use fold::{Binder, Fold, IntervalFold, Monoid, Placeholder, RangeFold};
 // Not API: `kernel!`'s emitted code sums a family's copies with it.
 #[doc(hidden)]
 pub use fold::Chain;
@@ -43,6 +43,8 @@ pub use fold::Chain;
 pub mod integral;
 
 pub mod kind;
+pub mod library;
+
 pub mod variance;
 
 pub use variance::{LatticeShape, Variance};
