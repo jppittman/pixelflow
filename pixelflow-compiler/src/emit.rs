@@ -266,7 +266,9 @@ fn emit_args(entry: &FnItem, analyzed: &AnalyzedKernel) -> TokenStream {
             /// When `block`'s program declares a different number of
             /// arguments — it was compiled from some other kernel, or from
             /// this one composed beside other arguments. Nothing is
-            /// written.
+            /// written. The count is all that is checked: a block of
+            /// another program that declares as many arguments takes these
+            /// values by position (plan §1.4).
             #vis fn write_into(
                 &self,
                 block: &mut ::pixelflow_core::UniformBlock,
@@ -362,13 +364,16 @@ fn instantiated_range(range: &crate::sema::StructuralRange) -> TokenStream {
          `f32` lane, which names every integer only that far",
         range.text()
     );
+    // The locals are the emission's own names, `__`-prefixed as its others
+    // are: spelled `lo`, a structural parameter `lo` in scope turned the
+    // binding into a pattern naming it, which rustc refuses (E0158).
     quote! {
         const {
-            let lo: usize = #lo;
-            let hi: usize = #hi;
-            ::core::assert!(lo <= hi, #backwards);
-            ::core::assert!(hi <= #bound, #past);
-            (lo as u32)..(hi as u32)
+            let __lo: usize = #lo;
+            let __hi: usize = #hi;
+            ::core::assert!(__lo <= __hi, #backwards);
+            ::core::assert!(__hi <= #bound, #past);
+            (__lo as u32)..(__hi as u32)
         }
     }
 }
@@ -708,14 +713,14 @@ mod tests {
             }
         });
         assert!(
-            code.contains("const { let lo : usize = 0 ; let hi : usize = N ;"),
+            code.contains("const { let __lo : usize = 0 ; let __hi : usize = N ;"),
             "{code}"
         );
         assert!(
             code.contains("runs backwards at this instantiation"),
             "{code}"
         );
-        assert!(code.contains("hi <= 16777216"), "{code}");
+        assert!(code.contains("__hi <= 16777216"), "{code}");
         assert!(code.contains("push_const (N as f32)"), "{code}");
     }
 }

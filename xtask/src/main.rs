@@ -655,7 +655,7 @@ impl IsaExecutionMode {
     fn scope(&self) -> &'static str {
         match self {
             Self::BuildOnly => "none",
-            Self::Smoke => "smoke: codegen+ir+core+pipeline + graphics' glyph JIT tests",
+            Self::Smoke => "smoke: codegen+ir+core+compiler+pipeline + graphics' glyph JIT tests",
             Self::BuildAndTest => "workspace",
         }
     }
@@ -686,6 +686,16 @@ impl IsaExecutionMode {
     /// invisible there because that tier reserved one more scratch register
     /// per `MulAdd` and so allocated a different schedule.
     ///
+    /// `pixelflow-compiler` is here for the same reason: `kernel!`'s tests
+    /// bake what the macro expands to and pin the values, so its suite is
+    /// the one that runs the front end's programs through every tier's
+    /// emitter. A value the optimizer may compute through an estimate is the
+    /// tier's: `Recip`'s accuracy is `rcpps`'s at AVX2 and `vrcp14ps`'s at
+    /// AVX-512, and a test that pinned a quotient bit for bit passed at
+    /// AVX-512, where it was written, and failed at AVX2 — which presubmit's
+    /// plain `cargo test` sees only on a runner whose widest tier is AVX2.
+    /// Its suite costs about ten seconds per level.
+    ///
     /// `pixelflow-pipeline` is here for a narrower reason: it does not emit
     /// machine code, but it *reads the vector width*. Its lane count is
     /// `jit_vector_bytes() / 4`, so its measurement harness computes
@@ -695,9 +705,11 @@ impl IsaExecutionMode {
     /// formula as a literal passed at one level and failed at the others for
     /// eight days of postsubmit before anything presubmit could see it.
     ///
-    /// Every other crate in the workspace consumes the same kernels through
-    /// the same interface at every level, and reads no per-level width, so
-    /// running it per level re-runs identical work.
+    /// Every other crate is left to postsubmit's workspace run, and that is
+    /// a price, not a claim that its tests mean the same at every level: a
+    /// test anywhere that bakes a kernel and pins its value is per-level
+    /// (the compiler's was). What earns a crate its place here is how much
+    /// of its suite is that, for what it costs to run per level.
     ///
     /// The economics are why this belongs presubmit at all: the test binaries
     /// are built once, for the lint, so the marginal cost is execution only —
@@ -717,6 +729,8 @@ impl IsaExecutionMode {
                     "pixelflow-ir",
                     "-p",
                     "pixelflow-core",
+                    "-p",
+                    "pixelflow-compiler",
                     "-p",
                     "pixelflow-pipeline",
                     "--no-fail-fast",

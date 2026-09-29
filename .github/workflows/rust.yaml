@@ -665,11 +665,11 @@ jobs:
     # a real per-tier *execution* signal affordable presubmit rather than
     # postsubmit-only.
     #
-    # It is a fraction, deliberately: the rest of the workspace consumes the
-    # same kernels through the same interface at every tier, so running it
-    # per tier re-runs identical work. Postsubmit still runs the full
-    # workspace per tier (see postsubmit-flake-detection.yaml) -- this catches
-    # the tier-specific miscompiles early, not all of them.
+    # It is a fraction, deliberately, and a price rather than a claim that
+    # the rest means the same at every tier: any test that bakes a kernel and
+    # pins a value is per-tier. Postsubmit still runs the full workspace per
+    # tier (see postsubmit-flake-detection.yaml) -- this catches the
+    # tier-specific failures early, not all of them.
     timeout-minutes: 25
     env:
       RUSTC_WRAPPER: sccache
@@ -717,7 +717,8 @@ jobs:
 
       # A plain `cargo test` runs the widest tier the runner's CPU has, and
       # only that one: on an AVX-512 runner the AVX2 backend is never entered.
-      # This runs the codegen/IR/core/pipeline suites once per tier the CPU
+      # This runs the codegen/IR/core/compiler/pipeline suites (and
+      # graphics' glyph JIT tests) once per tier the CPU
       # can execute, under `PIXELFLOW_ISA=avx2` and `PIXELFLOW_ISA=avx512`,
       # after one build and one clippy. A tier the hardware can't run is
       # reported NOT RUN per tier -- a skip that is stated, never silent. See
