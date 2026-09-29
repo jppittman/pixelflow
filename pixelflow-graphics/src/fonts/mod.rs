@@ -33,8 +33,8 @@
 //! signed area under ink — the non-zero rule's winding number integrated
 //! over the pixel. [`loop_blinn`] writes `F` as a formula, one term per
 //! monotone arc of the outline, each the area of the pixel to the arc's
-//! left within its band, and the e-graph closes every term's integral
-//! exactly (docs/plans/2026-09-23-a-glyph-is-a-formula.md). A pixel on an
+//! left within its band, written in closed form
+//! (docs/plans/2026-09-23-a-glyph-is-a-formula.md). A pixel on an
 //! edge reads the fraction of it the ink covers; a corner and a thin stem
 //! read their areas, not a ramp on one distance. Where two contours overlap
 //! inside a pixel, `|F|` clamped reads their union as FreeType's rasterizer

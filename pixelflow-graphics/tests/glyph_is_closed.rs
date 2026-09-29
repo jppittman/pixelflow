@@ -1,25 +1,24 @@
-//! **Every glyph's area closes in the e-graph.** No integral a glyph is
-//! written with reaches the emitter, and none is left to quadrature.
+//! **Every glyph is written closed.** No glyph's arena holds an integral,
+//! and none is left for the compiler to close.
 //!
-//! A glyph is written as the area under each pixel
-//! (`fonts/loop_blinn.rs`): one fold over its piece table whose body holds
-//! `area(χ_p)` — two interval folds, the pixel's — and the e-graph closes
-//! them by rule (`FactorFold`, `NarrowInterval`, `ArcMoment`;
-//! docs/plans/2026-09-23-an-integral-is-a-fold.md §3, §8). Whatever the
-//! rules leave open is still legal: `passes::resolve` replaces it by its
-//! one-point quadrature before anything is emitted. That fallback is exactly
-//! what must not happen to a glyph — the quadrature of a crossing is a
-//! point sample, an aliased edge — and nothing downstream would notice: the
-//! coverage stays in range and the ink stays where it was. So this counts.
+//! A glyph's coverage is the area of the pixel under ink, one fold over its
+//! piece table whose body is each piece's area **in closed form**
+//! (`fonts/loop_blinn.rs`, `RisingArc::pixel_area`). It was once written as
+//! the integral it is, `area(χ_p)` — two interval folds per piece — and
+//! closed by e-graph rules, with one-point quadrature legalizing whatever
+//! they left open. That fallback point-sampled an edge while the coverage
+//! stayed in range and the ink stayed where it was, so nothing downstream
+//! could notice a glyph the budget had not closed. Written closed, there is
+//! nothing to close and nothing to fall back to — and this is what keeps it
+//! so.
 //!
 //! For every printable ASCII glyph at 7, 16 and 32 px, `HELLO` at 16, and
 //! every printable glyph as one run at 16, each composed and shaped as the
 //! atlas bakes it (texel centres, `tile_px × tile_px`):
 //!
+//! - the arena as written, links resolved, holds **no** interval fold;
 //! - `optimize_runtime_arena` optimizes it — `None` would mean the tier
 //!   declined, and the arena compiled would be the one written;
-//! - the term extraction chose holds **no** interval fold
-//!   (`runtime::unclosed_integrals`), so `resolve` has no quadrature to do;
 //! - and the optimized term holds no reciprocal estimate (`Recip`,
 //!   `Rsqrt`: 12–14 bits, where the closed form's quotients are exact
 //!   divides), no `Dwrt`, and no interval fold.
@@ -34,7 +33,7 @@ use pixelflow_core::Kernel;
 use pixelflow_graphics::fonts::{text, Font, Glyph};
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 use pixelflow_ir::{Fold, LatticeShape, OpKind};
-use pixelflow_search::runtime::{optimize_runtime_arena, unclosed_integrals};
+use pixelflow_search::runtime::optimize_runtime_arena;
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
@@ -84,32 +83,23 @@ fn is_estimate_or_derivative(node: ExprNode) -> bool {
 
 /// Every claim of the module docs, for `glyph` at a `tile × tile` lattice.
 /// `name` labels the failure. A glyph with no ink (a space) is the literal
-/// 0 and has nothing to close.
+/// 0 and still optimizes.
 fn assert_closed(name: &str, glyph: &Glyph, tile: u32) {
     let kernel = at_texel_centres(glyph);
     let (arena, root) = kernel.linked_parts();
-    let written = count(&arena, root, is_integral);
-    if glyph.support.is_empty() {
-        assert_eq!(written, 0, "{name}: an empty glyph holds an integral");
-        return;
-    }
-    assert!(
-        written > 0,
-        "{name}: the glyph is not written as an area, so this closes nothing"
+    assert_eq!(
+        count(&arena, root, is_integral),
+        0,
+        "{name}: the glyph is written with an integral"
     );
     let shape = LatticeShape::new([tile, tile]);
-    assert_eq!(
-        unclosed_integrals(&arena, root, shape),
-        Some(0),
-        "{name}: extraction left integrals for quadrature"
-    );
     let optimized = optimize_runtime_arena(&arena, root, shape)
         .unwrap_or_else(|| panic!("{name}: the runtime tier declined the glyph"));
     let (out, out_root) = &*optimized;
     assert_eq!(
         count(out, *out_root, is_integral),
         0,
-        "{name}: an integral survived optimization"
+        "{name}: optimization introduced an integral"
     );
     assert_eq!(
         count(out, *out_root, is_estimate_or_derivative),
@@ -119,7 +109,7 @@ fn assert_closed(name: &str, glyph: &Glyph, tile: u32) {
 }
 
 /// Every printable ASCII glyph at `size` px, on the atlas's tile.
-fn every_glyph_closes_at(size: u32) {
+fn every_glyph_is_closed_at(size: u32) {
     let font = Font::parse(FONT_DATA).expect("parse font");
     for ch in ' '..='~' {
         let glyph = font
@@ -130,41 +120,35 @@ fn every_glyph_closes_at(size: u32) {
 }
 
 #[test]
-fn every_glyph_closes_at_7px() {
-    every_glyph_closes_at(7);
+fn every_glyph_is_closed_at_7px() {
+    every_glyph_is_closed_at(7);
 }
 
 #[test]
-fn every_glyph_closes_at_16px() {
-    every_glyph_closes_at(16);
+fn every_glyph_is_closed_at_16px() {
+    every_glyph_is_closed_at(16);
 }
 
 #[test]
-fn every_glyph_closes_at_32px() {
-    every_glyph_closes_at(32);
+fn every_glyph_is_closed_at_32px() {
+    every_glyph_is_closed_at(32);
 }
 
 /// A run is one fold per character over one table, each over its own range
 /// of rows.
 #[test]
-fn a_run_closes() {
+fn a_run_is_closed() {
     let font = Font::parse(FONT_DATA).expect("parse font");
     assert_closed("HELLO@16", &text(&font, "HELLO", 16.0), 16);
 }
 
-/// **How long a run is decides nothing.** Every character's fold reads its
-/// rows through one body, so the e-graph holds one integral whatever the
-/// run's length, and the closing phase's class cap never meets it.
-///
-/// The run's integrals once had a body per character — each fold read
-/// `table[i + offset]` — so a run was as many integrals as characters, and
-/// the closing phase, which shares the saturation's class cap, stopped in
-/// its first round from about thirty characters on: 3 of 68 integrals left
-/// to quadrature at 34 characters, 33 of 100 at 50, and at 80 the graph
-/// was at the cap before a rule fired. The per-glyph pins above could not
-/// see it; a run of 94 would.
+/// **How long a run is decides nothing.** A run of every printable glyph is
+/// 94 folds in one graph, and it holds no integral whatever saturation's
+/// class cap reaches — the case that once left a third of a 50-character
+/// run's integrals to quadrature when each character's term was closed by
+/// rule (docs/results/2026-09-23-glyph-is-a-formula.md, §3).
 #[test]
-fn a_run_of_every_glyph_closes() {
+fn a_run_of_every_glyph_is_closed() {
     let font = Font::parse(FONT_DATA).expect("parse font");
     let every: String = ('!'..='~').collect();
     assert_closed(

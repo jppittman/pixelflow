@@ -7,9 +7,8 @@
 //! `PIXEL_HALF_WIDTH`, and the author writes the shift:
 //! `area(|u, v| f(X + u, Y + v))` is the builder's `f.area()`. The first
 //! pins below hold the two to one `pixelflow_ir::key::canonical` for a
-//! half-plane, a disc, and one piece of a glyph as `fonts/loop_blinn.rs`
-//! builds it — `monotone_root` being `integral::monotone_root` under the
-//! glyph's floor. `kernel_raw!` keeps the lowered shape, so each comparison
+//! half-plane and a disc, and `monotone_root` to `integral::monotone_root`
+//! under `ROOT_FLOOR`. `kernel_raw!` keeps the lowered shape, so each comparison
 //! is the front end's word and not the optimizer's. An integral's variable
 //! is bound inside-out, as a fold's index is, so a nested integral captures
 //! nothing.
@@ -140,22 +139,12 @@ fn the_area_of_a_disc_is_kernel_area() {
     );
 }
 
-// One piece of a glyph, with literal coefficients: an arc rising in both
-// coordinates, run downward (`S = −1`) and counted positively (`σ = +1`),
-// cut to the rows `[−4, 4]` it reaches.
-const PIECE_X0: f32 = 1.25;
-const PIECE_E0X: f32 = 1.5;
-const PIECE_E1X: f32 = 0.5;
-const PIECE_Y0: f32 = -3.0;
-const PIECE_E0Y: f32 = 2.0;
-const PIECE_E1Y: f32 = 3.5;
-const PIECE_SIGMA: f32 = 1.0;
-const PIECE_S: f32 = -1.0;
-const PIECE_ROWS_LO: f32 = -4.0;
-const PIECE_ROWS_HI: f32 = 4.0;
-
-// The same row, written again in the block: a body captures nothing from
-// the host.
+// An arc written as the area it bounds, with literal coefficients: rising
+// in both coordinates, run downward (`S = −1`), counted positively
+// (`σ = +1`) and cut to the rows `[−4, 4]` it reaches — the integrand the
+// font's pieces were written with before each became its closed form
+// (`pixelflow-graphics/src/fonts/loop_blinn.rs`), kept as the arc integral
+// the rules close (`a_glyph_piece_closes`, below).
 kernel_raw! {
     const X0: f32 = 1.25;
     const E0X: f32 = 1.5;
@@ -189,7 +178,7 @@ kernel_raw! {
     }
 }
 
-/// `fonts/loop_blinn.rs`'s `monotone_root`: the one definition, over an
+/// `monotone_root` as the builder spells it: the one definition, over an
 /// arena the operands are spliced into, under `ROOT_FLOOR`.
 fn monotone_root(delta: &Kernel, step: &Kernel, bend: &Kernel) -> Kernel {
     fn graft(arena: &mut ExprArena, k: &Kernel) -> ExprId {
@@ -205,32 +194,6 @@ fn monotone_root(delta: &Kernel, step: &Kernel, bend: &Kernel) -> Kernel {
     let floor = RootFloor::new(ROOT_FLOOR).expect("the largest floor RootFloor admits");
     let root = integral::monotone_root(&mut arena, delta, rise, floor);
     Kernel::from_parts(arena, root)
-}
-
-/// `fonts/loop_blinn.rs`'s `piece_term`, its row read from literals.
-fn built_piece_term() -> Kernel {
-    let (zero, one) = (constant(0.0), constant(1.0));
-    let certified = |step: f32| constant(step).max(&zero);
-    let (b, bx) = (certified(PIECE_E0Y), certified(PIECE_E0X));
-    let (a, ax) = (certified(PIECE_E1Y).sub(&b), certified(PIECE_E1X).sub(&bx));
-    let t = monotone_root(&y().sub(&constant(PIECE_Y0)), &b, &a);
-    let x_at_t = constant(PIECE_X0).add(&t.mul(&bx.add(&bx).add(&ax.mul(&t))));
-    let left_of_the_arc = indicator(&zero.le(&t))
-        .mul(&indicator(&t.lt(&one)))
-        .mul(&indicator(&x().lt(&x_at_t)));
-    let reflected = constant(PIECE_S).mul(&y());
-    let term = constant(PIECE_SIGMA).mul(&left_of_the_arc.area().at(&x(), &reflected));
-    let reaches = y()
-        .gt(&constant(PIECE_ROWS_LO))
-        .and(&y().lt(&constant(PIECE_ROWS_HI)));
-    reaches.select(&term, &zero)
-}
-
-/// A piece of a glyph written in `kernel!` — its helper inlined inside
-/// `area`, `monotone_root` the intrinsic — is the piece the font builds.
-#[test]
-fn a_glyph_piece_is_the_piece_the_font_builds() {
-    assert_same_program(&piece_term(), &built_piece_term());
 }
 
 /// `monotone_root(δ, step, bend)` is `integral::monotone_root` under
@@ -505,7 +468,7 @@ fn the_power_moment_is_open_and_baked_by_quadrature_today() {
     }
 }
 
-/// One piece of a glyph, written in `kernel!`, closes: no integral it is
+/// An arc written as its area in `kernel!` closes: no integral it is
 /// written with reaches the emitter.
 #[test]
 fn a_glyph_piece_closes() {

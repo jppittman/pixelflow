@@ -655,7 +655,7 @@ impl IsaExecutionMode {
     fn scope(&self) -> &'static str {
         match self {
             Self::BuildOnly => "none",
-            Self::Smoke => "smoke: codegen+ir+core+compiler+pipeline + graphics' glyph JIT tests",
+            Self::Smoke => "smoke: codegen+ir+core+compiler+pipeline + graphics' glyph JIT tests and closed form",
             Self::BuildAndTest => "workspace",
         }
     }
@@ -716,6 +716,14 @@ impl IsaExecutionMode {
     /// about a minute per level against several for the whole workspace. That
     /// is the difference between a check that fits in a PR's wait and one
     /// that does not.
+    ///
+    /// `pixelflow-graphics`'s `fonts::loop_blinn` unit tests are here because
+    /// they hold a glyph piece's closed form to an `f64` reference arc by arc,
+    /// and what they pin is a tier's: spelled `δ/d`, a root's quotient became
+    /// a hoisted `recip` estimate, `3.9e-2` of coverage wrong at AVX2 and a
+    /// tenth of that at AVX-512. They are `pixelflow-core`'s arc and chord
+    /// adversarial cases, moved there when the glyph stopped being written
+    /// as an integral.
     #[cfg(target_arch = "x86_64")]
     fn test_commands(&self) -> Option<&'static [&'static [&'static str]]> {
         match self {
@@ -744,6 +752,15 @@ impl IsaExecutionMode {
                     "--test",
                     "font_rasterization_regression",
                     "--no-fail-fast",
+                ],
+                &[
+                    "test",
+                    "-p",
+                    "pixelflow-graphics",
+                    "--lib",
+                    "--no-fail-fast",
+                    "--",
+                    "fonts::loop_blinn::",
                 ],
             ]),
             Self::BuildAndTest => Some(&[&["test", "--workspace", "--no-fail-fast"]]),

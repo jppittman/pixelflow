@@ -38,7 +38,7 @@ use super::ttf::Font;
 ///
 /// Advance-based (kerning-free) layout: each glyph is scaled to `size` and
 /// placed at the accumulated advance. Coverage is the exact area of each
-/// pixel under ink, closed by the compiler at bake.
+/// pixel under ink, in closed form.
 ///
 /// This is the denotation — the function a laid-out string *is*. Like any
 /// other glyph kernel, it carries no coordinate frame: a caller wanting

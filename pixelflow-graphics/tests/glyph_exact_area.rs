@@ -25,14 +25,16 @@
 //!
 //! Every printable ASCII glyph of the crate's font, at 7, 16 and 32 px.
 //!
-//! ## The baseline: the exact area, closed by the compiler
+//! ## The baseline: the exact area, in closed form
 //!
-//! Coverage is the area of the pixel under ink, written as a formula and
-//! closed by the e-graph (`fonts/loop_blinn.rs`,
+//! Coverage is the area of the pixel under ink, each piece's term written
+//! in closed form (`fonts/loop_blinn.rs`,
 //! docs/plans/2026-09-23-a-glyph-is-a-formula.md). Measured 2026-09-23 on
-//! the AVX-512 and AVX2 tiers, which agree to every printed digit (the
-//! per-glyph table is [`BASELINE`], and
-//! `docs/results/2026-09-23-glyph-is-a-formula.md`):
+//! the AVX-512 and AVX2 tiers, which agree to every printed digit, when the
+//! e-graph derived that form from the integral the glyph was written as;
+//! unchanged to every printed digit, on both tiers, since the closed form is
+//! written instead (2026-09-29). The per-glyph table is [`BASELINE`], and
+//! `docs/results/2026-09-23-glyph-is-a-formula.md`:
 //!
 //! | size | inked glyphs | inked texels | max `E_max` | mean `E_mean` | `Σ N₀.₁` | mean centroid shift (x, y) |
 //! |---|---|---|---|---|---|---|
@@ -120,9 +122,9 @@ const PLATFORM_NOISE: f64 = 1e-3;
 /// `2⁻²²`: the unit of the closed form's own error bound,
 /// `2⁻²²·(1 + |X| + |Y| + 2·extent)` per texel — the parameter an arc is
 /// read at resolves to `2⁻²⁴`, which the arc's extent multiplies, and the
-/// coordinates carry their rounding into the clamp
-/// (`pixelflow_ir::IntervalFold::arc_moment`, "Floating point", pinned per
-/// arc by `pixelflow-core/tests/arc_oracle.rs`).
+/// coordinates carry their rounding into the clamp (`fonts/loop_blinn.rs`,
+/// `RisingArc::pixel_area`, "Floating point", pinned arc by arc by
+/// `loop_blinn`'s `adversarial` tests).
 const ARC_TOLERANCE_UNIT: f64 = 1.0 / 4_194_304.0;
 
 /// The closed form's bound at texel `(i, j)` of a `size`-px tile: the arc

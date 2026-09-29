@@ -26,8 +26,9 @@
 //! `extent` the outline's larger side: the parameter an arc is read at
 //! resolves to `2⁻²⁴`, which the arc's extent multiplies, and the
 //! coordinates carry their rounding into the clamp
-//! (`pixelflow_ir::IntervalFold::arc_moment`, "Floating point"; pinned per
-//! arc by `pixelflow-core/tests/arc_oracle.rs`). Derived, not measured:
+//! (`fonts/loop_blinn.rs`, `RisingArc::pixel_area`, "Floating point";
+//! pinned arc by arc by `loop_blinn`'s `adversarial` tests). Derived, not
+//! measured:
 //! the worst texel here uses under a quarter of it (a random contour off
 //! the grid; 9% for the named shapes), and the font's about a tenth
 //! (`glyph_exact_area.rs`).

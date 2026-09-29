@@ -12,7 +12,7 @@
 //!
 //! The bake JIT-compiles the fused glyph kernel once (`Lattice::bake`,
 //! global compile cache) and tabulates it; antialiasing is intrinsic to the
-//! kernel (each pixel's area, its integrals closed at compile time). The
+//! kernel (each pixel's area, in closed form). The
 //! read-back is a [`BilinearSampler`] — a JIT'd 4-tap gather kernel bound to
 //! the baked buffer. Texels therefore store *antialiased* coverage — no
 //! post-hoc filtering of hard 0/1 samples.

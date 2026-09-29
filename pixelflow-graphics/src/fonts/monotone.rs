@@ -3,14 +3,14 @@
 //!
 //! ## What it is for
 //!
-//! The area left of a curve, integrated over a pixel, closes in one formula
-//! only when the curve is a graph over `y` that also rises one way in `x`:
-//! then `clamp(x(y) − X, 0, 1)` is zero, then linear, then one, along the
-//! arc (docs/plans/2026-09-23-a-glyph-is-a-formula.md; the step-5 design's
-//! `ArcMoment`). That is a fact about the table's numbers, which a rewrite
-//! rule cannot see, so the kernel writes it in as a certificate —
-//! `max(step, 0)` on each control-polygon step — and the formula becomes an
-//! identity for every value in the table. The certificate is only *the
+//! The area left of a curve, integrated over a pixel, is one formula only
+//! when the curve is a graph over `y` that also rises one way in `x`: then
+//! `clamp(x(y) − X, 0, 1)` is zero, then linear, then one, along the arc
+//! (docs/plans/2026-09-23-a-glyph-is-a-formula.md; `loop_blinn`'s
+//! `RisingArc::pixel_area`). That is a fact about the table's numbers, which
+//! the kernel cannot see, so it writes it in as a certificate —
+//! `max(step, 0)` on each control-polygon step — and the formula holds for
+//! every value in the table. The certificate is only *the
 //! glyph's* geometry if every arc in the table already satisfies it. This
 //! type is how the table's builder proves that: a [`MonotoneQuad`] can only
 //! be built by [`MonotoneQuad::split`], which cuts any quadratic at its
