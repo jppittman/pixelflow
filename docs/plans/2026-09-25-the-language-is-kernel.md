@@ -504,3 +504,7 @@ Phase D proposes the edits.
   256 parameters. B3 deletes it.
 - **A second parser (F).** `pixelflow-pipeline/src/training/factored.rs:542`
   parses kernel code for `validate_corpus` (D17).
+- **A fold's index is exact only to 2²⁴ (F, B2).** It is an `f32` lane, and
+  `RangeFold` accepts any `u32` end, so a builder fold past 2²⁴ sums the
+  wrong terms without a word. `kernel!` refuses such a bound at lowering;
+  the refusal belongs in `RangeFold` (docs/BACKLOG.md, C8).

@@ -320,3 +320,265 @@ fn a_const_never_contracts_as_rustc_never_does() {
     );
     assert_eq!(Lattice::eval_at(&contracted(), 0.0, 0.0), RUST_CONTRACTION);
 }
+
+// ───────────────────── B2: folds over constant ranges ─────────────────────
+//
+// A fold (docs/plans/2026-09-25-the-language-is-kernel.md §1.5) is Rust's
+// iterator spelling of a reduction, so rustc is its oracle too: the same
+// tokens over the same range, as a host iterator. The bodies are chosen so
+// every term and every partial result is exact in `f32`, which makes the
+// comparison bit-for-bit whatever order the e-graph combines the terms in
+// once it unrolls the fold.
+
+/// The points the folds are sampled at: every term below is a multiple of a
+/// quarter, small enough that no sum or product of them rounds.
+const FOLD_SAMPLES: [(f32, f32); 4] = [(3.0, 5.0), (-2.5, 0.5), (0.25, -1.0), (1.0, 1.0)];
+
+/// A mask as a number, so a quantifier's value can be read off a lattice.
+fn indicator(m: bool) -> f32 {
+    if m { 1.0 } else { 0.0 }
+}
+
+/// `.map(|i| e).sum()` is Σ over the range, as rustc's `Iterator::sum` is.
+#[test]
+fn a_sum_folds_as_rustcs_does() {
+    let k = kernel!(|| (0..5).map(|i| X * (i as f32) + Y).sum());
+    let rust = |x: f32, y: f32| -> f32 { (0..5).map(|i| x * (i as f32) + y).sum() };
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(Lattice::eval_at(&k, x, y), rust(x, y), "at ({x}, {y})");
+    }
+    assert_eq!(bake(&k), 55.0, "5 + 8 + 11 + 14 + 17");
+}
+
+/// `.map(|i| e).product()` is Π over the range; a range need not start at 0.
+#[test]
+fn a_product_folds_as_rustcs_does() {
+    let k = kernel!(|| (1..5).map(|i| X + i as f32).product());
+    let rust = |x: f32, _y: f32| -> f32 { (1..5).map(|i| x + i as f32).product() };
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(Lattice::eval_at(&k, x, y), rust(x, y), "at ({x}, {y})");
+    }
+    assert_eq!(bake(&k), 840.0, "4 · 5 · 6 · 7");
+}
+
+/// `.fold(f32::INFINITY, f32::min)` is the minimum over the range.
+#[test]
+fn a_min_folds_as_rustcs_does() {
+    let k = kernel!(|| (0..4)
+        .map(|i| (X - i as f32).abs() + Y)
+        .fold(f32::INFINITY, f32::min));
+    let rust = |x: f32, y: f32| {
+        (0..4)
+            .map(|i| (x - i as f32).abs() + y)
+            .fold(f32::INFINITY, f32::min)
+    };
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(Lattice::eval_at(&k, x, y), rust(x, y), "at ({x}, {y})");
+    }
+}
+
+/// `.fold(f32::NEG_INFINITY, f32::max)` is the maximum over the range.
+#[test]
+fn a_max_folds_as_rustcs_does() {
+    let k = kernel!(|| (0..4)
+        .map(|i| Y * (i as f32) - X)
+        .fold(f32::NEG_INFINITY, f32::max));
+    let rust = |x: f32, y: f32| {
+        (0..4)
+            .map(|i| y * (i as f32) - x)
+            .fold(f32::NEG_INFINITY, f32::max)
+    };
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(Lattice::eval_at(&k, x, y), rust(x, y), "at ({x}, {y})");
+    }
+}
+
+/// `.any(|i| m)` is ∃ over the range, of `bool`s, as rustc's `Iterator::any`
+/// is: the samples put `X` below every index, between two, and above all.
+#[test]
+fn any_folds_as_rustcs_does() {
+    let k = kernel!(|| if (0..4).any(|i| X < i as f32) {
+        1.0
+    } else {
+        0.0
+    });
+    let rust = |x: f32, _y: f32| indicator((0..4).any(|i| x < i as f32));
+    for (x, y) in FOLD_SAMPLES.into_iter().chain([(3.0, 0.0), (-1.0, 0.0)]) {
+        assert_eq!(Lattice::eval_at(&k, x, y), rust(x, y), "at ({x}, {y})");
+    }
+}
+
+/// `.all(|i| m)` is ∀ over the range, of `bool`s, as rustc's `Iterator::all`
+/// is.
+#[test]
+fn all_folds_as_rustcs_does() {
+    let k = kernel!(|| if (1..4).all(|i| Y * (i as f32) > X) {
+        1.0
+    } else {
+        0.0
+    });
+    let rust = |x: f32, y: f32| indicator((1..4).all(|i| y * (i as f32) > x));
+    for (x, y) in FOLD_SAMPLES.into_iter().chain([(2.0, 1.0), (0.5, 1.0)]) {
+        assert_eq!(Lattice::eval_at(&k, x, y), rust(x, y), "at ({x}, {y})");
+    }
+}
+
+/// A fold's body sees the folds around it: `Σ_i Σ_j (10i + jX)` reads the
+/// outer index inside the inner body. Each fold binds its own slot, so the
+/// inner fold does not capture the outer index — which would compute
+/// `Σ_i Σ_j (10j + jX)`, `3 · Σ_j j(10 + X)`, where rustc says
+/// `4 · 30 + 3 · 6X`.
+#[test]
+fn a_nested_fold_captures_the_outer_index_as_rustcs_does() {
+    let k = kernel!(|| (0..3)
+        .map(|i| (0..4)
+            .map(|j| (i as f32) * 10.0 + (j as f32) * X)
+            .sum::<f32>())
+        .sum());
+    let rust = |x: f32, _y: f32| -> f32 {
+        (0..3)
+            .map(|i| {
+                (0..4)
+                    .map(|j| (i as f32) * 10.0 + (j as f32) * x)
+                    .sum::<f32>()
+            })
+            .sum()
+    };
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(Lattice::eval_at(&k, x, y), rust(x, y), "at ({x}, {y})");
+    }
+    // X = 3: 4 · (0 + 10 + 20) + 3 · (0 + 3 + 6 + 9) = 120 + 54.
+    assert_eq!(bake(&k), 174.0);
+    let captured = 3.0 * (0..4).map(|j| (j as f32) * (10.0 + AT.0)).sum::<f32>();
+    assert_ne!(bake(&k), captured, "the inner index captured the outer");
+}
+
+// A helper that folds, called inside a fold: the route §1.7's glyph takes,
+// a piece's helper integrating over its own range inside the sum over the
+// pieces. The helper's body is lowered in a frame of its own, but its fold
+// is still nested in the caller's.
+kernel! {
+    fn tens_and_units(x: f32) -> f32 {
+        (0..2).map(|j| x * 10.0 + (j as f32)).sum()
+    }
+    pub fn a_helpers_fold_in_a_fold() -> f32 {
+        (0..3).map(|i| tens_and_units(i as f32) * X).sum()
+    }
+}
+
+fn rust_tens_and_units(x: f32) -> f32 {
+    (0..2).map(|j| x * 10.0 + (j as f32)).sum()
+}
+
+/// A helper's fold inlined inside a fold is nested in it, as a fold written
+/// in place would be, and captures nothing: `Σ_i Σ_j (10i + j) · X` is
+/// `Σ_i (20i + 1) · X = 63X`. Were the helper's fold not counted as nested —
+/// its index sharing the caller's placeholder — the helper's rename would
+/// reach `i` through the argument, and this would compute
+/// `Σ_i Σ_j (10j + j) · X = 33X`.
+#[test]
+fn a_helpers_fold_inside_a_fold_captures_nothing_as_in_rustc() {
+    let k = a_helpers_fold_in_a_fold();
+    let rust = |x: f32, _y: f32| -> f32 { (0..3).map(|i| rust_tens_and_units(i as f32) * x).sum() };
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(Lattice::eval_at(&k, x, y), rust(x, y), "at ({x}, {y})");
+    }
+    // X = 3: 63 · 3.
+    assert_eq!(bake(&k), 189.0);
+    let captured = 3.0 * (0..2).map(|j| (j as f32) * 11.0 * AT.0).sum::<f32>();
+    assert_ne!(
+        bake(&k),
+        captured,
+        "the helper's index captured the caller's"
+    );
+}
+
+/// A fold's index is scoped to the fold's body, as a closure's parameter is:
+/// it shadows a `let` and a parameter of its name inside the body, and past
+/// the fold the name means them again. Were the index's scope left open past
+/// the body — the p6 leak, through a fold — `a` and `r` after the fold would
+/// name the index, and the kernel would not compile.
+#[test]
+fn a_fold_index_shadows_only_inside_its_body() {
+    let k = kernel!(|r: f32| {
+        let a = X;
+        (0..4).map(|a| a as f32).sum::<f32>() + (0..3).map(|r| r as f32).sum::<f32>() * a + r
+    })(10.0);
+    let rust = |x: f32, r: f32| {
+        let a = x;
+        (0..4).map(|a| a as f32).sum::<f32>() + (0..3).map(|r| r as f32).sum::<f32>() * a + r
+    };
+    assert_eq!(bake(&k), rust(AT.0, 10.0));
+    // 6 + 3 · X + r.
+    assert_eq!(bake(&k), 25.0);
+}
+
+/// A fold over an empty range is its monoid's identity, as rustc's is: 0,
+/// 1, +∞, −∞, false and true.
+#[test]
+fn a_fold_over_an_empty_range_is_the_identity_as_in_rustc() {
+    let sum = kernel!(|| (3..3).map(|i| X + i as f32).sum());
+    let product = kernel!(|| (3..3).map(|i| X + i as f32).product());
+    let min = kernel!(|| (3..3).map(|i| X + i as f32).fold(f32::INFINITY, f32::min));
+    let max = kernel!(|| (3..3)
+        .map(|i| X + i as f32)
+        .fold(f32::NEG_INFINITY, f32::max));
+    let any = kernel!(|| if (3..3).any(|i| X < i as f32) {
+        1.0
+    } else {
+        0.0
+    });
+    let all = kernel!(|| if (3..3).all(|i| X < i as f32) {
+        1.0
+    } else {
+        0.0
+    });
+
+    let x = AT.0;
+    let rust_sum: f32 = (3..3).map(|i| x + i as f32).sum();
+    let rust_product: f32 = (3..3).map(|i| x + i as f32).product();
+    let rust_min = (3..3).map(|i| x + i as f32).fold(f32::INFINITY, f32::min);
+    let rust_max = (3..3)
+        .map(|i| x + i as f32)
+        .fold(f32::NEG_INFINITY, f32::max);
+    assert_eq!(bake(&sum), rust_sum);
+    assert_eq!(bake(&product), rust_product);
+    assert_eq!(bake(&min), rust_min);
+    assert_eq!(bake(&max), rust_max);
+    assert_eq!(bake(&any), indicator((3..3).any(|i| x < i as f32)));
+    assert_eq!(bake(&all), indicator((3..3).all(|i| x < i as f32)));
+    assert_eq!(
+        [rust_sum, rust_product, rust_min, rust_max],
+        [0.0, 1.0, f32::INFINITY, f32::NEG_INFINITY]
+    );
+}
+
+// A range from `usize` consts, evaluated at expansion as rustc evaluates the
+// same `const`s, and a `usize` const converted by `as f32` in the body: the
+// mean of `X·i` over `i ∈ [LO, HI)`.
+const RUST_LO: usize = 2;
+const RUST_TERMS: usize = 3;
+const RUST_HI: usize = RUST_LO + RUST_TERMS;
+kernel! {
+    const LO: usize = 2;
+    const TERMS: usize = 3;
+    pub const HI: usize = LO + TERMS;
+    pub fn mean_over_consts() -> f32 {
+        (LO..HI).map(|i| X * (i as f32)).sum::<f32>() / (TERMS as f32)
+    }
+}
+
+/// A range's bounds may be `usize` consts, and a `pub` one is the host
+/// `const`.
+#[test]
+fn a_range_from_consts_folds_as_rustcs_does() {
+    assert_eq!(HI, RUST_HI);
+    let k = mean_over_consts();
+    let rust = |x: f32, _y: f32| {
+        (RUST_LO..RUST_HI).map(|i| x * (i as f32)).sum::<f32>() / (RUST_TERMS as f32)
+    };
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(Lattice::eval_at(&k, x, y), rust(x, y), "at ({x}, {y})");
+    }
+    assert_eq!(bake(&k), 9.0, "3 · (2 + 3 + 4) / 3");
+}

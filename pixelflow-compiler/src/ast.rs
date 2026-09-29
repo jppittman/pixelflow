@@ -27,12 +27,14 @@
 //!
 //! Expr
 //!   ├── Ident(name)                    // Variable reference: X, cx, etc.
-//!   ├── Literal(value)                 // Numeric literal, as its f32: 1.0, 2.5
+//!   ├── Literal(value)                 // Numeric literal: 1.0, 2.5, 4
 //!   ├── Binary(op, lhs, rhs)           // a + b, x * y
 //!   ├── Unary(op, operand)             // -x
 //!   ├── MethodCall(receiver, method, args) // x.sqrt(), a.max(b)
 //!   ├── Call(func, args)               // DX(e), a helper: f(x, y)
 //!   ├── If(cond, then, else)           // if c { a } else { b }
+//!   ├── Fold(reduction, range, binder, body) // (0..N).map(|i| e).sum()
+//!   ├── Cast(operand)                  // i as f32
 //!   ├── Block(stmts, expr)             // { let dx = ...; dx * dx }
 //!   └── Paren(inner)                   // (a + b)
 //! ```
@@ -67,7 +69,8 @@ pub enum Spelling {
     Items,
 }
 
-/// A `const NAME: f32 = expr;` item, evaluated at expansion.
+/// A `const NAME: f32 = expr;` or `const NAME: usize = expr;` item,
+/// evaluated at expansion.
 #[derive(Debug, Clone)]
 pub struct ConstItem {
     /// Doc comments, re-emitted on a `pub const`'s host twin.
@@ -75,7 +78,7 @@ pub struct ConstItem {
     /// `pub` makes the value a host `const` too.
     pub vis: syn::Visibility,
     pub name: Ident,
-    /// The declared type; sema requires `f32`.
+    /// The declared type; sema requires `f32` or `usize`.
     pub ty: Type,
     pub init: Expr,
 }
@@ -155,6 +158,12 @@ pub enum Expr {
     /// The choice: `if c { a } else { b }`.
     If(IfExpr),
 
+    /// A fold over a constant range: `(0..N).map(|i| e).sum()`.
+    Fold(FoldExpr),
+
+    /// A conversion: `i as f32`.
+    Cast(CastExpr),
+
     /// A block expression ({ let dx = ...; dx * dx }).
     Block(BlockExpr),
 
@@ -174,6 +183,8 @@ impl Expr {
             Expr::MethodCall(e) => e.span,
             Expr::Call(e) => e.span,
             Expr::If(e) => e.span,
+            Expr::Fold(e) => e.span,
+            Expr::Cast(e) => e.span,
             Expr::Block(e) => e.span,
             Expr::Paren(inner) => inner.span(),
         }
@@ -188,15 +199,96 @@ pub struct IdentExpr {
     pub span: Span,
 }
 
-/// A numeric literal, already the `f32` it denotes.
+/// A numeric literal: the number it denotes, decided by the parser.
 ///
-/// The parser decides the value — rounding a float once, as rustc does, and
-/// refusing a literal that names no `f32` — so no later stage holds the
-/// source text or rounds it again.
+/// The parser rounds a float once, as rustc does, so no later stage holds
+/// the source text or rounds it again. An integer is kept exactly as
+/// written, because its type depends on where it stands: a value where a
+/// value is expected ([`LiteralExpr::f32_value`]), a count in a range's
+/// bounds or a `usize` const ([`LiteralExpr::usize_value`]). Every stage
+/// asks those two questions here, so no two stages can answer them
+/// differently.
 #[derive(Debug, Clone)]
 pub struct LiteralExpr {
-    pub value: f32,
+    pub value: Literal,
     pub span: Span,
+}
+
+/// What a numeric literal denotes, before its position gives it a type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Literal {
+    /// A float literal, or an integer suffixed `f32` (a float literal to
+    /// rustc): the `f32` it rounds to, once.
+    F32(f32),
+    /// An unsuffixed integer literal: exactly the integer written.
+    Int(u128),
+}
+
+impl LiteralExpr {
+    /// The `f32` this literal denotes where a value is expected.
+    ///
+    /// An integer is refused unless an `f32` holds it exactly: at most
+    /// [`f32::MANTISSA_DIGITS`] significant bits. An integer's digits claim
+    /// exactness, and rustc has no rounding of its own to borrow here: it
+    /// refuses an unsuffixed integer where an `f32` is expected. `16777217`
+    /// (2²⁴ + 1) is the first integer refused; `1099511627776` (2⁴⁰) is
+    /// accepted.
+    pub fn f32_value(&self) -> syn::Result<f32> {
+        match self.value {
+            Literal::F32(value) => Ok(value),
+            // Exact, and finite: below 2¹²⁸, an integer with at most
+            // `MANTISSA_DIGITS` significant bits is at most `f32::MAX`.
+            Literal::Int(n) if significant_bits(n) <= f32::MANTISSA_DIGITS => Ok(n as f32),
+            Literal::Int(n) => Err(syn::Error::new(
+                self.span,
+                format!(
+                    "`{n}` is not exactly representable as an `f32`\n\
+                     \n\
+                     note: an `f32` holds an integer exactly only when it has at most {} \
+                     significant bits\n\
+                     \n\
+                     help: write the `f32` you mean as a float literal, e.g. `{n}.0`, \
+                     which rounds to the nearest one",
+                    f32::MANTISSA_DIGITS,
+                ),
+            )),
+        }
+    }
+
+    /// The `usize` this literal denotes in a range's bounds or a `usize`
+    /// const: an integer, at most `usize::MAX`. A `usize` is 64 bits on
+    /// every target this language compiles for (x86-64 and aarch64), and
+    /// the control plane is 64-bit.
+    pub fn usize_value(&self) -> syn::Result<u64> {
+        let Literal::Int(n) = self.value else {
+            return Err(syn::Error::new(
+                self.span,
+                "mismatched types: expected `usize`, found a float literal\n\
+                 \n\
+                 note: a range's bounds and a `usize` const are counts, written as integers",
+            ));
+        };
+        u64::try_from(n).map_err(|_| {
+            syn::Error::new(
+                self.span,
+                format!(
+                    "literal out of range for `usize`\n\
+                     \n\
+                     note: `{n}` is past `usize::MAX`, {}",
+                    u64::MAX
+                ),
+            )
+        })
+    }
+}
+
+/// The bits between an integer's highest and lowest set bits, inclusive:
+/// what a binary significand must hold to represent it exactly.
+fn significant_bits(n: u128) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+    u128::BITS - n.leading_zeros() - n.trailing_zeros()
 }
 
 /// Binary operators we recognize.
@@ -277,6 +369,80 @@ pub struct IfExpr {
     pub else_branch: Box<Expr>,
     /// The `if` token's span.
     pub span: Span,
+}
+
+/// `(lo..hi).map(|i| e).sum()` and its siblings: the fold of `e` over
+/// `i ∈ [lo, hi)` under a monoid, or the monoid's identity when the range is
+/// empty (docs/plans/2026-09-25-the-language-is-kernel.md §1.5).
+///
+/// The closure's parameter is the binder and its body is the fold's body.
+/// The closure is not a value, and has no meaning anywhere else. The bounds
+/// are constant, evaluated by `sema` at expansion, and the binder is a
+/// `usize`, which a body makes a value of only by `i as f32`.
+#[derive(Debug, Clone)]
+pub struct FoldExpr {
+    pub reduction: Reduction,
+    pub range: RangeExpr,
+    /// The closure's parameter: the index the body reads.
+    pub binder: Ident,
+    pub body: Box<Expr>,
+    /// The span of the method that names the reduction (`sum`, `fold`,
+    /// `any`, …).
+    pub span: Span,
+}
+
+/// The half-open `lo..hi` a fold ranges over.
+#[derive(Debug, Clone)]
+pub struct RangeExpr {
+    pub lo: Box<Expr>,
+    pub hi: Box<Expr>,
+    /// The `..` token's span.
+    pub span: Span,
+}
+
+/// Which monoid a fold combines its terms under, as the source spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reduction {
+    /// `.map(|i| e).sum()`: `+`, identity 0.
+    Sum,
+    /// `.map(|i| e).product()`: `×`, identity 1.
+    Product,
+    /// `.map(|i| e).fold(f32::INFINITY, f32::min)`: identity +∞.
+    Min,
+    /// `.map(|i| e).fold(f32::NEG_INFINITY, f32::max)`: identity −∞.
+    Max,
+    /// `.any(|i| m)`: a mask's `|`, identity all-clear.
+    Any,
+    /// `.all(|i| m)`: a mask's `&`, identity all-set.
+    All,
+}
+
+/// `operand as f32`, the language's one conversion. The target is always
+/// `f32` — the parser refuses any other — so it is not stored. `sema`
+/// accepts one operand: a `usize`, by name, a fold's index or a `usize`
+/// const.
+#[derive(Debug, Clone)]
+pub struct CastExpr {
+    pub operand: Box<Expr>,
+    /// The `as` token's span.
+    pub span: Span,
+}
+
+impl CastExpr {
+    /// The name being converted, through any parentheses, or `None` if the
+    /// operand is not a name. Only a name can be a `usize`: nothing in a
+    /// body computes one (plan §1.6), so a `usize` expression is always a
+    /// fold's index or a `usize` const.
+    pub fn named(&self) -> Option<&Ident> {
+        let mut operand = &*self.operand;
+        while let Expr::Paren(inner) = operand {
+            operand = inner;
+        }
+        match operand {
+            Expr::Ident(ident) => Some(&ident.name),
+            _ => None,
+        }
+    }
 }
 
 /// A statement in a block.

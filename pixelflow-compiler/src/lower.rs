@@ -13,14 +13,25 @@
 //! what lexical scoping means. A `const` lowers to the value `sema` gave it.
 //! An `if` lowers to [`OpKind::If`], the same node `.select` does.
 //!
+//! A fold lowers to one `Reduce` node over a [`Fold::Range`], built as
+//! `Kernel::over` builds it: the body against a placeholder index, then the
+//! binder chosen inside-out, the lowest slot no fold in the body binds. So a
+//! fold written here and the same fold built with `Kernel::sum_over` and its
+//! siblings are one arena. Nothing here unrolls: that is the e-graph's
+//! (`HalveFold`, `PeelFold`), when the kernel is baked.
+//!
 //! Emission — arena to the `TokenStream` that rebuilds it — is [`crate::emit`].
 
-use crate::ast::{BinaryOp, BlockExpr, Expr, FnItem, Role, Stmt, UnaryOp};
-use crate::sema::AnalyzedKernel;
+use crate::PLAN;
+use crate::ast::{
+    BinaryOp, BlockExpr, CastExpr, Expr, FnItem, FoldExpr, Reduction, Role, Stmt, UnaryOp,
+};
+use crate::sema::{AnalyzedKernel, ConstValue, range_bounds};
 use crate::symbol::Scopes;
-use pixelflow_ir::OpKind;
-use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+use pixelflow_ir::{Binder, Fold, Monoid, OpKind, Variance};
 use std::collections::HashMap;
+use std::ops::Range;
 
 /// DSL method calls that denote a fixed composition of primitive ops rather
 /// than a single [`OpKind`] — `(name, arg_count)`, `arg_count` excluding the
@@ -68,6 +79,106 @@ impl Projection {
 /// The coordinate axes, as `Dwrt` names them.
 const AXIS_X: u8 = 0;
 const AXIS_Y: u8 = 1;
+
+/// The `Var` index of the first placeholder: a fold's index while its body
+/// is built, before its slot is chosen.
+///
+/// Past every index a real binder can take — the reduction index space ends
+/// at [`Variance::VARIABLES`] — as `Kernel::over`'s placeholders are, so no
+/// rename of a placeholder can reach a binder an inner fold has already
+/// chosen. One placeholder per fold open at once, `PLACEHOLDER_BASE + depth`,
+/// so that a nested fold's rename never reaches its enclosing fold's index:
+/// sharing one would make `Σ_i Σ_j f(i, j)` into `Σ_i Σ_j f(j, j)`.
+const PLACEHOLDER_BASE: usize = Variance::VARIABLES as usize;
+
+/// A name in scope while a body is lowered.
+#[derive(Debug, Clone, Copy)]
+enum Binding {
+    /// A value: a `let`'s node, or a helper's parameter bound to its
+    /// argument's node.
+    Value(ExprId),
+    /// A fold's index, a `usize`: its placeholder `Var` while the fold's
+    /// body is built. A body reads it only as `i as f32`.
+    Index(ExprId),
+}
+
+/// The monoid a fold's spelling names.
+fn monoid(reduction: Reduction) -> Monoid {
+    match reduction {
+        Reduction::Sum => Monoid::SUM,
+        Reduction::Product => Monoid::PRODUCT,
+        Reduction::Min => Monoid::MIN,
+        Reduction::Max => Monoid::MAX,
+        Reduction::Any => Monoid::ANY,
+        Reduction::All => Monoid::ALL,
+    }
+}
+
+/// The largest bound a fold's index reaches exactly: 2²⁴.
+///
+/// The index is an `f32` lane — the binder's `Var`, and the counter the JIT
+/// steps by adding `1.0` — and an `f32` names every integer up to 2²⁴ and
+/// not every one past it, so past it indices round together and the fold is
+/// not the one written. Measured before this bound:
+/// `(16777100..16777300).map(|i| ((i as f32) - 16777000.0) * X).sum()` gave
+/// 39890 at `X = 1`, where rustc gives 39900; below 2²⁴ the two agree.
+const EXACT_INDEX_BOUND: u64 = 1 << f32::MANTISSA_DIGITS;
+
+/// A fold's bounds at the IR's width. `sema` holds a bound in 64 bits, as
+/// the control plane is. The IR narrows it twice: `RangeFold`'s ends are
+/// `u32` today (widening them is A5 of the plan, deprioritized), and the
+/// index is an `f32` lane, exact to [`EXACT_INDEX_BOUND`]. The lane is the
+/// tighter of the two and the one A5 would not lift, so a bound past it is
+/// refused here, naming both, rather than narrowed.
+fn ir_range(lo: u64, hi: u64) -> Result<Range<u32>, String> {
+    let exact = |bound: u64| {
+        u32::try_from(bound)
+            .ok()
+            .filter(|_| bound <= EXACT_INDEX_BOUND)
+    };
+    match (exact(lo), exact(hi)) {
+        (Some(lo), Some(hi)) => Ok(lo..hi),
+        _ => Err(format!(
+            "the range `{lo}..{hi}` reaches past {EXACT_INDEX_BOUND} (2^24): a fold's index is \
+             an `f32` lane, which names every integer only that far, so past it indices would \
+             round together and the fold would not be the one written\n\
+             note: a fold's ends are also `u32` in the IR today (`RangeFold`); 64-bit fold ends \
+             are A5 of {PLAN}, deprioritized, and would not widen the lane"
+        )),
+    }
+}
+
+/// The lowest binder no `Reduce` reachable from `body` binds.
+///
+/// `Kernel::over`'s rule, and a fold built here follows it so that the two
+/// constructions are one program: binders are chosen inside-out, so a fold
+/// sees every inner fold's slot and takes the next free one, and distinct
+/// live binders never share an index. `pixelflow-ir`'s own
+/// (`lowest_free_binder` in `kernel.rs`) is private and walks a `Dag`; this
+/// restatement goes with lowering's other copies in B5 of the plan, and
+/// `tests/fold_is_kernel_over.rs` pins the two to one canonical key.
+fn lowest_free_binder(arena: &ExprArena, body: ExprId) -> Result<Binder, String> {
+    let mut bound = [false; Binder::COUNT];
+    let mut seen = vec![false; arena.len()];
+    let mut stack = vec![body];
+    while let Some(id) = stack.pop() {
+        if std::mem::replace(&mut seen[id.0 as usize], true) {
+            continue;
+        }
+        if let ExprNode::Reduce { fold, .. } = arena.node(id) {
+            bound[usize::from(fold.binder().slot())] = true;
+        }
+        stack.extend(arena.children(id));
+    }
+    Binder::all()
+        .find(|binder| !bound[usize::from(binder.slot())])
+        .ok_or_else(|| {
+            format!(
+                "a fold whose body already binds all {} of the IR's indices (`Binder::COUNT`)",
+                Binder::COUNT
+            )
+        })
+}
 
 /// Build a `param_name → index` map over the params of an entry.
 ///
@@ -120,24 +231,26 @@ pub fn lower_entry(
             locals: Scopes::default(),
         },
         arena,
+        open_folds: 0,
     };
     lowering.lower(&entry.body)
 }
 
 /// The block's items: what every body can name besides its own scope.
 struct Program<'a> {
-    consts: &'a HashMap<String, f32>,
+    consts: &'a HashMap<String, ConstValue>,
     helpers: HashMap<String, &'a FnItem>,
 }
 
 /// The function being lowered: an entry's parameters by index, and the
-/// `let`-bound locals of the blocks being walked (one scope per block, with
-/// Rust's lexical scoping). An inlined helper's parameters are locals of its
-/// own frame, bound to the argument nodes.
+/// `let`-bound locals and fold indices of the blocks being walked (one scope
+/// per block, and one per fold body, with Rust's lexical scoping). An
+/// inlined helper's parameters are locals of its own frame, bound to the
+/// argument nodes.
 struct Frame {
     role: Role,
     params: HashMap<String, u8>,
-    locals: Scopes<ExprId>,
+    locals: Scopes<Binding>,
 }
 
 /// State threaded through the AST → arena walk.
@@ -145,6 +258,9 @@ struct Lowering<'a> {
     program: Program<'a>,
     frame: Frame,
     arena: &'a mut ExprArena,
+    /// How many folds' bodies are being built, across inlined helpers too:
+    /// the depth that picks the next fold's placeholder.
+    open_folds: usize,
 }
 
 impl Lowering<'_> {
@@ -156,7 +272,10 @@ impl Lowering<'_> {
         match expr {
             Expr::Ident(ident) => self.resolve(&ident.name.to_string()),
 
-            Expr::Literal(lit) => Ok(self.arena.push_const(lit.value)),
+            Expr::Literal(lit) => {
+                let value = lit.f32_value().map_err(|e| e.to_string())?;
+                Ok(self.arena.push_const(value))
+            }
 
             Expr::Binary(binary) => {
                 let lhs = self.lower(&binary.lhs)?;
@@ -266,10 +385,90 @@ impl Lowering<'_> {
                 Ok(self.arena.push_ternary(OpKind::If, cond, then, otherwise))
             }
 
+            Expr::Fold(fold) => self.lower_fold(fold),
+
+            Expr::Cast(cast) => self.lower_cast(cast),
+
             // Parentheses are transparent - just recurse into the inner expression
             Expr::Paren(inner) => self.lower(inner),
 
             Expr::Block(block) => self.lower_block(block),
+        }
+    }
+
+    /// `⊕_{i ∈ [lo, hi)} body` as one `Reduce` over a [`Fold::Range`].
+    ///
+    /// The body is built in a copy of the arena, against a placeholder
+    /// index, and only the finished fold is spliced back: the placeholder's
+    /// nodes, which renaming it to the chosen binder leaves unreachable,
+    /// stay in the copy and are dropped with it, so the arena this emits
+    /// holds only the program. Every id bound before the fold means the
+    /// same node in the copy, which is what lets the body read them.
+    fn lower_fold(&mut self, fold: &FoldExpr) -> Result<ExprId, String> {
+        let copy = self.arena.clone();
+        let enclosing = std::mem::replace(&mut *self.arena, copy);
+        let built = self.build_fold(fold);
+        let copy = std::mem::replace(&mut *self.arena, enclosing);
+        Ok(self.arena.splice(&copy, built?))
+    }
+
+    /// [`Self::lower_fold`]'s fold, built in the arena it swapped in: the
+    /// body with the index bound to a placeholder, then the binder chosen —
+    /// after the body exists, since which slots its folds bind decides it —
+    /// and the placeholder renamed to it.
+    fn build_fold(&mut self, fold: &FoldExpr) -> Result<ExprId, String> {
+        let (lo, hi) = range_bounds(&fold.range, self.program.consts).map_err(|e| e.to_string())?;
+        let range = ir_range(lo, hi)?;
+        if self.open_folds >= Binder::COUNT {
+            return Err(format!(
+                "folds nested more than {} deep: the IR binds at most that many indices at once \
+                 (`Binder::COUNT`)",
+                Binder::COUNT
+            ));
+        }
+        let placeholder_var = u8::try_from(PLACEHOLDER_BASE + self.open_folds)
+            .map_err(|_| format!("fold placeholder past `u8`: {} open", self.open_folds))?;
+        let placeholder = self.arena.push_var(placeholder_var);
+
+        self.frame.locals.push_scope();
+        self.frame
+            .locals
+            .bind(fold.binder.to_string(), Binding::Index(placeholder));
+        self.open_folds += 1;
+        let body = self.lower(&fold.body);
+        self.open_folds -= 1;
+        self.frame.locals.pop_scope();
+        let body = body?;
+
+        let binder = lowest_free_binder(self.arena, body)?;
+        let index = self.arena.push_var(binder.var());
+        let body = self
+            .arena
+            .substitute_vars_with(body, &[(placeholder_var, index)]);
+        Ok(self
+            .arena
+            .push_reduce(Fold::new(monoid(fold.reduction), binder, range), body))
+    }
+
+    /// `i as f32`. A fold's index is an `f32` lane already, so its
+    /// conversion is its binder's `Var`; a `usize` const is its value's
+    /// `f32`, rounded as Rust's `as` rounds it.
+    fn lower_cast(&mut self, cast: &CastExpr) -> Result<ExprId, String> {
+        let Some(name) = cast.named() else {
+            return Err("`as f32` converts a `usize`, which is a name".to_string());
+        };
+        let name = name.to_string();
+        if let Some(&binding) = self.frame.locals.lookup(&name) {
+            return match binding {
+                Binding::Index(index) => Ok(index),
+                Binding::Value(_) => Err(format!(
+                    "`{name} as f32`: `{name}` is a value, and `as f32` converts a `usize`"
+                )),
+            };
+        }
+        match self.program.consts.get(&name) {
+            Some(&ConstValue::Usize(count)) => Ok(self.arena.push_const(count as f32)),
+            _ => Err(format!("`{name} as f32`: `{name}` is not a `usize`")),
         }
     }
 
@@ -325,13 +524,17 @@ impl Lowering<'_> {
         let mut locals = Scopes::default();
         for (param, arg) in helper.params.iter().zip(args) {
             let id = self.lower(arg)?;
-            locals.bind(param.name.to_string(), id);
+            locals.bind(param.name.to_string(), Binding::Value(id));
         }
         let callee = Frame {
             role: Role::Helper,
             params: HashMap::new(),
             locals,
         };
+        // The frame is swapped and the fold depth is not: a helper's fold
+        // inlined inside a fold is nested in it, and its placeholder must
+        // not be the caller's, or its rename would reach the caller's index
+        // through the argument (pinned against rustc and the builder).
         let caller = std::mem::replace(&mut self.frame, callee);
         let body = self.lower(&helper.body);
         self.frame = caller;
@@ -349,8 +552,14 @@ impl Lowering<'_> {
     /// input is one refactor away from that bug again. For the same reason a
     /// coordinate in a helper is refused here too, not only in `sema`.
     fn resolve(&mut self, name: &str) -> Result<ExprId, String> {
-        if let Some(&id) = self.frame.locals.lookup(name) {
-            return Ok(id);
+        if let Some(&binding) = self.frame.locals.lookup(name) {
+            return match binding {
+                Binding::Value(id) => Ok(id),
+                Binding::Index(_) => Err(format!(
+                    "`{name}` is a fold's index, a `usize`, where a value is expected: \
+                     `{name} as f32`"
+                )),
+            };
         }
         // The same order sema documents: a binding, then a parameter, then
         // a const, then the coordinates. Sema refuses a parameter named X or
@@ -359,8 +568,14 @@ impl Lowering<'_> {
         if let Some(&idx) = self.frame.params.get(name) {
             return Ok(self.arena.push_param(idx));
         }
-        if let Some(&value) = self.program.consts.get(name) {
-            return Ok(self.arena.push_const(value));
+        match self.program.consts.get(name) {
+            Some(&ConstValue::F32(value)) => return Ok(self.arena.push_const(value)),
+            Some(ConstValue::Usize(_)) => {
+                return Err(format!(
+                    "`{name}` is a `usize` const, where a value is expected: `{name} as f32`"
+                ));
+            }
+            None => {}
         }
         let axis = match name {
             "X" => AXIS_X,
@@ -392,7 +607,9 @@ impl Lowering<'_> {
                 // sees whatever the name meant before: `let a = a + 1.0;`.
                 Stmt::Let(let_stmt) => {
                     let id = self.lower(&let_stmt.init)?;
-                    self.frame.locals.bind(let_stmt.name.to_string(), id);
+                    self.frame
+                        .locals
+                        .bind(let_stmt.name.to_string(), Binding::Value(id));
                 }
                 // A non-binding statement has no value to thread; lower it so
                 // any nested error surfaces, then discard the id.
@@ -419,6 +636,7 @@ fn push_dwrt(arena: &mut ExprArena, expr: ExprId, var: u8) -> ExprId {
 mod tests {
     use super::*;
     use crate::parser::parse;
+    use crate::sema::Ty;
     use pixelflow_ir::arena::ExprNode;
     use quote::quote;
 
@@ -436,7 +654,11 @@ mod tests {
                 let Expr::Literal(lit) = &c.init else {
                     panic!("this harness holds literal consts only");
                 };
-                (c.name.to_string(), lit.value)
+                let value = match Ty::from_syn(&c.ty) {
+                    Some(Ty::Usize) => ConstValue::Usize(lit.usize_value().expect("a count")),
+                    _ => ConstValue::F32(lit.f32_value().expect("a value")),
+                };
+                (c.name.to_string(), value)
             })
             .collect();
         let unanalyzed = AnalyzedKernel { def, consts };
@@ -578,6 +800,144 @@ mod tests {
             panic!("a helper reads no coordinate");
         };
         assert!(err.contains("`X` in a helper"), "got: {err}");
+    }
+
+    // ───────────────────────────── folds ─────────────────────────────
+
+    /// Whether any node in the arena — reachable or not — is a
+    /// placeholder index.
+    fn holds_a_placeholder(arena: &ExprArena) -> bool {
+        arena
+            .nodes()
+            .any(|(_, node)| matches!(node, ExprNode::Var(v) if usize::from(v) >= PLACEHOLDER_BASE))
+    }
+
+    /// A fold is one `Reduce` over its range, its body reading the binder's
+    /// `Var`, and the arena holds nothing else: the placeholder the body was
+    /// built against stayed in the copy it was built in.
+    #[test]
+    fn a_fold_lowers_to_one_reduce_and_leaves_nothing_behind() {
+        let (arena, root) = lowered(quote! { || (2..6).map(|i| X * (i as f32)).sum() });
+        let ExprNode::Reduce { fold, body } = arena.node(root) else {
+            panic!("expected a fold, got {}", arena.display(root));
+        };
+        let Fold::Range(range) = fold else {
+            panic!("a fold over a range, got {fold}");
+        };
+        assert_eq!(range.range(), 2..6);
+        assert_eq!(range.monoid(), Monoid::SUM);
+        assert_eq!(range.binder().slot(), 0);
+        let ExprNode::Binary(OpKind::Mul, x, index) = arena.node(body) else {
+            panic!("expected the product, got {}", arena.display(body));
+        };
+        assert!(matches!(arena.node(x), ExprNode::Var(0)));
+        assert!(matches!(arena.node(index), ExprNode::Var(v) if v == range.binder().var()));
+        assert!(!holds_a_placeholder(&arena));
+        assert_eq!(
+            arena.len(),
+            4,
+            "X, the index, the product, the fold, and nothing else"
+        );
+    }
+
+    /// Nested folds each take their own slot, inside-out, and no
+    /// placeholder of either survives.
+    #[test]
+    fn nested_folds_take_distinct_slots_inside_out() {
+        let (arena, root) = lowered(quote! {
+            || (0..3).map(|i| (0..4).map(|j| (i as f32) * (j as f32)).sum::<f32>()).sum()
+        });
+        let ExprNode::Reduce { fold: outer, body } = arena.node(root) else {
+            panic!("expected the outer fold, got {}", arena.display(root));
+        };
+        let ExprNode::Reduce { fold: inner, .. } = arena.node(body) else {
+            panic!("expected the inner fold, got {}", arena.display(body));
+        };
+        assert_eq!(outer.binder().slot(), 1);
+        assert_eq!(inner.binder().slot(), 0);
+        assert!(!holds_a_placeholder(&arena));
+    }
+
+    /// Lowering refuses a fold's index where a value is expected, as `sema`
+    /// does, without relying on it.
+    #[test]
+    fn an_index_where_a_value_is_expected_is_refused_here_too() {
+        let Err(err) = lower_unanalyzed(quote! { || (0..4).map(|i| X * i).sum() }) else {
+            panic!("`i` is a `usize`");
+        };
+        assert!(
+            err.contains("`i` is a fold's index, a `usize`"),
+            "got: {err}"
+        );
+        let Err(err) = lower_unanalyzed(quote! {
+            const N: usize = 4;
+            pub fn f() -> f32 { X * N }
+        }) else {
+            panic!("`N` is a `usize`");
+        };
+        assert!(err.contains("`N` is a `usize` const"), "got: {err}");
+    }
+
+    /// A `usize` const `as f32` is its value's `f32`.
+    #[test]
+    fn a_usize_const_as_f32_is_its_value() {
+        let (arena, root) = lowered(quote! {
+            const N: usize = 4;
+            pub fn f() -> f32 { N as f32 }
+        });
+        assert!(matches!(arena.node(root), ExprNode::Const(v) if v == 4.0));
+    }
+
+    /// `sema` holds a bound in 64 bits; the IR's index is an `f32` lane,
+    /// exact to 2²⁴, and its fold ends are `u32`. A bound past the lane is
+    /// refused — past `u32` too, naming the plan's A5 — and 2²⁴ itself is
+    /// the last bound accepted.
+    #[test]
+    fn a_bound_past_the_exact_index_is_refused_naming_a5() {
+        for past in [
+            quote! { || (0..16777217).map(|i| i as f32).sum() },
+            quote! { || (16777217..16777217).map(|i| i as f32).sum() },
+            quote! { || (0..4294967296).map(|i| i as f32).sum() },
+        ] {
+            let Err(err) = lower_unanalyzed(past) else {
+                panic!("past 2^24 an f32 lane does not name every index");
+            };
+            assert!(
+                err.contains("past 16777216 (2^24)") && err.contains("A5") && err.contains(PLAN),
+                "got: {err}"
+            );
+        }
+        let (arena, root) = lowered(quote! { || (16777215..16777216).map(|i| i as f32).sum() });
+        let ExprNode::Reduce {
+            fold: Fold::Range(range),
+            ..
+        } = arena.node(root)
+        else {
+            panic!("expected a fold, got {}", arena.display(root));
+        };
+        assert_eq!(range.range(), 16_777_215..16_777_216);
+    }
+
+    /// Folds nest as deep as the IR has binders, and no deeper: one more is
+    /// refused, not a panic.
+    #[test]
+    fn folds_nest_as_deep_as_the_ir_has_binders() {
+        let nest = |depth: usize| {
+            let mut body = quote! { X };
+            for _ in 0..depth {
+                body = quote! { (0..1).map(|i| #body).sum::<f32>() };
+            }
+            quote! { || #body }
+        };
+        let (arena, root) = lowered(nest(Binder::COUNT));
+        let ExprNode::Reduce { fold, .. } = arena.node(root) else {
+            panic!("expected a fold");
+        };
+        assert_eq!(usize::from(fold.binder().slot()), Binder::COUNT - 1);
+        let Err(err) = lower_unanalyzed(nest(Binder::COUNT + 1)) else {
+            panic!("one fold deeper than the index space");
+        };
+        assert!(err.contains("nested more than"), "got: {err}");
     }
 
     /// Helpers calling helpers: each call is its own inlining, over its own
