@@ -104,14 +104,21 @@ impl Monoid {
     /// bytes: the `kernel!` macro emits a family's monoid this way, by value,
     /// as it emits a fold by [`Fold::to_bits`], so the algebra the program
     /// combines copies under is the one lowering chose and no table of names
-    /// can say another.
+    /// can say another. A range fold's bits hold their monoid as this code.
+    ///
+    /// Not API: `kernel!`'s emitted code decodes it, in the crate that
+    /// writes the block, which is why the pair is `pub`; hidden, as
+    /// `pixelflow-core`'s `__macro` is. It hands no consumer an opcode to
+    /// reason with — see [`Fold::to_bits`].
+    #[doc(hidden)]
     #[must_use]
     pub fn marshal(self) -> OpCode {
         self.op().marshal()
     }
 
     /// Decode. `None` if the code names no op, or an op that generates no
-    /// algebra.
+    /// algebra. Not API, as [`marshal`](Self::marshal) is not.
+    #[doc(hidden)]
     #[must_use]
     pub fn unmarshal(code: OpCode) -> Option<Self> {
         OpKind::unmarshal(code).and_then(Self::of)
@@ -137,8 +144,13 @@ impl Monoid {
 /// builds its terms between steps. A callback is handed the monoid's own
 /// operation to build with; no caller names one.
 ///
+/// Not API: `kernel!`'s emitted code builds a family's copies through it, in
+/// the crate that writes the block, which is why it is `pub`; hidden, as
+/// `pixelflow-core`'s `__macro` is.
+///
 /// [`Kernel::over`]: crate::Kernel::over
 /// [`Kernel::fold`]: crate::Kernel::fold
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct Chain<R> {
     monoid: Monoid,
@@ -357,8 +369,13 @@ impl Fold {
     /// and the `kernel!` macro, which emits an arena as tokens that rebuild
     /// it at load time. Each of them is *serializing* a fold rather than
     /// reasoning about one, so this is what they get — not an accessor for
-    /// the combining opcode, which stays crate-private because the op set is
-    /// an IR concept and a consumer names algebras.
+    /// the combining opcode: the op set is an IR concept, a consumer names
+    /// algebras, and `Monoid::op` is crate-private. The opcode itself is
+    /// reachable — these bits decode, `Monoid::marshal` (hidden: the
+    /// macro's, and the code these bits hold the monoid as) round-trips
+    /// through `OpKind::unmarshal`, and a backend emitting a surviving loop
+    /// reads it through [`RangeFold::combine_op`] — so what is withheld is
+    /// an accessor offered to anything that reasons about a fold.
     ///
     /// The domain is a tag at bit 112 (`DOMAIN_TAG_SHIFT`); below it, a range is
     /// `stride << 80 | op << 72 | binder << 64 | lo << 32 | hi` — the layout
@@ -647,10 +664,18 @@ impl RangeFold {
         })
     }
 
+    /// The monoid's byte in [`RangeFold::to_bits`]: its code
+    /// (`Monoid::marshal`), the one encoding of a monoid, so the bits and a
+    /// `kernel!` expansion cannot come to spell one differently.
+    fn monoid_byte(self) -> u8 {
+        let [byte] = self.monoid.marshal().to_bytes();
+        byte
+    }
+
     /// The payload [`Fold::to_bits`] writes below the domain tag.
     fn to_bits(self) -> u128 {
         u128::from(self.stride) << 80
-            | u128::from(self.monoid.op().index() as u8) << 72
+            | u128::from(self.monoid_byte()) << 72
             | u128::from(self.binder.slot()) << 64
             | u128::from(self.lo) << 32
             | u128::from(self.hi)
@@ -660,7 +685,7 @@ impl RangeFold {
     /// [`Fold::from_bits`] for what is refused.
     fn from_bits(bits: u128) -> Option<Self> {
         let stride = ((bits >> 80) & 0xffff_ffff) as u32;
-        let monoid = Monoid::of(OpKind::from_index(((bits >> 72) & 0xff) as usize)?)?;
+        let monoid = Monoid::unmarshal(OpCode::from_bytes([((bits >> 72) & 0xff) as u8]))?;
         let binder = Binder::from_slot(((bits >> 64) & 0xff) as u8)?;
         let lo = ((bits >> 32) & 0xffff_ffff) as u32;
         let hi = (bits & 0xffff_ffff) as u32;

@@ -1330,8 +1330,7 @@ impl ExprArena {
     /// [`UniformIdentity`]: one instance read from twenty places is one slot,
     /// and two instances of one builder stay two.
     ///
-    /// [`splice_with`](Self::splice_with)'s case that places each uniform
-    /// by identity.
+    /// `splice_with`'s case that places each uniform by identity.
     pub fn splice(&mut self, other: &ExprArena, root: ExprId) -> ExprId {
         self.splice_with(other, root, |arena, slot| {
             let found = arena.uniform_slot_for(other.uniforms[slot.0 as usize]);
@@ -1348,6 +1347,11 @@ impl ExprArena {
     /// table rewritten and no identity searched for.
     ///
     /// Buffers merge by identity, as [`splice`](Self::splice)'s do.
+    ///
+    /// Not API: `kernel!`'s emitted code calls it, in the crate that writes
+    /// the block, which is why it is `pub`; hidden, as `pixelflow-core`'s
+    /// `__macro` is.
+    #[doc(hidden)]
     pub fn splice_with<F>(&mut self, other: &ExprArena, root: ExprId, mut input: F) -> ExprId
     where
         F: FnMut(&mut ExprArena, UniformId) -> ExprId,
