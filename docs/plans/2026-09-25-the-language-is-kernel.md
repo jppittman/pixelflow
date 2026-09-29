@@ -208,10 +208,10 @@ So the language has none:
   - as a scalar uniform, per call;
   - as a structural count (§1.4), which fixes how many uniforms there are.
 - **A family `pieces: [Row; N]` is not a table.** It is `10·N` scalar
-  uniforms at static slots. `pieces.map(|p| …)` iterates the family's
-  *structure* at instantiation: the program holds `N` copies of the body,
-  each over its own ten uniforms, and no index exists at runtime. That is
-  what "the kernel for that number of control points" means.
+  uniforms at static slots. `pieces.into_iter().map(|p| …)` iterates the
+  family's *structure* at instantiation: the program holds `N` copies of the
+  body, each over its own ten uniforms, and no index exists at runtime. That
+  is what "the kernel for that number of control points" means.
   - It is not a bespoke unrolling pass: there is no fold to unroll. The
     e-graph's `HalveFold` unrolls folds over ranges; a family has none.
   - The measured form of this program is `U_band` (one-pipeline §1.4,
@@ -281,15 +281,20 @@ kernel! {
     /// The pieces and the box are uniforms; N is the program.
     pub fn glyph<const N: usize>(pieces: [Row; N], bounds: Bounds) -> f32 {
         let (x, y) = (X + PIXEL_CENTER, Y + PIXEL_CENTER);
-        let f: f32 = pieces.map(|p| piece_term(p, x, y)).sum();
+        let f: f32 = pieces.into_iter().map(|p| piece_term(p, x, y)).sum();
         if inside(bounds, x, y) { coverage(f) } else { 0.0 }
     }
 }
 ```
 
-**The spelling still to choose (Q2)** is `pieces.map(…).sum()`: iteration
-over a family's structure at instantiation. The program it produces has no
-fold, no table and no index.
+**The spelling (Q2), chosen in B3 pending JP's veto,** is
+`pieces.into_iter().map(|p| …).sum()`: iteration over a family's structure
+at instantiation. It is Rust's own: `into_iter()` on an array yields its
+elements by value, so `p` passes to a helper taking a `Row`, and rustc
+types the block as the kernel does. The program it produces has no fold, no
+table and no index: at `N = 3` it is the three copies summed by hand, one
+canonical key (F, `pixelflow-compiler/tests/a_family_is_its_copies.rs`,
+which compiles this block).
 
 **What stays host Rust.** None of this is program; it produces the
 per-call uniforms and the count `N`.
@@ -349,6 +354,11 @@ Three problems, none of which touches the language:
 - Each entry becomes a host function that instantiates the lowered template
   with its structural values and returns the opaque `Kernel`.
 - The template is a replay of `ExprArena` pushes, as `emit.rs` emits today.
+- A family's iteration is its body's own template, built once over an
+  abstract element and the terms every copy shares (built once, outside
+  it), and copied per element at instantiation, the element's uniforms and
+  the shared terms in its inputs' places (B3). B6 closes that template
+  once, before the copies.
 - No optimization runs at expansion unless the instance is declared (Phase
   E).
 
@@ -423,12 +433,18 @@ and no digests are committed (one-pipeline §5, gate policy).
   items and helper `fn`s.
 - **B2.** Folds over constant ranges, and the binder type.
 - **B3.** Binding times and `Args`, records, structural counts, and families
-  of records iterated at instantiation.
+  of records iterated at instantiation. **Done**: records, binding times and
+  `Args` in `f002fb6a`; families and tuple `let`s in (this commit).
 - **B4.** `integral`, `area` and `monotone_root`.
 - **B5.** Lowering calls `pixelflow-ir`'s definitions, and `lower.rs`'s
   copies go.
 - **B6.** Helpers as optimization units (D19): a helper's integral is closed
   once and instantiated.
+  - A family's iteration is lowered as `body + marker`, which survives a
+    splice and not a rewrite: reassociated, `t + (body + marker)` reads as
+    an iteration of `t + body`. Nothing optimizes one today (B3 pins it);
+    before B6 closes a template, key the iteration by a handle a rewrite
+    cannot move.
 - **B7.** The equivalence gate: one glyph built by `kernel!` and by the
   builder gives the same pixels over ASCII at 7, 16 and 32 px.
 
@@ -484,7 +500,13 @@ bounding; recompile on zoom; caching later (§1.6–§1.8).
 **Q2. Syntax vetoes.** The syntax choices are yours:
 - the items block with `pub fn` entries;
 - `(0..N).map(|i| …).sum()`;
-- iterating a family at instantiation (`pieces.map(…)`);
+- iterating a family at instantiation: **chosen in B3, pending your veto**,
+  `pieces.into_iter().map(|p| …).sum()` and the other five reductions, as
+  `(0..N)` has them. Rust's own spelling, so the block's items compile as
+  Rust and rustc is the oracle: `into_iter()` on an array yields elements by
+  value, and `p` passes to a helper taking `Row`. The placeholder
+  `pieces.map(…)` is an array's own `map` in Rust, which returns an array
+  and has no `.sum()`;
 - `if` as the only choice;
 - `const` parameters as structural;
 - `integral` and `area`;

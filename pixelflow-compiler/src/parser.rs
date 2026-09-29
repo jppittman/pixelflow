@@ -25,8 +25,12 @@
 //!                                            -- an entry's structural parameters
 //! params  ::= (param (',' param)* ','?)?
 //! param   ::= IDENT ':' type
-//! type    ::= 'f32' | 'bool' | RECORD        -- an entry's parameters are `f32`s
-//!                                            -- and records: its uniforms
+//! type    ::= 'f32' | 'bool' | RECORD        -- an entry's parameters are `f32`s,
+//!                                            -- records and families: its uniforms
+//!           | '[' (RECORD | 'f32') ';' (INTEGER | IDENT) ']'
+//!                                            -- a family, an entry's: N elements'
+//!                                            -- uniforms, N a literal, a `usize`
+//!                                            -- const or a structural parameter
 //!
 //! cexpr   ::= cexpr ('+' | '-' | '*' | '/') cexpr   -- an `f32` const's initializer
 //!           | '-' cexpr | '(' cexpr ')'            -- or an integral's bounds,
@@ -49,6 +53,7 @@
 //!           | IDENT '(' (expr (',' expr)*)? ')'    -- a helper, inlined
 //!           | 'if' expr block 'else' (block | 'if' …)   -- the choice
 //!           | fold
+//!           | iteration
 //!           | integral
 //!           | 'monotone_root' '(' expr ',' expr ',' expr ')'   -- τ(δ), from (δ, step, bend)
 //!           | IDENT 'as' 'f32'         -- a `usize` (a fold's index, a `usize`
@@ -69,6 +74,19 @@
 //!           | range '.all' '(' binder expr ')'                           -- ∀, of bools
 //! range   ::= '(' iexpr '..' iexpr ')'     -- half-open, constant, forwards
 //! binder  ::= '|' IDENT '|'                -- the index: a `usize`
+//! iteration ::= family '.map' '(' element expr ')' '.sum' F32? '(' ')'           -- Σ
+//!           | family '.map' '(' element expr ')' '.product' F32? '(' ')'       -- Π
+//!           | family '.map' '(' element expr ')'
+//!                 '.fold' '(' 'f32::INFINITY' ',' 'f32::min' ')'             -- min
+//!           | family '.map' '(' element expr ')'
+//!                 '.fold' '(' 'f32::NEG_INFINITY' ',' 'f32::max' ')'         -- max
+//!           | family '.any' '(' element expr ')'                             -- ∃
+//!           | family '.all' '(' element expr ')'                             -- ∀
+//!                                          -- one copy of the body per element,
+//!                                          -- made when the host fn is instantiated
+//! family  ::= IDENT '.into_iter' '(' ')' | '(' family ')'
+//!                                          -- an entry's family, by value
+//! element ::= '|' IDENT '|'                -- one element: a record, or an `f32`
 //! integral ::= 'integral' '(' interval ',' '|' IDENT '|' expr ')'
 //!                                          -- ∫ over [lo, hi); the variable an `f32`
 //!           | 'area' '(' '|' IDENT ',' IDENT '|' expr ')'
@@ -83,6 +101,10 @@
 //!           | '&' | '|'                                -- bools combine
 //! block   ::= '{' stmt* expr '}'
 //! stmt    ::= 'let' IDENT (':' type)? '=' expr ';'
+//!           | 'let' '(' IDENT (',' IDENT)* ','? ')' (':' '(' type (',' type)* ')')?
+//!                 '=' '(' expr (',' expr)* ','? ')' ';'
+//!                                          -- as many names as expressions, each
+//!                                          -- bound to its own, all at once
 //!           | expr ';'
 //!
 //! VIS        -- `pub`, `pub(crate)`, …: a visibility, kept on the host item
@@ -113,6 +135,21 @@
 //! parameter, a `let` alias of one (`let q = p;`), an argument passed on, or
 //! the base of a field read.
 //!
+//! Families (plan §1.6). An entry's `pieces: [Row; N]` is `N` elements'
+//! uniforms at static slots, element-major, and not a table: it is iterated
+//! as a whole, `pieces.into_iter().map(|p| e).sum()` and its siblings,
+//! which denote ⊕ of `e[p := element k]` over the elements, the monoid's
+//! identity when there are none. The program holds one copy of the body per
+//! element, made when the host function is instantiated; no fold, binder or
+//! index exists for the family, and nothing else is done with one. The
+//! spelling is Rust's own — `into_iter()` on an array yields its elements by
+//! value, so `p` passes to a helper taking a `Row` — and rustc types it as
+//! the kernel does.
+//!
+//! A tuple is taken apart where it is written, and only there:
+//! `let (a, b) = (e1, e2);` binds each name to its expression, every
+//! expression read before any name binds, as Rust's does (D7's front half).
+//!
 //! A record and its fields keep their attributes, re-emitted on the host
 //! struct; every other item keeps only its doc comments.
 //!
@@ -120,26 +157,34 @@
 //! `const` or a `fn`; a record that is generic, a tuple struct or a unit
 //! struct, and a `repr` or a `cfg` on a record or its field (§1.3); an
 //! attribute other than a doc comment on a `const` or a `fn`; generics on a
-//! helper (B3) and on a `const`, and any generic of an entry but a
+//! helper and on a `const`, and any generic of an entry but a
 //! `const N: usize` without a default; a parameter typed as a closure
 //! (Phase D); a `fn` without a declared return type; an `if` without an
 //! `else` or an `if let`; `loop`/`while`/`for`; assignment; `return`; a
-//! closure anywhere but a fold's or an integral's; a tuple and a tuple field
-//! (B3, D7's front half); a record literal (Phase D, D7); a range anywhere
-//! but a fold's or an integral's; an `integral` or an `area` of any other
-//! shape than the two above (an argument missing or extra, the interval not
-//! a range, the closure's parameters not one plain name for `integral` and
-//! two distinct ones for `area`, a parameter with a type, a qualified
-//! closure or one with a return type); an inclusive or open-ended range; a
-//! method on a range or a mapped range that is not one of the fold's
-//! spellings; `.map`, `.any` or `.all` over anything but a range (iterating
-//! a family of records is B3); a `.fold` whose arguments are not one of the
-//! two above; a fold's closure with a type annotation, a pattern, more than
-//! one parameter, a return type or a qualifier; type arguments on a method
+//! closure anywhere but a fold's, an iteration's or an integral's; a tuple
+//! anywhere but a tuple `let`'s value, and a tuple's field (a tuple value is
+//! Phase D, D7); a record literal (Phase D, D7); indexing and slicing (there
+//! are no tables, §1.6); a range anywhere but a fold's or an integral's; an
+//! `integral` or an `area` of any other shape than the two above (an
+//! argument missing or extra, the interval not a range, the closure's
+//! parameters not one plain name for `integral` and two distinct ones for
+//! `area`, a parameter with a type, a qualified closure or one with a return
+//! type); an inclusive or open-ended range; a method on a range or a mapped
+//! range that is not one of the fold's spellings; any method on a family's
+//! `into_iter()` but `.map`, `.any` and `.all` — `.rev`, `.enumerate`,
+//! `.skip`, … (no index, no order, §1.6) — and a mapped family not ended by
+//! one of the six reductions; `.map`, `.any` or `.all` over anything but a
+//! range or a family's `into_iter()` (an array's own `.map`, `.iter()`);
+//! a `.fold` whose arguments are not one of the two above; a fold's or an
+//! iteration's closure with a type annotation, a pattern, more than one
+//! parameter, a return type or a qualifier; type arguments on a method
 //! (`::<f32>` on `.sum` and `.product` excepted); an `as` to any type but
 //! `f32`; a path or a call from outside the block; `%` and `!` (no IR op);
-//! a `let` whose pattern is not a plain name (`mut`, `ref`, `@`;
-//! destructuring is B3); a `let` without an initializer; `let … else`; an
+//! a `let` whose pattern is neither a plain name nor a tuple of them (`mut`,
+//! `ref`, `@`, a record's pattern); a tuple `let` whose value is not a tuple
+//! of as many expressions, with a pattern within its pattern, a `_` or a
+//! `..`, a name bound twice, no names, or an annotation that is not a tuple
+//! of as many types; a `let` without an initializer; `let … else`; an
 //! item or a macro inside a block; an operator not in the table above; a
 //! literal that is not a number; a literal suffixed with a type other than
 //! `f32`; an integer past `u128`; a float past `f32`'s range; and any other
@@ -154,7 +199,13 @@
 //! or a `bool`; a `usize` is used only as `i as f32`; a record only by name;
 //! an integrand is an `f32`); a record's field that is not an `f32` (§1.3); a
 //! record returned, built, chosen by an `if`, or used in arithmetic or a
-//! comparison (Phase D, D7); an unknown field; an `as` of anything but a
+//! comparison (Phase D, D7); a family whose element is not a record or an
+//! `f32`, whose count is not an integer literal, a `usize` const or a
+//! structural parameter, or that is a helper's parameter, and a family
+//! anywhere but as what `into_iter()` iterates — passed, aliased, compared,
+//! returned, converted, read by field — or with an array's method,
+//! `.len()`, `.iter()`, `.get` (§1.6); iterating what is not a family; an
+//! element outside its closure; an unknown field; an `as` of anything but a
 //! `usize` name; an integer an `f32` does not hold exactly where a value is
 //! expected; a `const` whose initializer is not a `cexpr` or an `iexpr`; a
 //! negated `usize`; a range whose bounds are not constant or that runs
@@ -178,10 +229,10 @@
 
 use crate::PLAN;
 use crate::ast::{
-    AREA, BinaryExpr, BinaryOp, BlockExpr, CallExpr, CastExpr, ConstItem, Expr, FieldExpr, FnItem,
-    FoldExpr, INTEGRAL, IdentExpr, IfExpr, IntegralBounds, IntegralExpr, KernelDef, LetStmt,
-    Literal, LiteralExpr, MethodCallExpr, Param, RangeExpr, RecordField, RecordItem, Reduction,
-    Spelling, Stmt, UnaryExpr, UnaryOp,
+    AREA, BinaryExpr, BinaryOp, BlockExpr, CallExpr, CastExpr, ConstItem, Expr, FAMILY_SUM,
+    FamilyExpr, FamilyType, FieldExpr, FnItem, FoldExpr, INTEGRAL, IdentExpr, IfExpr,
+    IntegralBounds, IntegralExpr, KernelDef, LetStmt, Literal, LiteralExpr, MethodCallExpr, Param,
+    ParamType, RangeExpr, RecordField, RecordItem, Reduction, Spelling, Stmt, UnaryExpr, UnaryOp,
 };
 use proc_macro2::{Span, TokenStream};
 use syn::parse::{Parse, ParseStream};
@@ -226,7 +277,7 @@ fn parse_closure(input: ParseStream) -> syn::Result<KernelDef> {
 
             params.push(Param {
                 name: ident,
-                ty: Box::new(ty),
+                ty: param_type(ty)?,
             });
 
             // Check for comma or end of params
@@ -520,7 +571,8 @@ fn structural_parameters(generics: &syn::Generics) -> syn::Result<Vec<syn::Ident
 }
 
 /// A helper takes no generics: it is inlined into an entry, and reads the
-/// entry's structural parameters only through its arguments.
+/// entry's structural parameters only through its arguments — a count as
+/// `n as f32`, a family one element at a time.
 fn refuse_a_helpers_generics(generics: &syn::Generics) -> syn::Result<()> {
     if let Some(param) = generics.params.first() {
         return Err(syn::Error::new_spanned(
@@ -529,9 +581,10 @@ fn refuse_a_helpers_generics(generics: &syn::Generics) -> syn::Result<()> {
                 "generics on a helper\n\
                  \n\
                  note: a helper is inlined into an entry, and reads the entry's structural \
-                 parameters through its arguments: pass `n as f32`\n\
-                 note: structural parameters are an entry's, `pub fn f<const N: usize>`; a \
-                 helper's are B3 of {PLAN}"
+                 parameters through its arguments: pass `n as f32`, or iterate a family in \
+                 the entry and pass the helper one element\n\
+                 note: structural parameters are an entry's, `pub fn f<const N: usize>` \
+                 (§1.4 of {PLAN})"
             ),
         ));
     }
@@ -580,7 +633,25 @@ fn convert_param(input: syn::FnArg) -> syn::Result<Param> {
         }
         _ => {}
     }
-    Ok(Param { name, ty: typed.ty })
+    Ok(Param {
+        name,
+        ty: param_type(*typed.ty)?,
+    })
+}
+
+/// A parameter's declared type: one value, or `[E; N]`, a family (plan
+/// §1.6). What the element and the count are is `sema`'s question; the
+/// count is converted as any expression is, so `sema` resolves it through
+/// the scopes it resolves every name through.
+fn param_type(ty: Type) -> syn::Result<ParamType> {
+    let Type::Array(array) = ty else {
+        return Ok(ParamType::One(Box::new(ty)));
+    };
+    Ok(ParamType::Family(FamilyType {
+        span: array.bracket_token.span.join(),
+        element: array.elem,
+        count: Box::new(convert_expr(array.len)?),
+    }))
 }
 
 /// A doc comment is kept, to be re-emitted on an entry; any other attribute
@@ -708,6 +779,12 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
             if let Some((range, map)) = a_mapped_range(&expr_method.receiver) {
                 return convert_fold_terminal(range, map, &expr_method);
             }
+            if let Some(family) = a_family(&expr_method.receiver) {
+                return convert_family_method(family, &expr_method);
+            }
+            if let Some((family, map)) = a_mapped_family(&expr_method.receiver) {
+                return convert_family_terminal(family, map, &expr_method);
+            }
             // Built before the receiver is converted, returned after it: the
             // receiver's own refusal, the innermost, comes first, as rustc's
             // does (`(0..4).rev().map(…)` is about `.rev`).
@@ -781,18 +858,31 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
         }
 
         // A value with parts, built in a body. A record enters a kernel as a
-        // parameter and is read by field; a tuple is flattened in the front
-        // end as a record is (D7's front half, B3), and a record built or
-        // returned is Phase D (D7).
+        // parameter and is read by field; a tuple is taken apart where it is
+        // written, by a `let` (D7's front half), and a tuple or a record
+        // built as a value — passed, returned, chosen — is Phase D (D7).
         syn::Expr::Tuple(expr_tuple) => Err(syn::Error::new(
             expr_tuple.paren_token.span.join(),
             format!(
                 "a tuple in a kernel body\n\
                  \n\
-                 note: every value in a kernel body is an `f32` or a `bool`; a record \
-                 parameter is read by field, `p.x0`\n\
-                 note: tuples are flattened in the front end as records are (D7's front \
-                 half), which is B3 of {PLAN}"
+                 note: every value in a kernel body is an `f32` or a `bool`; a tuple is taken \
+                 apart where it is written, by a `let`: {TUPLE_LET}\n\
+                 note: a tuple as a value — passed, returned or chosen — is Phase D (D7 of \
+                 {PLAN})"
+            ),
+        )),
+
+        // There are no tables (§1.6): nothing reads a family, or anything
+        // else, by index, and a slice is a range of indices.
+        syn::Expr::Index(expr_index) => Err(syn::Error::new(
+            expr_index.bracket_token.span.join(),
+            format!(
+                "indexing in a kernel body\n\
+                 \n\
+                 note: there are no tables (§1.6 of {PLAN}): a family is iterated as a whole, \
+                 {FAMILY_SUM}, one copy of the body per element, and nothing reads one \
+                 element, or a slice of them, by index"
             ),
         )),
 
@@ -890,8 +980,9 @@ fn convert_field(expr_field: syn::ExprField) -> syn::Result<Expr> {
                 format!(
                     "a tuple's field in a kernel body\n\
                      \n\
-                     note: a record's fields have names, `p.x0`; tuples are B3 (D7's front \
-                     half) of {PLAN}"
+                     note: a record's fields have names, `p.x0`; a tuple is taken apart by a \
+                     `let`, {TUPLE_LET}\n\
+                     note: a tuple as a value is Phase D (D7 of {PLAN})"
                 ),
             ));
         }
@@ -973,13 +1064,14 @@ fn a_mapped_range(receiver: &syn::Expr) -> Option<(&syn::ExprRange, &syn::ExprMe
     Some((a_range(&map.receiver)?, map))
 }
 
-/// The methods that iterate: a fold's `.map`, `.any` and `.all`.
+/// The methods that iterate, over a range or a family: `.map`, `.any` and
+/// `.all`.
 const ITERATING_METHODS: [&str; 3] = ["map", "any", "all"];
 
 /// The refusal of one of [`ITERATING_METHODS`] with a closure, called on
-/// anything but a range: the spelling of iterating a family of records
-/// (plan §1.6), which is B3, and not a closure out of place, which the
-/// closure's own refusal would say.
+/// anything but a range or a family's `into_iter()`: iteration spelled
+/// another way, and not a closure out of place, which the closure's own
+/// refusal would say.
 fn a_family_iterated(call: &syn::ExprMethodCall) -> Option<syn::Error> {
     if !ITERATING_METHODS.iter().any(|name| call.method == name) {
         return None;
@@ -992,17 +1084,141 @@ fn a_family_iterated(call: &syn::ExprMethodCall) -> Option<syn::Error> {
         return None;
     }
     let receiver = &call.receiver;
+    let lent = match a_named_call(receiver, "iter") {
+        Some(family) => format!(
+            "\nnote: `.iter()` lends references; a family's elements are iterated by value, \
+             `{family}.into_iter()`"
+        ),
+        None => String::new(),
+    };
     Some(syn::Error::new_spanned(
         receiver,
         format!(
-            "`.{}` over `{}`, which is not a range\n\
+            "`.{}` over `{}`, which is neither a range nor a family's `into_iter()`\n\
              \n\
              note: a fold iterates a constant range: {FOLD_SPELLINGS}\n\
-             note: iterating a family of records (`pieces.map(|p| …)`) is B3 of {PLAN}",
+             note: a family is iterated as a whole, at instantiation (§1.6 of {PLAN}): \
+             {FAMILY_SPELLINGS}{lent}",
             call.method,
             quote::quote!(#receiver)
         ),
     ))
+}
+
+// ─────────────────────────────── families ───────────────────────────────
+
+/// Every spelling of a family's iteration, as a refusal of any other names
+/// them (plan §1.6).
+const FAMILY_SPELLINGS: &str = "`pieces.into_iter().map(|p| e).sum()`, `.product()`, \
+     `.fold(f32::INFINITY, f32::min)` or `.fold(f32::NEG_INFINITY, f32::max)`, and \
+     `pieces.into_iter().any(|p| m)` or `.all(|p| m)`";
+
+/// The one place a tuple is written: a `let` taking it apart.
+const TUPLE_LET: &str = "`let (a, b) = (e1, e2);` binds each name to its expression";
+
+/// `name.method()`, through parentheses: the plain name a method with no
+/// arguments is called on.
+fn a_named_call<'a>(expr: &'a syn::Expr, method: &str) -> Option<&'a syn::Ident> {
+    let call = match expr {
+        syn::Expr::Paren(paren) => return a_named_call(&paren.expr, method),
+        syn::Expr::MethodCall(call) => call,
+        _ => return None,
+    };
+    if call.method != method || !call.args.is_empty() || call.turbofish.is_some() {
+        return None;
+    }
+    a_plain_name(&call.receiver)
+}
+
+/// A name, through parentheses: how a family is written.
+fn a_plain_name(expr: &syn::Expr) -> Option<&syn::Ident> {
+    match expr {
+        syn::Expr::Paren(paren) => a_plain_name(&paren.expr),
+        syn::Expr::Path(path) if path.qself.is_none() => path.path.get_ident(),
+        _ => None,
+    }
+}
+
+/// `pieces.into_iter()`: the family a method is called on, element by
+/// element and by value — the spelling that types as the kernel does, since
+/// an element passes to a helper taking the record.
+fn a_family(receiver: &syn::Expr) -> Option<&syn::Ident> {
+    a_named_call(receiver, "into_iter")
+}
+
+/// `pieces.into_iter().map(f)`: the family and the `map` call a reduction
+/// is called on.
+fn a_mapped_family(receiver: &syn::Expr) -> Option<(&syn::Ident, &syn::ExprMethodCall)> {
+    let syn::Expr::MethodCall(map) = receiver else {
+        return None;
+    };
+    if map.method != "map" {
+        return None;
+    }
+    Some((a_family(&map.receiver)?, map))
+}
+
+/// A method called on a family's iterator itself: `.any(|p| m)` and
+/// `.all(|p| m)` iterate it, and nothing else is a value — there is no index
+/// to enumerate, skip or take by, and no order to reverse.
+fn convert_family_method(family: &syn::Ident, call: &syn::ExprMethodCall) -> syn::Result<Expr> {
+    let reduction = match call.method.to_string().as_str() {
+        "any" => Reduction::Any,
+        "all" => Reduction::All,
+        "map" => {
+            return Err(syn::Error::new_spanned(
+                call,
+                format!(
+                    "a mapped family is an iterator, not a value\n\
+                     \n\
+                     note: a family's iteration ends in the reduction that combines its \
+                     copies: {FAMILY_SPELLINGS}"
+                ),
+            ));
+        }
+        other => {
+            return Err(syn::Error::new(
+                call.method.span(),
+                format!(
+                    "`.{other}` on a family's iterator\n\
+                     \n\
+                     note: a family is iterated as a whole, its elements by value: \
+                     {FAMILY_SPELLINGS}\n\
+                     note: a family is not a table (§1.6 of {PLAN}): there is no index to \
+                     enumerate, skip or take by, no order to reverse, and no length but the \
+                     count it is declared with"
+                ),
+            ));
+        }
+    };
+    refuse_turbofish(call)?;
+    let (element, body) = the_closure(call, &FAMILY_CLOSURE)?;
+    Ok(Expr::Family(FamilyExpr {
+        reduction,
+        family: family.clone(),
+        element,
+        body: Box::new(body),
+        span: call.method.span(),
+    }))
+}
+
+/// The method that ends `pieces.into_iter().map(|p| e)`: the reduction its
+/// copies are combined under.
+fn convert_family_terminal(
+    family: &syn::Ident,
+    map: &syn::ExprMethodCall,
+    call: &syn::ExprMethodCall,
+) -> syn::Result<Expr> {
+    let reduction = mapped_reduction(call)?;
+    refuse_turbofish(map)?;
+    let (element, body) = the_closure(map, &FAMILY_CLOSURE)?;
+    Ok(Expr::Family(FamilyExpr {
+        reduction,
+        family: family.clone(),
+        element,
+        body: Box::new(body),
+        span: call.method.span(),
+    }))
 }
 
 /// A method called on a range itself: `.any(|i| m)` and `.all(|i| m)` are
@@ -1033,7 +1249,7 @@ fn convert_range_method(range: &syn::ExprRange, call: &syn::ExprMethodCall) -> s
         }
     };
     refuse_turbofish(call)?;
-    let (binder, body) = the_closure(call)?;
+    let (binder, body) = the_closure(call, &FOLD_CLOSURE)?;
     Ok(Expr::Fold(FoldExpr {
         reduction,
         range: convert_range(range)?,
@@ -1050,23 +1266,9 @@ fn convert_fold_terminal(
     map: &syn::ExprMethodCall,
     call: &syn::ExprMethodCall,
 ) -> syn::Result<Expr> {
-    let reduction = match call.method.to_string().as_str() {
-        "sum" => sum_or_product(call, Reduction::Sum)?,
-        "product" => sum_or_product(call, Reduction::Product)?,
-        "fold" => fold_monoid(call)?,
-        other => {
-            return Err(syn::Error::new(
-                call.method.span(),
-                format!(
-                    "`.{other}` does not end a fold\n\
-                     \n\
-                     note: a fold is spelled {FOLD_SPELLINGS}"
-                ),
-            ));
-        }
-    };
+    let reduction = mapped_reduction(call)?;
     refuse_turbofish(map)?;
-    let (binder, body) = the_closure(map)?;
+    let (binder, body) = the_closure(map, &FOLD_CLOSURE)?;
     Ok(Expr::Fold(FoldExpr {
         reduction,
         range: convert_range(range)?,
@@ -1074,6 +1276,25 @@ fn convert_fold_terminal(
         body: Box::new(body),
         span: call.method.span(),
     }))
+}
+
+/// The reduction a method called on a `.map(…)` names: the monoid a fold's
+/// terms, or a family's copies, are combined under.
+fn mapped_reduction(call: &syn::ExprMethodCall) -> syn::Result<Reduction> {
+    match call.method.to_string().as_str() {
+        "sum" => sum_or_product(call, Reduction::Sum),
+        "product" => sum_or_product(call, Reduction::Product),
+        "fold" => fold_monoid(call),
+        other => Err(syn::Error::new(
+            call.method.span(),
+            format!(
+                "`.{other}` does not end a fold\n\
+                 \n\
+                 note: a fold is spelled {FOLD_SPELLINGS}\n\
+                 note: a family's iteration is spelled {FAMILY_SPELLINGS}"
+            ),
+        )),
+    }
 }
 
 /// `.sum()` and `.product()` take no arguments, and a type argument only if
@@ -1194,17 +1415,73 @@ fn refuse_turbofish(call: &syn::ExprMethodCall) -> syn::Result<()> {
     }
 }
 
-/// The one argument of a fold's `.map`, `.any` or `.all`: a closure whose
-/// parameter is the fold's index and whose body is the fold's body.
-fn the_closure(call: &syn::ExprMethodCall) -> syn::Result<(syn::Ident, Expr)> {
+/// What the one parameter of an iteration's closure is — a fold's index or
+/// a family's element — for the refusal of any other shape.
+struct IterationClosure {
+    /// Whose closure it is: `a fold's`.
+    whose: &'static str,
+    /// Its one spelling: `|i| body`.
+    spelling: &'static str,
+    /// What its parameter and its body are.
+    meaning: &'static str,
+    /// What its body is, which is why it declares no return type.
+    body: &'static str,
+    /// What its one parameter is.
+    parameter: &'static str,
+    /// The refusal of a typed parameter.
+    typed: &'static str,
+    /// The refusal of a pattern.
+    pattern: &'static str,
+}
+
+/// `(a..b).map(|i| body)`: the parameter is the index.
+const FOLD_CLOSURE: IterationClosure = IterationClosure {
+    whose: "a fold's",
+    spelling: "|i| body",
+    meaning: "its parameter is the fold's index and its body is what the fold combines",
+    body: "a term of the fold",
+    parameter: "the index it ranges over",
+    typed: "a fold's index is a `usize`, always; write the plain name, `|i|`",
+    pattern: "a fold's index is a plain name: `|i|`",
+};
+
+/// `pieces.into_iter().map(|p| body)`: the parameter is one element.
+const FAMILY_CLOSURE: IterationClosure = IterationClosure {
+    whose: "a family's",
+    spelling: "|p| body",
+    meaning: "its parameter is one element of the family and its body is that element's \
+              copy",
+    body: "each element's copy",
+    parameter: "the element",
+    typed: "a family's element has the family's element type, always; write the plain \
+            name, `|p|`",
+    pattern: "a family's element is a plain name, `|p|`; a record element's fields are \
+              read by name, `p.x0`",
+};
+
+/// The one argument of an iteration's `.map`, `.any` or `.all`: a closure
+/// whose parameter is a fold's index or a family's element, and whose body
+/// is what is combined.
+fn the_closure(
+    call: &syn::ExprMethodCall,
+    shape: &IterationClosure,
+) -> syn::Result<(syn::Ident, Expr)> {
+    let IterationClosure {
+        whose,
+        spelling,
+        meaning,
+        body,
+        parameter,
+        typed,
+        pattern,
+    } = shape;
     let [syn::Expr::Closure(closure)] = call.args.iter().collect::<Vec<_>>()[..] else {
         return Err(syn::Error::new(
             call.method.span(),
             format!(
-                "`.{}` takes one argument, the closure `|i| body`\n\
+                "`.{}` takes one argument, the closure `{spelling}`\n\
                  \n\
-                 note: its parameter is the fold's index and its body is what the fold \
-                 combines",
+                 note: {meaning}",
                 call.method
             ),
         ));
@@ -1218,40 +1495,34 @@ fn the_closure(call: &syn::ExprMethodCall) -> syn::Result<(syn::Ident, Expr)> {
     if qualified {
         return Err(syn::Error::new_spanned(
             closure,
-            "a fold's closure is `|i| body`, unqualified\n\
-             \n\
-             note: it is the fold's body, not a value: nothing is captured, moved or awaited",
+            format!(
+                "{whose} closure is `{spelling}`, unqualified\n\
+                 \n\
+                 note: it is {body}, not a value: nothing is captured, moved or awaited"
+            ),
         ));
     }
     if let syn::ReturnType::Type(_, ty) = &closure.output {
         return Err(syn::Error::new_spanned(
             ty,
-            "a fold's closure declares no return type: its body is a term of the fold, an \
-             `f32` for a sum, product, min or max, a `bool` for `any` or `all`",
+            format!(
+                "{whose} closure declares no return type: its body is {body}, an `f32` for a \
+                 sum, product, min or max, a `bool` for `any` or `all`"
+            ),
         ));
     }
     let [param] = closure.inputs.iter().collect::<Vec<_>>()[..] else {
         return Err(syn::Error::new_spanned(
             &closure.inputs,
-            "a fold's closure takes one parameter, the index it ranges over",
+            format!("{whose} closure takes one parameter, {parameter}"),
         ));
     };
-    let binder = match param {
+    let name = match param {
         Pat::Ident(pat_ident) => plain_name(pat_ident, param)?,
-        Pat::Type(typed) => {
-            return Err(syn::Error::new_spanned(
-                &typed.ty,
-                "a fold's index is a `usize`, always; write the plain name, `|i|`",
-            ));
-        }
-        other => {
-            return Err(syn::Error::new_spanned(
-                other,
-                "a fold's index is a plain name: `|i|`",
-            ));
-        }
+        Pat::Type(annotated) => return Err(syn::Error::new_spanned(&annotated.ty, *typed)),
+        other => return Err(syn::Error::new_spanned(other, *pattern)),
     };
-    Ok((binder, convert_expr((*closure.body).clone())?))
+    Ok((name, convert_expr((*closure.body).clone())?))
 }
 
 /// `a..b`: both bounds, half-open. Whether they are constant, and run
@@ -1572,56 +1843,7 @@ fn convert_block(block: syn::Block) -> syn::Result<BlockExpr> {
         let is_last = i == block.stmts.len() - 1;
 
         match stmt {
-            syn::Stmt::Local(local) => {
-                // let binding
-                let name = match &local.pat {
-                    Pat::Ident(pat_ident) => plain_name(pat_ident, &local.pat)?,
-                    Pat::Type(pat_type) => match &*pat_type.pat {
-                        Pat::Ident(pat_ident) => plain_name(pat_ident, &local.pat)?,
-                        pattern => return Err(refuse_let_pattern(pattern)),
-                    },
-                    pattern => return Err(refuse_let_pattern(pattern)),
-                };
-
-                let ty = match &local.pat {
-                    Pat::Type(pat_type) => Some((*pat_type.ty).clone()),
-                    _ => None,
-                };
-
-                let init = local.init.as_ref().ok_or_else(|| {
-                    syn::Error::new_spanned(
-                        &local.pat,
-                        "let binding must have an initializer\n\
-                         \n\
-                         help: provide a value for this binding:\n\
-                         help:   let dx = X - cx;",
-                    )
-                })?;
-
-                // The `else` branch used to be dropped unread. It could never
-                // run — a plain name always matches — so accepting it would
-                // compile a branch nobody can reach, silently.
-                if let Some((else_token, _)) = &init.diverge {
-                    return Err(syn::Error::new_spanned(
-                        else_token,
-                        "`let ... else` is not supported in a kernel body\n\
-                         \n\
-                         note: a kernel `let` binds a plain name, which always matches, \
-                         so the `else` branch could never run\n\
-                         \n\
-                         help: remove the `else` branch",
-                    ));
-                }
-
-                let init_expr = convert_expr((*init.expr).clone())?;
-
-                stmts.push(Stmt::Let(Box::new(LetStmt {
-                    span: name.span(),
-                    name,
-                    ty,
-                    init: init_expr,
-                })));
-            }
+            syn::Stmt::Local(local) => stmts.push(convert_let(local)?),
 
             syn::Stmt::Expr(expr, semi) => {
                 let converted = convert_expr(expr.clone())?;
@@ -1670,18 +1892,199 @@ fn convert_block(block: syn::Block) -> syn::Result<BlockExpr> {
     })
 }
 
-/// A `let` whose pattern is not a name — `let (x, y) = …`, `let Row { x0, .. }
-/// = …` — takes a value apart; a record's fields are read by name instead.
+/// A `let`: a plain name bound to its expression, or `let (a, b) = (e1,
+/// e2);`, each name bound to its own expression (D7's front half).
+fn convert_let(local: &syn::Local) -> syn::Result<Stmt> {
+    let (pattern, annotation) = match &local.pat {
+        Pat::Type(pat_type) => (&*pat_type.pat, Some(&*pat_type.ty)),
+        pattern => (pattern, None),
+    };
+    let init = local.init.as_ref().ok_or_else(|| {
+        syn::Error::new_spanned(
+            &local.pat,
+            "let binding must have an initializer\n\
+             \n\
+             help: provide a value for this binding:\n\
+             help:   let dx = X - cx;",
+        )
+    })?;
+    // The `else` branch used to be dropped unread. It could never run — a
+    // plain name always matches, and so does a tuple of them — so accepting
+    // it would compile a branch nobody can reach, silently.
+    if let Some((else_token, _)) = &init.diverge {
+        return Err(syn::Error::new_spanned(
+            else_token,
+            "`let ... else` is not supported in a kernel body\n\
+             \n\
+             note: a kernel `let` binds a plain name, which always matches, \
+             so the `else` branch could never run\n\
+             \n\
+             help: remove the `else` branch",
+        ));
+    }
+    match pattern {
+        Pat::Ident(pat_ident) => {
+            let name = plain_name(pat_ident, &local.pat)?;
+            Ok(Stmt::Let(Box::new(LetStmt {
+                span: name.span(),
+                name,
+                ty: annotation.cloned(),
+                init: convert_expr((*init.expr).clone())?,
+            })))
+        }
+        Pat::Tuple(names) => convert_let_tuple(names, annotation, &init.expr),
+        pattern => Err(refuse_let_pattern(pattern)),
+    }
+}
+
+/// `let (a, b) = (e1, e2);`: plain names, as many as the tuple of
+/// expressions has elements, each bound to its own, all at once. A tuple is
+/// taken apart where it is written and nowhere else, so nothing of it is
+/// left to be a value (D7's front half); a pattern within the pattern, a
+/// `_`, and a value that is not a tuple of expressions are refused.
+fn convert_let_tuple(
+    pattern: &syn::PatTuple,
+    annotation: Option<&Type>,
+    init: &syn::Expr,
+) -> syn::Result<Stmt> {
+    let mut names: Vec<syn::Ident> = Vec::with_capacity(pattern.elems.len());
+    for element in &pattern.elems {
+        let name = match element {
+            Pat::Ident(pat_ident) => plain_name(pat_ident, element)?,
+            Pat::Wild(wild) => {
+                return Err(syn::Error::new_spanned(
+                    wild,
+                    "`_` in a tuple `let`\n\
+                     \n\
+                     note: a kernel body has no effects, so a value nothing reads need not be \
+                     written: drop it from both tuples",
+                ));
+            }
+            Pat::Tuple(_) | Pat::Paren(_) => {
+                return Err(syn::Error::new_spanned(
+                    element,
+                    format!(
+                        "a pattern within a tuple `let`\n\
+                         \n\
+                         note: a tuple inside a tuple is a tuple value, and a tuple as a value \
+                         is Phase D (D7 of {PLAN})\n\
+                         help: bind the names flat, `let (a, b, c) = (e1, e2, e3);`"
+                    ),
+                ));
+            }
+            other => return Err(refuse_let_pattern(other)),
+        };
+        if names.contains(&name) {
+            return Err(syn::Error::new(
+                name.span(),
+                format!(
+                    "identifier `{name}` is bound more than once in the same pattern\n\
+                     \n\
+                     note: rustc refuses it too (E0416)"
+                ),
+            ));
+        }
+        names.push(name);
+    }
+    if names.is_empty() {
+        return Err(syn::Error::new_spanned(
+            pattern,
+            "a tuple `let` of no names binds nothing\n\
+             \n\
+             note: a kernel body has no unit value to take apart",
+        ));
+    }
+    let values = match tuple_expression(init) {
+        Some(values) => values,
+        None => {
+            return Err(syn::Error::new_spanned(
+                init,
+                format!(
+                    "the value of a tuple `let` is a tuple of expressions, `(e1, e2)`\n\
+                     \n\
+                     note: a tuple is taken apart where it is written; a tuple computed — \
+                     returned, passed or chosen — is a tuple value, which is Phase D (D7 of \
+                     {PLAN})"
+                ),
+            ));
+        }
+    };
+    if values.len() != names.len() {
+        return Err(syn::Error::new_spanned(
+            init,
+            format!(
+                "mismatched types: expected a tuple with {} elements, found one with {} \
+                 elements\n\
+                 \n\
+                 note: `let ({}) = …` binds each name to one expression of the tuple",
+                names.len(),
+                values.len(),
+                names
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+    let types = element_types(annotation, names.len())?;
+    let mut lets = Vec::with_capacity(names.len());
+    for ((name, value), ty) in names.into_iter().zip(values).zip(types) {
+        lets.push(LetStmt {
+            span: name.span(),
+            name,
+            ty,
+            init: convert_expr(value.clone())?,
+        });
+    }
+    Ok(Stmt::LetTuple(lets))
+}
+
+/// The expressions of a tuple, through parentheses, or `None` for anything
+/// else.
+fn tuple_expression(expr: &syn::Expr) -> Option<Vec<&syn::Expr>> {
+    match expr {
+        syn::Expr::Paren(paren) => tuple_expression(&paren.expr),
+        syn::Expr::Tuple(tuple) => Some(tuple.elems.iter().collect()),
+        _ => None,
+    }
+}
+
+/// Each name's annotation in `let (a, b): (f32, f32) = …`: the tuple
+/// type's elements, one per name, or none at all when there is no
+/// annotation.
+fn element_types(annotation: Option<&Type>, arity: usize) -> syn::Result<Vec<Option<Type>>> {
+    let Some(annotation) = annotation else {
+        return Ok(vec![None; arity]);
+    };
+    match annotation {
+        Type::Tuple(tuple) if tuple.elems.len() == arity => {
+            Ok(tuple.elems.iter().cloned().map(Some).collect())
+        }
+        _ => Err(syn::Error::new_spanned(
+            annotation,
+            format!(
+                "the annotation of a tuple `let` of {arity} names is a tuple of {arity} types, \
+                 `(f32, f32)`"
+            ),
+        )),
+    }
+}
+
+/// A `let` whose pattern is neither a name nor a tuple of names — `let Row
+/// { x0, .. } = …`, `let [a, b] = …` — takes a value apart that the language
+/// reads otherwise: a record by field.
 fn refuse_let_pattern(pattern: &Pat) -> syn::Error {
     syn::Error::new_spanned(
         pattern,
         format!(
             "a pattern in a kernel `let`\n\
              \n\
-             note: a kernel `let` binds a plain name: an `f32`, a `bool`, or a record, which \
-             it aliases (`let q = p;`) and whose fields are read by name (`q.x0`)\n\
-             note: destructuring is flattened in the front end as a record is (D7's front \
-             half), which is B3 of {PLAN}"
+             note: a kernel `let` binds a plain name — an `f32`, a `bool`, or a record, which \
+             it aliases (`let q = p;`) and whose fields are read by name (`q.x0`) — or takes \
+             a tuple apart where it is written, {TUPLE_LET}\n\
+             note: a record's fields are read by name, not taken apart by a pattern \
+             (§1.3 of {PLAN})"
         ),
     )
 }
@@ -1884,7 +2287,7 @@ mod tests {
         assert_eq!(entry.params[0].name.to_string(), "cx");
         assert_eq!(entry.params[1].name.to_string(), "m");
         for (param, want) in entry.params.iter().zip(["f32", "bool"]) {
-            let syn::Type::Path(path) = &*param.ty else {
+            let syn::Type::Path(path) = param.ty.written() else {
                 panic!("expected a path type for {}", param.name);
             };
             assert_eq!(path.path.segments[0].ident.to_string(), want);
@@ -1906,27 +2309,23 @@ mod tests {
         assert!(err.contains("a qualified call"), "got: {err}");
     }
 
-    /// A value with parts built or taken apart in a body is refused where it
-    /// is written: a `let` pattern, a tuple and a tuple's field naming B3,
-    /// where tuples are flattened in the front end as records are (D7's
-    /// front half, which §1.7's glyph needs for `let (x, y) = …`); a record
-    /// literal naming Phase D (D7).
+    /// A value with parts built or taken apart in a body, anywhere but a
+    /// tuple `let`, is refused where it is written: a record's pattern
+    /// naming §1.3, since a record is read by field; a tuple as a value and
+    /// a tuple's field naming Phase D (D7), since a tuple is taken apart
+    /// where it is written and so is never one; a record literal naming
+    /// Phase D (D7). (They named B3 until the tuple `let` came, which is
+    /// `a_tuple_let_binds_each_name_to_its_expression`.)
     #[test]
-    fn a_pattern_a_tuple_and_a_record_literal_are_refused_naming_their_phase() {
-        let cases: [(TokenStream, &str, &str); 6] = [
-            (quote! { || { let (a, b) = (X, Y); a } }, "a pattern", "B3"),
-            (
-                quote! { || { let (a, b): (f32, f32) = (X, Y); a } },
-                "a pattern",
-                "B3",
-            ),
+    fn a_record_pattern_a_tuple_value_and_a_record_literal_are_refused_naming_their_phase() {
+        let cases: [(TokenStream, &str, &str); 4] = [
             (
                 quote! { || { let Row { x0, .. } = p; x0 } },
                 "a pattern",
-                "B3",
+                "§1.3",
             ),
-            (quote! { || (X, Y) }, "a tuple in a kernel body", "B3"),
-            (quote! { |p: f32| p.0 }, "a tuple's field", "B3"),
+            (quote! { || (X, Y) }, "a tuple in a kernel body", "D7"),
+            (quote! { |p: f32| p.0 }, "a tuple's field", "D7"),
             (quote! { || Row { x0: X }.x0 }, "a record literal", "D7"),
         ];
         for (input, expected, phase) in cases {
@@ -2536,24 +2935,321 @@ mod tests {
         }
     }
 
-    /// A fold's spelling over something that is not a range is iterating a
-    /// family of records, and is refused naming B3, where the closure's own
-    /// refusal would name the fold and the integral.
+    /// An iteration's spelling over anything but a range or a family's
+    /// `into_iter()` is refused naming both spellings and §1.6, where the
+    /// closure's own refusal would name the fold and the integral: an
+    /// array's own `.map`, and `.iter()`, which lends references where a
+    /// family's elements are values, among them.
     #[test]
-    fn iterating_anything_but_a_range_is_refused_naming_b3() {
+    fn iterating_anything_but_a_range_or_a_family_is_refused_naming_both() {
         for input in [
             quote! { |pieces: f32| pieces.map(|p| p * X).sum() },
             quote! { |pieces: f32| pieces.any(|p| p < X) },
             quote! { || X.all(|p| p < Y) },
+            quote! { |v: [f32; 2]| v.map(|e| e * X).sum() },
+            quote! { |v: [f32; 2]| (X + v).into_iter().map(|e| e).sum() },
         ] {
             let err = refusal(input);
             assert!(
-                err.contains("which is not a range")
-                    && err.contains("a family of records")
-                    && err.contains("B3"),
+                err.contains("which is neither a range nor a family's `into_iter()`")
+                    && err.contains("(a..b).map(|i| e).sum()")
+                    && err.contains("pieces.into_iter().map(|p| e).sum()")
+                    && err.contains("§1.6"),
                 "got: {err}"
             );
         }
+        let err = refusal(quote! { |v: [f32; 2]| v.iter().map(|e| e * X).sum() });
+        assert!(
+            err.contains("`.iter()` lends references") && err.contains("`v.into_iter()`"),
+            "got: {err}"
+        );
+    }
+
+    // ───────────────────────────── families ─────────────────────────────
+
+    /// A parameter `[E; N]` is a family: its element as written, and its
+    /// count converted as any expression is, for `sema` to resolve.
+    #[test]
+    fn a_family_parameter_parses_as_its_element_and_count() {
+        let def = parse(quote! {
+            pub fn f<const N: usize>(pieces: [Row; N], r: f32) -> f32 { r }
+        })
+        .expect("parses");
+        let ParamType::Family(family) = &def.fns[0].params[0].ty else {
+            panic!("`[Row; N]` is a family: {:?}", def.fns[0].params[0].ty);
+        };
+        let syn::Type::Path(element) = &*family.element else {
+            panic!("the element is `Row`");
+        };
+        assert!(element.path.is_ident("Row"));
+        assert_eq!(
+            family.count.named().map(ToString::to_string),
+            Some("N".to_string())
+        );
+        assert!(matches!(def.fns[0].params[1].ty, ParamType::One(_)));
+
+        let def = parse(quote! { |v: [f32; 3]| X }).expect("parses");
+        let ParamType::Family(family) = &entry(&def).params[0].ty else {
+            panic!("`[f32; 3]` is a family");
+        };
+        assert!(matches!(*family.count, Expr::Literal(_)));
+    }
+
+    /// The family iteration the body `|v: [f32; 2]| <expr>` parses to.
+    fn family(input: TokenStream) -> FamilyExpr {
+        let def = parse(quote! { |v: [f32; 2]| #input }).expect("the iteration parses");
+        match &entry(&def).body {
+            Expr::Family(family) => family.clone(),
+            other => panic!("expected a family's iteration, got {other:?}"),
+        }
+    }
+
+    /// Each spelling of a family's iteration names its monoid, as a fold's
+    /// does; the closure's parameter is the element, and the family is the
+    /// name `into_iter()` is called on, through parentheses too.
+    #[test]
+    fn every_family_spelling_parses_to_its_reduction() {
+        let cases: [(TokenStream, Reduction); 8] = [
+            (
+                quote! { v.into_iter().map(|e| e * X).sum() },
+                Reduction::Sum,
+            ),
+            (
+                quote! { v.into_iter().map(|e| e * X).sum::<f32>() },
+                Reduction::Sum,
+            ),
+            (
+                quote! { v.into_iter().map(|e| e * X).product() },
+                Reduction::Product,
+            ),
+            (
+                quote! { (v).into_iter().map(|e| e * X).product::<f32>() },
+                Reduction::Product,
+            ),
+            (
+                quote! { v.into_iter().map(|e| e * X).fold(f32::INFINITY, f32::min) },
+                Reduction::Min,
+            ),
+            (
+                quote! { v.into_iter().map(|e| e * X).fold(f32::NEG_INFINITY, f32::max) },
+                Reduction::Max,
+            ),
+            (quote! { v.into_iter().any(|e| e < X) }, Reduction::Any),
+            (quote! { v.into_iter().all(|e| e < X) }, Reduction::All),
+        ];
+        for (input, want) in cases {
+            let parsed = family(input);
+            assert_eq!(parsed.reduction, want);
+            assert_eq!(parsed.family.to_string(), "v");
+            assert_eq!(parsed.element.to_string(), "e");
+        }
+    }
+
+    /// A family iterated any other way is refused where it is written,
+    /// naming the spellings it has: no adaptor that indexes, skips, takes or
+    /// reorders (a family is not a table, §1.6), no mapped family left as an
+    /// iterator, no reduction but the six, and a closure `|p| body`.
+    #[test]
+    fn a_family_iterated_any_other_way_is_refused() {
+        let cases: [(TokenStream, &str); 13] = [
+            (
+                quote! { v.into_iter().rev().map(|e| e).sum() },
+                "`.rev` on a family's iterator",
+            ),
+            (
+                quote! { v.into_iter().enumerate().map(|e| X).sum() },
+                "`.enumerate` on a family's iterator",
+            ),
+            (quote! { v.into_iter().skip(1).any(|e| e < X) }, "§1.6"),
+            (
+                quote! { v.into_iter().map(|e| e) },
+                "a mapped family is an iterator, not a value",
+            ),
+            (
+                quote! { v.into_iter().map(|e| e).min() },
+                "does not end a fold",
+            ),
+            (
+                quote! { v.into_iter().map(|e| e).sum(1.0) },
+                "takes no arguments",
+            ),
+            (
+                quote! { v.into_iter().map(|e| e).fold(0.0, |a, b| a + b) },
+                "names no monoid",
+            ),
+            (
+                quote! { v.into_iter().map(|e: f32| e).sum() },
+                "the family's element type, always",
+            ),
+            (
+                quote! { v.into_iter().map(|(a, b)| a).sum() },
+                "a family's element is a plain name",
+            ),
+            (
+                quote! { v.into_iter().map(move |e| e).sum() },
+                "a family's closure is `|p| body`, unqualified",
+            ),
+            (
+                quote! { v.into_iter().map(|e, f| e).sum() },
+                "a family's closure takes one parameter, the element",
+            ),
+            (
+                quote! { v.into_iter().map(X).sum() },
+                "the closure `|p| body`",
+            ),
+            (
+                quote! { v.into_iter().map::<f32>(|e| e).sum() },
+                "takes no type arguments",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(quote! { |v: [f32; 2]| #input });
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
+    }
+
+    /// Nothing is read by index — a family's element, a slice of them, or
+    /// anything else: there are no tables (§1.6).
+    #[test]
+    fn indexing_and_slicing_are_refused_naming_section_1_6() {
+        for input in [
+            quote! { |v: [f32; 3]| v[0] },
+            quote! { |v: [f32; 3]| v[1..3].into_iter().map(|e| e).sum() },
+            quote! { || X[0] },
+        ] {
+            let err = refusal(input);
+            assert!(
+                err.contains("indexing in a kernel body")
+                    && err.contains("there are no tables")
+                    && err.contains("§1.6"),
+                "got: {err}"
+            );
+        }
+    }
+
+    // ───────────────────────────── tuple lets ─────────────────────────────
+
+    /// The one tuple `let` of `|| { input; X }`, flattened.
+    fn tuple_let(input: TokenStream) -> Vec<LetStmt> {
+        let def = parse(quote! { || { #input; X } }).expect("parses");
+        let Expr::Block(block) = &entry(&def).body else {
+            panic!("a block");
+        };
+        let [Stmt::LetTuple(lets)] = block.stmts.as_slice() else {
+            panic!("one tuple `let`, got {:?}", block.stmts);
+        };
+        lets.clone()
+    }
+
+    /// `let (a, b) = (e1, e2);` is flattened: each name bound to its own
+    /// expression, with its own annotation when the tuple type gives one,
+    /// in one statement that binds them all at once (D7's front half). It
+    /// used to be refused, naming B3.
+    #[test]
+    fn a_tuple_let_binds_each_name_to_its_expression() {
+        let lets = tuple_let(quote! { let (a, b) = (X, Y + 1.0) });
+        let names: Vec<String> = lets.iter().map(|l| l.name.to_string()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert!(matches!(lets[0].init, Expr::Ident(_)));
+        assert!(matches!(lets[1].init, Expr::Binary(_)));
+        assert!(lets.iter().all(|l| l.ty.is_none()));
+
+        let lets = tuple_let(quote! { let (m, w): (bool, f32) = ((X < Y), X) });
+        let types: Vec<String> = lets
+            .iter()
+            .map(|l| {
+                let ty = l.ty.as_ref().expect("annotated");
+                quote!(#ty).to_string()
+            })
+            .collect();
+        assert_eq!(types, ["bool", "f32"]);
+
+        assert_eq!(
+            tuple_let(quote! { let (a,) = ((X,)) }).len(),
+            1,
+            "a tuple of one"
+        );
+    }
+
+    /// A tuple is written in one place, the tuple `let` that takes it
+    /// apart; anywhere else it is a tuple value, refused naming Phase D
+    /// (D7), and so is a `let` whose value is not a tuple of expressions.
+    #[test]
+    fn a_tuple_anywhere_but_a_destructuring_let_is_refused() {
+        let cases: [(TokenStream, &str); 6] = [
+            (quote! { || (X, Y) }, "a tuple in a kernel body"),
+            (
+                quote! { || { let t = (X, Y); X } },
+                "a tuple in a kernel body",
+            ),
+            (quote! { || X.max((X, Y)) }, "a tuple in a kernel body"),
+            (
+                quote! { || { let (a, b) = (X, Y); (b, a) } },
+                "a tuple in a kernel body",
+            ),
+            (
+                quote! { || { let (a, b) = t; a } },
+                "the value of a tuple `let` is a tuple of expressions",
+            ),
+            (
+                quote! { || { let (a, b) = if X < Y { (X, Y) } else { (Y, X) }; a } },
+                "the value of a tuple `let` is a tuple of expressions",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(input);
+            assert!(
+                err.contains(expected) && err.contains("Phase D") && err.contains("D7"),
+                "expected `{expected}` naming Phase D, got: {err}"
+            );
+        }
+    }
+
+    /// A tuple `let` binds plain names, as many as its tuple has elements,
+    /// each once: a mismatched arity (rustc's E0308), a pattern within the
+    /// pattern (a tuple value, Phase D), `_`, `..`, a name bound twice
+    /// (E0416), no names at all, and an annotation that is not a tuple of
+    /// as many types are each refused where they are written.
+    #[test]
+    fn a_tuple_let_of_another_shape_is_refused() {
+        let cases: [(TokenStream, &str); 9] = [
+            (
+                quote! { let (a, b) = (X, Y, X) },
+                "expected a tuple with 2 elements, found one with 3 elements",
+            ),
+            (
+                quote! { let (a, b, c) = (X, Y) },
+                "expected a tuple with 3 elements, found one with 2 elements",
+            ),
+            (
+                quote! { let ((a, b), c) = ((X, Y), X) },
+                "a pattern within a tuple `let`",
+            ),
+            (
+                quote! { let ((a), b) = (X, Y) },
+                "a pattern within a tuple `let`",
+            ),
+            (quote! { let (a, _) = (X, Y) }, "`_` in a tuple `let`"),
+            (
+                quote! { let (a, ..) = (X, Y) },
+                "a pattern in a kernel `let`",
+            ),
+            (
+                quote! { let (a, a) = (X, Y) },
+                "identifier `a` is bound more than once in the same pattern",
+            ),
+            (quote! { let () = () }, "binds nothing"),
+            (
+                quote! { let (a, b): (f32, f32, f32) = (X, Y) },
+                "the annotation of a tuple `let` of 2 names is a tuple of 2 types",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(quote! { || { #input; X } });
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
+        let err = refusal(quote! { || { let ((a, b), c) = ((X, Y), X); a } });
+        assert!(err.contains("Phase D (D7"), "got: {err}");
     }
 
     /// Type arguments name a type a method would be generic over, and no
@@ -2599,8 +3295,9 @@ mod tests {
     }
 
     /// A `fn` signature carries nothing the language cannot honor: an
-    /// entry's generics are `const N: usize` and nothing else, and a
-    /// helper's are B3.
+    /// entry's generics are `const N: usize` and nothing else, and a helper
+    /// has none — it reads its entry's through its arguments. (The helper's
+    /// refusal named B3 until B3 was done without helper generics.)
     #[test]
     fn a_fn_signature_is_plain() {
         let cases: [(TokenStream, &str); 10] = [
@@ -2610,7 +3307,7 @@ mod tests {
             ),
             (
                 quote! { fn h<const N: usize>(x: f32) -> f32 { x } pub fn f() -> f32 { X } },
-                "B3",
+                "pass the helper one element",
             ),
             (quote! { pub fn f<T>() -> f32 { X } }, "B3"),
             (quote! { pub fn f<'a>() -> f32 { X } }, "lifetime parameter"),

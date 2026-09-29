@@ -32,7 +32,7 @@
 use core::ops::Range;
 
 use crate::arena::{REDUCE_BINDER_BASE, REDUCE_BINDERS};
-use crate::kind::OpKind;
+use crate::kind::{OpCode, OpKind};
 
 /// The algebra a reduction folds under: an associative combining operation
 /// together with the identity an empty domain folds to.
@@ -97,6 +97,81 @@ impl Monoid {
         self.op()
             .monoid_identity()
             .expect("a Monoid's operator has an identity")
+    }
+
+    /// Encode for transmission: its combining operation's [`OpCode`]. As
+    /// for [`OpKind::marshal`], the round trip is what is promised, not the
+    /// bytes: the `kernel!` macro emits a family's monoid this way, by value,
+    /// as it emits a fold by [`Fold::to_bits`], so the algebra the program
+    /// combines copies under is the one lowering chose and no table of names
+    /// can say another.
+    #[must_use]
+    pub fn marshal(self) -> OpCode {
+        self.op().marshal()
+    }
+
+    /// Decode. `None` if the code names no op, or an op that generates no
+    /// algebra.
+    #[must_use]
+    pub fn unmarshal(code: OpCode) -> Option<Self> {
+        OpKind::unmarshal(code).and_then(Self::of)
+    }
+}
+
+/// `⊕` of distinct terms under a [`Monoid`], built as the terms arrive:
+/// `((t₀ ⊕ t₁) ⊕ t₂) ⊕ …`, left to right — the first term alone, no identity
+/// in front of it — and the monoid's identity when no term arrives.
+///
+/// The one shape a fold of *distinct* terms has. Not [`Kernel::over`]'s,
+/// which folds one body over an index, and not an unrolled fold's, which
+/// pairs its terms (`passes`' `combine_halved`): those are one body `N`
+/// times. [`Kernel::fold`] builds through it, and so does a `kernel!`
+/// family's instantiation — `N` copies of a body, each over its own
+/// element's uniforms (docs/plans/2026-09-25-the-language-is-kernel.md
+/// §1.6) — so the copies and the same terms folded by `Kernel::fold` are
+/// one program, and a family is one with its terms written out by hand.
+///
+/// Generic over how a node is named, and handed each node to build as a
+/// callback, because its callers build into different things — a
+/// `Kernel`'s DAG builder and an [`ExprArena`](crate::ExprArena) — and each
+/// builds its terms between steps. A callback is handed the monoid's own
+/// operation to build with; no caller names one.
+///
+/// [`Kernel::over`]: crate::Kernel::over
+/// [`Kernel::fold`]: crate::Kernel::fold
+#[derive(Clone, Copy, Debug)]
+pub struct Chain<R> {
+    monoid: Monoid,
+    /// The terms so far, combined; `None` before the first.
+    folded: Option<R>,
+}
+
+impl<R> Chain<R> {
+    /// No terms yet, under `monoid`.
+    #[must_use]
+    pub fn new(monoid: Monoid) -> Self {
+        Self {
+            monoid,
+            folded: None,
+        }
+    }
+
+    /// Fold in `term`. The first term is the fold so far; after it,
+    /// `combine` builds `folded ⊕ term` from the monoid's operation and the
+    /// two operands, in that order.
+    pub fn push(&mut self, term: R, combine: impl FnOnce(OpKind, R, R) -> R) {
+        self.folded = Some(match self.folded.take() {
+            None => term,
+            Some(folded) => combine(self.monoid.op(), folded, term),
+        });
+    }
+
+    /// The fold of every term pushed, or — when none was — what `identity`
+    /// builds from the monoid's identity.
+    #[must_use]
+    pub fn finish(self, identity: impl FnOnce(f32) -> R) -> R {
+        let monoid = self.monoid;
+        self.folded.unwrap_or_else(|| identity(monoid.identity()))
     }
 }
 
@@ -813,6 +888,45 @@ mod tests {
         assert_eq!(indices, [3, 4, 5, 6]);
         assert!(fold.is_empty());
         assert_eq!(fold.len(), 0);
+    }
+
+    /// A monoid round-trips through its code, every one of them, and a code
+    /// naming an op that generates no algebra decodes to none.
+    #[test]
+    fn a_monoid_round_trips_through_its_code() {
+        for monoid in [
+            Monoid::SUM,
+            Monoid::PRODUCT,
+            Monoid::MAX,
+            Monoid::MIN,
+            Monoid::ANY,
+            Monoid::ALL,
+            Monoid::SEQ,
+        ] {
+            assert_eq!(Monoid::unmarshal(monoid.marshal()), Some(monoid));
+        }
+        assert_eq!(Monoid::unmarshal(OpKind::Sub.marshal()), None);
+    }
+
+    /// A chain of distinct terms is left-nested, the first term alone and
+    /// the monoid's own operation between each pair — `((a ⊕ b) ⊕ c)`, no
+    /// identity in front — and a chain of none is the monoid's identity.
+    #[test]
+    fn a_chain_folds_its_terms_left_to_right_and_none_to_the_identity() {
+        let spelled = |monoid: Monoid, terms: &[&str]| {
+            let mut chain = Chain::new(monoid);
+            for term in terms {
+                chain.push(alloc::string::String::from(*term), |op, folded, term| {
+                    alloc::format!("({folded} {op:?} {term})")
+                });
+            }
+            chain.finish(|identity| alloc::format!("{identity}"))
+        };
+        assert_eq!(spelled(Monoid::SUM, &["a", "b", "c"]), "((a Add b) Add c)");
+        assert_eq!(spelled(Monoid::MIN, &["a", "b"]), "(a Min b)");
+        assert_eq!(spelled(Monoid::PRODUCT, &["a"]), "a");
+        assert_eq!(spelled(Monoid::PRODUCT, &[]), "1");
+        assert_eq!(spelled(Monoid::MAX, &[]), "-inf");
     }
 
     #[test]

@@ -32,7 +32,7 @@ pub mod dyadic;
 /// binds, and the domain that index runs over. See the module docs for why
 /// those are a type rather than three `Const` children.
 pub mod fold;
-pub use fold::{Binder, Fold, IntervalFold, Monoid, RangeFold};
+pub use fold::{Binder, Chain, Fold, IntervalFold, Monoid, RangeFold};
 
 /// What an integral over an interval closes to: the closed forms the
 /// e-graph's integration rules write, beside the interval whose ends they

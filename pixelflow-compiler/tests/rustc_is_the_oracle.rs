@@ -514,7 +514,8 @@ fn a_fold_index_shadows_only_inside_its_body() {
 }
 
 /// A fold over an empty range is its monoid's identity, as rustc's is: 0,
-/// 1, +∞, −∞, false and true.
+/// 1, +∞, −∞, false and true — the sum's `+0.0` where rustc's `Sum for
+/// f32` starts from `-0.0`, a difference `==` cannot see.
 #[test]
 fn a_fold_over_an_empty_range_is_the_identity_as_in_rustc() {
     let sum = kernel!(|| (3..3).map(|i| X + i as f32).sum());
@@ -686,4 +687,206 @@ fn a_structural_count_folds_as_rustcs_const_generic_does() {
     }
     // X = 3: (1 + 2 + 3 + 4) · 3 / 4.
     assert_eq!(bake(&mean_index::<4>()), 7.5);
+}
+
+// ─────────────── B3: families, and tuple lets ───────────────
+//
+// A family (docs/plans/2026-09-25-the-language-is-kernel.md §1.6) is written
+// as a Rust array of the block's records or of `f32`s, and iterated as Rust
+// iterates one, by value: `masses.into_iter().map(|m| e)`. So rustc is its
+// oracle too: the same tokens, over the host struct the macro emits, in a
+// host `fn` generic over the same count — the items of the block written
+// again as Rust — and, for the closure form, a Rust closure over the same
+// array. Every value is a quarter and every partial result exact, so the
+// comparison is bit for bit whatever order the optimizer combines the
+// copies in.
+
+kernel! {
+    /// A weighted point.
+    pub struct Mass { pub x: f32, pub w: f32 }
+
+    fn pull(m: Mass, x: f32) -> f32 { m.w * (x - m.x) }
+
+    /// Σ over the family, each element through a helper.
+    pub fn total_pull<const N: usize>(masses: [Mass; N]) -> f32 {
+        masses.into_iter().map(|m| pull(m, X) + Y).sum()
+    }
+
+    /// The nearest, weighted: a minimum over the family.
+    pub fn nearest<const N: usize>(masses: [Mass; N]) -> f32 {
+        masses
+            .into_iter()
+            .map(|m| (X - m.x).abs() * m.w)
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// Whether any point is right of the sample, as a number.
+    pub fn any_right<const N: usize>(masses: [Mass; N]) -> f32 {
+        if masses.into_iter().any(|m| X < m.x) { 1.0 } else { 0.0 }
+    }
+
+    /// A family iterated in a fold's body: each copy reads the fold's index,
+    /// and a term of it that reads no element, which the copies share.
+    pub fn swept<const N: usize>(masses: [Mass; N]) -> f32 {
+        (0..3)
+            .map(|i| {
+                let lever = i as f32 * 2.0 + X;
+                masses.into_iter().map(|m| m.w * lever - m.x).sum::<f32>()
+            })
+            .sum()
+    }
+}
+
+fn rust_pull(m: Mass, x: f32) -> f32 {
+    m.w * (x - m.x)
+}
+
+fn rust_total_pull<const N: usize>(masses: [Mass; N], x: f32, y: f32) -> f32 {
+    masses.into_iter().map(|m| rust_pull(m, x) + y).sum()
+}
+
+fn rust_nearest<const N: usize>(masses: [Mass; N], x: f32) -> f32 {
+    masses
+        .into_iter()
+        .map(|m| (x - m.x).abs() * m.w)
+        .fold(f32::INFINITY, f32::min)
+}
+
+fn rust_any_right<const N: usize>(masses: [Mass; N], x: f32) -> f32 {
+    indicator(masses.into_iter().any(|m| x < m.x))
+}
+
+fn rust_swept<const N: usize>(masses: [Mass; N], x: f32) -> f32 {
+    (0..3)
+        .map(|i| {
+            let lever = i as f32 * 2.0 + x;
+            masses.into_iter().map(|m| m.w * lever - m.x).sum::<f32>()
+        })
+        .sum()
+}
+
+/// Three weighted points, each coordinate and weight a quarter.
+const MASSES: [Mass; 3] = [
+    Mass { x: 1.0, w: 2.0 },
+    Mass { x: -0.5, w: 0.25 },
+    Mass { x: 2.5, w: 1.5 },
+];
+
+/// A family of records folds as the same tokens over a Rust array of the
+/// host struct do: a sum through a helper, a minimum and `any`, at three
+/// points, at one, and at none — each monoid's identity, as rustc's, the
+/// sum's `+0.0` where rustc's is `-0.0`, as B2's empty range has it.
+#[test]
+fn a_family_of_records_folds_as_rustcs_array_does() {
+    let [first, ..] = MASSES;
+    for (x, y) in FOLD_SAMPLES.into_iter().chain([(2.0, 1.0), (-1.0, 0.25)]) {
+        let at = |k: &Kernel| Lattice::eval_at(k, x, y);
+        assert_eq!(at(&total_pull(MASSES)), rust_total_pull(MASSES, x, y));
+        assert_eq!(at(&nearest(MASSES)), rust_nearest(MASSES, x));
+        assert_eq!(at(&any_right(MASSES)), rust_any_right(MASSES, x));
+        assert_eq!(at(&total_pull([first])), rust_total_pull([first], x, y));
+        assert_eq!(at(&nearest([first])), rust_nearest([first], x));
+        assert_eq!(at(&total_pull([])), rust_total_pull([], x, y));
+        assert_eq!(at(&nearest([])), rust_nearest([], x));
+        assert_eq!(at(&any_right([])), rust_any_right([], x));
+    }
+    // X = 3, Y = 5: 2·2 + 5, 0.25·3.5 + 5, 1.5·0.5 + 5.
+    assert_eq!(bake(&total_pull(MASSES)), 9.0 + 5.875 + 5.75);
+    // `==` cannot tell the zeros apart; the bits can. An empty family sums
+    // to `Monoid::SUM`'s identity, `+0.0`, where rustc's `Sum for f32`
+    // starts from `-0.0`.
+    assert_eq!(bake(&total_pull([])).to_bits(), 0.0_f32.to_bits());
+}
+
+/// A family iterated in a fold's body reads the fold's index, and the term
+/// its copies share reads it too, as rustc's nested iterators do.
+#[test]
+fn a_family_in_a_fold_reads_its_index_as_rustc_does() {
+    let [first, ..] = MASSES;
+    for (x, y) in FOLD_SAMPLES {
+        let at = |k: &Kernel| Lattice::eval_at(k, x, y);
+        assert_eq!(at(&swept(MASSES)), rust_swept(MASSES, x), "at ({x}, {y})");
+        assert_eq!(at(&swept([first])), rust_swept([first], x), "at ({x}, {y})");
+    }
+}
+
+/// A family of `f32`s in the closure form folds as a Rust closure over the
+/// same array does: each of the six reductions.
+#[test]
+fn a_family_of_f32s_folds_as_rustcs_array_does() {
+    let sum = kernel!(|v: [f32; 4]| v.into_iter().map(|e| (X - e) * Y).sum::<f32>());
+    let product = kernel!(|v: [f32; 4]| v.into_iter().map(|e| X + e).product::<f32>());
+    let max = kernel!(|v: [f32; 4]| v
+        .into_iter()
+        .map(|e| e * X)
+        .fold(f32::NEG_INFINITY, f32::max));
+    let min = kernel!(|v: [f32; 4]| v
+        .into_iter()
+        .map(|e| (e - X) * Y)
+        .fold(f32::INFINITY, f32::min));
+    let all = kernel!(|v: [f32; 4]| if v.into_iter().all(|e| e < X) {
+        1.0
+    } else {
+        0.0
+    });
+    let any = kernel!(|v: [f32; 4]| if v.into_iter().any(|e| X < e) {
+        1.0
+    } else {
+        0.0
+    });
+    let rust_sum =
+        |v: [f32; 4], x: f32, y: f32| -> f32 { v.into_iter().map(|e| (x - e) * y).sum() };
+    let rust_product =
+        |v: [f32; 4], x: f32, _y: f32| -> f32 { v.into_iter().map(|e| x + e).product() };
+    let rust_max = |v: [f32; 4], x: f32, _y: f32| {
+        v.into_iter()
+            .map(|e| e * x)
+            .fold(f32::NEG_INFINITY, f32::max)
+    };
+    let rust_min = |v: [f32; 4], x: f32, y: f32| {
+        v.into_iter()
+            .map(|e| (e - x) * y)
+            .fold(f32::INFINITY, f32::min)
+    };
+    let rust_all = |v: [f32; 4], x: f32, _y: f32| indicator(v.into_iter().all(|e| e < x));
+    let rust_any = |v: [f32; 4], x: f32, _y: f32| indicator(v.into_iter().any(|e| x < e));
+    for v in [[0.5, -1.0, 2.25, 0.0], [4.0, 0.25, -0.75, 1.5]] {
+        for (x, y) in FOLD_SAMPLES {
+            let at = |k: &Kernel| Lattice::eval_at(k, x, y);
+            assert_eq!(at(&sum(v)), rust_sum(v, x, y), "{v:?} at ({x}, {y})");
+            assert_eq!(
+                at(&product(v)),
+                rust_product(v, x, y),
+                "{v:?} at ({x}, {y})"
+            );
+            assert_eq!(at(&max(v)), rust_max(v, x, y), "{v:?} at ({x}, {y})");
+            assert_eq!(at(&min(v)), rust_min(v, x, y), "{v:?} at ({x}, {y})");
+            assert_eq!(at(&all(v)), rust_all(v, x, y), "{v:?} at ({x}, {y})");
+            assert_eq!(at(&any(v)), rust_any(v, x, y), "{v:?} at ({x}, {y})");
+        }
+    }
+}
+
+/// `let (a, b) = (e1, e2);` binds each name to its expression, all at once,
+/// as Rust's does: `let (a, b) = (b, a);` swaps, where binding one name at a
+/// time would give `b` the new `a`, and this would be `0` everywhere.
+#[test]
+fn a_tuple_let_binds_as_rustcs_does() {
+    let k = kernel!(|| {
+        let (a, b) = (X, Y * 2.0);
+        let (a, b) = (b, a);
+        let (c,) = (a - b,);
+        c * a
+    });
+    let rust = |x: f32, y: f32| {
+        let (a, b) = (x, y * 2.0);
+        let (a, b) = (b, a);
+        let (c,) = (a - b,);
+        c * a
+    };
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(Lattice::eval_at(&k, x, y), rust(x, y), "at ({x}, {y})");
+    }
+    // X = 3, Y = 5: (10 − 3) · 10.
+    assert_eq!(bake(&k), 70.0);
 }

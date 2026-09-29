@@ -35,6 +35,12 @@
 //! 7. **Binding times** (plan §1.4): an entry's structural parameters are
 //!    counts, and every parameter is a uniform — [`AnalyzedKernel::parameters`]
 //!    is the order they are declared in.
+//! 8. **Families** (plan §1.6): an entry's `[R; N]` is a family of records
+//!    or `f32`s, its count a literal, a `usize` const or a structural
+//!    parameter ([`family_count`]); it is iterated, and is nothing else — no
+//!    expression is one — and its body is a term of the monoid, in a scope
+//!    where the closure's parameter is one element. A tuple `let` types every
+//!    expression before it binds any name.
 //!
 //! ## Symbol Resolution Rules
 //!
@@ -44,7 +50,8 @@
 //!    record, bound per call; a helper's is the argument at the call
 //! 3. a fold's index → the fold's binder, a `usize`, visible in the fold's
 //!    body and nowhere else; an integral's variable → the integral's binder,
-//!    an `f32`, likewise
+//!    an `f32`, likewise; a family's element → one element's uniforms, a
+//!    different element's in each copy, likewise
 //! 4. a `const` → its value
 //! 5. an entry's structural parameter → a count, fixed per instantiation
 //! 6. an intrinsic (X, Y) → a coordinate `Var`, in an entry only: a helper
@@ -68,13 +75,13 @@
 
 use crate::PLAN;
 use crate::ast::{
-    BinaryExpr, BinaryOp, BlockExpr, CallExpr, CastExpr, ConstItem, Expr, FieldExpr, FnItem,
-    FoldExpr, IfExpr, IntegralBounds, IntegralExpr, KernelDef, LANGUAGE_FUNCTIONS, LetStmt,
-    MONOTONE_ROOT, MethodCallExpr, Param, RangeExpr, RecordField, RecordId, Reduction, Role,
-    Spelling, Stmt, UnaryOp,
+    BinaryExpr, BinaryOp, BlockExpr, CallExpr, CastExpr, ConstItem, Expr, FAMILY_SUM, FamilyExpr,
+    FamilyType, FieldExpr, FnItem, FoldExpr, IdentExpr, IfExpr, IntegralBounds, IntegralExpr,
+    KernelDef, LANGUAGE_FUNCTIONS, LetStmt, MONOTONE_ROOT, MethodCallExpr, Param, ParamType,
+    RangeExpr, RecordField, RecordId, Reduction, Role, Spelling, Stmt, UnaryOp,
 };
 use crate::lower::{LIBRARY_METHODS, Projection};
-use crate::symbol::{SymbolKind, SymbolTable};
+use crate::symbol::{Symbol, SymbolKind, SymbolTable};
 use pixelflow_ir::{Binder, IntervalFold, OpKind, known_method_names};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
@@ -100,6 +107,12 @@ use syn::{Ident, Type};
 /// name — a parameter, a `let` alias, an argument passed on — and read only
 /// by field. Anything that would compute one, choose one or return one is
 /// Phase D (D7).
+///
+/// The fifth, a family, is an entry's `[R; N]` (§1.6): `N` elements' scalar
+/// uniforms, and not a table. A name of this type is refused everywhere but
+/// one place — as what `name.into_iter()` iterates, where the program holds
+/// one copy of the body per element — so nothing indexes, measures, passes,
+/// aliases, compares or returns one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ty {
     /// A value.
@@ -112,6 +125,25 @@ pub enum Ty {
     Usize,
     /// One of the block's records.
     Record(RecordId),
+    /// A family of elements of this type; its count is its parameter's.
+    Family(Element),
+}
+
+/// What a family's elements are: one of the block's records, or an `f32`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Element {
+    F32,
+    Record(RecordId),
+}
+
+impl Element {
+    /// One element's type, as the closure's parameter has it.
+    pub fn ty(self) -> Ty {
+        match self {
+            Element::F32 => Ty::F32,
+            Element::Record(record) => Ty::Record(record),
+        }
+    }
 }
 
 impl Ty {
@@ -151,7 +183,7 @@ impl Ty {
                      body converts by `i as f32`"
                 ),
             )),
-            Some(Ty::Record(_)) | None => Err(syn::Error::new_spanned(
+            Some(Ty::Record(_) | Ty::Family(_)) | None => Err(syn::Error::new_spanned(
                 ty,
                 format!(
                     "{what} an `f32` or a `bool`\n\
@@ -162,14 +194,16 @@ impl Ty {
         }
     }
 
-    /// The type's name, as written; a record's is its own
-    /// ([`Items::name_of`]), and here it is only `record`.
+    /// The type's name, as written; a record's and a family's are their
+    /// own ([`Items::name_of`]), and here they are only `record` and
+    /// `family`.
     pub fn name(self) -> &'static str {
         match self {
             Ty::F32 => "f32",
             Ty::Bool => "bool",
             Ty::Usize => "usize",
             Ty::Record(_) => "record",
+            Ty::Family(_) => "family",
         }
     }
 }
@@ -231,18 +265,22 @@ pub struct AnalyzedKernel {
     pub consts: HashMap<String, ConstValue>,
 }
 
-/// An entry's parameter as its program sees it (plan §1.4): a uniform
-/// scalar, or a record of them.
-#[derive(Debug, Clone, Copy)]
+/// An entry's parameter as its program sees it (plan §1.4, §1.6): a uniform
+/// scalar, a record of them, or a family of either.
+#[derive(Debug, Clone)]
 pub(crate) struct Parameter<'a> {
     pub name: &'a Ident,
-    /// The record it is, with that record's fields, or `None` for an `f32`.
+    /// The record it is — or each of its elements is — with that record's
+    /// fields, or `None` for an `f32`.
     pub record: Option<(RecordId, &'a [RecordField])>,
+    /// A family's count, `None` for one value: its elements are declared
+    /// one after another, each its scalars, element-major.
+    pub family: Option<Count>,
 }
 
-/// One uniform scalar of an entry: a parameter, or one field of a record
-/// parameter — what the host function's argument `param` or `param.field`
-/// is, for this call.
+/// One uniform scalar of a value: the value itself, or one of its record's
+/// fields — what the host function's argument `param` or `param.field` is,
+/// for this call, or for a family's element `element.field`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Scalar<'a> {
     pub param: &'a Ident,
@@ -250,9 +288,10 @@ pub(crate) struct Scalar<'a> {
 }
 
 impl<'a> Parameter<'a> {
-    /// Its uniform scalars, in the order its program declares them: the
-    /// parameter itself, or its record's fields in field order.
-    pub fn scalars(self) -> impl Iterator<Item = Scalar<'a>> {
+    /// One value's uniform scalars, in the order its program declares
+    /// them: the value itself, or its record's fields in field order. A
+    /// family's are one element's, declared once per element.
+    pub fn scalars(&self) -> impl Iterator<Item = Scalar<'a>> + use<'a> {
         let param = self.name;
         let (whole, fields): (Option<Scalar<'a>>, &'a [RecordField]) = match self.record {
             None => (Some(Scalar { param, field: None }), &[]),
@@ -269,11 +308,16 @@ impl<'a> Parameter<'a> {
 
 impl AnalyzedKernel {
     /// An entry's parameters in declaration order: every one a uniform, a
-    /// record one per field (plan §1.4). The one definition of the order a
+    /// record one per field, a family one per field of each element,
+    /// element-major (plan §1.4, §1.6). The one definition of the order a
     /// program declares its uniforms in — lowering declares them by it,
     /// and the host function and its `Args` record supply them by it — so
     /// a positional binding cannot disagree with the program it binds.
     pub(crate) fn parameters<'a>(&'a self, entry: &'a FnItem) -> Vec<Parameter<'a>> {
+        let scope = RangeScope {
+            consts: &self.consts,
+            structural: &entry.structural,
+        };
         entry
             .params
             .iter()
@@ -281,8 +325,15 @@ impl AnalyzedKernel {
                 name: &param.name,
                 record: self
                     .def
-                    .record_named(&param.ty)
+                    .record_named(param.ty.written())
                     .map(|id| (id, self.def.record(id).fields.as_slice())),
+                family: match &param.ty {
+                    ParamType::One(_) => None,
+                    ParamType::Family(family) => Some(
+                        family_count(&family.count, scope)
+                            .expect("sema evaluated every family's count"),
+                    ),
+                },
             })
             .collect()
     }
@@ -385,7 +436,7 @@ impl<'a> Items<'a> {
             items.refuse_a_taken_name(&c.name)?;
             let ty = match Ty::from_syn(&c.ty) {
                 Some(ty @ (Ty::F32 | Ty::Usize)) => ty,
-                Some(Ty::Bool | Ty::Record(_)) | None => {
+                Some(Ty::Bool | Ty::Record(_) | Ty::Family(_)) | None => {
                     return Err(syn::Error::new_spanned(
                         &c.ty,
                         "a `const` in a `kernel!` block is an `f32` or a `usize`\n\
@@ -524,10 +575,12 @@ impl<'a> Items<'a> {
         }
     }
 
-    /// A type's name as a diagnostic writes it: a record's is its own.
+    /// A type's name as a diagnostic writes it: a record's is its own, and a
+    /// family's is its element's in brackets.
     fn name_of(&self, ty: Ty) -> String {
         match ty {
             Ty::Record(record) => self.def.record(record).name.to_string(),
+            Ty::Family(element) => format!("[{}; N]", self.name_of(element.ty())),
             Ty::F32 | Ty::Bool | Ty::Usize => ty.name().to_string(),
         }
     }
@@ -568,16 +621,24 @@ impl<'a> Items<'a> {
     }
 
     fn param_type(&self, param: &Param, role: Role) -> syn::Result<Ty> {
-        if let Some(record) = self.def.record_named(&param.ty) {
+        match &param.ty {
+            ParamType::One(ty) => self.one_param_type(ty, role),
+            ParamType::Family(family) => self.family_type(family, role),
+        }
+    }
+
+    /// One value's type: an `f32` or a record, or a `bool` in a helper.
+    fn one_param_type(&self, ty: &Type, role: Role) -> syn::Result<Ty> {
+        if let Some(record) = self.def.record_named(ty) {
             return Ok(Ty::Record(record));
         }
-        let named = match &*param.ty {
+        let named = match ty {
             Type::Path(path) if path.qself.is_none() => path.path.get_ident(),
             _ => None,
         };
-        if let Some(name) = named.filter(|_| Ty::from_syn(&param.ty).is_none()) {
+        if let Some(name) = named.filter(|_| Ty::from_syn(ty).is_none()) {
             return Err(syn::Error::new_spanned(
-                &param.ty,
+                ty,
                 format!(
                     "a kernel parameter is an `f32` or a `bool`, or one of this block's \
                      records, and `{name}` is none of them\n\
@@ -587,18 +648,53 @@ impl<'a> Items<'a> {
                 ),
             ));
         }
-        let ty = Ty::of_a_value(&param.ty, "a kernel parameter is")?;
-        match (role, ty) {
+        let value = Ty::of_a_value(ty, "a kernel parameter is")?;
+        match (role, value) {
             (Role::Entry, Ty::Bool) => Err(syn::Error::new_spanned(
-                &param.ty,
+                ty,
                 "an entry's parameter is an `f32` or a record\n\
                  \n\
                  note: an entry's parameters are its uniforms, bound per call: an `f32` is one, \
                  a record is one per field, and a uniform is a number\n\
                  help: take the mask's operands as parameters and compare them in the body",
             )),
-            _ => Ok(ty),
+            _ => Ok(value),
         }
+    }
+
+    /// `[E; N]`: an entry's family of records or `f32`s (§1.6). A helper
+    /// takes an element, never a family. The count is checked with the
+    /// body, where the `const`s have their values.
+    fn family_type(&self, family: &FamilyType, role: Role) -> syn::Result<Ty> {
+        if role == Role::Helper {
+            return Err(syn::Error::new(
+                family.span,
+                format!(
+                    "a family as a helper's parameter\n\
+                     \n\
+                     note: a helper takes one element, `fn piece_term(p: Row, …)`, and a family \
+                     is iterated in the entry that declares it: \
+                     `pieces.into_iter().map(|p| piece_term(p, …)).sum()`\n\
+                     note: a family is not a table, and nothing passes one on (§1.6 of {PLAN})"
+                ),
+            ));
+        }
+        if let Some(record) = self.def.record_named(&family.element) {
+            return Ok(Ty::Family(Element::Record(record)));
+        }
+        if Ty::from_syn(&family.element) == Some(Ty::F32) {
+            return Ok(Ty::Family(Element::F32));
+        }
+        Err(syn::Error::new_spanned(
+            &family.element,
+            format!(
+                "a family's element is one of this block's records or an `f32`\n\
+                 \n\
+                 note: a family is `N` elements' scalar uniforms at static slots, element-major \
+                 (§1.3, §1.6 of {PLAN}): a mask is not a uniform, and a family of families, \
+                 of tuples or of another block's type has no slots to be"
+            ),
+        ))
     }
 }
 
@@ -636,6 +732,9 @@ impl<'a> FnAnalyzer<'a> {
         }
         let signature = &items.fns[&f.name.to_string()];
         for (param, &ty) in f.params.iter().zip(&signature.params) {
+            if let ParamType::Family(family) = &param.ty {
+                family_count(&family.count, analyzer.range_scope())?;
+            }
             analyzer.register_parameter(param, ty)?;
         }
         Ok(analyzer)
@@ -761,6 +860,8 @@ impl<'a> FnAnalyzer<'a> {
 
             Expr::Fold(fold) => self.type_of_fold(fold),
 
+            Expr::Family(family) => self.type_of_family(family),
+
             Expr::Integral(integral) => self.type_of_integral(integral),
 
             Expr::Cast(cast) => self.type_of_cast(cast),
@@ -808,6 +909,14 @@ impl<'a> FnAnalyzer<'a> {
         ))
     }
 
+    /// The family `expr` names, through parentheses, if it names one in
+    /// scope.
+    fn a_family_named<'e>(&self, expr: &'e Expr) -> Option<&'e Ident> {
+        let name = expr.named()?;
+        let symbol = self.symbols.lookup(&name.to_string())?;
+        matches!(symbol.ty, Ty::Family(_)).then_some(name)
+    }
+
     /// A record-typed expression is a name: a parameter or a `let` alias
     /// of one. Anything else that has a record's type — a block ending in
     /// one, a `.clone()` of one — computes a record, and a record is never
@@ -849,6 +958,47 @@ impl<'a> FnAnalyzer<'a> {
         self.symbols.push_scope();
         self.symbols.register_index(&fold.binder.to_string());
         let typed = self.expect(&fold.body, term, what);
+        self.symbols.pop_scope();
+        typed
+    }
+
+    /// `pieces.into_iter().map(|p| e).sum()` and its siblings: `pieces` is a
+    /// family, and the body a term of the monoid, typed in a scope of its own
+    /// where the closure's parameter is one element — a record or an `f32`.
+    /// The body sees every enclosing binding, as a fold's does; the element
+    /// is in scope there and nowhere else, so nothing of one element leaks
+    /// out of its copy.
+    fn type_of_family(&mut self, family: &FamilyExpr) -> syn::Result<Ty> {
+        let element = match self.symbols.lookup(&family.family.to_string()) {
+            Some(Symbol {
+                ty: Ty::Family(element),
+                ..
+            }) => *element,
+            Some(_) => {
+                let found = self.type_of(&Expr::Ident(IdentExpr {
+                    name: family.family.clone(),
+                    span: family.family.span(),
+                }))?;
+                return Err(syn::Error::new(
+                    family.family.span(),
+                    format!(
+                        "`{}` is a `{}`, not a family\n\
+                         \n\
+                         note: a family is an entry's parameter declared `[R; N]`, iterated as \
+                         a whole: {FAMILY_SUM} (§1.6 of {PLAN})",
+                        family.family,
+                        self.items.name_of(found)
+                    ),
+                ));
+            }
+            None => return self.resolve_ident(&family.family),
+        };
+        self.refuse_shadowing_an_item(&family.element, "a family's element")?;
+        let (term, what) = term_type(family.reduction);
+        self.symbols.push_scope();
+        self.symbols
+            .register_element(&family.element.to_string(), element.ty());
+        let typed = self.expect(&family.body, term, what);
         self.symbols.pop_scope();
         typed
     }
@@ -927,6 +1077,7 @@ impl<'a> FnAnalyzer<'a> {
                 "a `bool` is a mask; it becomes a number by a choice, `if m { 1.0 } else { 0.0 }`"
             }
             Ty::Record(_) => "a record is its fields; each is an `f32` already, `p.x0`",
+            Ty::Family(_) => "a family is iterated as a whole, and is never one value",
             Ty::F32 | Ty::Usize => "it is a value already, and needs no conversion",
         };
         Err(syn::Error::new(
@@ -1018,10 +1169,11 @@ impl<'a> FnAnalyzer<'a> {
                     ),
                 ));
             }
-            if symbol.ty == Ty::Usize {
-                return Err(a_count_is_not_a_value(ident));
-            }
-            return Ok(symbol.ty);
+            return match symbol.ty {
+                Ty::Usize => Err(a_count_is_not_a_value(ident)),
+                Ty::Family(_) => Err(a_family_is_not_a_value(ident)),
+                ty => Ok(ty),
+            };
         }
         if self.items.fns.contains_key(&name) {
             return Err(syn::Error::new(
@@ -1064,6 +1216,14 @@ impl<'a> FnAnalyzer<'a> {
     fn type_of_method_call(&mut self, call: &MethodCallExpr) -> syn::Result<Ty> {
         let method_name = call.method.to_string();
         let arg_count = call.args.len();
+
+        // A family's methods are Rust's arrays' — `.len()`, `.iter()`,
+        // `.get(k)` — and each would measure, lend or index it: there is no
+        // table (§1.6). Refused by name here, before the method is looked up
+        // as an operation it is not.
+        if let Some(family) = self.a_family_named(&call.receiver) {
+            return Err(a_familys_method(family, &call.method));
+        }
 
         if RETIRED_METHODS.contains(&method_name.as_str()) {
             return Err(syn::Error::new(
@@ -1320,6 +1480,7 @@ impl<'a> FnAnalyzer<'a> {
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Let(let_stmt) => self.analyze_let(let_stmt)?,
+                Stmt::LetTuple(lets) => self.analyze_let_tuple(lets)?,
                 // A record as a statement is a value lowering has no lane
                 // for, so it is refused here rather than there.
                 Stmt::Expr(expr) => {
@@ -1344,6 +1505,30 @@ impl<'a> FnAnalyzer<'a> {
     /// Analyze a let statement: the initializer is typed, checked against an
     /// annotation if there is one, and the name is bound to that type.
     fn analyze_let(&mut self, let_stmt: &LetStmt) -> syn::Result<()> {
+        let found = self.let_type(let_stmt)?;
+        self.symbols
+            .register_local(&let_stmt.name.to_string(), found);
+        Ok(())
+    }
+
+    /// `let (a, b) = (e1, e2);`: every expression is typed where the
+    /// statement stands, before any of its names binds — `let (a, b) = (b,
+    /// a);` swaps, as it does in Rust — and then each name is bound to its
+    /// expression's type.
+    fn analyze_let_tuple(&mut self, lets: &[LetStmt]) -> syn::Result<()> {
+        let mut found = Vec::with_capacity(lets.len());
+        for let_stmt in lets {
+            found.push(self.let_type(let_stmt)?);
+        }
+        for (let_stmt, ty) in lets.iter().zip(found) {
+            self.symbols.register_local(&let_stmt.name.to_string(), ty);
+        }
+        Ok(())
+    }
+
+    /// The type a `let` binds its name to, its initializer checked against
+    /// its annotation if it has one.
+    fn let_type(&mut self, let_stmt: &LetStmt) -> syn::Result<Ty> {
         self.refuse_shadowing_an_item(&let_stmt.name, "`let`")?;
 
         // The initializer is analyzed before the binding exists, so it sees
@@ -1370,9 +1555,7 @@ impl<'a> FnAnalyzer<'a> {
                 )?
             }
         };
-        self.symbols
-            .register_local(&let_stmt.name.to_string(), found);
-        Ok(())
+        Ok(found)
     }
 
     /// Type `expr`, and refuse it unless it is `want`, saying what `what`
@@ -1420,6 +1603,53 @@ impl<'a> FnAnalyzer<'a> {
     }
 }
 
+/// A family where a value is expected: in arithmetic, a comparison, a
+/// helper's argument, a `let`, a field read, a conversion, a return. A
+/// family is not a table (§1.6): it is iterated as a whole, and nothing else
+/// is done with one.
+fn a_family_is_not_a_value(name: &Ident) -> syn::Error {
+    syn::Error::new(
+        name.span(),
+        format!(
+            "`{name}` is a family, where a value is expected\n\
+             \n\
+             note: a family is not a table (§1.6 of {PLAN}): it is iterated as a whole, \
+             {FAMILY_SUM} — the program holds one copy of the body per element — and is never \
+             indexed, measured, passed, aliased, compared or returned\n\
+             help: a helper takes one element: \
+             `{name}.into_iter().map(|p| helper(p, …)).sum()`"
+        ),
+    )
+}
+
+/// A method of a Rust array called on a family: `.len()` measures it,
+/// `.iter()` lends it, `.get(k)` indexes it, and a family is none of those
+/// things (§1.6).
+fn a_familys_method(family: &Ident, method: &Ident) -> syn::Error {
+    let why = match method.to_string().as_str() {
+        "len" => "a family's length is the count it is declared with, `[R; N]`: a structural \
+                  parameter, read where a value is expected as `N as f32`, or a constant"
+            .to_string(),
+        "into_iter" => format!(
+            "`{family}.into_iter()` is iterated by `.map(|p| …)` and a reduction, or by \
+             `.any(|p| …)` or `.all(|p| …)`, and is not a value"
+        ),
+        other => format!(
+            "`.{other}` would lend, index or reorder a family's elements, and there is no \
+             table: {FAMILY_SUM} is the one way to read them"
+        ),
+    };
+    syn::Error::new(
+        method.span(),
+        format!(
+            "`{family}.{method}(…)`: a family is iterated as a whole, and has no other methods\n\
+             \n\
+             note: {why}\n\
+             note: a family is not a table (§1.6 of {PLAN})"
+        ),
+    )
+}
+
 /// A `usize` where a value is expected. A `usize` — a fold's index, a
 /// `usize` const or a structural parameter — is a value only as `i as f32`:
 /// nothing in the language computes with one, because there is nothing to
@@ -1456,7 +1686,7 @@ pub(crate) enum Count {
 
 impl Count {
     /// The count as a Rust `usize` expression.
-    fn tokens(&self) -> TokenStream {
+    pub(crate) fn tokens(&self) -> TokenStream {
         match self {
             Count::Known(value) => {
                 let value = proc_macro2::Literal::u64_unsuffixed(*value);
@@ -1663,6 +1893,48 @@ impl UsizeScope for RangeScope<'_> {
                  (§1.5 of {PLAN})"
             ),
         )
+    }
+}
+
+/// A family's count (plan §1.6): an integer literal, a `usize` const or one
+/// of its entry's structural parameters — a name or an integer, and no
+/// arithmetic, since it is the host array's length, `[Row; N]`, and each
+/// value is its own program.
+///
+/// The one evaluation of it: `sema` checks a family with it, and emission
+/// writes the host type and the instantiation's copies from the count it
+/// returns.
+pub(crate) fn family_count(count: &Expr, scope: RangeScope<'_>) -> syn::Result<Count> {
+    let not_a_count = || {
+        syn::Error::new(
+            count.span(),
+            format!(
+                "a family's count is an integer literal, a `usize` const or its entry's \
+                 structural parameter\n\
+                 \n\
+                 note: it is the length of the host array, `[Row; N]`, and each value is its own \
+                 program (§1.4, §1.6 of {PLAN})"
+            ),
+        )
+    };
+    let name = match count {
+        Expr::Paren(inner) => return family_count(inner, scope),
+        Expr::Literal(literal) => return literal.usize_value().map(Count::Known),
+        Expr::Ident(ident) => &ident.name,
+        _ => return Err(not_a_count()),
+    };
+    match scope.consts.get(&name.to_string()) {
+        Some(ConstValue::Usize(value)) => Ok(Count::Known(*value)),
+        Some(ConstValue::F32(_)) => Err(syn::Error::new(
+            name.span(),
+            format!(
+                "`{name}` is an `f32` const, and a family's count is a `usize`\n\
+                 \n\
+                 help: declare the count as `const {name}: usize`"
+            ),
+        )),
+        None if scope.structural.contains(name) => Ok(Count::Structural(quote!(#name))),
+        None => Err(not_a_count()),
     }
 }
 
@@ -1974,7 +2246,7 @@ impl ConstEvaluator<'_> {
         let value = match self.types.get(&key) {
             Some(Ty::Usize) => ConstValue::Usize(self.known_usize(&item.init)?),
             Some(Ty::F32) => ConstValue::F32(self.eval_f32(&item.init)?),
-            Some(Ty::Bool | Ty::Record(_)) | None => {
+            Some(Ty::Bool | Ty::Record(_) | Ty::Family(_)) | None => {
                 return Err(syn::Error::new_spanned(
                     &item.ty,
                     "a `const` in a `kernel!` block is an `f32` or a `usize`",
@@ -2104,6 +2376,7 @@ fn collect_calls(expr: &Expr, fns: &[String], out: &mut Vec<(String, Span)>) {
         }
         // A bound is constant, so it calls nothing; a body may.
         Expr::Fold(fold) => collect_calls(&fold.body, fns, out),
+        Expr::Family(family) => collect_calls(&family.body, fns, out),
         Expr::Integral(integral) => collect_calls(&integral.body, fns, out),
         Expr::Cast(cast) => collect_calls(&cast.operand, fns, out),
         Expr::Field(field) => collect_calls(&field.base, fns, out),
@@ -2116,6 +2389,11 @@ fn collect_block_calls(block: &BlockExpr, fns: &[String], out: &mut Vec<(String,
     for stmt in &block.stmts {
         match stmt {
             Stmt::Let(let_stmt) => collect_calls(&let_stmt.init, fns, out),
+            Stmt::LetTuple(lets) => {
+                for let_stmt in lets {
+                    collect_calls(&let_stmt.init, fns, out);
+                }
+            }
             Stmt::Expr(expr) => collect_calls(expr, fns, out),
         }
     }
@@ -3421,5 +3699,241 @@ mod tests {
         }
         let err = refusal(quote! { pub fn f<const N: usize, const N: usize>() -> f32 { X } });
         assert!(err.contains("declared twice"), "got: {err}");
+    }
+
+    // ───────────────────────────── families ─────────────────────────────
+
+    /// A family is an entry's `[R; N]` of records or `f32`s, its count a
+    /// literal, a `usize` const or a structural parameter; it is iterated,
+    /// each element read by field or as a value, through a helper, in a fold
+    /// and in a nested iteration over the same family, under every monoid.
+    #[test]
+    fn a_family_is_iterated_over_its_elements() {
+        accepted(with_row(quote! {
+            const K: usize = 2;
+            fn scaled(p: Row, x: f32) -> f32 { p.s * (x - p.x0) }
+            pub fn f<const N: usize>(pieces: [Row; N], v: [f32; 3], w: [f32; K], r: f32) -> f32 {
+                let total: f32 = pieces.into_iter().map(|p| scaled(p, X) * r).sum();
+                let nearest = v.into_iter().map(|e| (X - e).abs()).fold(f32::INFINITY, f32::min);
+                let pairs: f32 = pieces
+                    .into_iter()
+                    .map(|p| pieces.into_iter().map(|q| p.x0 * q.s).sum::<f32>())
+                    .sum();
+                let hit = w.into_iter().any(|e| X < e)
+                    & pieces.into_iter().all(|p| (0..N).any(|i| p.x0 < i as f32));
+                if hit { total + nearest + pairs } else { 0.0 }
+            }
+        }));
+        accepted(quote! { |v: [f32; 4]| v.into_iter().map(|e| e * X).product::<f32>() });
+    }
+
+    /// A family is never a value (§1.6): passed to a helper, aliased by a
+    /// `let`, in arithmetic or a comparison, returned, converted, or read by
+    /// field, it is refused at its name, naming the one way it is read.
+    #[test]
+    fn a_family_is_never_a_value_naming_section_1_6() {
+        let cases: [TokenStream; 8] = [
+            quote! { fn h(x: f32) -> f32 { x } pub fn f(v: [f32; 2]) -> f32 { h(v) } },
+            quote! { pub fn f(v: [f32; 2]) -> f32 { let w = v; X } },
+            quote! { pub fn f(v: [f32; 2]) -> f32 { let (w, s) = (v, X); s } },
+            quote! { pub fn f(v: [f32; 2]) -> f32 { v + 1.0 } },
+            quote! { pub fn f(v: [f32; 2]) -> bool { v == v } },
+            quote! { pub fn f(v: [f32; 2]) -> f32 { v } },
+            quote! { pub fn f(v: [f32; 2]) -> f32 { v as f32 } },
+            quote! { pub struct Row { pub x0: f32 } pub fn f(v: [Row; 2]) -> f32 { v.x0 } },
+        ];
+        for input in cases {
+            let err = refusal(input);
+            assert!(
+                err.contains("`v` is a family, where a value is expected")
+                    && err.contains("pieces.into_iter().map(|p| e).sum()")
+                    && err.contains("§1.6"),
+                "got: {err}"
+            );
+        }
+    }
+
+    /// A family's own methods — an array's `.len()`, `.iter()`, `.get(k)` —
+    /// would measure, lend or index it, and are refused by name, `.len()`
+    /// saying where a family's length is.
+    #[test]
+    fn a_familys_array_methods_are_refused_naming_section_1_6() {
+        let cases: [(TokenStream, &str); 4] = [
+            (
+                quote! { pub fn f<const N: usize>(v: [f32; N]) -> f32 { v.len() } },
+                "a family's length is the count it is declared with",
+            ),
+            (
+                quote! { pub fn f(v: [f32; 2]) -> f32 { v.get(0) } },
+                "would lend, index or reorder",
+            ),
+            (
+                quote! { pub fn f(v: [f32; 2]) -> f32 { v.iter() } },
+                "would lend, index or reorder",
+            ),
+            (
+                quote! { pub fn f(v: [f32; 2]) -> f32 { v.into_iter() } },
+                "is iterated by `.map(|p| …)` and a reduction",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(input);
+            assert!(
+                err.contains(expected) && err.contains("§1.6"),
+                "expected `{expected}`, got: {err}"
+            );
+        }
+    }
+
+    /// An element is its copy's alone: out of the closure it is not in
+    /// scope, and a record element is not the closure's value either.
+    #[test]
+    fn a_familys_element_does_not_leak_out_of_its_copy() {
+        let cases: [(TokenStream, &str); 3] = [
+            (
+                quote! { pub fn f(v: [f32; 2]) -> f32 { v.into_iter().map(|e| e).sum::<f32>() + e } },
+                "cannot find `e`",
+            ),
+            (
+                with_row(quote! {
+                    pub fn f(ps: [Row; 2]) -> f32 {
+                        let q: f32 = ps.into_iter().map(|p| p.x0).sum();
+                        q + p.x0
+                    }
+                }),
+                "cannot find `p`",
+            ),
+            (
+                with_row(
+                    quote! { pub fn f(ps: [Row; 2]) -> f32 { ps.into_iter().map(|p| p).sum() } },
+                ),
+                "the record `Row` where a value is expected",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(input);
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
+    }
+
+    /// A family is an entry's parameter of records or `f32`s, counted by a
+    /// literal, a `usize` const or a structural parameter: a helper takes
+    /// an element, never a family (§1.6); a family of masks, of arrays, of
+    /// another block's type, and a count computed or not a `usize`, are
+    /// refused where they are written.
+    #[test]
+    fn a_family_is_an_entrys_records_or_f32s_counted_by_a_constant() {
+        let cases: [(TokenStream, &str); 7] = [
+            (
+                quote! { fn h(v: [f32; 2]) -> f32 { 1.0 } pub fn f() -> f32 { X } },
+                "a family as a helper's parameter",
+            ),
+            (
+                quote! { pub fn f(v: [bool; 2]) -> f32 { X } },
+                "a family's element is one of this block's records or an `f32`",
+            ),
+            (
+                quote! { pub fn f(v: [[f32; 2]; 2]) -> f32 { X } },
+                "a family's element is one of this block's records or an `f32`",
+            ),
+            (
+                quote! { pub fn f<const N: usize>(v: [f32; N * 2]) -> f32 { X } },
+                "a family's count is an integer literal, a `usize` const",
+            ),
+            (
+                quote! { const R: f32 = 2.0; pub fn f(v: [f32; R]) -> f32 { X } },
+                "`R` is an `f32` const, and a family's count is a `usize`",
+            ),
+            (
+                quote! { pub fn f(v: [f32; M]) -> f32 { X } },
+                "a family's count is an integer literal, a `usize` const",
+            ),
+            (
+                quote! { pub fn f(v: [f32; 2.0]) -> f32 { X } },
+                "expected `usize`, found a float literal",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(input);
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
+        let err = refusal(quote! { fn h(v: [f32; 2]) -> f32 { 1.0 } pub fn f() -> f32 { X } });
+        assert!(
+            err.contains("a helper takes one element") && err.contains("§1.6"),
+            "got: {err}"
+        );
+    }
+
+    /// Only a family is iterated, its element shadows no item, and its body
+    /// is a term of its monoid.
+    #[test]
+    fn only_a_family_is_iterated_and_its_body_is_a_term() {
+        let cases: [(TokenStream, &str); 7] = [
+            (
+                quote! { pub fn f(r: f32) -> f32 { r.into_iter().map(|e| e).sum() } },
+                "`r` is a `f32`, not a family",
+            ),
+            (
+                with_row(quote! { pub fn f(p: Row) -> f32 { p.into_iter().map(|e| e).sum() } }),
+                "`p` is a `Row`, not a family",
+            ),
+            (
+                quote! { pub fn f() -> f32 { X.into_iter().map(|e| e).sum() } },
+                "`X` is a `f32`, not a family",
+            ),
+            (
+                quote! { pub fn f() -> f32 { pieces.into_iter().map(|e| e).sum() } },
+                "cannot find `pieces`",
+            ),
+            (
+                quote! { pub fn f(v: [f32; 2]) -> f32 { v.into_iter().map(|X| X).sum() } },
+                "a family's element `X` shadows the intrinsic",
+            ),
+            (
+                quote! { pub fn f(v: [f32; 2]) -> f32 { v.into_iter().map(|e| e < X).sum() } },
+                "a sum, a product, a minimum or a maximum combines `f32`s",
+            ),
+            (
+                quote! { pub fn f(v: [f32; 2]) -> bool { v.into_iter().any(|e| e) } },
+                "`any` and `all` combine `bool`s",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(input);
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
+    }
+
+    // ───────────────────────────── tuple lets ─────────────────────────────
+
+    /// A tuple `let` types every expression where the statement stands,
+    /// before any of its names binds — so `let (a, b) = (b, a);` swaps, as
+    /// Rust's does — and then binds each name to its expression's type: a
+    /// mask, a value, a record aliased.
+    #[test]
+    fn a_tuple_let_types_each_expression_before_binding_any_name() {
+        accepted(quote! { || { let (a, b) = (X, Y); let (a, b) = (b, a); a - b } });
+        accepted(quote! { || { let (m, w) = (X < Y, X); if m { w } else { 0.0 } } });
+        accepted(with_row(quote! {
+            pub fn f(p: Row, r: f32) -> f32 { let (q, s) = (p, r); q.x0 * s }
+        }));
+        let cases: [(TokenStream, &str); 3] = [
+            (
+                quote! { || { let (b, c) = (X < Y, b); X } },
+                "cannot find `b`",
+            ),
+            (
+                quote! { || { let (a, b): (f32, f32) = (X, X < Y); a } },
+                "`b` is declared as a `f32`",
+            ),
+            (
+                quote! { || { let (X, b) = (Y, Y); b } },
+                "shadows the intrinsic coordinate",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(input);
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
     }
 }
