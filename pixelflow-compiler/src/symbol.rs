@@ -13,11 +13,17 @@
 //! | Const      | Expansion time      | `Const(v)`, or a count | PI, N |
 //! | Local      | Expression scope    | A shared `ExprId`, or a record's fields | dx, q |
 //! | Index      | A fold's body       | The fold's binder `Var` | i    |
+//! | Kernel     | Per call (host)     | The argument's term, spliced at each application | k |
 //!
 //! A helper's parameters are a further thing at lowering — the argument's
 //! own node, or a record argument's fields, bound by name where the helper
 //! is inlined — but to `sema` they are parameters like any other: a name
 //! with a type.
+//!
+//! A kernel is a parameter typed `impl Fn(f32, f32) -> f32` (Phase D-a): to
+//! `sema` a name of [`Ty::Kernel`], applied, `k(x, y)`, or passed on; at
+//! lowering an argument admitted when the entry's host function is called,
+//! whose term each application splices in at its coordinates.
 //!
 //! ## Intrinsic Coordinates
 //!

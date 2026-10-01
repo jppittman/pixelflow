@@ -109,7 +109,9 @@ fn if_and_select_lower_to_the_same_arena() {
 
 /// A block written where no prelude is in scope: a record, a `pub const`, a
 /// helper, a tuple `let`, a fold over a structural count, the `Args`
-/// record, and the closure form. The expansion names every item by path,
+/// record, the closure form, and an entry that takes a kernel — whose host
+/// function runs lowering's steps, a fold's and a library method's and a
+/// derivative's among them. The expansion names every item by path,
 /// so it expands in a `#[no_implicit_prelude]` module as anywhere else —
 /// which a bare `Some`, or a method called through a prelude trait, would
 /// not.
@@ -130,6 +132,11 @@ mod without_a_prelude {
             let (a, b) = (r, X);
             (0..N).map(|i| weighed(m, a) + (i as f32)).sum::<f32>()
                 + if b < v { HALF } else { 0.0 }
+        }
+
+        /// A kernel applied in a fold over a structural count, weighed.
+        pub fn applied<const N: usize>(k: impl Fn(f32, f32) -> f32, m: Mass) -> f32 {
+            weighed(m, (0..N).map(|i| k(X + (i as f32), Y)).sum::<f32>()) + X.fract() + DX(Y)
         }
     }
 
@@ -167,4 +174,10 @@ fn a_block_expands_where_no_prelude_is_in_scope() {
     assert_eq!(rebound.buffer(), baked.buffer());
 
     assert_eq!(Lattice::eval_at(&scaled(1.0, 2.0), 0.5, 0.0), 2.5);
+
+    // Σ_i (x + i + y) over three, times the weight, plus fract(x) and ∂Y/∂X.
+    let k = ::pixelflow_compiler::kernel!(|| X + Y);
+    let by_rust: f32 = m.x * (0..3).map(|i| x + i as f32 + 1.0).sum::<f32>() + m.w + x;
+    let applied = without_a_prelude::applied::<3>(&k, m);
+    assert_eq!(Lattice::eval_at(&applied, x, 1.0), by_rust);
 }

@@ -6,6 +6,8 @@
   one program per font per zoom level, there are no tables, the control
   points are uniforms, and `select` is renamed `if` (§1.6, §1.7). Revised
   again 2026-10-01: no arrays (below). Phases A and B are done but B7; Phase C waits on O1–O4.
+  2026-10-01: JP answered O1 and O2 "Yes and yes". D-a, the O2 half, is
+  done (this commit).
 - **No arrays** (2026-10-01). JP: *"Why do we have any arrays at all?"*
   and *"No arrays at all.. please go read recent docs about how this ought
   to work."*
@@ -167,7 +169,7 @@ sugar for a block with one entry.
 | `bool` | a mask; comparisons produce it; `&` and `\|` combine it | an all-ones or all-zero lane, `OpKind::mask(bool)` |
 | `usize` | a fold binder or a structural count | `Var(REDUCE_BINDER_BASE + slot)`; converted by an explicit `i as f32` |
 | records | named `f32` fields | flattened at lowering |
-| `impl Fn(f32, f32) -> f32` | a kernel-typed parameter (Phase D) | a hole spliced at instantiation |
+| `impl Fn(f32, f32) -> f32` | a kernel-typed parameter: a kernel the host passes at run time, applied `k(x, y)` (Phase D-a, done) | none of its own: each application splices the argument's term, `k[X := x, Y := y]` (`ExprArena::apply`) |
 | `u32` bits | packed words (Phase D) | `Bits` ops |
 
 **No collection types** (JP, 2026-10-01: *"No arrays at all."*). The
@@ -184,6 +186,28 @@ a mask. F: probe p16 gives 5. After this plan it is a type error.
 | structural | `const N: usize`, a zoom level's tile extent; the font's shape, meaning which glyphs and how many pieces each (I) | at instantiation, or by what the host composes; each value is its own program | yes |
 | uniform | a piece's ten coordinates and a glyph's box, written once per font and zoom; a cell's glyph id, origin, `fg` and `bg`, per call | through the program's block: an entry's `Args` record, or for the composed font, O3 | no |
 | kernel-typed | `k: impl Fn(f32, f32) -> f32` | at runtime; composed, then `P` | the composed program's |
+
+- **A kernel-typed argument is admitted when the host function is called**
+  (F, D-a). The host function takes it as a `&Kernel`, and builds its
+  program then: it runs lowering's steps, the IR calls the macro makes at
+  expansion for any other entry. The composed program declares the entry's
+  own uniforms first, in `AnalyzedKernel::parameters` order, then each
+  argument's, in parameter order and that argument's own declaration
+  order, read or not; an instance passed twice is declared once, where it
+  first appears. That is `Kernel`'s rule for a composition's operands
+  (B3a). Its key is the composed term's, and nothing combines the
+  template's key with the argument's.
+  - **O3 reads off this order.** Where an instance's slots land is its
+    position in the composition: for `glyph(ink, bounds)` with `ink` a
+    balanced `sum2` tree of `one_piece` instances, the box is slots `0..4`
+    and piece `k` is slots `4 + 10k .. 14 + 10k` (F, pinned by
+    `kernel_copy.rs`). So the walk that composes the font can return each
+    instance's offset as a prefix sum over what it composed. Not built
+    (O3).
+  - An entry that takes a kernel has no `Args` record: its block declares
+    the argument's uniforms too, so a record of the entry's own would
+    rebind only a program whose argument declares none. Binding a
+    composed program is O3.
 
 - **Everything that is not structural is a uniform, and a uniform is a
   scalar.** An `f32` argument no longer folds into a constant because of its
@@ -298,7 +322,9 @@ kernel! {
         pub sigma: f32, pub s: f32,
         pub lo: f32, pub hi: f32,
     }
-    /// A glyph's box: four uniforms.
+    /// A glyph's box: the outline's bounding box, four uniforms. Coverage
+    /// reaches half a pixel past it, which `inside` reaches too, so the
+    /// host passes the outline's own box.
     pub struct Bounds { pub x0: f32, pub y0: f32, pub x1: f32, pub y1: f32 }
 
     const PIXEL_CENTER: f32 = 0.5;
@@ -361,8 +387,12 @@ kernel! {
         if (y > p.lo) & (y < p.hi) { term } else { 0.0 }
     }
 
+    /// Whether the pixel about (x, y) can meet the outline: its centre
+    /// within half a pixel of the outline's box. Every piece's term is
+    /// exactly 0 farther out.
     fn inside(b: Bounds, x: f32, y: f32) -> bool {
-        (x >= b.x0) & (x <= b.x1) & (y >= b.y0) & (y <= b.y1)
+        (x >= b.x0 - PIXEL_HALF) & (x <= b.x1 + PIXEL_HALF)
+            & (y >= b.y0 - PIXEL_HALF) & (y <= b.y1 + PIXEL_HALF)
     }
 
     /// One piece's term at the sample, over its own ten uniforms. The host
@@ -371,10 +401,17 @@ kernel! {
         piece_term(p, X, Y)
     }
 
+    /// Two kernels summed at the sample: the operation of the monoid a
+    /// glyph's ink is, which the host folds its pieces' instances with — a
+    /// balanced tree, by index.
+    pub fn sum2(a: impl Fn(f32, f32) -> f32, b: impl Fn(f32, f32) -> f32) -> f32 {
+        a(X, Y) + b(X, Y)
+    }
+
     /// One glyph. Texel (i, j) holds coverage at (i+½, j+½). `ink` is the
     /// sum of the glyph's pieces, composed by the host, and `ink(x, y)`
     /// reads it at the pixel's centre: application is contramap (§1.2).
-    /// `ink` is kernel-typed (Phase D-a, not built; O2).
+    /// `ink` is kernel-typed (Phase D-a).
     pub fn glyph(ink: impl Fn(f32, f32) -> f32, bounds: Bounds) -> f32 {
         let (x, y) = (X + PIXEL_CENTER, Y + PIXEL_CENTER);
         if inside(bounds, x, y) { coverage(ink(x, y)) } else { 0.0 }
@@ -397,7 +434,7 @@ font loaded at runtime), and the language has no collection to hold it
 (§1.3). So the walk over the parsed font is host Rust, and it composes:
 - **a piece:** one instance of `one_piece` over its own ten uniforms;
 - **a glyph:** `glyph(ink, bounds)` over its box's four uniforms, with
-  `ink` the sum of its pieces' instances;
+  `ink` the sum of its pieces' instances, a balanced tree of `sum2`;
 - **the font:** its glyphs under a balanced tree of
   `if id < k { lower } else { upper }`.
   - **I:** the host numbers the font's glyphs `0..G`, halves the range, and
@@ -413,27 +450,34 @@ font loaded at runtime), and the language has no collection to hold it
 That is the whole font program. The tree is the partition that `if` and
 bounding make (§1.6). It is not a table, and the host chooses no program.
 
-**Three things about it are open:**
-- **The composition surface (O2).**
-  - The block spells it with a kernel-typed argument, `ink`. That is Phase
-    D-a, and it is not built (F): sema has no kernel type, and the parser
-    refuses `impl Fn` (`parser.rs:602`).
-  - The id tree has no spelling in the block at all, because its shape is
-    the font's.
-  - Until D-a, only the builder composes, and §1.1 says the builder is not
-    a surface.
+**The composition surface (O2) is built** (D-a, this commit). The host
+composes a glyph from `kernel!` entries alone: one `one_piece` instance
+per piece, summed by `sum2` as a balanced tree, and `glyph(ink, bounds)`
+over the sum. Nothing of the builder is on that path (F,
+`kernel_copy.rs`): the rows are the font's data, and the box is the
+outline's own, which `inside` reaches half a pixel past. That reach was
+the builder's, in `Support`'s dilated box, until review found the test
+borrowing it. Measured: with the outline's box and no reach in the block,
+'A' at 16 px draws texel (3, 2) as 0 where the builder draws 0.19. The id
+tree is not built, and its shape is still the font's (C1).
+
+**Two things about it are open:**
 - **The units (O1).** The font is too big for one e-graph or one emit
   (§1.8). So each glyph is its own unit, and the id tree links them. The
   link that keeps a unit separate is not built.
 - **Binding (O3).** The host writes each instance's uniforms into the
   composed program's block. No document says how it finds their slots.
 
-**Today's copy (F).** `one_piece` and the helpers it calls are expanded from
-`pixelflow-compiler/tests/common/section_1_7.rs`. `fonts/loop_blinn/kernel_copy.rs`
-(`a_piece_is_one_term_through_either_definition`) pins that piece's term
-against the builder's `piece_term`: they are one canonical key. The file's
-`glyph<const N>` over a family, and the bake through it, were deleted with
-the families (B3).
+**Today's copy (F).** The block above is expanded from
+`pixelflow-compiler/tests/common/section_1_7.rs`, and
+`fonts/loop_blinn/kernel_copy.rs` pins it against the builder twice.
+- `a_piece_is_one_term_through_either_definition`: `one_piece` and the
+  builder's `piece_term` are one canonical key.
+- `real_glyphs_composed_in_the_language_draw_the_builders_pixels`: DejaVu's
+  A, O, S, g, 8 and Q at 16 px, composed as above, draw the builder
+  `glyph`'s pixels to twice the closed form's error bound. They differ by
+  at most 1.9·10⁻⁶ on AVX-512 and on AVX2, against a bound of 1.6·10⁻⁵ at
+  its smallest.
 
 **A piece's term is its closed form, not an integral** (JP, 2026-09-29:
 *"delete all the integral stuff. other languages don't try this. probably
@@ -514,6 +558,10 @@ piece was its own integral, went with the integral (§1.5).
 - Each entry becomes a host function that instantiates the lowered template
   with its structural values and returns the opaque `Kernel`.
 - The template is a replay of `ExprArena` pushes, as `emit.rs` emits today.
+- An entry that takes a kernel cannot be lowered before its argument
+  exists. Its host function is lowering's steps instead, emitted as the
+  statements that take them: the same IR calls, run when it is called
+  (`emit::Staged`, D-a).
 - No optimization runs at expansion unless the instance is declared (Phase
   E).
 
@@ -530,7 +578,7 @@ The evidence and JP's rulings settle these. JP can overturn any.
 | D3 | tables and arrays | **none** (JP: no tables; 2026-10-01, no arrays). No collection type: data enters as scalar uniforms, a count is how many instances the host composed, and choice is `if` (§1.3, §1.6) |
 | D4 | binders | `usize` in sema; slots inside-out; a kernel-typed argument's binders are renamed away from those live at its hole |
 | D5 | `.at` | application is contramap (§1.2) |
-| D6 | functions across blocks or crates | inlined within a block; across blocks only as kernel-typed arguments at runtime. A proc macro sees only its own tokens |
+| D6 | functions across blocks or crates | inlined within a block; across blocks only as kernel-typed arguments at runtime (D-a, done). A proc macro sees only its own tokens |
 | D7 | records and tuples | flattened in the front end; record returns (`-> Rgba`) with one `if` on the packed word, as `packed.rs` relies on (Phase D) |
 | D8 | masks and bits | types in sema only |
 | D9 | the frame | one font program per zoom level (JP, Q1). A cell is one call writing its glyph id, origin, `fg` and `bg`; the glyph is chosen inside the program by the `if id < k` tree; a zoom recompiles; caching later (JP, §1.7) |
@@ -540,7 +588,7 @@ The evidence and JP's rulings settle these. JP can overturn any.
 | D13 | where production kernels live | above pixelflow-core. The cell grid is terminal-shaped and leaves core (CLAUDE.md: no terminal logic in PixelFlow) |
 | D14 | `kernel_raw!` | deleted. Every JIT compile optimizes (`jit_cache.rs:145`), so its promise never reached machine code |
 | D15 | spellings | §1.5's folds; `if` is the only choice; `DX(e)`/`DY(e)` as today; the `.select`, `.lt`, … aliases go once the five CI-contract bodies are rewritten, keeping their names |
-| D16 | public surface | an opaque `Kernel`; `Uniform`, `Scalar`, `Monoid` and `Bits` leave. `__macro` narrows to what expansions name. Only compiler crates depend on `pixelflow-ir`, enforced by CI |
+| D16 | public surface | an opaque `Kernel`; `Uniform`, `Scalar`, `Monoid` and `Bits` leave. `__macro` narrows to what expansions name (since D-a that includes `ExprArena::admit`, `apply`, `open_fold`, `close_fold` and `compact`, and `OpenFold::index`). Only compiler crates depend on `pixelflow-ir`, enforced by CI |
 | D17 | the second parser | `training/factored.rs`'s `parse_kernel_code_arena` and its printer are deleted with the corpus tool that uses them, or routed through the one parser if that tool is still needed |
 | D18 | `Select` | renamed `If` everywhere (§1.6; JP) |
 | D19 | helpers | **withdrawn** with the integrals (§1.5): it existed to close a helper's integral once, with its parameters abstract, and a helper holds none |
@@ -669,6 +717,7 @@ and no digests are committed (one-pipeline §5, gate policy).
 ### Phase D: the builder goes internal
 
 - **D-a.** Kernel-typed parameters, with the capture-avoiding splice (D4).
+  **Done** (this commit). See O2's answer for what was built.
 - **D-b.** Record returns, `u32` bits, and the packed frame.
 - **D-c.** Scenes, ML and the runtime examples move onto `kernel!`.
 - **D-d.** The fluent constructors leave `Kernel`. Graphics and runtime drop
@@ -724,11 +773,104 @@ is recorded as open, not decided. The recommendations are inferences (I).
     (which needs X1 for a linear emit) or as separate code joined by
     calls. Do not guess it now.
 
-**O2. The composition surface.**
-- **Evidence.**
+**O2. The composition surface.** **Answered (JP, 2026-10-01): yes.** D-a
+is built before C1 (this commit), so the host composes `kernel!` entries
+and the builder never becomes the font's surface.
+- **What was built.**
+  - `impl Fn(f32, f32) -> f32` is a parameter type of an entry or a helper,
+    and every other spelling of a function is refused. A body applies a
+    kernel, `k(x, y)`, or passes it by name to a helper. Anything else is a
+    spanned error naming this plan: arithmetic on one, a `let`, an `if`'s
+    arm, a return, a record's field, `as f32`.
+  - The block is Rust. `sema` refuses what rustc's move checker would of an
+    `impl Fn`: a kernel passed on twice, used after it is passed on, or
+    passed on inside a fold's body (E0382, E0507). The check follows the
+    flow, as rustc's does: an `if`'s arms are two paths, so a kernel one
+    arm passes on is the other arm's to apply or pass on, and after the
+    `if` it is moved if either arm moved it. The language has no loop, so
+    that join is all of rustc's rule (pinned against rustc,
+    `rustc_is_the_oracle.rs`).
+  - The closure form takes no kernel, spelled any way: bare, in
+    parentheses, or through a macro's `$t:ty`. rustc refuses `impl Trait`
+    in a closure's parameters (E0562).
+  - The host function takes a `&Kernel`. It only reads the argument, and a
+    borrow passes one instance twice (`sum2(&a, &a)`). Owning it would
+    reuse the argument's arena only by building on top of it, which would
+    declare its uniforms before the entry's own.
+  - Lowering is one walk over a `Site`. `Expansion` builds an arena at
+    expansion; its argument type is uninhabited, so it cannot apply one.
+    `Staged` emits each step as the statement that takes it, and the host
+    function runs them when it is called.
+  - The IR gained the steps that run then: `ExprArena::admit` and `apply`
+    beside `Kernel::at`, `open_fold`/`close_fold` beside `close_over` (also
+    the macro's own fold, so the sequence has one definition), `compact`,
+    and `free_index`, a scoped walk that replaces `free_var_at_or_above`
+    for `by_ref` too. `apply` asserts the arena declares the argument's
+    uniforms, so an argument applied where it was not admitted cannot
+    declare them in read order.
+  - Application is `Kernel::at`'s term, `k[X := u, Y := v]`, through the
+    arena's own `substitute_vars_with`, and pinned as one key with `at` for
+    an argument that names no other kernel. A `DX` inside an argument
+    survives the application and follows the warp: `k = DX(X·X)` applied
+    at `(2X, Y)` is 24 at x = 3, as `.at` gives, where resolving it first
+    would give 12 (pinned, with `DX` outside the application pinned
+    separately).
+  - At `(X, Y)` the argument is spliced as it stands, so a `Ref` in it
+    stays a name. A glyph held by `by_ref`, which is how O1 marks a unit,
+    is still a unit when summed (pinned). Under a warp a `Ref` is
+    expanded, as `at` expands one. So an argument that names another
+    kernel, applied at the sample, is `at`'s program under another key: a
+    cache entry each. Inside a fold, the fold around it cannot see the
+    referent's own fold and may take the same binder; once the name is
+    expanded the referent's fold shadows it, which is binding, not capture
+    (pinned: 123 at (3, 5), by name and as itself, as Rust's sum).
+  - **D4, as built (pending JP).** D4's row says an argument's binders
+    are renamed away from those live at its hole. What is built keeps them
+    apart with no rename: the folds around a hole are still open when the
+    argument is spliced in, and close after it, past its binders, which is
+    `close_over`'s one rule. The meaning is D4's: nothing is captured
+    (132 at (3, 5), rustc's value; captured would be 156). The program is
+    the builder's `Kernel::over` around `at` (one key, pinned). Whether the
+    row should say so instead is JP's.
+  - An argument must be closed and read no table, or the host function
+    panics.
+- **Measured (F, release, AVX-512, one thread, real Noto).**
+  - A 189-piece glyph (Noto id 2436) composes in 94–102 ms: `one_piece`
+    ×189 4.4 ms, the `sum2` tree 67–75 ms, `glyph` 20–26 ms. 19,495
+    nodes, 1,894 uniforms.
+  - Noto's ASCII, 94 glyphs and 1,625 pieces with each glyph its own
+    program (O1), composes in 427–499 ms. The largest glyph is '@', at 56
+    pieces and 18–21 ms. 170,007 nodes, 16,626 uniforms.
+  - Again after review, on a shared host, with `apply`'s check that the
+    arena admitted the argument and without it (the glyph 14 runs each
+    way, the ASCII 10):
+    the 189-piece glyph 83–124 ms (median 102) and 84–124 ms (median
+    105); the ASCII 429–544 ms (median 472) and 433–574 ms (median 485).
+    The check costs nothing that run-to-run noise does not hide. `inside`'s
+    half-pixel reach adds four nodes a glyph: 19,499 and 170,383.
+  - Composition copies at each level of the tree, so it is O(n log n).
+    `uniform_slot_for` searches linearly, which is quadratic in uniforms:
+    negligible per glyph, but on the zoom path once a whole font is one
+    program (C1, about 16k uniforms).
+- **Left open.**
+  - A mask at the host boundary. A `bool` entry's kernel passed where
+    `-> f32` is declared reads all-ones as NaN and draws plausible pixels.
+    Refusing `-> bool` entries would not close it: the builder makes masks
+    too, until D-d, and closure-form `bool` kernels are pinned against
+    `any_over`/`all_over` (`fold_is_kernel_over.rs`). Nor would `admit`
+    refusing a root in `OpKind::is_bitwise_domain`: `If` is in it, and a
+    piece's term is an `If` of numbers, while an `If` of masks is a mask.
+    The fix is a type, a mask kernel the host cannot pass as a `&Kernel`,
+    which is the general case `Bits`'s doc tracks.
+  - The id tree's threshold. `k` is computed by halving a font loaded at
+    run time, and a const generic is fixed when rustc compiles, so
+    `split::<k>` cannot be called for a runtime font. Whether `k` becomes a
+    uniform written once per font, or something else, is C1's, with O3.
+  - One `id` instance shared by every node of the tree is a convention of
+    the host walk. It is not a type (O3).
+- **Evidence (before the answer).**
   - The language composes across blocks only through kernel-typed
-    arguments (D6). Those are D-a, which is not built: sema has no kernel
-    type, and the parser refuses `impl Fn` (`parser.rs:602`).
+    arguments (D6). Those were D-a, then not built.
   - The builder composes today, and §1.1 says it is not a surface.
   - The walk is host work because the font is runtime data (§1.1, §1.7). A
     bundled font's walk could run at build time instead (Phase E).
@@ -742,6 +884,10 @@ is recorded as open, not decided. The recommendations are inferences (I).
 
 **O3. Binding a composed program.**
 - **Evidence.**
+  - D-a fixes where an instance's slots land: the entry's own first, then
+    each argument's, in parameter order (§1.4). So the walk can return
+    offsets as prefix sums. A glyph's box is at `0..4` and piece `k` is at
+    `4 + 10k` (F, `kernel_copy.rs`).
   - An entry's `Args` streams its values by position (`set_declared`), and
     the only check is the count (§1.4, "Which program is not yet a type").
   - A composed program's slots are the flattening of every instance's.
@@ -781,7 +927,11 @@ is recorded as open, not decided. The recommendations are inferences (I).
 - `(0..N).map(|i| …).sum()`;
 - `if` as the only choice;
 - `const` parameters as structural;
-- `DX(e)`.
+- `DX(e)`;
+- `k: impl Fn(f32, f32) -> f32`, a `&Kernel` on the host side, and `sum2`
+  as a glyph's ink. A kernel is moved when it is passed, as rustc moves it.
+  The alternative is `&impl Fn(f32, f32) -> f32`, which rustc copies, so
+  one kernel could be passed to two helpers.
 
 **Q3. `text()` and `run`** (no production caller). **Recommendation:**
 delete them. A string of glyphs is a sequence of per-cell calls, the same

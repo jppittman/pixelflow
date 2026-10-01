@@ -1,4 +1,4 @@
-//! Kernels compose as **values**, and that is the whole composition surface.
+//! Kernels compose as **values**, through the builder.
 //!
 //! A `kernel!` body used to be able to declare a manifold-typed parameter
 //! (`|sdf: kernel|`), and the builder spliced the argument's fragment into its
@@ -6,9 +6,15 @@
 //! `Kernel::at`/`sum`/`select`/arithmetic already say at the value level, and
 //! it went with the tier that needed it
 //! (docs/plans/2026-09-06-kernel-with-a-lattice.md, S4b-2). These are the same
-//! claims, made against the surviving surface: composition nests, derivatives
+//! claims, made against the builder's surface: composition nests, derivatives
 //! see through the whole chain, a shared kernel used several times stays one
 //! DAG, and `at` warps coordinates per site.
+//!
+//! The language's own composition surface is a kernel-typed parameter,
+//! `k: impl Fn(f32, f32) -> f32`, applied `k(x, y)` — the builder's `at` —
+//! and that is `kernel_typed_parameters.rs`'s (Phase D-a of
+//! docs/plans/2026-09-25-the-language-is-kernel.md). These stay until the
+//! builder's constructors leave the public surface (Phase D-d).
 
 use pixelflow_compiler::kernel;
 use pixelflow_core::{Kernel, Lattice};

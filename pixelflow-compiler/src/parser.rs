@@ -25,8 +25,11 @@
 //!                                            -- an entry's structural parameters
 //! params  ::= (param (',' param)* ','?)?
 //! param   ::= IDENT ':' type
-//! type    ::= 'f32' | 'bool' | RECORD        -- an entry's parameters are `f32`s
-//!                                            -- and records: its uniforms
+//! type    ::= 'f32' | 'bool' | RECORD        -- an entry's `f32`s and records
+//!                                            -- are its uniforms
+//!           | 'impl' 'Fn' '(' 'f32' ',' 'f32' ')' '->' 'f32'
+//!                                            -- a kernel: an argument the host
+//!                                            -- passes at run time (Phase D-a)
 //!
 //! cexpr   ::= cexpr ('+' | '-' | '*' | '/') cexpr   -- an `f32` const's initializer,
 //!           | '-' cexpr | '(' cexpr ')'            -- evaluated at expansion,
@@ -47,6 +50,8 @@
 //!           | expr '.' IDENT                       -- a record's field
 //!           | PROJECTION '(' expr ')'
 //!           | IDENT '(' (expr (',' expr)*)? ')'    -- a helper, inlined
+//!           | KERNEL '(' expr ',' expr ')'         -- a kernel applied at
+//!                                                  -- `(x, y)`: contramap
 //!           | 'if' expr block 'else' (block | 'if' …)   -- the choice
 //!           | fold
 //!           | IDENT 'as' 'f32'         -- a `usize` (a fold's index, a `usize`
@@ -83,6 +88,7 @@
 //! RECORD     -- the name of one of the block's records
 //! METHOD     -- an `OpKind` method, a `LIBRARY_METHODS` composition, or `clone`
 //! PROJECTION -- V, DX, DY, DXX, DXY, DYY
+//! KERNEL     -- a kernel-typed parameter in scope
 //! ```
 //!
 //! A `let` is scoped as Rust scopes it (`crate::symbol`), and so is a fold's
@@ -120,8 +126,10 @@
 //! struct, and a `repr` or a `cfg` on a record or its field (§1.3); an
 //! attribute other than a doc comment on a `const` or a `fn`; generics on a
 //! helper and on a `const`, and any generic of an entry but a
-//! `const N: usize` without a default; a parameter typed as a closure
-//! (Phase D); a `fn` without a declared return type; an `if` without an
+//! `const N: usize` without a default; a function, spelled any way, as a
+//! parameter of the closure form (rustc's E0562 of an `impl` type: an entry
+//! of the items form takes a kernel);
+//! a `fn` without a declared return type; an `if` without an
 //! `else` or an `if let`; `loop`/`while`/`for`; assignment; `return`; a
 //! closure anywhere but a fold's; a tuple
 //! anywhere but a tuple `let`'s value, and a tuple's field (a tuple value is
@@ -159,8 +167,15 @@
 //! expected; a `const` whose initializer is not a `cexpr` or an `iexpr`; a
 //! negated `usize`; a range whose bounds are not constant or that runs
 //! backwards; `.at()`,
-//! `.constant()`, `.collapse()`; a block with no final expression; and an
-//! `Args` record's name taken twice.
+//! `.constant()`, `.collapse()`; a block with no final expression; an
+//! `Args` record's name taken twice; a function type spelled any way but
+//! `impl Fn(f32, f32) -> f32`; a kernel used as anything but applied, with
+//! two `f32`s, or passed by name to a helper's kernel-typed parameter — in
+//! arithmetic, a comparison, a `let`, an `if`'s arm, a record's field, a
+//! return, `as` (Phase D-a); a kernel passed on twice on one path, or used
+//! after it is passed on on that path, or passed on inside a fold's body —
+//! what rustc refuses of an `impl Fn` it moves (E0382, E0507); and a
+//! parameter, `let` or index named after a projection.
 //!
 //! Refused by lowering, where the language meets the IR's widths: a range
 //! bound past 2²⁴, the last integer bound a fold's index — an `f32` lane —
@@ -177,8 +192,9 @@
 use crate::PLAN;
 use crate::ast::{
     BinaryExpr, BinaryOp, BlockExpr, CallExpr, CastExpr, ConstItem, Expr, FieldExpr, FnItem,
-    FoldExpr, IdentExpr, IfExpr, KernelDef, LetStmt, Literal, LiteralExpr, MethodCallExpr, Param,
-    RangeExpr, RecordField, RecordItem, Reduction, Spelling, Stmt, UnaryExpr, UnaryOp,
+    FoldExpr, FunctionType, IdentExpr, IfExpr, KernelDef, LetStmt, Literal, LiteralExpr,
+    MethodCallExpr, Param, RangeExpr, RecordField, RecordItem, Reduction, Spelling, Stmt,
+    UnaryExpr, UnaryOp,
 };
 use proc_macro2::{Span, TokenStream};
 use syn::parse::{Parse, ParseStream};
@@ -221,6 +237,7 @@ fn parse_closure(input: ParseStream) -> syn::Result<KernelDef> {
             // Parse type
             let ty: Type = input.parse()?;
             refuse_a_collection(&ty)?;
+            refuse_a_kernel_in_a_closure(&ty)?;
 
             params.push(Param {
                 name: ident,
@@ -565,22 +582,40 @@ fn convert_param(input: syn::FnArg) -> syn::Result<Param> {
             ));
         }
     };
-    match &*typed.ty {
-        Type::ImplTrait(_) | Type::BareFn(_) | Type::TraitObject(_) => {
-            return Err(syn::Error::new_spanned(
-                &typed.ty,
-                format!(
-                    "a kernel-typed parameter\n\
-                     \n\
-                     note: passing a function to a kernel `fn` is Phase D of {PLAN}; this \
-                     parameter is an `f32`, a `bool` or one of the block's records"
-                ),
-            ));
-        }
-        _ => {}
-    }
+    // A kernel-typed parameter, `impl Fn(f32, f32) -> f32`, and every other
+    // spelling of a function are `sema`'s: whether one is the language's
+    // type takes the block's records to say, as a record's does.
     refuse_a_collection(&typed.ty)?;
     Ok(Param { name, ty: typed.ty })
+}
+
+/// The closure sugar takes no kernel-typed parameter: rustc refuses
+/// `impl Trait` in a closure's parameters (E0562), and the language's
+/// closure is Rust's, so `|k: impl Fn(f32, f32) -> f32| …` is not a closure
+/// rustc would compile. An entry in the items form takes one (plan Phase
+/// D-a).
+///
+/// Every spelling of a function is refused here, by the classification
+/// `sema` types a parameter with ([`FunctionType::of`]): through
+/// parentheses and a macro's invisible group, a kernel spelled `(impl Fn…)`
+/// is still one, and any other function is a misspelled kernel, whose
+/// correct spelling the closure cannot take either.
+fn refuse_a_kernel_in_a_closure(ty: &Type) -> syn::Result<()> {
+    if FunctionType::of(ty) == FunctionType::NotOne {
+        return Ok(());
+    }
+    Err(syn::Error::new_spanned(
+        ty,
+        format!(
+            "a function as the closure's parameter\n\
+             \n\
+             note: a kernel-typed parameter is `impl Fn(f32, f32) -> f32`, and rustc refuses \
+             `impl Trait` in a closure's parameters (E0562): the closure form is Rust's \
+             closure, so it takes no kernel\n\
+             help: take the kernel in an entry of the items form, `kernel! {{ pub fn f(k: impl \
+             Fn(f32, f32) -> f32) -> f32 {{ k(X, Y) }} }}` (Phase D-a of {PLAN})"
+        ),
+    ))
 }
 
 /// A parameter typed as a collection — an array `[R; N]` or a slice `[R]`,
@@ -911,8 +946,10 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
                 "a closure in a kernel body\n\
                  \n\
                  note: a closure is the body of a fold, and nothing else: {FOLD_SPELLINGS}\n\
-                 note: a function as an argument is Phase D of {PLAN}; a private `fn` in the \
-                 block is a helper, called by name"
+                 note: a function is passed as a kernel, to an entry's or a helper's \
+                 kernel-typed parameter, `k: impl Fn(f32, f32) -> f32`, and applied by name, \
+                 `k(x, y)` (Phase D-a of {PLAN}); a private `fn` in the block is a helper, \
+                 called by name"
             ),
         )),
 
@@ -2723,7 +2760,7 @@ mod tests {
     /// refusal named B3 until B3 was done without helper generics.)
     #[test]
     fn a_fn_signature_is_plain() {
-        let cases: [(TokenStream, &str); 10] = [
+        let cases: [(TokenStream, &str); 9] = [
             (
                 quote! { fn h<const N: usize>(x: f32) -> f32 { x } pub fn f() -> f32 { X } },
                 "generics on a helper",
@@ -2744,15 +2781,44 @@ mod tests {
             ),
             (quote! { pub fn f() { X } }, "declares no return type"),
             (quote! { pub fn f(mut x: f32) -> f32 { x } }, "plain name"),
-            (
-                quote! { pub fn f(g: impl Fn(f32) -> f32) -> f32 { X } },
-                "Phase D",
-            ),
             (quote! { const fn f() -> f32 { X } }, "`const fn`"),
         ];
         for (input, expected) in cases {
             let err = refusal(input);
             assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
+    }
+
+    /// A kernel-typed parameter is parsed, as any typed parameter is, and
+    /// `sema` decides whether its type is the language's one function type.
+    /// The closure form takes none: rustc refuses `impl Trait` in a
+    /// closure's parameters (E0562).
+    #[test]
+    fn a_kernel_typed_parameter_is_an_entrys_and_not_a_closures() {
+        let def = parse(quote! {
+            pub fn f(k: impl Fn(f32, f32) -> f32, r: f32) -> f32 { k(X, Y) * r }
+        })
+        .expect("an entry's kernel-typed parameter parses");
+        assert!(def.fns[0].params[0].is_kernel());
+        assert!(!def.fns[0].params[1].is_kernel());
+        // However it is spelled: bare, in parentheses, through a macro's
+        // `$t:ty` (an invisible group), or as some other function.
+        let grouped = proc_macro2::Group::new(
+            proc_macro2::Delimiter::None,
+            quote! { impl Fn(f32, f32) -> f32 },
+        );
+        for closure in [
+            quote! { |k: impl Fn(f32, f32) -> f32| k(X, Y) },
+            quote! { |k: (impl Fn(f32, f32) -> f32)| k(X, Y) },
+            quote! { |k: #grouped| k(X, Y) },
+            quote! { |k: &dyn Fn(f32, f32) -> f32| k(X, Y) },
+            quote! { |k: fn(f32, f32) -> f32| k(X, Y) },
+        ] {
+            let err = refusal(closure.clone());
+            assert!(
+                err.contains("E0562") && err.contains("Phase D-a"),
+                "{closure}: got {err}"
+            );
         }
     }
 }

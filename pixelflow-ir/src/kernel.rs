@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arena::{
-    Axis, BufferDecl, BufferIdentity, ExprArena, ExprId, IndexSpaceFull, UniformDecl,
+    Axis, BufferDecl, BufferIdentity, ExprArena, ExprId, ExprNode, IndexSpaceFull, UniformDecl,
     UniformIdentity,
 };
 use crate::dag::{Builder, Dag, Node, Rooted};
@@ -922,22 +922,25 @@ impl Kernel {
     ///
     /// # Panics
     ///
-    /// Panics on a kernel that is still *open* — one holding a
-    /// [`BinderScope`] placeholder, i.e. the index a `Kernel::over` body is
-    /// being built against. A name for an open term means nothing: the
-    /// referent's value depends on a binding the store cannot carry, and the
-    /// binder's rename cannot reach through a name to substitute it, so what
-    /// expansion would put back is an index nothing binds.
+    /// Panics on a kernel that is *open* ([`ExprArena::free_index`]) — one
+    /// holding a [`BinderScope`] placeholder, i.e. the index a `Kernel::over`
+    /// body is being built against, or reading a binder no fold in it binds.
+    /// A name for an open term means nothing: the referent's value depends
+    /// on a binding the store cannot carry, the binder's rename cannot reach
+    /// through a name to substitute it, and a fold built around the name
+    /// chooses its binder without seeing through it — so what expansion
+    /// would put back is an index nothing binds, or the wrong fold's.
     #[cfg(feature = "std")]
     #[must_use]
     pub fn by_ref(&self) -> Self {
         let (arena, root) = self.parts();
-        let open = arena.free_var_at_or_above(root, crate::fold::PLACEHOLDER_BASE);
+        let open = arena.free_index(root);
         assert!(
             open.is_none(),
-            "Kernel::by_ref: this kernel holds Var({}), a reduction binder's \
-             placeholder — it is the body of a `Kernel::over` still under \
-             construction, and an open term has no identity to name it by",
+            "Kernel::by_ref: this kernel reads Var({}), an index no fold in it \
+             binds — the body of a `Kernel::over` still under construction, or \
+             a fold's body cut from its fold — and an open term has no identity \
+             to name it by",
             open.unwrap_or_default(),
         );
         let key = crate::store::KernelStore::intern(self);
@@ -1003,6 +1006,124 @@ impl Kernel {
     /// separately from the kernel that reads it.
     pub fn buffer_data(&self) -> impl Iterator<Item = (BufferIdentity, &Arc<[f32]>)> {
         self.inner.buffers.iter().map(|(id, data)| (*id, data))
+    }
+}
+
+/// A kernel admitted as an argument of a program being built in an arena
+/// ([`ExprArena::admit`]): checked closed and reading no table, its uniforms
+/// declared there in its own order. It is what [`ExprArena::apply`] takes,
+/// so no argument is applied without those two checks; that the arena it is
+/// applied in declared its uniforms is `apply`'s own assertion, since a
+/// fold's body is built in a copy of the arena that admitted it
+/// ([`ExprArena::open_fold`]), which a borrow of that arena could not name.
+#[derive(Clone, Copy)]
+pub struct Argument<'k>(&'k Kernel);
+
+/// **Application is contramap, in an arena.** A `kernel!` entry that takes a
+/// kernel-typed parameter, `k: impl Fn(f32, f32) -> f32`, runs lowering's
+/// steps when it is called, and `k(u, v)` in its body is one of them
+/// (docs/plans/2026-09-25-the-language-is-kernel.md, Phase D-a).
+///
+/// What `k(u, v)` denotes. A kernel is a function of the coordinate map:
+/// `⟦k⟧ : (S → ℝ²) → (S → ℝ)`, with `X`, `Y` the map's two components and
+/// `DX`, `DY` derivatives in the sample `s ∈ S`. Applying it precomposes
+/// the map: `⟦k(u, v)⟧(φ) = ⟦k⟧(s ↦ (⟦u⟧(φ)(s), ⟦v⟧(φ)(s)))`. That is
+/// [`Kernel::at`], and the term is the same, `k[X := u, Y := v]` — the IR's
+/// own substitution, [`ExprArena::substitute_vars_with`], the arena-level
+/// sibling of the one `at` makes over a kernel's DAG — one canonical key
+/// with `at`'s, for an argument that names no other kernel. One that does,
+/// applied at `(X, Y)`, keeps the name ([`ExprArena::apply`]) where `at`
+/// expands it: the same program, under another key. A `Dwrt` in `k`
+/// survives the substitution, so a derivative in an argument is taken in
+/// the sample, by the chain rule, as it is under `at`
+/// (`derivative_under_warp.rs`): `DX` of `X·X` applied at `(2X, Y)` is
+/// `8X`, not the `4X` that `2x` evaluated at `2X` would be.
+///
+/// Binders. An application inside a fold's body happens while that fold is
+/// open: its index is a placeholder, and the folds around the hole choose
+/// their binders only when they close ([`ExprArena::close_fold`]), after
+/// the argument is in — the lowest slot no fold in the body binds, the
+/// argument's folds among them. So the argument keeps its own binders, the
+/// folds around it take others, and the hole's coordinates may read those
+/// folds' indices: nothing is captured, with no second binder rule beside
+/// [`ExprArena::close_over`]'s.
+impl ExprArena {
+    /// Admit `kernel` as an argument of the program this arena builds, and
+    /// declare its uniforms here, in its own declaration order, read or not
+    /// — after whatever this arena declared before (an entry's own
+    /// parameters), and once each: an instance admitted twice, or shared
+    /// with an earlier argument, is declared where it first appears. That is
+    /// the order `Kernel`'s combinators declare an operand's in, so a
+    /// positional binding of the composed program reads it off the
+    /// composition.
+    ///
+    /// # Panics
+    ///
+    /// If `kernel` reads a table — a buffer declared or carried: the
+    /// language has none (D3 of docs/plans/2026-09-25-the-language-is-kernel.md)
+    /// — or is open ([`ExprArena::free_index`]): an index no fold in it binds
+    /// would be bound by whichever fold this arena builds around its
+    /// application, as [`Kernel::by_ref`] refuses a name for one.
+    pub fn admit<'k>(&mut self, kernel: &'k Kernel) -> Argument<'k> {
+        assert!(
+            kernel.buffers().is_empty() && kernel.buffer_data().next().is_none(),
+            "a kernel-typed argument reads a table, and the language has none (D3 of \
+             docs/plans/2026-09-25-the-language-is-kernel.md): pass a kernel over \
+             uniforms",
+        );
+        let (arena, root) = kernel.parts();
+        let open = arena.free_index(root);
+        assert!(
+            open.is_none(),
+            "a kernel-typed argument reads Var({}), an index no fold in it binds, which \
+             a fold around its application would bind: an argument is closed (D4 of \
+             docs/plans/2026-09-25-the-language-is-kernel.md)",
+            open.unwrap_or_default(),
+        );
+        for decl in kernel.uniforms() {
+            self.uniform_slot_for(*decl);
+        }
+        Argument(kernel)
+    }
+
+    /// `argument` applied at `(u, v)`, nodes of this arena: its term
+    /// spliced in with `X := u` and `Y := v` — see this block's doc for what
+    /// that denotes.
+    ///
+    /// At `(X, Y)` the substitution is the identity, and there is nothing to
+    /// substitute: the term is spliced as it stands, a [`Ref`] in it left a
+    /// name. Under a real warp a name is expanded first, as [`Kernel::at`]
+    /// expands one, because a substitution cannot reach through it.
+    ///
+    /// # Panics
+    ///
+    /// If this arena does not declare `argument`'s uniforms — it, or the
+    /// arena it was copied from to build a fold's body, did not
+    /// [`admit`](Self::admit) it. Spliced here, they would be declared in
+    /// the order this application reads them, and only those it reads,
+    /// which is not the order a positional binding of the composed program
+    /// reads off its parameters (D-a and O3 of
+    /// docs/plans/2026-09-25-the-language-is-kernel.md).
+    ///
+    /// [`Ref`]: ExprNode::Ref
+    pub fn apply(&mut self, argument: &Argument<'_>, [u, v]: [ExprId; 2]) -> ExprId {
+        let Argument(kernel) = *argument;
+        let declared = |decl: &UniformDecl| self.uniforms().iter().any(|d| d.id == decl.id);
+        assert!(
+            kernel.uniforms().iter().all(declared),
+            "a kernel-typed argument applied in an arena that did not admit it: its \
+             uniforms would be declared in the order this application reads them, not \
+             its own (D-a of docs/plans/2026-09-25-the-language-is-kernel.md)",
+        );
+        let at_the_sample = self.node(u) == ExprNode::Var(Axis::X.var())
+            && self.node(v) == ExprNode::Var(Axis::Y.var());
+        if at_the_sample {
+            let (arena, root) = kernel.parts();
+            return self.splice(arena, root);
+        }
+        let (linked, root) = kernel.linked_parts();
+        let spliced = self.splice(&linked, root);
+        self.substitute_vars_with(spliced, &[(Axis::X.var(), u), (Axis::Y.var(), v)])
     }
 }
 
@@ -1276,5 +1397,205 @@ mod tests {
         let left = Kernel::x().with_buffer_data(id, Arc::from([1.0f32].as_slice()));
         let right = Kernel::y().with_buffer_data(id, Arc::from([1.0f32].as_slice()));
         let _refused = left.add(&right);
+    }
+
+    // ───────────────────────── admit / apply ─────────────────────────
+
+    /// `k` admitted into a fresh arena and applied at `(u, v)`, as the
+    /// kernel it builds — what an entry taking `k` does with `k(u, v)`.
+    fn applied(k: &Kernel, at: impl FnOnce(&mut ExprArena) -> [ExprId; 2]) -> Kernel {
+        let mut arena = ExprArena::new();
+        let argument = arena.admit(k);
+        let at = at(&mut arena);
+        let root = arena.apply(&argument, at);
+        let (arena, root) = arena.compact(root);
+        Kernel::from_parts(arena, root)
+    }
+
+    fn key(k: &Kernel) -> crate::key::Canonical {
+        let (arena, root) = k.parts();
+        crate::key::canonical(arena, root)
+    }
+
+    /// Applied under a warp, an argument is `Kernel::at`'s term: one
+    /// program, by canonical key, with its uniforms where `at` puts them.
+    #[test]
+    fn an_application_is_at() {
+        let r = Uniform::new(2.5);
+        let k = Kernel::x().mul(&Kernel::y()).sub(&r.kernel());
+        let warped = applied(&k, |a| {
+            let (x, y) = (a.push_var(Axis::X.var()), a.push_var(Axis::Y.var()));
+            let one = a.push_const(1.0);
+            [
+                a.push_binary(OpKind::Add, x, one),
+                a.push_binary(OpKind::Mul, y, y),
+            ]
+        });
+        let at = k.at(
+            &Kernel::x().add(&Kernel::constant(1.0)),
+            &Kernel::y().mul(&Kernel::y()),
+        );
+        assert_eq!(key(&warped), key(&at));
+    }
+
+    /// A derivative in the argument survives the application, to be taken
+    /// in the sample: `DX(X·X)` applied at `(2X, Y)` is `at`'s term, `8X`,
+    /// not `2x` read at `2X`.
+    #[test]
+    fn a_derivative_in_an_argument_is_at() {
+        let k = Kernel::x().mul(&Kernel::x()).dx();
+        let warped = applied(&k, |a| {
+            let (x, y) = (a.push_var(Axis::X.var()), a.push_var(Axis::Y.var()));
+            let two = a.push_const(2.0);
+            [a.push_binary(OpKind::Mul, x, two), y]
+        });
+        let at = k.at(&Kernel::x().mul(&Kernel::constant(2.0)), &Kernel::y());
+        assert_eq!(key(&warped), key(&at));
+        let (arena, root) = warped.parts();
+        assert!(
+            arena
+                .nodes()
+                .any(|(_, n)| matches!(n, ExprNode::Binary(OpKind::Dwrt, ..))),
+            "the derivative is still to be taken: {}",
+            arena.display(root)
+        );
+    }
+
+    /// An argument is applied only in an arena that admitted it, or in a
+    /// fold body's copy of one: anywhere else its uniforms would be
+    /// declared in the order the application reads them.
+    #[test]
+    #[should_panic(expected = "an arena that did not admit it")]
+    fn an_argument_applied_where_it_was_not_admitted_is_refused() {
+        let k = Uniform::new(1.0).kernel().mul(&Kernel::x());
+        let mut admitting = ExprArena::new();
+        let argument = admitting.admit(&k);
+        let mut other = ExprArena::new();
+        let (x, y) = (other.push_var(Axis::X.var()), other.push_var(Axis::Y.var()));
+        let _refused = other.apply(&argument, [x, y]);
+    }
+
+    /// A fold's body is built in a copy of the arena ([`ExprArena::open_fold`]),
+    /// which declares what the arena did: an argument admitted before the
+    /// fold opened is applied inside it.
+    #[test]
+    fn an_argument_admitted_before_a_fold_is_applied_inside_it() {
+        let k = Uniform::new(1.0).kernel().mul(&Kernel::x());
+        let mut arena = ExprArena::new();
+        let argument = arena.admit(&k);
+        let open = arena.open_fold(0).expect("one fold open");
+        let index = open.index();
+        let y = arena.push_var(Axis::Y.var());
+        let body = arena.apply(&argument, [index, y]);
+        let fold = arena
+            .close_fold(open, body, |binder| Fold::new(Monoid::SUM, binder, 0..3))
+            .expect("a binder is free");
+        assert_eq!(arena.uniforms(), k.uniforms());
+        assert!(matches!(arena.node(fold), ExprNode::Reduce { .. }));
+    }
+
+    /// At the sample the term is spliced as it stands, so a name in it
+    /// stays a name — the reference a glyph's unit is held by (O1 of the
+    /// plan) survives being summed.
+    #[cfg(feature = "std")]
+    #[test]
+    fn at_the_sample_a_name_stays_a_name() {
+        let named = Kernel::x().mul(&Kernel::y()).by_ref();
+        let here = applied(&named, |a| {
+            [a.push_var(Axis::X.var()), a.push_var(Axis::Y.var())]
+        });
+        let (arena, root) = here.parts();
+        assert!(
+            matches!(arena.node(root), ExprNode::Ref(_)),
+            "{}",
+            arena.display(root)
+        );
+        let moved = applied(&named, |a| {
+            let x = a.push_var(Axis::X.var());
+            [x, x]
+        });
+        let (arena, root) = moved.parts();
+        assert!(
+            !arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))),
+            "under a warp the name is expanded: {}",
+            arena.display(root)
+        );
+    }
+
+    /// The arena's own declarations first, then each argument's in its
+    /// order, read or not; an instance admitted twice is declared once.
+    #[test]
+    fn an_argument_declares_its_uniforms_in_its_order_once() {
+        let [a0, a1, b0] = [Uniform::new(1.0), Uniform::new(2.0), Uniform::new(3.0)];
+        // `a1` is declared before `a0`, and nothing reads it.
+        let a = {
+            let mut arena = ExprArena::new();
+            let _unread = arena.declare_uniform(a1.decl());
+            let read = arena.declare_uniform(a0.decl());
+            let root = arena.push_uniform(read);
+            Kernel::from_parts(arena, root)
+        };
+        assert_eq!(a.uniforms(), [a1.decl(), a0.decl()]);
+        let b = b0.kernel();
+        let own = UniformDecl {
+            id: UniformIdentity::mint(),
+            default: 0.5,
+        };
+        let mut arena = ExprArena::new();
+        arena.declare_uniform(own);
+        let _a = arena.admit(&a);
+        let _b = arena.admit(&b);
+        let _a_again = arena.admit(&a);
+        let declared: Vec<UniformDecl> = arena.uniforms().to_vec();
+        let mut want = alloc::vec![own];
+        want.extend_from_slice(a.uniforms());
+        want.push(b0.decl());
+        assert_eq!(declared, want);
+    }
+
+    /// An argument reads no table: the language has none (D3).
+    #[test]
+    #[should_panic(expected = "reads a table")]
+    fn an_argument_reading_a_table_is_refused() {
+        let table =
+            Kernel::x().with_buffer_data(BufferIdentity::mint(), Arc::from([1.0f32].as_slice()));
+        let _refused = ExprArena::new().admit(&table);
+    }
+
+    /// A kernel reading only `index`, which nothing in it binds.
+    fn open_at(index: u8) -> Kernel {
+        let mut a = ExprArena::new();
+        let root = a.push_var(index);
+        Kernel::from_parts(a, root)
+    }
+
+    /// An argument is closed: the placeholder of a fold still being built —
+    /// a `Kernel::over` body passed on from inside its closure — would be
+    /// bound by the fold around its application.
+    #[test]
+    #[should_panic(expected = "an index no fold in it binds")]
+    fn an_argument_holding_a_placeholder_is_refused() {
+        let placeholder = crate::fold::Placeholder::nth(0).expect("a placeholder");
+        let _refused = ExprArena::new().admit(&open_at(placeholder.var()));
+    }
+
+    /// And so would a binder no fold in it binds — a fold's body cut from
+    /// its fold — which a scan for placeholders alone let through.
+    #[test]
+    #[should_panic(expected = "an index no fold in it binds")]
+    fn an_argument_reading_a_free_binder_is_refused() {
+        let binder = Binder::from_slot(0).expect("a binder");
+        let _refused = ExprArena::new().admit(&open_at(binder.var()));
+    }
+
+    /// A name asks the same question of what it names, with the same walk:
+    /// a free binder has no identity either (`naming_an_open_term_is_refused`
+    /// pins the placeholder).
+    #[cfg(feature = "std")]
+    #[test]
+    #[should_panic(expected = "an open term has no identity")]
+    fn naming_a_term_reading_a_free_binder_is_refused() {
+        let binder = Binder::from_slot(0).expect("a binder");
+        let _refused = open_at(binder.var()).by_ref();
     }
 }
