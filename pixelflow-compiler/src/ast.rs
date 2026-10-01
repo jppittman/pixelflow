@@ -192,6 +192,21 @@ impl FnItem {
         }
     }
 
+    /// Whether a parameter is kernel-typed: the entry is then a composition,
+    /// built when its host function is called (plan Phase D-a).
+    pub fn takes_a_kernel(&self) -> bool {
+        self.params.iter().any(Param::is_kernel)
+    }
+
+    /// Whether the entry has an `Args` record (plan §1.4): it has uniform
+    /// parameters and nothing else. An entry that takes a kernel has none —
+    /// its program declares the kernel's uniforms after its own, and the
+    /// record could rebind only a program whose argument declares none.
+    /// Binding a composed program is O3 of the plan.
+    pub fn has_args_record(&self) -> bool {
+        !self.params.is_empty() && !self.takes_a_kernel()
+    }
+
     /// The name of an entry's `Args` record: the entry's name in
     /// UpperCamelCase, then `Args` — `shifted_radius` has
     /// `ShiftedRadiusArgs` (plan §1.4). `sema` refuses one that collides,
@@ -215,13 +230,127 @@ impl FnItem {
     }
 }
 
-/// A declared parameter: a scalar, or one of the block's records.
+/// A declared parameter: a scalar, one of the block's records, or a kernel.
 #[derive(Debug, Clone)]
 pub struct Param {
     /// Parameter name.
     pub name: Ident,
-    /// The declared type (`f32` or a record; `bool` in a helper).
+    /// The declared type (`f32`, a record or `impl Fn(f32, f32) -> f32`;
+    /// `bool` in a helper).
     pub ty: Box<Type>,
+}
+
+impl Param {
+    /// Whether the parameter is kernel-typed, `impl Fn(f32, f32) -> f32`.
+    pub fn is_kernel(&self) -> bool {
+        FunctionType::of(&self.ty) == FunctionType::Kernel
+    }
+}
+
+/// What a declared type is as a function.
+///
+/// The language has one function type, `impl Fn(f32, f32) -> f32`: a kernel
+/// supplied at run time, a function of the two coordinates (plan §1.3,
+/// §1.4, Phase D-a). The one classification of a type as that: `sema` types
+/// a parameter by it and refuses every other spelling of a function, naming
+/// this one, and lowering and emission find an entry's kernel-typed
+/// parameters by it, so no two stages can disagree about which they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionType {
+    /// Not a function.
+    NotOne,
+    /// `impl Fn(f32, f32) -> f32`.
+    Kernel,
+    /// A function spelled some other way: what differs from the one
+    /// spelling.
+    Misspelled(&'static str),
+}
+
+impl FunctionType {
+    /// The classification of `ty`.
+    pub fn of(ty: &Type) -> Self {
+        match ty {
+            Type::Paren(inner) => Self::of(&inner.elem),
+            Type::Group(inner) => Self::of(&inner.elem),
+            Type::ImplTrait(bounds) => Self::of_bounds(&bounds.bounds),
+            Type::TraitObject(_) => Self::Misspelled(
+                "`impl`, not `dyn`: a kernel-typed parameter is `impl Fn(f32, f32) -> f32`, \
+                 and the host passes a `&Kernel` for it",
+            ),
+            Type::BareFn(_) => Self::Misspelled(
+                "`impl Fn`, not a function pointer: a kernel is a program built at run time, \
+                 not a Rust function",
+            ),
+            Type::Reference(reference) => match Self::of(&reference.elem) {
+                Self::NotOne => Self::NotOne,
+                Self::Kernel | Self::Misspelled(_) => Self::Misspelled(
+                    "by value, `impl Fn(f32, f32) -> f32`, not by reference: the host \
+                     function passes a `&Kernel` for it",
+                ),
+            },
+            _ => Self::NotOne,
+        }
+    }
+
+    /// `impl B`: a kernel when `B` is `Fn(f32, f32) -> f32`, alone.
+    fn of_bounds(
+        bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    ) -> Self {
+        let mut bounds = bounds.iter();
+        let (Some(syn::TypeParamBound::Trait(bound)), None) = (bounds.next(), bounds.next()) else {
+            return Self::Misspelled(
+                "one bound, `Fn(f32, f32) -> f32`, and no other: a kernel is a function of \
+                 the two coordinates and nothing more",
+            );
+        };
+        if bound.lifetimes.is_some() || !matches!(bound.modifier, syn::TraitBoundModifier::None) {
+            return Self::Misspelled("`Fn(f32, f32) -> f32`, with no lifetimes and no `?`");
+        }
+        let segment = match bound.path.segments.iter().collect::<Vec<_>>().as_slice() {
+            [segment] if bound.path.leading_colon.is_none() => *segment,
+            _ => return Self::Misspelled("`Fn`, by its own name"),
+        };
+        match segment.ident.to_string().as_str() {
+            "Fn" => {}
+            "FnMut" | "FnOnce" => {
+                return Self::Misspelled(
+                    "`Fn`: a kernel is applied, and nothing a body does mutates or consumes it",
+                );
+            }
+            _ => {
+                return Self::Misspelled(
+                    "an `impl` type is a kernel, `impl Fn(f32, f32) -> f32`, and nothing else",
+                );
+            }
+        }
+        let syn::PathArguments::Parenthesized(signature) = &segment.arguments else {
+            return Self::Misspelled("`Fn(f32, f32) -> f32`, its signature written out");
+        };
+        let takes_the_coordinates =
+            signature.inputs.len() == 2 && signature.inputs.iter().all(is_f32);
+        if !takes_the_coordinates {
+            return Self::Misspelled(
+                "`Fn(f32, f32)`: a kernel is a function of the two coordinates, applied as \
+                 `k(x, y)`",
+            );
+        }
+        match &signature.output {
+            syn::ReturnType::Type(_, output) if is_f32(output) => Self::Kernel,
+            _ => Self::Misspelled(
+                "`-> f32`: a kernel's value is an `f32`; a mask is a `bool` a body computes, \
+                 never a kernel's value",
+            ),
+        }
+    }
+}
+
+/// Whether `ty` is `f32`, by its own name.
+fn is_f32(ty: &Type) -> bool {
+    match ty {
+        Type::Path(path) => path.qself.is_none() && path.path.is_ident("f32"),
+        Type::Group(inner) => is_f32(&inner.elem),
+        _ => false,
+    }
 }
 
 /// An expression in the kernel body.

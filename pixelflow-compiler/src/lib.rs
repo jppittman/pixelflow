@@ -23,6 +23,12 @@
 //! Rust TokenStream that rebuilds a `Kernel` at load time
 //! ```
 //!
+//! An entry that takes a kernel-typed parameter leaves the diagram at
+//! lowering: its argument exists only when its host function is called, so
+//! lowering's steps are emitted as the statements that take them, and run
+//! then (`emit::Staged`, Phase D-a of
+//! docs/plans/2026-09-25-the-language-is-kernel.md).
+//!
 //! Two representations, the surface AST and the IR. It used to be five: the
 //! optimizer ran
 //! on the *AST*, so `kernel!` went AST → e-graph → extracted DAG → back to an
@@ -76,7 +82,8 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 ///
 /// - A `pub fn name(params) -> f32 { body }` is an **entry**: the macro
 ///   emits a host `pub fn name(params) -> Kernel`, taking its parameters by
-///   their declared types, and — when it has parameters — its `Args` record
+///   their declared types — a kernel-typed one as a `&Kernel` — and, when
+///   it has uniform parameters and no kernel-typed one, its `Args` record
 ///   (see *Binding times* below).
 /// - A private `fn` is a **helper**: type-checked once, inlined at each call.
 ///   Helpers may call helpers; a cycle is refused, because the language is a
@@ -198,14 +205,51 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 /// let plane = Lattice::frame(64, 64).bake(&unit_circle);
 /// ```
 ///
-/// Kernels compose as values — `Kernel::at`/`sum`/`select`/arithmetic — so
-/// there is no manifold-typed parameter. Derivatives (`DX`/`DY`) become
-/// symbolic `Dwrt` nodes, resolved by the e-graph here when it can and by
-/// codegen otherwise.
+/// Derivatives (`DX`/`DY`) become symbolic `Dwrt` nodes, resolved by the
+/// e-graph here when it can and by codegen otherwise. The closure form takes
+/// no kernel-typed parameter: rustc refuses `impl Trait` in a closure's
+/// parameters (E0562).
+///
+/// # Kernel-typed parameters
+///
+/// An entry's parameter typed `impl Fn(f32, f32) -> f32` is a **kernel**
+/// the host passes when it calls the entry (§1.3, §1.4, Phase D-a), and the
+/// host function takes a `&Kernel` for it. A body applies one, `k(x, y)` —
+/// the argument at `(x, y)`, which is `k.at(x, y)`: application is
+/// contramap — or passes it by name to a helper's kernel-typed parameter,
+/// and does nothing else with it: arithmetic on one, a `let` of one, a
+/// return of one are refused. As rustc moves an `impl Fn` it passes, a body
+/// passes one on at most once on each path through it — an `if`'s arms are
+/// two — then uses it no more on that path, and never inside a fold's body.
+///
+/// Such an entry is a composition, whose program exists only once the host
+/// passes its argument, so its host function runs lowering's steps when it
+/// is called: the IR calls this macro makes at expansion for any other
+/// entry, then. No optimizer runs on it at expansion; the composed program
+/// is optimized when it is baked. A fold around an application closes after
+/// the argument is in, so the argument keeps its binders and the fold takes
+/// another (D4). An argument is closed and reads no table, or the call
+/// panics.
+///
+/// ```ignore
+/// kernel! {
+///     pub fn sum2(a: impl Fn(f32, f32) -> f32, b: impl Fn(f32, f32) -> f32) -> f32 {
+///         a(X, Y) + b(X, Y)
+///     }
+///
+///     /// Three copies of `k`, a column apart.
+///     pub fn columns(k: impl Fn(f32, f32) -> f32) -> f32 {
+///         (0..3).map(|i| k(X + (i as f32), Y)).sum()
+///     }
+/// }
+///
+/// let disc = kernel!(|r: f32| (X * X + Y * Y).sqrt() - r)(4.0);
+/// let both = sum2(&disc, &columns(&disc));
+/// ```
 ///
 /// # Binding times
 ///
-/// Every value a program reads is bound at one of two times (§1.4):
+/// Every value a program reads is bound at one of three times (§1.4):
 ///
 /// - **Structural**: an entry's `const N: usize` generics. The host function
 ///   is generic over them, and each value is its own program — a count in a
@@ -223,6 +267,12 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 ///   declarations the entry's in order beside argument-free kernels; beside
 ///   other arguments the count differs, and `write_into` refuses. A
 ///   constant is a `const` item.
+/// - **Kernel-typed**: an argument the host passes when it calls the entry.
+///   The composed program declares the entry's own uniforms first, in
+///   declaration order, then each argument's, in parameter order and that
+///   argument's own order, read or not — an instance passed twice declared
+///   once, where it first appears. Its key is the composed term's. It has
+///   no `Args` record: binding a composed program is O3 of the plan.
 ///
 /// ```ignore
 /// use pixelflow_compiler::kernel;
@@ -267,6 +317,10 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 ///    instantiated.
 /// 5. **Emission**: the arena becomes code that rebuilds it at load time,
 ///    the call's values as its uniforms' defaults
+///
+/// An entry that takes a kernel skips 3 to 5 at expansion: its host
+/// function is lowering's steps, emitted as the statements that take them,
+/// and builds its arena when it is called (Phase D-a).
 #[proc_macro]
 pub fn kernel(input: TokenStream) -> TokenStream {
     expand(input, &mut macro_tier())

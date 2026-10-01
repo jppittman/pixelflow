@@ -135,6 +135,29 @@ impl Axis {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct IndexSpaceFull;
 
+/// A fold whose body is being built: what [`ExprArena::open_fold`] hands
+/// out and [`ExprArena::close_fold`] takes back — the arena the fold is
+/// built into, set aside while its body is built in a copy, and the
+/// placeholder the body reads as its index.
+///
+/// Not `Clone`: one fold is closed once, and the arena it holds is put back
+/// exactly then.
+#[must_use = "an open fold is closed with `ExprArena::close_fold`, which restores the arena"]
+pub struct OpenFold {
+    enclosing: ExprArena,
+    placeholder: Placeholder,
+    index: ExprId,
+}
+
+impl OpenFold {
+    /// The fold's index, as the body reads it: a placeholder `Var` until
+    /// [`ExprArena::close_fold`] chooses the binder and renames it.
+    #[must_use]
+    pub fn index(&self) -> ExprId {
+        self.index
+    }
+}
+
 /// The `Var` indices Z and W had. Reserved, never reissued: a reduction
 /// binder taking one of them would make an arena written before the change
 /// read back as a different program.
@@ -696,35 +719,69 @@ impl ExprArena {
         None
     }
 
-    /// The first `Var(i)` with `i >= floor` reachable from `root`, if any.
+    /// The lowest index `root` reads that no fold within it binds — a
+    /// reduction binder's `Var`, or a placeholder's — or `None` when `root`
+    /// is **closed**: every index it reads is bound by a `Reduce` around the
+    /// read, inside `root`.
     ///
     /// `Var`'s index space is three namespaces stacked in one integer —
     /// coordinates, then the reserved retired axes, then reduction binders,
-    /// then a binder's under-construction placeholder — so "is this term open
-    /// above `floor`?" is the only question a caller can ask structurally.
-    /// [`retired_axis`](ExprArena::retired_axis) is its sibling for the one
-    /// range that is closed rather than open-ended.
+    /// then a binder's under-construction placeholder. A coordinate is read,
+    /// never bound, and is not an index; everything from the first binder up
+    /// is one, and a term that reads one it does not bind means nothing on
+    /// its own: its value depends on a fold outside it. That is the question
+    /// a name ([`Kernel::by_ref`](crate::Kernel::by_ref)) and a kernel-typed
+    /// argument ([`ExprArena::admit`]) both ask, so it is asked here once.
+    ///
+    /// Scoped, not a scan: a binder read under the `Reduce` that binds it is
+    /// bound, and the same `Var` read outside it is free. Asking only whether
+    /// some `Var` above a floor is reachable — what this replaced — saw a
+    /// placeholder and missed a free binder, which the next fold built around
+    /// the term could then choose, and capture.
     ///
     /// Reachable from `root`, not every node, for
     /// [`retired_axis`](ExprArena::retired_axis)'s reason: an arena keeps the
     /// nodes a rebuild replaced, and nothing evaluates those.
     #[must_use]
-    pub fn free_var_at_or_above(&self, root: ExprId, floor: u8) -> Option<u8> {
-        let mut seen = alloc::vec![false; self.len()];
+    pub fn free_index(&self, root: ExprId) -> Option<u8> {
+        /// One bit per `Var` index a `u8` can name.
+        type Indices = [u128; 2];
+        fn bit(index: u8) -> Indices {
+            let mut indices = [0; 2];
+            indices[usize::from(index / 128)] = 1 << (index % 128);
+            indices
+        }
+        let mut reached = alloc::vec![false; root.0 as usize + 1];
         let mut stack = alloc::vec![root];
         while let Some(id) = stack.pop() {
-            let idx = id.0 as usize;
-            if core::mem::replace(&mut seen[idx], true) {
+            if core::mem::replace(&mut reached[id.0 as usize], true) {
                 continue;
-            }
-            if let ExprNode::Var(i) = &self.node(id)
-                && *i >= floor
-            {
-                return Some(*i);
             }
             stack.extend(self.children(id));
         }
-        None
+        // Children precede their parents in an arena, so one ascending pass
+        // sees every child's free indices before its parent asks for them.
+        let mut free: Vec<Indices> = alloc::vec![[0; 2]; root.0 as usize + 1];
+        for index in (0..=root.0 as usize).filter(|&index| reached[index]) {
+            let id = ExprId(index as u32);
+            free[index] = match self.node(id) {
+                ExprNode::Var(i) if i >= REDUCE_BINDER_BASE => bit(i),
+                ExprNode::Reduce { fold, body } => {
+                    let bound = bit(fold.binder().var());
+                    let [low, high] = free[body.0 as usize];
+                    [low & !bound[0], high & !bound[1]]
+                }
+                _ => self.children(id).fold([0; 2], |[low, high], child| {
+                    let [child_low, child_high] = free[child.0 as usize];
+                    [low | child_low, high | child_high]
+                }),
+            };
+        }
+        match free[root.0 as usize] {
+            [0, 0] => None,
+            [0, high] => Some(128 + high.trailing_zeros() as u8),
+            [low, _] => Some(low.trailing_zeros() as u8),
+        }
     }
 
     /// Push a `Const(v)` node.
@@ -1537,6 +1594,79 @@ impl ExprArena {
         let root = closed.push_reduce(fold, body);
         let closed = closed.finish(&[root]);
         Ok(to_arena(closed.entry(), &tables))
+    }
+
+    /// Begin a fold's body in this arena, the `depth`th fold open at once:
+    /// this arena becomes a copy of itself, the body is built in it against
+    /// the returned fold's [`index`](OpenFold::index), and
+    /// [`close_fold`](Self::close_fold) puts the enclosing arena back with
+    /// only the closed fold added.
+    ///
+    /// The two are the one definition of building a fold where its body is
+    /// written — `kernel!`'s lowering, at expansion, and an entry that takes
+    /// a kernel-typed argument, which runs lowering's steps when it is called
+    /// (docs/plans/2026-09-25-the-language-is-kernel.md, Phase D-a) — so a
+    /// fold built either way lays out its arena the same way. Every id bound
+    /// before the fold opened means the same node in the copy, which is what
+    /// lets the body read them; what the placeholder read, and what renaming
+    /// it leaves behind, stay in the copy and go with it.
+    ///
+    /// One placeholder per fold open at once, the `depth`th for `depth`
+    /// open, so a nested fold's rename never reaches its enclosing fold's
+    /// index. `None` past [`Binder::COUNT`] folds deep: a program cannot
+    /// nest more than it has binders.
+    #[must_use]
+    pub fn open_fold(&mut self, depth: usize) -> Option<OpenFold> {
+        let placeholder = Placeholder::nth(depth).filter(|_| depth < Binder::COUNT)?;
+        let copy = self.clone();
+        let enclosing = core::mem::replace(self, copy);
+        let index = self.push_var(placeholder.var());
+        Some(OpenFold {
+            enclosing,
+            placeholder,
+            index,
+        })
+    }
+
+    /// End the fold [`open_fold`](Self::open_fold) began: its `body`, built
+    /// in this arena, closed by [`close_over`](Self::close_over) into
+    /// `fold_at`'s fold, and spliced into the enclosing arena, which this
+    /// arena becomes again. Returns the fold's node there.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexSpaceFull`] when the body binds every binder; the enclosing
+    /// arena is restored either way.
+    pub fn close_fold(
+        &mut self,
+        open: OpenFold,
+        body: ExprId,
+        fold_at: impl FnOnce(Binder) -> Fold,
+    ) -> Result<ExprId, IndexSpaceFull> {
+        let OpenFold {
+            enclosing,
+            placeholder,
+            ..
+        } = open;
+        let copy = core::mem::replace(self, enclosing);
+        let (closed, root) = copy.close_over(body, placeholder, fold_at)?;
+        Ok(self.splice(&closed, root))
+    }
+
+    /// The fragment at `root` and nothing else: every node `root` reaches,
+    /// in this arena's order, and every buffer and uniform this arena
+    /// declares, slot for slot — read or not, since a positional binding
+    /// supplies them in that order. What building left behind (a node a
+    /// substitution replaced, a `let` nothing read) is dropped.
+    ///
+    /// It matters because some passes ask questions of a *whole* arena — a
+    /// fast path that skips a rebuild when no node needs one — and a rebuild
+    /// can move nodes, so an arena carrying construction garbage could
+    /// compile to other bytes than the same program without it, under one
+    /// cache key.
+    #[must_use]
+    pub fn compact(&self, root: ExprId) -> (ExprArena, ExprId) {
+        self.relink(root, &self.buffers, &self.uniforms)
     }
 
     /// The lowest binder no `Reduce` reachable from `body` binds, or `None`
@@ -2468,6 +2598,110 @@ mod tests {
 
         assert_eq!(arena.children(v).len(), 0);
         assert_eq!(arena.children(bin).len(), 2);
+    }
+
+    // ───────────────────────── free_index ─────────────────────────
+
+    /// An index is free where no fold around the read binds it: a
+    /// placeholder always, a binder outside its `Reduce`, and neither a
+    /// coordinate nor a binder under the `Reduce` that binds it.
+    #[test]
+    fn an_index_is_free_only_outside_the_fold_that_binds_it() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(Axis::X.var());
+        assert_eq!(a.free_index(x), None, "a coordinate is read, never bound");
+
+        let binder = Binder::from_slot(1).expect("a binder");
+        let i = a.push_var(binder.var());
+        assert_eq!(a.free_index(i), Some(binder.var()));
+        let body = a.push_binary(OpKind::Mul, x, i);
+        let fold = a.push_reduce(Fold::new(Monoid::SUM, binder, 0..4), body);
+        assert_eq!(a.free_index(fold), None, "bound under its fold");
+
+        // The same binder read beside the fold, outside it, is free: a
+        // scan for "some binder Var is reachable" cannot tell this from the
+        // line above.
+        let beside = a.push_binary(OpKind::Add, fold, i);
+        assert_eq!(a.free_index(beside), Some(binder.var()));
+
+        let placeholder = Placeholder::nth(0).expect("a placeholder");
+        let p = a.push_var(placeholder.var());
+        let both = a.push_binary(OpKind::Add, beside, p);
+        assert_eq!(
+            a.free_index(both),
+            Some(binder.var()),
+            "the lowest free index, the binder below the placeholder"
+        );
+        let open = a.push_binary(OpKind::Add, fold, p);
+        assert_eq!(a.free_index(open), Some(placeholder.var()));
+    }
+
+    // ───────────────────── open_fold / close_fold ─────────────────────
+
+    /// A fold built where its body is written is `close_over`'s fold of
+    /// that body, spliced into the enclosing arena — and the enclosing arena
+    /// gains that and nothing else: the placeholder stayed in the copy.
+    #[test]
+    fn a_fold_opened_and_closed_is_close_overs_and_leaves_nothing_behind() {
+        let mut a = ExprArena::new();
+        let x = a.push_var(Axis::X.var());
+        let before = a.len();
+        let open = a.open_fold(0).expect("depth 0 is in range");
+        let index = open.index();
+        let body = a.push_binary(OpKind::Mul, x, index);
+        let fold = a
+            .close_fold(open, body, |b| Fold::new(Monoid::SUM, b, 0..4))
+            .expect("one fold binds one binder");
+
+        let ExprNode::Reduce { fold: range, body } = a.node(fold) else {
+            panic!("a fold, got {}", a.display(fold));
+        };
+        assert_eq!(range.binder().slot(), 0);
+        assert_eq!(
+            a.node(body),
+            ExprNode::Binary(OpKind::Mul, x, a.push_var(range.binder().var()))
+        );
+        assert_eq!(a.free_index(fold), None);
+        assert_eq!(
+            a.len(),
+            before + 3,
+            "the binder's Var, the body and the fold; no placeholder"
+        );
+    }
+
+    /// No deeper than the index space: one fold per binder.
+    #[test]
+    fn a_fold_opens_no_deeper_than_the_binders() {
+        let mut a = ExprArena::new();
+        assert!(a.open_fold(Binder::COUNT - 1).is_some());
+        assert!(a.open_fold(Binder::COUNT).is_none());
+    }
+
+    // ───────────────────────── compact ─────────────────────────
+
+    /// What `root` does not reach is dropped, and every declaration is kept
+    /// in its slot, read or not.
+    #[test]
+    fn compact_keeps_the_program_and_every_declaration() {
+        let mut a = ExprArena::new();
+        let unread = a.declare_uniform(UniformDecl {
+            id: UniformIdentity::mint(),
+            default: 1.0,
+        });
+        let read = a.declare_uniform(UniformDecl {
+            id: UniformIdentity::mint(),
+            default: 2.0,
+        });
+        let _garbage = a.push_uniform(unread);
+        let x = a.push_var(Axis::X.var());
+        let _also_garbage = a.push_binary(OpKind::Sub, x, x);
+        let u = a.push_uniform(read);
+        let root = a.push_binary(OpKind::Add, x, u);
+
+        let (compact, compact_root) = a.compact(root);
+        assert_eq!(compact.len(), 3, "X, the read uniform, the sum");
+        assert_eq!(compact.uniforms(), a.uniforms(), "every slot, in order");
+        assert!(compact.subtree_eq(compact_root, &a, root));
     }
 }
 

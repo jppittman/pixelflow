@@ -33,6 +33,13 @@
 //!    is the order they are declared in.
 //! 7. **Tuple `let`s** (D7's front half): a tuple `let` types every
 //!    expression before it binds any name.
+//! 8. **Kernels** (Phase D-a): a parameter typed `impl Fn(f32, f32) -> f32`
+//!    is a kernel the host passes at run time ([`Ty::Kernel`]). A body
+//!    applies one, `k(x, y)`, or passes it by name to a helper's
+//!    kernel-typed parameter, and does nothing else with it; and, as rustc
+//!    moves an `impl Fn` it passes, it passes one on at most once on each
+//!    path (an `if`'s arms are two), uses it after that on that path not at
+//!    all, and never inside a fold's body.
 //!
 //! ## Symbol Resolution Rules
 //!
@@ -64,8 +71,8 @@
 use crate::PLAN;
 use crate::ast::{
     BinaryExpr, BinaryOp, BlockExpr, CallExpr, CastExpr, ConstItem, Expr, FieldExpr, FnItem,
-    FoldExpr, IfExpr, KernelDef, LetStmt, MethodCallExpr, Param, RangeExpr, RecordField, RecordId,
-    Reduction, Role, Spelling, Stmt, UnaryOp,
+    FoldExpr, FunctionType, IfExpr, KernelDef, LetStmt, MethodCallExpr, Param, RangeExpr,
+    RecordField, RecordId, Reduction, Role, Spelling, Stmt, UnaryOp,
 };
 use crate::lower::{LIBRARY_METHODS, Projection};
 use crate::symbol::{SymbolKind, SymbolTable};
@@ -94,6 +101,12 @@ use syn::{Ident, Type};
 /// name — a parameter, a `let` alias, an argument passed on — and read only
 /// by field. Anything that would compute one, choose one or return one is
 /// Phase D (D7).
+///
+/// The fifth, a kernel, is a function of the two coordinates the host
+/// supplies at run time: a parameter typed `impl Fn(f32, f32) -> f32`
+/// (Phase D-a). It is not a value either. A body applies it, `k(x, y)` —
+/// the argument evaluated at `(x, y)`, an `f32` — or passes it by name to a
+/// helper's kernel-typed parameter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ty {
     /// A value.
@@ -106,6 +119,8 @@ pub enum Ty {
     Usize,
     /// One of the block's records.
     Record(RecordId),
+    /// A kernel-typed parameter: `impl Fn(f32, f32) -> f32`.
+    Kernel,
 }
 
 impl Ty {
@@ -145,7 +160,7 @@ impl Ty {
                      body converts by `i as f32`"
                 ),
             )),
-            Some(Ty::Record(_)) | None => Err(syn::Error::new_spanned(
+            Some(Ty::Record(_) | Ty::Kernel) | None => Err(syn::Error::new_spanned(
                 ty,
                 format!(
                     "{what} an `f32` or a `bool`\n\
@@ -164,6 +179,7 @@ impl Ty {
             Ty::Bool => "bool",
             Ty::Usize => "usize",
             Ty::Record(_) => "record",
+            Ty::Kernel => "impl Fn(f32, f32) -> f32",
         }
     }
 }
@@ -262,15 +278,18 @@ impl<'a> Parameter<'a> {
 }
 
 impl AnalyzedKernel {
-    /// An entry's parameters in declaration order: every one a uniform, a
-    /// record one per field (plan §1.4). The one definition of the order a
-    /// program declares its uniforms in — lowering declares them by it,
-    /// and the host function and its `Args` record supply them by it — so
-    /// a positional binding cannot disagree with the program it binds.
+    /// An entry's uniform parameters in declaration order: an `f32` is one
+    /// uniform, a record one per field (plan §1.4). The one definition of
+    /// the order a program declares its own uniforms in — lowering declares
+    /// them by it, and the host function and its `Args` record supply them
+    /// by it — so a positional binding cannot disagree with the program it
+    /// binds. A kernel-typed parameter is not among them: its uniforms are
+    /// the argument's, declared after these ([`Self::kernel_parameters`]).
     pub(crate) fn parameters<'a>(&'a self, entry: &'a FnItem) -> Vec<Parameter<'a>> {
         entry
             .params
             .iter()
+            .filter(|param| !param.is_kernel())
             .map(|param| Parameter {
                 name: &param.name,
                 record: self
@@ -278,6 +297,21 @@ impl AnalyzedKernel {
                     .record_named(&param.ty)
                     .map(|id| (id, self.def.record(id).fields.as_slice())),
             })
+            .collect()
+    }
+
+    /// An entry's kernel-typed parameters in declaration order: the order
+    /// their arguments are admitted in, and so the order each argument's
+    /// uniforms are declared in, after the entry's own
+    /// ([`Self::parameters`]) — `Kernel`'s rule for a composition's
+    /// operands, which a positional binding of the composed program reads
+    /// (O3 of the plan).
+    pub(crate) fn kernel_parameters<'a>(&self, entry: &'a FnItem) -> Vec<&'a Ident> {
+        entry
+            .params
+            .iter()
+            .filter(|param| param.is_kernel())
+            .map(|param| &param.name)
             .collect()
     }
 }
@@ -376,7 +410,7 @@ impl<'a> Items<'a> {
             items.refuse_a_taken_name(&c.name)?;
             let ty = match Ty::from_syn(&c.ty) {
                 Some(ty @ (Ty::F32 | Ty::Usize)) => ty,
-                Some(Ty::Bool | Ty::Record(_)) | None => {
+                Some(Ty::Bool | Ty::Record(_) | Ty::Kernel) | None => {
                     return Err(syn::Error::new_spanned(
                         &c.ty,
                         "a `const` in a `kernel!` block is an `f32` or a `usize`\n\
@@ -432,7 +466,7 @@ impl<'a> Items<'a> {
     fn refuse_a_taken_args_record(&self) -> syn::Result<()> {
         let mut taken: HashMap<String, &Ident> = HashMap::with_capacity(self.def.fns.len());
         let entries = self.def.fns.iter().filter(|f| f.role() == Role::Entry);
-        for entry in entries.filter(|f| !f.params.is_empty()) {
+        for entry in entries.filter(|f| f.has_args_record()) {
             let args = entry.args_record().to_string();
             let clash = match taken.get(&args) {
                 Some(other) => Some(format!("the `Args` record of `{other}`")),
@@ -447,8 +481,8 @@ impl<'a> Items<'a> {
                     format!(
                         "`{}`'s `Args` record, `{args}`, is also {clash}\n\
                          \n\
-                         note: each entry with parameters has an `Args` record, named after \
-                         it in UpperCamelCase (§1.4 of {PLAN})\n\
+                         note: each entry with uniform parameters, and no kernel-typed one, has \
+                         an `Args` record, named after it in UpperCamelCase (§1.4 of {PLAN})\n\
                          help: rename one of the two",
                         entry.name
                     ),
@@ -475,6 +509,10 @@ impl<'a> Items<'a> {
             }
             let what = match (&field.ty, self.def.record_named(&field.ty)) {
                 (_, Some(inner)) => format!("the record `{}`", self.def.record(inner).name),
+                (ty, None) if FunctionType::of(ty) != FunctionType::NotOne => format!(
+                    "a function: a kernel is a `fn`'s parameter, applied by name, never a \
+                     field (Phase D-a of {PLAN})"
+                ),
                 (Type::Array(_), None) => "an array".to_string(),
                 (Type::Tuple(_), None) => "a tuple".to_string(),
                 (ty, None) => match Ty::from_syn(ty) {
@@ -508,7 +546,7 @@ impl<'a> Items<'a> {
     fn name_of(&self, ty: Ty) -> String {
         match ty {
             Ty::Record(record) => self.def.record(record).name.to_string(),
-            Ty::F32 | Ty::Bool | Ty::Usize => ty.name().to_string(),
+            Ty::F32 | Ty::Bool | Ty::Usize | Ty::Kernel => ty.name().to_string(),
         }
     }
 
@@ -531,6 +569,18 @@ impl<'a> Items<'a> {
     /// What a `fn` returns: an `f32` or a `bool`. A record return is Phase
     /// D (D7): it lowers to one program per field, or to a packed word.
     fn return_type(&self, ty: &Type) -> syn::Result<Ty> {
+        if FunctionType::of(ty) != FunctionType::NotOne {
+            return Err(syn::Error::new_spanned(
+                ty,
+                format!(
+                    "a `fn` returning a function\n\
+                     \n\
+                     note: a kernel `fn` returns an `f32` or a `bool`; a kernel is composed by \
+                     the host, which passes one entry's kernel to another's kernel-typed \
+                     parameter (§1.7 and Phase D-a of {PLAN})"
+                ),
+            ));
+        }
         if let Some(record) = self.def.record_named(ty) {
             return Err(syn::Error::new_spanned(
                 ty,
@@ -550,6 +600,23 @@ impl<'a> Items<'a> {
     fn param_type(&self, param: &Param, role: Role) -> syn::Result<Ty> {
         if let Some(record) = self.def.record_named(&param.ty) {
             return Ok(Ty::Record(record));
+        }
+        match FunctionType::of(&param.ty) {
+            FunctionType::Kernel => return Ok(Ty::Kernel),
+            FunctionType::Misspelled(why) => {
+                return Err(syn::Error::new_spanned(
+                    &param.ty,
+                    format!(
+                        "a kernel-typed parameter is `impl Fn(f32, f32) -> f32`, and this one is \
+                         spelled otherwise\n\
+                         \n\
+                         note: {why}\n\
+                         note: a kernel is passed by the host at run time and applied by name, \
+                         `k(x, y)` (Phase D-a of {PLAN})"
+                    ),
+                ));
+            }
+            FunctionType::NotOne => {}
         }
         let named = match &*param.ty {
             Type::Path(path) if path.qself.is_none() => path.path.get_ident(),
@@ -591,6 +658,16 @@ struct FnAnalyzer<'a> {
     structural: &'a [Ident],
     role: Role,
     symbols: SymbolTable,
+    /// How many folds' bodies the walk is inside: a fold's body is a Rust
+    /// closure, and a closure `.map` calls again cannot move what it
+    /// captured.
+    folds_open: usize,
+    /// Each kernel-typed parameter passed on to a helper on the path the
+    /// walk is on, by name, where: rustc moves an `impl Fn` it passes, so
+    /// nothing after it on that path uses it (E0382). Per path, as rustc's
+    /// check is: an `if`'s arms are two paths, and after the `if` a kernel
+    /// either one moved is moved ([`FnAnalyzer::type_of_if`]).
+    moved: HashMap<String, Span>,
 }
 
 impl<'a> FnAnalyzer<'a> {
@@ -607,6 +684,8 @@ impl<'a> FnAnalyzer<'a> {
             structural: &f.structural,
             role: f.role(),
             symbols: SymbolTable::new(),
+            folds_open: 0,
+            moved: HashMap::new(),
         };
         for (name, &ty) in &items.consts {
             analyzer.symbols.register_const(name, ty);
@@ -670,11 +749,24 @@ impl<'a> FnAnalyzer<'a> {
     }
 
     /// A parameter or a `let` may not take the name of a coordinate, a
-    /// `const`, a structural parameter or a `fn` — rustc refuses a binding
-    /// that shadows a const generic, too. A `let` may shadow a parameter or
-    /// another `let`, as Rust's does.
+    /// projection, a `const`, a structural parameter or a `fn` — rustc
+    /// refuses a binding that shadows a const generic, too. A `let` may
+    /// shadow a parameter or another `let`, as Rust's does.
+    ///
+    /// A projection because a call is resolved by its name: a kernel named
+    /// `DX` would make `DX(x, y)` an application here and a derivative to a
+    /// stage that looked the projection up first.
     fn refuse_shadowing_an_item(&self, name: &Ident, binder: &str) -> syn::Result<()> {
         let text = name.to_string();
+        if Projection::from_name(&text).is_some() {
+            return Err(syn::Error::new(
+                name.span(),
+                format!(
+                    "{binder} `{text}` is named after the projection `{text}(e)`\n\
+                     help: rename this {binder} to something else"
+                ),
+            ));
+        }
         // A `let X` would make `X` mean the local below it — and lowering
         // used to match the coordinate names before locals, so the kernel
         // silently read the coordinate instead (`{ let X = Y; X }` gave X).
@@ -826,7 +918,9 @@ impl<'a> FnAnalyzer<'a> {
         let (term, what) = term_type(fold.reduction);
         self.symbols.push_scope();
         self.symbols.register_index(&fold.binder.to_string());
+        self.folds_open += 1;
         let typed = self.expect(&fold.body, term, what);
+        self.folds_open -= 1;
         self.symbols.pop_scope();
         typed
     }
@@ -850,6 +944,12 @@ impl<'a> FnAnalyzer<'a> {
                 "a `bool` is a mask; it becomes a number by a choice, `if m { 1.0 } else { 0.0 }`"
             }
             Ty::Record(_) => "a record is its fields; each is an `f32` already, `p.x0`",
+            Ty::Kernel => {
+                return Err(Self::kernel_is_not_a_value(
+                    cast.operand.span(),
+                    "the operand of `as f32`, which converts a `usize`",
+                ));
+            }
             Ty::F32 | Ty::Usize => "it is a value already, and needs no conversion",
         };
         Err(syn::Error::new(
@@ -889,13 +989,26 @@ impl<'a> FnAnalyzer<'a> {
 
     /// `if c { a } else { b }`: the condition is a `bool`, the arms agree,
     /// and the value has the arms' type.
+    ///
+    /// The arms are two paths, and a kernel one passes on is moved on that
+    /// path only: the other arm may use it, as rustc's move check, which
+    /// follows the flow, lets it. After the `if`, a kernel either arm moved
+    /// is moved — rustc's "maybe moved", which it refuses to use (E0382).
+    /// The language has no loop, so that join is the whole of the rule.
     fn type_of_if(&mut self, choice: &IfExpr) -> syn::Result<Ty> {
         self.expect(
             &choice.cond,
             Ty::Bool,
             "the condition of an `if` is a `bool`; a comparison gives one",
         )?;
+        let before_the_arms = self.moved.clone();
         let then = self.type_of_block(&choice.then_branch)?;
+        if then == Ty::Kernel {
+            return Err(Self::kernel_is_not_a_value(
+                choice.then_branch.span,
+                "an arm of an `if`",
+            ));
+        }
         if let Ty::Record(record) = then {
             return Err(syn::Error::new(
                 choice.span,
@@ -909,11 +1022,16 @@ impl<'a> FnAnalyzer<'a> {
                 ),
             ));
         }
-        self.expect(
+        let moved_by_then = core::mem::replace(&mut self.moved, before_the_arms);
+        let ty = self.expect(
             &choice.else_branch,
             then,
             "both arms of an `if` have the same type",
-        )
+        )?;
+        for (name, span) in moved_by_then {
+            self.moved.entry(name).or_insert(span);
+        }
+        Ok(ty)
     }
 
     /// Resolve an identifier reference to the innermost binding of its name
@@ -1146,9 +1264,27 @@ impl<'a> FnAnalyzer<'a> {
             .map(|(_, count)| *count)
     }
 
-    /// A free function call: a helper, inlined by lowering, or a projection.
+    /// A free function call: a kernel applied, a helper inlined by
+    /// lowering, or a projection. A name in scope is resolved first, as
+    /// lowering resolves it: a kernel-typed parameter is applied, and any
+    /// other binding is not a function.
     fn type_of_call(&mut self, call: &CallExpr) -> syn::Result<Ty> {
         let name = call.func.to_string();
+        if let Some(symbol) = self.symbols.lookup(&name).copied() {
+            if symbol.ty == Ty::Kernel {
+                return self.type_of_application(call);
+            }
+            return Err(syn::Error::new(
+                call.func.span(),
+                format!(
+                    "`{name}` is a `{}`, and only a kernel is applied\n\
+                     \n\
+                     note: a kernel is a parameter typed `impl Fn(f32, f32) -> f32`, applied \
+                     at two coordinates, `{name}(x, y)` (Phase D-a of {PLAN})",
+                    self.items.name_of(symbol.ty)
+                ),
+            ));
+        }
         if let Some(signature) = self.items.fns.get(&name) {
             return self.type_of_helper_call(call, signature.clone());
         }
@@ -1181,6 +1317,103 @@ impl<'a> FnAnalyzer<'a> {
         ))
     }
 
+    /// `k(x, y)`: a kernel applied at two `f32` coordinates, which is the
+    /// kernel's value there, an `f32` — contramap (§1.2), `k.at(x, y)`.
+    ///
+    /// Applying a kernel borrows it (`Fn::call` takes `&self`), so a body
+    /// applies one as often as it likes — but not once it has passed it on,
+    /// which moved it (E0382), nor while an argument passes it on, which
+    /// rustc refuses as a move out of the borrowed callee.
+    fn type_of_application(&mut self, call: &CallExpr) -> syn::Result<Ty> {
+        let name = call.func.to_string();
+        self.refuse_a_moved_kernel(&call.func, "applied")?;
+        let [x, y] = call.args.as_slice() else {
+            return Err(syn::Error::new(
+                call.func.span(),
+                format!(
+                    "the kernel `{name}` is applied at the two coordinates, `{name}(x, y)`, and \
+                     {} {} supplied",
+                    call.args.len(),
+                    if call.args.len() == 1 { "was" } else { "were" },
+                ),
+            ));
+        };
+        let what = "a kernel is applied at two `f32` coordinates";
+        self.expect(x, Ty::F32, what)?;
+        self.expect(y, Ty::F32, what)?;
+        self.refuse_a_moved_kernel(&call.func, "applied")?;
+        Ok(Ty::F32)
+    }
+
+    /// A kernel passed on to a helper's kernel-typed parameter: by name, and
+    /// moved, as rustc moves an `impl Fn` it passes — so at most once on a
+    /// path, not after it was moved on that path, and not from inside a
+    /// fold's body, a closure `.map` calls again (E0507).
+    fn pass_a_kernel(&mut self, arg: &Expr, what: &str) -> syn::Result<()> {
+        let found = self.type_of(arg)?;
+        if found != Ty::Kernel {
+            return Err(syn::Error::new(
+                arg.span(),
+                format!(
+                    "mismatched types: expected `{}`, found `{}`\n\
+                     \n\
+                     note: {what}",
+                    Ty::Kernel.name(),
+                    self.items.name_of(found)
+                ),
+            ));
+        }
+        let Some(name) = arg.named() else {
+            return Err(syn::Error::new(
+                arg.span(),
+                format!(
+                    "a kernel computed by an expression, where a kernel is passed by name\n\
+                     \n\
+                     note: a kernel is a parameter, passed on by its name (Phase D-a of {PLAN})"
+                ),
+            ));
+        };
+        self.refuse_a_moved_kernel(name, "passed on")?;
+        if self.folds_open > 0 {
+            return Err(syn::Error::new(
+                name.span(),
+                format!(
+                    "the kernel `{name}` passed on inside a fold's body\n\
+                     \n\
+                     note: passing an `impl Fn` moves it, and a fold's body is a closure `.map` \
+                     calls once per index, which cannot move what it captured (rustc's E0507)\n\
+                     help: apply it in the fold's body, `{name}(x, y)`, or pass it to a helper \
+                     whose fold applies it"
+                ),
+            ));
+        }
+        self.moved.insert(name.to_string(), name.span());
+        Ok(())
+    }
+
+    /// Refuse a use of the kernel `name` after it was passed on: rustc's
+    /// E0382, which a block of the language is held to because it is Rust.
+    fn refuse_a_moved_kernel(&self, name: &Ident, use_: &str) -> syn::Result<()> {
+        let Some(moved) = self.moved.get(&name.to_string()) else {
+            return Ok(());
+        };
+        let mut err = syn::Error::new(
+            name.span(),
+            format!(
+                "the kernel `{name}` {use_} after it was passed on\n\
+                 \n\
+                 note: a kernel-typed parameter is an `impl Fn`, which moves when it is passed, \
+                 so nothing uses it after (rustc's E0382)\n\
+                 help: pass it to one helper, and apply it there as often as it is needed"
+            ),
+        );
+        err.combine(syn::Error::new(
+            *moved,
+            format!("`{name}` was passed on here"),
+        ));
+        Err(err)
+    }
+
     /// A call to one of the block's `fn`s: a helper, at its arity, with
     /// arguments of its parameters' types.
     fn type_of_helper_call(&mut self, call: &CallExpr, signature: Signature) -> syn::Result<Ty> {
@@ -1211,15 +1444,16 @@ impl<'a> FnAnalyzer<'a> {
             ));
         }
         for (position, (arg, &want)) in call.args.iter().zip(&signature.params).enumerate() {
-            self.expect(
-                arg,
-                want,
-                &format!(
-                    "parameter {} of `{name}` is a `{}`",
-                    position + 1,
-                    self.items.name_of(want)
-                ),
-            )?;
+            let what = format!(
+                "parameter {} of `{name}` is a `{}`",
+                position + 1,
+                self.items.name_of(want)
+            );
+            if want == Ty::Kernel {
+                self.pass_a_kernel(arg, &what)?;
+                continue;
+            }
+            self.expect(arg, want, &what)?;
         }
         Ok(signature
             .ret
@@ -1243,11 +1477,13 @@ impl<'a> FnAnalyzer<'a> {
                 Stmt::LetTuple(lets) => self.analyze_let_tuple(lets)?,
                 // A record as a statement is a value lowering has no lane
                 // for, so it is refused here rather than there.
-                Stmt::Expr(expr) => {
-                    if let Ty::Record(record) = self.type_of(expr)? {
-                        return Err(self.record_is_not_a_value(expr, record));
+                Stmt::Expr(expr) => match self.type_of(expr)? {
+                    Ty::Record(record) => return Err(self.record_is_not_a_value(expr, record)),
+                    Ty::Kernel => {
+                        return Err(Self::kernel_is_not_a_value(expr.span(), "a statement"));
                     }
-                }
+                    Ty::F32 | Ty::Bool | Ty::Usize => {}
+                },
             }
         }
         match &block.expr {
@@ -1297,8 +1533,22 @@ impl<'a> FnAnalyzer<'a> {
         let found = match &let_stmt.ty {
             None => match self.type_of(&let_stmt.init)? {
                 Ty::Record(record) => Ty::Record(self.named_record(&let_stmt.init, record)?),
+                Ty::Kernel => {
+                    return Err(Self::kernel_is_not_a_value(let_stmt.init.span(), "a `let`"));
+                }
                 value => value,
             },
+            Some(annotation) if FunctionType::of(annotation) != FunctionType::NotOne => {
+                return Err(syn::Error::new_spanned(
+                    annotation,
+                    format!(
+                        "a `let` of a function\n\
+                         \n\
+                         note: a kernel is a parameter, applied by name, `k(x, y)`; a `let` binds \
+                         an `f32`, a `bool` or a record (Phase D-a of {PLAN})"
+                    ),
+                ));
+            }
             Some(annotation) => {
                 let want = match self.items.declared(annotation) {
                     Some(record @ Ty::Record(_)) => record,
@@ -1333,6 +1583,9 @@ impl<'a> FnAnalyzer<'a> {
         if let (Ty::Record(record), Ty::F32 | Ty::Bool) = (found, want) {
             return Err(self.record_is_not_a_value(expr, record));
         }
+        if found == Ty::Kernel {
+            return Err(Self::kernel_is_not_a_value(expr.span(), what));
+        }
         Err(syn::Error::new(
             expr.span(),
             format!(
@@ -1343,6 +1596,24 @@ impl<'a> FnAnalyzer<'a> {
                 self.items.name_of(found)
             ),
         ))
+    }
+
+    /// A kernel where a value is expected — in arithmetic, a comparison, a
+    /// method's operand, a fold's body, a `let`, an `if`'s arm, a return, a
+    /// statement: `where_` says which. A kernel is applied, or passed on.
+    fn kernel_is_not_a_value(span: Span, where_: &str) -> syn::Error {
+        syn::Error::new(
+            span,
+            format!(
+                "a kernel where a value is expected\n\
+                 \n\
+                 note: {where_}\n\
+                 note: a kernel is a function of the two coordinates, and is not a value: a \
+                 body applies it, `k(x, y)` — its value at `(x, y)`, an `f32` — or passes it by \
+                 name to a helper's kernel-typed parameter (Phase D-a of {PLAN})\n\
+                 help: `k(X, Y)` is its value at the sample"
+            ),
+        )
     }
 
     /// A record where a value is expected: in arithmetic, a comparison, a
@@ -1757,7 +2028,7 @@ impl ConstEvaluator<'_> {
         let value = match self.types.get(&key) {
             Some(Ty::Usize) => ConstValue::Usize(self.known_usize(&item.init)?),
             Some(Ty::F32) => ConstValue::F32(self.eval_f32(&item.init)?),
-            Some(Ty::Bool | Ty::Record(_)) | None => {
+            Some(Ty::Bool | Ty::Record(_) | Ty::Kernel) | None => {
                 return Err(syn::Error::new_spanned(
                     &item.ty,
                     "a `const` in a `kernel!` block is an `f32` or a `usize`",
@@ -2989,6 +3260,253 @@ mod tests {
         for (input, expected) in cases {
             let err = refusal(input);
             assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
+    }
+
+    // ───────────────────────────── kernels ─────────────────────────────
+
+    /// A body over a kernel-typed parameter, and helpers to pass one to.
+    fn with_kernel(body: TokenStream) -> TokenStream {
+        quote! {
+            fn at(k: impl Fn(f32, f32) -> f32, x: f32) -> f32 { k(x, x) }
+            fn plain(x: f32) -> f32 { x }
+            #body
+        }
+    }
+
+    /// A kernel-typed parameter is `impl Fn(f32, f32) -> f32`, an entry's
+    /// or a helper's; a body applies it at two `f32`s, as often as it likes
+    /// and inside a fold, and passes it on by name, once, after applying it.
+    #[test]
+    fn a_kernel_is_applied_and_passed_on() {
+        accepted(with_kernel(quote! {
+            pub fn f(k: impl Fn(f32, f32) -> f32, r: f32) -> f32 {
+                k(X, Y) * r + k(Y + 1.0, X) + (0..3).map(|i| k(X, i as f32)).sum::<f32>()
+            }
+            pub fn g(k: impl Fn(f32, f32) -> f32) -> f32 { at(k, X) }
+            pub fn h(k: impl Fn(f32, f32) -> f32) -> f32 { k(X, Y) + at(k, Y) }
+        }));
+    }
+
+    /// Every other spelling of a function is refused, naming the one the
+    /// language has, what differs, and the phase.
+    #[test]
+    fn a_function_spelled_otherwise_is_refused() {
+        let cases: [(TokenStream, &str); 8] = [
+            (quote! { k: impl Fn(f32) -> f32 }, "two coordinates"),
+            (quote! { k: impl Fn(f32, f32) -> bool }, "`-> f32`"),
+            (quote! { k: impl Fn(f32, f32) }, "`-> f32`"),
+            (
+                quote! { k: impl FnMut(f32, f32) -> f32 },
+                "mutates or consumes",
+            ),
+            (quote! { k: impl Fn(f32, f32) -> f32 + Copy }, "one bound"),
+            (quote! { k: &impl Fn(f32, f32) -> f32 }, "not by reference"),
+            (quote! { k: &dyn Fn(f32, f32) -> f32 }, "not by reference"),
+            (quote! { k: fn(f32, f32) -> f32 }, "not a function pointer"),
+        ];
+        for (param, expected) in cases {
+            let err = refusal(quote! { pub fn f(#param) -> f32 { X } });
+            assert!(
+                err.contains(expected) && err.contains("impl Fn(f32, f32) -> f32"),
+                "`{param}`: expected `{expected}`, got: {err}"
+            );
+            assert!(err.contains("Phase D-a"), "names the plan's phase: {err}");
+        }
+    }
+
+    /// A kernel is not a value, wherever a value is expected: each refusal
+    /// says so and names the phase.
+    #[test]
+    fn a_kernel_is_not_a_value() {
+        let cases: [TokenStream; 9] = [
+            quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { k + 1.0 } },
+            quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> bool { k < X } },
+            quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { k.sqrt() } },
+            quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { k } },
+            quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { let j = k; X } },
+            quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { k; X } },
+            quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { plain(k) } },
+            quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { (0..2).map(|i| k).sum() } },
+            quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { if X < Y { k } else { k } } },
+        ];
+        for input in cases {
+            let text = input.to_string();
+            let err = refusal(with_kernel(input));
+            assert!(
+                err.contains("a kernel where a value is expected") && err.contains("Phase D-a"),
+                "`{text}`: got {err}"
+            );
+        }
+    }
+
+    /// A kernel is a parameter and nothing else: as a record's field, a
+    /// return type, a `let`'s annotation or the operand of `as f32` it is
+    /// refused, naming the phase.
+    #[test]
+    fn a_kernel_is_a_parameter_and_nothing_else() {
+        let cases: [(TokenStream, &str); 4] = [
+            (
+                quote! { pub struct R { k: impl Fn(f32, f32) -> f32 } pub fn f() -> f32 { X } },
+                "never a field",
+            ),
+            (
+                quote! { pub fn f() -> impl Fn(f32, f32) -> f32 { X } },
+                "a `fn` returning a function",
+            ),
+            (
+                quote! {
+                    pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 {
+                        let j: impl Fn(f32, f32) -> f32 = k;
+                        X
+                    }
+                },
+                "a `let` of a function",
+            ),
+            (
+                quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { k as f32 } },
+                "the operand of `as f32`",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(input);
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+            assert!(err.contains("Phase D-a"), "names the plan's phase: {err}");
+        }
+    }
+
+    /// An application is a kernel's, at two `f32`s; a name that is not a
+    /// kernel is not applied.
+    #[test]
+    fn an_application_is_a_kernels_at_two_values() {
+        let cases: [(TokenStream, &str); 4] = [
+            (
+                quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { k(X) } },
+                "applied at the two coordinates",
+            ),
+            (
+                quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { k(X, Y, X) } },
+                "applied at the two coordinates",
+            ),
+            (
+                quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { k(X < Y, Y) } },
+                "applied at two `f32` coordinates",
+            ),
+            (
+                quote! { pub fn f(r: f32) -> f32 { r(X, Y) } },
+                "only a kernel is applied",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(input);
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
+    }
+
+    /// A kernel is passed on by name, to a kernel-typed parameter.
+    #[test]
+    fn a_kernel_is_passed_on_by_name_to_a_kernel_typed_parameter() {
+        let cases: [(TokenStream, &str); 2] = [
+            (
+                quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { at({ k }, X) } },
+                "passed by name",
+            ),
+            (
+                quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { at(X, X) } },
+                "expected `impl Fn(f32, f32) -> f32`, found `f32`",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(with_kernel(input));
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
+    }
+
+    /// rustc moves an `impl Fn` it passes, and a block is Rust: a kernel is
+    /// passed on at most once, used not at all after, and never from inside
+    /// a fold's body, a closure `.map` calls again (E0382, E0507).
+    #[test]
+    fn a_kernel_passed_on_moves_as_rustc_moves_it() {
+        let cases: [(TokenStream, &str); 4] = [
+            (
+                quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { at(k, X) + at(k, Y) } },
+                "E0382",
+            ),
+            (
+                quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { at(k, X) + k(X, Y) } },
+                "E0382",
+            ),
+            (
+                quote! { pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 { k(at(k, X), Y) } },
+                "E0382",
+            ),
+            (
+                quote! {
+                    pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 {
+                        (0..2).map(|i| at(k, i as f32)).sum()
+                    }
+                },
+                "E0507",
+            ),
+        ];
+        for (input, expected) in cases {
+            let err = refusal(with_kernel(input));
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
+    }
+
+    /// An `if`'s arms are two paths, as rustc's move check follows them: a
+    /// kernel passed on in one arm is the other's to use or pass on, and
+    /// after the `if` it is moved if either arm moved it (E0382).
+    #[test]
+    fn a_kernel_passed_on_in_one_arm_is_the_others() {
+        accepted(with_kernel(quote! {
+            pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 {
+                if X < Y { at(k, X) } else { k(X, Y) }
+            }
+            pub fn g(k: impl Fn(f32, f32) -> f32) -> f32 {
+                if X < Y { at(k, X) } else { at(k, Y) }
+            }
+            pub fn h(k: impl Fn(f32, f32) -> f32) -> f32 {
+                if X < Y { k(X, Y) } else if X < 0.0 { at(k, Y) } else { at(k, X) }
+            }
+        }));
+        let maybe_moved = [
+            quote! {
+                pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 {
+                    (if X < Y { at(k, X) } else { 0.0 }) + k(X, Y)
+                }
+            },
+            quote! {
+                pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 {
+                    (if X < Y { 0.0 } else { at(k, X) }) + k(X, Y)
+                }
+            },
+            quote! {
+                pub fn f(k: impl Fn(f32, f32) -> f32) -> f32 {
+                    (if X < Y { 0.0 } else if X < 0.0 { at(k, X) } else { 1.0 }) + at(k, Y)
+                }
+            },
+        ];
+        for input in maybe_moved {
+            let err = refusal(with_kernel(input));
+            assert!(err.contains("E0382"), "got: {err}");
+        }
+    }
+
+    /// A parameter, `let` or index named after a projection is refused: a
+    /// call is resolved by its name, and `DX(x, y)` must not mean a kernel
+    /// to one stage and a derivative to another.
+    #[test]
+    fn a_binding_named_after_a_projection_is_refused() {
+        for input in [
+            quote! { pub fn f(DX: impl Fn(f32, f32) -> f32) -> f32 { DX(X, Y) } },
+            quote! { pub fn f(V: f32) -> f32 { V } },
+            quote! { || { let DY = X; DY } },
+            quote! { || (0..2).map(|DXX| DXX as f32).sum() },
+        ] {
+            let err = refusal(input);
+            assert!(err.contains("is named after the projection"), "got: {err}");
         }
     }
 }

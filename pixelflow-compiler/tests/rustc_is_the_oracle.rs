@@ -717,3 +717,178 @@ fn a_tuple_let_binds_as_rustcs_does() {
     // X = 3, Y = 5: (10 − 3) · 10.
     assert_eq!(bake(&k), 70.0);
 }
+
+// ─────────────── D-a: kernel-typed parameters ───────────────
+//
+// A kernel-typed parameter (docs/plans/2026-09-25-the-language-is-kernel.md
+// §1.3, Phase D-a) is Rust's `impl Fn(f32, f32) -> f32`, so rustc is its
+// oracle too: the block's `fn`s are host `fn`s of the same tokens, the
+// sample their last two arguments, and a Rust closure of an argument's
+// tokens is passed where the host passes its kernel. The block compiles as
+// Rust as written: a kernel is applied, which borrows it, and passed on once,
+// which moves it (`sema` refuses what rustc's move checker would).
+//
+// What rustc cannot speak to is `DX` in an argument: Rust has no derivative.
+// `kernel_typed_parameters.rs` pins it against `Kernel::at`, the chain rule.
+
+kernel! {
+    /// A helper taking a kernel, which it applies twice.
+    fn twice_at(k: impl Fn(f32, f32) -> f32, x: f32, y: f32) -> f32 {
+        k(x, y) + k(y, x)
+    }
+
+    /// An application at warped coordinates, and one at others.
+    pub fn applied_at(k: impl Fn(f32, f32) -> f32) -> f32 {
+        k(X + 1.0, Y * 2.0) - k(Y, X)
+    }
+
+    /// A kernel passed on to a helper.
+    pub fn swapped(k: impl Fn(f32, f32) -> f32, r: f32) -> f32 {
+        twice_at(k, X + r, Y)
+    }
+
+    /// Two kernels summed at the sample: the operation a glyph's ink is a
+    /// tree of (§1.7).
+    pub fn summed(a: impl Fn(f32, f32) -> f32, b: impl Fn(f32, f32) -> f32) -> f32 {
+        a(X, Y) + b(X, Y)
+    }
+
+    /// D4: a kernel applied inside a fold whose index the coordinates read.
+    pub fn over_columns(k: impl Fn(f32, f32) -> f32) -> f32 {
+        (0..3).map(|i| k(X + (i as f32), Y)).sum()
+    }
+
+    /// A kernel passed on in one arm and applied in the other: two paths,
+    /// as rustc's move check follows them.
+    pub fn one_arm_passes(k: impl Fn(f32, f32) -> f32, r: f32) -> f32 {
+        if X < Y { twice_at(k, X + r, Y) } else { k(X, Y) }
+    }
+}
+
+fn rust_twice_at(k: impl Fn(f32, f32) -> f32, x: f32, y: f32) -> f32 {
+    k(x, y) + k(y, x)
+}
+
+fn rust_applied_at(k: impl Fn(f32, f32) -> f32, x: f32, y: f32) -> f32 {
+    k(x + 1.0, y * 2.0) - k(y, x)
+}
+
+fn rust_swapped(k: impl Fn(f32, f32) -> f32, r: f32, x: f32, y: f32) -> f32 {
+    rust_twice_at(k, x + r, y)
+}
+
+fn rust_summed(a: impl Fn(f32, f32) -> f32, b: impl Fn(f32, f32) -> f32, x: f32, y: f32) -> f32 {
+    a(x, y) + b(x, y)
+}
+
+fn rust_over_columns(k: impl Fn(f32, f32) -> f32, x: f32, y: f32) -> f32 {
+    (0..3).map(|i| k(x + (i as f32), y)).sum()
+}
+
+fn rust_one_arm_passes(k: impl Fn(f32, f32) -> f32, r: f32, x: f32, y: f32) -> f32 {
+    if x < y {
+        rust_twice_at(k, x + r, y)
+    } else {
+        k(x, y)
+    }
+}
+
+/// `X·3 − Y·s` with `s = ½`, and its Rust closure: every value it takes at
+/// the samples is exact.
+fn plane() -> (Kernel, impl Fn(f32, f32) -> f32 + Copy) {
+    let k = kernel!(|s: f32| X * 3.0 - Y * s)(0.5);
+    (k, |x: f32, y: f32| x * 3.0 - y * 0.5)
+}
+
+/// `k(u, v)` means what calling a closure at `(u, v)` means: the argument
+/// at the warped coordinates.
+#[test]
+fn an_application_is_rusts_call() {
+    let (k, rust_k) = plane();
+    let written = applied_at(&k);
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(
+            Lattice::eval_at(&written, x, y),
+            rust_applied_at(rust_k, x, y),
+            "at ({x}, {y})"
+        );
+    }
+}
+
+/// A kernel passed to a helper means what passing a closure to a host `fn`
+/// means, beside the entry's own argument.
+#[test]
+fn a_kernel_passed_to_a_helper_is_rusts_closure_passed() {
+    let (k, rust_k) = plane();
+    for r in [0.0, 1.5, -2.0] {
+        let written = swapped(&k, r);
+        for (x, y) in FOLD_SAMPLES {
+            assert_eq!(
+                Lattice::eval_at(&written, x, y),
+                rust_swapped(rust_k, r, x, y),
+                "r = {r}, at ({x}, {y})"
+            );
+        }
+    }
+}
+
+/// One kernel passed for both parameters is one closure passed for both:
+/// its value, twice.
+#[test]
+fn one_kernel_passed_twice_is_rusts_closure_shared() {
+    let (k, rust_k) = plane();
+    let written = summed(&k, &k);
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(
+            Lattice::eval_at(&written, x, y),
+            rust_summed(rust_k, rust_k, x, y),
+            "at ({x}, {y})"
+        );
+    }
+}
+
+/// D4. An argument holding its own fold, applied inside a fold whose index
+/// the coordinates read, means what the same closure called in the same
+/// iterator means: `Σ_i Σ_j ((X + i)·j + Y)`, 132 at (3, 5). Were the
+/// argument's index the fold's around it, this would be 156.
+#[test]
+fn an_argument_holding_a_fold_inside_a_fold_is_rusts() {
+    let k = kernel!(|| (0..4).map(|j| X * (j as f32) + Y).sum());
+    let rust_k = |x: f32, y: f32| -> f32 { (0..4).map(|j| x * (j as f32) + y).sum() };
+    let written = over_columns(&k);
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(
+            Lattice::eval_at(&written, x, y),
+            rust_over_columns(rust_k, x, y),
+            "at ({x}, {y})"
+        );
+    }
+    assert_eq!(bake(&written), 132.0);
+    // Captured, the coordinate reads the argument's own index: three copies
+    // of `Σ_j ((X + j)·j + Y)`.
+    let captured = 3.0
+        * (0..4)
+            .map(|j| (AT.0 + j as f32) * (j as f32) + AT.1)
+            .sum::<f32>();
+    assert_eq!(captured, 156.0);
+    assert_ne!(bake(&written), captured);
+}
+
+/// A kernel moved in one arm of an `if` and applied in the other is a
+/// closure passed in one arm and called in the other, which rustc accepts:
+/// each sample takes the arm its coordinates choose — both arms, across
+/// these samples.
+#[test]
+fn a_kernel_passed_on_in_one_arm_is_rusts() {
+    let (k, rust_k) = plane();
+    let written = one_arm_passes(&k, 1.5);
+    let arms: Vec<bool> = FOLD_SAMPLES.iter().map(|&(x, y)| x < y).collect();
+    assert!(arms.contains(&true) && arms.contains(&false));
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(
+            Lattice::eval_at(&written, x, y),
+            rust_one_arm_passes(rust_k, 1.5, x, y),
+            "at ({x}, {y})"
+        );
+    }
+}

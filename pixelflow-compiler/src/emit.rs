@@ -18,8 +18,21 @@
 //! a `Kernel`, or a closure over its parameters' `f32`s returning one. The
 //! items form is items: a host `#[repr(C)]` struct per record, a host `const`
 //! per `pub const`, and per entry a host `fn` returning a `Kernel` and, when
-//! it has parameters, its `Args` record. A helper is inlined and a private
-//! `const` is folded, so neither leaves a trace.
+//! it has uniform parameters and no kernel-typed one, its `Args` record. A
+//! helper is inlined and a private `const` is folded, so neither leaves a
+//! trace.
+//!
+//! **An entry that takes a kernel is staged** (plan Phase D-a). Its
+//! argument, `k: impl Fn(f32, f32) -> f32`, is a `&Kernel` the host passes
+//! when it calls the entry's host function, so the program does not exist
+//! at expansion: the host function *is* lowering, run then. [`Staged`] is
+//! the [`Site`] that writes each of lowering's steps as the statement that
+//! takes it — the same IR call [`Expansion`] makes now, in the same order —
+//! and `k(x, y)` is one more, [`ExprArena::apply`]. No optimizer runs at
+//! expansion on such an entry, as on a template: the composed program is
+//! optimized when it is baked (§1.8).
+//!
+//! [`ExprArena::apply`]: pixelflow_ir::arena::ExprArena::apply
 //!
 //! **Binding times** (docs/plans/2026-09-25-the-language-is-kernel.md §1.4).
 //! A host function takes its parameters by their declared types, and every
@@ -42,8 +55,10 @@ use quote::{format_ident, quote};
 use syn::Ident;
 
 use crate::ast::{ConstItem, FnItem, RecordItem, Role, Spelling};
-use crate::lower::{self, Holes, Lowered};
+use crate::lower::{Expansion, FoldRange, Holes, Lowered, Site, lower_entry};
 use crate::sema::{AnalyzedKernel, ConstValue, Scalar};
+use pixelflow_ir::arena::Axis;
+use pixelflow_ir::{Binder, Monoid};
 
 /// Emit arena-backend code for an analyzed kernel.
 ///
@@ -59,11 +74,9 @@ use crate::sema::{AnalyzedKernel, ConstValue, Scalar};
 ///
 /// For the items form: one struct per record, one `const` per `pub const`,
 /// and for each entry its host `fn`, generic over its structural parameters
-/// and taking its parameters by their declared types, and its `Args` record.
-///
-/// Kernels compose as *values* — `Kernel::at`/`sum`/`select`/arithmetic — not
-/// by inlining a manifold through a macro slot, so there is no
-/// manifold-typed parameter and nothing here to lower one with.
+/// and taking its parameters by their declared types — a kernel-typed one as
+/// a `&Kernel` — and its `Args` record. An entry that takes a kernel is
+/// [`Staged`]: lowered when its host function is called.
 ///
 /// `optimizer` rewrites each lowered arena before it is emitted. It is a
 /// parameter rather than a branch because "do not optimize" is a value:
@@ -92,8 +105,17 @@ pub fn emit_kernel(
                 items.extend(emit_const(c, analyzed.consts[&c.name.to_string()]));
             }
             for entry in analyzed.def.fns.iter().filter(|f| f.role() == Role::Entry) {
-                let arena_code = entry_arena(entry, analyzed, optimizer)?;
-                items.extend(emit_entry(entry, &arena_code));
+                let body = match entry.takes_a_kernel() {
+                    true => Staged::lower(entry, analyzed)?,
+                    false => {
+                        let arena_code = entry_arena(entry, analyzed, optimizer)?;
+                        quote! {
+                            let (__arena, __root) = #arena_code;
+                            ::pixelflow_core::Kernel::from_parts(__arena, __root)
+                        }
+                    }
+                };
+                items.extend(emit_entry(entry, &body));
                 items.extend(emit_args(entry, analyzed));
             }
             Ok(items)
@@ -118,7 +140,7 @@ fn entry_arena(
     analyzed: &AnalyzedKernel,
     optimizer: &mut dyn Optimize,
 ) -> Result<TokenStream, String> {
-    let Lowered { arena, root, holes } = lower::lower_entry(entry, analyzed)?;
+    let Lowered { arena, root, holes } = Expansion::lower(entry, analyzed)?;
     let context = EntryContext {
         arguments: analyzed
             .parameters(entry)
@@ -185,24 +207,35 @@ fn emit_closure(entry: &FnItem, arena_code: &TokenStream) -> TokenStream {
     }
 }
 
-/// An entry's expansion: a host function returning a `Kernel`, generic over
-/// its structural parameters and taking its parameters by their declared
-/// types, with the entry's visibility and doc comments.
-fn emit_entry(entry: &FnItem, arena_code: &TokenStream) -> TokenStream {
+/// An entry's expansion: a host function returning a `Kernel` — `body`,
+/// statements that build it — generic over its structural parameters and
+/// taking its parameters by their declared types, with the entry's
+/// visibility and doc comments.
+///
+/// A kernel-typed parameter is taken as a `&Kernel`, not a `Kernel`: the
+/// host function only reads it, splicing a copy of its term into the
+/// program it builds, and a borrow passes one instance to two parameters,
+/// `sum2(&a, &a)`, and halves a list into a tree by reference, as
+/// `Kernel::at` and `Lattice::bake` take theirs. Owning it would buy the
+/// argument's arena only by building on top of it, which would declare its
+/// uniforms before the entry's own.
+fn emit_entry(entry: &FnItem, body: &TokenStream) -> TokenStream {
     let attrs = &entry.attrs;
     let vis = &entry.vis;
     let name = &entry.name;
     let (generics, _) = structural_generics(&entry.structural);
     let params = entry.params.iter().map(|p| {
         let (name, ty) = (&p.name, &p.ty);
-        quote!(#name: #ty)
+        match p.is_kernel() {
+            true => quote!(#name: &::pixelflow_core::Kernel),
+            false => quote!(#name: #ty),
+        }
     });
     quote! {
         #(#attrs)*
         #[must_use]
         #vis fn #name #generics ( #(#params),* ) -> ::pixelflow_core::Kernel {
-            let (__arena, __root) = #arena_code;
-            ::pixelflow_core::Kernel::from_parts(__arena, __root)
+            #body
         }
     }
 }
@@ -212,9 +245,10 @@ fn emit_entry(entry: &FnItem, arena_code: &TokenStream) -> TokenStream {
 /// `write_into`, which writes them — a record's fields in field order —
 /// into a block by the entry's declaration order
 /// (`UniformBlock::set_declared`), as an array literal whose length rustc
-/// counts. An entry with no parameters has none.
+/// counts. An entry with no parameters has none, and neither has one that
+/// takes a kernel ([`FnItem::has_args_record`]).
 fn emit_args(entry: &FnItem, analyzed: &AnalyzedKernel) -> TokenStream {
-    if entry.params.is_empty() {
+    if !entry.has_args_record() {
         return TokenStream::new();
     }
     let vis = &entry.vis;
@@ -591,6 +625,217 @@ fn node(arena: &ExprArena, id: ExprId, context: &EntryContext) -> TokenStream {
     }
 }
 
+/// The site an entry that takes a kernel is lowered at: the Rust statements
+/// that build its arena when its host function is called (plan Phase D-a).
+///
+/// Each of lowering's steps becomes the statement that takes it, naming a
+/// term by the variable that holds its node: the same IR call [`Expansion`]
+/// makes at expansion — a push, a [`library`](pixelflow_ir::library)
+/// definition, [`ExprArena::open_fold`] and [`ExprArena::close_fold`] — in
+/// the same order, so a program built at load time is the one lowering
+/// would have built at expansion. The steps only `Staged` has are an
+/// argument's: [`ExprArena::admit`] when the host function is called, after
+/// the entry's own uniforms, and [`ExprArena::apply`] at each `k(x, y)`.
+///
+/// What is left is compacted ([`ExprArena::compact`]): a node a
+/// substitution replaced or nothing read is dropped, as emission drops one
+/// from an arena built at expansion, so the kernel holds the program alone.
+///
+/// A fold staged here closes when the host function runs, and panics then
+/// if its body — an argument's folds among them — binds every binder, as
+/// `Kernel::over` panics.
+///
+/// [`ExprArena::open_fold`]: pixelflow_ir::arena::ExprArena::open_fold
+/// [`ExprArena::close_fold`]: pixelflow_ir::arena::ExprArena::close_fold
+/// [`ExprArena::admit`]: pixelflow_ir::arena::ExprArena::admit
+/// [`ExprArena::apply`]: pixelflow_ir::arena::ExprArena::apply
+/// [`ExprArena::compact`]: pixelflow_ir::arena::ExprArena::compact
+#[derive(Default)]
+pub struct Staged {
+    statements: Vec<TokenStream>,
+    /// How many variables have been named: every one is fresh.
+    named: u64,
+    /// The folds open, innermost last: the variable holding each, and the
+    /// closure that makes its `Fold` once its binder is chosen.
+    open: Vec<(Ident, TokenStream)>,
+}
+
+impl Staged {
+    /// The host function's body for `entry`, an entry that takes a kernel:
+    /// statements building its kernel when it is called.
+    ///
+    /// # Errors
+    ///
+    /// When the body has a construct lowering cannot express.
+    pub fn lower(entry: &FnItem, analyzed: &AnalyzedKernel) -> Result<TokenStream, String> {
+        let mut site = Staged::default();
+        let root = lower_entry(entry, analyzed, &mut site)?;
+        let statements = site.statements;
+        Ok(quote! {
+            let mut __arena = ::pixelflow_core::__macro::ir::arena::ExprArena::new();
+            #(#statements)*
+            let (__arena, __root) = __arena.compact(#root);
+            ::pixelflow_core::Kernel::from_parts(__arena, __root)
+        })
+    }
+
+    /// A fresh variable, `prefix` then a number.
+    fn fresh(&mut self, prefix: &str) -> Ident {
+        let name = format_ident!("{prefix}{}", self.named);
+        self.named += 1;
+        name
+    }
+
+    /// The statement binding `step`'s node to a fresh variable, which names
+    /// it.
+    fn step(&mut self, step: TokenStream) -> Ident {
+        let term = self.fresh("__t");
+        self.statements.push(quote! { let #term = #step; });
+        term
+    }
+
+    /// The closure an open fold closes into: its monoid, carried as a
+    /// fold's bits (as [`node`] carries a `Fold`), its binder the one
+    /// `close_fold` chooses, and its range — known, or this
+    /// instantiation's ([`instantiated_range`]).
+    fn fold_at(monoid: Monoid, range: FoldRange) -> TokenStream {
+        let first = Binder::from_slot(0).expect("the IR has a binder");
+        let bits = pixelflow_ir::Fold::new(monoid, first, 0..0).to_bits();
+        let range = match range {
+            FoldRange::Known(range) => {
+                let (lo, hi) = (range.start, range.end);
+                quote!(#lo..#hi)
+            }
+            FoldRange::Structural(range) => instantiated_range(&range),
+        };
+        quote! {
+            |__binder| ::pixelflow_core::__macro::ir::fold::Fold::new(
+                ::pixelflow_core::__macro::ir::fold::Fold::from_bits(#bits)
+                    .expect("kernel! emitted a well-formed fold")
+                    .monoid(),
+                __binder,
+                #range,
+            )
+        }
+    }
+}
+
+impl Site for Staged {
+    type Term = Ident;
+    type Argument = Ident;
+
+    fn constant(&mut self, value: f32) -> Ident {
+        // By bit pattern, for `node`'s reason.
+        let bits = value.to_bits();
+        self.step(quote!(__arena.push_const(f32::from_bits(#bits))))
+    }
+
+    fn coordinate(&mut self, axis: Axis) -> Ident {
+        let var = axis.var();
+        self.step(quote!(__arena.push_var(#var)))
+    }
+
+    fn unary(&mut self, op: pixelflow_ir::OpKind, a: Ident) -> Ident {
+        let op = opkind_to_tokens(op);
+        self.step(quote!(__arena.push_unary(#op, #a)))
+    }
+
+    fn binary(&mut self, op: pixelflow_ir::OpKind, [a, b]: [Ident; 2]) -> Ident {
+        let op = opkind_to_tokens(op);
+        self.step(quote!(__arena.push_binary(#op, #a, #b)))
+    }
+
+    fn ternary(&mut self, op: pixelflow_ir::OpKind, [a, b, c]: [Ident; 3]) -> Ident {
+        let op = opkind_to_tokens(op);
+        self.step(quote!(__arena.push_ternary(#op, #a, #b, #c)))
+    }
+
+    fn fract(&mut self, x: Ident) -> Ident {
+        self.step(quote!(::pixelflow_core::__macro::ir::library::fract(&mut __arena, #x)))
+    }
+
+    fn hypot(&mut self, [a, b]: [Ident; 2]) -> Ident {
+        self.step(quote!(::pixelflow_core::__macro::ir::library::hypot(&mut __arena, [#a, #b])))
+    }
+
+    fn clamp(&mut self, x: Ident, [lo, hi]: [Ident; 2]) -> Ident {
+        self.step(quote!(
+            ::pixelflow_core::__macro::ir::library::clamp(&mut __arena, #x, [#lo, #hi])
+        ))
+    }
+
+    fn derivative(&mut self, e: Ident, axis: Axis) -> Ident {
+        let axis = match axis {
+            Axis::X => quote!(::pixelflow_core::__macro::ir::arena::Axis::X),
+            Axis::Y => quote!(::pixelflow_core::__macro::ir::arena::Axis::Y),
+        };
+        self.step(quote!(
+            ::pixelflow_core::__macro::ir::library::derivative(&mut __arena, #e, #axis)
+        ))
+    }
+
+    /// Declared with the call's value as its default, as [`arena_to_tokens`]
+    /// declares an expanded entry's, so baking the kernel draws the call.
+    fn uniform(&mut self, scalar: Scalar<'_>) -> Ident {
+        let slot = self.fresh("__u");
+        let value = argument(scalar);
+        self.statements.push(quote! {
+            let #slot = __arena.declare_uniform(::pixelflow_core::__macro::ir::arena::UniformDecl {
+                id: ::pixelflow_core::__macro::ir::arena::UniformIdentity::mint(),
+                default: #value,
+            });
+        });
+        self.step(quote!(__arena.push_uniform(#slot)))
+    }
+
+    fn kernel_parameter(&mut self, name: &Ident) -> Result<Ident, String> {
+        let argument = self.fresh("__k");
+        self.statements
+            .push(quote! { let #argument = __arena.admit(#name); });
+        Ok(argument)
+    }
+
+    /// The host function's own `N as f32`: it is generic over `N`.
+    fn count(&mut self, _position: usize, name: &Ident) -> Result<Ident, String> {
+        Ok(self.step(quote!(__arena.push_const(#name as f32))))
+    }
+
+    fn open_fold(
+        &mut self,
+        depth: usize,
+        monoid: Monoid,
+        range: FoldRange,
+    ) -> Result<Ident, String> {
+        let fold = self.fresh("__f");
+        let depth = proc_macro2::Literal::usize_unsuffixed(depth);
+        self.statements.push(quote! {
+            let #fold = __arena
+                .open_fold(#depth)
+                .expect("kernel! refused a fold nested past the binders at expansion");
+        });
+        self.open.push((fold.clone(), Self::fold_at(monoid, range)));
+        Ok(self.step(quote!(#fold.index())))
+    }
+
+    fn close_fold(&mut self, body: Ident) -> Result<Ident, String> {
+        let (fold, fold_at) = self
+            .open
+            .pop()
+            .expect("lowering closes only the folds it opened");
+        Ok(self.step(quote! {
+            __arena.close_fold(#fold, #body, #fold_at).expect(
+                "kernel!: a fold around a kernel's application has no binder left: its body, \
+                 the argument's folds among them, binds every one of the IR's indices \
+                 (`Binder::COUNT`)"
+            )
+        }))
+    }
+
+    fn apply(&mut self, kernel: &Ident, [x, y]: [Ident; 2]) -> Ident {
+        self.step(quote!(__arena.apply(&#kernel, [#x, #y])))
+    }
+}
+
 /// The path naming `kind` in generated code.
 ///
 /// One line per op used to live here — 40 of the 50, closing with a
@@ -778,6 +1023,57 @@ mod tests {
             .expect("parses"),
         )
         .expect("analyzes");
+        let mut offered = Offered(0);
+        emit_kernel(&analyzed, &mut offered).expect("emits");
+        assert_eq!(offered.0, 1, "`plain` alone");
+    }
+
+    /// An entry that takes a kernel is staged: its host function takes the
+    /// argument as a `&Kernel`, admits it after declaring its own uniforms,
+    /// applies it where the body does, and compacts what it built. It has no
+    /// `Args` record, and no optimizer sees it — its program exists only
+    /// once the host function is called.
+    #[test]
+    fn an_entry_that_takes_a_kernel_is_staged() {
+        let input = quote! {
+            pub struct Bounds { pub x0: f32, pub x1: f32 }
+            pub fn glyph(ink: impl Fn(f32, f32) -> f32, b: Bounds) -> f32 {
+                if (X > b.x0) & (X < b.x1) { ink(X + 0.5, Y) } else { 0.0 }
+            }
+            pub fn sum2(a: impl Fn(f32, f32) -> f32, b: impl Fn(f32, f32) -> f32) -> f32 {
+                a(X, Y) + b(X, Y)
+            }
+            pub fn plain(r: f32) -> f32 { r + X }
+        };
+        let code = expansion(input.clone());
+        assert!(
+            code.contains(
+                "pub fn glyph (ink : & :: pixelflow_core :: Kernel , b : Bounds) -> :: \
+                 pixelflow_core :: Kernel"
+            ),
+            "{code}"
+        );
+        assert!(
+            code.contains(
+                "pub fn sum2 (a : & :: pixelflow_core :: Kernel , b : & :: pixelflow_core :: \
+                 Kernel)"
+            ),
+            "{code}"
+        );
+        let declared_last = code.find("default : b . x1").expect("b.x1 is declared");
+        let admitted = code.find("__arena . admit (ink)").expect("ink is admitted");
+        assert!(declared_last < admitted, "own uniforms first: {code}");
+        assert!(code.contains("__arena . apply (&"), "{code}");
+        assert!(code.contains("__arena . compact ("), "{code}");
+        assert!(!code.contains("GlyphArgs"), "no `Args` record: {code}");
+        assert!(!code.contains("Sum2Args"), "no `Args` record: {code}");
+        assert!(code.contains("PlainArgs"), "{code}");
+        assert!(
+            !code.contains(":: std ::"),
+            "no `::std` path, so a `no_std` crate expands it: {code}"
+        );
+
+        let analyzed = analyze(parse(input).expect("parses")).expect("analyzes");
         let mut offered = Offered(0);
         emit_kernel(&analyzed, &mut offered).expect("emits");
         assert_eq!(offered.0, 1, "`plain` alone");
