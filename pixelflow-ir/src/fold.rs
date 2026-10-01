@@ -94,26 +94,18 @@ impl Monoid {
 
     /// Encode for transmission: its combining operation's [`OpCode`]. As
     /// for [`OpKind::marshal`], the round trip is what is promised, not the
-    /// bytes: the `kernel!` macro emits a family's monoid this way, by value,
-    /// as it emits a fold by [`Fold::to_bits`], so the algebra the program
-    /// combines copies under is the one lowering chose and no table of names
-    /// can say another. A range fold's bits hold their monoid as this code.
-    ///
-    /// Not API: `kernel!`'s emitted code decodes it, in the crate that
-    /// writes the block, which is why the pair is `pub`; hidden, as
-    /// `pixelflow-core`'s `__macro` is. It hands no consumer an opcode to
-    /// reason with — see [`Fold::to_bits`].
-    #[doc(hidden)]
+    /// bytes. A range fold's bits hold their monoid as this code
+    /// ([`Fold::to_bits`]); crate-private, so it hands no consumer an opcode
+    /// to reason with.
     #[must_use]
-    pub fn marshal(self) -> OpCode {
+    pub(crate) fn marshal(self) -> OpCode {
         self.op().marshal()
     }
 
     /// Decode. `None` if the code names no op, or an op that generates no
-    /// algebra. Not API, as [`marshal`](Self::marshal) is not.
-    #[doc(hidden)]
+    /// algebra.
     #[must_use]
-    pub fn unmarshal(code: OpCode) -> Option<Self> {
+    pub(crate) fn unmarshal(code: OpCode) -> Option<Self> {
         OpKind::unmarshal(code).and_then(Self::of)
     }
 }
@@ -125,27 +117,16 @@ impl Monoid {
 /// The one shape a fold of *distinct* terms has. Not [`Kernel::over`]'s,
 /// which folds one body over an index, and not an unrolled fold's, which
 /// pairs its terms (`passes`' `combine_halved`): those are one body `N`
-/// times. [`Kernel::fold`] builds through it, and so does a `kernel!`
-/// family's instantiation — `N` copies of a body, each over its own
-/// element's uniforms (docs/plans/2026-09-25-the-language-is-kernel.md
-/// §1.6) — so the copies and the same terms folded by `Kernel::fold` are
-/// one program, and a family is one with its terms written out by hand.
+/// times. [`Kernel::fold`] builds through it.
 ///
 /// Generic over how a node is named, and handed each node to build as a
-/// callback, because its callers build into different things — a
-/// `Kernel`'s DAG builder and an [`ExprArena`](crate::ExprArena) — and each
-/// builds its terms between steps. A callback is handed the monoid's own
-/// operation to build with; no caller names one.
-///
-/// Not API: `kernel!`'s emitted code builds a family's copies through it, in
-/// the crate that writes the block, which is why it is `pub`; hidden, as
-/// `pixelflow-core`'s `__macro` is.
+/// callback, so the builder builds its terms between steps. A callback is
+/// handed the monoid's own operation to build with; no caller names one.
 ///
 /// [`Kernel::over`]: crate::Kernel::over
 /// [`Kernel::fold`]: crate::Kernel::fold
-#[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
-pub struct Chain<R> {
+pub(crate) struct Chain<R> {
     monoid: Monoid,
     /// The terms so far, combined; `None` before the first.
     folded: Option<R>,
@@ -154,7 +135,7 @@ pub struct Chain<R> {
 impl<R> Chain<R> {
     /// No terms yet, under `monoid`.
     #[must_use]
-    pub fn new(monoid: Monoid) -> Self {
+    pub(crate) fn new(monoid: Monoid) -> Self {
         Self {
             monoid,
             folded: None,
@@ -164,7 +145,7 @@ impl<R> Chain<R> {
     /// Fold in `term`. The first term is the fold so far; after it,
     /// `combine` builds `folded ⊕ term` from the monoid's operation and the
     /// two operands, in that order.
-    pub fn push(&mut self, term: R, combine: impl FnOnce(OpKind, R, R) -> R) {
+    pub(crate) fn push(&mut self, term: R, combine: impl FnOnce(OpKind, R, R) -> R) {
         self.folded = Some(match self.folded.take() {
             None => term,
             Some(folded) => combine(self.monoid.op(), folded, term),
@@ -174,7 +155,7 @@ impl<R> Chain<R> {
     /// The fold of every term pushed, or — when none was — what `identity`
     /// builds from the monoid's identity.
     #[must_use]
-    pub fn finish(self, identity: impl FnOnce(f32) -> R) -> R {
+    pub(crate) fn finish(self, identity: impl FnOnce(f32) -> R) -> R {
         let monoid = self.monoid;
         self.folded.unwrap_or_else(|| identity(monoid.identity()))
     }
@@ -556,8 +537,7 @@ impl Fold {
     }
 
     /// The monoid's byte in [`Fold::to_bits`]: its code
-    /// (`Monoid::marshal`), the one encoding of a monoid, so the bits and a
-    /// `kernel!` expansion cannot come to spell one differently.
+    /// (`Monoid::marshal`), the one encoding of a monoid.
     fn monoid_byte(self) -> u8 {
         let [byte] = self.monoid.marshal().to_bytes();
         byte
@@ -572,8 +552,7 @@ impl Fold {
     /// reasoning about one, so this is what they get — not an accessor for
     /// the combining opcode: the op set is an IR concept, a consumer names
     /// algebras, and `Monoid::op` is crate-private. The opcode itself is
-    /// reachable — these bits decode, `Monoid::marshal` (hidden: the
-    /// macro's, and the code these bits hold the monoid as) round-trips
+    /// reachable — these bits decode, the monoid's code in them round-trips
     /// through `OpKind::unmarshal`, and a backend emitting a surviving loop
     /// reads it through [`Fold::combine_op`] — so what is withheld is
     /// an accessor offered to anything that reasons about a fold.

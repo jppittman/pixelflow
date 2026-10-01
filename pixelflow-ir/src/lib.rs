@@ -33,9 +33,6 @@ pub mod dyadic;
 /// those are a type rather than three `Const` children.
 pub mod fold;
 pub use fold::{Binder, Fold, Monoid, Placeholder};
-// Not API: `kernel!`'s emitted code sums a family's copies with it.
-#[doc(hidden)]
-pub use fold::Chain;
 
 pub mod kind;
 pub mod library;

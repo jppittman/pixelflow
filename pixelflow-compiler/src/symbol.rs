@@ -13,11 +13,6 @@
 //! | Const      | Expansion time      | `Const(v)`, or a count | PI, N |
 //! | Local      | Expression scope    | A shared `ExprId`, or a record's fields | dx, q |
 //! | Index      | A fold's body       | The fold's binder `Var` | i    |
-//! | Element    | A family's body, once per element | Its element's `Uniform`s, per copy | p |
-//!
-//! A family (`pieces: [Row; N]`) is a parameter too, of an entry only: `N`
-//! elements' uniforms, declared by the host function when it is
-//! instantiated, and iterated as a whole — no expression is one.
 //!
 //! A helper's parameters are a further thing at lowering — the argument's
 //! own node, or a record argument's fields, bound by name where the helper
@@ -86,10 +81,6 @@ pub enum SymbolKind {
     /// A fold's index, the closure's parameter: a `usize`, scoped to the
     /// fold's body.
     Index,
-
-    /// A family's element, the closure's parameter: a record or an `f32`,
-    /// scoped to the iteration's body, a different element in each copy.
-    Element,
 }
 
 /// A symbol in the symbol table.
@@ -210,12 +201,6 @@ impl SymbolTable {
     /// scope the fold's body is typed in.
     pub fn register_index(&mut self, name: &str) {
         self.bind(name, SymbolKind::Index, Ty::Usize);
-    }
-
-    /// Register a family's element, of the family's element type, in the
-    /// innermost scope: the scope the iteration's body is typed in.
-    pub fn register_element(&mut self, name: &str, ty: Ty) {
-        self.bind(name, SymbolKind::Element, ty);
     }
 
     fn bind(&mut self, name: &str, kind: SymbolKind, ty: Ty) {

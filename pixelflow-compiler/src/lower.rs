@@ -40,25 +40,16 @@
 //! over a range that names one, and its `N as f32`s, are left open
 //! ([`Holes`]) and filled when its host function is instantiated.
 //!
-//! So does an entry with a family (`pieces: [Row; N]`, plan §1.6). A
-//! family's uniforms are declared by its host function, `N` elements of
-//! them, and nothing here declares them; an iteration of it lowers its body
-//! once, over an abstract element — one uniform per field, declared here
-//! and never by the host — and leaves the copies to be made per
-//! instantiation ([`Families`]).
-//!
 //! Emission — arena to the `TokenStream` that rebuilds it — is [`crate::emit`].
 
 use crate::PLAN;
 use crate::ast::{
-    BinaryOp, BlockExpr, CastExpr, Expr, FamilyExpr, FieldExpr, FnItem, FoldExpr, LetStmt,
-    RecordId, Reduction, Role, Stmt, UnaryOp,
+    BinaryOp, BlockExpr, CastExpr, Expr, FieldExpr, FnItem, FoldExpr, LetStmt, RecordId, Reduction,
+    Role, Stmt, UnaryOp,
 };
 use crate::sema::{AnalyzedKernel, Bounds, ConstValue, RangeScope, StructuralRange, range_bounds};
 use crate::symbol::Scopes;
-use pixelflow_ir::arena::{
-    Axis, ExprArena, ExprId, ExprNode, IndexSpaceFull, UniformDecl, UniformIdentity,
-};
+use pixelflow_ir::arena::{Axis, ExprArena, ExprId, IndexSpaceFull, UniformDecl, UniformIdentity};
 use pixelflow_ir::library;
 use pixelflow_ir::{Binder, Fold, Monoid, OpKind, Placeholder};
 use std::collections::HashMap;
@@ -126,10 +117,6 @@ impl Projection {
 /// A name in scope while a body is lowered.
 #[derive(Debug, Clone)]
 enum Binding {
-    /// An entry's family: which of its parameters, and what its elements
-    /// are. It has no node — its uniforms are the host function's to
-    /// declare — and is read only by being iterated.
-    Family(FamilyParameter),
     /// A value: a `let`'s node, an entry's parameter's uniform, or a
     /// helper's parameter bound to its argument's node.
     Value(ExprId),
@@ -142,18 +129,8 @@ enum Binding {
     Record(RecordId, Rc<[ExprId]>),
 }
 
-/// A family parameter, as an iteration of it needs it: where it stands
-/// among the entry's parameters (so emission finds its uniforms), and its
-/// elements' record, or `None` for `f32`s.
-#[derive(Debug, Clone, Copy)]
-struct FamilyParameter {
-    position: usize,
-    record: Option<RecordId>,
-}
-
-/// The monoid a fold's spelling names — and a family's iteration's, which
-/// emission carries to the program by value ([`Monoid::marshal`]).
-pub(crate) fn monoid(reduction: Reduction) -> Monoid {
+/// The monoid a fold's spelling names.
+fn monoid(reduction: Reduction) -> Monoid {
     match reduction {
         Reduction::Sum => Monoid::SUM,
         Reduction::Product => Monoid::PRODUCT,
@@ -274,79 +251,12 @@ impl Holes {
     }
 }
 
-/// The operation of a family's node, `body + marker` (see [`Families`]).
-/// Read as a program it is the body plus a NaN, NaN everywhere — never
-/// plausible pixels — and emission writes the copies in its place.
-const FAMILY_NODE: OpKind = OpKind::Add;
-
-/// One iteration of a family, as lowering left it for emission: the body,
-/// lowered once over an abstract element, to be copied per element when the
-/// host function is instantiated (plan §1.6).
-///
-/// Its node in the lowered arena is `FAMILY_NODE(body, marker)`: the body
-/// is a child, so every walk lowering makes — the binder an enclosing fold
-/// chooses, the placeholder it renames, the splice that carries a fold's
-/// body home — reaches it as it reaches any subterm, and the copies bind
-/// exactly what the body binds. The marker is a uniform declared for this
-/// iteration alone, with a NaN default; it is how emission tells the node
-/// from an ordinary sum, by identity, which survives every splice that
-/// renumbers a node. It does not survive a rewrite: reassociated,
-/// `t + (body + marker)` reads as an iteration of `t + body`, `t` copied
-/// `N` times. So no optimizer is offered an entry with a family (pinned in
-/// emission's tests), and B6, which closes a template, needs a handle that
-/// survives rewriting before it optimizes one.
-#[derive(Debug)]
-pub struct Iteration {
-    /// The marker's identity.
-    pub marker: UniformIdentity,
-    /// The family: its position among the entry's parameters.
-    pub parameter: usize,
-    /// What the copies are combined under.
-    pub reduction: Reduction,
-    /// The abstract element: one uniform per field, in field order (one
-    /// for an `f32`), each copy's own element's in its place.
-    pub element: Vec<UniformIdentity>,
-}
-
-/// What an entry's lowered arena leaves for its host function to make: the
-/// copies of each iteration of a family.
-#[derive(Debug, Default)]
-pub struct Families {
-    iterations: Vec<Iteration>,
-}
-
-impl Families {
-    /// The iteration `id` is the node of, and its body, if it is one: the
-    /// node's shape is `FAMILY_NODE(body, marker)` with `marker` one of
-    /// these iterations'. The one reading of the node lowering builds.
-    pub fn node(&self, arena: &ExprArena, id: ExprId) -> Option<(&Iteration, ExprId)> {
-        let ExprNode::Binary(FAMILY_NODE, body, marker) = arena.node(id) else {
-            return None;
-        };
-        let ExprNode::Uniform(slot) = arena.node(marker) else {
-            return None;
-        };
-        let marker = arena.uniform_decl(slot).id;
-        let iteration = self.iterations.iter().find(|it| it.marker == marker)?;
-        Some((iteration, body))
-    }
-
-    /// Whether `id` is an iteration's marker or one of its element's
-    /// uniforms: a uniform no host function declares.
-    pub fn holds(&self, id: UniformIdentity) -> bool {
-        self.iterations
-            .iter()
-            .any(|iteration| iteration.marker == id || iteration.element.contains(&id))
-    }
-}
-
 /// An entry lowered: its arena and root, and what the arena leaves open if
 /// it is a template.
 pub struct Lowered {
     pub arena: ExprArena,
     pub root: ExprId,
     pub holes: Holes,
-    pub families: Families,
 }
 
 /// Lower an entry's body, inlining the block's helpers and folding its
@@ -366,15 +276,7 @@ pub fn lower_entry(entry: &FnItem, analyzed: &AnalyzedKernel) -> Result<Lowered,
         .collect();
     let mut arena = ExprArena::new();
     let mut locals = Scopes::default();
-    for (position, parameter) in analyzed.parameters(entry).into_iter().enumerate() {
-        if parameter.family.is_some() {
-            let family = FamilyParameter {
-                position,
-                record: parameter.record.map(|(record, _)| record),
-            };
-            locals.bind(parameter.name.to_string(), Binding::Family(family));
-            continue;
-        }
+    for parameter in analyzed.parameters(entry) {
         let mut uniforms = parameter.scalars().map(|_| {
             let slot = arena.declare_uniform(UniformDecl {
                 id: UniformIdentity::mint(),
@@ -398,16 +300,10 @@ pub fn lower_entry(entry: &FnItem, analyzed: &AnalyzedKernel) -> Result<Lowered,
         arena: &mut arena,
         open_folds: 0,
         holes: Holes::default(),
-        families: Families::default(),
     };
     let root = lowering.lower(&entry.body)?;
-    let (holes, families) = (lowering.holes, lowering.families);
-    Ok(Lowered {
-        arena,
-        root,
-        holes,
-        families,
-    })
+    let holes = lowering.holes;
+    Ok(Lowered { arena, root, holes })
 }
 
 /// The block's items: what every body can name besides its own scope.
@@ -441,8 +337,6 @@ struct Lowering<'a> {
     /// What a template leaves open: the ranges of its folds over structural
     /// parameters.
     holes: Holes,
-    /// What a template leaves to be copied: its families' iterations.
-    families: Families,
 }
 
 impl Lowering<'_> {
@@ -559,8 +453,6 @@ impl Lowering<'_> {
 
             Expr::Fold(fold) => self.lower_fold(fold),
 
-            Expr::Family(family) => self.lower_family(family),
-
             Expr::Cast(cast) => self.lower_cast(cast),
 
             Expr::Field(field) => self.lower_field(field),
@@ -593,56 +485,6 @@ impl Lowering<'_> {
                 })
             }
         }
-    }
-
-    /// `⊕_k body[p := element k]` over a family's elements: the body once,
-    /// over an abstract element, under its [`Iteration`]'s node — the copies
-    /// are the instantiation's to make (plan §1.6). No binder is chosen and
-    /// no index exists: each copy reads its own element's uniforms, and
-    /// binds what the body binds.
-    fn lower_family(&mut self, family: &FamilyExpr) -> Result<ExprId, String> {
-        let parameter = match self.frame.locals.lookup(&family.family.to_string()) {
-            Some(Binding::Family(parameter)) => *parameter,
-            _ => return Err(format!("`{}` is not a family", family.family)),
-        };
-        let width = match parameter.record {
-            Some(record) => self.program.analyzed.def.record(record).fields.len(),
-            None => 1,
-        };
-        let element: Vec<(UniformIdentity, ExprId)> =
-            (0..width).map(|_| self.declare_unbound()).collect();
-        let (marker, marker_leaf) = self.declare_unbound();
-        let leaves: Rc<[ExprId]> = element.iter().map(|(_, leaf)| *leaf).collect();
-        let binding = match parameter.record {
-            Some(record) => Binding::Record(record, leaves),
-            None => Binding::Value(leaves[0]),
-        };
-
-        self.frame.locals.push_scope();
-        self.frame.locals.bind(family.element.to_string(), binding);
-        let body = self.lower(&family.body);
-        self.frame.locals.pop_scope();
-        let body = body?;
-
-        self.families.iterations.push(Iteration {
-            marker,
-            parameter: parameter.position,
-            reduction: family.reduction,
-            element: element.into_iter().map(|(id, _)| id).collect(),
-        });
-        Ok(self.arena.push_binary(FAMILY_NODE, body, marker_leaf))
-    }
-
-    /// A uniform no host function declares — an abstract element's field,
-    /// or an iteration's marker — and its leaf. Its default is [`UNBOUND`]:
-    /// every copy reads its own element's uniform in its place.
-    fn declare_unbound(&mut self) -> (UniformIdentity, ExprId) {
-        let decl = UniformDecl {
-            id: UniformIdentity::mint(),
-            default: UNBOUND,
-        };
-        let slot = self.arena.declare_uniform(decl);
-        (decl.id, self.arena.push_uniform(slot))
     }
 
     /// A fold: `fold_at`'s fold of `fold`'s body,
@@ -721,9 +563,6 @@ impl Lowering<'_> {
                 Binding::Value(_) | Binding::Record(..) => Err(format!(
                     "`{name} as f32`: `{name}` is a value, and `as f32` converts a `usize`"
                 )),
-                Binding::Family(_) => Err(format!(
-                    "`{name} as f32`: `{name}` is a family, and `as f32` converts a `usize`"
-                )),
             };
         }
         if let Some(position) = self.frame.structural.iter().position(|n| n == name) {
@@ -775,7 +614,7 @@ impl Lowering<'_> {
     fn record_named(&self, expr: &Expr) -> Option<(RecordId, Rc<[ExprId]>)> {
         match self.frame.locals.lookup(&expr.named()?.to_string())? {
             Binding::Record(record, fields) => Some((*record, Rc::clone(fields))),
-            Binding::Value(_) | Binding::Index(_) | Binding::Family(_) => None,
+            Binding::Value(_) | Binding::Index(_) => None,
         }
     }
 
@@ -862,10 +701,6 @@ impl Lowering<'_> {
                 Binding::Record(..) => Err(format!(
                     "`{name}` is a record, where a value is expected: read a field, \
                      `{name}.x0`"
-                )),
-                Binding::Family(_) => Err(format!(
-                    "`{name}` is a family, where a value is expected: iterate it, \
-                     `{name}.into_iter().map(|p| …)`"
                 )),
             };
         }
@@ -1343,109 +1178,6 @@ mod tests {
             panic!("one binder deeper than the IR has");
         };
         assert!(err.contains("folds nested more than"), "got: {err}");
-    }
-
-    // ───────────────────────────── families ─────────────────────────────
-
-    /// An entry lowered through `sema`, with what it leaves for emission.
-    fn lowered_entry(input: proc_macro2::TokenStream) -> Lowered {
-        let analyzed = crate::sema::analyze(parse(input).expect("parses")).expect("analyzes");
-        lower_entry(&analyzed.def.fns[0], &analyzed).expect("lowers")
-    }
-
-    /// A family's iteration lowers to its node, `body + marker`, the body
-    /// lowered once over an abstract element — one uniform per field, which
-    /// no host function declares — and nothing else: no fold, no binder, no
-    /// index. The family itself declares nothing: its `N` elements' uniforms
-    /// are the host function's.
-    #[test]
-    fn a_familys_iteration_lowers_to_its_body_once_over_an_abstract_element() {
-        let Lowered {
-            arena,
-            root,
-            families,
-            ..
-        } = lowered_entry(quote! {
-            struct Pair { a: f32, b: f32 }
-            pub fn f<const N: usize>(r: f32, pairs: [Pair; N]) -> f32 {
-                pairs.into_iter().map(|p| p.b * X + r).product()
-            }
-        });
-        let (iteration, body) = families
-            .node(&arena, root)
-            .expect("the root is the family's node");
-        assert_eq!(iteration.parameter, 1, "`pairs`, the second parameter");
-        assert_eq!(iteration.reduction, Reduction::Product);
-        assert_eq!(iteration.element.len(), 2, "one uniform per field");
-        let held: Vec<bool> = arena
-            .uniforms()
-            .iter()
-            .map(|u| families.holds(u.id))
-            .collect();
-        assert_eq!(
-            held,
-            [false, true, true, true],
-            "`r`, then the element's `a` and `b` and the marker"
-        );
-        let ExprNode::Binary(OpKind::Add, product, r) = arena.node(body) else {
-            panic!("`p.b * X + r`, got {}", arena.display(body));
-        };
-        assert!(matches!(arena.node(r), ExprNode::Uniform(UniformId(0))));
-        let ExprNode::Binary(OpKind::Mul, b, _) = arena.node(product) else {
-            panic!("`p.b * X`, got {}", arena.display(product));
-        };
-        let ExprNode::Uniform(slot) = arena.node(b) else {
-            panic!("`p.b` is a uniform, got {}", arena.display(b));
-        };
-        assert_eq!(arena.uniform_decl(slot).id, iteration.element[1]);
-        assert!(
-            !arena
-                .nodes()
-                .any(|(_, node)| matches!(node, ExprNode::Reduce { .. })),
-            "no fold: {}",
-            arena.display(root)
-        );
-    }
-
-    /// A family's body is a subterm like any other to the folds around it
-    /// and in it: a fold around an iteration binds past the fold in the
-    /// body, and the body reads the outer fold's index — renamed from its
-    /// placeholder through the family's node — and the inner one's.
-    #[test]
-    fn a_fold_around_a_familys_iteration_reaches_into_its_body() {
-        let Lowered {
-            arena,
-            root,
-            families,
-            ..
-        } = lowered_entry(quote! {
-            pub fn f(v: [f32; 2]) -> f32 {
-                (0..3)
-                    .map(|i| v.into_iter().map(|e| (0..2).map(|j| (j as f32) * e + i as f32).sum::<f32>()).sum::<f32>())
-                    .sum()
-            }
-        });
-        let ExprNode::Reduce { fold: outer, body } = arena.node(root) else {
-            panic!("the fold, got {}", arena.display(root));
-        };
-        let (_, family_body) = families.node(&arena, body).expect("the family's node");
-        let ExprNode::Reduce {
-            fold: inner,
-            body: integrand,
-        } = arena.node(family_body)
-        else {
-            panic!("the inner fold, got {}", arena.display(family_body));
-        };
-        assert_eq!((outer.binder().slot(), inner.binder().slot()), (1, 0));
-        let ExprNode::Binary(OpKind::Add, _, index) = arena.node(integrand) else {
-            panic!("`j * e + i`, got {}", arena.display(integrand));
-        };
-        assert!(
-            matches!(arena.node(index), ExprNode::Var(v) if v == outer.binder().var()),
-            "the fold's index, renamed: {}",
-            arena.display(integrand)
-        );
-        assert!(!holds_a_placeholder(&arena));
     }
 
     /// `let (a, b) = (b, a);` binds both names at once, to what each

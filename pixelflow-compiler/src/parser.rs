@@ -25,12 +25,8 @@
 //!                                            -- an entry's structural parameters
 //! params  ::= (param (',' param)* ','?)?
 //! param   ::= IDENT ':' type
-//! type    ::= 'f32' | 'bool' | RECORD        -- an entry's parameters are `f32`s,
-//!                                            -- records and families: its uniforms
-//!           | '[' (RECORD | 'f32') ';' (INTEGER | IDENT) ']'
-//!                                            -- a family, an entry's: N elements'
-//!                                            -- uniforms, N a literal, a `usize`
-//!                                            -- const or a structural parameter
+//! type    ::= 'f32' | 'bool' | RECORD        -- an entry's parameters are `f32`s
+//!                                            -- and records: its uniforms
 //!
 //! cexpr   ::= cexpr ('+' | '-' | '*' | '/') cexpr   -- an `f32` const's initializer,
 //!           | '-' cexpr | '(' cexpr ')'            -- evaluated at expansion,
@@ -53,7 +49,6 @@
 //!           | IDENT '(' (expr (',' expr)*)? ')'    -- a helper, inlined
 //!           | 'if' expr block 'else' (block | 'if' …)   -- the choice
 //!           | fold
-//!           | iteration
 //!           | IDENT 'as' 'f32'         -- a `usize` (a fold's index, a `usize`
 //!                                      -- const or a structural parameter) as
 //!                                      -- a value
@@ -72,19 +67,6 @@
 //!           | range '.all' '(' binder expr ')'                           -- ∀, of bools
 //! range   ::= '(' iexpr '..' iexpr ')'     -- half-open, constant, forwards
 //! binder  ::= '|' IDENT '|'                -- the index: a `usize`
-//! iteration ::= family '.map' '(' element expr ')' '.sum' F32? '(' ')'           -- Σ
-//!           | family '.map' '(' element expr ')' '.product' F32? '(' ')'       -- Π
-//!           | family '.map' '(' element expr ')'
-//!                 '.fold' '(' 'f32::INFINITY' ',' 'f32::min' ')'             -- min
-//!           | family '.map' '(' element expr ')'
-//!                 '.fold' '(' 'f32::NEG_INFINITY' ',' 'f32::max' ')'         -- max
-//!           | family '.any' '(' element expr ')'                             -- ∃
-//!           | family '.all' '(' element expr ')'                             -- ∀
-//!                                          -- one copy of the body per element,
-//!                                          -- made when the host fn is instantiated
-//! family  ::= IDENT '.into_iter' '(' ')' | '(' family ')'
-//!                                          -- an entry's family, by value
-//! element ::= '|' IDENT '|'                -- one element: a record, or an `f32`
 //! F32     ::= '::' '<' 'f32' '>'
 //! binop   ::= '+' | '-' | '*' | '/'
 //!           | '<' | '<=' | '>' | '>=' | '==' | '!='    -- a comparison: a bool
@@ -121,16 +103,10 @@
 //! parameter, a `let` alias of one (`let q = p;`), an argument passed on, or
 //! the base of a field read.
 //!
-//! Families (plan §1.6). An entry's `pieces: [Row; N]` is `N` elements'
-//! uniforms at static slots, element-major, and not a table: it is iterated
-//! as a whole, `pieces.into_iter().map(|p| e).sum()` and its siblings,
-//! which denote ⊕ of `e[p := element k]` over the elements, the monoid's
-//! identity when there are none. The program holds one copy of the body per
-//! element, made when the host function is instantiated; no fold, binder or
-//! index exists for the family, and nothing else is done with one. The
-//! spelling is Rust's own — `into_iter()` on an array yields its elements by
-//! value, so `p` passes to a helper taking a `Row` — and rustc types it as
-//! the kernel does.
+//! The language has no collection types (plan §1.3, §1.6): no array, slice,
+//! list or table, as a parameter, a value or a thing to iterate. Several
+//! values are several parameters, a record is its named fields, and the one
+//! iteration is a fold, over a range.
 //!
 //! A tuple is taken apart where it is written, and only there:
 //! `let (a, b) = (e1, e2);` binds each name to its expression, every
@@ -147,18 +123,16 @@
 //! `const N: usize` without a default; a parameter typed as a closure
 //! (Phase D); a `fn` without a declared return type; an `if` without an
 //! `else` or an `if let`; `loop`/`while`/`for`; assignment; `return`; a
-//! closure anywhere but a fold's or an iteration's; a tuple
+//! closure anywhere but a fold's; a tuple
 //! anywhere but a tuple `let`'s value, and a tuple's field (a tuple value is
-//! Phase D, D7); a record literal (Phase D, D7); indexing and slicing (there
-//! are no tables, §1.6); a range anywhere but a fold's; an inclusive or
-//! open-ended range; a method on a range or a mapped
-//! range that is not one of the fold's spellings; any method on a family's
-//! `into_iter()` but `.map`, `.any` and `.all` — `.rev`, `.enumerate`,
-//! `.skip`, … (no index, no order, §1.6) — and a mapped family not ended by
-//! one of the six reductions; `.map`, `.any` or `.all` over anything but a
-//! range or a family's `into_iter()` (an array's own `.map`, `.iter()`);
-//! a `.fold` whose arguments are not one of the two above; a fold's or an
-//! iteration's closure with a type annotation, a pattern, more than one
+//! Phase D, D7); a record literal (Phase D, D7); every spelling of a
+//! collection — a parameter typed as an array or a slice, an array literal,
+//! indexing and slicing, `.into_iter()` and `.iter()`, and `.map`, `.any` or
+//! `.all` over anything but a range (no collection types, §1.3, §1.6); a
+//! range anywhere but a fold's; an inclusive or open-ended range; a method
+//! on a range or a mapped range that is not one of the fold's spellings;
+//! a `.fold` whose arguments are not one of the two above; a fold's
+//! closure with a type annotation, a pattern, more than one
 //! parameter, a return type or a qualifier; type arguments on a method
 //! (`::<f32>` on `.sum` and `.product` excepted); an `as` to any type but
 //! `f32`; a path or a call from outside the block; `%` and `!` (no IR op);
@@ -180,13 +154,7 @@
 //! or a `bool`; a `usize` is used only as `i as f32`; a record only by name);
 //! a record's field that is not an `f32` (§1.3); a
 //! record returned, built, chosen by an `if`, or used in arithmetic or a
-//! comparison (Phase D, D7); a family whose element is not a record or an
-//! `f32`, whose count is not an integer literal, a `usize` const or a
-//! structural parameter, or that is a helper's parameter, and a family
-//! anywhere but as what `into_iter()` iterates — passed, aliased, compared,
-//! returned, converted, read by field — or with an array's method,
-//! `.len()`, `.iter()`, `.get` (§1.6); iterating what is not a family; an
-//! element outside its closure; an unknown field; an `as` of anything but a
+//! comparison (Phase D, D7); an unknown field; an `as` of anything but a
 //! `usize` name; an integer an `f32` does not hold exactly where a value is
 //! expected; a `const` whose initializer is not a `cexpr` or an `iexpr`; a
 //! negated `usize`; a range whose bounds are not constant or that runs
@@ -208,10 +176,9 @@
 
 use crate::PLAN;
 use crate::ast::{
-    BinaryExpr, BinaryOp, BlockExpr, CallExpr, CastExpr, ConstItem, Expr, FAMILY_SUM, FamilyExpr,
-    FamilyType, FieldExpr, FnItem, FoldExpr, IdentExpr, IfExpr, KernelDef, LetStmt, Literal,
-    LiteralExpr, MethodCallExpr, Param, ParamType, RangeExpr, RecordField, RecordItem, Reduction,
-    Spelling, Stmt, UnaryExpr, UnaryOp,
+    BinaryExpr, BinaryOp, BlockExpr, CallExpr, CastExpr, ConstItem, Expr, FieldExpr, FnItem,
+    FoldExpr, IdentExpr, IfExpr, KernelDef, LetStmt, Literal, LiteralExpr, MethodCallExpr, Param,
+    RangeExpr, RecordField, RecordItem, Reduction, Spelling, Stmt, UnaryExpr, UnaryOp,
 };
 use proc_macro2::{Span, TokenStream};
 use syn::parse::{Parse, ParseStream};
@@ -253,10 +220,11 @@ fn parse_closure(input: ParseStream) -> syn::Result<KernelDef> {
             input.parse::<Token![:]>()?;
             // Parse type
             let ty: Type = input.parse()?;
+            refuse_a_collection(&ty)?;
 
             params.push(Param {
                 name: ident,
-                ty: param_type(ty)?,
+                ty: Box::new(ty),
             });
 
             // Check for comma or end of params
@@ -551,7 +519,7 @@ fn structural_parameters(generics: &syn::Generics) -> syn::Result<Vec<syn::Ident
 
 /// A helper takes no generics: it is inlined into an entry, and reads the
 /// entry's structural parameters only through its arguments — a count as
-/// `n as f32`, a family one element at a time.
+/// `n as f32`.
 fn refuse_a_helpers_generics(generics: &syn::Generics) -> syn::Result<()> {
     if let Some(param) = generics.params.first() {
         return Err(syn::Error::new_spanned(
@@ -560,8 +528,7 @@ fn refuse_a_helpers_generics(generics: &syn::Generics) -> syn::Result<()> {
                 "generics on a helper\n\
                  \n\
                  note: a helper is inlined into an entry, and reads the entry's structural \
-                 parameters through its arguments: pass `n as f32`, or iterate a family in \
-                 the entry and pass the helper one element\n\
+                 parameters through its arguments: pass `n as f32`\n\
                  note: structural parameters are an entry's, `pub fn f<const N: usize>` \
                  (§1.4 of {PLAN})"
             ),
@@ -612,25 +579,49 @@ fn convert_param(input: syn::FnArg) -> syn::Result<Param> {
         }
         _ => {}
     }
-    Ok(Param {
-        name,
-        ty: param_type(*typed.ty)?,
-    })
+    refuse_a_collection(&typed.ty)?;
+    Ok(Param { name, ty: typed.ty })
 }
 
-/// A parameter's declared type: one value, or `[E; N]`, a family (plan
-/// §1.6). What the element and the count are is `sema`'s question; the
-/// count is converted as any expression is, so `sema` resolves it through
-/// the scopes it resolves every name through.
-fn param_type(ty: Type) -> syn::Result<ParamType> {
-    let Type::Array(array) = ty else {
-        return Ok(ParamType::One(Box::new(ty)));
-    };
-    Ok(ParamType::Family(FamilyType {
-        span: array.bracket_token.span.join(),
-        element: array.elem,
-        count: Box::new(convert_expr(array.len)?),
-    }))
+/// A parameter typed as a collection — an array `[R; N]` or a slice `[R]`,
+/// through references and parentheses — is refused where it is written: the
+/// language has none.
+fn refuse_a_collection(ty: &Type) -> syn::Result<()> {
+    fn names_a_collection(ty: &Type) -> bool {
+        match ty {
+            Type::Array(_) | Type::Slice(_) => true,
+            Type::Reference(reference) => names_a_collection(&reference.elem),
+            Type::Paren(inner) => names_a_collection(&inner.elem),
+            _ => false,
+        }
+    }
+    if !names_a_collection(ty) {
+        return Ok(());
+    }
+    Err(no_collection_types(
+        ty,
+        "a collection-typed parameter",
+        "a parameter is an `f32`, a `bool` or one of the block's records; several values \
+         are several parameters",
+    ))
+}
+
+/// The refusal of a collection, spelled any way: `what` is the spelling
+/// found, and `instead` what the language has in its place. There are no
+/// collection types (plan §1.3, §1.6): no array, slice, list or table, so
+/// nothing is indexed, measured or iterated but a fold's range.
+fn no_collection_types(tokens: impl quote::ToTokens, what: &str, instead: &str) -> syn::Error {
+    syn::Error::new_spanned(
+        tokens,
+        format!(
+            "{what} in a `kernel!` block\n\
+             \n\
+             note: the language has no collection types (§1.3, §1.6 of {PLAN}): no array, \
+             slice, list or table, so nothing is indexed, measured or iterated but a fold's \
+             range\n\
+             note: {instead}"
+        ),
+    )
 }
 
 /// A doc comment is kept, to be re-emitted on an entry; any other attribute
@@ -758,16 +749,10 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
             if let Some((range, map)) = a_mapped_range(&expr_method.receiver) {
                 return convert_fold_terminal(range, map, &expr_method);
             }
-            if let Some(family) = a_family(&expr_method.receiver) {
-                return convert_family_method(family, &expr_method);
-            }
-            if let Some((family, map)) = a_mapped_family(&expr_method.receiver) {
-                return convert_family_terminal(family, map, &expr_method);
-            }
             // Built before the receiver is converted, returned after it: the
             // receiver's own refusal, the innermost, comes first, as rustc's
             // does (`(0..4).rev().map(…)` is about `.rev`).
-            let family = a_family_iterated(&expr_method);
+            let collection = a_collection_iterated(&expr_method);
             if let Some(arguments) = &expr_method.turbofish {
                 return Err(syn::Error::new_spanned(
                     arguments,
@@ -778,7 +763,7 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
                 ));
             }
             let receiver = convert_expr(*expr_method.receiver)?;
-            if let Some(refusal) = family {
+            if let Some(refusal) = collection {
                 return Err(refusal);
             }
             let args = expr_method
@@ -849,17 +834,18 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
             ),
         )),
 
-        // There are no tables (§1.6): nothing reads a family, or anything
-        // else, by index, and a slice is a range of indices.
-        syn::Expr::Index(expr_index) => Err(syn::Error::new(
-            expr_index.bracket_token.span.join(),
-            format!(
-                "indexing in a kernel body\n\
-                 \n\
-                 note: there are no tables (§1.6 of {PLAN}): a family is iterated as a whole, \
-                 {FAMILY_SUM}, one copy of the body per element, and nothing reads one \
-                 element, or a slice of them, by index"
-            ),
+        // There are no collection types (§1.3, §1.6): nothing is read by
+        // index, a slice is a range of indices, and nothing builds an array.
+        syn::Expr::Index(expr_index) => Err(no_collection_types(
+            &expr_index,
+            "indexing",
+            "a value is an `f32` or a `bool` and a record is read by field, `p.x0`; nothing \
+             is read by index, and a slice is a range of indices",
+        )),
+        syn::Expr::Array(_) | syn::Expr::Repeat(_) => Err(no_collection_types(
+            &expr,
+            "an array",
+            "several values are several parameters, or several `let`s",
         )),
 
         syn::Expr::Struct(expr_struct) => Err(syn::Error::new_spanned(
@@ -924,8 +910,7 @@ fn convert_expr(expr: syn::Expr) -> syn::Result<Expr> {
             format!(
                 "a closure in a kernel body\n\
                  \n\
-                 note: a closure is the body of a fold or of a family's iteration, and \
-                 nothing else: {FOLD_SPELLINGS}; {FAMILY_SUM}\n\
+                 note: a closure is the body of a fold, and nothing else: {FOLD_SPELLINGS}\n\
                  note: a function as an argument is Phase D of {PLAN}; a private `fn` in the \
                  block is a helper, called by name"
             ),
@@ -1039,15 +1024,25 @@ fn a_mapped_range(receiver: &syn::Expr) -> Option<(&syn::ExprRange, &syn::ExprMe
     Some((a_range(&map.receiver)?, map))
 }
 
-/// The methods that iterate, over a range or a family: `.map`, `.any` and
-/// `.all`.
+/// The methods that iterate: a fold's `.map`, `.any` and `.all`.
 const ITERATING_METHODS: [&str; 3] = ["map", "any", "all"];
 
-/// The refusal of one of [`ITERATING_METHODS`] with a closure, called on
-/// anything but a range or a family's `into_iter()`: iteration spelled
-/// another way, and not a closure out of place, which the closure's own
-/// refusal would say.
-fn a_family_iterated(call: &syn::ExprMethodCall) -> Option<syn::Error> {
+/// The methods that make a collection something to iterate: an array's or a
+/// slice's, by value or by reference.
+const COLLECTION_METHODS: [&str; 2] = ["into_iter", "iter"];
+
+/// The refusal of a collection iterated: one of [`COLLECTION_METHODS`], or
+/// one of [`ITERATING_METHODS`] with a closure called on anything but a
+/// range — and not a closure out of place, which the closure's own refusal
+/// would say. The one iteration is a fold, and it ranges over integers.
+fn a_collection_iterated(call: &syn::ExprMethodCall) -> Option<syn::Error> {
+    if COLLECTION_METHODS.iter().any(|name| call.method == name) {
+        return Some(no_collection_types(
+            call,
+            &format!("`.{}()`", call.method),
+            &format!("the one iteration is a fold, over a range: {FOLD_SPELLINGS}"),
+        ));
+    }
     if !ITERATING_METHODS.iter().any(|name| call.method == name) {
         return None;
     }
@@ -1059,142 +1054,19 @@ fn a_family_iterated(call: &syn::ExprMethodCall) -> Option<syn::Error> {
         return None;
     }
     let receiver = &call.receiver;
-    let lent = match a_named_call(receiver, "iter") {
-        Some(family) => format!(
-            "\nnote: `.iter()` lends references; a family's elements are iterated by value, \
-             `{family}.into_iter()`"
-        ),
-        None => String::new(),
-    };
-    Some(syn::Error::new_spanned(
+    Some(no_collection_types(
         receiver,
-        format!(
-            "`.{}` over `{}`, which is neither a range nor a family's `into_iter()`\n\
-             \n\
-             note: a fold iterates a constant range: {FOLD_SPELLINGS}\n\
-             note: a family is iterated as a whole, at instantiation (§1.6 of {PLAN}): \
-             {FAMILY_SPELLINGS}{lent}",
+        &format!(
+            "`.{}` over `{}`, which is not a range,",
             call.method,
             quote::quote!(#receiver)
         ),
+        &format!("a fold iterates a constant range: {FOLD_SPELLINGS}"),
     ))
 }
 
-// ─────────────────────────────── families ───────────────────────────────
-
-/// Every spelling of a family's iteration, as a refusal of any other names
-/// them (plan §1.6).
-const FAMILY_SPELLINGS: &str = "`pieces.into_iter().map(|p| e).sum()`, `.product()`, \
-     `.fold(f32::INFINITY, f32::min)` or `.fold(f32::NEG_INFINITY, f32::max)`, and \
-     `pieces.into_iter().any(|p| m)` or `.all(|p| m)`";
-
 /// The one place a tuple is written: a `let` taking it apart.
 const TUPLE_LET: &str = "`let (a, b) = (e1, e2);` binds each name to its expression";
-
-/// `name.method()`, through parentheses: the plain name a method with no
-/// arguments is called on.
-fn a_named_call<'a>(expr: &'a syn::Expr, method: &str) -> Option<&'a syn::Ident> {
-    let call = match expr {
-        syn::Expr::Paren(paren) => return a_named_call(&paren.expr, method),
-        syn::Expr::MethodCall(call) => call,
-        _ => return None,
-    };
-    if call.method != method || !call.args.is_empty() || call.turbofish.is_some() {
-        return None;
-    }
-    a_plain_name(&call.receiver)
-}
-
-/// A name, through parentheses: how a family is written.
-fn a_plain_name(expr: &syn::Expr) -> Option<&syn::Ident> {
-    match expr {
-        syn::Expr::Paren(paren) => a_plain_name(&paren.expr),
-        syn::Expr::Path(path) if path.qself.is_none() => path.path.get_ident(),
-        _ => None,
-    }
-}
-
-/// `pieces.into_iter()`: the family a method is called on, element by
-/// element and by value — the spelling that types as the kernel does, since
-/// an element passes to a helper taking the record.
-fn a_family(receiver: &syn::Expr) -> Option<&syn::Ident> {
-    a_named_call(receiver, "into_iter")
-}
-
-/// `pieces.into_iter().map(f)`: the family and the `map` call a reduction
-/// is called on.
-fn a_mapped_family(receiver: &syn::Expr) -> Option<(&syn::Ident, &syn::ExprMethodCall)> {
-    let syn::Expr::MethodCall(map) = receiver else {
-        return None;
-    };
-    if map.method != "map" {
-        return None;
-    }
-    Some((a_family(&map.receiver)?, map))
-}
-
-/// A method called on a family's iterator itself: `.any(|p| m)` and
-/// `.all(|p| m)` iterate it, and nothing else is a value — there is no index
-/// to enumerate, skip or take by, and no order to reverse.
-fn convert_family_method(family: &syn::Ident, call: &syn::ExprMethodCall) -> syn::Result<Expr> {
-    let reduction = match call.method.to_string().as_str() {
-        "any" => Reduction::Any,
-        "all" => Reduction::All,
-        "map" => {
-            return Err(syn::Error::new_spanned(
-                call,
-                format!(
-                    "a mapped family is an iterator, not a value\n\
-                     \n\
-                     note: a family's iteration ends in the reduction that combines its \
-                     copies: {FAMILY_SPELLINGS}"
-                ),
-            ));
-        }
-        other => {
-            return Err(syn::Error::new(
-                call.method.span(),
-                format!(
-                    "`.{other}` on a family's iterator\n\
-                     \n\
-                     note: a family is iterated as a whole, its elements by value: \
-                     {FAMILY_SPELLINGS}\n\
-                     note: a family is not a table (§1.6 of {PLAN}): there is no index to \
-                     enumerate, skip or take by, no order to reverse, and no length but the \
-                     count it is declared with"
-                ),
-            ));
-        }
-    };
-    refuse_turbofish(call)?;
-    let (element, body) = the_closure(call, &FAMILY_CLOSURE)?;
-    Ok(Expr::Family(FamilyExpr {
-        reduction,
-        family: family.clone(),
-        element,
-        body: Box::new(body),
-        span: call.method.span(),
-    }))
-}
-
-/// The method that ends `pieces.into_iter().map(|p| e)`: the reduction its
-/// copies are combined under.
-fn convert_family_terminal(
-    family: &syn::Ident,
-    map: &syn::ExprMethodCall,
-    call: &syn::ExprMethodCall,
-) -> syn::Result<Expr> {
-    let reduction = mapped_reduction(call)?;
-    refuse_turbofish(map)?;
-    let (element, body) = the_closure(map, &FAMILY_CLOSURE)?;
-    Ok(Expr::Family(FamilyExpr {
-        reduction,
-        family: family.clone(),
-        element,
-        body: Box::new(body),
-        span: call.method.span(),
-    }))
-}
 
 /// A method called on a range itself: `.any(|i| m)` and `.all(|i| m)` are
 /// folds, and nothing else is a value.
@@ -1224,7 +1096,7 @@ fn convert_range_method(range: &syn::ExprRange, call: &syn::ExprMethodCall) -> s
         }
     };
     refuse_turbofish(call)?;
-    let (binder, body) = the_closure(call, &FOLD_CLOSURE)?;
+    let (binder, body) = the_closure(call)?;
     Ok(Expr::Fold(FoldExpr {
         reduction,
         range: convert_range(range)?,
@@ -1241,9 +1113,23 @@ fn convert_fold_terminal(
     map: &syn::ExprMethodCall,
     call: &syn::ExprMethodCall,
 ) -> syn::Result<Expr> {
-    let reduction = mapped_reduction(call)?;
+    let reduction = match call.method.to_string().as_str() {
+        "sum" => sum_or_product(call, Reduction::Sum)?,
+        "product" => sum_or_product(call, Reduction::Product)?,
+        "fold" => fold_monoid(call)?,
+        other => {
+            return Err(syn::Error::new(
+                call.method.span(),
+                format!(
+                    "`.{other}` does not end a fold\n\
+                     \n\
+                     note: a fold is spelled {FOLD_SPELLINGS}"
+                ),
+            ));
+        }
+    };
     refuse_turbofish(map)?;
-    let (binder, body) = the_closure(map, &FOLD_CLOSURE)?;
+    let (binder, body) = the_closure(map)?;
     Ok(Expr::Fold(FoldExpr {
         reduction,
         range: convert_range(range)?,
@@ -1251,25 +1137,6 @@ fn convert_fold_terminal(
         body: Box::new(body),
         span: call.method.span(),
     }))
-}
-
-/// The reduction a method called on a `.map(…)` names: the monoid a fold's
-/// terms, or a family's copies, are combined under.
-fn mapped_reduction(call: &syn::ExprMethodCall) -> syn::Result<Reduction> {
-    match call.method.to_string().as_str() {
-        "sum" => sum_or_product(call, Reduction::Sum),
-        "product" => sum_or_product(call, Reduction::Product),
-        "fold" => fold_monoid(call),
-        other => Err(syn::Error::new(
-            call.method.span(),
-            format!(
-                "`.{other}` does not end a fold\n\
-                 \n\
-                 note: a fold is spelled {FOLD_SPELLINGS}\n\
-                 note: a family's iteration is spelled {FAMILY_SPELLINGS}"
-            ),
-        )),
-    }
 }
 
 /// `.sum()` and `.product()` take no arguments, and a type argument only if
@@ -1390,73 +1257,17 @@ fn refuse_turbofish(call: &syn::ExprMethodCall) -> syn::Result<()> {
     }
 }
 
-/// What the one parameter of an iteration's closure is — a fold's index or
-/// a family's element — for the refusal of any other shape.
-struct IterationClosure {
-    /// Whose closure it is: `a fold's`.
-    whose: &'static str,
-    /// Its one spelling: `|i| body`.
-    spelling: &'static str,
-    /// What its parameter and its body are.
-    meaning: &'static str,
-    /// What its body is, which is why it declares no return type.
-    body: &'static str,
-    /// What its one parameter is.
-    parameter: &'static str,
-    /// The refusal of a typed parameter.
-    typed: &'static str,
-    /// The refusal of a pattern.
-    pattern: &'static str,
-}
-
-/// `(a..b).map(|i| body)`: the parameter is the index.
-const FOLD_CLOSURE: IterationClosure = IterationClosure {
-    whose: "a fold's",
-    spelling: "|i| body",
-    meaning: "its parameter is the fold's index and its body is what the fold combines",
-    body: "a term of the fold",
-    parameter: "the index it ranges over",
-    typed: "a fold's index is a `usize`, always; write the plain name, `|i|`",
-    pattern: "a fold's index is a plain name: `|i|`",
-};
-
-/// `pieces.into_iter().map(|p| body)`: the parameter is one element.
-const FAMILY_CLOSURE: IterationClosure = IterationClosure {
-    whose: "a family's",
-    spelling: "|p| body",
-    meaning: "its parameter is one element of the family and its body is that element's \
-              copy",
-    body: "each element's copy",
-    parameter: "the element",
-    typed: "a family's element has the family's element type, always; write the plain \
-            name, `|p|`",
-    pattern: "a family's element is a plain name, `|p|`; a record element's fields are \
-              read by name, `p.x0`",
-};
-
-/// The one argument of an iteration's `.map`, `.any` or `.all`: a closure
-/// whose parameter is a fold's index or a family's element, and whose body
-/// is what is combined.
-fn the_closure(
-    call: &syn::ExprMethodCall,
-    shape: &IterationClosure,
-) -> syn::Result<(syn::Ident, Expr)> {
-    let IterationClosure {
-        whose,
-        spelling,
-        meaning,
-        body,
-        parameter,
-        typed,
-        pattern,
-    } = shape;
+/// The one argument of a fold's `.map`, `.any` or `.all`: a closure whose
+/// parameter is the fold's index and whose body is the fold's body.
+fn the_closure(call: &syn::ExprMethodCall) -> syn::Result<(syn::Ident, Expr)> {
     let [syn::Expr::Closure(closure)] = call.args.iter().collect::<Vec<_>>()[..] else {
         return Err(syn::Error::new(
             call.method.span(),
             format!(
-                "`.{}` takes one argument, the closure `{spelling}`\n\
+                "`.{}` takes one argument, the closure `|i| body`\n\
                  \n\
-                 note: {meaning}",
+                 note: its parameter is the fold's index and its body is what the fold \
+                 combines",
                 call.method
             ),
         ));
@@ -1470,34 +1281,40 @@ fn the_closure(
     if qualified {
         return Err(syn::Error::new_spanned(
             closure,
-            format!(
-                "{whose} closure is `{spelling}`, unqualified\n\
-                 \n\
-                 note: it is {body}, not a value: nothing is captured, moved or awaited"
-            ),
+            "a fold's closure is `|i| body`, unqualified\n\
+             \n\
+             note: it is a term of the fold, not a value: nothing is captured, moved or awaited",
         ));
     }
     if let syn::ReturnType::Type(_, ty) = &closure.output {
         return Err(syn::Error::new_spanned(
             ty,
-            format!(
-                "{whose} closure declares no return type: its body is {body}, an `f32` for a \
-                 sum, product, min or max, a `bool` for `any` or `all`"
-            ),
+            "a fold's closure declares no return type: its body is a term of the fold, an \
+             `f32` for a sum, product, min or max, a `bool` for `any` or `all`",
         ));
     }
     let [param] = closure.inputs.iter().collect::<Vec<_>>()[..] else {
         return Err(syn::Error::new_spanned(
             &closure.inputs,
-            format!("{whose} closure takes one parameter, {parameter}"),
+            "a fold's closure takes one parameter, the index it ranges over",
         ));
     };
-    let name = match param {
+    let binder = match param {
         Pat::Ident(pat_ident) => plain_name(pat_ident, param)?,
-        Pat::Type(annotated) => return Err(syn::Error::new_spanned(&annotated.ty, *typed)),
-        other => return Err(syn::Error::new_spanned(other, *pattern)),
+        Pat::Type(typed) => {
+            return Err(syn::Error::new_spanned(
+                &typed.ty,
+                "a fold's index is a `usize`, always; write the plain name, `|i|`",
+            ));
+        }
+        other => {
+            return Err(syn::Error::new_spanned(
+                other,
+                "a fold's index is a plain name: `|i|`",
+            ));
+        }
     };
-    Ok((name, convert_expr((*closure.body).clone())?))
+    Ok((binder, convert_expr((*closure.body).clone())?))
 }
 
 /// `a..b`: both bounds, half-open. Whether they are constant, and run
@@ -2037,7 +1854,7 @@ mod tests {
         assert_eq!(entry.params[0].name.to_string(), "cx");
         assert_eq!(entry.params[1].name.to_string(), "m");
         for (param, want) in entry.params.iter().zip(["f32", "bool"]) {
-            let syn::Type::Path(path) = param.ty.written() else {
+            let syn::Type::Path(path) = &*param.ty else {
                 panic!("expected a path type for {}", param.name);
             };
             assert_eq!(path.path.segments[0].ident.to_string(), want);
@@ -2129,7 +1946,6 @@ mod tests {
             quote! { || unsafe { X } },
             quote! { || match X { _ => Y } },
             quote! { || &X },
-            quote! { || [X, Y] },
             quote! { || X? },
         ] {
             let err = refusal(other);
@@ -2656,11 +2472,11 @@ mod tests {
         );
     }
 
-    /// A closure is the body of a fold or of a family's iteration and
-    /// nothing else: anywhere else it is refused, naming the spellings of
-    /// both, and the phase that brings a function as an argument.
+    /// A closure is the body of a fold and nothing else: anywhere else it is
+    /// refused, naming the fold's spellings, and the phase that brings a
+    /// function as an argument.
     #[test]
-    fn a_closure_outside_a_fold_or_an_iteration_is_refused() {
+    fn a_closure_outside_a_fold_is_refused() {
         for input in [
             quote! { || X.max(|i| i) },
             quote! { || { let f = |x: f32| x; X } },
@@ -2670,203 +2486,66 @@ mod tests {
             let err = refusal(input);
             assert!(
                 err.contains("a closure in a kernel body")
-                    && err.contains("the body of a fold or of a family's iteration")
+                    && err.contains("the body of a fold, and nothing else")
                     && err.contains("(a..b).map(|i| e).sum()")
-                    && err.contains("pieces.into_iter().map(|p| e).sum()")
                     && err.contains("Phase D"),
                 "got: {err}"
             );
         }
     }
 
-    /// An iteration's spelling over anything but a range or a family's
-    /// `into_iter()` is refused naming both spellings and §1.6, where the
-    /// closure's own refusal would name them less precisely: an
-    /// array's own `.map`, and `.iter()`, which lends references where a
-    /// family's elements are values, among them.
+    /// The language has no collection types (§1.3, §1.6), and every spelling
+    /// of one is refused where it is written, saying so: a parameter typed
+    /// as an array or a slice, by value or by reference; an array literal;
+    /// indexing and slicing; `.into_iter()` and `.iter()`; and a fold's
+    /// spelling over anything but a range — where the closure's own refusal
+    /// would say less.
     #[test]
-    fn iterating_anything_but_a_range_or_a_family_is_refused_naming_both() {
-        for input in [
-            quote! { |pieces: f32| pieces.map(|p| p * X).sum() },
-            quote! { |pieces: f32| pieces.any(|p| p < X) },
-            quote! { || X.all(|p| p < Y) },
-            quote! { |v: [f32; 2]| v.map(|e| e * X).sum() },
-            quote! { |v: [f32; 2]| (X + v).into_iter().map(|e| e).sum() },
-        ] {
-            let err = refusal(input);
-            assert!(
-                err.contains("which is neither a range nor a family's `into_iter()`")
-                    && err.contains("(a..b).map(|i| e).sum()")
-                    && err.contains("pieces.into_iter().map(|p| e).sum()")
-                    && err.contains("§1.6"),
-                "got: {err}"
-            );
-        }
-        let err = refusal(quote! { |v: [f32; 2]| v.iter().map(|e| e * X).sum() });
-        assert!(
-            err.contains("`.iter()` lends references") && err.contains("`v.into_iter()`"),
-            "got: {err}"
-        );
-    }
-
-    // ───────────────────────────── families ─────────────────────────────
-
-    /// A parameter `[E; N]` is a family: its element as written, and its
-    /// count converted as any expression is, for `sema` to resolve.
-    #[test]
-    fn a_family_parameter_parses_as_its_element_and_count() {
-        let def = parse(quote! {
-            pub fn f<const N: usize>(pieces: [Row; N], r: f32) -> f32 { r }
-        })
-        .expect("parses");
-        let ParamType::Family(family) = &def.fns[0].params[0].ty else {
-            panic!("`[Row; N]` is a family: {:?}", def.fns[0].params[0].ty);
-        };
-        let syn::Type::Path(element) = &*family.element else {
-            panic!("the element is `Row`");
-        };
-        assert!(element.path.is_ident("Row"));
-        assert_eq!(
-            family.count.named().map(ToString::to_string),
-            Some("N".to_string())
-        );
-        assert!(matches!(def.fns[0].params[1].ty, ParamType::One(_)));
-
-        let def = parse(quote! { |v: [f32; 3]| X }).expect("parses");
-        let ParamType::Family(family) = &entry(&def).params[0].ty else {
-            panic!("`[f32; 3]` is a family");
-        };
-        assert!(matches!(*family.count, Expr::Literal(_)));
-    }
-
-    /// The family iteration the body `|v: [f32; 2]| <expr>` parses to.
-    fn family(input: TokenStream) -> FamilyExpr {
-        let def = parse(quote! { |v: [f32; 2]| #input }).expect("the iteration parses");
-        match &entry(&def).body {
-            Expr::Family(family) => family.clone(),
-            other => panic!("expected a family's iteration, got {other:?}"),
-        }
-    }
-
-    /// Each spelling of a family's iteration names its monoid, as a fold's
-    /// does; the closure's parameter is the element, and the family is the
-    /// name `into_iter()` is called on, through parentheses too.
-    #[test]
-    fn every_family_spelling_parses_to_its_reduction() {
-        let cases: [(TokenStream, Reduction); 8] = [
+    fn a_collection_spelled_any_way_is_refused_naming_its_sections() {
+        let cases: [(TokenStream, &str); 14] = [
+            (quote! { |v: [f32; 2]| X }, "a collection-typed parameter"),
             (
-                quote! { v.into_iter().map(|e| e * X).sum() },
-                Reduction::Sum,
+                quote! { pub struct Row { pub x0: f32 } pub fn f<const N: usize>(pieces: [Row; N]) -> f32 { X } },
+                "a collection-typed parameter",
             ),
             (
-                quote! { v.into_iter().map(|e| e * X).sum::<f32>() },
-                Reduction::Sum,
+                quote! { fn h(v: &[f32]) -> f32 { 1.0 } pub fn f() -> f32 { X } },
+                "a collection-typed parameter",
+            ),
+            (quote! { |v: [f32]| X }, "a collection-typed parameter"),
+            (quote! { || [X, Y] }, "an array"),
+            (quote! { || { let v = [X; 2]; X } }, "an array"),
+            (quote! { || X[0] }, "indexing"),
+            (quote! { |v: f32| v[1..3] }, "indexing"),
+            (
+                quote! { |v: f32| v.into_iter().map(|e| e * X).sum() },
+                "`.into_iter()`",
+            ),
+            (quote! { |v: f32| v.iter().any(|e| e < X) }, "`.iter()`"),
+            (
+                quote! { |pieces: f32| pieces.map(|p| p * X).sum() },
+                "`.map` over `pieces`, which is not a range,",
             ),
             (
-                quote! { v.into_iter().map(|e| e * X).product() },
-                Reduction::Product,
+                quote! { |pieces: f32| pieces.any(|p| p < X) },
+                "`.any` over `pieces`, which is not a range,",
             ),
             (
-                quote! { (v).into_iter().map(|e| e * X).product::<f32>() },
-                Reduction::Product,
+                quote! { || X.all(|p| p < Y) },
+                "`.all` over `X`, which is not a range,",
             ),
             (
-                quote! { v.into_iter().map(|e| e * X).fold(f32::INFINITY, f32::min) },
-                Reduction::Min,
-            ),
-            (
-                quote! { v.into_iter().map(|e| e * X).fold(f32::NEG_INFINITY, f32::max) },
-                Reduction::Max,
-            ),
-            (quote! { v.into_iter().any(|e| e < X) }, Reduction::Any),
-            (quote! { v.into_iter().all(|e| e < X) }, Reduction::All),
-        ];
-        for (input, want) in cases {
-            let parsed = family(input);
-            assert_eq!(parsed.reduction, want);
-            assert_eq!(parsed.family.to_string(), "v");
-            assert_eq!(parsed.element.to_string(), "e");
-        }
-    }
-
-    /// A family iterated any other way is refused where it is written,
-    /// naming the spellings it has: no adaptor that indexes, skips, takes or
-    /// reorders (a family is not a table, §1.6), no mapped family left as an
-    /// iterator, no reduction but the six, and a closure `|p| body`.
-    #[test]
-    fn a_family_iterated_any_other_way_is_refused() {
-        let cases: [(TokenStream, &str); 13] = [
-            (
-                quote! { v.into_iter().rev().map(|e| e).sum() },
-                "`.rev` on a family's iterator",
-            ),
-            (
-                quote! { v.into_iter().enumerate().map(|e| X).sum() },
-                "`.enumerate` on a family's iterator",
-            ),
-            (quote! { v.into_iter().skip(1).any(|e| e < X) }, "§1.6"),
-            (
-                quote! { v.into_iter().map(|e| e) },
-                "a mapped family is an iterator, not a value",
-            ),
-            (
-                quote! { v.into_iter().map(|e| e).min() },
-                "does not end a fold",
-            ),
-            (
-                quote! { v.into_iter().map(|e| e).sum(1.0) },
-                "takes no arguments",
-            ),
-            (
-                quote! { v.into_iter().map(|e| e).fold(0.0, |a, b| a + b) },
-                "names no monoid",
-            ),
-            (
-                quote! { v.into_iter().map(|e: f32| e).sum() },
-                "the family's element type, always",
-            ),
-            (
-                quote! { v.into_iter().map(|(a, b)| a).sum() },
-                "a family's element is a plain name",
-            ),
-            (
-                quote! { v.into_iter().map(move |e| e).sum() },
-                "a family's closure is `|p| body`, unqualified",
-            ),
-            (
-                quote! { v.into_iter().map(|e, f| e).sum() },
-                "a family's closure takes one parameter, the element",
-            ),
-            (
-                quote! { v.into_iter().map(X).sum() },
-                "the closure `|p| body`",
-            ),
-            (
-                quote! { v.into_iter().map::<f32>(|e| e).sum() },
-                "takes no type arguments",
+                quote! { || (X + Y).map(|e| e).sum() },
+                "which is not a range,",
             ),
         ];
         for (input, expected) in cases {
-            let err = refusal(quote! { |v: [f32; 2]| #input });
-            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
-        }
-    }
-
-    /// Nothing is read by index — a family's element, a slice of them, or
-    /// anything else: there are no tables (§1.6).
-    #[test]
-    fn indexing_and_slicing_are_refused_naming_section_1_6() {
-        for input in [
-            quote! { |v: [f32; 3]| v[0] },
-            quote! { |v: [f32; 3]| v[1..3].into_iter().map(|e| e).sum() },
-            quote! { || X[0] },
-        ] {
             let err = refusal(input);
             assert!(
-                err.contains("indexing in a kernel body")
-                    && err.contains("there are no tables")
-                    && err.contains("§1.6"),
-                "got: {err}"
+                err.contains(expected)
+                    && err.contains("the language has no collection types")
+                    && err.contains("§1.3, §1.6"),
+                "expected `{expected}`, got: {err}"
             );
         }
     }
@@ -3051,7 +2730,7 @@ mod tests {
             ),
             (
                 quote! { fn h<const N: usize>(x: f32) -> f32 { x } pub fn f() -> f32 { X } },
-                "pass the helper one element",
+                "pass `n as f32`",
             ),
             (quote! { pub fn f<T>() -> f32 { X } }, "B3"),
             (quote! { pub fn f<'a>() -> f32 { X } }, "lifetime parameter"),

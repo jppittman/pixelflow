@@ -720,7 +720,7 @@ impl Rise {
 
     /// `τ(δ) = δ / max(step + √max(step² + bend·δ, 0), ROOT_FLOOR)`: the
     /// parameter at which the rise reaches `δ` — the one definition, which
-    /// `kernel!`'s copy of the glyph writes out
+    /// `kernel!`'s copy of a piece's term writes out
     /// (`pixelflow-compiler/tests/common/section_1_7.rs`).
     ///
     /// **Law.** `q(t) = δ` is `bend·t² + 2·step·t − δ = 0`, whose increasing
