@@ -3,9 +3,32 @@
 ## Metadata
 - **Author**: JP (direction), Claude (draft)
 - **Status**: `Proposed`. Revised the same day after JP's rulings on Q1:
-  there are no tables, the control points are uniforms, a glyph's program
-  is the kernel for its number of control points, and `select` is renamed
-  `if` (§1.6, §1.7). Phase A is in progress.
+  one program per font per zoom level, there are no tables, the control
+  points are uniforms, and `select` is renamed `if` (§1.6, §1.7). Revised
+  again 2026-10-01: no arrays (below). Phase A is in progress.
+- **No arrays** (2026-10-01). JP: *"Why do we have any arrays at all?"*
+  and *"No arrays at all.. please go read recent docs about how this ought
+  to work."*
+  - **Where the plan went wrong (F, git): `43ec6487`.** JP had corrected
+    one thing in `60f701c4`: the control points are uniforms, not
+    constants. `43ec6487` changed two more. It replaced the font program
+    with one program per control-point count `N`, which Q1 had offered JP
+    (`8b2bc63b`: "one program per `N`, dispatched per region") and JP had
+    not chosen. And it brought back, as a "family" `[Row; N]`, the uniform
+    array `60f701c4` had dropped. It read JP's atlas sentence the way
+    one-pipeline already had ("One program per control-point count",
+    written before the Q1 ruling). B3's second half then built the family
+    (`e65a72e3`, `fe5913cc`).
+  - `60f701c4` was not array-free either: it had structural lists
+    (`Glyph { pieces: [Row] }`, `Font { glyphs: [(u32, Glyph)] }`,
+    `FONT.by_id`). Its font program and its `if id < k` tree were right.
+  - **This revision** restores one program per font per zoom level with no
+    collection type anywhere. A piece is one instance of one entry over its
+    own ten uniforms, a glyph is its pieces summed under its box, the font
+    is its glyphs under an `if id < k` tree, and host Rust composes them
+    (§1.3, §1.6–§1.8). The families are superseded (B3) and deleted by the
+    companion code CL. What the documents do not settle is listed as open,
+    not decided (§4, O1–O4).
 - **Integrals deleted** (2026-09-29). JP: *"just do b. delete all the
   integral stuff. other languages don't try this. probably for good
   reason."* The language has no integral: §1.5's `integral`, `area` and
@@ -144,9 +167,12 @@ sugar for a block with one entry.
 | `bool` | a mask; comparisons produce it; `&` and `\|` combine it | an all-ones or all-zero lane, `OpKind::mask(bool)` |
 | `usize` | a fold binder or a structural count | `Var(REDUCE_BINDER_BASE + slot)`; converted by an explicit `i as f32` |
 | records | named `f32` fields | flattened at lowering |
-| `[R; N]`, `N` structural | a family of `N` records of scalar uniforms, iterated at instantiation and never indexed (§1.6) | `N`·width scalar `Uniform`s at static slots |
 | `impl Fn(f32, f32) -> f32` | a kernel-typed parameter (Phase D) | a hole spliced at instantiation |
 | `u32` bits | packed words (Phase D) | `Bits` ops |
+
+**No collection types** (JP, 2026-10-01: *"No arrays at all."*). The
+language has no arrays, families, lists or tables. A count of things is not
+a type. It is how many instances the host composed (§1.7).
 
 **Masks are typed.** Today `X.select(Y, 7.0)` compiles and blends a number as
 a mask. F: probe p16 gives 5. After this plan it is a type error.
@@ -155,18 +181,22 @@ a mask. F: probe p16 gives 5. After this plan it is a type error.
 
 | parameter | example | binding | in the key? |
 |---|---|---|---|
-| structural | `const N: usize`, a zoom level's tile extent | at instantiation; each value is its own program | yes |
-| uniform | a piece's ten coordinates, the box, `fg`, `bg`, the origin | per call, through the entry's `Args` record | no |
+| structural | `const N: usize`, a zoom level's tile extent; the font's shape, meaning which glyphs and how many pieces each (I) | at instantiation, or by what the host composes; each value is its own program | yes |
+| uniform | a piece's ten coordinates and a glyph's box, written once per font and zoom; a cell's glyph id, origin, `fg` and `bg`, per call | through the program's block: an entry's `Args` record, or for the composed font, O3 | no |
 | kernel-typed | `k: impl Fn(f32, f32) -> f32` | at runtime; composed, then `P` | the composed program's |
 
 - **Everything that is not structural is a uniform, and a uniform is a
   scalar.** An `f32` argument no longer folds into a constant because of its
   type at the call site; today the call-site type decides (`emit.rs:79-100`).
-- **The control points are uniforms** (JP). A glyph's program is the kernel
-  for its number of pieces `N`, and the glyph itself is the uniform values.
-  Two glyphs with the same `N` share one program, whatever font they came
-  from. A new `N` or a new tile extent is a new program: recompiled, cached
-  by key.
+- **The control points are uniforms** (JP), **and the program is the font's
+  at one zoom level** (JP, Q1).
+  - Each piece is an instance of one entry over its own ten uniforms.
+    Identity is by instance, so two pieces are two factors of the block
+    (uniform-slot-identity §3).
+  - The control points and the boxes are written once per font and zoom. A
+    cell writes about six uniforms (§1.7).
+  - A new font or a new tile extent is a new program: recompiled, cached by
+    key.
 - **Each entry has an `Args` record.** A compiled program is bound from
   `&Args`, and "every argument supplied" is a type rather than a runtime
   assert. It replaces `Uniform` handles, `UniformBlock::set`'s linear search
@@ -180,6 +210,8 @@ a mask. F: probe p16 gives 5. After this plan it is a type error.
     block to the entry it was compiled from: a block typed by the entry
     (`UniformBlock<A>`, made by compiling that entry's kernel), or a
     per-entry token the kernel carries and `write_into` checks.
+  - **A composed program has no entry of its own.** Binding the font, made
+    from many entries' instances, is O3.
 
 ### 1.5 Folds
 
@@ -223,26 +255,31 @@ codebase has gone wrong before:
 
 So the language has none:
 
-- **No uniform arrays, no buffers, no `Gather` read by a program's author.**
-  Data enters a program in one of two ways:
-  - as a scalar uniform, per call;
-  - as a structural count (§1.4), which fixes how many uniforms there are.
-- **A family `pieces: [Row; N]` is not a table.** It is `10·N` scalar
-  uniforms at static slots. `pieces.into_iter().map(|p| …)` iterates the
-  family's *structure* at instantiation: the program holds `N` copies of the
-  body, each over its own ten uniforms, and no index exists at runtime. That
-  is what "the kernel for that number of control points" means.
-  - It is not a bespoke unrolling pass: there is no fold to unroll. The
-    e-graph's `HalveFold` unrolls folds over ranges; a family has none.
-  - The measured form of this program is `U_band` (one-pipeline §1.4,
-    Appendix A): the same `N` instances over scalar uniforms.
+- **No arrays, no uniform arrays, no buffers, no `Gather` read by a
+  program's author** (§1.3). Data enters a program in one of two ways:
+  - as a scalar uniform in the program's block, written per call or once
+    per font and zoom;
+  - as structure (§1.4): the tile extent, and the font's shape, which fixes
+    how many instances the host composes and so how many uniforms there
+    are.
 - **Choosing among alternatives is `if`.** A tree of `if`s over a uniform
   (`if id < k { … } else { … }`) is a binary space partition over it. So is
   a tree of bounding tests over space: a glyph's box, a piece's band.
+  - **The worked example is the font (§1.7).** A cell's glyph id is one
+    uniform. The font is its glyphs under a balanced tree of `if id < k`,
+    so choosing a glyph takes about log₂ G tests for G glyphs. Inside the
+    chosen glyph, its box and each piece's band, `(y > lo) & (y < hi)`, cut
+    space. A piece's term is exactly zero outside its band (F,
+    `fonts/loop_blinn.rs`'s `piece_term`: "The cut to the rows is an
+    identity"), so that cut changes no bit.
   - The partition falls out of `if` and bounding, and nobody builds it as a
-    structure.
+    structure. No table maps an id to a glyph, and no host lookup chooses a
+    program.
   - A mask that is uniform across a batch takes one arm, which is a jump.
-    Only a mask that varies by lane blends.
+    Only a mask that varies by lane blends. The id is the same for the
+    whole call, and a band reads `y` alone, which is uniform over a batch
+    (the same doc). So their arms are jumps. The emitter does this once X1
+    lands (below).
 - **`Select` is renamed `If`**, in the IR, the e-graph, the emitter and the
   docs. CLAUDE.md needs a section, "Select contains an if", to explain what
   the name hides. The emitter was built on the misreading, blend by default
@@ -250,17 +287,18 @@ So the language has none:
   glyph bake (docs/BACKLOG.md X1) and the slowness of runs. The name is the
   bug (A6).
 
-### 1.7 A glyph is the kernel for its number of control points
+### 1.7 A font is one program per zoom level
 
 ```rust
 kernel! {
-    /// One oriented monotone arc piece.
+    /// One oriented monotone arc piece: ten uniforms.
     pub struct Row {
         pub x0: f32, pub e0x: f32, pub e1x: f32,
         pub y0: f32, pub e0y: f32, pub e1y: f32,
         pub sigma: f32, pub s: f32,
         pub lo: f32, pub hi: f32,
     }
+    /// A glyph's box: four uniforms.
     pub struct Bounds { pub x0: f32, pub y0: f32, pub x1: f32, pub y1: f32 }
 
     const PIXEL_CENTER: f32 = 0.5;
@@ -327,91 +365,142 @@ kernel! {
         (x >= b.x0) & (x <= b.x1) & (y >= b.y0) & (y <= b.y1)
     }
 
-    /// The glyph with N pieces. Texel (i, j) holds coverage at (i+½, j+½).
-    /// The pieces and the box are uniforms; N is the program.
-    pub fn glyph<const N: usize>(pieces: [Row; N], bounds: Bounds) -> f32 {
+    /// One piece's term at the sample, over its own ten uniforms. The host
+    /// composes one instance per piece.
+    pub fn one_piece(p: Row) -> f32 {
+        piece_term(p, X, Y)
+    }
+
+    /// One glyph. Texel (i, j) holds coverage at (i+½, j+½). `ink` is the
+    /// sum of the glyph's pieces, composed by the host, and `ink(x, y)`
+    /// reads it at the pixel's centre: application is contramap (§1.2).
+    /// `ink` is kernel-typed (Phase D-a, not built; O2).
+    pub fn glyph(ink: impl Fn(f32, f32) -> f32, bounds: Bounds) -> f32 {
         let (x, y) = (X + PIXEL_CENTER, Y + PIXEL_CENTER);
-        let f: f32 = pieces.into_iter().map(|p| piece_term(p, x, y)).sum();
-        if inside(bounds, x, y) { coverage(f) } else { 0.0 }
+        if inside(bounds, x, y) { coverage(ink(x, y)) } else { 0.0 }
     }
 }
 ```
 
-**The spelling (Q2), chosen in B3 pending JP's veto,** is
-`pieces.into_iter().map(|p| …).sum()`: iteration over a family's structure
-at instantiation. It is Rust's own: `into_iter()` on an array yields its
-elements by value, so `p` passes to a helper taking a `Row`, and rustc
-types the block as the kernel does. The program it produces has no fold, no
-table and no index: at `N = 3` it is the three copies summed by hand, one
-canonical key (F, `pixelflow-compiler/tests/a_family_is_its_copies.rs`,
-which compiles this block from `pixelflow-compiler/tests/common/section_1_7.rs`).
+**The atlas becomes the font program.** JP: *"The 'atlas' becomes the kernel
+for that number of control points."* The atlas holds one font at one tile
+size (F, `atlas.rs:46-60`: "An atlas is bound to ONE font", rebuilt "on
+cell-size and density changes"). So the kernel that replaces it is the
+font's at one zoom level (I), which is what JP's Q1 answer says.
+
+**What the language defines** is the block: a piece's record and its term
+in closed form, a glyph's box test, and coverage. Nothing in it is a
+collection, and nothing in it names a count.
+
+**What the host composes** is the font. The font is runtime data (§1.1: a
+font loaded at runtime), and the language has no collection to hold it
+(§1.3). So the walk over the parsed font is host Rust, and it composes:
+- **a piece:** one instance of `one_piece` over its own ten uniforms;
+- **a glyph:** `glyph(ink, bounds)` over its box's four uniforms, with
+  `ink` the sum of its pieces' instances;
+- **the font:** its glyphs under a balanced tree of
+  `if id < k { lower } else { upper }`.
+  - **I:** the host numbers the font's glyphs `0..G`, halves the range, and
+    `k` is the first id of the upper half. `k` is a count, so it is
+    structural.
+  - `id` is one uniform, and every node reads it.
+
+That is the whole font program. The tree is the partition that `if` and
+bounding make (§1.6). It is not a table, and the host chooses no program.
+
+**Three things about it are open:**
+- **The composition surface (O2).**
+  - The block spells it with a kernel-typed argument, `ink`. That is Phase
+    D-a, and it is not built (F): sema has no kernel type, and the parser
+    refuses `impl Fn` (`parser.rs:602`).
+  - The id tree has no spelling in the block at all, because its shape is
+    the font's.
+  - Until D-a, only the builder composes, and §1.1 says the builder is not
+    a surface.
+- **The units (O1).** The font is too big for one e-graph or one emit
+  (§1.8). So each glyph is its own unit, and the id tree links them. The
+  link that keeps a unit separate is not built.
+- **Binding (O3).** The host writes each instance's uniforms into the
+  composed program's block. No document says how it finds their slots.
+
+**Today's copy (F).** `one_piece` and the helpers it calls are expanded from
+`pixelflow-compiler/tests/common/section_1_7.rs`. `fonts/loop_blinn/kernel_copy.rs`
+(`a_piece_is_one_term_through_either_definition`) pins that piece's term
+against the builder's `piece_term`: they are one canonical key. The file's
+`glyph<const N>` over a family, and the bake through it, are superseded with
+the families (B3) and deleted by the companion code CL.
 
 **A piece's term is its closed form, not an integral** (JP, 2026-09-29:
 *"delete all the integral stuff. other languages don't try this. probably
-for good reason."*). The block first wrote it as
-`p.sigma * area(|u, v| left_of_the_arc(p, x + u, p.s * y + v))` and left
-the calculus to the e-graph, whose rules stopped closing under the class
-cap once a glyph had a few dozen pieces (§1.8, problem 1) — and one-point
-quadrature legalized whatever was left, with nothing to notice. `piece_area`
-is the area itself; the builder's glyph (`fonts/loop_blinn.rs`) was
-rewritten to the same closed form first, and its `piece_term` and this
-block's are one canonical key (F, `fonts/loop_blinn/kernel_copy.rs`, which
-also bakes real glyphs through both). The integral itself was then deleted
-from the language, the IR and the e-graph (§1.5), and `monotone_root`, the
-intrinsic the block used to call, with it: the block defines it.
+for good reason."*).
+- The block first wrote it as
+  `p.sigma * area(|u, v| left_of_the_arc(p, x + u, p.s * y + v))` and left
+  the calculus to the e-graph.
+- The e-graph's rules stopped closing under the class cap once a glyph had
+  a few dozen pieces (§1.5), and one-point quadrature legalized whatever was
+  left, with nothing to notice.
+- `piece_area` is the area itself. The builder's glyph
+  (`fonts/loop_blinn.rs`) was rewritten to the same closed form first.
+- The integral was then deleted from the language, the IR and the e-graph
+  (§1.5). `monotone_root`, the intrinsic the block used to call, went with
+  it, and the block now defines it.
 
-**What stays host Rust.** None of this is program; it produces the
-per-call uniforms and the count `N`.
+**What stays host Rust.** None of this is program. It produces the font's
+uniforms and the program's shape:
 - font parsing, compound glyphs and mirroring (`ttf.rs`);
 - the f64 monotone split (`monotone.rs`);
 - `piece_row`'s rounding, with its debug asserts;
-- layout.
+- layout;
+- the walk over the parsed font that composes the program (above).
 
-**A cell is one call.** A cell calls `glyph::<N>` with its glyph's pieces,
-box, colours and origin as uniforms. The loop over cells is host schedule
-until scheduling moves into the compiler. A call costs 6–9 ns once A2 lands
-(F, measured with `vzeroupper`), so 12k cells is about 0.1 ms of calls plus
-the uniform writes.
+**A cell is one call.**
+- A cell writes its glyph id, its origin `(x0, y0)` (collapse-is-a-fold
+  §2.1), `fg` and `bg`, about six uniforms (I), and calls the font program
+  over its tile.
+- The control points stay as written for the zoom level.
+- The colour blend and the pack belong to the packed frame (Phase D-b).
+- The loop over cells is host schedule until scheduling moves into the
+  compiler.
+- A call costs 6–9 ns once A2 lands (F, measured with `vzeroupper`), so
+  12k cells is about 0.1 ms of calls.
 
-**Selection is `if` and bounding, not a lookup.** The host chooses which
-program a cell calls by its glyph's `N`, and passes that glyph's uniforms.
-Inside the program every choice is an `if`: the box, each piece's band. A
-mask uniform across a batch takes one arm, which is a jump, so the tree of
-`if`s partitions space by itself.
-
-**A zoom level recompiles.** The tile extent is structural, so a new pixel
-size is a new set of programs, one per `N` the font uses: 35 for Noto's
-ASCII, 89 for the whole font (F). Caching comes later (JP). An empty glyph
-stays distinct from a missing one, as the atlas's slot layout does today
-(`atlas.rs:163-200`).
+**A zoom level recompiles the font.**
+- The tile extent is structural, so a new pixel size is a new program.
+- **I:** the host rescales the outlines and rewrites the font's uniforms. A
+  scaling `at` will not do: the closed form bakes in the pixel, so a glyph
+  kernel is correct under translation only (CLAUDE.md, "Glyph coverage").
+- Caching comes later (JP).
+- An empty glyph stays distinct from a missing one, as the atlas's slot
+  layout does today (`atlas.rs:163-200`).
 
 ### 1.8 What it takes, and where it lands
 
-Three problems, none of which touches the language:
+Two problems, neither of which touches the language. A third, that every
+piece was its own integral, went with the integral (§1.5).
 
-1. **Every piece is its own integral.** *Moot since each piece's term is
-   written as its closed form (§1.7), and withdrawn with the integral
-   (§1.5): there is no integral to close, and no rule to close one.* A
-   glyph has up to 189 pieces (F, Noto). Integrals written separately stop
-   closing past about 37 in one e-graph, because each pays for its own
-   derivation under a shared class cap (F, one-pipeline Appendix A).
-   - **Fix: a helper is a unit of optimization.** `piece_term`'s integral is
-     closed once, with its parameters abstract, and each of the `N` copies
-     instantiates the closed form over its own uniforms.
-   - This is "close once, instance N", with the function marking what is
-     shared, so nothing has to recognize it.
-   - It is sound because no rule matches a parameter specially: a derivation
-     over free parameters instantiates to a derivation over any values (F:
-     no rule matches `ENode::Uniform`; one-pipeline Appendix A).
-2. **Size.** At about 100 classes a piece, the largest glyph is about 19k
-   classes, under `HARD_CLASS_LIMIT` (100k, `graph.rs:512`). Code is about
-   1.5 KB a piece (F: `U_band`, 279 KB at N = 189), and about 1.1 MB for
-   the 35 programs of Noto's ASCII (F).
-3. **Zoom latency.** One program compiles in 7 ms at N = 8 and 4.4 s at
-   N = 189 (F, `U_band`'s emit, superlinear in N). So a zoom level takes
-   seconds on one thread.
-   - **Fix:** the programs are independent, so compile them in parallel, and
-     emit arms as blocks (X1) to remove the superlinear emit.
+1. **Size (O1).** One font program is too big for one e-graph or one emit.
+   - Noto's ASCII has 1,625 pieces (F).
+   - A 32-piece glyph inserts 3,324 classes (F, `7aba74a7`), about 100 a
+     piece. **I:** the font inserts about 160k classes before any rule
+     fires. That is over `HARD_CLASS_LIMIT` (100k, `graph.rs:489`) and
+     three times the classical ceiling (50k, `7aba74a7`).
+   - Emission is superlinear. One glyph's program emits in 7 ms at 8 pieces
+     and 4.4 s at 189 (F, `U_band`, measured at `8b7b75a`).
+   - Code is about 1.5 KB a piece (F: `U_band`, 279 KB at 189 pieces).
+     **I:** about 2.4 MB for ASCII.
+   - **Fix: each glyph is its own unit of optimization, and the id tree
+     links them**, as `60f701c4` had it. The largest glyph, 189 pieces, is
+     about 19k classes, under both caps (I, at the same rate).
+   - **The link is not built.** `P`, as one-pipeline §1.1 denotes it,
+     expands every reference before it optimizes (`expand_refs`), and
+     composition-is-linking's linker "only inlines". A link that keeps a
+     glyph a separate unit has to be built (O1).
+2. **Zoom latency.** A zoom recompiles every glyph.
+   - A 64-piece glyph bakes in 806–897 ms under the unpinned cap (C2),
+     and one of 189 pieces emits in 4.4 s. So a zoom level takes seconds
+     on one thread.
+   - **Fix:** glyphs are independent units, so compile them in parallel,
+     and emit arms as blocks (X1) to remove the superlinear emit.
    - "We'll make computing the programs fast, and focus on the caching
      later" (JP).
 
@@ -420,17 +509,6 @@ Three problems, none of which touches the language:
 - Each entry becomes a host function that instantiates the lowered template
   with its structural values and returns the opaque `Kernel`.
 - The template is a replay of `ExprArena` pushes, as `emit.rs` emits today.
-- A family's iteration is its body's own template, built over an abstract
-  element and the terms every copy shares (built once, outside it), and
-  copied per element at instantiation, the element's uniforms and the
-  shared terms in its inputs' places (B3). Templates are built innermost
-  first. A body that iterates no family itself, as §1.7's glyph's does
-  not, has a template the size of the body whatever `N` is. A body that
-  does holds the table of the arena it is copied into and its inner
-  iteration's copies, `N` of them, so its template grows with `N` and is
-  one instantiation's. (B6 would have closed each template as it was
-  built, so an enclosing template held closed inner copies rather than `N`
-  open integrals; it went with the integrals.)
 - No optimization runs at expansion unless the instance is declared (Phase
   E).
 
@@ -442,16 +520,16 @@ The evidence and JP's rulings settle these. JP can overturn any.
 
 | # | decision | resolution |
 |---|---|---|
-| D1 | binding times | §1.4: structural (counts and extents), uniform (every number, per call), or kernel-typed; `Args` records |
+| D1 | binding times | §1.4: structural (counts and extents), uniform (every number: a cell's per call, the font's once per font and zoom), or kernel-typed; `Args` records |
 | D2 | what the macro compiles | the JIT template always; declared instances optimized at expansion (Phase E); `macro_tier`, `Templates`, `ENode::Param` and `kernel_raw!` deleted (one-pipeline M1–M5) |
-| D3 | tables | **none** (JP). A family of records is `N` scalar uniforms iterated at instantiation; choice is `if` (§1.6) |
+| D3 | tables and arrays | **none** (JP: no tables; 2026-10-01, no arrays). No collection type: data enters as scalar uniforms, a count is how many instances the host composed, and choice is `if` (§1.3, §1.6) |
 | D4 | binders | `usize` in sema; slots inside-out; a kernel-typed argument's binders are renamed away from those live at its hole |
 | D5 | `.at` | application is contramap (§1.2) |
 | D6 | functions across blocks or crates | inlined within a block; across blocks only as kernel-typed arguments at runtime. A proc macro sees only its own tokens |
 | D7 | records and tuples | flattened in the front end; record returns (`-> Rgba`) with one `if` on the packed word, as `packed.rs` relies on (Phase D) |
 | D8 | masks and bits | types in sema only |
-| D9 | the frame | a cell calls the kernel for its glyph's `N` with the glyph's uniforms; a zoom recompiles; caching later (JP, §1.7) |
-| D10 | `CachedGlyph`, `CachedText`, the atlas, `BilinearSampler` | deleted as the frame moves to per-cell calls. Caching returns later as its own design (JP) |
+| D9 | the frame | one font program per zoom level (JP, Q1). A cell is one call writing its glyph id, origin, `fg` and `bg`; the glyph is chosen inside the program by the `if id < k` tree; a zoom recompiles; caching later (JP, §1.7) |
+| D10 | `CachedGlyph`, `CachedText`, the atlas, `BilinearSampler` | become the font program, and are deleted as the frame moves to per-cell calls, after C2's measurement (O4). Caching returns later as its own design (JP) |
 | D11 | loop-carried iteration | refused in the syntax. The two fractal benches (`shader_bench`) stay on the IR as compiler research |
 | D12 | binder-indexed immediates | refused; the packer names its four channels |
 | D13 | where production kernels live | above pixelflow-core. The cell grid is terminal-shaped and leaves core (CLAUDE.md: no terminal logic in PixelFlow) |
@@ -487,11 +565,12 @@ and no digests are committed (one-pipeline §5, gate policy).
 - **A6. `Select` renamed `If`** (D18). A mechanical rename, with CLAUDE.md's
   "Select contains an if" section retitled.
 - **A4. The uniform chain at 64 bits:** `UniformId`, `dense_slot`,
-  `ScheduledOp::Uniform` and `emit_uniform_load`'s offset. A glyph at
-  N = 189 has 1,894 uniforms, and nothing bounds `N`; today `declare_uniform`
-  asserts below `u16::MAX` (`arena.rs:700-704`). `UniformBlock::set`'s linear
-  search (`manifold.rs:113-125`) goes with it: the `Args` record is
-  positional.
+  `ScheduledOp::Uniform` and `emit_uniform_load`'s offset. **Done** in
+  `964be574`: `declare_uniform`'s assertion below `u16::MAX` is gone, and
+  `UniformBlock::set`'s linear search is an index.
+  - A font program holds about 16k uniforms for Noto's ASCII alone (I:
+    1,625 pieces at ten each, plus four per glyph's box).
+  - Nothing bounds a font's size.
 - **Deprioritized.** 64-bit fold ends (A5) have no driver in this plan.
   Likewise the caps A4 leaves beside the uniform chain, so the remaining
   widths stay visible: `push_nary` and the key's `Nary` child count at
@@ -505,10 +584,19 @@ and no digests are committed (one-pipeline §5, gate policy).
   items and helper `fn`s. **Done** in `fb324728`.
 - **B2.** Folds over constant ranges, and the binder type. **Done** in
   `96c240b8`.
-- **B3.** Binding times and `Args`, records, structural counts, and families
-  of records iterated at instantiation. **Done**: records, binding times and
-  `Args` in `f002fb6a`; families and tuple `let`s in `e65a72e3` (B3's
-  second half).
+- **B3.** Binding times and `Args`, records, structural counts, and tuple
+  `let`s. **Done**: records, binding times and `Args` in `f002fb6a`; tuple
+  `let`s in `e65a72e3` (B3's second half).
+  - **Families are superseded** (JP, 2026-10-01: *"No arrays at all."*).
+    `e65a72e3` and `fe5913cc` also built families of records iterated at
+    instantiation: the `[R; N]` parameter (`Ty::Family`), the family
+    template, and the iteration's marker uniform.
+  - The companion code CL deletes them, with their tests,
+    `a_family_is_its_copies.rs` and `family_args_allocate_nothing.rs`.
+  - The marker also extended `Uniform`'s meaning without extending its
+    type. It is a uniform declared for the iteration alone, with a NaN
+    default, which emission recognizes by identity (`lower.rs`,
+    `Iteration`). It survives a splice and not a rewrite.
 - **B4.** `integral`, `area` and `monotone_root`. **Done** in `d9d759a4`,
   with review follow-ups in `68781e16`, and **deleted** with the integral
   (2026-09-29, §1.5): the syntax, its `sema` and lowering, the reserved
@@ -526,16 +614,11 @@ and no digests are committed (one-pipeline §5, gate policy).
 - **B6.** **Withdrawn** with the integrals (§1.5, D19). It was: helpers as
   optimization units, a helper's integral closed once and instantiated.
   What it found about templates stands for whatever next optimizes one:
-  - Two units are closed, both through `ExprArena::splice_with`: a
-    helper's template over its parameters, and a family's template over
-    its shared terms and its element. For §1.7's glyph they coincide: the
-    family's body is `piece_term(p, x, y)`, whose element `p` and inputs
-    `x`, `y` are the helper's parameters.
-  - A family's iteration is lowered as `body + marker`, which survives a
-    splice and not a rewrite: reassociated, `t + (body + marker)` reads as
-    an iteration of `t + body`. Nothing optimizes one today (B3 pins it);
-    before B6 closes a template, key the iteration by a handle a rewrite
-    cannot move.
+  - A helper's template is closed over its parameters through
+    `ExprArena::splice_with`.
+  - Its findings about a family's template are superseded with the
+    families (B3). Those were the template over shared terms and an element,
+    the iteration lowered as `body + marker`, and nesting innermost first.
   - A template's inputs are `Uniform` leaves, and a uniform's variance is
     constant on the lattice (`variance.rs`, "a uniform is here"). An input
     stands for any term the copies share, `x = X + ½` included. That is
@@ -545,31 +628,35 @@ and no digests are committed (one-pipeline §5, gate policy).
     price `x`-dependent work as per-call. Before extracting in a template,
     seed each input's variance from the term it stands for, or give a
     template's input a leaf meaning of its own.
-  - Close templates innermost first (§1.8): a template whose body iterates
-    a family holds its inner copies and is built per instantiation.
 - **B7.** The equivalence gate: one glyph built by `kernel!` and by the
   builder gives the same pixels over ASCII at 7, 16 and 32 px.
 
 ### Phase C: the font is written in `kernel!`
 
-- **C1.** The §1.7 block: one program per `N` per tile extent, the glyph
-  its uniforms.
+- **C1.** The §1.7 block and the host's walk: one font program per zoom
+  level. It is built first for Noto's ASCII at one size: per-glyph units
+  (O1), the id tree, and one call per cell.
+  - It waits on O1's link, and on D-a or O2's interim answer.
   - The gates are `glyph_exact_area`, `glyph_area_edge_cases`,
     `freetype_oracle`, `glyph_optimizes_estimate_free` and the goldens.
     (`glyph_is_closed` also pinned that no glyph held an integral, which
     the IR can no longer express; the rest of it is
     `glyph_optimizes_estimate_free`.)
-  - Re-baselined pins go in their own commit.
-- **C2.** The frame calls `glyph::<N>` per cell. The atlas,
-  `CachedGlyph`/`CachedText` and `BilinearSampler` go (D10). A zoom
-  recompiles.
-  - Measure the frame against today's before switching: 80×24 and 200×60,
-    at 16 and 32 px.
-  - The unpinned classical cap (`7aba74a7`) costs the family shape: a
-    `glyph::<64>` bakes in 376 → 897 ms on AVX-512 (415 → 806 ms on AVX2),
-    code +15–20%, for an extraction within 1.2e-7 of the fold's. The
-    per-cell program pays that once per `N` per zoom; measure it with the
-    frame.
+  - Re-baselined pins go in their own commit. The atlas's bilinear read
+    goes, so pixels move wherever density ≠ 1 (one-pipeline §1.6).
+- **C2.** The frame calls the font program per cell. The atlas,
+  `CachedGlyph`/`CachedText` and `BilinearSampler` become the font program
+  and go (D10). A zoom recompiles.
+  - **Gate: measure before deleting (O4).** Measure the frame against
+    today's at 80×24 and 200×60, at 16 and 32 px, on both x86 tiers, and
+    measure a zoom's compile. If 200×60 at 32 px misses 16.7 ms, that goes
+    to JP before the atlas is deleted.
+  - The unpinned classical cap (`7aba74a7`) costs a glyph of copies. B3's
+    family `glyph::<64>` bakes in 376 → 897 ms on AVX-512 (415 → 806 ms on
+    AVX2), with code +15–20%, for an extraction within 1.2e-7 of the
+    fold's. **I:** a glyph composed of 64 `one_piece` instances is the same
+    sum. The font program pays that once per glyph per zoom; measure it
+    with the frame.
 - **C3.** The glyph's tests move onto `kernel!`.
 - **C4.** `text()` and `run` (Q3).
 
@@ -603,20 +690,89 @@ and no digests are committed (one-pipeline §5, gate policy).
 
 ## 4. Open questions for JP
 
-**Q1. Answered (JP):** no tables; the control points are uniforms; the
-program is the kernel for a glyph's number of control points; `if` and
-bounding; recompile on zoom; caching later (§1.6–§1.8).
+**Q1. Answered (JP):** one program per font per zoom level; no tables; the
+control points are uniforms; `if` and bounding; recompile on zoom; caching
+later (§1.6–§1.8). And, 2026-10-01: no arrays at all (§1.3). What the
+answers leave open is O1–O4.
+
+**Open for JP (2026-10-01).** The documents do not settle these four. Each
+is recorded as open, not decided. The recommendations are inferences (I).
+
+**O1. The font is too big for one e-graph or one emit.**
+- **Evidence.**
+  - §1.8: Noto's ASCII is 1,625 pieces (F), so about 160k classes are
+    inserted before any rule fires (I, from 3,324 for a 32-piece glyph, F).
+    `HARD_CLASS_LIMIT` is 100k (`graph.rs:489`), and the classical ceiling
+    is 50k (`7aba74a7`).
+  - Emission is superlinear: 7 ms at 8 pieces and 4.4 s at 189 (F).
+  - `60f701c4` §1.8 reached the same fix: each glyph is its own unit,
+    linked by the `if` tree.
+  - Composition only inlines. `P` as one-pipeline §1.1 denotes it begins
+    with `expand_refs`, and composition-is-linking's title is "the linker
+    only inlines".
+- **Recommendation.**
+  - Make the unit a property of `P`. Saturate and extract each glyph by
+    itself, in parallel, with the id tree the only term across units.
+  - Build that link as its own CL before C1.
+  - Then measure, in C1, whether the units are emitted as one program
+    (which needs X1 for a linear emit) or as separate code joined by
+    calls. Do not guess it now.
+
+**O2. The composition surface.**
+- **Evidence.**
+  - The language composes across blocks only through kernel-typed
+    arguments (D6). Those are D-a, which is not built: sema has no kernel
+    type, and the parser refuses `impl Fn` (`parser.rs:602`).
+  - The builder composes today, and §1.1 says it is not a surface.
+  - The walk is host work because the font is runtime data (§1.1, §1.7). A
+    bundled font's walk could run at build time instead (Phase E).
+- **Recommendation.**
+  - Build D-a before C1, so the host composes `kernel!` entries and the
+    builder never becomes the font's surface.
+  - If C2's measurement (O4) must come first, a builder prototype outside
+    the tree is enough to measure, and is then deleted.
+  - Keep the walk at runtime. Phase E declares a bundled font's instances
+    later (Q4).
+
+**O3. Binding a composed program.**
+- **Evidence.**
+  - An entry's `Args` streams its values by position (`set_declared`), and
+    the only check is the count (§1.4, "Which program is not yet a type").
+  - A composed program's slots are the flattening of every instance's.
+    Uniform-slot-identity §3 calls the link step that flattening.
+  - `Uniform` handles, which bind by identity, leave the public surface
+    (D16).
+  - No document says how the host finds each piece's ten slots in the
+    font's block, or how a cell writes its six without rewriting the font's
+    16k (A4).
+- **Recommendation.**
+  - The walk that composes the font returns, with the program, where each
+    instance's slots landed.
+  - The font's values are written once per font and zoom, and a cell's per
+    call.
+  - Tie the block to the composed program by type (§1.4's follow-up)
+    before C2. One font's values written into another font's block bind
+    silently and draw plausible wrong pixels.
+
+**O4. The frame budget.**
+- **Evidence.**
+  - One-pipeline §6 measured a frame with no atlas: a host loop over cells,
+    calling per-`N` `U_band` programs. At 200×60 and 32 px it took
+    84.4 / 22.9 ms (1 / 4 threads) on AVX-512 and 50.3 / 20.0 ms on AVX2,
+    against 16.7 ms. 80×24 at 16 px fit (6.9 / 2.8 and 4.1 / 1.6 ms).
+  - It was measured at `8b7b75a`, before the closed form (`4202a5aa`), and
+    it calls itself "a bound on the direction, not on this plan".
+  - One-pipeline's Q3 recommended keeping the atlas until D1. JP's atlas
+    sentence and Q1 ruling replace it with the font program (D10).
+- **Recommendation.**
+  - Measure the font program before deleting the atlas (C2's gate).
+  - If 200×60 at 32 px misses 16.7 ms, bring JP the numbers and the two
+    levers, caching (JP's "later") or D1 placement, before anything is
+    deleted.
 
 **Q2. Syntax vetoes.** The syntax choices are yours:
 - the items block with `pub fn` entries;
 - `(0..N).map(|i| …).sum()`;
-- iterating a family at instantiation: **chosen in B3, pending your veto**,
-  `pieces.into_iter().map(|p| …).sum()` and the other five reductions, as
-  `(0..N)` has them. Rust's own spelling, so the block's items compile as
-  Rust and rustc is the oracle: `into_iter()` on an array yields elements by
-  value, and `p` passes to a helper taking `Row`. The placeholder
-  `pieces.map(…)` is an array's own `map` in Rust, which returns an array
-  and has no `.sum()`;
 - `if` as the only choice;
 - `const` parameters as structural;
 - `DX(e)`.
@@ -626,7 +782,7 @@ delete them. A string of glyphs is a sequence of per-cell calls, the same
 path as the terminal.
 
 **Q4. AOT's first user.** **Recommendation:** a bundled font at declared
-pixel sizes: its `N`s and tile extents are known at build time.
+pixel sizes: its glyphs and tile extents are known at build time.
 
 **Q5. CLAUDE.md.** These lines codify the builder or construction-time
 unrolling: 17, 19, 173, 176, 209–217, 244–249, 520–529, 558 and 566–568.
