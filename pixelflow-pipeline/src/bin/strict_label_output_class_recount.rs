@@ -154,6 +154,7 @@ fn render_chosen(eg: &EGraph, choices: &[Option<usize>], class: EClassId) -> Str
         ENode::Buffer(_) => "buf".to_string(),
         ENode::Uniform(_) => "uniform".to_string(),
         ENode::Param(i) => format!("p{i}"),
+        ENode::Ref { key, .. } => format!("unit{:016x}", key.bits()),
         ENode::Op { op, children } => {
             let kids: Vec<String> = children
                 .iter()

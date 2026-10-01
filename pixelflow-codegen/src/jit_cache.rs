@@ -54,7 +54,7 @@ use crate::CompiledKernel;
 use crate::emit;
 use crate::error::CompileError;
 use pixelflow_ir::LatticeShape;
-use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, ExprNode, UniformDecl};
+use pixelflow_ir::arena::{BufferDecl, ExprNode, UniformDecl};
 use pixelflow_ir::key::{Canonical, canonical};
 
 static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Arc<CompiledKernel>>>> = OnceLock::new();
@@ -98,31 +98,27 @@ pub struct Linked {
 /// Compile a [`Kernel`](pixelflow_ir::Kernel) for a lattice of the given `shape`.
 pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Linked, CompileError> {
     let (arena, root) = kernel.parts();
-    // References first, before the key or the link is read off anything. A
-    // `Ref` is a leaf whose body — and whose buffer and uniform declarations
-    // — are not in this arena, so a key taken here would name a kernel other
-    // than the one that gets emitted, and the link handed back would be
-    // missing every slot the referent reads. Expanding *is* the linker
-    // (docs/plans/2026-09-09-composition-is-linking.md §3), and it makes
-    // "a reference is a kernel" true at this boundary rather than only in the
-    // algebra: `Manifold::compile` needs to know nothing about it.
+    // The link tables, and the key, are read off the kernel with every
+    // reference expanded. A `Ref` is a leaf whose body — and whose buffer and
+    // uniform declarations — are not in this arena, so a key taken off the
+    // arena alone would name a kernel other than the one that gets emitted,
+    // and the link handed back would be missing every slot the referent
+    // reads. Slot order is ABI, and a unit's uniforms are slots.
     //
     // Guarded rather than called unconditionally: the pass's own identity
     // path still clones the arena, and this runs on every compile including
     // the cache hits.
-    let expanded = arena
-        .nodes()
-        .any(|(_, n)| matches!(n, ExprNode::Ref(_)))
-        .then(|| pixelflow_ir::passes::expand_refs_owned(arena, root));
-    let (arena, root) = match &expanded {
+    let holds_a_ref = arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_)));
+    let expanded = holds_a_ref.then(|| pixelflow_ir::passes::expand_refs_owned(arena, root));
+    let (linked_arena, linked_root) = match &expanded {
         Some((linked, linked_root)) => (linked, *linked_root),
         None => (arena, root),
     };
     let Canonical {
-        mut key,
+        key: expanded_key,
         buffers,
         uniforms,
-    } = canonical(arena, root);
+    } = canonical(linked_arena, linked_root);
 
     // Optimize, link, then emit. This is not a step callers get to sequence:
     // an arena reaching a backend unoptimized is never what anyone wanted,
@@ -131,10 +127,17 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // with no CSE and no FMA fusion. It is inside the compile entry because
     // that is the only place it cannot be forgotten.
     //
-    // It bails to the arena as given for constructs the e-graph does not
-    // model (`egraph::insert`'s `Declined`: a `Guard`, a `Param`, an op
-    // `Vocabulary::Runtime` does not resolve, such as a `RawGather`); those
-    // still compile, just without the extra fusion. A `Reduce` is modelled —
+    // The optimizer is handed the arena *as written*, references and all: a
+    // reference is a unit, optimized by itself and linked back in after
+    // extraction (`pixelflow_search::runtime`'s units;
+    // docs/plans/2026-09-25-the-language-is-kernel.md §4, O1).
+    //
+    // It bails for constructs the e-graph does not model
+    // (`egraph::insert`'s `Declined`: a `Guard`, a `Param`, an op
+    // `Vocabulary::Runtime` does not resolve, such as a `RawGather`) in a
+    // term with no unit; those still compile — from the *expanded* arena, so
+    // a reference never reaches the emitter — just without the extra fusion,
+    // and saturation telemetry records the decline. A `Reduce` is modelled —
     // it enters the e-graph as itself, and a fold extraction keeps is
     // emitted as a loop.
     //
@@ -142,12 +145,12 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // key was built from — extraction redeclares identities in its own
     // walk order — without touching a node, so the bytes of a kernel that
     // declares neither a buffer nor a uniform are exactly what they were.
-    let emit_fn = |arena: &ExprArena, root: ExprId| {
+    let emit_fn = || {
         let optimized = pixelflow_search::runtime::optimize_runtime_arena(arena, root, shape);
         let (arena, root) = optimized
             .as_deref()
             .map(|(a, r)| (a, *r))
-            .unwrap_or((arena, root));
+            .unwrap_or((linked_arena, linked_root));
         if buffers.is_empty() && uniforms.is_empty() {
             return emit::compile(arena, root, shape);
         }
@@ -158,7 +161,11 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // Keyed on the arena *as handed in*, before optimization, plus the shape.
     // Optimization is a deterministic function of those two, so equal inputs
     // yield equal output and a hit skips the saturation as well as the codegen.
-    key.extend_from_slice(&shape.key_bytes());
+    let key = cache_key(
+        expanded_key,
+        shape,
+        holds_a_ref.then(|| canonical(arena, root).key),
+    );
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(hit) = cache.lock().expect("jit_cache: lock poisoned").get(&key) {
         return Ok(Linked {
@@ -171,7 +178,7 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // Compile outside the lock so concurrent distinct-kernel constructions
     // don't serialize. A racing duplicate compile wastes work; the first
     // insertion wins so all callers share one region.
-    let result = emit_fn(arena, root)?;
+    let result = emit_fn()?;
     let compiled = Arc::new(CompiledKernel::new(result.code, shape));
     let mut guard = cache.lock().expect("jit_cache: lock poisoned");
     let kernel = guard.entry(key).or_insert(compiled).clone();
@@ -180,6 +187,45 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
         buffers,
         uniforms,
     })
+}
+
+/// The first byte of a key whose kernel names units. No node encoding
+/// starts with it (`pixelflow_ir::key`'s tags are small), so such a key never
+/// equals the key of a kernel without one.
+const UNIT_PROGRAM_TAG: u8 = 0xff;
+
+/// The compile cache's key: what the code is a function of.
+///
+/// Without units that is the expanded kernel's structure and the shape —
+/// unchanged from before units existed. **With units it is also where they
+/// are.** The expanded structure cannot say: `body` and `body.by_ref()`
+/// expand alike and are different programs, since a unit is optimized by
+/// itself, so on that key whichever compiled first would answer for both and
+/// the bytes would depend on compile order. `as_written` — the kernel's own
+/// canonical bytes, in which a `Ref` is its referent's identity — says it.
+/// Laid out tag, the expanded key's length, the expanded key, the shape (a
+/// fixed width), then `as_written`, so two unit keys are equal only when all
+/// three are.
+///
+/// The cost of keying on identity, recorded in
+/// docs/plans/2026-09-25-the-language-is-kernel.md §4 O1: a unit's identity
+/// digests the uniforms it was minted with, so a font rebuilt over fresh
+/// uniforms is a new entry here, where the same structure without units
+/// would hit. A structural key that walks through the units is the caching
+/// JP has deferred.
+fn cache_key(expanded: Vec<u8>, shape: LatticeShape, as_written: Option<Vec<u8>>) -> Vec<u8> {
+    let Some(as_written) = as_written else {
+        let mut key = expanded;
+        key.extend_from_slice(&shape.key_bytes());
+        return key;
+    };
+    let mut key = Vec::new();
+    key.push(UNIT_PROGRAM_TAG);
+    key.extend_from_slice(&(expanded.len() as u64).to_le_bytes());
+    key.extend_from_slice(&expanded);
+    key.extend_from_slice(&shape.key_bytes());
+    key.extend_from_slice(&as_written);
+    key
 }
 
 /// Number of distinct kernels interned so far (test/telemetry hook).
@@ -195,7 +241,7 @@ pub fn entry_count() -> usize {
 mod tests {
     use super::*;
     use pixelflow_ir::Kernel;
-    use pixelflow_ir::arena::{BufferIdentity, UniformIdentity};
+    use pixelflow_ir::arena::{BufferIdentity, ExprArena, UniformIdentity};
     use pixelflow_ir::fold::{Binder, Fold, Monoid};
     use pixelflow_ir::kind::OpKind;
 

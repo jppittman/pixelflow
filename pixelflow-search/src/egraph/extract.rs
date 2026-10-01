@@ -924,7 +924,8 @@ pub fn extract<C: CostFunction>(
                     | ENode::Const(_)
                     | ENode::Buffer(_)
                     | ENode::Uniform(_)
-                    | ENode::Param(_) => costs.node_cost(node, None),
+                    | ENode::Param(_)
+                    | ENode::Ref { .. } => costs.node_cost(node, None),
                     // A fold is, for costing, a node with one child: its
                     // metadata is not an operand, so `children_slice` is the
                     // whole of what this arm needs to know about either.
@@ -1363,6 +1364,16 @@ pub fn choices_to_arena(
                         // thing in the destination arena, and the builder
                         // substitutes it there.
                         let expr_id = arena.embed(Shape::Param(*i));
+                        if idx < id_map.len() {
+                            id_map[idx] = Some(expr_id);
+                        }
+                        result_stack.push(expr_id);
+                    }
+                    ENode::Ref { key, .. } => {
+                        // A unit comes back as its name: its body is
+                        // optimized by itself and linked after extraction
+                        // (`pixelflow_ir::passes::link`).
+                        let expr_id = arena.embed(Shape::Ref(*key));
                         if idx < id_map.len() {
                             id_map[idx] = Some(expr_id);
                         }
@@ -2307,6 +2318,7 @@ fn canonical_key(egraph: &EGraph, node: &ENode) -> (u8, u128, usize, Vec<u32>) {
         // The fold *is* the discriminating part: two folds over one body
         // differ only in their metadata, so that is what orders them.
         ENode::Reduce { fold, .. } => (6, fold.to_bits(), children.len(), children),
+        ENode::Ref { key, .. } => (7, u128::from(key.bits()), 0, children),
     }
 }
 
@@ -2611,7 +2623,8 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for TreePricer<'_,
             | ENode::Const(_)
             | ENode::Buffer(_)
             | ENode::Uniform(_)
-            | ENode::Param(_) => own,
+            | ENode::Param(_)
+            | ENode::Ref { .. } => own,
             // Saturating fold, not `.sum()`: a child's own cost can already
             // sit at a prohibitive sentinel (the `usize::MAX / 4`
             // `CostModel::node_op_cost` gives a fold whose monoid has no
@@ -3265,7 +3278,8 @@ mod tests {
                     | ENode::Const(_)
                     | ENode::Buffer(_)
                     | ENode::Uniform(_)
-                    | ENode::Param(_) => own,
+                    | ENode::Param(_)
+                    | ENode::Ref { .. } => own,
                     ENode::Op { .. } | ENode::Reduce { .. } => {
                         let children = node.children_slice();
                         if children.iter().any(|&c| egraph.find(c) == canonical) {
@@ -4620,7 +4634,8 @@ mod tests {
                 | ENode::Const(_)
                 | ENode::Buffer(_)
                 | ENode::Uniform(_)
-                | ENode::Param(_) => 0,
+                | ENode::Param(_)
+                | ENode::Ref { .. } => 0,
             }
         }
     }

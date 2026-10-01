@@ -6,8 +6,10 @@
   one program per font per zoom level, there are no tables, the control
   points are uniforms, and `select` is renamed `if` (§1.6, §1.7). Revised
   again 2026-10-01: no arrays (below). Phases A and B are done but B7; Phase C waits on O1–O4.
-  2026-10-01: JP answered O1 and O2 "Yes and yes". D-a, the O2 half, is
-  done (this commit).
+  2026-10-01: JP answered O1 and O2 "Yes and yes". Both are built: D-a,
+  the O2 half (`feat(compiler): kernel-typed parameters, applied as
+  contramap`), and O1, each glyph its own optimization unit in `P`
+  (`feat(search): a named kernel is its own optimization unit`; §4, O1).
 - **No arrays** (2026-10-01). JP: *"Why do we have any arrays at all?"*
   and *"No arrays at all.. please go read recent docs about how this ought
   to work."*
@@ -450,7 +452,7 @@ font loaded at runtime), and the language has no collection to hold it
 That is the whole font program. The tree is the partition that `if` and
 bounding make (§1.6). It is not a table, and the host chooses no program.
 
-**The composition surface (O2) is built** (D-a, this commit). The host
+**The composition surface (O2) is built** (D-a, `7706e4b7`). The host
 composes a glyph from `kernel!` entries alone: one `one_piece` instance
 per piece, summed by `sum2` as a balanced tree, and `glyph(ink, bounds)`
 over the sum. Nothing of the builder is on that path (F,
@@ -463,8 +465,10 @@ tree is not built, and its shape is still the font's (C1).
 
 **Two things about it are open:**
 - **The units (O1).** The font is too big for one e-graph or one emit
-  (§1.8). So each glyph is its own unit, and the id tree links them. The
-  link that keeps a unit separate is not built.
+  (§1.8). So each glyph is its own unit, and the id tree links them.
+  **Built** (O1): a glyph composed by name (`by_ref`) is saturated and
+  extracted by itself and linked into the tree after extraction. Emission
+  is still one program, and superlinear (§4, O1).
 - **Binding (O3).** The host writes each instance's uniforms into the
   composed program's block. No document says how it finds their slots.
 
@@ -530,26 +534,28 @@ piece was its own integral, went with the integral (§1.5).
 1. **Size (O1).** One font program is too big for one e-graph or one emit.
    - Noto's ASCII has 1,625 pieces (F).
    - A 32-piece glyph inserts 3,324 classes (F, `7aba74a7`), about 100 a
-     piece. **I:** the font inserts about 160k classes before any rule
-     fires. That is over `HARD_CLASS_LIMIT` (100k, `graph.rs:489`) and
-     three times the classical ceiling (50k, `7aba74a7`).
+     piece. The font inlined inserts **169,263** classes before any rule
+     fires (F, O1's measurement; the inference here was about 160k). That
+     is over `HARD_CLASS_LIMIT` (100k, `graph.rs`) and three times the
+     classical ceiling (50k, `7aba74a7`).
    - Emission is superlinear. One glyph's program emits in 7 ms at 8 pieces
      and 4.4 s at 189 (F, `U_band`, measured at `8b7b75a`).
    - Code is about 1.5 KB a piece (F: `U_band`, 279 KB at 189 pieces).
-     **I:** about 2.4 MB for ASCII.
+     ASCII's 94 inked glyphs, each emitted alone, are 2.58 MB (F, O1).
    - **Fix: each glyph is its own unit of optimization, and the id tree
-     links them**, as `60f701c4` had it. The largest glyph, 189 pieces, is
-     about 19k classes, under both caps (I, at the same rate).
-   - **The link is not built.** `P`, as one-pipeline §1.1 denotes it,
-     expands every reference before it optimizes (`expand_refs`), and
-     composition-is-linking's linker "only inlines". A link that keeps a
-     glyph a separate unit has to be built (O1).
+     links them**, as `60f701c4` had it. **Built** (O1). The largest Noto
+     ASCII glyph is `@`, 56 pieces, and inserts 5,796 classes (F, O1); the
+     189-piece glyph above is `U_band`, not an ASCII glyph.
 2. **Zoom latency.** A zoom recompiles every glyph.
    - (I, measured on B3's family `glyph::<64>`) a 64-piece glyph bakes in 806–897 ms under the unpinned cap (C2),
      and one of 189 pieces emits in 4.4 s. So a zoom level takes seconds
      on one thread.
    - **Fix:** glyphs are independent units, so compile them in parallel,
      and emit arms as blocks (X1) to remove the superlinear emit.
+     - Built for optimization (O1): units saturate and extract in
+       parallel, and a glyph structure saturates once per process, so a
+       second zoom level optimizes the ASCII font in 0.8–1.4 s with no
+       saturation (F). Emission is still one program, and is the cost.
    - "We'll make computing the programs fast, and focus on the caching
      later" (JP).
 
@@ -658,7 +664,7 @@ and no digests are committed (one-pipeline §5, gate policy).
   `f32` const) are gone, and so is `ExprArena::close_over`'s refusal of a
   fold its caller declined.
 - **B5.** Lowering calls `pixelflow-ir`'s definitions, and `lower.rs`'s
-  copies go. **Done** (this commit): `library`'s `fract`, `hypot`, `clamp`
+  copies go. **Done** in `b6d39fc3`: `library`'s `fract`, `hypot`, `clamp`
   and `derivative`, written once over the sites a term is built in and
   built through by `Kernel`'s methods, lowering and the integrals' closed
   forms; `Axis`; `ExprArena::close_over` and `Placeholder`; the 2²⁴ bound
@@ -717,7 +723,7 @@ and no digests are committed (one-pipeline §5, gate policy).
 ### Phase D: the builder goes internal
 
 - **D-a.** Kernel-typed parameters, with the capture-avoiding splice (D4).
-  **Done** (this commit). See O2's answer for what was built.
+  **Done** in `7706e4b7`. See O2's answer for what was built.
 - **D-b.** Record returns, `u32` bits, and the packed frame.
 - **D-c.** Scenes, ML and the runtime examples move onto `kernel!`.
 - **D-d.** The fluent constructors leave `Kernel`. Graphics and runtime drop
@@ -753,28 +759,161 @@ answers leave open is O1–O4.
 **Open for JP (2026-10-01).** The documents do not settle these four. Each
 is recorded as open, not decided. The recommendations are inferences (I).
 
-**O1. The font is too big for one e-graph or one emit.**
+**O1. The font is too big for one e-graph or one emit.** **Answered (JP,
+2026-10-01): yes** — each glyph is its own optimization unit, linked by the
+id tree, built into `P` before C1. Built (`feat(search): a named kernel is its own optimization unit`); below the evidence.
 - **Evidence.**
   - §1.8: Noto's ASCII is 1,625 pieces (F), so about 160k classes are
-    inserted before any rule fires (I, from 3,324 for a 32-piece glyph, F).
-    `HARD_CLASS_LIMIT` is 100k (`graph.rs:489`), and the classical ceiling
-    is 50k (`7aba74a7`).
+    inserted before any rule fires (I, from 3,324 for a 32-piece glyph, F;
+    measured since: 169,263). `HARD_CLASS_LIMIT` is 100k (`graph.rs`), and
+    the classical ceiling is 50k (`7aba74a7`).
   - Emission is superlinear: 7 ms at 8 pieces and 4.4 s at 189 (F).
   - `60f701c4` §1.8 reached the same fix: each glyph is its own unit,
     linked by the `if` tree.
   - Composition only inlines. `P` as one-pipeline §1.1 denotes it begins
     with `expand_refs`, and composition-is-linking's title is "the linker
     only inlines".
-- **Recommendation.**
-  - Make the unit a property of `P`. Saturate and extract each glyph by
-    itself, in parallel, with the id tree the only term across units.
-  - Build that link as its own CL before C1.
-  - Then measure, in C1, whether the units are emitted as one program
-    (which needs X1 for a linear emit) or as separate code joined by
-    calls. Do not guess it now.
+- **The recommendation JP accepted.** Make the unit a property of `P`:
+  saturate and extract each glyph by itself, in parallel, with the id tree
+  the only term across units; build that link as its own CL before C1; and
+  measure in C1 whether the units are emitted as one program (which needs
+  X1 for a linear emit) or as separate code joined by calls.
+- **What was built (`feat(search): a named kernel is its own optimization unit`).**
+  - **The denotation.** `P(k, s, t) = emit_t ∘ legalize_t ∘ L_s(k)`, with
+    `L_s(t) = link(Ô_s(t), r ↦ L_s(body r))` and `Ô_s = extract_s ∘
+    saturate ∘ insert°`, where `insert°` holds each unit as a leaf. **Law
+    U:** `⟦L_s(k)⟧ = ⟦expand_refs(k)⟧`, by induction over the units: a
+    unit leaf carries its referent's variance, the one fact a rule reads off
+    a leaf; a unit is closed over the coordinates, so its context cannot
+    change what it reads (a fold around it may share its slot, and the
+    inner fold shadows, as every pass already respects); and the link
+    substitutes equals for equals. The proof and the mechanism are in
+    `pixelflow_search::runtime`'s module docs.
+  - **What marks a unit: a `Ref`** (`Kernel::by_ref`). It already denotes
+    "this kernel, named by content", no shipped kernel makes one, and the
+    host's walk chooses the granularity: it names each glyph, and the
+    pieces stay inlined, which is where a glyph's CSE is.
+    - Rejected: a new node or a flag on `Ref` (two names for one thing);
+      one unit per piece (1,625 units of about 100 classes, losing each
+      glyph's CSE); and reading the units off the DAG as the arms of every
+      `If` whose mask is frame-uniform. That last needs no marker and
+      keeps the compile key a function of `k`, but it imposes a boundary on
+      every program with a uniform `If`, chosen by a structural heuristic
+      rather than by the program, which moves the bytes of kernels that
+      asked for nothing; and the opaque leaf is needed anyway where the
+      term around the font is not an `If` (D-b's blend), so it would be a
+      second marker beside the first.
+  - **How a unit is optimized:** by the same stages, through the same
+    structure-keyed cache, so a glyph that recurs across fonts, zoom levels
+    or programs saturates once. That cache now holds one in-flight slot per
+    structure, so concurrent units never saturate one structure twice.
+    Units run on scoped workers pulling from one index; the result lands by
+    index and the link walks the term's own order, so the worker count
+    cannot reach the program (pinned node for node at 1 and 4 workers).
+  - **How the term around the units treats one:** as an opaque leaf
+    (`ENode::Ref { key, variance }`), admitted by the unit walk
+    (`EGraph::admit_unit`, crate-private; every other path still declines
+    a reference), priced 0. That price is right for a form that mentions a
+    unit twice (the link splices it once) and blind to a rewrite that
+    changes how often one is evaluated; the font's outer term is an id
+    tree and offers no such choice. A unit is still hoisted out of a fold
+    it does not read, on its variance (pinned).
+  - **When units are linked:** after extraction, before legalization, by
+    one walk shared with `expand_refs` (`passes::link`, the one new public
+    function: the runtime tier links optimized bodies through it rather
+    than through a copy). `lower_dwrt` runs once, on the linked program.
+    Emission stays one program.
+  - **A reference a `Dwrt` reaches is no unit:** it is linked as written
+    before insertion, so the chain rule runs in the graph as before
+    (pinned: `∂(x²)/∂x` through a name).
+  - **A decline narrows.** A unit the e-graph cannot hold is linked as
+    written while the rest optimize, and saturation telemetry records every
+    decline (`record_decline`). The compile falls back to the *expanded*
+    arena when nothing optimized, so a `Ref` never reaches the emitter.
+  - **Shape** enters as before: every unit and the term around them are
+    extracted at the program's shape, per call; saturation is shape-free.
+  - **The compile key names where the units are.** `body` and
+    `body.by_ref()` expand alike and are different programs, so the key of
+    a program of units appends its own canonical bytes, in which a `Ref` is
+    its referent's identity. Without a `Ref` the key is unchanged.
+- **Measured (F; release, AVX-512, 4 threads; Noto Sans Mono ASCII, the
+  §1.7 composition: one `one_piece` instance per piece over its ten
+  uniforms, summed under each glyph's box, each glyph a unit, under a
+  balanced id tree; 16 px).**
+  - 94 inked glyphs, 1,625 pieces, 35 distinct piece counts; the largest
+    glyph is `@`, 56 pieces.
+  - Inlined, the program inserts 169,263 classes and stops on the class
+    cap after 0 rounds: no rule fires anywhere in the font, and its
+    optimization (2.6 s) hands back the 169,263-node input.
+  - With units: **36 saturations** (35 glyph structures, since the control
+    points are uniforms, and the id tree), each under its own cap: the
+    largest, `@`, inserts 5,796 classes against a cap of 46,368 and stops
+    there after 2 rounds in 718 ms; the id tree inserts 374 and quiesces.
+    The 36 saturations sum to 5.9 s of CPU; **the whole font optimizes in
+    2.1–2.5 s wall clock** over two runs (walk, 36 saturations, 95
+    extractions, link).
+    The link gives 164,338 nodes against 169,263 inlined.
+  - A second zoom level in the same process (32 px) saturates nothing and
+    takes 0.8–1.4 s: extractions and the link.
+  - Emission as one program, through the whole compile (the units'
+    saturations already cached by the font's, the inlined subsets
+    saturating their own), units against inlined: 4 glyphs (70 pieces)
+    113,168 B in 0.64 s against 114,240 B in 1.28 s; 8 glyphs (157)
+    253,984 B in 4.0 s against 227,360 B in 4.3 s; 16 glyphs (232)
+    376,832 B in 12.3 s against 326,520 B in 13.5 s; 32 glyphs (599
+    pieces) with units, 970,028 B in 166 s. The 94 glyphs each emitted
+    alone are 2.58 MB in 2.7 s, the slowest `@` at 0.36 s.
+  - So units take the font from "nothing fires" to every glyph saturated
+    under its cap in 2.5 s, and **emitting the font as one program is
+    C1's problem**: it grows about cubically in the pieces (the design
+    measured 49 minutes for all 94 at `4b82a352` in a scratch crate), while
+    the same code emitted glyph by glyph is under 3 s. X1, or units emitted
+    as calls, is the lever; this CL decides neither.
+  - Bytes: at 8 and 16 glyphs the units program is 12–15% larger than the
+    inlined one (1% smaller at 4). The inlined runs there stopped on the class cap after one
+    round; each unit ran two. The latency prior minimizes cycles, not
+    bytes, so this is not a measured loss of speed; time per cell is C2's
+    measurement (O4).
+- **What is lost.** Rewriting across a unit's boundary: constants,
+  algebra, and CSE of equal-but-not-identical terms between a glyph and
+  its context, and hoisting part of a glyph. For the font the term around
+  the glyphs is the id tree and a cell runs one glyph, so nothing crossing
+  glyphs is on an executed path (I). Identical subterms still share: the
+  link splices into a hash-consed arena.
+- **Where the design was not followed, and why: the compile key names
+  units by value.** An adversarial review asked for a structural key that
+  walks through the units (a `refs` link table beside `buffers` and
+  `uniforms`, relinked like them). Without it:
+  - (a) a font rebuilt over fresh uniforms is a new compile-cache entry
+    (about 2.6 MB of code) where the same structure without units would
+    hit, and the cache never evicts;
+  - (b) a preloaded program (Phase E) cannot hit a run-time compile of a
+    program of units, because a build and a run mint different identities.
+  - It was kept because the store already grows the same way: `by_ref`
+    interns each glyph by value, and the store never evicts either, so a
+    structural compile key alone would not stop a rebuilt font from
+    growing the process. Both are the caching JP put later. An
+    over-specific key misses sharing and never shares wrongly. **Before
+    E1** a program of units needs the structural key (or E1 declares
+    instances without units).
+- **Left for others.**
+  - **D-a / C1: one application rule.** Units survive only if a glyph
+    reaches `P` as a reference. `Kernel::at` expands a reference at
+    construction, so a kernel-typed argument applied at exactly `(X, Y)`
+    must be spliced as it stands, not expanded, or the font reaches `P`
+    inlined and is emitted unoptimized with no error. Whichever of D-a and
+    C1 lands second adds the pin: a unit composed through the
+    application reaches `P` as a leaf, one telemetry record per unit.
+  - **C1's gate:** the font's largest saturation runs at least one round.
+    Today zero rounds is silent.
+  - **Who marks a unit after D-d** — `by_ref` on the opaque `Kernel`, or
+    the language (every kernel-typed argument, or an attribute on an
+    entry) — is JP's.
+  - composition-is-linking's L4 (inlining as an e-graph rule) is not built
+    and, for units, not wanted until C1 measures calls.
 
 **O2. The composition surface.** **Answered (JP, 2026-10-01): yes.** D-a
-is built before C1 (this commit), so the host composes `kernel!` entries
+is built before C1 (`7706e4b7`), so the host composes `kernel!` entries
 and the builder never becomes the font's surface.
 - **What was built.**
   - `impl Fn(f32, f32) -> f32` is a parameter type of an entry or a helper,

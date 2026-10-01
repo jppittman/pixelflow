@@ -909,10 +909,18 @@ impl Kernel {
     ///
     /// The tabulations `k` carries come along, so the data still travels with
     /// the value; the referent's arena, root and tables are reachable through
-    /// the key. Today every reference is inlined again by
-    /// [`expand_refs`](crate::passes::expand_refs) before anything else sees
-    /// it — the linker only inlines — so this changes what a kernel *costs to
-    /// build*, never what it means.
+    /// the key.
+    ///
+    /// **A name is an optimization unit.** The runtime tier
+    /// (`pixelflow_search::runtime::optimize_runtime_arena`) saturates and
+    /// extracts a referent by itself, holds it in the referring term as an
+    /// opaque leaf no rewrite reaches inside, and links the two after
+    /// extraction ([`link`](crate::passes::link)), so the emitter still sees
+    /// one program. That is how a font too big for one e-graph is optimized
+    /// a glyph at a time (docs/plans/2026-09-25-the-language-is-kernel.md §4,
+    /// O1). So this changes what a kernel *costs to build* and where the
+    /// optimizer's boundaries fall — which rewrites can cross the name —
+    /// never what it means.
     ///
     /// This is the only way a `Ref` node is produced — so it is also why a
     /// `no_std` build cannot hold one: the store a name is looked up in needs

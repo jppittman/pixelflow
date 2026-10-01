@@ -380,11 +380,14 @@ pub enum ExprNode {
     /// composition can hold instead of splicing a body in
     /// (docs/plans/2026-09-09-composition-is-linking.md); the referent lives
     /// in the [`KernelStore`](crate::store::KernelStore) and
-    /// [`expand_refs`](crate::passes::expand_refs) is what puts it back.
+    /// [`link`](crate::passes::link) is what puts it back — its body as
+    /// written ([`expand_refs`](crate::passes::expand_refs)), or as the runtime
+    /// tier optimized it by itself (a *unit*).
     ///
     /// A leaf with an identity of its own, like [`ExprNode::Buffer`]: it has
     /// no children in *this* arena, and every pass that reads structure must
-    /// either expand it or refuse it — never walk through it.
+    /// expand it, refuse it, or hold it as an opaque leaf the way the runtime
+    /// tier's e-graph holds a unit — never walk through it.
     Ref(KernelKey),
     Unary(OpKind, ExprId),
     Binary(OpKind, ExprId, ExprId),

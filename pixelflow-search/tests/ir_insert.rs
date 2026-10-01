@@ -169,10 +169,13 @@ fn a_param_is_held_by_the_macro_vocabulary_and_declined_by_the_runtime_one() {
     );
 }
 
-/// A reference is declined, not mishandled. `passes::expand_refs` runs before
-/// saturation in every pipeline, so one arriving here is a pipeline-order bug
-/// — and the e-graph must say so rather than insert a leaf it cannot rewrite,
-/// which would silently make an inlining rule look like it had nothing to do.
+/// A reference the graph was not told is a unit is declined, not mishandled.
+/// The runtime tier's unit walk admits each unit it holds the body of
+/// (`EGraph::admit_unit`, crate-private — its own test is in `insert.rs`), and
+/// only then does a `Ref` insert, as a leaf carrying its referent's variance.
+/// A graph nobody told — any vocabulary, any caller outside that walk — has no
+/// variance to give the leaf, and must say so rather than insert one it
+/// cannot reason about.
 #[test]
 fn a_reference_is_declined_by_every_vocabulary() {
     let named = Kernel::x().mul(&Kernel::constant(3.0)).by_ref();
@@ -242,11 +245,12 @@ fn a_write_and_a_seq_are_declined_by_every_vocabulary() {
     }
 }
 
-/// And the runtime tier as a whole does not decline it: `ExpandRefs` runs
-/// first, so what reaches the e-graph is the referent's body and the kernel
-/// optimizes exactly as the spliced composition does.
+/// And the runtime tier as a whole does not decline it: the referent is a
+/// unit, saturated and extracted by itself and linked back in, so its body is
+/// optimized exactly as the spliced composition's would be and no `Ref`
+/// survives into what the emitter gets.
 #[test]
-fn the_runtime_pipeline_expands_before_it_saturates() {
+fn the_runtime_pipeline_optimizes_a_named_body() {
     let body = Kernel::x().mul(&Kernel::constant(0.0)).add(&Kernel::y());
     let named = body.by_ref();
     let (arena, root) = named.parts();

@@ -2,9 +2,9 @@
 
 use super::ops::Op;
 use alloc::vec::Vec;
-use pixelflow_ir::Variance;
 use pixelflow_ir::arena::{BufferDecl, UniformDecl};
 use pixelflow_ir::fold::Fold;
+use pixelflow_ir::{KernelKey, Variance};
 
 /// Identifier for an equivalence class in the e-graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -76,6 +76,23 @@ pub enum ENode {
     /// Hash-consing therefore does what it should: two folds are one node iff
     /// they fold the same body, under the same algebra, over the same range.
     Reduce { fold: Fold, body: EClassId },
+    /// A **unit**: a kernel named by content, optimized by itself and linked
+    /// in after extraction (`crate::runtime`;
+    /// docs/plans/2026-09-25-the-language-is-kernel.md §4, O1). A leaf here,
+    /// opaque to every rule as a [`ENode::Uniform`] is: its body is not in
+    /// this graph, so no rewrite can reach inside it, and extraction hands
+    /// back the name.
+    ///
+    /// It carries `variance`, its referent's, because that is the one fact a
+    /// rule reads off a leaf — `FactorFold`'s side condition, and the binder
+    /// substitution `PeelFold`/`HalveFold` skip a binder-free class by — and
+    /// the one fact extraction prices a leaf's evaluations by. A unit is
+    /// closed (its variance names no binder), so every rewrite conditioned
+    /// on binder-invariance is the one it would be with the body inlined.
+    /// Only the runtime tier's unit walk admits one (`EGraph::admit_unit`);
+    /// [`insert`](super::insert) declines a reference the graph was not told
+    /// is a unit.
+    Ref { key: KernelKey, variance: Variance },
 }
 
 impl ENode {
@@ -131,7 +148,8 @@ impl ENode {
             | ENode::Const(_)
             | ENode::Buffer(_)
             | ENode::Uniform(_)
-            | ENode::Param(_) => &[],
+            | ENode::Param(_)
+            | ENode::Ref { .. } => &[],
             ENode::Op { children, .. } => children,
             ENode::Reduce { body, .. } => core::slice::from_ref(body),
         }
@@ -145,7 +163,8 @@ impl ENode {
             | ENode::Const(_)
             | ENode::Buffer(_)
             | ENode::Uniform(_)
-            | ENode::Param(_) => &mut [],
+            | ENode::Param(_)
+            | ENode::Ref { .. } => &mut [],
             ENode::Op { children, .. } => children,
             ENode::Reduce { body, .. } => core::slice::from_mut(body),
         }
@@ -181,6 +200,9 @@ impl ENode {
             ENode::Const(_) | ENode::Buffer(_) | ENode::Uniform(_) | ENode::Param(_) => {
                 Variance::CONST
             }
+            // A unit varies as its referent does, which the leaf carries
+            // because its body is not here to ask.
+            ENode::Ref { variance, .. } => *variance,
             ENode::Op { children, .. } => children
                 .iter()
                 .fold(Variance::CONST, |acc, &c| acc.union(child(c))),
@@ -223,6 +245,18 @@ impl PartialEq for ENode {
             // Identity and default, bitwise (`UniformDecl`'s own equality).
             (ENode::Uniform(a), ENode::Uniform(b)) => a == b,
             (ENode::Param(a), ENode::Param(b)) => a == b,
+            // The key is the referent; its variance is a function of it, so
+            // comparing both is comparing the key, checked.
+            (
+                ENode::Ref {
+                    key: k1,
+                    variance: v1,
+                },
+                ENode::Ref {
+                    key: k2,
+                    variance: v2,
+                },
+            ) => k1 == k2 && v1 == v2,
             (
                 ENode::Op {
                     op: op1,
@@ -280,6 +314,11 @@ impl core::hash::Hash for ENode {
                 6u8.hash(state);
                 fold.hash(state);
                 body.hash(state);
+            }
+            ENode::Ref { key, variance } => {
+                7u8.hash(state);
+                key.hash(state);
+                variance.hash(state);
             }
         }
     }

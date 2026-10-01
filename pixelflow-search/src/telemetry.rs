@@ -45,7 +45,7 @@
 use std::io::Write as _;
 use std::time::Duration;
 
-use crate::egraph::{CostModel, ExtractionReport, OptimizerStats, SaturationStop};
+use crate::egraph::{CostModel, Declined, ExtractionReport, OptimizerStats, SaturationStop};
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
 
 pub use crate::tier::Tier;
@@ -148,6 +148,25 @@ pub fn record(inv: SaturationInvocation<'_>) {
     write_line(inv.tier, &line);
 }
 
+/// Emit one JSONL record for a term the e-graph **declined**, saying why.
+///
+/// A decline is not an error — the term is compiled as written, which is
+/// always correct — but it is an optimization that silently did not happen,
+/// and under units it can happen per unit: one glyph holding a construct the
+/// graph does not model is linked unoptimized while the rest of the font
+/// optimizes (docs/plans/2026-09-25-the-language-is-kernel.md §4, O1). So it
+/// is a record, not a silence. Its shape differs from [`record`]'s — it has
+/// no budget, no stop and no extraction — and the `declined` field is what
+/// tells the two apart.
+pub(crate) fn record_decline(tier: Tier, declined: Declined) {
+    let line = format!(
+        "{{\"tier\":\"{tier}\",\"declined\":\"{reason}\"}}",
+        tier = tier.as_json_str(),
+        reason = escape_json(&format!("{declined:?}")),
+    );
+    write_line(tier, &line);
+}
+
 fn stop_str(stop: SaturationStop) -> &'static str {
     match stop {
         SaturationStop::Quiesced => "quiesced",
@@ -237,13 +256,13 @@ fn latency_prior_cost(arena: &ExprArena, root: ExprId) -> usize {
             | ExprNode::Param(_)
             | ExprNode::Buffer(_)
             | ExprNode::Uniform(_) => None,
-            // Not `None`: a reference's cost is its referent's, and pricing
-            // it at zero would put a silently wrong number in a measurement.
-            // Saturation never sees one — `egraph::insert` declines a `Ref`
-            // — so this arena cannot hold one either.
-            ExprNode::Ref(k) => panic!(
-                "latency_prior_cost: {k:?} — a reference has no cost of its own,                  and expand_refs runs before saturation, so one here means this                  arena never went through the pipeline"
-            ),
+            // A unit: a leaf of the term this saturation held, its body
+            // optimized and recorded by a saturation of its own
+            // (`crate::runtime`'s units). The record is of this term, so the
+            // unit costs nothing here — exactly as `CostModel` priced it to
+            // the extraction being recorded — and its own record carries
+            // what it costs.
+            ExprNode::Ref(_) => None,
             // A fold survives extraction; the legalizer unrolls it after.
             // Priced as the node it is, which is what `CostModel` says about
             // it — see `node_op_cost`'s note on why that is a sentinel.

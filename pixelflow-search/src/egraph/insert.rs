@@ -34,18 +34,22 @@ pub enum Declined {
     /// [`ENode::Param`](super::node::ENode::Param), because an unbound slot
     /// is what a builder *is*.
     Param(u8),
-    /// A kernel named by content. `passes::expand_refs` runs before saturation
-    /// in every pipeline, so one here is a pipeline-order bug rather than a
-    /// term the e-graph could learn to hold: a reference has no structure to
-    /// rewrite, and inlining it inside saturation is a rule that does not
-    /// exist yet (docs/plans/2026-09-09-composition-is-linking.md §3).
+    /// A kernel named by content, which the graph was not told is a unit.
+    ///
+    /// The runtime tier holds a reference as an opaque leaf when its unit
+    /// walk has admitted it (`EGraph::admit_unit`): the unit is optimized by
+    /// itself and linked after extraction
+    /// (docs/plans/2026-09-25-the-language-is-kernel.md §4, O1). Anything
+    /// else — the macro tier, a research tool, a reference no walk admitted —
+    /// meets a name with no structure to rewrite and no variance to read,
+    /// and declines it: inlining inside saturation is a rule that does not
+    /// exist (docs/plans/2026-09-09-composition-is-linking.md §3).
     Ref(pixelflow_ir::KernelKey),
     /// A `Guard` — the hard lowering of an `If`
     /// (docs/plans/2026-09-12-emit-should-just-emit.md). Declined for a
     /// reason specific to this stage (G1), not a standing one: extraction
     /// has no price for choosing a `Guard` over the `If` it is equal to,
-    /// so there is nothing yet for the e-graph to gain by holding one — the
-    /// same position `Ref` is in, but temporary rather than structural.
+    /// so there is nothing yet for the e-graph to gain by holding one.
     /// `Guard`'s arms name kernels the same way a `Ref` does, and are
     /// unrepresentable as e-graph structure for the same reason: nothing
     /// here can rewrite inside a name. G3 is what gives extraction a price
@@ -74,9 +78,10 @@ pub enum Declined {
 /// have substituted it, so one surviving is a term that was never
 /// specialized. Which vocabulary may hold which leaf is the job `Vocabulary`
 /// exists for, and saying it there is what stopped the macro tier from
-/// smuggling params past this gate disguised as `Var`s. A `Ref` declines
-/// under either, since its body is not in this term at all —
-/// `passes::expand_refs` puts it there, and runs first.
+/// smuggling params past this gate disguised as `Var`s. A `Ref` inserts as
+/// an opaque [`ENode::Ref`] leaf under [`Vocabulary::Runtime`] when the graph
+/// has admitted it as a unit (`EGraph::admit_unit`, which carries the
+/// variance its body is not here to give), and declines otherwise.
 ///
 /// **Reachable-only.** A term representation may hold nodes no longer reached
 /// from `root` — an arena accumulates construction garbage — and inserting
@@ -113,7 +118,12 @@ pub fn insert<I: Ir>(
                         Vocabulary::Templates => egraph.add(ENode::Param(i)),
                         Vocabulary::Runtime => return Err(Declined::Param(i)),
                     },
-                    Shape::Ref(key) => return Err(Declined::Ref(key)),
+                    Shape::Ref(key) => match (vocab, egraph.unit_variance(key)) {
+                        (Vocabulary::Runtime, Some(variance)) => {
+                            egraph.add(ENode::Ref { key, variance })
+                        }
+                        _ => return Err(Declined::Ref(key)),
+                    },
                     Shape::Guard { .. } => return Err(Declined::Guard),
                     Shape::Write { .. } => return Err(Declined::Write),
                     Shape::Buffer(decl) => egraph.add(ENode::Buffer(decl)),
@@ -204,4 +214,69 @@ pub fn reachable_count<I: Ir>(term: &I, root: I::Ref) -> usize {
         }
     }
     seen.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pixelflow_ir::{ExprArena, ExprId, Kernel, KernelKey, KernelStore, OpKind, Variance};
+
+    /// `Ref(named)·Y` over a fresh arena, the reference, and the key it names.
+    fn named_times_y() -> (ExprArena, ExprId, ExprId, KernelKey) {
+        let named = Kernel::x().mul(&Kernel::constant(5.5));
+        let key = KernelStore::intern(&named);
+        let mut arena = ExprArena::new();
+        let reference = arena.push_ref(key);
+        let y = arena.push_var(1);
+        let root = arena.push_binary(OpKind::Mul, reference, y);
+        (arena, root, reference, key)
+    }
+
+    /// A unit the graph admitted inserts as one opaque leaf, carrying the
+    /// variance it was admitted with — so the product over it varies with X
+    /// as well as Y, which nothing could have learned from the name.
+    #[test]
+    fn an_admitted_unit_is_a_leaf_carrying_its_variance() {
+        let (arena, root, reference, key) = named_times_y();
+        let mut eg = EGraph::new();
+        eg.admit_unit(key, Variance::X);
+        let product = insert(&arena, root, &mut eg, Vocabulary::Runtime).expect("admitted");
+        let leaf = insert(&arena, reference, &mut eg, Vocabulary::Runtime).expect("admitted");
+        assert!(
+            eg.nodes(leaf).iter().any(|n| matches!(
+                n,
+                ENode::Ref { key: k, variance } if *k == key && *variance == Variance::X
+            )),
+            "the leaf names the unit and carries its variance"
+        );
+        assert_eq!(eg.variance(product), Variance::X.union(Variance::Y));
+    }
+
+    /// Admission is the runtime tier's: under the macro tier's vocabulary a
+    /// reference still declines, admitted or not, as it does in a graph no
+    /// one told about it.
+    #[test]
+    fn only_the_runtime_vocabulary_holds_a_unit() {
+        let (arena, root, _, key) = named_times_y();
+        let mut admitted = EGraph::new();
+        admitted.admit_unit(key, Variance::X);
+        assert_eq!(
+            insert(&arena, root, &mut admitted, Vocabulary::Templates),
+            Err(Declined::Ref(key))
+        );
+        let mut untold = EGraph::new();
+        assert_eq!(
+            insert(&arena, root, &mut untold, Vocabulary::Runtime),
+            Err(Declined::Ref(key))
+        );
+    }
+
+    /// A unit is optimized out of its context, which is sound only for a
+    /// closed term: one reading a binder is refused at the door.
+    #[test]
+    #[should_panic(expected = "a unit must be")]
+    fn an_open_unit_is_refused() {
+        let key = KernelStore::intern(&Kernel::y().add(&Kernel::constant(0.75)));
+        EGraph::new().admit_unit(key, Variance::Y.union(Variance::BINDERS));
+    }
 }

@@ -110,8 +110,10 @@ pub enum Shape<'a, R> {
     Uniform(UniformDecl),
     /// A kernel named by content — a leaf here, because its body is in the
     /// [`KernelStore`](crate::store::KernelStore) and not in this term. An
-    /// e-graph insert declines one, for the reason it declines a `Param`:
-    /// there is no value to reason about until something resolves it.
+    /// e-graph insert holds one as an opaque leaf only when the graph was
+    /// told it is a unit and given its variance (the runtime tier's unit
+    /// walk), and otherwise declines it, for the reason it declines a
+    /// `Param`: there is nothing to reason about until something resolves it.
     ///
     /// (The `Ref` in [`Ir::Ref`] is unrelated — that is how a representation
     /// *names* one of its own nodes; this is a name for a whole kernel.)
@@ -136,9 +138,10 @@ pub enum Shape<'a, R> {
     /// `mask` is the one real child; `on`/`off` are content-addressed names,
     /// not terms in this language at all — the same leaf-of-a-whole-kernel
     /// deal as [`Shape::Ref`], and for the same reason: an e-graph `insert`
-    /// declines a `Guard` exactly as it declines a `Ref`, since there is no
-    /// structure behind either name to reason about until something
-    /// resolves it (extraction cannot choose a `Guard` yet — that is G3).
+    /// declines a `Guard` as it declines a `Ref` no one told it is a unit,
+    /// since there is no structure behind either name to reason about until
+    /// something resolves it (extraction cannot choose a `Guard` yet — that
+    /// is G3).
     Guard {
         mask: R,
         on: KernelKey,
