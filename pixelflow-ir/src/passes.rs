@@ -58,6 +58,7 @@ use crate::arena::{ExprArena, ExprId, ExprNode};
 use crate::fold::Fold;
 use crate::kind::OpKind;
 use crate::variance::Variance;
+use alloc::borrow::Cow;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
@@ -266,13 +267,15 @@ fn copy_node(
 /// Replace every [`ExprNode::Ref`] reachable from `root` with its referent,
 /// spliced in, returning the (possibly new) root in the same arena.
 ///
-/// This is the linker, and in this stage it only inlines
-/// (docs/plans/2026-09-09-composition-is-linking.md §3): a reference is
-/// resolved through the [`KernelStore`](crate::store::KernelStore) and its
-/// body copied in at the reference's position, reading the same coordinates
-/// the reference did. The splice merges the referent's buffer and uniform
-/// declarations into this arena by identity, exactly as composition does, so
-/// a referent over bound memory keeps naming the same memory.
+/// This is [`link`] with every body the [`KernelStore`](crate::store::KernelStore)'s,
+/// as written: a reference is resolved there and its body copied in at the
+/// reference's position, reading the same coordinates the reference did. The
+/// splice merges the referent's buffer and uniform declarations into this
+/// arena by identity, exactly as composition does, so a referent over bound
+/// memory keeps naming the same memory. The runtime tier links each body as
+/// *optimized* instead, through [`link`] itself: the store is where a unit's
+/// body is found, not the only thing a name may be linked to
+/// (docs/plans/2026-09-25-the-language-is-kernel.md §4, O1).
 ///
 /// Recursive: a referent may itself hold references, and each is expanded
 /// before its body is spliced. That terminates because references form a DAG
@@ -294,20 +297,64 @@ fn copy_node(
 /// `Kernel::by_ref`, which interns before it names, so an unresolvable key is
 /// a corrupt graph rather than a condition to recover from.
 pub fn expand_refs(arena: &mut ExprArena, root: ExprId) -> ExprId {
-    let mut spliced: BTreeMap<crate::key::KernelKey, ExprId> = BTreeMap::new();
+    link_with(arena, root, |key| {
+        let (body, body_root) = expanded_referent(key);
+        Some((Cow::Owned(body), body_root))
+    })
+}
+
+/// Replace every [`ExprNode::Ref`] reachable from `root` whose key `bodies`
+/// holds with that body, spliced in, returning the (possibly new) root in
+/// the same arena. A key `bodies` does not hold stays a reference.
+///
+/// The one linker walk, with the bodies given rather than looked up.
+/// [`expand_refs`] is it over the store's bodies as written; the runtime
+/// tier is it over each unit's body as *optimized* — a unit is saturated
+/// and extracted by itself, its own references held as opaque leaves, and
+/// linked here after extraction and before legalization, so the emitter
+/// sees one program (docs/plans/2026-09-25-the-language-is-kernel.md §4,
+/// O1). A body may hold references of its own, and each is linked through
+/// `bodies` before the body is spliced. A name is spliced once per key, as
+/// in [`expand_refs`].
+///
+/// Sound for any `bodies` whose entries denote what their keys name: the
+/// splice reads the reference's own coordinates, so `⟦Ref k⟧ = ⟦body k⟧`
+/// and the term's denotation is unchanged.
+pub fn link(
+    arena: &mut ExprArena,
+    root: ExprId,
+    bodies: &BTreeMap<crate::key::KernelKey, (ExprArena, ExprId)>,
+) -> ExprId {
+    link_with(arena, root, |key| {
+        let (body, body_root) = bodies.get(&key)?;
+        if !body.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))) {
+            return Some((Cow::Borrowed(body), *body_root));
+        }
+        let mut linked = body.clone();
+        let linked_root = link(&mut linked, *body_root, bodies);
+        Some((Cow::Owned(linked), linked_root))
+    })
+}
+
+/// The walk [`expand_refs`] and [`link`] share: each reachable `Ref` whose
+/// key `referent` answers is replaced by that body, spliced once per key.
+fn link_with<'b>(
+    arena: &mut ExprArena,
+    root: ExprId,
+    mut referent: impl FnMut(crate::key::KernelKey) -> Option<(Cow<'b, ExprArena>, ExprId)>,
+) -> ExprId {
+    let mut spliced: BTreeMap<crate::key::KernelKey, Option<ExprId>> = BTreeMap::new();
     rebuild_arena(arena, root, |arena, node, _m| match node {
-        ExprNode::Ref(key) => Some(
-            *spliced
-                .entry(*key)
-                .or_insert_with(|| splice_referent(arena, *key)),
-        ),
+        ExprNode::Ref(key) => *spliced.entry(*key).or_insert_with(|| {
+            referent(*key).map(|(body, body_root)| arena.splice(&body, body_root))
+        }),
         _ => None,
     })
 }
 
-/// Resolve one reference and splice its (itself ref-free) body into `arena`.
+/// Resolve one reference to its body, itself expanded.
 #[cfg(feature = "std")]
-fn splice_referent(arena: &mut ExprArena, key: crate::key::KernelKey) -> ExprId {
+fn expanded_referent(key: crate::key::KernelKey) -> (ExprArena, ExprId) {
     let referent = crate::store::KernelStore::resolve(key).unwrap_or_else(|| {
         panic!(
             "expand_refs: {key:?} names no interned kernel — every Ref is \
@@ -315,8 +362,7 @@ fn splice_referent(arena: &mut ExprArena, key: crate::key::KernelKey) -> ExprId 
         )
     });
     let (ref_arena, ref_root) = referent.parts();
-    let (expanded, expanded_root) = expand_refs_owned(ref_arena, ref_root);
-    arena.splice(&expanded, expanded_root)
+    expand_refs_owned(ref_arena, ref_root)
 }
 
 /// The same, where there is no store to resolve against.
@@ -327,7 +373,7 @@ fn splice_referent(arena: &mut ExprArena, key: crate::key::KernelKey) -> ExprId 
 /// here means one was minted by hand through `ExprArena::push_ref`, which
 /// names nothing.
 #[cfg(not(feature = "std"))]
-fn splice_referent(_arena: &mut ExprArena, key: crate::key::KernelKey) -> ExprId {
+fn expanded_referent(key: crate::key::KernelKey) -> (ExprArena, ExprId) {
     panic!(
         "expand_refs: {key:?} cannot be resolved — the KernelStore is the \
          `std` feature, and so is Kernel::by_ref, so nothing here can have \
@@ -2316,6 +2362,48 @@ mod ref_expansion_tests {
             ExpandRefs.optimize(arena, root),
             Rewritten::Unchanged
         ));
+    }
+
+    /// `link` splices the bodies it is given — here not the store's — once
+    /// per key, links a body's own references through the same map first,
+    /// and leaves a key it was not given a reference.
+    #[test]
+    fn link_splices_the_bodies_it_is_given_and_leaves_the_rest() {
+        let key_of = |k: &Kernel| match k.parts().0.node(k.parts().1) {
+            ExprNode::Ref(key) => key,
+            other => panic!("expected a reference, got {other:?}"),
+        };
+        let inner = Kernel::y().by_ref();
+        let outer_body = Kernel::x().add(&inner);
+        let outer = outer_body.by_ref();
+        let unlinked = Kernel::constant(2.0).by_ref();
+        let program = outer.mul(&outer).add(&unlinked);
+
+        // `inner` is linked to 7, which is not what the store holds for it.
+        let mut seven = ExprArena::new();
+        let seven_root = seven.push_const(7.0);
+        let (outer_arena, outer_root) = outer_body.parts();
+        let bodies = BTreeMap::from([
+            (key_of(&inner), (seven, seven_root)),
+            (key_of(&outer), (outer_arena.clone(), outer_root)),
+        ]);
+        let (arena, root) = program.parts();
+        let mut linked = arena.clone();
+        let root = link(&mut linked, root, &bodies);
+
+        let ExprNode::Binary(OpKind::Add, product, rest) = linked.node(root) else {
+            panic!("expected a sum, got {}", linked.display(root));
+        };
+        assert_eq!(linked.node(rest), ExprNode::Ref(key_of(&unlinked)));
+        let ExprNode::Binary(OpKind::Mul, a, b) = linked.node(product) else {
+            panic!("expected a product, got {}", linked.display(product));
+        };
+        assert_eq!(a, b, "one name is one node, however often it is read");
+        let ExprNode::Binary(OpKind::Add, x, c) = linked.node(a) else {
+            panic!("expected X + 7, got {}", linked.display(a));
+        };
+        assert_eq!(linked.node(x), ExprNode::Var(0));
+        assert_eq!(linked.node(c), ExprNode::Const(7.0));
     }
 
     /// `lower_dwrt` on its own refuses a reference rather than inventing a

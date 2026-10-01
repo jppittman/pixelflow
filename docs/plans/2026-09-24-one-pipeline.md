@@ -149,6 +149,23 @@ P(k, s, t) = emit_t ∘ legalize_t ∘ extract_s ∘ saturate_R ∘ insert ∘ c
 saturate_R = folds_R ∘ main_(R∖folds) ∘ closing_R        one rule set, three phases
 ```
 
+- **`P` begins with the unit walk, not `expand_refs`** (2026-10-01,
+  [the-language-is-kernel](2026-09-25-the-language-is-kernel.md) §4 O1,
+  built). A reference is a unit: every stage from `canonical` to `extract_s`
+  runs on each unit by itself and on the term around the units, with each
+  unit an opaque leaf carrying its variance, and the optimized bodies are
+  linked after extraction, before `legalize_t`:
+
+  ```text
+  P(k, s, t) = emit_t ∘ legalize_t ∘ L_s (k)
+  L_s(t)     = link( extract_s ∘ saturate_R ∘ insert° ∘ canonical (t),  r ↦ L_s(body r) )
+  ```
+
+  With no reference `L_s` is the formula above, call for call.
+  `expand_refs` is `L_s` with every optimization the identity, and is what
+  `legalize_t` still runs first. A reference a `Dwrt` reaches is linked
+  before insertion and is no unit. The law is in `pixelflow_search::runtime`
+  (Law U).
 - **One rule set, one vocabulary.** `R` is today's `RuleSet::runtime()`, which
   becomes the only set. Its phases are subsets of it, not other sets.
   - F: `closing_R` exists today (`graph.rs:1426-1450`).
@@ -172,6 +189,12 @@ saturate_R = folds_R ∘ main_(R∖folds) ∘ closing_R        one rule set, thr
 
   There the fold phase reads `s`, and reads `t` through `L`. §1.5 says why
   it does not exist yet.
+  - **A constraint O1 adds to that target.** A unit is optimized out of its
+    context because it is closed over `X` and `Y`, and that holds only
+    while nothing before the link substitutes a coordinate. Once
+    `lattice_(s,t)` runs before the fold phase, a unit's `X` and `Y` are the
+    lattice's binders, so either the lattice contramap is applied to each
+    unit as well as to the term around them, or the link comes first.
 - **The JIT is `P` run at runtime; the build-time compile is `P` run at
   build time.** Its bytes are embedded, and at load they go into the same
   cache under the same key (§3.7, A4).
@@ -196,7 +219,13 @@ This holds by construction exactly when `P` depends on nothing but
 4. **A process-global `KernelStore` resolves `Guard` arms and `Ref`s**
    (`emit/mod.rs:4060-4066`; `passes.rs:318`; `variance.rs:312`).
    - No production code builds a `Guard` or calls `by_ref`.
+     - Since O1 the store is load-bearing for `P` wherever `by_ref` is
+       called: the unit walk finds each unit's body there. C1's font is
+       the first production caller.
    - A `Ref`'s key digests minted identities (`key.rs:112-118`).
+     - Since O1 that key is part of the compile cache's key for a program
+       of units, so such a program shares code only with the same units by
+       value (the-language-is-kernel §4, O1).
 5. **`PIXELFLOW_SATURATION`.** Under `saturation-switch` it skips saturation
    (`runtime.rs:123`, `:141`, `:151-157`, `:388-424`). Its only consumer
    went in #1235, and CI's `test` job runs `--all-features`

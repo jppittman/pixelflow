@@ -5,6 +5,17 @@
 and one composition site converted and measured (§2.1, §7). §5's first cost
 has its gate; the inlining rule (L4) waits on a kernel that composes
 identical referents, because §7 found the glyph is not one.
+
+**Amended 2026-10-01: a reference is an optimization unit**
+([the-language-is-kernel](2026-09-25-the-language-is-kernel.md) §4, O1,
+answered yes by JP). The runtime tier saturates and extracts a referent by
+itself, holds it in the referring term as an opaque leaf carrying its
+variance, and links the optimized body back in after extraction
+(`passes::link`, `pixelflow_search::runtime`). The title still holds — the
+linker only inlines; what it inlines is now each body as optimized — and
+L4 is not built: under O1 no rule opens a unit, so inline-or-call is not a
+choice the e-graph makes. Whether a unit is emitted inline or called is
+C1's measurement there, which is §5.2's question.
 **Author:** JP (the framing and both design decisions), Claude (draft)
 **Supersedes the framing of:**
 [2026-09-09-the-graph-differentiates.md](2026-09-09-the-graph-differentiates.md)

@@ -419,9 +419,10 @@ pub fn induce<I: Ir>(
                 let class = *memo.get(&body).expect("post-order maps children first");
                 ENode::Reduce { fold, body: class }
             }
-            // Not a term the graph ever held: `passes::expand_refs` runs
-            // before any insertion, so a witness term carrying a reference
-            // came from somewhere that skipped the pipeline.
+            // Not a term a witness graph holds: only the runtime tier's
+            // unit walk admits a reference (as a unit's opaque leaf), so a
+            // witness term carrying one came from somewhere that skipped
+            // the pipeline.
             Shape::Ref(key) => {
                 return Err(TermMiss {
                     node: format!("{key:?} (a reference; expand_refs first)"),

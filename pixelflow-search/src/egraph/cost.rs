@@ -325,11 +325,24 @@ impl CostModel {
             // Buffer is a leaf like Var/Const: the cost of the read lives on
             // the Gather that consumes it. A uniform's load is per call, not
             // per sample.
+            //
+            // A unit is priced 0 too, and that is a choice with a stated
+            // cost. Its body is optimized and priced in its own saturation,
+            // and the link splices a key once however often a form mentions
+            // it, so a price per mention would only penalize forms that emit
+            // the unit once anyway. What 0 does not see is a rewrite that
+            // changes how *often* a unit is evaluated — hoisting it out of a
+            // fold body it does not read, say — which this table then decides
+            // by the ops around the unit rather than by the unit's own cost.
+            // Law U (`crate::runtime`) holds regardless; the outer term's
+            // choice among such forms is not cost-optimal, and a font's outer
+            // term (an `if id < k` tree) offers none.
             ENode::Var(_)
             | ENode::Const(_)
             | ENode::Buffer(_)
             | ENode::Uniform(_)
-            | ENode::Param(_) => 0,
+            | ENode::Param(_)
+            | ENode::Ref { .. } => 0,
             // `Dwrt` is the internal autodiff marker, and the latency table
             // already carries a considered number for it (1000 — dear enough
             // that the extractor takes the chain rule wherever saturation

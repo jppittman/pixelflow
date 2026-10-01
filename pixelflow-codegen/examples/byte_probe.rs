@@ -25,10 +25,19 @@
 //! **One host, one ISA.** `compile` emits for the machine it runs on, so a
 //! run here says nothing about the other backends; `cargo xtask isa-matrix`
 //! is what covers those.
+//!
+//! **Two columns per kernel.** The first is [`compile`] alone: the emitter
+//! over the arena as written. The second, `jit_*`, is
+//! [`jit_cache::compile`](pixelflow_codegen::jit_cache::compile), the
+//! production path — optimize, link, emit — which is where a change to the
+//! optimizer or the linker shows up and the first column cannot see it. The
+//! two `named_*` kernels hold a reference (`Kernel::by_ref`), so they are
+//! the rows a change to how references are optimized is expected to move.
 
 use pixelflow_codegen::emit::compile;
 use pixelflow_codegen::fnv1a64;
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_codegen::jit_cache;
+use pixelflow_ir::{ExprArena, ExprId, Kernel, LatticeShape, OpKind, Uniform};
 
 fn xy(a: &mut ExprArena) -> (ExprId, ExprId) {
     (a.push_var(0), a.push_var(1))
@@ -130,16 +139,65 @@ fn cases() -> Vec<(&'static str, ExprArena, ExprId)> {
         out.push(("wide_spill", a, acc));
     }
 
+    // A uniform: the link step, where the code is compiled against dense
+    // slots and the caller's identities are mapped onto them.
+    {
+        let tint = Uniform::new(0.75).kernel();
+        let k = Kernel::x().mul(&tint).add(&Kernel::y());
+        let (a, r) = k.parts();
+        out.push(("uniform_tint", a.clone(), r));
+    }
+
+    // A named kernel beside other work: a reference the optimizer sees.
+    {
+        let body = Kernel::x()
+            .mul(&Kernel::x())
+            .add(&Kernel::y().mul(&Kernel::y()))
+            .sqrt()
+            .mul(&Kernel::constant(3.7))
+            .sin();
+        let k = body.by_ref().add(&Kernel::y().mul(&Kernel::constant(2.0)));
+        let (a, r) = k.parts();
+        out.push(("named_beside", a.clone(), r));
+    }
+
+    // Two named kernels as the arms of a choice over a uniform: a font's id
+    // tree, one level deep.
+    {
+        let id = Uniform::new(1.0).kernel();
+        let lower = Kernel::x()
+            .mul(&Kernel::constant(0.5))
+            .add(&Kernel::y())
+            .by_ref();
+        let upper = Kernel::y().mul(&Kernel::y()).sub(&Kernel::x()).by_ref();
+        let k = id.lt(&Kernel::constant(1.0)).select(&lower, &upper);
+        let (a, r) = k.parts();
+        out.push(("named_arms", a.clone(), r));
+    }
+
     out
+}
+
+/// The production compile's bytes, or why there are none.
+fn through_the_jit(arena: &ExprArena, root: ExprId) -> String {
+    let kernel = Kernel::from_parts(arena.clone(), root);
+    match jit_cache::compile(&kernel, LatticeShape::POINT) {
+        Ok(linked) => {
+            let bytes = linked.kernel.code_bytes();
+            format!("jit_len={:<6} jit_fnv={:016x}", bytes.len(), fnv1a64(bytes))
+        }
+        Err(e) => format!("jit ERROR {e:?}"),
+    }
 }
 
 fn main() {
     for (name, arena, root) in cases() {
-        match compile(&arena, root, pixelflow_ir::LatticeShape::POINT) {
+        let jit = through_the_jit(&arena, root);
+        match compile(&arena, root, LatticeShape::POINT) {
             Ok(r) => {
                 let bytes = r.code.as_bytes();
                 println!(
-                    "{name:<14} len={:<6} fnv={:016x} spills={} hoisted={}",
+                    "{name:<14} len={:<6} fnv={:016x} spills={} hoisted={} {jit}",
                     bytes.len(),
                     fnv1a64(bytes),
                     r.spill_count,
@@ -148,7 +206,7 @@ fn main() {
             }
             // Printed rather than propagated: a kernel this cannot compile is
             // still a data point, and the other rows are still worth having.
-            Err(e) => println!("{name:<14} ERROR {e:?}"),
+            Err(e) => println!("{name:<14} ERROR {e:?} {jit}"),
         }
     }
 }

@@ -86,7 +86,7 @@
 mod exact_area;
 
 use exact_area::{coverage, screen_pieces, signed_area, Grid, Piece, Point};
-use pixelflow_core::{Kernel, Lattice};
+use pixelflow_core::{Kernel, Lattice, Manifold, Uniform};
 use pixelflow_graphics::fonts::{loop_blinn, Contour, Font, GlyphAtlas, Outline, Segment};
 use std::sync::OnceLock;
 
@@ -558,6 +558,104 @@ fn between_the_snaps_every_texel_is_its_area() {
     }
     for (ratio, ch, size) in worst {
         eprintln!("{size} px: worst texel between the snaps {ratio:.3}× the bound ({ch:?})");
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// `glyphs` under a balanced tree of `if id < k` — the font program's id
+/// tree (docs/plans/2026-09-25-the-language-is-kernel.md §1.7), `first`
+/// being the id of `glyphs[0]`.
+fn id_tree(id: &Kernel, glyphs: &[Kernel], first: usize) -> Kernel {
+    if glyphs.len() == 1 {
+        return glyphs[0].clone();
+    }
+    let half = glyphs.len() / 2;
+    id.lt(&Kernel::constant((first + half) as f32)).select(
+        &id_tree(id, &glyphs[..half], first),
+        &id_tree(id, &glyphs[half..], first + half),
+    )
+}
+
+/// **A font program of units draws each of its glyphs.** Four glyphs under
+/// an `if id < k` tree, compiled once as one program, each glyph a *unit*
+/// (`Kernel::by_ref`) — saturated and extracted by itself, linked into the
+/// tree after extraction (docs/plans/2026-09-25-the-language-is-kernel.md
+/// §4, O1) — and again with the glyphs inlined, so one saturation sees them
+/// all.
+///
+/// - Every id of either program is within the closed form's bound of the
+///   exact area, and snaps its ends, as every baked glyph is
+///   ([`between_the_snaps_every_texel_is_its_area`]): where extraction may
+///   differ, the oracle is the judge.
+/// - Where it cannot, the unit draws the bits the glyph draws baked alone,
+///   the shipped path: a unit's saturation and extraction *are* the glyph's,
+///   one structure at one shape.
+#[test]
+fn a_font_program_of_units_draws_each_glyph() {
+    const SIZE: usize = 16;
+    const GLYPHS: [char; 4] = ['A', 'O', 'g', '@'];
+    let font = Font::parse(FONT_DATA).expect("parse font");
+    let extent = [u32::try_from(SIZE).expect("SIZE fits a u32"); 2];
+    let glyphs: Vec<Kernel> = GLYPHS
+        .iter()
+        .map(|&ch| {
+            font.glyph_kernel_scaled(ch, SIZE as f32)
+                .expect("an ASCII glyph")
+                .kernel()
+                .at(
+                    &Kernel::x().add(&Kernel::constant(0.5)),
+                    &Kernel::y().add(&Kernel::constant(0.5)),
+                )
+        })
+        .collect();
+    let named: Vec<Kernel> = glyphs.iter().map(Kernel::by_ref).collect();
+    let id = Uniform::new(0.0);
+    let units = Manifold::compile(&id_tree(&id.kernel(), &named, 0), extent);
+    let inlined = Manifold::compile(&id_tree(&id.kernel(), &glyphs, 0), extent);
+
+    let draw = |program: &Manifold, which: usize| -> Vec<f32> {
+        let mut block = program.block();
+        block
+            .set(id, which as f32)
+            .expect("id is the program's argument");
+        Lattice::frame(SIZE, SIZE)
+            .collapse(&program.bind(&[]).with_uniforms(&block))
+            .into_buffer()
+    };
+    let mut failures = Vec::new();
+    for (which, &ch) in GLYPHS.iter().enumerate() {
+        let exact: Vec<f64> = signed_area(
+            &screen_pieces(&font, ch, SIZE as f64),
+            Grid {
+                width: SIZE,
+                height: SIZE,
+            },
+        )
+        .into_iter()
+        .map(coverage)
+        .collect();
+        let alone = Lattice::frame(SIZE, SIZE)
+            .collapse(&Manifold::compile(&glyphs[which], extent).bind(&[]))
+            .into_buffer();
+        for (name, program) in [("units", &units), ("inlined", &inlined)] {
+            let drawn = draw(program, which);
+            let ours: Vec<f64> = drawn.iter().map(|&v| f64::from(v)).collect();
+            let stat = measure(&ours, &exact, SIZE);
+            if stat.between_snaps > 1.0 || stat.unsnapped_ends > 0 {
+                failures.push(format!(
+                    "{ch:?} ({name}): {:.2}× the bound between the snaps, {} unsnapped end(s)",
+                    stat.between_snaps, stat.unsnapped_ends
+                ));
+            }
+            if name == "units"
+                && drawn
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .ne(alone.iter().map(|v| v.to_bits()))
+            {
+                failures.push(format!("{ch:?}: the unit's bits are not the glyph's alone"));
+            }
+        }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

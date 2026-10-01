@@ -56,9 +56,9 @@
 //! §0): denominated in rule-application ordinal only, never an
 //! iteration/sweep counter and never wall-clock.
 
-use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{BufferDecl, UniformDecl};
 use pixelflow_ir::fold::Fold;
+use pixelflow_ir::{KernelKey, OpKind};
 
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
@@ -104,6 +104,8 @@ enum NodeShape {
     /// A fold's shape is its metadata plus its body's class — the metadata
     /// is part of the node's identity, so it is part of its shape.
     Reduce(Fold, u32),
+    /// A unit is its name: the same key is the same referent.
+    Ref(KernelKey),
 }
 
 impl NodeShape {
@@ -124,6 +126,7 @@ impl NodeShape {
             ENode::Reduce { fold, body } => {
                 NodeShape::Reduce(*fold, egraph.find(*body).index() as u32)
             }
+            ENode::Ref { key, .. } => NodeShape::Ref(*key),
         }
     }
 

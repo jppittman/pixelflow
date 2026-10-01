@@ -432,6 +432,7 @@ fn node_label(egraph: &EGraph, class: EClassId, idx: usize) -> String {
         ENode::Buffer(_) => "Buffer".into(),
         ENode::Uniform(_) => "Uniform".into(),
         ENode::Param(i) => format!("Param({i})"),
+        ENode::Ref { key, .. } => format!("Unit({key:?})"),
         ENode::Op { op, children } => {
             let cs: Vec<String> = children
                 .iter()

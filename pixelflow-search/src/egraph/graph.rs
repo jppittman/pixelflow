@@ -10,8 +10,9 @@ use super::provenance::{ApplicationRecord, Origin, UnionEvent};
 use super::provenance::{ENodeId, Provenance};
 use super::rewrite::{Rewrite, RewriteAction};
 use super::rules::RuleId;
-use pixelflow_ir::Variance;
+use alloc::collections::BTreeMap;
 use pixelflow_ir::kind::OpKind;
+use pixelflow_ir::{KernelKey, Variance};
 
 /// A potential rewrite target: (rule, e-class, node within class).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -133,6 +134,15 @@ pub struct EGraph {
     ///   fact is still a superset, so a rule reading it may miss an
     ///   opportunity but can never fire wrongly; soundness needs no repair.
     var_fact: Vec<Variance>,
+    /// The units this graph may hold as leaves, with the variance each
+    /// carries — told to it by the runtime tier's unit walk
+    /// ([`EGraph::admit_unit`]) before the term is inserted. A unit's body is
+    /// not in this graph, so its variance cannot be computed here; and a
+    /// reference the graph was not told about is one [`insert`](super::insert)
+    /// declines, which is what keeps every other path — the macro tier,
+    /// research tools — exactly as it was (docs/plans/2026-09-25-the-language-is-kernel.md
+    /// §4, O1).
+    units: BTreeMap<KernelKey, Variance>,
     /// Unions REFUSED because they would assert two numerically unequal
     /// constants equal — a proved falsehood the graph declines to absorb.
     /// Distinct (bits, bits) pairs, kept for reporting and tests; see
@@ -356,6 +366,7 @@ impl Clone for EGraph {
             active_application: self.active_application,
             const_fact: self.const_fact.clone(),
             var_fact: self.var_fact.clone(),
+            units: self.units.clone(),
             refused_const_unions: self.refused_const_unions.clone(),
             applications: self.applications,
             #[cfg(feature = "provenance-journal")]
@@ -510,6 +521,7 @@ impl EGraph {
             active_application: None,
             const_fact: Vec::new(),
             var_fact: Vec::new(),
+            units: BTreeMap::new(),
             refused_const_unions: Vec::new(),
             applications: 0,
             #[cfg(feature = "provenance-journal")]
@@ -548,6 +560,7 @@ impl EGraph {
             active_application: None,
             const_fact: Vec::new(),
             var_fact: Vec::new(),
+            units: BTreeMap::new(),
             refused_const_unions: Vec::new(),
             applications: 0,
             #[cfg(feature = "provenance-journal")]
@@ -685,6 +698,37 @@ impl EGraph {
         for child in node.children_slice_mut() {
             *child = self.find(*child);
         }
+    }
+
+    /// Tell this graph that `key` names a **unit** varying as `variance` says,
+    /// so a reference to it inserts as an opaque leaf
+    /// ([`ENode::Ref`]) rather than being declined.
+    ///
+    /// The runtime tier's unit walk calls this once per unit a term reads,
+    /// before inserting the term: it is the walk that holds each unit's body,
+    /// and so the only place its variance can be computed
+    /// (docs/plans/2026-09-25-the-language-is-kernel.md §4, O1).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `variance` names a binder or a retired axis — a unit is a
+    /// closed term over the coordinates and uniforms, and nothing else can be
+    /// optimized out of its context, because no rewrite outside it can reach
+    /// a binder inside it.
+    pub(crate) fn admit_unit(&mut self, key: KernelKey, variance: Variance) {
+        assert!(
+            variance.without(Variance::COORDS).is_const(),
+            "EGraph::admit_unit: {key:?} varies as {variance:?} — a unit must be \
+             closed over the coordinates, and this one reads a binder no \
+             rewrite outside it could substitute"
+        );
+        self.units.insert(key, variance);
+    }
+
+    /// The variance a unit admitted by [`Self::admit_unit`] carries, or
+    /// `None` if `key` was never admitted.
+    pub(crate) fn unit_variance(&self, key: KernelKey) -> Option<Variance> {
+        self.units.get(&key).copied()
     }
 
     /// Insert `node`, returning the e-class that contains it.
@@ -1181,6 +1225,12 @@ impl EGraph {
             ENode::Param(_) => pixelflow_ir::OpKind::Param,
             ENode::Op { op, .. } => op.kind(),
             ENode::Reduce { .. } => pixelflow_ir::OpKind::Reduce,
+            // No op names a whole kernel, and a unit is the one leaf a
+            // research walk cannot meet: only the runtime tier admits one.
+            ENode::Ref { key, .. } => panic!(
+                "canonical_op: {key:?} is a unit — a leaf only the runtime tier's \
+                 unit walk admits, and it has no OpKind"
+            ),
         }
     }
 
@@ -2979,6 +3029,25 @@ fn derivative_shape<S: NodeSink>(sink: &mut S, inner: &ENode, var: u8) -> EClass
         // Likewise ∂p/∂x = 0: a builder's scalar is one number for the
         // whole lattice, whichever number it turns out to be.
         ENode::Param(_) => return sink.make(ENode::constant(0.0)),
+        // A unit that does not vary along the axis has derivative zero, as
+        // a uniform does. One that does keeps its `Dwrt`: a name has no
+        // structure to differentiate. The unit walk links every reference
+        // a written `Dwrt` reaches before insertion, so the chain rule runs
+        // here on every derivative the program wrote; a `Dwrt` over a unit
+        // can only come of rewriting a class it shares, and one extraction
+        // keeps is lowered by `lower_dwrt` on the linked body, after the
+        // link, like any other `Dwrt` the rules did not reach.
+        ENode::Ref { variance, .. } => {
+            if !variance.depends_on(var) {
+                return sink.make(ENode::constant(0.0));
+            }
+            let var_const = sink.make(ENode::constant(var as f32));
+            let inner = sink.make(inner.clone());
+            return sink.make(ENode::Op {
+                op: &ops::Dwrt,
+                children: vec![inner, var_const],
+            });
+        }
         ENode::Op { op, children } => (*op, children.clone()),
         // `d(⊕_k f) = ⊕_k d(f)` is linearity, which holds for `Σ` and for
         // nothing else in the monoid set — `Π` wants the product rule, and
