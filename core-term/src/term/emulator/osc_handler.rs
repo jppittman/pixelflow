@@ -121,7 +121,7 @@ mod tests {
     }
 
     #[test]
-    fn osc_52_ignores_garbage() {
+    fn osc_52_with_a_malformed_or_non_utf8_payload_produces_no_action() {
         assert_eq!(osc("52;c;not base64!"), None);
         assert_eq!(osc("52;c;/w=="), None, "0xFF is not UTF-8");
     }

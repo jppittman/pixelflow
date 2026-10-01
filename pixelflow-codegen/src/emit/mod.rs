@@ -4555,6 +4555,39 @@ mod tests {
         }
     }
 
+    /// `IsaBackend::test_ge`'s default body — the fold loop's trip test on
+    /// every backend but AVX-512, which overrides it — is reached only by
+    /// compiling a surviving `Reduce` through a backend that does not
+    /// override it. AVX-512 is this host's own tier, so `EmitCtx::compile`
+    /// never reaches the default; built directly against the AVX2 backend
+    /// instead, the way `every_backend_emits_from_this_host` targets one
+    /// backend regardless of the host's own.
+    #[test]
+    fn the_default_trip_test_runs_a_surviving_reduce_to_the_right_answer_on_avx2() {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+
+        let binder = Binder::from_slot(0).expect("slot 0 exists");
+        let mut arena = ExprArena::new();
+        let x = arena.push_var(0);
+        let i = arena.push_var(binder.var());
+        let body = arena.push_binary(OpKind::Add, x, i);
+        let fold = Fold::new(Monoid::SUM, binder, 0..5);
+        let root = arena.push_reduce(fold, body);
+
+        let mut avx2b = avx2::driver::Avx2Backend::new(EmitCtx::default());
+        let lanes = avx2b.register_file().vector_bytes / BYTES_PER_LANE;
+        let schedule = schedule_for(&arena, root, POINT, lanes);
+        let result = compile_via_backend(schedule, &mut avx2b).expect("avx2 compile");
+
+        // sum_{i=0}^{4} (X + i) = 5*X + 10 — wrong on any trip-test mutation
+        // that garbles the loop's exit condition rather than just its cost.
+        for x in [0.0f32, 2.0, -1.5, 10.0] {
+            let got = eval_point(&result.code, x, 0.0);
+            let want = 5.0 * x + 10.0;
+            assert_eq!(got, want, "SUM via AVX2's default test_ge at x={x}");
+        }
+    }
+
     /// A fold whose result is *not* the kernel's own root, and whose body
     /// shares an invariant leaf with code outside it.
     ///
@@ -5559,7 +5592,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_binary_no_spills() {
+    fn resolving_a_binary_op_with_no_spilled_operands_reloads_nothing() {
         // left=v4, right=v5, dst=v6 — all in registers
         let locs = make_locs(&[(0, 4), (1, 5), (2, 6)], &[]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -5584,7 +5617,7 @@ mod tests {
     /// costs no reservation at all — which is why a binary never needs two,
     /// however many of its operands are in memory.
     #[test]
-    fn resolve_binary_left_spilled() {
+    fn resolving_a_binary_op_with_a_spilled_left_operand_reloads_it_straight_to_the_destination() {
         // left spilled at offset 0, right in v5
         let locs = make_locs(&[(1, 5), (2, 6)], &[(0, 0)]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -5611,7 +5644,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_binary_both_spilled() {
+    fn resolving_a_binary_op_with_both_operands_spilled_reloads_left_to_the_destination_and_right_to_a_scratch_register()
+     {
         // Both spilled: left → dst (temp trick), right → tmp_op
         let locs = make_locs(&[(2, 6)], &[(0, 0), (1, 16)]);
         let op = ScheduledOp::Binary(OpKind::Mul, regalloc::ValueId(0), regalloc::ValueId(1));
@@ -5687,7 +5721,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_muladd_fmla_path() {
+    fn resolving_a_muladd_with_every_operand_in_a_register_fuses_to_a_single_fmla() {
         // a in reg, b in reg, c in reg → FMLA with setup_mov for c→dst
         let locs = make_locs(&[(0, 4), (1, 5), (2, 7), (3, 8)], &[]);
         let op = ScheduledOp::Ternary(
@@ -5712,8 +5746,84 @@ mod tests {
         );
     }
 
+    /// `a`/`b` resident but `c` spilled still takes the fused path (only
+    /// *both multiplicands* spilled forces the decomposed one), and
+    /// `operand_sources` sends the reload straight into `dst` rather than a
+    /// separate scratch register — the FMLA encoding's own `dst` holds `c`
+    /// before the multiply-add, so reloading `c` anywhere else would need a
+    /// `setup_mov` the direct reload makes unnecessary.
     #[test]
-    fn resolve_muladd_decomposed_both_ab_spilled() {
+    fn resolving_a_muladd_with_only_c_spilled_reloads_it_straight_into_the_destination() {
+        let locs = make_locs(&[(0, 4), (1, 5)], &[(2, 32)]);
+        let op = ScheduledOp::Ternary(
+            OpKind::MulAdd,
+            regalloc::ValueId(0),
+            regalloc::ValueId(1),
+            regalloc::ValueId(2),
+        );
+        let plan =
+            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+
+        assert_eq!(
+            plan.reloads,
+            [Reload::FromStack {
+                target: Reg(8),
+                slot: Slot::new(32, 16),
+            }]
+        );
+        assert_eq!(plan.setup_mov, None, "c reloads straight into dst already");
+        assert_eq!(
+            plan.op,
+            ResolvedOp::FusedMulAdd {
+                dst: Reg(8),
+                a: Reg(4),
+                b: Reg(5)
+            }
+        );
+    }
+
+    /// `a` spilled alone (`b` and `c` resident) also takes the fused path —
+    /// the decomposed path needs *both* multiplicands spilled, not either
+    /// one — and `a`'s reload goes to its own reservation, not to `dst`:
+    /// `dst` is already spoken for by `c`'s `setup_mov`.
+    #[test]
+    fn resolving_a_muladd_with_only_a_spilled_still_fuses_and_reloads_a_to_its_own_register() {
+        let locs = make_locs(&[(1, 5), (2, 7)], &[(0, 0)]);
+        let op = ScheduledOp::Ternary(
+            OpKind::MulAdd,
+            regalloc::ValueId(0),
+            regalloc::ValueId(1),
+            regalloc::ValueId(2),
+        );
+        let plan =
+            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+
+        assert_eq!(
+            plan.reloads,
+            [Reload::FromStack {
+                target: RELOAD[0],
+                slot: Slot::new(0, 16),
+            }],
+            "a is not both multiplicands spilled, so it reloads to its own reservation"
+        );
+        assert_eq!(
+            plan.setup_mov,
+            Some((Reg(8), Reg(7))),
+            "c still moves into dst"
+        );
+        assert_eq!(
+            plan.op,
+            ResolvedOp::FusedMulAdd {
+                dst: Reg(8),
+                a: RELOAD[0],
+                b: Reg(5)
+            }
+        );
+    }
+
+    #[test]
+    fn resolving_a_muladd_with_a_and_b_spilled_decomposes_into_a_multiply_and_add_with_c_already_resident()
+     {
         // a and b both spilled → decomposed FMUL+FADD path
         // c in register
         let locs = make_locs(&[(2, 7), (3, 8)], &[(0, 0), (1, 16)]);
@@ -5762,7 +5872,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_muladd_decomposed_all_three_spilled() {
+    fn resolving_a_muladd_with_every_operand_spilled_decomposes_and_defers_the_c_reload() {
         // a, b, c all spilled → decomposed with deferred c reload
         let locs = make_locs(&[(3, 8)], &[(0, 0), (1, 16), (2, 32)]);
         let op = ScheduledOp::Ternary(
@@ -5789,7 +5899,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_var_is_nop() {
+    fn resolving_a_var_already_in_its_destination_register_emits_nothing() {
         let locs = make_locs(&[(0, 0)], &[]);
         let op = ScheduledOp::Var(0);
         let plan =
@@ -5799,7 +5909,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_const() {
+    fn resolving_a_const_emits_a_load_of_its_bit_pattern() {
         let locs = make_locs(&[(0, 6)], &[]);
         let op = ScheduledOp::Const(core::f32::consts::PI);
         let plan =
@@ -5856,7 +5966,7 @@ mod tests {
 
     /// A node nothing reaches never becomes a schedule entry.
     #[test]
-    fn arena_to_schedule_filters_unreachable() {
+    fn arena_to_schedule_filters_out_a_node_nothing_reaches() {
         let length = |garbage: bool| {
             let mut arena = ExprArena::new();
             let x = arena.push_var(0);
@@ -5875,7 +5985,32 @@ mod tests {
     }
 
     #[test]
-    fn arena_compile_simple() {
+    fn an_integer_shift_count_narrows_straight_to_a_u8_immediate() {
+        assert_eq!(shift_immediate(OpKind::Shl, 5.0), 5u8);
+        assert_eq!(shift_immediate(OpKind::Shr, 0.0), 0u8);
+        assert_eq!(shift_immediate(OpKind::Shl, 31.0), 31u8);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not an integer in 0..32")]
+    fn a_shift_count_of_exactly_32_panics_rather_than_wrapping_to_the_identity_shift() {
+        let _unreached = shift_immediate(OpKind::Shl, 32.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not an integer in 0..32")]
+    fn a_negative_shift_count_panics() {
+        let _unreached = shift_immediate(OpKind::Shl, -1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not an integer in 0..32")]
+    fn a_non_integer_shift_count_panics() {
+        let _unreached = shift_immediate(OpKind::Shl, 3.5);
+    }
+
+    #[test]
+    fn compiling_a_two_leaf_arena_sum_computes_the_right_answer_with_no_memory_traffic() {
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
@@ -5892,7 +6027,7 @@ mod tests {
     }
 
     #[test]
-    fn arena_compile_with_constant() {
+    fn compiling_an_arena_expression_with_a_constant_operand_computes_the_right_answer() {
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
         let two = arena.push_const(2.0);
@@ -5920,7 +6055,8 @@ mod tests {
     /// subject here — what spilling *does* — no longer depends on how small
     /// the pool can be made.
     #[test]
-    fn arena_compile_with_spills() {
+    fn compiling_a_wide_arena_expression_under_a_tight_register_budget_spills_and_still_computes_correctly()
+     {
         let mut arena = ExprArena::new();
         let x = arena.push_var(0);
         let y = arena.push_var(1);
@@ -6568,6 +6704,48 @@ mod tests {
                 reverted.at
             );
         }
+
+        /// The same fixture as the two tests above, but actually executed:
+        /// `split` is reloaded from its slot once and then read a second
+        /// time *from the register that reload left it in* (`t2 = t1 +
+        /// split`, `after = sel + split`) rather than reloaded again — the
+        /// "moves" reconciliation in `emit_scope` that brings a value back
+        /// into a pool register and keeps it there. The allocation-level
+        /// tests above confirm the *placement* says this; only running the
+        /// kernel confirms the *emitted code* agrees, which is a different
+        /// claim — the move that puts the value where the placement says it
+        /// is could itself be missing or wrong without either span check
+        /// noticing.
+        #[test]
+        fn a_kept_reload_inside_a_guarded_arm_computes_the_right_answer() {
+            let f = split_across_a_guarded_arm();
+            let result = EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH)
+                .compile(&f.arena, f.root, POINT)
+                .expect("split-across-arm kernel compiles");
+
+            let want = |x: f32, y: f32| -> f32 {
+                let split_v = (x * y).abs();
+                let mid = filler_value(split_v);
+                let base = mid * y;
+                let t1 = base * split_v;
+                let t2 = t1 + split_v;
+                let t3 = t2 * base + PADDING;
+                let f1 = base + base;
+                let f2 = f1 + base + PADDING;
+                let sel = if x > 0.0 { t3 } else { f2 };
+                let after = sel + split_v;
+                after + (x - y)
+            };
+
+            for &(x, y) in &[(1.0f32, 1.0f32), (-1.0, 1.0)] {
+                let got = eval_point(&result.code, x, y);
+                let expected = want(x, y);
+                assert!(
+                    (got - expected).abs() <= 1e-2 * expected.abs().max(1.0),
+                    "split-across-arm at ({x}, {y}): got {got}, want {expected}"
+                );
+            }
+        }
     }
 
     /// Run an arena kernel at `(x, 0)`, on whichever tier this host selected.
@@ -7052,7 +7230,7 @@ mod tests {
 
         /// A transcendental composed inside arithmetic still works: sin(x)·x + 1.
         #[test]
-        fn transcendental_in_expression() {
+        fn a_transcendental_op_composed_inside_arithmetic_matches_the_scalar_oracle() {
             let mut a = ExprArena::new();
             let x = a.push_var(0);
             let s = a.push_unary(OpKind::Sin, x);
@@ -7144,7 +7322,7 @@ mod tests {
         /// so it compiled one function twice and asserted it equalled
         /// itself; only the ground-truth comparison was load-bearing.
         #[test]
-        fn sched_no_spill_is_correct() {
+        fn a_schedule_that_fits_in_registers_computes_the_right_answer_without_spilling() {
             // f = sqrt(X*X + Y*Y) - Y*U, a non-commutative shape whose third
             // input is the kernel's argument rather than a third coordinate.
             let mut a = ExprArena::new();
@@ -7176,7 +7354,8 @@ mod tests {
         /// A wide expression that exceeds the allocatable registers must spill
         /// and still compute the right answer.
         #[test]
-        fn sched_spills_and_is_correct() {
+        fn a_schedule_that_exceeds_the_register_budget_spills_and_still_computes_the_right_answer()
+        {
             // sum_{i=1..=10} (X + i) * (Y + i), as a balanced tree, against a
             // pool at the floor: more live at once than seven registers hold.
             let mut a = ExprArena::new();
@@ -7233,7 +7412,7 @@ mod tests {
         /// the kernel's arguments alone would be lattice-invariant and hoist
         /// out of the body entirely, leaving nothing for a guard to skip.
         #[test]
-        fn sched_select_guards() {
+        fn a_select_with_a_uniform_mask_takes_the_guarded_branch_and_computes_the_right_answer() {
             let mut a = ExprArena::new();
             let x = a.push_var(0);
             let y = a.push_var(1);
@@ -8232,6 +8411,92 @@ mod tests {
             }
         }
 
+        /// Two independent `Guard`s in the same scope — not one nested in
+        /// the other's arm, two siblings — each with its own slot
+        /// (`compile_via_backend`'s `guard_slot`/`guard_slot_base`, keyed by
+        /// the guard's own index `k` among `nest.guard_count()`). A single
+        /// guard can never catch a bug in how its slot is computed
+        /// *relative to another guard's*: with one guard the arithmetic
+        /// degenerates to "the one slot" and any base/stride works. Two
+        /// guards whose slots collide would have one guard's result
+        /// overwrite the other's before the sum reads it — wrong in a very
+        /// particular way (one arm's constant leaks into both terms), which
+        /// only running the kernel catches; the allocation alone has no
+        /// opinion on whether two *different* addresses happen to be equal.
+        #[test]
+        fn two_sibling_guards_in_one_scope_each_land_in_their_own_slot() {
+            let on1_key = KernelStore::intern(&Kernel::constant(100.0));
+            let off1_key = KernelStore::intern(&Kernel::constant(200.0));
+            let on2_key = KernelStore::intern(&Kernel::constant(10.0));
+            let off2_key = KernelStore::intern(&Kernel::constant(20.0));
+
+            let flag1 = Uniform::new(0.0);
+            let flag1_kernel = flag1.kernel();
+            let (flag_arena, flag1_root) = flag1_kernel.parts();
+            let mut arena = flag_arena.clone();
+            // A second uniform, declared straight into the same arena the
+            // way `sched::arg_leaf` does — `flag1`'s own tiny arena only
+            // ever declares the one.
+            let flag2_slot = arena.declare_uniform(pixelflow_ir::Uniform::new(0.0).decl());
+            let flag2_root = arena.push_uniform(flag2_slot);
+
+            let one = arena.push_const(1.0);
+            let mask1 = arena.push_binary(OpKind::Eq, flag1_root, one);
+            let mask2 = arena.push_binary(OpKind::Eq, flag2_root, one);
+            let guard1 = arena.push_guard(mask1, on1_key, off1_key);
+            let guard2 = arena.push_guard(mask2, on2_key, off2_key);
+            let combined = arena.push_binary(OpKind::Add, guard1, guard2);
+
+            let marker = arena.push_var(MARKER);
+            let domain = lattice::Domain {
+                shape: POINT,
+                origin: origin(),
+            };
+            let write_root = lattice::collapse(&mut arena, marker, domain);
+            let packed_root = lattice::pack(&mut arena, write_root, lanes() as u32);
+            let root = arena.substitute_vars_with(packed_root, &[(MARKER, combined)]);
+
+            let ids = origin_slots(&arena);
+            let schedule = arena_to_schedule(&arena, root, ids);
+            let guard_ops = schedule
+                .iter()
+                .filter(|d| matches!(d.op, ScheduledOp::Guard(..)))
+                .count();
+            assert_eq!(
+                guard_ops, 2,
+                "both push_guard calls must survive into their own ScheduledOp::Guard \
+                 for this test to exercise two slots rather than one"
+            );
+            let code = compile_native(schedule, EmitCtx::default())
+                .expect("a two-guard kernel should compile")
+                .code;
+
+            let run = |flag1_value: f32, flag2_value: f32| -> f32 {
+                let uniforms = [flag1_value, flag2_value];
+                let origin_vals = [0.0f32, 0.0f32];
+                let mut out = [f32::NAN; 1];
+                let ctx: [*const f32; 2] = [uniforms.as_ptr(), origin_vals.as_ptr()];
+                // SAFETY: this arena declares no buffers and two uniforms
+                // (`flag1` at slot 0, `flag2` at slot 1), so `ctx[0]` is a
+                // two-`f32` uniform block and `ctx[1]` the origin block;
+                // `out` holds the one sample a `POINT`-shaped lattice writes.
+                unsafe {
+                    code.call(ctx.as_ptr(), out.as_mut_ptr(), 1);
+                }
+                out[0]
+            };
+
+            for &(f1, f2, want) in &[
+                (1.0f32, 1.0f32, 110.0f32), // on1 + on2
+                (1.0, 0.0, 120.0),          // on1 + off2
+                (0.0, 1.0, 210.0),          // off1 + on2
+                (0.0, 0.0, 220.0),          // off1 + off2
+            ] {
+                let got = run(f1, f2);
+                assert_eq!(got, want, "flags ({f1}, {f2}): got {got}, want {want}");
+            }
+        }
+
         /// The mask uniformly true: every lane (there is one, at `POINT`)
         /// takes the `on` arm.
         #[test]
@@ -8261,6 +8526,195 @@ mod tests {
             let run = compile_guard(on, off);
             assert_eq!(run(1.0), 6.0, "on arm: 2.0 * 3.0");
             assert_eq!(run(0.0), 9.0, "off arm: 10.0 - 1.0");
+        }
+    }
+
+    // =========================================================================
+    // Assembler primitives: `Label`, `Assembly`/`AsmProgram`, and the
+    // `Loc`/`Binding` storage enums. Every full-compile test above exercises
+    // these only incidentally — through whatever instructions a schedule
+    // happens to need — so none of them pins what these types themselves
+    // promise.
+    // =========================================================================
+    mod assembler_core {
+        use super::*;
+
+        #[test]
+        fn a_labels_name_round_trips_through_as_str() {
+            let label = Label::new("row_top");
+            assert_eq!(label.as_str(), "row_top");
+        }
+
+        #[test]
+        fn a_label_displays_as_its_bare_name() {
+            let label = Label::from("v12_past_true");
+            assert_eq!(alloc::format!("{label}"), "v12_past_true");
+        }
+
+        #[test]
+        fn a_label_debugs_as_its_quoted_name() {
+            let label = Label::new("exit");
+            assert_eq!(alloc::format!("{label:?}"), "\"exit\"");
+        }
+
+        #[test]
+        #[should_panic(expected = "longer than")]
+        fn a_label_longer_than_capacity_panics() {
+            let too_long = "x".repeat(Label::CAPACITY + 1);
+            let _unreached = Label::new(&too_long);
+        }
+
+        #[test]
+        fn assembly_with_capacity_reserves_an_empty_buffer() {
+            let asm = Assembly::with_capacity(64);
+            assert!(asm.code.is_empty());
+            assert!(asm.code.capacity() >= 64);
+        }
+
+        /// `jmp` to a label bound after a skipped `ret`: the assembler's two
+        /// passes must agree on where the label landed, and the branch's
+        /// `rel32` must be measured from the end of the `jmp` itself (the
+        /// displacement field), not from its start.
+        #[test]
+        fn an_assembled_program_resolves_a_forward_branch_to_where_its_label_lands() {
+            let mut code = Vec::new();
+            AsmProgram::from([
+                Item::Inst(x86_64::Inst::Jmp(x86_64::Jmp {
+                    target: Label::new("end"),
+                })),
+                Item::Inst(x86_64::Inst::ret()),
+                Item::Label(Label::new("end")),
+                Item::Inst(x86_64::Inst::ret()),
+            ])
+            .assemble(&mut code);
+
+            // jmp rel32 is 5 bytes; ret is 1. The label lands right after the
+            // skipped ret, at offset 6.
+            assert_eq!(code.len(), 7);
+            assert_eq!(code[5], 0xC3, "the skipped ret is still emitted");
+            assert_eq!(code[6], 0xC3, "the ret after the label is emitted too");
+            let disp = i32::from_le_bytes(code[1..5].try_into().unwrap());
+            assert_eq!(
+                disp, 1,
+                "rel32 is measured from the end of the displacement field"
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "branched to but never written")]
+        fn finishing_a_program_with_an_unbound_label_panics() {
+            let mut code = Vec::new();
+            assemble(
+                &mut code,
+                [x86_64::Inst::Jmp(x86_64::Jmp {
+                    target: Label::new("nowhere"),
+                })],
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "was written twice")]
+        fn binding_the_same_label_twice_panics() {
+            let mut asm = Assembly::from_code(Vec::new());
+            asm.bind(Label::new("here"));
+            asm.bind(Label::new("here"));
+        }
+
+        /// `AsmProgram` is itself an [`AsmInsn`] — a declarative program can
+        /// be nested inside another — and its `emit_into` is `assemble`
+        /// under another name rather than a no-op standing in for it.
+        #[test]
+        fn an_asm_program_used_as_an_instruction_assembles_through_its_emit_into() {
+            let mut code = Vec::new();
+            let program = AsmProgram::from([x86_64::Inst::ret()]);
+            AsmInsn::emit_into(program, &mut code);
+            assert_eq!(code, [0xC3]);
+        }
+
+        #[test]
+        fn a_vector_register_location_reports_its_register_and_no_slot() {
+            let loc = Loc::Reg(Reg(3));
+            assert_eq!(loc.storage(), Storage::Reg(Reg(3)));
+            assert_eq!(loc.target_reg(), Some(Reg(3)));
+            assert_eq!(loc.target_slot(), None);
+            assert_eq!(loc.source_reg(), Some(Reg(3)));
+            assert_eq!(loc.source_slot(), None);
+            assert_eq!(loc.source_storage(), Some(Storage::Reg(Reg(3))));
+        }
+
+        #[test]
+        fn a_spilled_location_reports_its_slot_and_no_register() {
+            let slot = Slot::new(16, 32);
+            let loc = Loc::Slot(slot);
+            assert_eq!(loc.storage(), Storage::Slot(slot));
+            assert_eq!(loc.target_reg(), None);
+            assert_eq!(loc.target_slot(), Some(slot));
+            assert_eq!(loc.source_reg(), None);
+            assert_eq!(loc.source_slot(), Some(slot));
+        }
+
+        #[test]
+        #[should_panic(expected = "expected register, got stack slot")]
+        fn asking_a_spilled_locs_register_panics() {
+            let _unreached = Loc::Slot(Slot::new(0, 16)).reg();
+        }
+
+        #[test]
+        #[should_panic(expected = "expected a vector register, got pointer register")]
+        fn asking_a_pointer_locs_vector_register_panics() {
+            let _unreached = Loc::Ptr(PtrReg(4)).reg();
+        }
+
+        #[test]
+        fn a_rematerialized_binding_has_no_location_no_storage_and_no_slot() {
+            let binding = Binding::Remat(1.0f32.to_bits());
+            assert_eq!(binding.as_loc(), None);
+            assert_eq!(binding.as_storage(), None);
+            assert_eq!(binding.as_slot(), None);
+        }
+
+        #[test]
+        fn a_register_bindings_slot_is_none_even_though_its_location_is_some() {
+            let binding = Binding::from(Reg(5));
+            assert_eq!(binding.as_loc(), Some(Loc::Reg(Reg(5))));
+            assert_eq!(binding.as_slot(), None);
+        }
+
+        #[test]
+        fn a_spilled_bindings_slot_is_its_own_slot() {
+            let slot = Slot::new(48, 16);
+            let binding = Binding::from(slot);
+            assert_eq!(binding.as_slot(), Some(slot));
+            assert_eq!(binding.as_storage(), Some(Storage::Slot(slot)));
+        }
+
+        /// `SourceOperand::source_storage` is a second, trait-dispatched
+        /// route to the same answer as the inherent `as_storage` — a
+        /// register-class pipeline that only ever goes through the trait
+        /// (every backend's `emit_resolve` does) would not notice if it
+        /// stopped forwarding.
+        #[test]
+        fn a_bindings_source_storage_agrees_with_its_as_storage() {
+            let reg = Binding::from(Reg(2));
+            let slot = Binding::from(Slot::new(0, 16));
+            let remat = Binding::Remat(0x4000_0000);
+            assert_eq!(reg.source_storage(), Some(Storage::Reg(Reg(2))));
+            assert_eq!(slot.source_storage(), Some(Storage::Slot(Slot::new(0, 16))));
+            assert_eq!(remat.source_storage(), None);
+        }
+
+        #[test]
+        #[should_panic(expected = "expected register, got rematerialized")]
+        fn asking_a_rematerialized_bindings_register_panics() {
+            let _unreached = Binding::Remat(0x3f80_0000).reg();
+        }
+
+        #[test]
+        fn a_pointer_register_converts_to_the_matching_gpr() {
+            let ptr = PtrReg(9);
+            assert_eq!(ptr.raw(), 9);
+            assert_eq!(ptr.as_gpr(), Gpr(9));
+            assert_eq!(Gpr::from(ptr), Gpr(9));
         }
     }
 }

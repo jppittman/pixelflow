@@ -62,17 +62,18 @@ fn assert_equivalent(name: &str, bytes: &[u8]) {
 }
 
 #[test]
-fn short_text() {
+fn short_text_prints_the_same_whether_fed_as_a_run_or_one_character_at_a_time() {
     assert_equivalent("short", b"hello");
 }
 
 #[test]
-fn text_that_exactly_fills_a_line() {
+fn text_that_exactly_fills_a_line_prints_the_same_whether_fed_as_a_run_or_one_character_at_a_time()
+{
     assert_equivalent("exact width", b"0123456789");
 }
 
 #[test]
-fn text_that_wraps_and_scrolls() {
+fn text_that_wraps_and_scrolls_prints_the_same_whether_fed_as_a_run_or_one_character_at_a_time() {
     assert_equivalent(
         "wrap and scroll",
         b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ",
@@ -80,17 +81,18 @@ fn text_that_wraps_and_scrolls() {
 }
 
 #[test]
-fn text_starting_mid_line() {
+fn text_starting_mid_line_prints_the_same_whether_fed_as_a_run_or_one_character_at_a_time() {
     assert_equivalent("mid line", b"\x1b[2;8Habcdefghij");
 }
 
 #[test]
-fn text_with_autowrap_off() {
+fn text_with_autowrap_off_prints_the_same_whether_fed_as_a_run_or_one_character_at_a_time() {
     assert_equivalent("autowrap off", b"\x1b[?7labcdefghijklmnopqrstuvwxyz");
 }
 
 #[test]
-fn text_overwriting_wide_characters() {
+fn text_overwriting_wide_characters_prints_the_same_whether_fed_as_a_run_or_one_character_at_a_time(
+) {
     // Runs ending on a wide character's primary cell, on its spacer, and past it.
     assert_equivalent("end on primary", "世界世界世\ra".as_bytes());
     assert_equivalent("end on spacer", "世界世界世\rab".as_bytes());
@@ -98,18 +100,21 @@ fn text_overwriting_wide_characters() {
 }
 
 #[test]
-fn text_mixed_with_wide_and_combining_characters() {
+fn text_mixed_with_wide_and_combining_characters_prints_the_same_whether_fed_as_a_run_or_one_character_at_a_time(
+) {
     assert_equivalent("mixed", "ab世cde\u{301}fgh界ij".as_bytes());
 }
 
 #[test]
-fn text_under_a_non_identity_charset() {
+fn text_under_a_non_identity_charset_prints_the_same_whether_fed_as_a_run_or_one_character_at_a_time(
+) {
     assert_equivalent("dec line drawing", b"\x1b(0lqqk\x1b(Bmx");
     assert_equivalent("uk national", b"\x1b(A#1#2\x1b(B#3");
 }
 
 #[test]
-fn text_inside_a_scroll_region_with_origin_mode() {
+fn text_inside_a_scroll_region_with_origin_mode_prints_the_same_whether_fed_as_a_run_or_one_character_at_a_time(
+) {
     assert_equivalent(
         "origin mode",
         b"\x1b[2;3r\x1b[?6habcdefghijklmnopqrstuvwxyz0123456789",
@@ -117,11 +122,11 @@ fn text_inside_a_scroll_region_with_origin_mode() {
 }
 
 #[test]
-fn text_with_attributes() {
+fn text_with_attributes_prints_the_same_whether_fed_as_a_run_or_one_character_at_a_time() {
     assert_equivalent("sgr", b"\x1b[1;31mred\x1b[0mplain\x1b[7minverse");
 }
 
 #[test]
-fn text_on_the_alternate_screen() {
+fn text_on_the_alternate_screen_prints_the_same_whether_fed_as_a_run_or_one_character_at_a_time() {
     assert_equivalent("alt screen", b"main\x1b[?1049halternate text here");
 }
