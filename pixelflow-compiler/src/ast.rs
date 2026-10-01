@@ -23,7 +23,7 @@
 //! FnItem
 //!   ├── vis                           // `pub` makes an entry; private is a helper
 //!   ├── structural: [name, ...]       // an entry's `const N: usize` parameters
-//!   ├── params: [(name, type), ...]   // scalars, records, and families `[R; N]`
+//!   ├── params: [(name, type), ...]   // scalar and record parameters
 //!   ├── ret: type                     // declared; absent only for the closure sugar
 //!   └── body: Expr
 //!
@@ -36,7 +36,6 @@
 //!   ├── Call(func, args)               // DX(e), a helper: f(x, y)
 //!   ├── If(cond, then, else)           // if c { a } else { b }
 //!   ├── Fold(reduction, range, binder, body) // (0..N).map(|i| e).sum()
-//!   ├── Family(reduction, family, element, body) // ps.into_iter().map(|p| e).sum()
 //!   ├── Cast(operand)                  // i as f32
 //!   ├── Field(base, member)            // p.x0, a record's field
 //!   ├── Block(stmts, expr)             // { let dx = ...; dx * dx }
@@ -216,49 +215,13 @@ impl FnItem {
     }
 }
 
-/// A declared parameter: a scalar, one of the block's records, or a family
-/// of either.
+/// A declared parameter: a scalar, or one of the block's records.
 #[derive(Debug, Clone)]
 pub struct Param {
     /// Parameter name.
     pub name: Ident,
-    /// The declared type.
-    pub ty: ParamType,
-}
-
-/// What a parameter is declared as: one value, or a family of them.
-#[derive(Debug, Clone)]
-pub enum ParamType {
-    /// One value, as written: an `f32` or a record (`bool` in a helper).
-    One(Box<Type>),
-    /// `[E; N]`: a family of `N` elements of `E` (plan §1.3, §1.6).
-    Family(FamilyType),
-}
-
-impl ParamType {
-    /// The type as written, for a diagnostic to point at: the one value's,
-    /// or the family's element's.
-    pub fn written(&self) -> &Type {
-        match self {
-            ParamType::One(ty) => ty,
-            ParamType::Family(family) => &family.element,
-        }
-    }
-}
-
-/// `[E; N]`: an entry's family — `N` elements of the record or `f32` `E`,
-/// which are `N`·width scalar uniforms at static slots, element-major, and
-/// not a table: nothing reads it by index, and it is iterated only as a
-/// whole, when the entry's host function is instantiated (plan §1.6).
-#[derive(Debug, Clone)]
-pub struct FamilyType {
-    /// The element's type, as written: a record or `f32`, `sema`'s question.
-    pub element: Box<Type>,
-    /// The count, as written: an integer literal, a `usize` const or the
-    /// entry's structural parameter, `sema`'s question.
-    pub count: Box<Expr>,
-    /// The brackets' span.
-    pub span: Span,
+    /// The declared type (`f32` or a record; `bool` in a helper).
+    pub ty: Box<Type>,
 }
 
 /// An expression in the kernel body.
@@ -293,10 +256,6 @@ pub enum Expr {
     /// A fold over a constant range: `(0..N).map(|i| e).sum()`.
     Fold(FoldExpr),
 
-    /// A family iterated at instantiation:
-    /// `pieces.into_iter().map(|p| e).sum()`.
-    Family(FamilyExpr),
-
     /// A conversion: `i as f32`.
     Cast(CastExpr),
 
@@ -323,7 +282,6 @@ impl Expr {
             Expr::Call(e) => e.span,
             Expr::If(e) => e.span,
             Expr::Fold(e) => e.span,
-            Expr::Family(e) => e.span,
             Expr::Cast(e) => e.span,
             Expr::Field(e) => e.span,
             Expr::Block(e) => e.span,
@@ -554,32 +512,6 @@ pub struct FoldExpr {
     /// `any`, …).
     pub span: Span,
 }
-
-/// `pieces.into_iter().map(|p| e).sum()` and its siblings: ⊕ of `e` over
-/// the elements of the family `pieces`, `e[p := element k]` for each `k`,
-/// or the monoid's identity when the family is empty
-/// (docs/plans/2026-09-25-the-language-is-kernel.md §1.6).
-///
-/// Not a fold: no index exists, at expansion or at run time. The family's
-/// count is structural, so the program holds `N` copies of the body, each
-/// over its own element's uniforms, made when the entry's host function is
-/// instantiated. The closure's parameter is the element — a record read by
-/// field, or an `f32` — and, as a fold's closure, it is not a value.
-#[derive(Debug, Clone)]
-pub struct FamilyExpr {
-    pub reduction: Reduction,
-    /// The family iterated, by name: one of the entry's parameters.
-    pub family: Ident,
-    /// The closure's parameter: one element.
-    pub element: Ident,
-    pub body: Box<Expr>,
-    /// The span of the method that names the reduction.
-    pub span: Span,
-}
-
-/// How a family is iterated, as a refusal names it: the one way its
-/// elements are read.
-pub const FAMILY_SUM: &str = "`pieces.into_iter().map(|p| e).sum()`";
 
 /// The half-open `lo..hi` a fold ranges over.
 #[derive(Debug, Clone)]

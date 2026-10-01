@@ -1357,8 +1357,6 @@ impl ExprArena {
     /// places still binds one pointer. Uniforms merge the same way, by
     /// [`UniformIdentity`]: one instance read from twenty places is one slot,
     /// and two instances of one builder stay two.
-    ///
-    /// `splice_with`'s case that places each uniform by identity.
     pub fn splice(&mut self, other: &ExprArena, root: ExprId) -> ExprId {
         self.splice_with(other, root, |arena, slot| {
             let found = arena.uniform_slot_for(other.uniforms[slot.0 as usize]);
@@ -1366,21 +1364,11 @@ impl ExprArena {
         })
     }
 
-    /// [`splice`](Self::splice), with `other`'s uniforms placed by the
-    /// caller: each uniform slot of `other` the fragment reads becomes the
-    /// node `input` builds for it here, built once however often the slot is
-    /// read. So `other` can be a function of its uniforms — a `kernel!`
-    /// family's template, over an abstract element and the terms it shares
-    /// with its program — and each splice one application of it, with no
-    /// table rewritten and no identity searched for.
-    ///
-    /// Buffers merge by identity, as [`splice`](Self::splice)'s do.
-    ///
-    /// Not API: `kernel!`'s emitted code calls it, in the crate that writes
-    /// the block, which is why it is `pub`; hidden, as `pixelflow-core`'s
-    /// `__macro` is.
-    #[doc(hidden)]
-    pub fn splice_with<F>(&mut self, other: &ExprArena, root: ExprId, mut input: F) -> ExprId
+    /// The walk [`splice`](Self::splice) is: `other`'s fragment copied in,
+    /// each uniform slot it reads becoming the node `input` builds for it
+    /// here, built once however often the slot is read. `splice` places
+    /// each by identity. Buffers merge by identity, as `splice`'s do.
+    fn splice_with<F>(&mut self, other: &ExprArena, root: ExprId, mut input: F) -> ExprId
     where
         F: FnMut(&mut ExprArena, UniformId) -> ExprId,
     {

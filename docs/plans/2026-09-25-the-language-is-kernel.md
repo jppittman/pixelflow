@@ -5,7 +5,7 @@
 - **Status**: `Proposed`. Revised the same day after JP's rulings on Q1:
   one program per font per zoom level, there are no tables, the control
   points are uniforms, and `select` is renamed `if` (§1.6, §1.7). Revised
-  again 2026-10-01: no arrays (below). Phase A is in progress.
+  again 2026-10-01: no arrays (below). Phases A and B are done but B7; Phase C waits on O1–O4.
 - **No arrays** (2026-10-01). JP: *"Why do we have any arrays at all?"*
   and *"No arrays at all.. please go read recent docs about how this ought
   to work."*
@@ -26,8 +26,8 @@
     collection type anywhere. A piece is one instance of one entry over its
     own ten uniforms, a glyph is its pieces summed under its box, the font
     is its glyphs under an `if id < k` tree, and host Rust composes them
-    (§1.3, §1.6–§1.8). The families are superseded (B3) and deleted by the
-    companion code CL. What the documents do not settle is listed as open,
+    (§1.3, §1.6–§1.8). The families are superseded (B3) and deleted
+    (`refactor(compiler): kernel! has no collection types`). What the documents do not settle is listed as open,
     not decided (§4, O1–O4).
 - **Integrals deleted** (2026-09-29). JP: *"just do b. delete all the
   integral stuff. other languages don't try this. probably for good
@@ -383,7 +383,7 @@ kernel! {
 ```
 
 **The atlas becomes the font program.** JP: *"The 'atlas' becomes the kernel
-for that number of control points."* The atlas holds one font at one tile
+for that number of control points, everything else is a uniform."* The atlas holds one font at one tile
 size (F, `atlas.rs:46-60`: "An atlas is bound to ONE font", rebuilt "on
 cell-size and density changes"). So the kernel that replaces it is the
 font's at one zoom level (I), which is what JP's Q1 answer says.
@@ -403,7 +403,12 @@ font loaded at runtime), and the language has no collection to hold it
   - **I:** the host numbers the font's glyphs `0..G`, halves the range, and
     `k` is the first id of the upper half. `k` is a count, so it is
     structural.
-  - `id` is one uniform, and every node reads it.
+  - `id` is one uniform, and every node reads it. That needs one id
+    instance read at every node: an entry instantiated per node with an
+    `id` parameter would mint one id per node (identity is by instance,
+    §1.4), and no document says how a composition reuses one (O3).
+  - Composing instances is the host walking data, not unrolling: there is
+    no fold over pieces, and each instance reads its own uniforms.
 
 That is the whole font program. The tree is the partition that `if` and
 bounding make (§1.6). It is not a table, and the host chooses no program.
@@ -427,8 +432,8 @@ bounding make (§1.6). It is not a table, and the host chooses no program.
 `pixelflow-compiler/tests/common/section_1_7.rs`. `fonts/loop_blinn/kernel_copy.rs`
 (`a_piece_is_one_term_through_either_definition`) pins that piece's term
 against the builder's `piece_term`: they are one canonical key. The file's
-`glyph<const N>` over a family, and the bake through it, are superseded with
-the families (B3) and deleted by the companion code CL.
+`glyph<const N>` over a family, and the bake through it, were deleted with
+the families (B3).
 
 **A piece's term is its closed form, not an integral** (JP, 2026-09-29:
 *"delete all the integral stuff. other languages don't try this. probably
@@ -496,7 +501,7 @@ piece was its own integral, went with the integral (§1.5).
      composition-is-linking's linker "only inlines". A link that keeps a
      glyph a separate unit has to be built (O1).
 2. **Zoom latency.** A zoom recompiles every glyph.
-   - A 64-piece glyph bakes in 806–897 ms under the unpinned cap (C2),
+   - (I, measured on B3's family `glyph::<64>`) a 64-piece glyph bakes in 806–897 ms under the unpinned cap (C2),
      and one of 189 pieces emits in 4.4 s. So a zoom level takes seconds
      on one thread.
    - **Fix:** glyphs are independent units, so compile them in parallel,
@@ -591,8 +596,9 @@ and no digests are committed (one-pipeline §5, gate policy).
     `e65a72e3` and `fe5913cc` also built families of records iterated at
     instantiation: the `[R; N]` parameter (`Ty::Family`), the family
     template, and the iteration's marker uniform.
-  - The companion code CL deletes them, with their tests,
-    `a_family_is_its_copies.rs` and `family_args_allocate_nothing.rs`.
+  - Deleted (`refactor(compiler): kernel! has no collection types`), with
+    their tests, `a_family_is_its_copies.rs` and
+    `family_args_allocate_nothing.rs`.
   - The marker also extended `Uniform`'s meaning without extending its
     type. It is a uniform declared for the iteration alone, with a NaN
     default, which emission recognizes by identity (`lower.rs`,

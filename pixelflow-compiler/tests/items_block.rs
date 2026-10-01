@@ -106,3 +106,65 @@ fn if_and_select_lower_to_the_same_arena() {
     assert_eq!(bake(&spelled_if), 6.0);
     assert_eq!(bake(&spelled_select), 6.0);
 }
+
+/// A block written where no prelude is in scope: a record, a `pub const`, a
+/// helper, a tuple `let`, a fold over a structural count, the `Args`
+/// record, and the closure form. The expansion names every item by path,
+/// so it expands in a `#[no_implicit_prelude]` module as anywhere else —
+/// which a bare `Some`, or a method called through a prelude trait, would
+/// not.
+#[no_implicit_prelude]
+mod without_a_prelude {
+    ::pixelflow_compiler::kernel! {
+        /// A point with a weight.
+        pub struct Mass { pub x: f32, pub w: f32 }
+
+        /// Half.
+        pub const HALF: f32 = 0.5;
+
+        fn weighed(m: Mass, r: f32) -> f32 { m.x * r + m.w }
+
+        /// The weighed point plus each fold index, plus a half where `v`
+        /// is past `X`.
+        pub fn swept<const N: usize>(m: Mass, v: f32, r: f32) -> f32 {
+            let (a, b) = (r, X);
+            (0..N).map(|i| weighed(m, a) + (i as f32)).sum::<f32>()
+                + if b < v { HALF } else { 0.0 }
+        }
+    }
+
+    /// The closure form, scaled.
+    pub fn scaled(v: f32, r: f32) -> ::pixelflow_core::Kernel {
+        let scaled = ::pixelflow_compiler::kernel!(|v: f32, r: f32| v * r + X);
+        scaled(v, r)
+    }
+}
+
+/// The block without a prelude means what it says, and its program rebinds
+/// from its `Args`.
+#[test]
+fn a_block_expands_where_no_prelude_is_in_scope() {
+    use without_a_prelude::{HALF, Mass, SweptArgs, scaled, swept};
+    let m = Mass { x: 1.0, w: 2.0 };
+    let (v, r) = (4.0, 0.5);
+    let x = 0.5;
+    let by_rust: f32 =
+        (0..3).map(|i| (m.x * r + m.w) + i as f32).sum::<f32>() + if x < v { HALF } else { 0.0 };
+    let kernel = swept::<3>(m, v, r);
+    assert_eq!(Lattice::eval_at(&kernel, x, 0.0), by_rust);
+
+    let lattice = Lattice::frame(4, 2);
+    let program = Manifold::compile(&kernel, lattice.extent);
+    let mut block = program.block();
+    let args = SweptArgs::<3> {
+        m: Mass { x: -1.0, w: 4.0 },
+        v: 0.125,
+        r: 2.0,
+    };
+    args.write_into(&mut block).expect("swept's own arguments");
+    let rebound = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
+    let baked = lattice.bake(&swept::<3>(args.m, args.v, args.r));
+    assert_eq!(rebound.buffer(), baked.buffer());
+
+    assert_eq!(Lattice::eval_at(&scaled(1.0, 2.0), 0.5, 0.0), 2.5);
+}

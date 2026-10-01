@@ -153,8 +153,8 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 /// — and the index `i` is a `usize`, which a body reads only as `i as f32`:
 /// there is no arithmetic on an index and nothing to index. A fold lowers to
 /// one `Reduce`, the node `Kernel::over` builds; unrolling it is the
-/// e-graph's choice, at bake time. A closure is the body of a fold or of a
-/// family's iteration and appears nowhere else.
+/// e-graph's choice, at bake time. A closure is the body of a fold and
+/// appears nowhere else.
 ///
 /// `if` is the choice. `.select(a, b)` still lowers to the same node this
 /// phase, and Phase B of the plan removes it.
@@ -164,53 +164,14 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 /// expression read before any name binds, as Rust's does. A tuple anywhere
 /// else is a value, which is Phase D (D7).
 ///
-/// # Families
+/// # No collection types
 ///
-/// An entry's parameter may be a family, `name: [R; N]`: `N` elements of one
-/// of the block's records or of `f32`s, `N` a structural parameter, an
-/// integer or a `usize` const (§1.6). A family is `N` elements' uniforms at
-/// static slots, element-major, and not a table: nothing indexes it,
-/// measures it, passes it on, compares it or returns it. It is iterated as a
-/// whole, as Rust iterates an array by value —
-/// `name.into_iter().map(|p| e).sum()`, `.product()`, the two `.fold`s,
-/// `name.into_iter().any(|p| m)` and `.all(|p| m)` — which is ⊕ of
-/// `e[p := element k]` over the elements, the monoid's identity when there
-/// are none. The program holds
-/// one copy of the body per element, made when the host function is
-/// instantiated: at `N = 3` it is `e[p₀] + e[p₁] + e[p₂]`, the copies
-/// written out, with no fold, no binder and no index. A helper takes one
-/// element; the entry's `Args` record holds the family as its array.
-///
-/// ```ignore
-/// use pixelflow_compiler::kernel;
-/// use pixelflow_core::{Lattice, Manifold};
-///
-/// kernel! {
-///     /// A disc: its centre and its radius.
-///     pub struct Disc { pub cx: f32, pub cy: f32, pub r: f32 }
-///
-///     fn inside(d: Disc, x: f32, y: f32) -> f32 {
-///         let (dx, dy) = (x - d.cx, y - d.cy);
-///         if dx * dx + dy * dy < d.r * d.r { 1.0 } else { 0.0 }
-///     }
-///
-///     /// How many of the discs cover the sample: `N` is the program, and
-///     /// the discs are its uniforms.
-///     pub fn cover<const N: usize>(discs: [Disc; N]) -> f32 {
-///         discs.into_iter().map(|d| inside(d, X, Y)).sum()
-///     }
-/// }
-///
-/// let lattice = Lattice::frame(8, 8);
-/// let a = Disc { cx: 3.0, cy: 3.0, r: 2.0 };
-/// let b = Disc { cx: 5.0, cy: 3.0, r: 2.0 };
-/// let once = lattice.bake(&cover([a, b]));                      // N = 2, inferred
-///
-/// let program = Manifold::compile(&cover([a, b]), lattice.extent);
-/// let mut block = program.block();
-/// CoverArgs { discs: [b, Disc { r: 3.0, ..a }] }.write_into(&mut block)?;
-/// let again = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
-/// ```
+/// The language has none (§1.3, §1.6): no array, slice, list or table — as
+/// a parameter, a value, or a thing to index or iterate. Several values are
+/// several parameters, a record is its named fields, and the one iteration
+/// is a fold, over a range. Each spelling of a collection — `[R; N]`,
+/// `&[R]`, `[a, b]`, `v[k]`, `.into_iter()`, `.iter()`, `.map` over anything
+/// but a range — is refused where it is written.
 ///
 /// # The closure form
 ///
@@ -302,11 +263,10 @@ pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
 /// 4. **Optimization**: e-graph saturation + latency-prior extraction, on
 ///    the arena. A kernel carrying a `Dwrt` declines here and is optimized
 ///    at bake time instead, so composition still gets the chain rule; so is
-///    an entry with structural parameters or a family, a template until it
-///    is instantiated.
+///    an entry with structural parameters, a template until it is
+///    instantiated.
 /// 5. **Emission**: the arena becomes code that rebuilds it at load time,
-///    the call's values as its uniforms' defaults, and a family's
-///    iterations the copies of their bodies, made as the host function runs
+///    the call's values as its uniforms' defaults
 #[proc_macro]
 pub fn kernel(input: TokenStream) -> TokenStream {
     expand(input, &mut macro_tier())
