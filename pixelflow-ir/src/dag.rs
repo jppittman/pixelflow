@@ -125,13 +125,13 @@ impl DagIdentity {
     /// identity and letting two unrelated DAGs share a scratch.
     fn mint() -> Self {
         static NEXT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        // `fetch_update`, not `fetch_add` + assert: the add would wrap
+        // `try_update`, not `fetch_add` + assert: the add would wrap
         // *before* the assert fires, so a caught panic would leave the
         // counter back on a live identity. Declining to store leaves it
         // permanently exhausted instead. (`arena.rs`'s `mint_identity` has
         // the long version of this note.)
         Self(
-            NEXT.fetch_update(
+            NEXT.try_update(
                 core::sync::atomic::Ordering::Relaxed,
                 core::sync::atomic::Ordering::Relaxed,
                 |n| n.checked_add(1),
@@ -223,7 +223,6 @@ impl<T> Dag<T> {
     }
 
     /// Every node, children strictly before parents.
-    #[must_use]
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = Node<'_, T>> + '_ {
         (0..self.nodes.len() as u32).map(move |ix| Node { dag: self, ix })
     }
@@ -577,7 +576,6 @@ impl<T: Clone> Clone for Rooted<T> {
 
 impl<T> Rooted<T> {
     /// The nodes the builder was told to keep.
-    #[must_use]
     pub fn entries(&self) -> impl ExactSizeIterator<Item = Node<'_, T>> + '_ {
         self.entries
             .iter()

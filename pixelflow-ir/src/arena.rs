@@ -234,11 +234,11 @@ impl BufferIdentity {
 /// if that panic is ever caught — or merely unwinds a non-fatal worker thread
 /// — the counter has already returned to 0 and the next mint hands out an
 /// identity that is still live. Two unrelated buffers (or uniforms) would
-/// then compare identical and merge into one splice/JIT slot. `fetch_update`
+/// then compare identical and merge into one splice/JIT slot. `try_update`
 /// declining to store leaves the counter permanently exhausted instead.
 fn mint_identity(counter: &core::sync::atomic::AtomicU64, what: &str) -> u64 {
     counter
-        .fetch_update(
+        .try_update(
             core::sync::atomic::Ordering::Relaxed,
             core::sync::atomic::Ordering::Relaxed,
             |n| n.checked_add(1),
@@ -1027,7 +1027,6 @@ impl ExprArena {
     /// this file names an offset, which is why there is no `nodes_raw`/
     /// `nary_children_raw` pair here any more).
     #[inline]
-    #[must_use]
     pub fn nodes(&self) -> impl DoubleEndedIterator<Item = (ExprId, ExprNode)> + '_ {
         (0..self.builder.dag().len() as u32).map(move |i| {
             let id = ExprId(i);
