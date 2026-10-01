@@ -7,11 +7,20 @@
   (§3.2), the build-time entry, CL4–CL5, Q1 and Q4 are superseded there.
   After JP's ruling that there are no tables and the control points are
   uniforms, this plan's tables backed by uniforms are superseded too: §1.3,
-  A8, CL8 and Q2, and the fold over pieces they fed. A glyph's program is
-  the kernel for its number of control points, `N` copies of one piece body
-  over scalar uniforms, and the measured `U_band` is that program
-  (the-language-is-kernel §1.6–§1.8). The frame (§1.6, Q3) is superseded:
-  a cell is one call.
+  A8, CL8 and Q2, and the fold over pieces they fed. The frame (§1.6, Q3) is
+  superseded: a cell is one call.
+- **Per-`N` programs and uniform families are superseded** (2026-10-01).
+  JP's Q1 ruling is one program per font per zoom level, and on 2026-10-01:
+  *"No arrays at all."* So this plan's "One program per control-point
+  count" (below) and Q5's uniform families are superseded.
+  - A font is one program per zoom level: each piece is an instance of one
+    entry over its own ten scalar uniforms, a glyph is its pieces summed
+    under its box, and the font is its glyphs under an `if id < k` tree
+    (the-language-is-kernel §1.6–§1.8).
+  - **I:** the measured `U_band` is one glyph of it.
+  - An earlier revision of this note said a glyph's program is the kernel
+    for its `N`. The language plan's metadata says where that came from
+    (`43ec6487`).
 - **The closing phase is superseded** (2026-09-29): `closing_R`, the
   integration family `saturate_bounded` ran to a fixpoint before the rest
   of the rule set, is deleted with the integral it closed, and with it
@@ -103,7 +112,9 @@ at `8b7b75a`. **I** marks an inference.
   never done at construction.
 - **Every range is constant.**
 - **One program per control-point count: exact N, not buckets** ("the kernel
-  for that number of control points").
+  for that number of control points"). *Superseded* (2026-10-01): this
+  reading predates JP's Q1 ruling, one program per font per zoom level.
+  There is no per-`N` program and no bucket (the-language-is-kernel §1.7).
 - **A bundled glyph's control points are uniforms** (rodata at build time),
   not constants ("everything else is a uniform").
 - **The build-time entry is the macro.** An earlier revision said a build
@@ -947,8 +958,8 @@ plan.
   - `program` (A3);
   - `unsafe jit_cache::preload` (A4);
   - `EmitCtx.isa` (C1);
-  - uniform families and their read (A8, answered by JP: "it is a
-    uniform"; spelled in the-language-is-kernel §1.6);
+  - *superseded* (2026-10-01): uniform families and their read (A8). JP:
+    *"No arrays at all."* There are none (the-language-is-kernel §1.3);
 - **Changes:**
   - `Optimizer::production(shape)` (M7);
   - one `RuleSet`, with `all_rules()` returning 69 (M4).
