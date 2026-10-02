@@ -283,6 +283,47 @@ mod tests {
     }
 
     #[test]
+    fn it_should_set_focus_state_to_unfocused_when_it_receives_focus_lost() {
+        let mut emu = create_test_emu_for_input();
+        let result = emu.interpret_input(EmulatorInput::User(UserInputAction::FocusLost));
+        assert_eq!(result, None);
+        assert!(matches!(emu.focus_state, FocusState::Unfocused));
+    }
+
+    #[test]
+    fn it_should_set_focus_state_to_focused_when_it_receives_focus_gained() {
+        let mut emu = create_test_emu_for_input();
+        emu.interpret_input(EmulatorInput::User(UserInputAction::FocusLost));
+
+        let result = emu.interpret_input(EmulatorInput::User(UserInputAction::FocusGained));
+
+        assert_eq!(result, None);
+        assert!(matches!(emu.focus_state, FocusState::Focused));
+    }
+
+    #[test]
+    fn it_should_request_clipboard_content_when_it_receives_request_clipboard_paste() {
+        let mut emu = create_test_emu_for_input();
+        let result =
+            emu.interpret_input(EmulatorInput::User(UserInputAction::RequestClipboardPaste));
+        assert_eq!(result, Some(EmulatorAction::RequestClipboardContent));
+    }
+
+    #[test]
+    fn it_should_request_clipboard_content_when_it_receives_request_primary_paste() {
+        let mut emu = create_test_emu_for_input();
+        let result = emu.interpret_input(EmulatorInput::User(UserInputAction::RequestPrimaryPaste));
+        assert_eq!(result, Some(EmulatorAction::RequestClipboardContent));
+    }
+
+    #[test]
+    fn it_should_return_quit_when_it_receives_request_quit() {
+        let mut emu = create_test_emu_for_input();
+        let result = emu.interpret_input(EmulatorInput::User(UserInputAction::RequestQuit));
+        assert_eq!(result, Some(EmulatorAction::Quit));
+    }
+
+    #[test]
     fn control_event_resize_returns_resize_pty_action() {
         let mut emu = create_test_emu_for_input();
 
