@@ -20,7 +20,7 @@
   - **I:** the measured `U_band` is one glyph of it.
   - An earlier revision of this note said a glyph's program is the kernel
     for its `N`. The language plan's metadata says where that came from
-    (`43ec6487`).
+    (`75b7e8f3`).
 - **The closing phase is superseded** (2026-09-29): `closing_R`, the
   integration family `saturate_bounded` ran to a fixpoint before the rest
   of the rule set, is deleted with the integral it closed, and with it

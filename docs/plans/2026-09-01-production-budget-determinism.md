@@ -478,7 +478,7 @@ Every input of at most 625 inserted classes keeps the budget it had.
 
 ### What moved
 
-Measured in release on AVX-512 and on AVX2 (`PIXELFLOW_ISA=avx2`), before = `15cc5942`.
+Measured in release on AVX-512 and on AVX2 (`PIXELFLOW_ISA=avx2`), before = `40e2bb00`.
 Saturation records come from `saturation-telemetry`.
 
 **Production: nothing.** 316 kernels per tier are bit-identical in code and in pixels:
