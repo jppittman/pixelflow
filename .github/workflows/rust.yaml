@@ -128,6 +128,16 @@ jobs:
       - name: Check every src/bin target is declared in its Cargo.toml
         run: bash scripts/check-bin-declarations.sh
 
+  wasm-status-reporting:
+    name: WASM status reporting regression
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check failure reporting independently of WASM buildability
+        run: python3 scripts/test_wasm_status.py
+
   # Platform `#[cfg(...)]` is encapsulation, not sprinkle (CLAUDE.md, "Code
   # Style"): it must gate a whole file/mod, or be a single-line dispatch item
   # in mod.rs. A grep-and-line-scan check, not a build, so it's fast and
@@ -862,24 +872,7 @@ jobs:
       # instead of one pass/fail bit for the whole dependency graph.
       - name: Check wasm32 buildability per crate
         shell: bash
-        run: |
-          set -uo pipefail
-          check() {
-            local label=$1
-            shift
-            echo "::group::$label"
-            if cargo check --target wasm32-unknown-unknown "$@"; then
-              echo "PASS: $label"
-            else
-              echo "::warning::FAIL (known, tracked): $label does not build for wasm32-unknown-unknown"
-            fi
-            echo "::endgroup::"
-          }
-          check "pixelflow-search" -p pixelflow-search
-          check "pixelflow-core" -p pixelflow-core
-          check "pixelflow-runtime web driver" -p pixelflow-runtime --no-default-features --features display_web
-        env:
-          DISPLAY_DRIVER: web
+        run: bash scripts/check-wasm-status.sh
 
   # `pixelflow-ir` compiles with `std` off. That is a real guarantee now, not
   # an aspiration, so it is enforced rather than reported: the crate is the
