@@ -178,9 +178,9 @@ impl RuleSet {
     /// [`RuleSet::production`] plus the bounded-fold decompositions and the
     /// integration rules.
     ///
-    /// The runtime tier's set, and only its: `kernel!` has no syntax that
-    /// builds a fold, so at the macro tier these rules can never fire. The
-    /// integration rules come last and match nothing but an integral, so a
+    /// The runtime tier's set. Macro-built pixel integrals reach this tier
+    /// after parameter binding and composition; the macro tier preserves them
+    /// without applying this rule family. The integration rules come last and match nothing but an integral, so a
     /// kernel without one saturates exactly as it did before they existed;
     /// with one, the graph runs them first ([`super::integral`]).
     /// Adding them to [`super::all_rules`] instead would leave them inert

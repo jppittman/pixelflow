@@ -96,6 +96,24 @@ use proc_macro::TokenStream;
 /// let plane = Lattice::frame(64, 64).bake(&unit_circle);
 /// ```
 ///
+/// # Pixel integrals and composition
+///
+/// `area(field)` (or `field.area()`) integrates the field over the unit
+/// pixel centred on the sample. Write an indicator with `.select(1.0, 0.0)`:
+/// comparison masks are bits, not numeric values.
+///
+/// ```ignore
+/// let coverage = kernel!(|edge: f32| area((X < edge).select(1.0, 0.0)));
+/// ```
+///
+/// `field.at(x, y)` precomposes coordinates simultaneously. Composition order
+/// matters: `field.at(2.0 * X, Y).area()` integrates the screen pixel under
+/// the scaled field; `field.area().at(2.0 * X, Y)` moves the field's integral.
+/// These use `Kernel`'s existing composition and integral constructors. The
+/// runtime e-graph closes recognized integrands; others retain the existing
+/// midpoint quadrature fallback. `area` does not promise exact integration
+/// for every expression.
+///
 /// # Parameters
 ///
 /// A builder's arguments are anything `Into<Scalar>`, and the type at the
@@ -317,6 +335,15 @@ mod every_advertised_method_compiles {
         assert!(expand(Macro::Kernel, "not_a_real_method", 0).is_err());
         // A real op at the wrong arity is just as unadvertised.
         assert!(expand(Macro::Kernel, "sqrt", 2).is_err());
+    }
+
+    #[test]
+    fn composition_methods_report_their_required_arity() {
+        for (method, supplied, want) in [("area", 1, 0), ("at", 0, 2), ("at", 3, 2)] {
+            let err =
+                expand(Macro::Kernel, method, supplied).expect_err("wrong arity must fail");
+            assert!(err.contains(&format!("takes {want} arguments")), "{err}");
+        }
     }
 
     /// A recognized name at the wrong arity must say so.

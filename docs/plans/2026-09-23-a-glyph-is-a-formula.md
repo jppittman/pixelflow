@@ -211,6 +211,34 @@ their trip counts, and where to prune. The set's contents — which pieces,
 which boxes — are per glyph and arrive at bind time; the program is per
 shape.
 
+### Shader syntax (2026-10-02)
+
+The shader frontend can now spell the existing pixel integral and coordinate
+composition directly, using `area(field)` / `field.area()` and
+`field.at(x, y)` in either `kernel!` or `kernel_raw!`. For a vertical chord:
+
+```rust
+let chord = kernel!(|lo: f32, hi: f32, edge: f32| {
+    let band = (Y >= lo).select(1.0, 0.0) * (Y < hi).select(1.0, 0.0);
+    area(band * (X < edge).select(1.0, 0.0))
+});
+```
+
+The frontend calls the existing `Kernel` constructors: it introduces no
+second integral definition, sampling loop, array surface, or rasterizer.
+Integration rules still run at runtime after binding and composition. Order
+retains the meaning decided in *an integral is a fold*: `field.at(x, y).area()`
+integrates the screen pixel, while `field.area().at(x, y)` precomposes the
+already-bound integral. Unrecognized integrands keep the existing midpoint
+fallback; this is not a claim of general symbolic integration.
+
+This closes a frontend gap, not §4.2–§4.4: the font still builds its bound
+piece table, buckets trip counts and writes support cuts by hand. The next
+compiler work remains demand-based pruning and sharing program structure
+without requiring the font author to arrange loops or padding. The behavior
+checks are in `pixelflow-compiler/tests/pixel_area.rs`; Rust execution was not
+available in the editing environment (no Cargo).
+
 ## 4. What the compiler must do
 
 Four capabilities, each a denotation the language nearly has.

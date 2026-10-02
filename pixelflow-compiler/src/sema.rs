@@ -29,7 +29,6 @@ use syn::Ident;
 /// DSL-specific methods that aren't IR operations.
 /// These are handled separately in the macro/runtime.
 const DSL_METHODS: &[&str] = &[
-    "at",       // coordinate transformation
     "constant", // collapse to Field
     "collapse", // alias for constant
     "clone",    // clone for reuse

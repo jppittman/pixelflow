@@ -9,7 +9,7 @@
 //! Emission — arena to the `TokenStream` that rebuilds it — is [`crate::emit`].
 
 use crate::ast::{BinaryOp, Expr, UnaryOp};
-use pixelflow_ir::OpKind;
+use pixelflow_ir::{Kernel, OpKind};
 use pixelflow_ir::arena::{ExprArena, ExprId};
 use std::collections::HashMap;
 use syn::Lit;
@@ -23,7 +23,13 @@ use syn::Lit;
 /// dispatch cannot silently drift on which library methods a kernel body may
 /// call. They did once, in both directions at once — see
 /// `every_advertised_method_compiles` in the crate root.
-pub(crate) const LIBRARY_METHODS: &[(&str, usize)] = &[("fract", 0), ("hypot", 1), ("clamp", 2)];
+pub(crate) const LIBRARY_METHODS: &[(&str, usize)] = &[
+    ("fract", 0),
+    ("hypot", 1),
+    ("clamp", 2),
+    ("area", 0),
+    ("at", 2),
+];
 
 /// Build a `param_name → index` map over the params of a kernel.
 ///
@@ -71,6 +77,22 @@ struct Lowering<'a> {
 }
 
 impl Lowering<'_> {
+    /// Use the language value's composition, rather than a second definition
+    /// of coordinate substitution or fresh integral binders in the frontend.
+    fn fragment(&self, root: ExprId) -> Kernel {
+        Kernel::from_parts(self.arena.clone(), root)
+    }
+
+    fn splice(&mut self, kernel: &Kernel) -> ExprId {
+        let (arena, root) = kernel.parts();
+        self.arena.splice(arena, root)
+    }
+
+    fn lower_area(&mut self, root: ExprId) -> ExprId {
+        let area = self.fragment(root).area();
+        self.splice(&area)
+    }
+
     /// Translate an AST node into the arena, resolving `let`-bound locals via
     /// `self.locals`. The optimizer emits `let`-bindings (a [`Expr::Block`]) for
     /// shared subexpressions; each binding maps to a single [`ExprId`], so the
@@ -143,17 +165,6 @@ impl Lowering<'_> {
             Expr::MethodCall(call) => {
                 let method = call.method.to_string();
 
-                // `.at(x, y)` warped a manifold-typed macro param at a
-                // call site. There are no manifold params: a kernel composes
-                // `Kernel` values, and `Kernel::at` is the warp.
-                if method == "at" {
-                    return Err(
-                        ".at() inside a kernel body samples a manifold param, and there are none; \
-                         compose Kernel values with Kernel::at instead"
-                            .to_string(),
-                    );
-                }
-
                 let receiver = self.lower(&call.receiver)?;
                 let arg_count = call.args.len();
 
@@ -185,6 +196,15 @@ impl Lowering<'_> {
                 }
 
                 match (method.as_str(), arg_count) {
+                    ("area", 0) => Ok(self.lower_area(receiver)),
+                    ("at", 2) => {
+                        let x = self.lower(&call.args[0])?;
+                        let y = self.lower(&call.args[1])?;
+                        let composed = self
+                            .fragment(receiver)
+                            .at(&self.fragment(x), &self.fragment(y));
+                        Ok(self.splice(&composed))
+                    }
                     // `fract(x) = x - floor(x)`.
                     ("fract", 0) => {
                         let f = self.arena.push_unary(OpKind::Floor, receiver);
@@ -220,7 +240,7 @@ impl Lowering<'_> {
                 let func = call.func.to_string();
                 if call.args.len() != 1 {
                     return Err(format!(
-                        "Unsupported call: {}/{} (projections take one argument)",
+                        "Unsupported call: {}/{} (this function takes one argument)",
                         func,
                         call.args.len()
                     ));
@@ -228,6 +248,7 @@ impl Lowering<'_> {
                 let inner = self.lower(&call.args[0])?;
                 match func.as_str() {
                     "V" => Ok(inner),
+                    "area" => Ok(self.lower_area(inner)),
                     "DX" => Ok(push_dwrt(self.arena, inner, 0)),
                     "DY" => Ok(push_dwrt(self.arena, inner, 1)),
                     "DZ" => Err(
