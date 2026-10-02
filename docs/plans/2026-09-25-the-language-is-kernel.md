@@ -13,17 +13,17 @@
 - **No arrays** (2026-10-01). JP: *"Why do we have any arrays at all?"*
   and *"No arrays at all.. please go read recent docs about how this ought
   to work."*
-  - **Where the plan went wrong (F, git): `43ec6487`.** JP had corrected
-    one thing in `60f701c4`: the control points are uniforms, not
-    constants. `43ec6487` changed two more. It replaced the font program
+  - **Where the plan went wrong (F, git): `75b7e8f3`.** JP had corrected
+    one thing in `10b76d53`: the control points are uniforms, not
+    constants. `75b7e8f3` changed two more. It replaced the font program
     with one program per control-point count `N`, which Q1 had offered JP
-    (`8b2bc63b`: "one program per `N`, dispatched per region") and JP had
+    (`739e8cb0`: "one program per `N`, dispatched per region") and JP had
     not chosen. And it brought back, as a "family" `[Row; N]`, the uniform
-    array `60f701c4` had dropped. It read JP's atlas sentence the way
+    array `10b76d53` had dropped. It read JP's atlas sentence the way
     one-pipeline already had ("One program per control-point count",
     written before the Q1 ruling). B3's second half then built the family
-    (`e65a72e3`, `fe5913cc`).
-  - `60f701c4` was not array-free either: it had structural lists
+    (`66c1f4a1`, `8b07cec1`).
+  - `10b76d53` was not array-free either: it had structural lists
     (`Glyph { pieces: [Row] }`, `Font { glyphs: [(u32, Glyph)] }`,
     `FONT.by_id`). Its font program and its `if id < k` tree were right.
   - **This revision** restores one program per font per zoom level with no
@@ -247,7 +247,7 @@ a mask. F: probe p16 gives 5. After this plan it is a type error.
 
 **There are no integrals.** JP, 2026-09-29: *"just do b. delete all the
 integral stuff. other languages don't try this. probably for good
-reason."* The table had three more rows, landed by B4 (`d9d759a4`):
+reason."* The table had three more rows, landed by B4 (`4b7ea263`):
 `integral(lo..hi, |u| e)` over an interval fold, `area(|u, v| e)` as two
 of them over the pixel, and the intrinsic `monotone_root(δ, step, bend)`. They were deleted with everything
 that gave them meaning — the IR's interval domain (`Fold::Interval`), the
@@ -452,7 +452,7 @@ font loaded at runtime), and the language has no collection to hold it
 That is the whole font program. The tree is the partition that `if` and
 bounding make (§1.6). It is not a table, and the host chooses no program.
 
-**The composition surface (O2) is built** (D-a, `7706e4b7`). The host
+**The composition surface (O2) is built** (D-a, `f0599991`). The host
 composes a glyph from `kernel!` entries alone: one `one_piece` instance
 per piece, summed by `sum2` as a balanced tree, and `glyph(ink, bounds)`
 over the sum. Nothing of the builder is on that path (F,
@@ -533,17 +533,17 @@ piece was its own integral, went with the integral (§1.5).
 
 1. **Size (O1).** One font program is too big for one e-graph or one emit.
    - Noto's ASCII has 1,625 pieces (F).
-   - A 32-piece glyph inserts 3,324 classes (F, `7aba74a7`), about 100 a
+   - A 32-piece glyph inserts 3,324 classes (F, `6c588c1b`), about 100 a
      piece. The font inlined inserts **169,263** classes before any rule
      fires (F, O1's measurement; the inference here was about 160k). That
      is over `HARD_CLASS_LIMIT` (100k, `graph.rs`) and three times the
-     classical ceiling (50k, `7aba74a7`).
+     classical ceiling (50k, `6c588c1b`).
    - Emission is superlinear. One glyph's program emits in 7 ms at 8 pieces
      and 4.4 s at 189 (F, `U_band`, measured at `8b7b75a`).
    - Code is about 1.5 KB a piece (F: `U_band`, 279 KB at 189 pieces).
      ASCII's 94 inked glyphs, each emitted alone, are 2.58 MB (F, O1).
    - **Fix: each glyph is its own unit of optimization, and the id tree
-     links them**, as `60f701c4` had it. **Built** (O1). The largest Noto
+     links them**, as `10b76d53` had it. **Built** (O1). The largest Noto
      ASCII glyph is `@`, 56 pieces, and inserts 5,796 classes (F, O1); the
      189-piece glyph above is `U_band`, not an ASCII glyph.
 2. **Zoom latency.** A zoom recompiles every glyph.
@@ -625,7 +625,7 @@ and no digests are committed (one-pipeline §5, gate policy).
   "Select contains an if" section retitled.
 - **A4. The uniform chain at 64 bits:** `UniformId`, `dense_slot`,
   `ScheduledOp::Uniform` and `emit_uniform_load`'s offset. **Done** in
-  `964be574`: `declare_uniform`'s assertion below `u16::MAX` is gone, and
+  `9c7e7397`: `declare_uniform`'s assertion below `u16::MAX` is gone, and
   `UniformBlock::set`'s linear search is an index.
   - A font program holds about 16k uniforms for Noto's ASCII alone (I:
     1,625 pieces at ten each, plus four per glyph's box).
@@ -640,14 +640,14 @@ and no digests are committed (one-pipeline §5, gate policy).
 ### Phase B: the syntax grows the font's constructs
 
 - **B1.** The items block, `if` as the only choice, typed masks, `const`
-  items and helper `fn`s. **Done** in `fb324728`.
+  items and helper `fn`s. **Done** in `2903b1f0`.
 - **B2.** Folds over constant ranges, and the binder type. **Done** in
-  `96c240b8`.
+  `92cf54df`.
 - **B3.** Binding times and `Args`, records, structural counts, and tuple
-  `let`s. **Done**: records, binding times and `Args` in `f002fb6a`; tuple
-  `let`s in `e65a72e3` (B3's second half).
+  `let`s. **Done**: records, binding times and `Args` in `c2b8b1ea`; tuple
+  `let`s in `66c1f4a1` (B3's second half).
   - **Families are superseded** (JP, 2026-10-01: *"No arrays at all."*).
-    `e65a72e3` and `fe5913cc` also built families of records iterated at
+    `66c1f4a1` and `8b07cec1` also built families of records iterated at
     instantiation: the `[R; N]` parameter (`Ty::Family`), the family
     template, and the iteration's marker uniform.
   - Deleted (`refactor(compiler): kernel! has no collection types`), with
@@ -657,14 +657,14 @@ and no digests are committed (one-pipeline §5, gate policy).
     type. It is a uniform declared for the iteration alone, with a NaN
     default, which emission recognizes by identity (`lower.rs`,
     `Iteration`). It survives a splice and not a rewrite.
-- **B4.** `integral`, `area` and `monotone_root`. **Done** in `d9d759a4`,
-  with review follow-ups in `68781e16`, and **deleted** with the integral
+- **B4.** `integral`, `area` and `monotone_root`. **Done** in `4b7ea263`,
+  with review follow-ups in `cc0dc47b`, and **deleted** with the integral
   (2026-09-29, §1.5): the syntax, its `sema` and lowering, the reserved
   names and `F32Scope` (which existed so a bound could be evaluated like an
   `f32` const) are gone, and so is `ExprArena::close_over`'s refusal of a
   fold its caller declined.
 - **B5.** Lowering calls `pixelflow-ir`'s definitions, and `lower.rs`'s
-  copies go. **Done** in `b6d39fc3`: `library`'s `fract`, `hypot`, `clamp`
+  copies go. **Done** in `85815a0f`: `library`'s `fract`, `hypot`, `clamp`
   and `derivative`, written once over the sites a term is built in and
   built through by `Kernel`'s methods, lowering and the integrals' closed
   forms; `Axis`; `ExprArena::close_over` and `Placeholder`; the 2²⁴ bound
@@ -711,7 +711,7 @@ and no digests are committed (one-pipeline §5, gate policy).
     today's at 80×24 and 200×60, at 16 and 32 px, on both x86 tiers, and
     measure a zoom's compile. If 200×60 at 32 px misses 16.7 ms, that goes
     to JP before the atlas is deleted.
-  - The unpinned classical cap (`7aba74a7`) costs a glyph of copies. B3's
+  - The unpinned classical cap (`6c588c1b`) costs a glyph of copies. B3's
     family `glyph::<64>` bakes in 376 → 897 ms on AVX-512 (415 → 806 ms on
     AVX2), with code +15–20%, for an extraction within 1.2e-7 of the
     fold's. **I:** a glyph composed of 64 `one_piece` instances is the same
@@ -723,7 +723,7 @@ and no digests are committed (one-pipeline §5, gate policy).
 ### Phase D: the builder goes internal
 
 - **D-a.** Kernel-typed parameters, with the capture-avoiding splice (D4).
-  **Done** in `7706e4b7`. See O2's answer for what was built.
+  **Done** in `f0599991`. See O2's answer for what was built.
 - **D-b.** Record returns, `u32` bits, and the packed frame.
 - **D-c.** Scenes, ML and the runtime examples move onto `kernel!`.
 - **D-d.** The fluent constructors leave `Kernel`. Graphics and runtime drop
@@ -766,9 +766,9 @@ id tree, built into `P` before C1. Built (`feat(search): a named kernel is its o
   - §1.8: Noto's ASCII is 1,625 pieces (F), so about 160k classes are
     inserted before any rule fires (I, from 3,324 for a 32-piece glyph, F;
     measured since: 169,263). `HARD_CLASS_LIMIT` is 100k (`graph.rs`), and
-    the classical ceiling is 50k (`7aba74a7`).
+    the classical ceiling is 50k (`6c588c1b`).
   - Emission is superlinear: 7 ms at 8 pieces and 4.4 s at 189 (F).
-  - `60f701c4` §1.8 reached the same fix: each glyph is its own unit,
+  - `10b76d53` §1.8 reached the same fix: each glyph is its own unit,
     linked by the `if` tree.
   - Composition only inlines. `P` as one-pipeline §1.1 denotes it begins
     with `expand_refs`, and composition-is-linking's title is "the linker
@@ -866,7 +866,7 @@ id tree, built into `P` before C1. Built (`feat(search): a named kernel is its o
   - So units take the font from "nothing fires" to every glyph saturated
     under its cap in 2.5 s, and **emitting the font as one program is
     C1's problem**: it grows about cubically in the pieces (the design
-    measured 49 minutes for all 94 at `4b82a352` in a scratch crate), while
+    measured 49 minutes for all 94 at `d8c39481` in a scratch crate), while
     the same code emitted glyph by glyph is under 3 s. X1, or units emitted
     as calls, is the lever; this CL decides neither.
   - Bytes: at 8 and 16 glyphs the units program is 12–15% larger than the
@@ -913,7 +913,7 @@ id tree, built into `P` before C1. Built (`feat(search): a named kernel is its o
     and, for units, not wanted until C1 measures calls.
 
 **O2. The composition surface.** **Answered (JP, 2026-10-01): yes.** D-a
-is built before C1 (`7706e4b7`), so the host composes `kernel!` entries
+is built before C1 (`f0599991`), so the host composes `kernel!` entries
 and the builder never becomes the font's surface.
 - **What was built.**
   - `impl Fn(f32, f32) -> f32` is a parameter type of an entry or a helper,
@@ -1051,7 +1051,7 @@ and the builder never becomes the font's surface.
     calling per-`N` `U_band` programs. At 200×60 and 32 px it took
     84.4 / 22.9 ms (1 / 4 threads) on AVX-512 and 50.3 / 20.0 ms on AVX2,
     against 16.7 ms. 80×24 at 16 px fit (6.9 / 2.8 and 4.1 / 1.6 ms).
-  - It was measured at `8b7b75a`, before the closed form (`4202a5aa`), and
+  - It was measured at `8b7b75a`, before the closed form (`33c6509b`), and
     it calls itself "a bound on the direction, not on this plan".
   - One-pipeline's Q3 recommended keeping the atlas until D1. JP's atlas
     sentence and Q1 ruling replace it with the font program (D10).
