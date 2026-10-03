@@ -315,6 +315,15 @@ today's callers run it as a diagnostic over an already-built schedule,
 while C2a wants demand available to the cost model while it is still
 choosing a term, which is a different call site and not yet wired to one.
 
+**2026-10-03 update.** That telemetry-only use is gone. `passes/demand.rs`,
+`emit::guards`' schedule-keyed instantiation, and the
+`PIXELFLOW_GUARD_TELEMETRY` line with its `demand_exclusive` column were
+deleted: nothing in production decided from them, `demand_of_arena` had only
+its own tests, and a diagnostic that nothing reads is machinery the next
+change must carry. The DNF algebra and the backward pass are in VCS history
+(last present at `0459d2b3`); C2a, when built, starts from this section's
+algebra rather than from a resident implementation.
+
 ## 7. Constraints
 
 - **Widening is always sound.** Any predicate may be replaced by a weaker

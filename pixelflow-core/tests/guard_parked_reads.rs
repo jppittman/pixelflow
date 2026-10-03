@@ -22,8 +22,7 @@
 //! the per-call one faults.
 //!
 //! Every kernel is checked texel by texel against a plain-`f64` reference,
-//! never a pixelflow evaluator. `PIXELFLOW_GUARD_TELEMETRY=1` prints, per
-//! scope, which `If`s were guarded.
+//! never a pixelflow evaluator.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 

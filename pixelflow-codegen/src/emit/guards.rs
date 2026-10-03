@@ -34,54 +34,10 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use pixelflow_ir::kind::OpKind;
-use pixelflow_ir::passes::demand::{Demand, Literal, demand_of};
 use pixelflow_search::egraph::CostModel;
 
 use super::ScheduledOp;
 use super::regalloc::{Def, ValueId};
-
-/// This schedule's demand, keyed by [`ValueId`] —
-/// `pixelflow_ir::passes::demand::demand_of` instantiated for
-/// [`ScheduledOp`]: every op passes its own demand through to its operands
-/// unchanged except `If`, whose mask is observed with the `If` and
-/// whose arms are observed only under their own polarity. The one
-/// definition of the DNF algebra and the backward pass lives in
-/// `pixelflow-ir`; this closure is the only thing specific to a schedule
-/// (docs/plans/2026-09-09-exprarena-on-dag.md).
-///
-/// `ops`, a dense `ValueId`-indexed lookup, is why this stays O(schedule):
-/// `demand_of`'s closure is called once per live value with only that
-/// value's key, not its `Def`, so the alternative is an O(n) scan per call.
-fn demand_of_schedule(
-    schedule: &[Def],
-    root: ValueId,
-    folds: &FoldReads,
-) -> BTreeMap<ValueId, Demand<ValueId>> {
-    let max_vid = schedule.iter().map(|def| def.value.0).max().unwrap_or(0) as usize;
-    let mut ops: Vec<Option<ScheduledOp>> = alloc::vec![None; max_vid + 1];
-    for def in schedule {
-        ops[def.value.0 as usize] = Some(def.op.clone());
-    }
-
-    demand_of(
-        schedule.iter().map(|def| def.value),
-        root,
-        |vid, observed| match ops.get(vid.0 as usize).and_then(Option::as_ref) {
-            Some(ScheduledOp::Ternary(OpKind::If, mask, if_true, if_false)) => {
-                alloc::vec![
-                    (*mask, observed.clone()),
-                    (*if_true, observed.and_literal(Literal::set(*mask))),
-                    (*if_false, observed.and_literal(Literal::clear(*mask))),
-                ]
-            }
-            Some(op) => folds
-                .reads(vid, op)
-                .map(|operand| (operand, observed.clone()))
-                .collect(),
-            None => Vec::new(),
-        },
-    )
-}
 
 /// Which arm of an `If` node a guard branch skips or targets.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -129,24 +85,6 @@ impl<T> ArmPair<T> {
         match arm {
             IfArm::True => &mut self.true_arm,
             IfArm::False => &mut self.false_arm,
-        }
-    }
-
-    /// Map a function over both arms.
-    #[inline]
-    pub fn map<U>(self, mut f: impl FnMut(T) -> U) -> ArmPair<U> {
-        ArmPair {
-            true_arm: f(self.true_arm),
-            false_arm: f(self.false_arm),
-        }
-    }
-
-    /// Borrow both arms.
-    #[inline]
-    pub fn as_ref(&self) -> ArmPair<&T> {
-        ArmPair {
-            true_arm: &self.true_arm,
-            false_arm: &self.false_arm,
         }
     }
 
@@ -291,10 +229,6 @@ impl IndexSet {
         for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
             *a &= !b;
         }
-    }
-
-    fn len(&self) -> usize {
-        self.bits.iter().map(|w| w.count_ones() as usize).sum()
     }
 
     /// The smallest member, if any.
@@ -616,51 +550,10 @@ pub(crate) fn analyze_if_guards(
     folds: &FoldReads,
 ) -> Vec<IfGuard> {
     let per_if = if_arms(schedule, external, folds);
-    let mut telemetry = Telemetry::new();
     let mut guards = Vec::new();
-
-    // One backward pass over the whole DAG, and only when someone is
-    // reading: demand is what an arm *may skip*, which is a weaker
-    // condition than what the partition may *move*, so it is recorded
-    // beside `exclusive` rather than replacing it. See `IfStat`.
-    let demand = telemetry
-        .is_on()
-        .then(|| {
-            let root = schedule.last()?.value;
-            Some(demand_of_schedule(schedule, root, folds))
-        })
-        .flatten();
 
     for arms in &per_if {
         let ranges = arms.ranges();
-        let demand_exclusive = demand.as_ref().map_or(ArmPair::new(0, 0), |d| {
-            let observed = |v: ValueId| d.get(&v).cloned().unwrap_or_default();
-            let arm = |lit: Literal<ValueId>| observed(arms.if_vid).and_literal(lit);
-            let count = |pred: &Demand<ValueId>| {
-                schedule
-                    .iter()
-                    .filter(|def| {
-                        let seen = observed(def.value);
-                        !seen.is_never() && seen.implies(pred)
-                    })
-                    .count()
-            };
-            ArmPair::new(
-                count(&arm(Literal::set(arms.mask_vid))),
-                count(&arm(Literal::clear(arms.mask_vid))),
-            )
-        });
-        telemetry.if_stat(|| IfStat {
-            demand_exclusive,
-            if_idx: arms.if_idx,
-            mask_idx: arms.mask_idx,
-            exclusive: arms.indices.as_ref().map(|s| s.len()),
-            guarded: ranges.map(|(s, e)| e - s),
-            intruders: arms
-                .indices
-                .as_ref()
-                .map(|indices| intruders(indices, schedule)),
-        });
 
         // Only create a guard if at least one arm has exclusive nodes
         if ranges.true_arm.0 != ranges.true_arm.1 || ranges.false_arm.0 != ranges.false_arm.1 {
@@ -672,7 +565,6 @@ pub(crate) fn analyze_if_guards(
         }
     }
 
-    telemetry.report(schedule.len());
     guards
 }
 
@@ -1047,154 +939,6 @@ fn is_topological(schedule: &[Def], folds: &FoldReads) -> bool {
         seen.insert(def.value);
     }
     true
-}
-
-/// Entries inside `[min(arm), max(arm)]` that the arm does not own.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct IntruderStats {
-    /// Total entries not belonging to the arm.
-    pub total: usize,
-    /// Of which are leaves (`Const` or coordinate `Var`).
-    pub leaves: usize,
-}
-
-/// What one `If` in the schedule offered a guard, and what survived.
-struct IfStat {
-    if_idx: usize,
-    /// Where the mask lands in the schedule; a guard needs it before the arm.
-    mask_idx: usize,
-    /// Values exclusive to each arm — what a guard could skip if the
-    /// exclusive set happened to be contiguous.
-    exclusive: ArmPair<usize>,
-    /// What [`demand_of_schedule`] calls exclusive to each arm — the values
-    /// observed only where this arm's polarity holds.
-    ///
-    /// At least `exclusive` unless a value's demand was widened to *always*
-    /// (`pixelflow_ir::passes::demand`'s `MAX_CLAUSES`), which undercounts a
-    /// value read under many different conditions inside one arm — a leaf
-    /// every glyph fold of a text run's box reads ([`FoldReads`]) is one.
-    /// Short of that the gap is the point: demand answers *may this be
-    /// skipped*, while `exclusive` answers the stronger *may this be skipped
-    /// and also moved*, which is what
-    /// [`cluster_if_arms`]'s three-way partition needs. Two `If`s
-    /// sharing a mask separate them — the inner `If`'s arms are
-    /// demand-exclusive to the outer one, but the inner `If` itself is
-    /// shared and reads them, so moving them past it is illegal. The gap
-    /// is the headroom a partition that ordered within its groups would
-    /// unlock.
-    demand_exclusive: ArmPair<usize>,
-    /// Schedule entries a guard actually skips on each arm.
-    guarded: ArmPair<usize>,
-    /// Entries that are NOT this arm's but lie between its first and its last,
-    /// as (total, of which leaves) — the values a single branch would have to
-    /// jump over, which is why the arm is not guardable.
-    intruders: ArmPair<IntruderStats>,
-}
-
-/// Entries inside `[min(arm), max(arm)]` that the arm does not own, and how
-/// many of those are leaves (a `Const` or a coordinate). Diagnosis only.
-fn intruders(arm: &IndexSet, schedule: &[Def]) -> IntruderStats {
-    let (Some(start), Some(end)) = (arm.min(), arm.max()) else {
-        return IntruderStats {
-            total: 0,
-            leaves: 0,
-        };
-    };
-    let mut total = 0;
-    let mut leaves = 0;
-    for (idx, def) in schedule.iter().enumerate().take(end + 1).skip(start) {
-        if arm.contains(idx) {
-            continue;
-        }
-        total += 1;
-        if matches!(
-            def.op,
-            ScheduledOp::Const(_) | ScheduledOp::Var(_) | ScheduledOp::Lanes(_)
-        ) {
-            leaves += 1;
-        }
-    }
-    IntruderStats { total, leaves }
-}
-
-/// The guard analysis, counted, on stderr when `PIXELFLOW_GUARD_TELEMETRY` is
-/// set in the environment.
-///
-/// Diagnosis only, and off by default: nothing the emitter decides with, and
-/// no emitted byte changes. It exists because "the guard did not fire" is a
-/// claim about the *schedule*, and the only way to settle it is to count. The
-/// two numbers per `If` are the two ways a guard is lost and they have
-/// different fixes: `exclusive` short of the arm's size is the analysis
-/// refusing (a value some other expression also reads), while `guarded` short
-/// of `exclusive` is the *order* refusing (the arm's own values are not a
-/// contiguous run, so one branch cannot span them).
-struct Telemetry {
-    stats: Option<Vec<IfStat>>,
-}
-
-impl Telemetry {
-    fn new() -> Self {
-        Self {
-            stats: std::env::var_os("PIXELFLOW_GUARD_TELEMETRY").map(|_| Vec::new()),
-        }
-    }
-
-    /// Whether anything will read what is recorded. Callers ask before
-    /// computing a statistic that costs more than reading a field.
-    fn is_on(&self) -> bool {
-        self.stats.is_some()
-    }
-
-    /// The stat is built lazily: computing it walks the schedule, and nothing
-    /// should pay for that when the telemetry is off.
-    fn if_stat(&mut self, stat: impl FnOnce() -> IfStat) {
-        if let Some(stats) = self.stats.as_mut() {
-            stats.push(stat());
-        }
-    }
-
-    fn report(&self, sched_len: usize) {
-        let Some(stats) = self.stats.as_ref() else {
-            return;
-        };
-        let covered: usize = stats
-            .iter()
-            .map(|s| s.guarded.true_arm + s.guarded.false_arm)
-            .sum();
-        let offered: usize = stats
-            .iter()
-            .map(|s| s.exclusive.true_arm + s.exclusive.false_arm)
-            .sum();
-        let demanded: usize = stats
-            .iter()
-            .map(|s| s.demand_exclusive.true_arm + s.demand_exclusive.false_arm)
-            .sum();
-        // `selects=`/`per_select=` are the line's persisted spelling: the op
-        // is `If` since D18 of docs/plans/2026-09-25-the-language-is-kernel.md,
-        // but `pixelflow-pipeline/scripts/corpus_gaps_aggregate.py` keys on
-        // these field names, so they stay.
-        std::eprintln!(
-            "guard-telemetry: schedule={sched_len} selects={} guarded={covered} \
-             exclusive={offered} demand_exclusive={demanded} per_select={:?}",
-            stats.len(),
-            stats
-                .iter()
-                .map(|s| {
-                    (
-                        s.if_idx,
-                        s.mask_idx,
-                        (s.exclusive.true_arm, s.exclusive.false_arm),
-                        (s.demand_exclusive.true_arm, s.demand_exclusive.false_arm),
-                        (s.guarded.true_arm, s.guarded.false_arm),
-                        (
-                            (s.intruders.true_arm.total, s.intruders.true_arm.leaves),
-                            (s.intruders.false_arm.total, s.intruders.false_arm.leaves),
-                        ),
-                    )
-                })
-                .collect::<Vec<_>>()
-        );
-    }
 }
 
 #[cfg(test)]

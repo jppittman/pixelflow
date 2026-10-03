@@ -349,7 +349,8 @@ ms to compile, 9,760 bytes (SSE2).
 scope, the schedule's length and per select: where the mask lands, the
 entries each arm owns exclusively, the entries a guard actually skips, and
 the entries belonging to someone else that lie between an arm's first and
-its last. On the chrome scene's body scope:
+its last. (Removed 2026-10-03 as a diagnostic nothing decided from; VCS
+history holds the instrument.) On the chrome scene's body scope:
 
 | | schedule | selects | arm-exclusive | guarded |
 |---|---:|---:|---:|---:|

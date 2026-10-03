@@ -1,40 +1,13 @@
 #!/usr/bin/env python3
-"""Aggregate corpus_gaps rows + guard telemetry into side-by-side tables.
+"""Aggregate corpus_gaps rows into side-by-side tables.
 
-usage: aggregate.py rows.csv guards.log out_prefix
-writes out_prefix.csv (rows + guard columns), out_prefix.json, out_prefix.tables.md
+usage: aggregate.py rows.csv out_prefix
+writes out_prefix.csv (rows + derived columns), out_prefix.json, out_prefix.tables.md
 """
-import csv, json, re, sys, statistics as st
+import csv, json, sys, statistics as st
 from collections import defaultdict, Counter
 
-rows_path, guards_path, out = sys.argv[1:4]
-
-# ---- guard telemetry: pair "corpus-gaps emit=<name>" with the next guard-telemetry line
-guards = {}
-cur = None
-pat = re.compile(r"guard-telemetry: schedule=(\d+) selects=(\d+) guarded=(\d+) exclusive=(\d+) per_select=(.*)")
-tuple_pat = re.compile(r"\((\d+), (\d+), \((\d+), (\d+)\), \((\d+), (\d+)\), \(\((\d+), (\d+)\), \((\d+), (\d+)\)\)\)")
-for line in open(guards_path):
-    line = line.rstrip("\n")
-    if line.startswith("corpus-gaps emit="):
-        cur = line[len("corpus-gaps emit="):]
-        guards[cur] = dict(schedule=0, selects_sched=0, guarded=0, exclusive=0, guarded_selects=0, exclusive_selects=0, scopes=0)
-        continue
-    if line.startswith("corpus-gaps kernel="):
-        cur = None
-        continue
-    m = pat.match(line)
-    if m and cur is not None:
-        # one line per scope of the collapse nest (frame, row, body): summed
-        sched, sel, gd, ex, per = m.groups()
-        g = guards[cur]
-        g["schedule"] += int(sched); g["selects_sched"] += int(sel); g["guarded"] += int(gd); g["exclusive"] += int(ex); g["scopes"] += 1
-        for t in tuple_pat.findall(per):
-            t = list(map(int, t))
-            if t[4] + t[5] > 0:
-                g["guarded_selects"] += 1
-            if t[2] + t[3] > 0:
-                g["exclusive_selects"] += 1
+rows_path, out = sys.argv[1:3]
 
 rows = list(csv.DictReader(open(rows_path)))
 NUM = [k for k in rows[0].keys() if k not in ("name", "group", "population", "stop", "emit", "ops", "rule_hist")]
@@ -44,17 +17,6 @@ for r in rows:
             r[k] = float(r[k])
         except ValueError:
             r[k] = float("nan")
-    g = guards.get(r["name"], {})
-    r["sched_len"] = g.get("schedule", float("nan"))
-    r["sched_selects"] = g.get("selects_sched", float("nan"))
-    r["guard_exclusive"] = g.get("exclusive", float("nan"))
-    r["guard_guarded"] = g.get("guarded", float("nan"))
-    r["guard_exclusive_frac"] = (g["exclusive"] / g["schedule"]) if g and g["schedule"] else float("nan")
-    r["guard_guarded_frac"] = (g["guarded"] / g["schedule"]) if g and g["schedule"] else float("nan")
-    r["guard_guarded_selects"] = g.get("guarded_selects", float("nan"))
-    r["guard_exclusive_selects"] = g.get("exclusive_selects", float("nan"))
-    r["guard_select_frac"] = (g["guarded_selects"] / g["selects_sched"]) if g and g["selects_sched"] else float("nan")
-    r["guard_lost_frac"] = (1 - g["guarded"] / g["exclusive"]) if g and g["exclusive"] else float("nan")
     r["classes_at_cap"] = 1.0 if r["stop"] == "ClassCap" else 0.0
     r["quiesced"] = 1.0 if r["stop"] == "Quiesced" else 0.0
     r["has_select"] = 1.0 if r["selects"] > 0 else 0.0
@@ -72,8 +34,7 @@ for r in rows:
     r["cmp_per_100"] = 100.0 * r["compares"] / max(1.0, r["nodes_hashcons"])
     r["bytes_per_hc_node"] = r["bytes"] / max(1.0, r["nodes_hashcons"])
 
-EXTRA = ["guard_exclusive_selects", "guard_select_frac", "sched_len", "sched_selects", "guard_exclusive", "guard_guarded", "guard_exclusive_frac", "guard_guarded_frac",
-         "guard_guarded_selects", "guard_lost_frac", "classes_at_cap", "quiesced", "has_select", "has_gather", "has_transc",
+EXTRA = ["classes_at_cap", "quiesced", "has_select", "has_gather", "has_transc",
          "dup_gt_1", "ext_shares", "hoist_frac", "class_per_hc_node", "apps_per_hc_node", "ext_shrink", "sel_per_100",
          "cmp_per_100", "bytes_per_hc_node"]
 
@@ -128,14 +89,6 @@ COLS = [
     ("arm_false_med", "median false-arm reach (nodes)"),
     ("arm_excl_frac", "arm-exclusive nodes / arm reach"),
     ("ext_selects", "selects in extracted term"),
-    ("sched_len", "schedule entries (emitter)"),
-    ("guard_exclusive_frac", "guard telemetry: exclusive entries / schedule"),
-    ("guard_guarded_frac", "guard telemetry: guarded entries / schedule"),
-    ("guard_lost_frac", "guard telemetry: exclusive but unguarded (order refuses)"),
-    ("sched_selects", "selects in the schedule"),
-    ("guard_exclusive_selects", "selects with a non-empty exclusive arm"),
-    ("guard_guarded_selects", "selects that got a guard"),
-    ("guard_select_frac", "guarded selects / schedule selects"),
     ("ext_trip_sharing", "DP objective (trip-weighted) tree/dag"),
     ("gathers", "gathers"),
     ("has_gather", "fraction with any gather"),
@@ -183,7 +136,7 @@ for col, label in COLS:
 
 md.append("\n### By group (median)\n")
 gcols = ["nodes_reachable", "nodes_hashcons", "splice_factor", "input_sharing", "ext_sharing", "selects", "compares", "gathers",
-         "transcendentals", "sched_len", "guard_exclusive_frac", "guard_guarded_frac", "hoist_frac", "body_frac", "classes", "applications",
+         "transcendentals", "hoist_frac", "body_frac", "classes", "applications",
          "classes_at_cap", "quiesced", "bytes", "ext_nodes"]
 md.append("| group | n | " + " | ".join(gcols) + " |")
 md.append("|---|---:|" + "---:|" * len(gcols))
@@ -275,7 +228,7 @@ md.append(f"\nTotal applications: real {rules['real'][2]:,}, synthetic {rules['s
 # headline kernels
 md.append("\n### The production scenes and grids, individually\n")
 hcols = ["nodes_reachable", "nodes_hashcons", "nodes_lowered_hc", "splice_factor", "input_sharing", "ext_sharing", "ext_nodes", "dag_cost_delta_pct", "selects", "compares", "gathers",
-         "sched_len", "sched_selects", "guard_exclusive", "guard_guarded", "guard_guarded_selects", "hoist_frac", "classes", "class_cap", "stop", "applications", "iterations", "bytes", "spill_slots", "opt_ms"]
+         "hoist_frac", "classes", "class_cap", "stop", "applications", "iterations", "bytes", "spill_slots", "opt_ms"]
 md.append("| kernel | " + " | ".join(hcols) + " |")
 md.append("|---|" + "---:|" * len(hcols))
 for r in rows:

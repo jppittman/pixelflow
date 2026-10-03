@@ -10,14 +10,12 @@
 //! (tier, stop reason, classes, applications, per-rule firing histogram from
 //! the provenance journal) and what the emitter made of the result (bytes,
 //! spill slots, hoisted values, schedule entries per scope of the collapse
-//! nest, trip-weighted memory ops). The guard analysis is the emitter's own
-//! `PIXELFLOW_GUARD_TELEMETRY` line on stderr; this binary prints a marker
-//! before each compile so a reader can pair the two streams.
+//! nest, trip-weighted memory ops).
 //!
 //! Usage:
 //! ```bash
-//! PIXELFLOW_GUARD_TELEMETRY=1 cargo run --release -p pixelflow-pipeline --bin corpus_gaps -- \
-//!   --dumps <dir>[,<dir>...] --out rows.csv --synthetic-n 24 2> guards.log
+//! cargo run --release -p pixelflow-pipeline --bin corpus_gaps -- \
+//!   --dumps <dir>[,<dir>...] --out rows.csv --synthetic-n 24
 //! ```
 //!
 //! Rows are appended to `--out` as each kernel finishes, so a run that dies
@@ -103,10 +101,6 @@ struct Kernel {
 
 fn main() {
     let args = Args::parse();
-    assert!(
-        std::env::var_os("PIXELFLOW_GUARD_TELEMETRY").is_some(),
-        "run with PIXELFLOW_GUARD_TELEMETRY=1 so the emitter's guard analysis lands on stderr"
-    );
     let mut out = open_out(&args.out);
     let done: HashSet<String> = existing_names(&args.out);
 
@@ -861,7 +855,6 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
         let r = ordered.splice(&extracted, extracted_root);
         (ordered, r)
     };
-    eprintln!("corpus-gaps emit={}", k.name);
     // `emit::compile` refuses an arena naming the retired Z/W axes
     // (`Var(2)`/`Var(3)`): production has two coordinate axes and uniforms,
     // and a generator that draws from four "variables" builds kernels the
