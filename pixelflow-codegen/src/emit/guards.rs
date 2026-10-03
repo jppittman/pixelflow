@@ -40,6 +40,8 @@ use super::ScheduledOp;
 use super::regalloc::{Def, ValueId};
 pub(crate) use crate::program::IfGuard;
 #[cfg(any(debug_assertions, feature = "layout-shadow"))]
+use crate::program::layout::Layout;
+#[cfg(any(debug_assertions, feature = "layout-shadow"))]
 use crate::program::ownership::Ownership;
 pub use crate::program::{ArmPair, IfArm};
 
@@ -416,10 +418,19 @@ pub(crate) fn analyze_if_guards(
 ) -> Vec<IfGuard> {
     let per_if = if_arms(schedule, external, folds);
     #[cfg(any(debug_assertions, feature = "layout-shadow"))]
-    assert_ownership_agrees(schedule, external, folds, &per_if);
+    {
+        assert_ownership_agrees(schedule, external, folds, &per_if);
+        assert_layout_agrees(schedule, external, folds, &per_if);
+    }
+    guards_from(&per_if)
+}
+
+/// The guards `per_if`'s arms earn: one per `If` with at least one arm a
+/// branch can span, sorted by `if_idx` (ascending).
+fn guards_from(per_if: &[IfArms]) -> Vec<IfGuard> {
     let mut guards = Vec::new();
 
-    for arms in &per_if {
+    for arms in per_if {
         let ranges = arms.ranges();
 
         // Only create a guard if at least one arm has exclusive nodes
@@ -449,6 +460,12 @@ fn assert_ownership_agrees(
     folds: &FoldReads,
     per_if: &[IfArms],
 ) {
+    // Both stages read a schedule in which every value precedes its readers,
+    // which the allocator has always required; a hand-built fixture that
+    // breaks it has no ownership to compare.
+    if !crate::program::layout::reads_follow(0..schedule.len(), schedule, folds) {
+        return;
+    }
     let own = Ownership::of(schedule, external, folds);
     assert_eq!(
         own.arms().len(),
@@ -474,6 +491,75 @@ fn assert_ownership_agrees(
                 new.arm, old.if_idx
             );
         }
+    }
+}
+
+/// The layout is valid exactly when the old analysis, run on the order the
+/// layout chose, finds the runs the layout says it made.
+///
+/// So the old analysis is the oracle for the new order, on every call: it must
+/// find the same guards at the same positions over the same ranges; every
+/// arm it guarded on the order it was given the layout must guard too; and a
+/// scope in which it refused nothing for its order must come back unmoved. An
+/// inequality is a stop — the layout is what gets fixed, never the bound.
+#[cfg(any(debug_assertions, feature = "layout-shadow"))]
+fn assert_layout_agrees(
+    schedule: &[Def],
+    external: &[ValueId],
+    folds: &FoldReads,
+    per_if: &[IfArms],
+) {
+    if !crate::program::layout::reads_follow(0..schedule.len(), schedule, folds) {
+        return;
+    }
+    let layout = Layout::of(schedule, external, folds);
+    assert!(
+        layout.is_topological(schedule, folds),
+        "the layout put a value ahead of an operand"
+    );
+    let permuted: Vec<Def> = layout
+        .order
+        .iter()
+        .map(|&old| schedule[old].clone())
+        .collect();
+    for (old, &new) in layout.position.iter().enumerate() {
+        assert_eq!(
+            permuted[new].value, schedule[old].value,
+            "the layout's two maps are not inverses"
+        );
+    }
+    let found = guards_from(&if_arms(&permuted, external, folds));
+    assert_eq!(
+        found.len(),
+        layout.guards.len(),
+        "the old analysis finds a different number of branches in the laid-out order"
+    );
+    for (found, laid) in found.iter().zip(&layout.guards) {
+        assert_eq!(
+            (found.if_idx, found.mask_vid, found.ranges),
+            (laid.if_idx, laid.mask_vid, laid.ranges),
+            "the laid-out order is not the runs the layout says"
+        );
+    }
+    for old in guards_from(per_if) {
+        let value = schedule[old.if_idx].value;
+        let kept = layout
+            .guards
+            .iter()
+            .find(|laid| permuted[laid.if_idx].value == value)
+            .unwrap_or_else(|| panic!("the layout lost the branch of {value:?}"));
+        for arm in IfArm::ALL {
+            assert!(
+                !old.is_guarded(arm) || kept.is_guarded(arm),
+                "the layout lost the {arm:?} arm's branch of {value:?}"
+            );
+        }
+    }
+    if per_if.iter().all(|arms| !arms.refused_for_order()) {
+        assert!(
+            layout.is_identity(),
+            "nothing was refused for its order, and the layout moved something"
+        );
     }
 }
 
@@ -671,7 +757,7 @@ fn if_arms(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Vec<IfA
 /// mask (a handful of ops per arm, varying per lane, 3.6x slower with a
 /// guard) and a sphere's silhouette (214 entries, uniformly false in 97% of
 /// batches, 3.2x faster with one).
-const MISPREDICT_PENALTY_CYCLES: usize = 16;
+pub(crate) const MISPREDICT_PENALTY_CYCLES: usize = 16;
 
 /// Reorder a scope's schedule so that an `If`'s arm-exclusive entries form
 /// one run — where that, and only that, is what stands between the arm and a

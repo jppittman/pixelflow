@@ -32,12 +32,12 @@
 //! cones, this one reads only the edges.
 
 use alloc::vec::Vec;
-use core::cell::Cell;
 
 use pixelflow_ir::kind::OpKind;
 use pixelflow_search::egraph::CostModel;
 
 use crate::emit::guards::{FoldReads, def_cycles};
+use crate::program::tree::Tree;
 use crate::program::{Def, IfArm, ScheduledOp, ValueId};
 
 /// A region of one scope: the scope itself, or one arm of one `If` in it.
@@ -75,30 +75,23 @@ pub(crate) struct Arm {
 pub(crate) struct Ownership {
     /// The region each schedule position belongs to.
     region_of: Vec<Region>,
-    /// Each region's parent; the scope's own is itself.
-    parent: Vec<Region>,
-    /// Each region's distance from the scope.
-    depth: Vec<usize>,
-    /// A skip pointer to a proper ancestor, placed so that climbing to any
-    /// depth takes O(log depth) hops (Myers' skew-binary jump pointers): one
-    /// word per region, where a table of every power-of-two ancestor would
-    /// cost a word per level.
-    jump: Vec<Region>,
+    /// The regions, nested as the `If`s are.
+    regions: Tree,
     /// Every arm of every `If`, in schedule order, true arm first.
     arms: Vec<Arm>,
-    /// What the pass walked: one for each read and one for each hop an
-    /// ancestor climb took. A count and not a clock, so a test can pin how
-    /// the pass grows and fail the same way on every host.
-    steps: Cell<usize>,
+    /// What the pass walked: one for each read, besides the hops its
+    /// ancestor queries took.
+    #[cfg(test)]
+    reads: usize,
 }
 
 /// Where a value sits in the scope's schedule, by `ValueId`: dense, because
 /// ids are handed out sequentially. Absent for a value this scope does not
 /// define (a live-in from an enclosing scope).
-struct Positions(Vec<Option<usize>>);
+pub(crate) struct Positions(Vec<Option<usize>>);
 
 impl Positions {
-    fn of(schedule: &[Def]) -> Self {
+    pub(crate) fn of(schedule: &[Def]) -> Self {
         let len = schedule
             .iter()
             .map(|def| def.value.0 as usize + 1)
@@ -111,7 +104,7 @@ impl Positions {
         Self(at)
     }
 
-    fn get(&self, value: ValueId) -> Option<usize> {
+    pub(crate) fn get(&self, value: ValueId) -> Option<usize> {
         self.0.get(value.0 as usize).copied().flatten()
     }
 }
@@ -129,11 +122,10 @@ impl Ownership {
         let cycles = CostModel::latency_prior();
         let mut me = Self {
             region_of: alloc::vec![Region::SCOPE; schedule.len()],
-            parent: alloc::vec![Region::SCOPE],
-            depth: alloc::vec![0],
-            jump: alloc::vec![Region::SCOPE],
+            regions: Tree::rooted(),
             arms: Vec::new(),
-            steps: Cell::new(0),
+            #[cfg(test)]
+            reads: 0,
         };
         // The region every reader of each position agrees on so far.
         let mut readers: Vec<Option<Region>> = alloc::vec![None; schedule.len()];
@@ -154,17 +146,20 @@ impl Ownership {
                 let Some(at) = positions.get(value) else {
                     return;
                 };
-                me.steps.set(me.steps.get() + 1);
+                #[cfg(test)]
+                {
+                    me.reads += 1;
+                }
                 readers[at] = Some(match readers[at] {
                     None => region,
-                    Some(known) => me.common_ancestor(known, region),
+                    Some(known) => Region(me.regions.common_ancestor(known.0, region.0)),
                 });
             };
 
             match &def.op {
                 ScheduledOp::Ternary(OpKind::If, mask, if_true, if_false) => {
-                    let on_true = me.open(here);
-                    let on_false = me.open(here);
+                    let on_true = Region(me.regions.grow(here.0));
+                    let on_false = Region(me.regions.grow(here.0));
                     // Pushed false arm first: the sweep meets the `If`s
                     // last-to-first and the list is reversed once at the end.
                     me.arms.push(Arm {
@@ -198,71 +193,17 @@ impl Ownership {
         me
     }
 
-    fn open(&mut self, parent: Region) -> Region {
-        let region = Region(self.parent.len());
-        let near = self.jump[parent.0];
-        let far = self.jump[near.0];
-        // Skew-binary rule: jump from the parent's jump target's own target
-        // when the two hops are the same length, else just to the parent.
-        let jump = if self.depth[parent.0] - self.depth[near.0]
-            == self.depth[near.0] - self.depth[far.0]
-        {
-            far
-        } else {
-            parent
-        };
-        self.parent.push(parent);
-        self.depth.push(self.depth[parent.0] + 1);
-        self.jump.push(jump);
-        region
-    }
-
-    fn hop(&self) {
-        self.steps.set(self.steps.get() + 1);
-    }
-
-    /// `region`'s ancestor at `depth`, which must not be deeper than it.
-    fn ancestor_at(&self, mut region: Region, depth: usize) -> Region {
-        while self.depth[region.0] > depth {
-            self.hop();
-            region = if self.depth[self.jump[region.0].0] >= depth {
-                self.jump[region.0]
-            } else {
-                self.parent[region.0]
-            };
-        }
-        region
-    }
-
-    /// The deepest region containing both `a` and `b`.
-    fn common_ancestor(&self, a: Region, b: Region) -> Region {
-        let (mut a, mut b) = match self.depth[a.0].cmp(&self.depth[b.0]) {
-            core::cmp::Ordering::Greater => (self.ancestor_at(a, self.depth[b.0]), b),
-            core::cmp::Ordering::Less => (a, self.ancestor_at(b, self.depth[a.0])),
-            core::cmp::Ordering::Equal => (a, b),
-        };
-        while a != b {
-            self.hop();
-            (a, b) = if self.jump[a.0] != self.jump[b.0] {
-                (self.jump[a.0], self.jump[b.0])
-            } else {
-                (self.parent[a.0], self.parent[b.0])
-            };
-        }
-        a
-    }
-
     /// Each arm's price: the cycles of every def in its region or one nested
     /// in it. A child's number is larger than its parent's, so one descending
     /// sweep folds every region into its parent.
     fn price(&mut self, schedule: &[Def], folds: &FoldReads, cycles: &CostModel) {
-        let mut subtree = alloc::vec![0usize; self.parent.len()];
+        let mut subtree = alloc::vec![0usize; self.regions.len()];
         for (pos, def) in schedule.iter().enumerate() {
             let region = self.region_of[pos].0;
             subtree[region] = subtree[region].saturating_add(def_cycles(def, folds, cycles));
         }
         for region in (1..subtree.len()).rev() {
-            let parent = self.parent[region].0;
+            let parent = self.regions.parent(region);
             subtree[parent] = subtree[parent].saturating_add(subtree[region]);
         }
         for arm in &mut self.arms {
@@ -280,16 +221,22 @@ impl Ownership {
         self.region_of[pos]
     }
 
-    /// Whether `inner` is `outer` or nested in it.
-    pub(crate) fn is_within(&self, inner: Region, outer: Region) -> bool {
-        self.depth[inner.0] >= self.depth[outer.0]
-            && self.ancestor_at(inner, self.depth[outer.0]) == outer
+    /// The regions, for a stage that nests something in them.
+    pub(crate) fn regions(&self) -> &Tree {
+        &self.regions
     }
 
-    /// What the pass walked (see the field).
+    /// Whether `inner` is `outer` or nested in it.
+    pub(crate) fn is_within(&self, inner: Region, outer: Region) -> bool {
+        self.regions.is_within(inner.0, outer.0)
+    }
+
+    /// What the pass walked: reads plus ancestor hops. A count and not a
+    /// clock, so a test can pin how the pass grows and fail the same way on
+    /// every host.
     #[cfg(test)]
     pub(crate) fn steps(&self) -> usize {
-        self.steps.get()
+        self.reads + self.regions.hops()
     }
 }
 
