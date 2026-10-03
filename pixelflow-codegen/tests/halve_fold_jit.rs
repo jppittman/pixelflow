@@ -14,6 +14,17 @@
 //! shape peeling one term at a time has always produced, built without
 //! touching `Fold`, `Reduce`, or the e-graph at all.
 //!
+//! **What the halving side hands the JIT.** Under the production latency
+//! prior a loop and its unrolling cost the same, so extraction keeps the
+//! first node the class held — the `Reduce` — and the chain the rules built
+//! is never the term anyone compiles (docs/BACKLOG.md, E6). A test that
+//! extracted under that prior and compiled the result would compile a loop
+//! and say nothing about `HalveFold`. So the extraction here prices a loop
+//! out ([`LoopsCostMore`]): the extractor must take the chain, and the
+//! value the JIT computes is the value halving to exhaustion built. That the
+//! chain exists at all — no `Reduce` reachable from the extracted root — is
+//! asserted, not assumed.
+//!
 //! Every [`Monoid`](pixelflow_ir::Monoid) this crate has (`SUM`, `PRODUCT`,
 //! `MIN`, `MAX`, the two mask quantifiers) is commutative, so this cannot
 //! exercise the property that actually distinguishes the stride-2
@@ -34,16 +45,30 @@
 use pixelflow_codegen::emit::compile;
 use pixelflow_ir::{ExprArena, ExprId, ExprNode, Kernel, LatticeShape, OpKind};
 use pixelflow_search::egraph::{
-    CostModel, EGraph, SaturationConfig, Vocabulary, extract, fold_rules, insert,
+    CostFunction, CostModel, EGraph, ENode, SaturationConfig, Vocabulary, extract, fold_rules,
+    insert,
 };
 
-/// Whether a `Reduce` survives *reachable from `root`* — not whether one
-/// merely sits somewhere in the arena. `passes::expand_reduce`
-/// clones and lowers rather than pruning, so its output still *holds* the
-/// pre-lowering `Reduce` the arena arrived with; nothing reaches it any
-/// longer, and scanning every node instead of walking from `root` would
-/// refuse a perfectly legal arena (see `ExprArena::retired_axis`'s own doc
-/// for the same pitfall, already paid for once).
+/// What a loop costs [`LoopsCostMore`] beyond the latency prior: more than any
+/// chain these tests build, so a class that holds both a `Reduce` and a chain
+/// always extracts the chain.
+const LOOP_PENALTY: usize = 1 << 24;
+
+/// The latency prior, with every `Reduce` priced out.
+struct LoopsCostMore(CostModel);
+
+impl CostFunction for LoopsCostMore {
+    fn node_cost(&self, node: &ENode, parent: Option<OpKind>) -> usize {
+        let own = self.0.node_cost(node, parent);
+        match node {
+            ENode::Reduce { .. } => own.saturating_add(LOOP_PENALTY),
+            _ => own,
+        }
+    }
+}
+
+/// Whether a `Reduce` is *reachable from `root`* — not whether one merely
+/// sits somewhere in the arena.
 fn has_fold(arena: &ExprArena, root: ExprId) -> bool {
     let mut seen = vec![false; arena.len()];
     let mut stack = vec![root];
@@ -100,18 +125,9 @@ fn hand_unrolled_sum(n: u32) -> (ExprArena, ExprId) {
 
 /// Saturate `(arena, root)` with the production fold vocabulary
 /// (`egraph::fold_rules::fold_rules`: `HalveFold`, `PeelFold` as its
-/// odd-remainder epilogue, `EmptyFold`), run to exhaustion, extract, and —
-/// exactly as the real pipeline does (`pixelflow_search::runtime`'s
-/// `Saturate` is always followed by `LowerDwrt, ExpandReduce`) — legalize
-/// whatever `Reduce` extraction still preferred to leave in place.
-///
-/// A survivor here is expected, not a bug: a fold this short can extract
-/// cheaper *as* a trivial `Reduce` than as the `Op` chain expanding it would
-/// cost one more node than — `Kernel::sum_over`'s body is bare `Var`, priced
-/// at 0, so nothing here ever spends more to unroll the last term than to
-/// leave it folded. `passes::expand_reduce` is exactly the pass that turns
-/// "extraction may leave this folded" into "codegen never sees a `Reduce`",
-/// which is why production always runs it last regardless of what survived.
+/// odd-remainder epilogue, `EmptyFold`), run to exhaustion, and extract the
+/// cheapest term with loops priced out — the chain halving built, which must
+/// hold no `Reduce`.
 fn unroll_by_halving(
     arena: &ExprArena,
     root: ExprId,
@@ -120,13 +136,14 @@ fn unroll_by_halving(
     let mut eg = EGraph::with_rules(fold_rules());
     let class = insert(arena, root, &mut eg, Vocabulary::Runtime).expect("a fold inserts");
     SaturationConfig::compatibility(iterations).run(&mut eg);
-    let (extracted, extracted_root, _cost) = extract(&eg, class, &CostModel::latency_prior());
-    let (out, out_root) = pixelflow_ir::passes::expand_reduce_owned(&extracted, extracted_root);
+    let (extracted, extracted_root, _cost) =
+        extract(&eg, class, &LoopsCostMore(CostModel::latency_prior()));
     assert!(
-        !has_fold(&out, out_root),
-        "the legalizer must leave no Reduce behind, whatever extraction chose"
+        !has_fold(&extracted, extracted_root),
+        "halving to exhaustion must leave a Reduce-free chain in the root's class, \
+         and a loop priced out must not be extracted while one exists"
     );
-    (out, out_root, eg.application_count())
+    (extracted, extracted_root, eg.application_count())
 }
 
 /// The load-bearing comparison: halving `Σ_{k<n} k` to exhaustion reaches the
@@ -184,11 +201,11 @@ fn halving_matches_peeling_odd_trip_count() {
 
 /// The performance claim itself, at the scale that motivated it
 /// (CLAUDE.md's "A 34,993-node glyph fold therefore burns ~n applications").
-/// No JIT here — a 34,993-term reference chain would make this test about
-/// codegen throughput, not about the application count, which is measured
-/// directly and is the only thing this checks. Value correctness at this
-/// shape is what the two tests above already cover, at a scale a JIT and a
-/// hand-built reference can still check quickly.
+/// No JIT and no extraction here — a 34,993-term chain would make this test
+/// about codegen and extraction throughput, not about the application count,
+/// which is measured directly and is the only thing this checks. Value
+/// correctness at this shape is what the two tests above already cover, at a
+/// scale a JIT and a hand-built reference can still check quickly.
 #[test]
 fn halving_a_glyph_scale_fold_costs_far_fewer_than_n_applications() {
     let n = 34_993;
@@ -196,18 +213,12 @@ fn halving_a_glyph_scale_fold_costs_far_fewer_than_n_applications() {
     let (arena, root) = kernel.parts();
 
     let mut eg = EGraph::with_rules(fold_rules());
-    let class = insert(arena, root, &mut eg, Vocabulary::Runtime).expect("a fold inserts");
+    insert(arena, root, &mut eg, Vocabulary::Runtime).expect("a fold inserts");
     // Peeling one term at a time would need on the order of `n` rounds;
     // halving needs `O(log n)` — comfortable headroom either way, and this
     // test is about the applications actually spent, not the round cap.
     SaturationConfig::compatibility(64).run(&mut eg);
-    let (extracted, extracted_root, _cost) = extract(&eg, class, &CostModel::latency_prior());
-    let (out, out_root) = pixelflow_ir::passes::expand_reduce_owned(&extracted, extracted_root);
 
-    assert!(
-        !has_fold(&out, out_root),
-        "the legalizer must leave no Reduce behind, whatever extraction chose"
-    );
     let apps = eg.application_count();
     // Measured ~89 applications for n=34,993 (versus ~n for one-term-at-a-time
     // peeling) — this asserts three orders of magnitude below `n`, generous

@@ -27,9 +27,9 @@
 //!
 //! **`Reduce` is legal in the arena and [`legalize`] leaves every one
 //! standing**, nested or not: codegen emits a surviving fold as a loop, and a
-//! fold inside a fold's body as a loop inside a loop. [`expand_reduce`] is
-//! still here for a caller that wants every fold gone — a test comparing the
-//! two shapes — and is on no production path.
+//! fold inside a fold's body as a loop inside a loop. There is no pass that
+//! unrolls one: a fold a caller wants gone is halved away by the e-graph's
+//! `HalveFold` (`pixelflow-search`), not by a lowering.
 //!
 //! **Nothing here knows what it is lowering *for*.** There is no `cfg` in this
 //! module beyond `#[cfg(test)]`, and no import outside `crate::{arena, fold,
@@ -55,7 +55,6 @@
 //! Nothing re-fuses `mul`+`add` into `MulAdd` afterwards — see `horner_step`.
 
 use crate::arena::{ExprArena, ExprId, ExprNode};
-use crate::fold::Fold;
 use crate::kind::OpKind;
 use crate::variance::Variance;
 use alloc::borrow::Cow;
@@ -146,7 +145,7 @@ fn is_transcendental_binary(op: OpKind) -> bool {
 /// already-lowered child — or `None` to keep it as a plain structural copy.
 /// Shared subexpressions are rebuilt once (`id_map` dedups), so a DAG stays a
 /// DAG. This is the single skeleton behind [`expand_transcendentals`],
-/// [`expand_gather`], and [`expand_reduce`]; each supplies only its `lower`
+/// [`expand_gather`], and [`expand_refs`]; each supplies only its `lower`
 /// hook. Mirrors [`ExprArena::substitute_vars_with`].
 fn rebuild_arena<F>(arena: &mut ExprArena, root: ExprId, mut lower: F) -> ExprId
 where
@@ -280,10 +279,11 @@ fn copy_node(
 /// referent is spliced once per key, and every later `Ref` to that key
 /// points at the same subgraph. A kernel referenced `m` times therefore
 /// costs one copy of its body rather than `m` — and a reduction inside it
-/// is unrolled once by [`expand_reduce`], not `m` times. Splicing per use
-/// would give back exactly what composition by value costs (measured on a
-/// glyph whose winding sum is read once per boundary piece: 16k, 37k, 58k
-/// legalized nodes *per piece* at 40, 73, 132 pieces — quadratic).
+/// is one fold, not `m`. Splicing per use would give back exactly what
+/// composition by value costs (measured, when legalization still unrolled
+/// every fold, on a glyph whose winding sum is read once per boundary piece:
+/// 16k, 37k, 58k legalized nodes *per piece* at 40, 73, 132 pieces —
+/// quadratic).
 ///
 /// # Panics
 ///
@@ -495,237 +495,6 @@ fn lower_gather(arena: &mut ExprArena, buf: ExprId, x: ExprId, y: ExprId) -> Exp
     let idx = arena.push_binary(OpKind::Add, row, xi);
 
     arena.push_binary(OpKind::RawGather, buf, idx)
-}
-
-// ─────────────────────────────── Reduce lowering ──────────────────────────────
-
-/// Unroll every `Reduce` reachable from `root` into an explicit accumulation
-/// tree, returning the (possibly new) root in the same arena.
-///
-/// A range becomes N inlined copies of `body`, one per index the fold's
-/// range visits, the reduction index substituted as a `Const` in each —
-/// [`unroll_reduce`] has the exact combining shape. Because the range is
-/// static (bound memory), each copy's gather indices become constant, so the
-/// emitter folds their addresses to immediates: the fold compiles to a flat,
-/// call-free, unrolled kernel. This is the reduction analogue of
-/// [`expand_gather`].
-pub fn expand_reduce(arena: &mut ExprArena, root: ExprId) -> ExprId {
-    rebuild_arena(arena, root, |arena, node, m| match node {
-        // The body is already lowered; unroll the fold over it.
-        ExprNode::Reduce { fold, body } => Some(unroll_reduce(arena, *fold, m(*body))),
-        _ => None,
-    })
-}
-
-/// Owned wrapper mirroring [`expand_transcendentals_owned`]: identity fast-path
-/// when the arena has no `Reduce`, otherwise clone-and-lower.
-#[must_use]
-pub fn expand_reduce_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    if !arena
-        .nodes()
-        .any(|(_, n)| matches!(n, ExprNode::Reduce { .. }))
-    {
-        return (arena.clone(), root);
-    }
-    let mut owned = arena.clone();
-    let new_root = expand_reduce(&mut owned, root);
-    (owned, new_root)
-}
-
-/// Build the unrolled accumulation for one fold whose body is already lowered.
-///
-/// This is [`Fold::halve`] run to exhaustion, falling back to
-/// [`Fold::peel_back`] for the odd remainder at whatever level it arises —
-/// the same preference `egraph::fold_rules::HalveFold` gives the saturator.
-/// Sharing the two methods (rather than each restating "even → pair up, odd
-/// → strip one from the back") is what keeps a fold that survives extraction
-/// unrolling into the *identical* shape one saturation resolved itself: one
-/// definition of "fully unrolled," not two that happen to agree today.
-fn unroll_reduce(arena: &mut ExprArena, fold: Fold, body: ExprId) -> ExprId {
-    // Empty domain folds to the monoid identity.
-    if fold.is_empty() {
-        return arena.push_const(fold.monoid().identity());
-    }
-    let combiner_op = fold.monoid().op();
-    let var_idx = fold.binder().var();
-
-    // Which of the body's nodes actually vary with the index. Everything else
-    // is shared across all N terms rather than copied into each of them: the
-    // rewrite `⊕_i (f(i) · c) = c · ⊕_i f(i)` obtained by not duplicating `c`
-    // in the first place. Computed once here, before the substitutions start
-    // appending; every node reachable from `body` predates that point, so the
-    // table covers each id the substitution asks about.
-    let variance = crate::variance::compute_arena_variance(arena);
-
-    // Ascending order (`peel`, not `peel_back`): `combine_halved` pairs
-    // front-to-back, so the terms must already run left to right.
-    let mut terms = Vec::with_capacity(fold.len() as usize);
-    let mut rest = fold;
-    while let Some((k, shorter)) = rest.peel() {
-        terms.push(Substitution::new(body, var_idx, k as f32, &variance).apply(arena, body));
-        rest = shorter;
-    }
-
-    combine_halved(arena, fold, &terms, combiner_op)
-}
-
-/// Combine `terms` — `fold`'s own terms, already substituted, left to
-/// right — the way repeated [`Fold::halve`] does: pair adjacent terms,
-/// recursing on the doubled-stride fold, until [`Fold::halve`] declines
-/// (an odd count, or the single-term base case), at which point
-/// [`Fold::peel_back`] strips the last term and this recurses on the even
-/// remainder. Threading `fold` through rather than re-deriving "even vs
-/// odd" from `terms.len()` keeps this one definition: the decomposition
-/// [`Fold::halve`]/[`Fold::peel_back`] already are, not a second copy of
-/// their logic that could drift from it.
-fn combine_halved(arena: &mut ExprArena, fold: Fold, terms: &[ExprId], op: OpKind) -> ExprId {
-    debug_assert_eq!(
-        fold.len() as usize,
-        terms.len(),
-        "a fold and its substituted terms stay in lockstep"
-    );
-    if let Some(halved) = fold.halve() {
-        let paired: Vec<ExprId> = terms
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&[a, b]| arena.push_binary(op, a, b))
-            .collect();
-        return combine_halved(arena, halved, &paired, op);
-    }
-    let (rest, _last_index) = fold
-        .peel_back()
-        .expect("combine_halved is never called on an empty fold");
-    let last = *terms
-        .last()
-        .expect("fold.len() == terms.len(), both non-empty");
-    if rest.is_empty() {
-        // `fold.len() == 1`: nothing left to combine `last` with.
-        return last;
-    }
-    let rest_val = combine_halved(arena, rest, &terms[..terms.len() - 1], op);
-    arena.push_binary(op, rest_val, last)
-}
-
-/// One unrolled term of a fold: the body with the bound index replaced by a
-/// literal step.
-///
-/// The variance table is what makes this cheap. A subtree that does not depend
-/// on the index would be rebuilt unchanged, so it is not rebuilt at all — the
-/// original node is returned and all N terms share it. That is the rewrite
-/// `⊕_i (f(i) · c) = c · ⊕_i f(i)` obtained by declining to duplicate `c`.
-struct Substitution<'a> {
-    /// The index being replaced, and the step to replace it with.
-    var: u8,
-    value: f32,
-    /// Variance for every node the body can reach, indexed by `ExprId`.
-    variance: &'a [Variance],
-    /// Rebuilt nodes, so a shared subtree is rebuilt once and stays shared.
-    ///
-    /// Sized to the body, not the arena: children are pushed before their
-    /// parent, so nothing the body reaches has an id above the body's own.
-    /// One table per term is unavoidable (each term substitutes a different
-    /// value), but an arena-sized one is written in full on allocation —
-    /// `None` here is not the zero pattern — and the arena grows with every
-    /// term appended, so the unroll wrote O(terms × arena) bytes to produce
-    /// O(terms × body) nodes.
-    memo: Vec<Option<ExprId>>,
-}
-
-impl<'a> Substitution<'a> {
-    fn new(body: ExprId, var: u8, value: f32, variance: &'a [Variance]) -> Self {
-        Self {
-            var,
-            value,
-            variance,
-            memo: alloc::vec![None; body.0 as usize + 1],
-        }
-    }
-
-    fn apply(&mut self, arena: &mut ExprArena, id: ExprId) -> ExprId {
-        let idx = id.0 as usize;
-        if let Some(Some(m)) = self.memo.get(idx) {
-            return *m;
-        }
-        // Indexed, not looked up: the table covers every id the body reaches
-        // (`unroll_reduce` computes it after the body exists), and a fold
-        // that rebinds this slot is stopped here and nowhere else — its
-        // variance excludes its own binder.
-        if self.variance[idx].is_invariant_in(self.var) {
-            return id;
-        }
-        let new = match arena.node(id).clone() {
-            ExprNode::Var(i) if i == self.var => arena.push_const(self.value),
-            ExprNode::Var(i) => arena.push_var(i),
-            ExprNode::Const(v) => arena.push_const(v),
-            ExprNode::Param(i) => arena.push_param(i),
-            ExprNode::Buffer(b) => arena.push_buffer(b),
-            ExprNode::Uniform(u) => arena.push_uniform(u),
-            // A leaf, and a closed one: a referent binds its own reduction
-            // indices, so no substitution of this fold's index can reach
-            // inside it.
-            ExprNode::Ref(k) => arena.push_ref(k),
-            ExprNode::Unary(op, a) => {
-                let a = self.apply(arena, a);
-                arena.push_unary(op, a)
-            }
-            ExprNode::Binary(op, a, b) => {
-                let a = self.apply(arena, a);
-                let b = self.apply(arena, b);
-                arena.push_binary(op, a, b)
-            }
-            ExprNode::Ternary(op, a, b, c) => {
-                let a = self.apply(arena, a);
-                let b = self.apply(arena, b);
-                let c = self.apply(arena, c);
-                arena.push_ternary(op, a, b, c)
-            }
-            ExprNode::Nary(op, ..) => {
-                let children: Vec<ExprId> = arena.children(id).collect();
-                let mapped: Vec<ExprId> = children
-                    .into_iter()
-                    .map(|ch| self.apply(arena, ch))
-                    .collect();
-                arena.push_nary(op, &mapped)
-            }
-            // A nested fold reached here binds a slot of its own, so this
-            // index passes through its body. One that rebinds this slot
-            // never gets here: it shadows the slot, so its variance clears
-            // it and the check above returns it untouched. "A nested fold
-            // never reuses a live slot" is not what makes that safe — it is
-            // false across a `Ref`: `Kernel::over` chooses its slot without
-            // seeing through one, and `expand_refs` then splices a fold
-            // rebinding the slot inside a fold that binds it.
-            ExprNode::Reduce { fold, body } => {
-                let body = self.apply(arena, body);
-                arena.push_reduce(fold, body)
-            }
-            // Same reasoning as `Ref` just above: an arm names a closed
-            // kernel binding its own indices, so this fold's substitution
-            // cannot reach inside it. Only the mask, a real child of this
-            // arena, can hold the index and is recursed into.
-            ExprNode::Guard { mask, on, off } => {
-                let mask = self.apply(arena, mask);
-                arena.push_guard(mask, on, off)
-            }
-            // The value may read the index; the binders name folds that
-            // are never unrolled — a lattice fold survives to codegen as a
-            // loop — so they pass through untouched.
-            ExprNode::Write {
-                row,
-                col,
-                lane,
-                value,
-            } => {
-                let value = self.apply(arena, value);
-                arena.push_write(row, col, lane, value)
-            }
-        };
-        if let Some(slot) = self.memo.get_mut(idx) {
-            *slot = Some(new);
-        }
-        new
-    }
 }
 
 // ─────────────────────────────── Dwrt lowering ───────────────────────────────
@@ -1764,7 +1533,7 @@ fn horner_step(arena: &mut ExprArena, acc: ExprId, x: ExprId, add: ExprId) -> Ex
 #[cfg(test)]
 mod dwrt_tests {
     use super::*;
-    use crate::fold::{Binder, Monoid};
+    use crate::fold::{Binder, Fold, Monoid};
 
     /// The first reduction binder — `Var(4)`, which these folds bind.
     fn binder() -> Binder {
@@ -2185,29 +1954,6 @@ impl Optimize for LowerDwrt {
     }
 }
 
-/// Unroll every `Reduce` into its terms.
-///
-/// The extents are static, so the binder disappears into N terms sharing their
-/// index-invariant subtrees, and what saturation then sees is binder-free
-/// arithmetic it can CSE and fold across those terms — rather than rewriting
-/// under a binder.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ExpandReduce;
-
-impl Optimize for ExpandReduce {
-    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if !arena
-            .nodes()
-            .any(|(_, n)| matches!(n, ExprNode::Reduce { .. }))
-        {
-            return Rewritten::Unchanged;
-        }
-        let mut owned = arena.clone();
-        let new_root = expand_reduce(&mut owned, root);
-        Rewritten::Changed(owned, new_root)
-    }
-}
-
 #[cfg(test)]
 mod nested_reduce_tests {
     use super::*;
@@ -2291,32 +2037,6 @@ mod nested_reduce_tests {
         assert!(
             matches!(legalized.node(lhs), ExprNode::Reduce { fold, .. } if fold.range() == (0..3)),
             "the inner Reduce must be the outer body's own operand, not unrolled into it"
-        );
-    }
-
-    /// `u + Σ_{u ∈ [0,2)} u`, substituting `u := 2`: the sum rebinds the
-    /// slot and shadows it, so the substitution stops there — `2 + Σ_{u<2} u`,
-    /// the fold the original node, not `2 + Σ_{u<2} 2`. `Kernel::over`
-    /// never nests a live slot, but `expand_refs` can: a fold's slot is
-    /// chosen without seeing through a `Ref`. What stops it is the variance
-    /// table: a fold's variance excludes its own binder.
-    #[test]
-    fn a_substitution_stops_at_a_fold_that_rebinds_its_slot() {
-        let mut a = ExprArena::new();
-        let slot = Binder::from_slot(0).expect("slot 0 exists");
-        let u = a.push_var(slot.var());
-        let inner = a.push_reduce(Fold::new(Monoid::SUM, slot, 0..2), u);
-        let body = a.push_binary(OpKind::Add, u, inner);
-
-        let variance = crate::variance::compute_arena_variance(&a);
-        let term = Substitution::new(body, slot.var(), 2.0, &variance).apply(&mut a, body);
-        let ExprNode::Binary(OpKind::Add, value, sum) = a.node(term) else {
-            panic!("the body's sum survives: {:?}", a.node(term));
-        };
-        assert_eq!(a.node(value), ExprNode::Const(2.0));
-        assert_eq!(
-            sum, inner,
-            "the shadowing fold is the original node, untouched"
         );
     }
 }

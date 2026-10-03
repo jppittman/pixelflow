@@ -185,7 +185,7 @@ fn binder_weighted_sum_over_reads_every_column_exactly() {
 ///
 /// This test used to assert the opposite, and the inversion is the whole of
 /// stage 2c (docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md).
-/// `legalize` ran `expand_reduce` unconditionally, so a `Reduce` became
+/// `legalize` unrolled every `Reduce` unconditionally, so a `Reduce` became
 /// `extent` inlined copies of its body — each with the binder substituted as
 /// a distinct `Const`, which is what let the following `expand_gather` see a
 /// constant index — and the node count scaled with the extent. Codegen emits

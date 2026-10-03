@@ -931,7 +931,7 @@ impl ExprArena {
     /// index, which range. Every one of those was an assertion here — a
     /// combiner that is a monoid, a var index inside the binder space, a trip
     /// count that fits — and each is now a thing the type will not build.
-    /// `expand_reduce` lowers a survivor to an unrolled accumulation.
+    /// A survivor reaches codegen as a loop.
     pub fn push_reduce(&mut self, fold: Fold, body: ExprId) -> ExprId {
         self.intern(NodeData::Reduce(fold), &[body])
     }

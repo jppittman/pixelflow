@@ -256,6 +256,9 @@ gain. Gate: extraction keeps the fold for a glyph and unrolls a 2-term one.
 codegen cannot take it, which after R1 is nothing. Gate: the glyph suites and
 goldens unmoved; `emit` wall clock on `8`@32 falls by the order §1 predicts, or
 the prediction is wrong and this document says so.
+*Done 2026-10-03: the fallback itself is deleted (`expand_reduce`,
+`expand_reduce_owned`, `ExpandReduce`; one-pipeline M13) — a fold the graph
+leaves standing is a loop, and no pass unrolls one.*
 
 **R4 — partial unrolling** (backlog **E1**): geometric `SplitFold`,
 `⊕_{[lo,hi)} = ⊕_{[lo,mid)} ⊕ ⊕_{[mid,hi)}`, bisecting. Needs no substitution

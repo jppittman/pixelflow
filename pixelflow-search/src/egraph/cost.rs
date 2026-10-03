@@ -156,7 +156,7 @@ pub fn latency_prior_cycles() -> OpMap<usize> {
         // one: codegen's guard analysis once read it as the price of a whole
         // loop, and refused a branch over a 64-trip fold as too cheap to be
         // worth one. (It said "lowered (unrolled) before costing" while
-        // `ExpandReduce` ran first. No production path runs it now: codegen
+        // folds were unrolled before saturation. They no longer are: codegen
         // emits a surviving fold as a loop.)
         OpKind::Reduce => 0,
         // A leaf like Buffer: its one broadcast load lands in the per-call

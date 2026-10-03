@@ -22,8 +22,10 @@
 //!   explicitly instead of looping.
 //! - Is eliminated by a `lowering` pass before any backend sees it
 //!   (transcendentals by `expand_transcendentals`, `Dwrt` by `lower_dwrt`,
-//!   `Reduce` by `expand_reduce`, the ternary `Gather` op by `expand_gather`
-//!   — see `lowering.rs`) — absent from every list here on purpose.
+//!   the ternary `Gather` op by `expand_gather` — see `lowering.rs`) — absent
+//!   from every list here on purpose.
+//! - Is a loop, not an op: a `Reduce` survives `legalize` and opens a
+//!   `regalloc::Scope::Fold` — likewise absent.
 //! - Is structural and never becomes a `ScheduledOp` at all (`Var`, `Const`,
 //!   `Tuple`, `Buffer`) — likewise absent.
 //! - `RawGather` (bound-memory read) reaches `ResolvedOp::Gather`, but is

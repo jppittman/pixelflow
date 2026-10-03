@@ -4466,12 +4466,8 @@ mod tests {
         }
     }
 
-    /// **The new path this stage adds.** `passes::legalize` still runs
-    /// `expand_reduce` unconditionally — that is 2c's byte-identical gate,
-    /// no production kernel reaches codegen with a surviving `Reduce` yet —
-    /// so this test is the only thing exercising it, the same way
-    /// `surviving_dwrt_fails_loudly` above reaches the scheduler directly to
-    /// see a shape `legalize` would otherwise have cleaned up first.
+    /// `passes::legalize` leaves every `Reduce` standing, so a fold reaches
+    /// the emitter as a loop; this builds one by hand and compiles it.
     ///
     /// `SUM` over four terms, matched against the closed form
     /// `⊕_{i<4}(X+i) = 4X + 6`; `MIN` over the same range, matched against
@@ -4565,10 +4561,9 @@ mod tests {
     ///
     /// Same DAG as `a_surviving_reduce_shares_a_leaf_and_feeds_further_arithmetic`
     /// (`shared` read once inside the fold's body, once again after it),
-    /// but pushed to the arena in the *interleaved* order a real unroll
-    /// produces (const, add, const, add, const, add — see
-    /// `unroll_reduce`'s substitution) rather than all three constants
-    /// first. That reordering alone, with no change to the DAG's shape,
+    /// but pushed to the arena in the *interleaved* order unrolling a fold
+    /// produces (const, add, const, add, const, add) rather than all three
+    /// constants first. That reordering alone, with no change to the DAG's shape,
     /// used to compute `24` instead of `21`: the outer scope's own copy of
     /// `shared` shared a register with the fold's own per-iteration
     /// recompute of it, and the fold's internal register allocation —

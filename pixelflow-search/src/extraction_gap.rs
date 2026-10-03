@@ -1048,10 +1048,10 @@ fn measure(
     // with no reference: the arena as written (`expand_refs` is the identity
     // on it; one that held a reference is measured here whole rather than
     // unit by unit, as production would optimize it). Legalization
-    // (`LowerDwrt`, `ExpandReduce`) runs
-    // *after* saturation now — it is the fallback for shapes the graph
-    // declined — so lowering here would measure a pipeline that no longer
-    // exists, on an arena an order of magnitude larger than production's.
+    // (`LowerDwrt`) runs *after* saturation now — it is the fallback for
+    // shapes the graph declined — so lowering here would measure a pipeline
+    // that no longer exists, on an arena an order of magnitude larger than
+    // production's.
     let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
     let node_count = reachable_count(&arena, root);
 
