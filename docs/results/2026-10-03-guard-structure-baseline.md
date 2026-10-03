@@ -69,7 +69,7 @@ on time as well as on bytes.
 |---|---|
 | `render::packed::tests::the_chrome_sphere_keeps_its_branches` | chrome, through `jit_cache::compile`: (3 guards, 6 arms) on every tier |
 | `render::packed::tests::the_sphere_silhouette_branches_over_its_one_costly_arm` | silhouette: (1 guard, 1 arm) since the layout switch; (0, 0, 0) before it |
-| `tests/glyph_branches.rs` | a glyph's coverage mask earns no branch (a branch there measured 3.6x slower) |
+| `tests/glyph_branches.rs` | a glyph (in-tree fallback font): (0, 0) before the layout switch, **(3, 3) after** (the three arms that own a loop over its pieces) |
 | `emit::tests::a_chrome_shaped_kernel_keeps_its_branches` | the same shape at the scale of one channel: (3, 6, 70), with a silhouette-shaped control (0, 0, 0) |
 
 Entries are recorded here, not pinned: the count moves with every rewrite
