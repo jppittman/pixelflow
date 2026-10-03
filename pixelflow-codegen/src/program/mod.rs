@@ -11,7 +11,11 @@
 // `layout-shadow` feature, which is where the check against the old
 // exclusivity analysis runs.
 #[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
+pub(crate) mod layout;
+#[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
 pub(crate) mod ownership;
+#[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
+pub(crate) mod tree;
 
 use alloc::vec::Vec;
 
