@@ -14,41 +14,10 @@ use alloc::vec::Vec;
 
 use super::guards::{IfArm, IfGuard};
 use super::{Gpr, KReg, OperandSource, PtrReg, Reg, ScheduledOp, operand_sources, reloads_wanted};
-
-/// A value in the program (SSA-style).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ValueId(pub u32);
-
-/// Which register file a value lives in: a vector of `f32` lanes, or an
-/// address.
-///
-/// A function of the defining op ([`ScheduledOp::class`]), and every
-/// consumer knows by position which it reads — a `Gather`'s index is a
-/// vector and its base is a pointer. The two classes never compete for a
-/// register, so allocation runs once per class over one schedule
-/// ([`LinearScan`]), each pass blind to the other's values, and the assembler
-/// gets a [`PtrReg`] where it demands one because the allocator never held
-/// the address anywhere else (docs/plans/2026-09-22-a-pointer-is-a-value.md).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Class {
-    /// One SIMD batch of `f32`, in a [`Reg`].
-    Vector,
-    /// An address, in a [`PtrReg`].
-    Pointer,
-}
-
-/// One step of a schedule: a value, and the operation that defines it.
-///
-/// Every step defines exactly one value — the DAG is in SSA form — so a
-/// schedule is a sequence of these, and a value's program point is its index
-/// in that sequence.
-#[derive(Clone, Debug)]
-pub struct Def {
-    /// The value this step defines.
-    pub value: ValueId,
-    /// The operation that computes it.
-    pub op: ScheduledOp,
-}
+pub use crate::program::{
+    Class, Def, Scope, ScopeFold, ScopeGuardArm, ScopeRegion, ScopedSchedule, ValueId,
+};
+pub(crate) use crate::program::{all_operands, operands, pointer_operand, structural_children};
 
 /// The complete platform-dependent surface of register allocation.
 ///
@@ -623,51 +592,6 @@ impl Carried {
             pointers: self.pointers.union(other.pointers),
         }
     }
-}
-
-/// Which scope of a loop nest: the body the call runs once, or one of the
-/// folds nested in it.
-///
-/// A **name**, not a coordinate. It used to be half of one — [`Point`] was
-/// `(scope, index)` ordered lexicographically — and that only worked while
-/// the nest was a *chain*: scopes totally ordered by nesting, and all of an
-/// outer scope's code preceding all of an inner scope's. The second stops
-/// being true the moment a scope opens in the *middle* of another, which is
-/// what a surviving `Reduce` is: the parent's own defs sit on both sides of
-/// the fold's. So the ordering moved to where it is always meaningful —
-/// within one scope — and this is now only the key that says which one.
-///
-/// The nest is a **tree**: every fold hangs off whichever scope holds its
-/// def. The lattice's own rows and columns are folds too
-/// (docs/plans/2026-09-16-collapse-is-a-fold.md), so there is no spine of
-/// regions any more — there is the body, run once per call, and folds all
-/// the way down. The derived `Ord` is therefore **not** nesting order — it
-/// is a total order over names, for deterministic keying.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Scope {
-    /// The whole function: what runs once per call, and holds the outermost
-    /// fold's def.
-    Body,
-    /// A surviving `Reduce`'s loop body, indexing
-    /// [`NestAllocation::folds`]. It opens in the *middle* of its parent's
-    /// schedule, which is what makes the nest a tree.
-    Fold(usize),
-    /// One arm of a surviving `Guard`, indexing
-    /// [`NestAllocation::guard_arms`]. Also opens in the middle of its
-    /// parent's schedule — at the `Guard` def, exactly as a fold opens at
-    /// its `Reduce` — but it is a branch, not a loop: it runs at most once
-    /// per time its parent's def is reached, carries nothing in (a guard
-    /// arm's arena is wholly separate from its parent's — a name, not a
-    /// closure), and hands back one result the parent stores to a shared
-    /// slot (docs/plans/2026-09-12-emit-should-just-emit.md §3). Additive
-    /// to [`Scope::Fold`] rather than unified with it: the two are the same
-    /// shape to the frame layout (a region opening mid-schedule) but
-    /// different in what crosses the boundary, and every existing `Fold`
-    /// consumer already assumes a `Reduce` at the opening def — keeping
-    /// this a separate variant means those consumers need no change to
-    /// keep answering exactly as they did before a `Guard` ever reached
-    /// this allocator (the G2 byte-identity gate).
-    GuardArm(usize),
 }
 
 /// A program point: a position in one scope's schedule.
@@ -1660,83 +1584,6 @@ pub trait RegisterAllocator {
     /// implementation places values over the schedule it was given and
     /// returns it unchanged.
     fn allocate_nest(&self, nest: ScopedSchedule, file: &RegisterFile) -> NestAllocation;
-}
-
-/// A schedule split by scope: the body the call runs once, and the folds
-/// nested in it.
-///
-/// This is the loop nest as data. `body` is what happens once per call — the
-/// per-call values, and the outermost fold's def — and each fold's schedule
-/// is what happens once per trip of its loop. Each scope's `roots` are the
-/// values it computes for the scopes inside it: placed here, by the
-/// outermost scope binding every binder the value depends on, so a value
-/// depending on nothing is computed once per call and one depending only on
-/// the row binder once per row (docs/plans/2026-09-16-collapse-is-a-fold.md
-/// §2.2).
-///
-/// The body is a field rather than `folds[0]` because it is genuinely a
-/// different thing: it wraps everything and opens nowhere.
-pub struct ScopedSchedule {
-    /// What runs once per call.
-    pub body: ScopeRegion,
-    /// The surviving folds, in [`Scope::Fold`] order — every one of them,
-    /// the lattice's own included.
-    pub folds: Vec<ScopeFold>,
-    /// The surviving `Guard`s' arms, in [`Scope::GuardArm`] order. Built
-    /// separately from `folds` — after [`RegisterAllocator::allocate_nest`]'s
-    /// caller has already carved the folds out and clustered their arms —
-    /// because a guard arm's schedule does not come from carving anything
-    /// out of this nest's own; it comes from resolving a wholly separate
-    /// `KernelKey` (see [`Scope::GuardArm`]'s doc).
-    pub guard_arms: Vec<ScopeGuardArm>,
-}
-
-/// One scope of a [`ScopedSchedule`] that opens nowhere: the body.
-pub struct ScopeRegion {
-    /// Values this scope computes for the ones inside it.
-    pub roots: Vec<ValueId>,
-    /// What it computes, in topological order.
-    pub schedule: Vec<Def>,
-    /// This scope's `If` guards: which entries of `schedule` each branch
-    /// skips. A table over `schedule`, handed in with it — the allocator
-    /// places split ranges around the arms it names and the emitter branches
-    /// over them, and neither derives them.
-    pub(crate) guards: Vec<IfGuard>,
-}
-
-/// One surviving fold of a [`ScopedSchedule`]: a scope that opens in the
-/// middle of another scope.
-pub struct ScopeFold {
-    /// The scope whose schedule holds this loop's def.
-    pub parent: Scope,
-    /// Which def of `parent` — the `Reduce` this is the body of.
-    pub at: usize,
-    /// Values this fold computes for the scopes inside it.
-    pub roots: Vec<ValueId>,
-    /// The loop body, in topological order.
-    pub schedule: Vec<Def>,
-    /// The body's `If` guards, as [`ScopeRegion::guards`].
-    pub(crate) guards: Vec<IfGuard>,
-}
-
-/// One arm of a surviving `Guard`, as an input to
-/// [`RegisterAllocator::allocate_nest`]: a scope that opens in the middle of
-/// another scope, exactly like [`ScopeFold`], but with no `roots` — its
-/// schedule is wholly self-contained (a separate arena's own, freshly
-/// numbered), so it has nothing to read from its parent beyond the branch
-/// condition the parent resolves before ever reaching this scope.
-pub struct ScopeGuardArm {
-    /// The scope whose schedule holds the `Guard` def this is an arm of.
-    pub parent: Scope,
-    /// The `Guard` def's position in `parent`'s schedule.
-    pub at: usize,
-    /// Which of the `Guard`'s two arms this is.
-    pub arm: IfArm,
-    /// This arm's own evaluation order, in topological order, ending at the
-    /// value the parent stores to the `Guard`'s result slot.
-    pub schedule: Vec<Def>,
-    /// The arm's `If` guards, as [`ScopeRegion::guards`].
-    pub(crate) guards: Vec<IfGuard>,
 }
 
 /// Linear scan with Belady eviction, live-range splitting and constant
@@ -3697,68 +3544,6 @@ pub fn no_temps(_op: &ScheduledOp) -> u8 {
     0
 }
 
-/// The values an operation reads *as registers*, in operand order.
-///
-/// A `Reduce` is a leaf here, the same as `Uniform` — by the time one reaches
-/// a schedule this function walks, `extract_folds` has already carved its
-/// body out into its own `ScopeFold`; the `ValueId` `ScheduledOp::Reduce`
-/// still carries is `schedule_variance`'s and `extract_folds`'s own concern
-/// (they run before extraction, and after respectively, over different
-/// schedules), never an operand this scope's allocation resolves. What the
-/// loop it opens reads from this scope is a dependency all the same, and the
-/// guard analysis has it as one (`guards::FoldReads`). A `Seq`
-/// sequences two effects and reads no register; a `Write` reads the one
-/// value it stores — its row and column are binders, found where their
-/// folds keep them, not operands.
-pub(crate) fn operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use<'_> {
-    let (a, b, c) = match sop {
-        ScheduledOp::Var(_)
-        | ScheduledOp::Lanes(_)
-        | ScheduledOp::Const(_)
-        | ScheduledOp::Context(_)
-        | ScheduledOp::Uniform(..)
-        | ScheduledOp::Reduce(..)
-        | ScheduledOp::Seq(..) => (None, None, None),
-        // A gather's base is a pointer, read through `pointer_operand`; the
-        // index is its one vector operand.
-        ScheduledOp::Unary(_, a)
-        | ScheduledOp::ShiftImm(_, a, _)
-        | ScheduledOp::Gather(a, _)
-        | ScheduledOp::Broadcast(a, _) => (Some(*a), None, None),
-        ScheduledOp::Write { value, .. } => (Some(*value), None, None),
-        // A `Guard`'s mask is the one register operand its own def reads —
-        // its two arms are names into a wholly separate arena, not values in
-        // this schedule, exactly as a `Reduce`'s body is not (see the doc
-        // above) but without even that much: an arm's operands are its own
-        // scope's concern (`LinearScan::allocate_nest`'s guard-arm loop),
-        // never this scope's.
-        ScheduledOp::Guard(mask, _, _) => (Some(*mask), None, None),
-        ScheduledOp::Binary(_, a, b) => (Some(*a), Some(*b), None),
-        ScheduledOp::Ternary(_, a, b, c) => (Some(*a), Some(*b), Some(*c)),
-    };
-    [a, b, c].into_iter().flatten()
-}
-
-/// The address an operation reads, if it reads one: a gather's, a
-/// broadcast's or a uniform load's base, always a [`Class::Pointer`] value.
-/// One at most, which is what lets [`Scratch::ptr_reload`] be a single
-/// register.
-pub(crate) fn pointer_operand(sop: &ScheduledOp) -> Option<ValueId> {
-    match sop {
-        ScheduledOp::Gather(_, base) | ScheduledOp::Broadcast(_, base) => Some(*base),
-        ScheduledOp::Uniform(base, _) => Some(*base),
-        _ => None,
-    }
-}
-
-/// Every value an operation reads, of either class: [`operands`] then
-/// [`pointer_operand`]. What a liveness question that does not care which
-/// file a value lives in asks — how many times a root is read, whether a
-/// schedule is topological.
-pub(crate) fn all_operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use<'_> {
-    operands(sop).chain(pointer_operand(sop))
-}
-
 /// The values an operation reads from `class`'s file.
 fn operands_of(sop: &ScheduledOp, class: Class) -> impl Iterator<Item = ValueId> + use<'_> {
     let (vectors, pointer) = match class {
@@ -3766,19 +3551,6 @@ fn operands_of(sop: &ScheduledOp, class: Class) -> impl Iterator<Item = ValueId>
         Class::Pointer => (None, pointer_operand(sop)),
     };
     vectors.into_iter().flatten().chain(pointer)
-}
-
-/// Every value an operation is *built from*: its operands of both classes,
-/// plus the body a `Reduce` folds and the two effects a `Seq` orders — the
-/// children a walk of the DAG's structure follows, as opposed to the
-/// registers an instruction reads ([`operands`]).
-pub(crate) fn structural_children(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use<'_> {
-    let extra = match sop {
-        ScheduledOp::Reduce(_, body) => [Some(*body), None],
-        ScheduledOp::Seq(a, b) => [Some(*a), Some(*b)],
-        _ => [None, None],
-    };
-    all_operands(sop).chain(extra.into_iter().flatten())
 }
 
 #[cfg(test)]
