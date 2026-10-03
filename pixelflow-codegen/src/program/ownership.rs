@@ -226,6 +226,7 @@ impl Ownership {
         &self.regions
     }
 
+    #[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
     /// Whether `inner` is `outer` or nested in it.
     pub(crate) fn is_within(&self, inner: Region, outer: Region) -> bool {
         self.regions.is_within(inner.0, outer.0)

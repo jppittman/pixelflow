@@ -298,11 +298,21 @@ impl Layout {
         }
     }
 
+    /// `schedule` in the new order.
+    pub(crate) fn apply(&self, schedule: &[Def]) -> Vec<Def> {
+        self.order
+            .iter()
+            .map(|&old| schedule[old].clone())
+            .collect()
+    }
+
+    #[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
     /// Whether the schedule is returned as it came.
     pub(crate) fn is_identity(&self) -> bool {
         self.order.iter().enumerate().all(|(new, &old)| new == old)
     }
 
+    #[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
     /// Whether every read follows the value it reads, in the new order: the
     /// property a layout must keep, and the one a wrong ownership silently
     /// breaks.
@@ -317,6 +327,7 @@ impl Layout {
     }
 }
 
+#[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
 /// Whether, taking `schedule`'s defs in `order`, every read follows the value
 /// it reads. A value this schedule does not define (a live-in) is not read
 /// from here.

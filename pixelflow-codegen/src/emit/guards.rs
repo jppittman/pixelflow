@@ -327,6 +327,7 @@ fn transitive_deps(
 /// [`IfArms::range`], which is where the *order* gets its say.
 struct IfArms {
     if_idx: usize,
+    #[cfg(test)]
     if_vid: ValueId,
     mask_vid: ValueId,
     /// Where the mask lands, or `usize::MAX` when it is not in this scope's
@@ -336,6 +337,7 @@ struct IfArms {
     /// Everything the `If` reads, transitively, as schedule positions —
     /// which is also, by complement, everything between the mask and the
     /// `If` that the `If` does NOT need.
+    #[cfg(test)]
     cone: IndexSet,
     /// What each arm's own entries cost, in latency-prior cycles — what a
     /// guard on that arm could save, against what the branch costs when it
@@ -384,6 +386,7 @@ impl IfArms {
         ArmPair::new(self.true_range(), self.false_range())
     }
 
+    #[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
     /// An arm the ORDER refuses: it is worth guarding and no branch can span
     /// it. Distinct from an arm that owns nothing, and from one too cheap to
     /// guard — no reordering helps either of those.
@@ -703,18 +706,22 @@ fn if_arms(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Vec<IfA
                 .copied()
                 .unwrap_or(usize::MAX);
 
-            let mut cone = IndexSet::empty(schedule.len());
-            for vid in mask_deps
-                .iter()
-                .chain(true_deps.iter())
-                .chain(false_deps.iter())
-            {
-                if let Some(&idx) = vid_to_sched_idx.get(vid)
-                    && idx != usize::MAX
+            #[cfg(test)]
+            let cone = {
+                let mut cone = IndexSet::empty(schedule.len());
+                for vid in mask_deps
+                    .iter()
+                    .chain(true_deps.iter())
+                    .chain(false_deps.iter())
                 {
-                    cone.insert(idx);
+                    if let Some(&idx) = vid_to_sched_idx.get(vid)
+                        && idx != usize::MAX
+                    {
+                        cone.insert(idx);
+                    }
                 }
-            }
+                cone
+            };
 
             let arm_cycles = |indices: &IndexSet| -> usize {
                 indices
@@ -727,10 +734,12 @@ fn if_arms(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Vec<IfA
 
             arms.push(IfArms {
                 if_idx: i,
+                #[cfg(test)]
                 if_vid: *sel_vid,
                 mask_vid: *mask_vid,
                 mask_idx,
                 indices: ArmPair::new(true_indices, false_indices),
+                #[cfg(test)]
                 cone,
                 cycles: ArmPair::new(true_cycles, false_cycles),
             });
@@ -811,6 +820,7 @@ pub(crate) const MISPREDICT_PENALTY_CYCLES: usize = 16;
 /// `folds` is what each loop this scope opens reads from it ([`FoldReads`]):
 /// a permutation is only legal if it keeps those reads ahead of the loop, and
 /// a loop's `Reduce` def names none of them as an operand.
+#[cfg(test)]
 pub(crate) fn cluster_if_arms(schedule: Vec<Def>, folds: &FoldReads) -> Vec<Def> {
     let mut current = schedule;
     // Keyed by the `If`'s *value*: the one identity that survives a
@@ -849,6 +859,7 @@ pub(crate) fn cluster_if_arms(schedule: Vec<Def>, folds: &FoldReads) -> Vec<Def>
 /// The schedule with the region of the `If` that `arms` describes
 /// stable-partitioned into shared, then
 /// true-exclusive, then false-exclusive entries.
+#[cfg(test)]
 fn partition_around(schedule: &[Def], arms: &IfArms, folds: &FoldReads) -> Vec<Def> {
     let first_arm = arms.indices[IfArm::True]
         .iter()
@@ -924,6 +935,7 @@ fn partition_around(schedule: &[Def], arms: &IfArms, folds: &FoldReads) -> Vec<D
 /// shared with the world outside it. Moving such a value behind its consumer
 /// produced a kernel that read an undefined register, and the emitted code was
 /// wrong in a way no unit test of the analysis would have shown.
+#[cfg(test)]
 fn is_topological(schedule: &[Def], folds: &FoldReads) -> bool {
     let defined: alloc::collections::BTreeSet<ValueId> =
         schedule.iter().map(|def| def.value).collect();

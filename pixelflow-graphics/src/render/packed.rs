@@ -446,11 +446,20 @@ mod tests {
         );
     }
 
-    /// The control: a silhouette over the sky earns no guard, its arms being
-    /// under the mispredict bound — the glyph and silhouette arms that a
-    /// branch makes slower, not faster.
+    /// The silhouette over the sky: one `If`, and one arm worth a branch.
+    ///
+    /// The arm is over the mispredict bound and was refused, before the layout
+    /// chose the order, because its values were not one run; the layout gives it
+    /// its branch. A spatially coherent mask earns one: the sphere's silhouette
+    /// is uniform in most batches. Pinned on guards and arms (entries are
+    /// recorded in `docs/results`).
     #[test]
-    fn the_sphere_silhouette_earns_no_branch() {
-        assert_eq!(branches_of(&silhouette()), (0, 0, 0));
+    fn the_sphere_silhouette_branches_over_its_one_costly_arm() {
+        let (guards, arms, entries) = branches_of(&silhouette());
+        assert_eq!(
+            (guards, arms),
+            (1, 1),
+            "the silhouette's branches moved ({entries} entries)"
+        );
     }
 }
