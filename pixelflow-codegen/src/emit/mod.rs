@@ -69,7 +69,7 @@ pub mod avx512;
 pub(crate) mod coverage;
 pub mod encoded;
 pub mod executable;
-mod guards;
+pub(crate) mod guards;
 pub mod regalloc;
 pub mod storage;
 pub mod traffic;
@@ -7944,6 +7944,83 @@ mod tests {
             width,
             height: 1,
         })
+    }
+
+    /// What an `If` arm may own when the values it reads are shared with the
+    /// world outside it — through a block pointer the lowering mints.
+    mod arm_ownership {
+        use super::*;
+        use pixelflow_ir::arena::{UniformDecl, UniformIdentity};
+
+        fn decl(default: f32) -> UniformDecl {
+            UniformDecl {
+                id: UniformIdentity::mint(),
+                default,
+            }
+        }
+
+        /// `x > 0 ? rsqrt(x·u1 + 2) : -x`, plus `x·u2` outside the `If`: two
+        /// arguments of one link block, the first read only inside the true
+        /// arm and the second outside it.
+        ///
+        /// The block's base is a `Context` def made at the first `Uniform`
+        /// read, which sits inside the arm's span — and is read again by the
+        /// second uniform's load, outside it. An arm that owned the base
+        /// would skip it on a batch with no true lane, and the second
+        /// uniform's load would read a register nothing wrote. So the base
+        /// belongs to the scope, the arm keeps its branch, and the kernel is
+        /// right on a batch of all-true, all-false and mixed lanes.
+        #[test]
+        fn a_block_pointer_read_inside_an_arm_and_outside_it_is_the_scopes() {
+            let mut a = ExprArena::new();
+            let (u1, u2) = (a.declare_uniform(decl(3.0)), a.declare_uniform(decl(5.0)));
+            let x = a.push_var(0);
+            let zero = a.push_const(0.0);
+            let two = a.push_const(2.0);
+            let mask = a.push_binary(OpKind::Gt, x, zero);
+            let first = a.push_uniform(u1);
+            let scaled = a.push_binary(OpKind::Mul, x, first);
+            let shifted = a.push_binary(OpKind::Add, scaled, two);
+            let heavy = a.push_unary(OpKind::Rsqrt, shifted);
+            let light = a.push_unary(OpKind::Neg, x);
+            let sel = a.push_ternary(OpKind::If, mask, heavy, light);
+            let second = a.push_uniform(u2);
+            let tail = a.push_binary(OpKind::Mul, x, second);
+            let root = a.push_binary(OpKind::Add, sel, tail);
+
+            let shape = LatticeShape::new([lanes() as u32, 1]);
+            let result = compile(&a, root, shape).expect("compiles");
+            let branches = result.traffic.branches;
+            assert_eq!(
+                (branches.guards, branches.arms_branched),
+                (1, 1),
+                "the true arm is worth a branch and the false arm is not"
+            );
+
+            let expect = |x: f32| {
+                let sel = if x > 0.0 {
+                    1.0 / (x * 3.0 + 2.0).sqrt()
+                } else {
+                    -x
+                };
+                sel + x * 5.0
+            };
+            let width = lanes();
+            for (label, start) in [
+                ("all lanes true", 1.0),
+                ("all lanes false", -(width as f32) - 1.0),
+                ("mixed lanes", -(width as f32 / 2.0) + 0.5),
+            ] {
+                let out = collapse_into(&result.code, &[], &[3.0, 5.0], (start, 0.0), shape);
+                for (lane, got) in out.iter().enumerate() {
+                    let want = expect(start + lane as f32);
+                    assert!(
+                        (got - want).abs() <= 1e-3 * want.abs().max(1.0),
+                        "{label}, lane {lane}: {got} != {want}"
+                    );
+                }
+            }
+        }
     }
 
     /// A gather whose address the lane binder does not reach is one scalar

@@ -16,6 +16,10 @@ workspace = true
 # calls into `pixelflow_search::runtime::optimize_runtime_arena`, whose
 # telemetry hook is what this actually enables.
 saturation-telemetry = ["pixelflow-search/saturation-telemetry"]
+# Release builds carry the check that the ownership pass and the exclusivity
+# analysis it replaces agree on every arm of every `If` (debug builds always
+# do). For gating a release-mode compile of a large input; off by default.
+layout-shadow = []
 
 [dependencies]
 pixelflow-ir = { path = "../pixelflow-ir" }

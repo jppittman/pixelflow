@@ -39,6 +39,8 @@ use pixelflow_search::egraph::CostModel;
 use super::ScheduledOp;
 use super::regalloc::{Def, ValueId};
 pub(crate) use crate::program::IfGuard;
+#[cfg(any(debug_assertions, feature = "layout-shadow"))]
+use crate::program::ownership::Ownership;
 pub use crate::program::{ArmPair, IfArm};
 
 /// A dense bitset over `0..capacity`.
@@ -226,7 +228,7 @@ impl FoldReads {
     /// operands of both register classes — a gather's base pointer is a read
     /// as much as its index is — and, for a `Reduce` that opens a fold here,
     /// what the fold reads.
-    fn reads<'a>(
+    pub(crate) fn reads<'a>(
         &'a self,
         value: ValueId,
         op: &'a ScheduledOp,
@@ -251,7 +253,7 @@ impl FoldReads {
 /// loop it opens here ([`FoldReads`]). The summand of an `If` arm's price
 /// and of a fold body's, which are one question: what running these entries
 /// costs.
-fn def_cycles(def: &Def, folds: &FoldReads, cycles: &CostModel) -> usize {
+pub(crate) fn def_cycles(def: &Def, folds: &FoldReads, cycles: &CostModel) -> usize {
     match &def.op {
         ScheduledOp::Var(_)
         | ScheduledOp::Lanes(_)
@@ -413,6 +415,8 @@ pub(crate) fn analyze_if_guards(
     folds: &FoldReads,
 ) -> Vec<IfGuard> {
     let per_if = if_arms(schedule, external, folds);
+    #[cfg(any(debug_assertions, feature = "layout-shadow"))]
+    assert_ownership_agrees(schedule, external, folds, &per_if);
     let mut guards = Vec::new();
 
     for arms in &per_if {
@@ -429,6 +433,48 @@ pub(crate) fn analyze_if_guards(
     }
 
     guards
+}
+
+/// The old analysis and [`Ownership`] answer one question two ways: per `If`
+/// and arm, the same entries and the same price.
+///
+/// Run on every call in a debug build and, in release, under the
+/// `layout-shadow` feature: the equality is what lets the ownership pass
+/// replace this analysis. An inequality is a stop — ownership is then not the
+/// exclusivity relation for that input, and the pass is what gets fixed.
+#[cfg(any(debug_assertions, feature = "layout-shadow"))]
+fn assert_ownership_agrees(
+    schedule: &[Def],
+    external: &[ValueId],
+    folds: &FoldReads,
+    per_if: &[IfArms],
+) {
+    let own = Ownership::of(schedule, external, folds);
+    assert_eq!(
+        own.arms().len(),
+        2 * per_if.len(),
+        "ownership found a different number of `If`s"
+    );
+    let (pairs, _) = own.arms().as_chunks::<2>();
+    for (old, pair) in per_if.iter().zip(pairs) {
+        for new in pair {
+            assert_eq!(new.if_pos, old.if_idx, "ownership met a different `If`");
+            let owned: Vec<usize> = (0..schedule.len())
+                .filter(|&pos| own.is_within(own.region_of(pos), new.region))
+                .collect();
+            let exclusive: Vec<usize> = old.indices[new.arm].iter().collect();
+            assert_eq!(
+                owned, exclusive,
+                "{:?} arm of the If at {}: ownership and exclusivity disagree on what it owns",
+                new.arm, old.if_idx
+            );
+            assert_eq!(
+                new.cycles, old.cycles[new.arm],
+                "{:?} arm of the If at {}: ownership and exclusivity price it differently",
+                new.arm, old.if_idx
+            );
+        }
+    }
 }
 
 /// Every `If` in the schedule, with the entries exclusive to each arm.
