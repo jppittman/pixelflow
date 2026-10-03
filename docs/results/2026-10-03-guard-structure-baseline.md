@@ -74,3 +74,40 @@ on time as well as on bytes.
 
 Entries are recorded here, not pinned: the count moves with every rewrite
 rule, while an arm gained or lost is the failure the pins exist to catch.
+
+## What the layout stage will change (measured in shadow, 2026-10-03)
+
+`program::layout` chooses the order from ownership instead of repairing it, and
+the old analysis checks it on every compile in a debug build (and under the
+`layout-shadow` feature in release): it must find, in the laid-out order,
+exactly the runs the layout says, keep every arm it guarded itself, and leave a
+scope unmoved when it refused nothing for its order. It never disagreed. What
+the layout *realizes*, against what is emitted today:
+
+| fixture | emitted today | layout, on today's (clustered) schedule | layout, on the unclustered schedule |
+|---|---|---|---|
+| chrome (final scope) | 6 arms | 6 arms, order unmoved | 6 arms (clustering off: 4) |
+| sphere silhouette | 0 arms | **1 arm** | 1 arm |
+| units font N=4+8+16 | 537 arms | 537 arms, order unmoved | **537 arms** (clustering off: 0) |
+| units font N=32 | 693 arms | | **693 arms** (clustering off: 0) |
+| 95-kernel glyph table, both tiers | 224 arms | **576 arms** | 576 arms (clustering off: 24) |
+
+The last column is the point: from a schedule nothing has repaired, the layout
+finds exactly the arms `cluster_if_arms` produced, in the one pass, and the
+units font at N=32 compiles in 3.0 s with the search off, against 135 s with it.
+
+Two rows move what is emitted, so the switch is a measured change and not a
+refactor:
+
+- **The 95-kernel glyph table, 224 -> 576 arms.** All 352 additions are arms
+  clustering left unguarded because their values are not one run after
+  hoisting, and every one is a fold-owning arm: 2,216 to 35,549 cycles over 19
+  to 38 entries (the old arms are 201 to 497 cycles over 52 to 130). No arm
+  under 200 cycles is realized, so no coverage-mask arm (a handful of ops, 3.6x
+  slower guarded) is. They skip a loop over a glyph's pieces when the pixel is
+  outside the bounding box. Whether that wins is the glyph ns/texel gate's to
+  say.
+- **The sphere silhouette, 0 -> 1 arm.** One arm is over the bound and refused
+  today for its order. The pin `the_sphere_silhouette_earns_no_branch` holds
+  today's answer; it flips with the switch, and ns/px on this fixture decides
+  whether the new answer stays.

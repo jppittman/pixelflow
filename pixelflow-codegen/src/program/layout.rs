@@ -382,16 +382,18 @@ mod tests {
             .iter()
             .map(|&old| schedule[old].value.0)
             .collect();
-        // Every branch the old analysis found, the layout keeps.
+        // Every branch the old analysis found, the layout keeps: matched by the
+        // `If`'s own value, since every fixture's `If`s share a mask.
         for old in &guards {
+            let value = schedule[old.if_idx].value;
             let kept = layout
                 .guards
                 .iter()
-                .find(|new| new.mask_vid == old.mask_vid)
+                .find(|new| schedule[layout.order[new.if_idx]].value == value)
                 .expect("a branch the old analysis found is lost");
             for arm in crate::program::IfArm::ALL {
                 assert!(
-                    old.range(arm).0 == old.range(arm).1 || kept.range(arm).0 != kept.range(arm).1,
+                    !old.is_guarded(arm) || kept.is_guarded(arm),
                     "{arm:?} arm lost its branch"
                 );
             }

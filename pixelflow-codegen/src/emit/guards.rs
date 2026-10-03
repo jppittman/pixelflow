@@ -462,7 +462,9 @@ fn assert_ownership_agrees(
 ) {
     // Both stages read a schedule in which every value precedes its readers,
     // which the allocator has always required; a hand-built fixture that
-    // breaks it has no ownership to compare.
+    // breaks it has no ownership to compare. No compile reaches this: the
+    // 95-kernel glyph table on both tiers, the units font and chrome ran with
+    // the skip counted, and it never fired.
     if !crate::program::layout::reads_follow(0..schedule.len(), schedule, folds) {
         return;
     }
@@ -509,6 +511,7 @@ fn assert_layout_agrees(
     folds: &FoldReads,
     per_if: &[IfArms],
 ) {
+    // As `assert_ownership_agrees`: never fires on a compile.
     if !crate::program::layout::reads_follow(0..schedule.len(), schedule, folds) {
         return;
     }
