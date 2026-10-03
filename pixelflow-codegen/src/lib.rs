@@ -20,6 +20,7 @@ extern crate alloc;
 pub mod emit;
 pub mod error;
 pub mod isa;
+mod program;
 
 pub mod compiled_kernel;
 pub use compiled_kernel::CompiledKernel;

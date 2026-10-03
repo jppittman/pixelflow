@@ -38,145 +38,10 @@ use pixelflow_search::egraph::CostModel;
 
 use super::ScheduledOp;
 use super::regalloc::{Def, ValueId};
-
-/// Which arm of an `If` node a guard branch skips or targets.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum IfArm {
-    /// The `if_true` arm: skipped when all lanes of the mask are false.
-    True,
-    /// The `if_false` arm: skipped when all lanes of the mask are true.
-    False,
-}
-
-impl IfArm {
-    /// Both arms of an `If`.
-    pub const ALL: [Self; 2] = [Self::True, Self::False];
-}
-
-/// A value associated with each arm of an `If` node (`True` and `False`).
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct ArmPair<T> {
-    pub true_arm: T,
-    pub false_arm: T,
-}
-
-impl<T> ArmPair<T> {
-    /// Construct a pair from true-arm and false-arm values.
-    #[inline]
-    pub const fn new(true_arm: T, false_arm: T) -> Self {
-        Self {
-            true_arm,
-            false_arm,
-        }
-    }
-
-    /// Access the value for `arm`.
-    #[inline]
-    pub const fn get(&self, arm: IfArm) -> &T {
-        match arm {
-            IfArm::True => &self.true_arm,
-            IfArm::False => &self.false_arm,
-        }
-    }
-
-    /// Mutably access the value for `arm`.
-    #[inline]
-    pub fn get_mut(&mut self, arm: IfArm) -> &mut T {
-        match arm {
-            IfArm::True => &mut self.true_arm,
-            IfArm::False => &mut self.false_arm,
-        }
-    }
-
-    /// Iterate over references to both arm values.
-    #[inline]
-    pub fn values(&self) -> impl Iterator<Item = &T> {
-        [&self.true_arm, &self.false_arm].into_iter()
-    }
-}
-
-impl<T> core::ops::Index<IfArm> for ArmPair<T> {
-    type Output = T;
-    #[inline]
-    fn index(&self, arm: IfArm) -> &Self::Output {
-        self.get(arm)
-    }
-}
-
-impl<T> core::ops::IndexMut<IfArm> for ArmPair<T> {
-    #[inline]
-    fn index_mut(&mut self, arm: IfArm) -> &mut Self::Output {
-        self.get_mut(arm)
-    }
-}
-
-/// Describes an If node's short-circuit structure in the schedule.
-///
-/// For `If(mask, if_true, if_false)`, identifies contiguous ranges of
-/// schedule entries that are exclusive to each arm (not shared with mask
-/// or the other arm). These ranges can be guarded by conditional branches.
-#[derive(Debug, Clone)]
-pub(crate) struct IfGuard {
-    /// Schedule index of the If node itself.
-    pub(crate) if_idx: usize,
-    /// ValueId of the mask operand (already computed before arms).
-    pub(crate) mask_vid: ValueId,
-    /// Range of schedule indices exclusive to each arm: `[start, end)`.
-    /// Empty if `start == end`.
-    pub(crate) ranges: ArmPair<(usize, usize)>,
-}
-
-impl IfGuard {
-    /// Schedule index range exclusive to the given arm: `[start, end)`.
-    #[must_use]
-    #[inline]
-    pub(crate) const fn range(&self, arm: IfArm) -> (usize, usize) {
-        match arm {
-            IfArm::True => self.ranges.true_arm,
-            IfArm::False => self.ranges.false_arm,
-        }
-    }
-
-    /// Schedule index range exclusive to the true arm: `[start, end)`.
-    #[must_use]
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) const fn true_range(&self) -> (usize, usize) {
-        self.ranges.true_arm
-    }
-
-    /// Schedule index range exclusive to the false arm: `[start, end)`.
-    #[must_use]
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) const fn false_range(&self) -> (usize, usize) {
-        self.ranges.false_arm
-    }
-
-    /// Whether this arm is guarded (has a non-empty range).
-    #[must_use]
-    #[inline]
-    pub(crate) fn is_guarded(&self, arm: IfArm) -> bool {
-        let (s, e) = self.range(arm);
-        s != e
-    }
-
-    /// Whether either arm is guarded.
-    #[must_use]
-    #[inline]
-    pub(crate) fn has_guarded_arm(&self) -> bool {
-        IfArm::ALL.iter().any(|&arm| self.is_guarded(arm))
-    }
-
-    /// Total entries skipped across both arms.
-    #[must_use]
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn total_guarded_entries(&self) -> usize {
-        (self.ranges.true_arm.1 - self.ranges.true_arm.0)
-            + (self.ranges.false_arm.1 - self.ranges.false_arm.0)
-    }
-}
+pub(crate) use crate::program::IfGuard;
+#[cfg(any(debug_assertions, feature = "layout-shadow"))]
+use crate::program::ownership::Ownership;
+pub use crate::program::{ArmPair, IfArm};
 
 /// A dense bitset over `0..capacity`.
 ///
@@ -363,7 +228,7 @@ impl FoldReads {
     /// operands of both register classes — a gather's base pointer is a read
     /// as much as its index is — and, for a `Reduce` that opens a fold here,
     /// what the fold reads.
-    fn reads<'a>(
+    pub(crate) fn reads<'a>(
         &'a self,
         value: ValueId,
         op: &'a ScheduledOp,
@@ -388,7 +253,7 @@ impl FoldReads {
 /// loop it opens here ([`FoldReads`]). The summand of an `If` arm's price
 /// and of a fold body's, which are one question: what running these entries
 /// costs.
-fn def_cycles(def: &Def, folds: &FoldReads, cycles: &CostModel) -> usize {
+pub(crate) fn def_cycles(def: &Def, folds: &FoldReads, cycles: &CostModel) -> usize {
     match &def.op {
         ScheduledOp::Var(_)
         | ScheduledOp::Lanes(_)
@@ -550,6 +415,8 @@ pub(crate) fn analyze_if_guards(
     folds: &FoldReads,
 ) -> Vec<IfGuard> {
     let per_if = if_arms(schedule, external, folds);
+    #[cfg(any(debug_assertions, feature = "layout-shadow"))]
+    assert_ownership_agrees(schedule, external, folds, &per_if);
     let mut guards = Vec::new();
 
     for arms in &per_if {
@@ -566,6 +433,48 @@ pub(crate) fn analyze_if_guards(
     }
 
     guards
+}
+
+/// The old analysis and [`Ownership`] answer one question two ways: per `If`
+/// and arm, the same entries and the same price.
+///
+/// Run on every call in a debug build and, in release, under the
+/// `layout-shadow` feature: the equality is what lets the ownership pass
+/// replace this analysis. An inequality is a stop — ownership is then not the
+/// exclusivity relation for that input, and the pass is what gets fixed.
+#[cfg(any(debug_assertions, feature = "layout-shadow"))]
+fn assert_ownership_agrees(
+    schedule: &[Def],
+    external: &[ValueId],
+    folds: &FoldReads,
+    per_if: &[IfArms],
+) {
+    let own = Ownership::of(schedule, external, folds);
+    assert_eq!(
+        own.arms().len(),
+        2 * per_if.len(),
+        "ownership found a different number of `If`s"
+    );
+    let (pairs, _) = own.arms().as_chunks::<2>();
+    for (old, pair) in per_if.iter().zip(pairs) {
+        for new in pair {
+            assert_eq!(new.if_pos, old.if_idx, "ownership met a different `If`");
+            let owned: Vec<usize> = (0..schedule.len())
+                .filter(|&pos| own.is_within(own.region_of(pos), new.region))
+                .collect();
+            let exclusive: Vec<usize> = old.indices[new.arm].iter().collect();
+            assert_eq!(
+                owned, exclusive,
+                "{:?} arm of the If at {}: ownership and exclusivity disagree on what it owns",
+                new.arm, old.if_idx
+            );
+            assert_eq!(
+                new.cycles, old.cycles[new.arm],
+                "{:?} arm of the If at {}: ownership and exclusivity price it differently",
+                new.arm, old.if_idx
+            );
+        }
+    }
 }
 
 /// Every `If` in the schedule, with the entries exclusive to each arm.

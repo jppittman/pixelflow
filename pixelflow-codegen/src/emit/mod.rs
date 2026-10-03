@@ -69,7 +69,7 @@ pub mod avx512;
 pub(crate) mod coverage;
 pub mod encoded;
 pub mod executable;
-mod guards;
+pub(crate) mod guards;
 pub mod regalloc;
 pub mod storage;
 pub mod traffic;
@@ -78,9 +78,9 @@ pub mod x86_64;
 pub use encoded::EncodedInst;
 pub use storage::{Slot, SourceOperand, StackFrame, Storage, StoreTarget};
 
-use pixelflow_ir::fold::Fold;
 use pixelflow_ir::kind::OpKind;
 
+pub use crate::program::ScheduledOp;
 pub use guards::IfArm;
 use guards::analyze_if_guards;
 use traffic::{BranchTraffic, Counting, EmitTraffic};
@@ -2473,133 +2473,6 @@ fn emit_scope<B: IsaBackend>(
     let code = asm.finish();
     backend.scope_end(allocation.scope(), code.len() as u32);
     Ok((code, result_reg, frame_size, real_spill_count))
-}
-
-/// Info about an operation in the schedule.
-#[derive(Debug, Clone)]
-pub enum ScheduledOp {
-    /// Variable reference (input register)
-    Var(u8),
-    /// Constant value
-    Const(f32),
-    /// Unary op with input value
-    Unary(OpKind, regalloc::ValueId),
-    /// Binary op with input values
-    Binary(OpKind, regalloc::ValueId, regalloc::ValueId),
-    /// Ternary op with input values
-    Ternary(
-        OpKind,
-        regalloc::ValueId,
-        regalloc::ValueId,
-        regalloc::ValueId,
-    ),
-    /// Bit-shift by a compile-time immediate: `op` is `Shl` or `Shr`, the value
-    /// is `ValueId`, and the shift count is folded out of the `Const` RHS by
-    /// `arena_to_schedule` (so it never becomes a scheduled value / register).
-    ShiftImm(OpKind, regalloc::ValueId, u8),
-    /// Bound-memory gather: read the buffer whose base is the second operand
-    /// at the lane index computed by the first. Lowered from
-    /// `RawGather(Buffer(slot), index)`; the `Buffer` leaf *is* the base — a
-    /// [`ScheduledOp::Context`] def, a [`regalloc::Class::Pointer`] value
-    /// the allocator places like any other — so the index is the one vector
-    /// operand and the base the one pointer operand.
-    Gather(regalloc::ValueId, regalloc::ValueId),
-    /// A `Gather` whose index is the same in every lane: one scalar load,
-    /// broadcast. The same `RawGather(Buffer(slot), index)`, split from
-    /// [`ScheduledOp::Gather`] by [`arena_to_schedule`] on the index's
-    /// variance — it lacks the lane binder's bit, so lane 0 *is* the index
-    /// and the other lanes are copies of it. A glyph's per-piece table
-    /// reads are addressed by its fold's own binder and nothing else, which
-    /// makes them this and not a gather; the split is what turns a per-lane
-    /// address sequence (`vpextrd`/`vinsertps` ×4, `vgatherdps`, four
-    /// `umov`/`ldr`/`ins`) into `cvttss2si` + `vbroadcastss [base + idx*4]`.
-    /// Index first, base second, as `Gather`.
-    Broadcast(regalloc::ValueId, regalloc::ValueId),
-    /// Per-call scalar, broadcast from a block: the value at `4 * offset`
-    /// from the block whose base is the pointer operand — the link's
-    /// uniform block, or the origin's. Not a leaf to the placement, since
-    /// the load is an instruction worth doing once per call rather than
-    /// once per batch. The offset is a [`UniformId`]'s slot, at its width.
-    Uniform(regalloc::ValueId, u64),
-    /// The `k`-th pointer of the context the kernel is called with: a
-    /// buffer's base for `k` below the buffer count, the link's uniform
-    /// block and the origin block after. The definition of every
-    /// [`regalloc::Class::Pointer`] value; no operands, variance `CONST`,
-    /// so it is placed in the per-call scope and carried into the loops
-    /// inside by `plan_carries` on the strength of its reads there — one
-    /// load per call where every gather used to reload it
-    /// (docs/plans/2026-09-22-a-pointer-is-a-value.md).
-    Context(u16),
-    /// The lane fold's binder: the constant `[0, 1, …, L−1]`. The fold
-    /// whose binder this is executes by lanes (its body is inlined into its
-    /// parent's schedule — see [`arena_to_schedule`]), so the binder is a
-    /// leaf here rather than a loop counter. Carries the binder so its
-    /// variance bit is the fold's, which is what "lane-uniform" is read off.
-    Lanes(Binder),
-    /// The store the lattice's folds wrap a kernel in: `value`'s first
-    /// `lanes` lanes at `out + 4·(row·pitch + col)`, `row` and `col` being
-    /// the enclosing folds' binders. This def *is* the lane fold, executed
-    /// by lanes: `lane` is that fold's binder, which it closes over the way
-    /// any `Reduce` closes over its own, and `lanes` its trip count — the
-    /// full batch, or a row's remainder — so two lane folds sharing one
-    /// arena `Write` are two defs of different widths reading one value.
-    Write {
-        row: Binder,
-        col: Binder,
-        lane: Binder,
-        lanes: u32,
-        value: regalloc::ValueId,
-    },
-    /// Two effects, the first then the second: the unit monoid's own
-    /// combine, which is what a `SEQ` fold over a row's main batches and its
-    /// remainder is. Reads no register — the schedule's order *is* the
-    /// sequencing — and defines no value.
-    Seq(regalloc::ValueId, regalloc::ValueId),
-    /// A surviving bounded fold: `⊕` over `fold`'s visited indices, whose
-    /// body is the value named by the second field — in *this schedule's*
-    /// numbering (`arena_to_schedule` maps it like any other child), before
-    /// [`extract_folds`] carves the body out into its own
-    /// [`regalloc::ScopeFold`]. Kept only so [`schedule_variance`] can look
-    /// the body's variance up (`Reduce`'s own result is the body's variance
-    /// with the binder's own bit removed) and so [`extract_folds`] can find
-    /// the body's closure; the emitter never resolves it as an operand —
-    /// the loop's result comes from [`regalloc::Allocation::opens_at`]
-    /// naming the [`regalloc::Scope::Fold`] this def opens, not from this
-    /// `ValueId`.
-    Reduce(Fold, regalloc::ValueId),
-    /// A surviving `Guard`: the mask, and its two arms' names. `mask` is a
-    /// real value in *this* schedule (`arena_to_schedule` maps it like any
-    /// other child); the two `KernelKey`s are not — they name kernels whose
-    /// bodies live in wholly separate arenas, resolved through
-    /// `KernelStore::resolve` by `extract_guards`, which schedules each arm
-    /// as its own [`regalloc::Scope::GuardArm`], exactly as [`extract_folds`]
-    /// carves a [`ScheduledOp::Reduce`]'s body into its own
-    /// [`regalloc::Scope::Fold`] — except an arm is not carved *out of*
-    /// anything here, since nothing of it was ever in this schedule to carve.
-    /// The emitter never resolves this def's operands the ordinary way: its
-    /// own `ValueId` is forced to a slot (`regalloc`'s `Scan`, mirroring a
-    /// `Reduce`'s accumulator), and the two arms' scopes — found by
-    /// `regalloc::Allocation::guard_opening_at` — are each emitted as a
-    /// nested scope bracketed by a branch instead of a loop
-    /// (docs/plans/2026-09-12-emit-should-just-emit.md §3).
-    Guard(
-        regalloc::ValueId,
-        pixelflow_ir::key::KernelKey,
-        pixelflow_ir::key::KernelKey,
-    ),
-}
-
-impl ScheduledOp {
-    /// Which register file the value this op defines lives in: a
-    /// [`ScheduledOp::Context`] is an address, everything else is a vector
-    /// (an effect's "value" included, which is never placed anywhere).
-    #[must_use]
-    pub fn class(&self) -> regalloc::Class {
-        match self {
-            ScheduledOp::Context(_) => regalloc::Class::Pointer,
-            _ => regalloc::Class::Vector,
-        }
-    }
 }
 
 // =============================================================================
@@ -8071,6 +7944,83 @@ mod tests {
             width,
             height: 1,
         })
+    }
+
+    /// What an `If` arm may own when the values it reads are shared with the
+    /// world outside it — through a block pointer the lowering mints.
+    mod arm_ownership {
+        use super::*;
+        use pixelflow_ir::arena::{UniformDecl, UniformIdentity};
+
+        fn decl(default: f32) -> UniformDecl {
+            UniformDecl {
+                id: UniformIdentity::mint(),
+                default,
+            }
+        }
+
+        /// `x > 0 ? rsqrt(x·u1 + 2) : -x`, plus `x·u2` outside the `If`: two
+        /// arguments of one link block, the first read only inside the true
+        /// arm and the second outside it.
+        ///
+        /// The block's base is a `Context` def made at the first `Uniform`
+        /// read, which sits inside the arm's span — and is read again by the
+        /// second uniform's load, outside it. An arm that owned the base
+        /// would skip it on a batch with no true lane, and the second
+        /// uniform's load would read a register nothing wrote. So the base
+        /// belongs to the scope, the arm keeps its branch, and the kernel is
+        /// right on a batch of all-true, all-false and mixed lanes.
+        #[test]
+        fn a_block_pointer_read_inside_an_arm_and_outside_it_is_the_scopes() {
+            let mut a = ExprArena::new();
+            let (u1, u2) = (a.declare_uniform(decl(3.0)), a.declare_uniform(decl(5.0)));
+            let x = a.push_var(0);
+            let zero = a.push_const(0.0);
+            let two = a.push_const(2.0);
+            let mask = a.push_binary(OpKind::Gt, x, zero);
+            let first = a.push_uniform(u1);
+            let scaled = a.push_binary(OpKind::Mul, x, first);
+            let shifted = a.push_binary(OpKind::Add, scaled, two);
+            let heavy = a.push_unary(OpKind::Rsqrt, shifted);
+            let light = a.push_unary(OpKind::Neg, x);
+            let sel = a.push_ternary(OpKind::If, mask, heavy, light);
+            let second = a.push_uniform(u2);
+            let tail = a.push_binary(OpKind::Mul, x, second);
+            let root = a.push_binary(OpKind::Add, sel, tail);
+
+            let shape = LatticeShape::new([lanes() as u32, 1]);
+            let result = compile(&a, root, shape).expect("compiles");
+            let branches = result.traffic.branches;
+            assert_eq!(
+                (branches.guards, branches.arms_branched),
+                (1, 1),
+                "the true arm is worth a branch and the false arm is not"
+            );
+
+            let expect = |x: f32| {
+                let sel = if x > 0.0 {
+                    1.0 / (x * 3.0 + 2.0).sqrt()
+                } else {
+                    -x
+                };
+                sel + x * 5.0
+            };
+            let width = lanes();
+            for (label, start) in [
+                ("all lanes true", 1.0),
+                ("all lanes false", -(width as f32) - 1.0),
+                ("mixed lanes", -(width as f32 / 2.0) + 0.5),
+            ] {
+                let out = collapse_into(&result.code, &[], &[3.0, 5.0], (start, 0.0), shape);
+                for (lane, got) in out.iter().enumerate() {
+                    let want = expect(start + lane as f32);
+                    assert!(
+                        (got - want).abs() <= 1e-3 * want.abs().max(1.0),
+                        "{label}, lane {lane}: {got} != {want}"
+                    );
+                }
+            }
+        }
     }
 
     /// A gather whose address the lane binder does not reach is one scalar
