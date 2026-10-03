@@ -5545,19 +5545,21 @@ mod tests {
             .map(|i| def(i, ScheduledOp::Const(1.0)))
             .collect();
         body.push(def(roots, ScheduledOp::Reduce(fold_meta(), ValueId(0))));
-        ScopedSchedule {
+        guarded(ScopedSchedule {
             body: ScopeRegion {
                 roots: (0..roots).map(ValueId).collect(),
                 schedule: body,
+                guards: Vec::new(),
             },
             folds: vec![ScopeFold {
                 parent: Scope::Body,
                 at: roots as usize,
                 roots: Vec::new(),
                 schedule: core::iter::once(binder.clone()).chain(reads).collect(),
+                guards: Vec::new(),
             }],
             guard_arms: Vec::new(),
-        }
+        })
     }
 
     /// The roots go in the order of what a carry saves, then of their ids:
