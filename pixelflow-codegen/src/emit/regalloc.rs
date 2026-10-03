@@ -12,7 +12,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::guards::{FoldReads, IfArm, IfGuard, analyze_if_guards};
+use super::guards::{IfArm, IfGuard};
 use super::{Gpr, KReg, OperandSource, PtrReg, Reg, ScheduledOp, operand_sources, reloads_wanted};
 
 /// A value in the program (SSA-style).
@@ -1402,13 +1402,14 @@ impl<'a> Allocation<'a> {
         &self.code().roots
     }
 
-    /// This scope's `If` short-circuit guards, as analyzed once during
-    /// allocation.
+    /// This scope's `If` short-circuit guards: the table the nest was handed
+    /// in ([`ScopeRegion::guards`]), read back.
     ///
     /// The schedule an emitter reads here is the one the allocator scanned —
-    /// [`schedule`](Self::schedule) never reorders it — so the guard analysis
-    /// is the same question asked and answered twice. This is the answer on
-    /// file; nothing downstream needs to ask again.
+    /// [`schedule`](Self::schedule) never reorders it — so these indices are
+    /// the same ones the allocator placed split ranges around. The question
+    /// was answered once, where the scope was built, and nothing downstream
+    /// asks it again.
     #[must_use]
     pub(crate) fn if_guards(&self) -> &'a [IfGuard] {
         &self.code().guards
@@ -1644,43 +1645,21 @@ impl<'a> Allocation<'a> {
 /// produced, and it panics at the point of failure rather than handing a
 /// caller a string it can only propagate.
 pub trait RegisterAllocator {
-    /// Place every value in a loop nest, and choose the evaluation order.
+    /// Place every value in a loop nest.
     ///
-    /// This is the whole job, and it is deliberately the *only* required
-    /// method. The nest — not a flat schedule — is the honest input, because
-    /// where a value is read decides what keeping it in a register is worth:
-    /// a read inside a loop costs its reload once per iteration, a read in the
+    /// This is the whole job, and it is deliberately the *only* method. The
+    /// nest — not a flat schedule — is the honest input, because where a
+    /// value is read decides what keeping it in a register is worth: a read
+    /// inside a loop costs its reload once per iteration, a read in the
     /// prologue costs it once. An allocator handed a flat `Vec<Def>` cannot
     /// tell those apart, so it cannot price them, and the only policy it can
     /// implement is one that ignores the difference.
     ///
-    /// Taking the nest by value because choosing the order is part of the job:
-    /// an implementation may permute what it is handed, and returns the order
-    /// it settled on.
+    /// The nest is handed over finished: each scope's schedule is the order it
+    /// is emitted in, and its `If` guards are indices into that order, so an
+    /// implementation places values over the schedule it was given and
+    /// returns it unchanged.
     fn allocate_nest(&self, nest: ScopedSchedule, file: &RegisterFile) -> NestAllocation;
-
-    /// A loop-free schedule, which is the degenerate nest: one body, no
-    /// folds, nothing carried across anything.
-    ///
-    /// Provided rather than required, and in that direction on purpose. It
-    /// used to be the other way round — `allocate` required, `allocate_nest`
-    /// defaulted to calling it once per region — which put the loop policy in
-    /// this trait's default body, where every implementation inherited it and
-    /// none of them owned it. A trait should say what an allocator answers,
-    /// not how.
-    fn allocate(&self, dag: Vec<Def>, file: &RegisterFile) -> NestAllocation {
-        self.allocate_nest(
-            ScopedSchedule {
-                body: ScopeRegion {
-                    roots: Vec::new(),
-                    schedule: dag,
-                },
-                folds: Vec::new(),
-                guard_arms: Vec::new(),
-            },
-            file,
-        )
-    }
 }
 
 /// A schedule split by scope: the body the call runs once, and the folds
@@ -1718,6 +1697,11 @@ pub struct ScopeRegion {
     pub roots: Vec<ValueId>,
     /// What it computes, in topological order.
     pub schedule: Vec<Def>,
+    /// This scope's `If` guards: which entries of `schedule` each branch
+    /// skips. A table over `schedule`, handed in with it — the allocator
+    /// places split ranges around the arms it names and the emitter branches
+    /// over them, and neither derives them.
+    pub(crate) guards: Vec<IfGuard>,
 }
 
 /// One surviving fold of a [`ScopedSchedule`]: a scope that opens in the
@@ -1731,6 +1715,8 @@ pub struct ScopeFold {
     pub roots: Vec<ValueId>,
     /// The loop body, in topological order.
     pub schedule: Vec<Def>,
+    /// The body's `If` guards, as [`ScopeRegion::guards`].
+    pub(crate) guards: Vec<IfGuard>,
 }
 
 /// One arm of a surviving `Guard`, as an input to
@@ -1749,6 +1735,8 @@ pub struct ScopeGuardArm {
     /// This arm's own evaluation order, in topological order, ending at the
     /// value the parent stores to the `Guard`'s result slot.
     pub schedule: Vec<Def>,
+    /// The arm's `If` guards, as [`ScopeRegion::guards`].
+    pub(crate) guards: Vec<IfGuard>,
 }
 
 /// Linear scan with Belady eviction, live-range splitting and constant
@@ -2286,53 +2274,6 @@ impl RegisterAllocator for LinearScan {
             }
         };
 
-        // Every scope's `If` guards, before any scan: what an arm may own
-        // depends on what the loops the scope opens read from it, and what
-        // it is worth depends on what they cost (`FoldReads`), which takes
-        // those loops' schedules — and the loop below reaches a fold only
-        // after the scope it opens in. Innermost first: a fold's price is
-        // made of the folds inside it, and a child's index is always above
-        // its parent's.
-        let schedule_of = |scope: Scope| match scope {
-            Scope::Body => nest.body.schedule.as_slice(),
-            Scope::Fold(j) => nest.folds[j].schedule.as_slice(),
-            Scope::GuardArm(_) => unreachable!("a fold never opens in a guard arm"),
-        };
-        let mut reads: Vec<FoldReads> = (0..=nest.folds.len())
-            .map(|_| FoldReads::default())
-            .collect();
-        for scope in (0..nest.folds.len())
-            .rev()
-            .map(Scope::Fold)
-            .chain(core::iter::once(Scope::Body))
-        {
-            let schedule = schedule_of(scope);
-            let opened = FoldReads::new(
-                schedule,
-                nest.folds
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, fold)| fold.parent == scope)
-                    .map(|(k, fold)| {
-                        let inner = &reads[scope_ix(Scope::Fold(k))];
-                        (schedule[fold.at].value, fold.schedule.as_slice(), inner)
-                    }),
-            );
-            reads[scope_ix(scope)] = opened;
-        }
-        let guards_in = |scope: Scope, roots: &[ValueId]| {
-            analyze_if_guards(schedule_of(scope), roots, &reads[scope_ix(scope)])
-        };
-        let mut guards: Vec<Vec<IfGuard>> =
-            core::iter::once(guards_in(Scope::Body, &nest.body.roots))
-                .chain(
-                    nest.folds
-                        .iter()
-                        .enumerate()
-                        .map(|(j, fold)| guards_in(Scope::Fold(j), &fold.roots)),
-                )
-                .collect();
-
         let body_scan = self.scan(
             nest.body.schedule,
             file,
@@ -2340,7 +2281,7 @@ impl RegisterAllocator for LinearScan {
                 live_in: &BTreeMap::new(),
                 roots: &nest.body.roots,
             },
-            core::mem::take(&mut guards[scope_ix(Scope::Body)]),
+            nest.body.guards,
         );
         let mut body_parked: BTreeMap<ValueId, Where> = BTreeMap::new();
         let body_carries = park_roots(
@@ -2470,7 +2411,7 @@ impl RegisterAllocator for LinearScan {
                     live_in: &fold_parked,
                     roots: &fold.roots,
                 },
-                core::mem::take(&mut guards[scope_ix(Scope::Fold(index))]),
+                fold.guards,
             );
             // This fold's own roots, for the folds inside it: carried from
             // what its own code leaves free, or parked.
@@ -2542,8 +2483,7 @@ impl RegisterAllocator for LinearScan {
             }));
             // An arm parks nothing and opens no fold: its schedule is a
             // separate arena's, which `extract_guards` carves nothing out of.
-            let arm_guards = analyze_if_guards(&arm.schedule, &[], &FoldReads::default());
-            let scan = self.scan(arm.schedule, &inside, Boundary::CLOSED, arm_guards);
+            let scan = self.scan(arm.schedule, &inside, Boundary::CLOSED, arm.guards);
             guard_arms.push(GuardArmScope {
                 parent: arm.parent,
                 at: arm.at,
@@ -2619,10 +2559,9 @@ struct Scan {
     /// increasing schedule order. Empty for a value this scope does not place.
     ranges: Vec<Vec<(usize, Where)>>,
     scratch: Vec<Scratch>,
-    /// This scope's `If` guards, analyzed once against `schedule` here and
-    /// carried into its [`ScopeCode`] rather than recomputed at emission: the
-    /// schedule a scope emits is the one it was scanned with, unchanged, so a
-    /// second analysis of it would answer a question already on file.
+    /// This scope's `If` guards, as it was handed them and carried into its
+    /// [`ScopeCode`] for the emitter: the schedule a scope emits is the one it
+    /// was scanned with, unchanged, so they index it as they indexed the input.
     guards: Vec<IfGuard>,
 }
 
@@ -3183,11 +3122,10 @@ impl LinearScan {
     /// `boundary` is what crosses this scope's edges: the parks it enters
     /// with and the roots it hands to the scopes inside it ([`Boundary`]).
     ///
-    /// `guards` are this schedule's `If` guards: [`analyze_if_guards`]
-    /// over it, told what the scopes inside it read — its roots, which no arm
-    /// may own (a skipped arm would leave the park unwritten for a loop that
-    /// runs regardless), and what each loop it opens reads, which no arm may
-    /// own unless the loop is skipped with it.
+    /// `guards` are this schedule's `If` guards, as the scope was handed them
+    /// ([`ScopeRegion::guards`]): they name which entries a branch skips, and
+    /// the scan keeps a split range from naming a register a skipped arm never
+    /// loaded.
     ///
     /// The vector pass and the pointer pass see the same schedule, the same
     /// guard arms and the same parks; each places its own class's values in
@@ -3768,7 +3706,7 @@ pub fn no_temps(_op: &ScheduledOp) -> u8 {
 /// (they run before extraction, and after respectively, over different
 /// schedules), never an operand this scope's allocation resolves. What the
 /// loop it opens reads from this scope is a dependency all the same, and the
-/// guard analysis has it as one: [`FoldReads`]. A `Seq`
+/// guard analysis has it as one (`guards::FoldReads`). A `Seq`
 /// sequences two effects and reads no register; a `Write` reads the one
 /// value it stores — its row and column are binders, found where their
 /// folds keep them, not operands.
@@ -3846,7 +3784,17 @@ pub(crate) fn structural_children(sop: &ScheduledOp) -> impl Iterator<Item = Val
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emit::{allocate_flat, tabulate_guards};
     use pixelflow_ir::kind::OpKind;
+
+    /// `nest` with its guards tabulated the way a compile tabulates them.
+    ///
+    /// The allocator is handed finished nests, and a literal a test writes by
+    /// hand has no table until it is given one.
+    fn guarded(mut nest: ScopedSchedule) -> ScopedSchedule {
+        tabulate_guards(&mut nest);
+        nest
+    }
 
     // --- bit sets ---
 
@@ -4061,7 +4009,7 @@ mod tests {
     }
 
     fn alloc(schedule: Vec<Def>) -> NestAllocation {
-        LinearScan.allocate(schedule, &TEST_FILE)
+        allocate_flat(schedule, &TEST_FILE)
     }
 
     /// A scope that enters with nothing parked, hands nothing off and holds
@@ -4470,7 +4418,7 @@ mod tests {
     #[test]
     fn a_temp_collides_with_neither_the_operand_nor_the_destination() {
         let schedule = vec![leaf(0), def(1, ScheduledOp::Unary(OpKind::Neg, ValueId(0)))];
-        let a = LinearScan.allocate(schedule, &TEMP_FILE);
+        let a = allocate_flat(schedule, &TEMP_FILE);
 
         let temp = a.body().scratch(1).temp(0).expect("`Neg` asked for a temp");
         assert!(
@@ -4522,7 +4470,7 @@ mod tests {
             ScheduledOp::Ternary(OpKind::If, ValueId(2), ValueId(3), ValueId(4)),
         ));
         let at_if = schedule.len() - 1;
-        let a = LinearScan.allocate(schedule, &TEMP_FILE);
+        let a = allocate_flat(schedule, &TEMP_FILE);
         let s = a.body().scratch(at_if);
 
         // The reservation answers the question it is for: how many of this
@@ -4738,7 +4686,7 @@ mod tests {
     /// Nothing is reserved for an operand that is already in a register.
     #[test]
     fn a_resident_operand_reserves_no_reload_target() {
-        let a = LinearScan.allocate(add_two_leaves(), &TEMP_FILE);
+        let a = allocate_flat(add_two_leaves(), &TEMP_FILE);
         let s = a.body().scratch(2);
         assert_eq!(s.reload(0), None);
         assert_eq!(s.reload(1), None);
@@ -4755,7 +4703,7 @@ mod tests {
         // The shape that used to fall through: a `Neg` whose operand is a
         // computed value, so the temp has to miss a pool register that is
         // already holding something.
-        let a = LinearScan.allocate(
+        let a = allocate_flat(
             vec![
                 leaf(0),
                 leaf(1),
@@ -4772,7 +4720,7 @@ mod tests {
     /// everywhere else, which is the whole reason for asking per-op.
     #[test]
     fn an_op_that_asks_for_no_temp_gets_none() {
-        let a = LinearScan.allocate(add_two_leaves(), &TEMP_FILE);
+        let a = allocate_flat(add_two_leaves(), &TEMP_FILE);
         assert_eq!(a.body().scratch(2).temp(0), None, "`Add` asked for no temp");
     }
 
@@ -4787,7 +4735,7 @@ mod tests {
             def(3, ScheduledOp::Unary(OpKind::Sqrt, ValueId(2))),
             def(4, ScheduledOp::Unary(OpKind::Sqrt, ValueId(3))),
         ];
-        let a = LinearScan.allocate(schedule, &TEMP_FILE);
+        let a = allocate_flat(schedule, &TEMP_FILE);
         assert_eq!(spill_count(&a), 0, "four values fit a four-register pool");
 
         let temp = a.body().scratch(1).temp(0).expect("`Neg` asked for a temp");
@@ -5007,22 +4955,24 @@ mod tests {
         // defined.
         body.push(def(200, ScheduledOp::Binary(OpKind::Add, acc, ValueId(0))));
         let alloc = LinearScan.allocate_nest(
-            ScopedSchedule {
+            guarded(ScopedSchedule {
                 body: ScopeRegion {
                     roots: vec![root],
+                    guards: Vec::new(),
                     schedule: body,
                 },
                 folds: vec![ScopeFold {
                     parent: Scope::Body,
                     at: reduce_at,
                     roots: Vec::new(),
+                    guards: Vec::new(),
                     schedule: vec![
                         def(50, ScheduledOp::Var(fold_meta().binder().var())),
                         def(51, ScheduledOp::Binary(OpKind::Add, ValueId(50), root)),
                     ],
                 }],
                 guard_arms: Vec::new(),
-            },
+            }),
             &TEST_FILE,
         );
         let body = alloc.body();
@@ -5046,9 +4996,10 @@ mod tests {
     fn a_constant_read_by_a_fold_is_carried_across_it() {
         let c = ValueId(1);
         let alloc = LinearScan.allocate_nest(
-            ScopedSchedule {
+            guarded(ScopedSchedule {
                 body: ScopeRegion {
                     roots: vec![c],
+                    guards: Vec::new(),
                     schedule: vec![
                         leaf(0),
                         def(c.0, ScheduledOp::Const(3.0)),
@@ -5060,13 +5011,14 @@ mod tests {
                     parent: Scope::Body,
                     at: 2,
                     roots: Vec::new(),
+                    guards: Vec::new(),
                     schedule: vec![
                         def(50, ScheduledOp::Var(fold_meta().binder().var())),
                         def(51, ScheduledOp::Binary(OpKind::Add, ValueId(50), c)),
                     ],
                 }],
                 guard_arms: Vec::new(),
-            },
+            }),
             &NEST_FILE,
         );
         let carry = alloc
@@ -5438,7 +5390,7 @@ mod tests {
         // destination, which is the other way a destination could be pushed
         // onto an operand.
         for file in [&TEST_FILE, &TEMP_FILE] {
-            let a = LinearScan.allocate(schedule.clone(), file);
+            let a = allocate_flat(schedule.clone(), file);
             assert!(
                 spill_count(&a) > 0,
                 "the schedule has to reach eviction for this to test anything"
@@ -5564,7 +5516,7 @@ mod tests {
             acc = ValueId(width + i);
         }
         for file in [&TEST_FILE, &TEMP_FILE] {
-            let a = LinearScan.allocate(schedule.clone(), file);
+            let a = allocate_flat(schedule.clone(), file);
             assert!(spill_count(&a) > 0, "the schedule has to reach eviction");
             assert_reservations_match_residency(&a.body(), file);
         }
@@ -5677,9 +5629,10 @@ mod tests {
     fn nest_with_sibling_folds() -> NestAllocation {
         let park = ValueId(5);
         LinearScan.allocate_nest(
-            ScopedSchedule {
+            guarded(ScopedSchedule {
                 body: ScopeRegion {
                     roots: vec![park],
+                    guards: Vec::new(),
                     schedule: vec![
                         leaf(0),
                         def(5, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
@@ -5697,6 +5650,7 @@ mod tests {
                         parent: Scope::Body,
                         at: 2,
                         roots: vec![ValueId(10)],
+                        guards: Vec::new(),
                         schedule: vec![
                             def(10, ScheduledOp::Unary(OpKind::Neg, park)),
                             def(11, ScheduledOp::Reduce(fold_meta(), ValueId(10))),
@@ -5706,17 +5660,19 @@ mod tests {
                         parent: Scope::Body,
                         at: 3,
                         roots: vec![ValueId(20)],
+                        guards: Vec::new(),
                         schedule: vec![def(20, ScheduledOp::Unary(OpKind::Neg, park))],
                     },
                     ScopeFold {
                         parent: Scope::Fold(0),
                         at: 1,
                         roots: Vec::new(),
+                        guards: Vec::new(),
                         schedule: vec![def(50, ScheduledOp::Unary(OpKind::Neg, ValueId(10)))],
                     },
                 ],
                 guard_arms: Vec::new(),
-            },
+            }),
             &NEST_FILE,
         )
     }
@@ -5753,9 +5709,10 @@ mod tests {
             .checked();
             let (a, b) = (ValueId(2), ValueId(3));
             let alloc = LinearScan.allocate_nest(
-                ScopedSchedule {
+                guarded(ScopedSchedule {
                     body: ScopeRegion {
                         roots: vec![a, b],
+                        guards: Vec::new(),
                         schedule: vec![
                             leaf(0),
                             def(2, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
@@ -5768,6 +5725,7 @@ mod tests {
                         parent: Scope::Body,
                         at: 3,
                         roots: Vec::new(),
+                        guards: Vec::new(),
                         schedule: vec![
                             def(50, ScheduledOp::Var(fold_meta().binder().var())),
                             def(51, ScheduledOp::Binary(OpKind::Add, ValueId(50), a)),
@@ -5775,7 +5733,7 @@ mod tests {
                         ],
                     }],
                     guard_arms: Vec::new(),
-                },
+                }),
                 &file,
             );
             let body = alloc.body();
@@ -5830,9 +5788,10 @@ mod tests {
         let read = ValueId(5);
         let unused = ValueId(6);
         let alloc = LinearScan.allocate_nest(
-            ScopedSchedule {
+            guarded(ScopedSchedule {
                 body: ScopeRegion {
                     roots: vec![read, unused],
+                    guards: Vec::new(),
                     schedule: vec![
                         leaf(0),
                         def(5, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
@@ -5845,10 +5804,11 @@ mod tests {
                     at: 3,
                     roots: Vec::new(),
                     // The fold names `read` every trip and `unused` never.
+                    guards: Vec::new(),
                     schedule: vec![def(50, ScheduledOp::Unary(OpKind::Neg, read))],
                 }],
                 guard_arms: Vec::new(),
-            },
+            }),
             &NEST_FILE,
         );
         assert!(
@@ -5891,9 +5851,10 @@ mod tests {
             }
             .checked();
             let alloc = LinearScan.allocate_nest(
-                ScopedSchedule {
+                guarded(ScopedSchedule {
                     body: ScopeRegion {
                         roots: vec![base],
+                        guards: Vec::new(),
                         schedule: vec![
                             leaf(0),
                             def(1, ScheduledOp::Context(0)),
@@ -5904,6 +5865,7 @@ mod tests {
                         parent: Scope::Body,
                         at: 2,
                         roots: Vec::new(),
+                        guards: Vec::new(),
                         schedule: vec![
                             // The enclosing park's placeholder: a pointer's
                             // stays its own op, so the scope inside reads the
@@ -5914,7 +5876,7 @@ mod tests {
                         ],
                     }],
                     guard_arms: Vec::new(),
-                },
+                }),
                 &file,
             );
             let body = alloc.body();
@@ -5978,9 +5940,10 @@ mod tests {
             }
             .checked();
             let alloc = LinearScan.allocate_nest(
-                ScopedSchedule {
+                guarded(ScopedSchedule {
                     body: ScopeRegion {
                         roots: vec![vector, pointer],
+                        guards: Vec::new(),
                         schedule: vec![
                             leaf(0),
                             def(5, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
@@ -5992,6 +5955,7 @@ mod tests {
                         parent: Scope::Body,
                         at: 3,
                         roots: Vec::new(),
+                        guards: Vec::new(),
                         schedule: vec![
                             def(6, ScheduledOp::Context(0)),
                             def(50, ScheduledOp::Var(fold_meta().binder().var())),
@@ -6001,7 +5965,7 @@ mod tests {
                         ],
                     }],
                     guard_arms: Vec::new(),
-                },
+                }),
                 &file,
             );
             let inside = alloc.scope(Scope::Fold(0));
@@ -6150,9 +6114,10 @@ mod tests {
     #[should_panic(expected = "is not an earlier scope")]
     fn a_folds_parent_must_already_exist() {
         let _ = LinearScan.allocate_nest(
-            ScopedSchedule {
+            guarded(ScopedSchedule {
                 body: ScopeRegion {
                     roots: Vec::new(),
+                    guards: Vec::new(),
                     schedule: vec![
                         leaf(0),
                         def(1, ScheduledOp::Reduce(fold_meta(), ValueId(0))),
@@ -6162,10 +6127,11 @@ mod tests {
                     parent: Scope::Fold(1),
                     at: 1,
                     roots: Vec::new(),
+                    guards: Vec::new(),
                     schedule: vec![leaf(50)],
                 }],
                 guard_arms: Vec::new(),
-            },
+            }),
             &NEST_FILE,
         );
     }
@@ -6195,19 +6161,21 @@ mod tests {
         let at = outer.len();
         outer.push(def(99, ScheduledOp::Reduce(fold_meta(), ValueId(0))));
         let alloc = LinearScan.allocate_nest(
-            ScopedSchedule {
+            guarded(ScopedSchedule {
                 body: ScopeRegion {
                     roots: roots.clone(),
+                    guards: Vec::new(),
                     schedule: outer,
                 },
                 folds: vec![ScopeFold {
                     parent: Scope::Body,
                     at,
                     roots: Vec::new(),
+                    guards: Vec::new(),
                     schedule: inner,
                 }],
                 guard_arms: Vec::new(),
-            },
+            }),
             &NEST_FILE,
         );
         (roots, alloc)
@@ -6293,9 +6261,10 @@ mod tests {
     fn a_carried_roots_result_register_is_not_reserved_when_it_is_already_resident() {
         let root = ValueId(5);
         let alloc = LinearScan.allocate_nest(
-            ScopedSchedule {
+            guarded(ScopedSchedule {
                 body: ScopeRegion {
                     roots: vec![root],
+                    guards: Vec::new(),
                     schedule: vec![
                         leaf(0),
                         def(5, ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
@@ -6306,6 +6275,7 @@ mod tests {
                     parent: Scope::Body,
                     at: 2,
                     roots: Vec::new(),
+                    guards: Vec::new(),
                     schedule: vec![
                         // A real use, so `root` is ranked for carrying at all.
                         def(200, ScheduledOp::Unary(OpKind::Neg, root)),
@@ -6316,7 +6286,7 @@ mod tests {
                     ],
                 }],
                 guard_arms: Vec::new(),
-            },
+            }),
             &NEST_FILE,
         );
         assert!(
