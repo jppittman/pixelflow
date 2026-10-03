@@ -9,11 +9,9 @@
 //! [`EGraph`](super::graph::EGraph) records nothing until
 //! [`EGraph::enable_growth_telemetry`](super::graph::EGraph::enable_growth_telemetry)
 //! is called: the per-application hook checks `self.growth.is_some()` before
-//! doing any work — the same `is_on()`-gated shape
-//! `pixelflow-codegen/src/emit/guards.rs`'s `PIXELFLOW_GUARD_TELEMETRY`
-//! telemetry uses for a per-node measurement. **It must cost nothing when
-//! off**, and this module's only paid work when off is that one
-//! `Option::is_some()` check per committed rewrite application.
+//! doing any work. **It must cost nothing when off**, and this module's only
+//! paid work when off is that one `Option::is_some()` check per committed
+//! rewrite application.
 //!
 //! # Why this exists
 //!

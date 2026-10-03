@@ -45,10 +45,6 @@
 //! The errors were stale accumulators — a whole batch's `W` in place of
 //! another — not rounding; the tolerance is sized for `f32` accumulation over
 //! ~100 terms and `sin`'s polynomial, and nothing more.
-//!
-//! `PIXELFLOW_GUARD_TELEMETRY=1 cargo test -p pixelflow-core --test
-//! guard_sibling_fold -- --nocapture --test-threads=1` prints, per scope,
-//! which `If`s were guarded and how many entries each arm skips.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 

@@ -29,9 +29,7 @@
 //! `pixelflow-codegen` can name a guard — and is pinned there
 //! (`emit::guards`' unit tests price the arm; `emit`'s test
 //! `a_fold_owned_by_an_arm_is_guarded` finds the branch in the allocated
-//! nest). `PIXELFLOW_GUARD_TELEMETRY=1 cargo test -p pixelflow-core --test
-//! guard_fold_price -- --nocapture --test-threads=1` prints, per scope, the
-//! entries each arm skips.
+//! nest).
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
