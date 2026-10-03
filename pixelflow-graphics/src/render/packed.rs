@@ -371,4 +371,86 @@ mod tests {
             0xff00_0000 | 0xff_0000
         );
     }
+
+    // -- What a scene's compile branches over -----------------------------
+    //
+    // A guarded `If` and a blended one produce the same picture, so no
+    // golden sees a scene lose its branches; it only gets slower. These pins
+    // read `EmitTraffic::branches`, the tables the emitter branches on.
+
+    /// The frame the branch pins compile at: the size the throughput numbers
+    /// are quoted for.
+    const FRAME: [u32; 2] = [1920, 1080];
+
+    fn ray() -> crate::scene3d::Ray {
+        crate::scene3d::Ray::through_screen(FRAME[0] as f32, FRAME[1] as f32)
+    }
+
+    fn sphere_hit(ray: &crate::scene3d::Ray) -> crate::scene3d::Hit {
+        let k = Kernel::constant;
+        crate::scene3d::Sphere::new([k(0.0), k(0.0), k(4.0)], k(1.0)).hit(ray)
+    }
+
+    /// The floor checker under the sky: what one ray sees of the world.
+    fn world(ray: &crate::scene3d::Ray) -> Rgba {
+        use crate::scene3d::{checker, sky, Plane};
+        let floor = Plane::at_height(Kernel::constant(-1.0)).hit(ray);
+        floor.select(
+            &checker(&floor.point()[0], &floor.point()[2], &floor.footprint()),
+            &sky(ray),
+        )
+    }
+
+    /// A chrome sphere over a checker floor, reflecting the floor and sky:
+    /// the sphere's `If`, and a world's `If`s on each side of it.
+    fn chrome() -> Rgba {
+        let ray = ray();
+        let sphere = sphere_hit(&ray);
+        let mirrored = ray.reflected(sphere.normal());
+        sphere.select(&world(&mirrored), &world(&ray))
+    }
+
+    /// The sphere's silhouette over the sky, and nothing else: one `If`
+    /// whose arms are cheaper than a mispredicted branch.
+    fn silhouette() -> Rgba {
+        let ray = ray();
+        sphere_hit(&ray).select(&Rgba::opaque_gray(0.5), &crate::scene3d::sky(&ray))
+    }
+
+    /// The branches of `color` as compiled for a frame — through
+    /// `jit_cache::compile`, the one entry a [`PackedManifold`] compiles by.
+    fn branches_of(color: &Rgba) -> (u64, u64, u64) {
+        let linked = pixelflow_codegen::jit_cache::compile(
+            &packed_kernel(color, RGBA),
+            pixelflow_ir::LatticeShape::new(FRAME),
+        )
+        .expect("compile");
+        let b = linked.kernel.branches();
+        (b.guards, b.arms_branched, b.arm_entries)
+    }
+
+    /// The chrome sphere keeps the branches it earns: three of its `If`s
+    /// guard both their arms. Pinned on guards and arms, not on entries — an
+    /// entry count moves with every rewrite rule, an arm lost does not.
+    ///
+    /// Without `cluster_if_arms` the same scene still reads three guards but
+    /// only four arms, and runs 3.5x slower on AVX-512 and 2.6x on AVX2
+    /// with the same pixels, which is why the arms are counted.
+    #[test]
+    fn the_chrome_sphere_keeps_its_branches() {
+        let (guards, arms, entries) = branches_of(&chrome());
+        assert_eq!(
+            (guards, arms),
+            (3, 6),
+            "chrome's branches moved ({entries} entries)"
+        );
+    }
+
+    /// The control: a silhouette over the sky earns no guard, its arms being
+    /// under the mispredict bound — the glyph and silhouette arms that a
+    /// branch makes slower, not faster.
+    #[test]
+    fn the_sphere_silhouette_earns_no_branch() {
+        assert_eq!(branches_of(&silhouette()), (0, 0, 0));
+    }
 }

@@ -179,7 +179,11 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // don't serialize. A racing duplicate compile wastes work; the first
     // insertion wins so all callers share one region.
     let result = emit_fn()?;
-    let compiled = Arc::new(CompiledKernel::new(result.code, shape));
+    let compiled = Arc::new(CompiledKernel::new(
+        result.code,
+        result.traffic.branches,
+        shape,
+    ));
     let mut guard = cache.lock().expect("jit_cache: lock poisoned");
     let kernel = guard.entry(key).or_insert(compiled).clone();
     Ok(Linked {

@@ -83,7 +83,7 @@ use pixelflow_ir::kind::OpKind;
 
 pub use guards::IfArm;
 use guards::analyze_if_guards;
-use traffic::{Counting, EmitTraffic};
+use traffic::{BranchTraffic, Counting, EmitTraffic};
 
 use alloc::vec::Vec;
 
@@ -4380,6 +4380,7 @@ fn compile_via_backend<B: IsaBackend>(
             vector_bytes: file.vector_bytes,
             pool: file.scratch.len(),
             carried,
+            branches: BranchTraffic::of(&nest),
         },
     })
 }
@@ -6395,54 +6396,11 @@ mod tests {
                 .collect()
         }
 
-        /// What a nest's branches amount to, read the way the emitter reads
-        /// them: `Allocation::if_guards`, summed over every scope.
-        ///
-        /// A guard is value-identical to the blend it replaces, so no pixel
-        /// golden can see one lost or one added; this is the one place the
-        /// count is a fact a test can fail on. The three numbers are three
-        /// different ways to lose: an `If` that stopped earning a guard
-        /// (`guards`), an arm that stopped being one contiguous run
-        /// (`arms_branched`), and a run that shrank (`arm_entries`).
-        #[derive(Debug, PartialEq, Eq)]
-        struct BranchCensus {
-            /// `If`s with at least one arm under a branch.
-            guards: usize,
-            /// Arms under a branch: a guard buys one or both of its two.
-            arms_branched: usize,
-            /// Schedule entries under a branch, summed over every such arm
-            /// (an entry inside two nested arms counts in each).
-            arm_entries: usize,
-        }
-
-        /// The census of `nest`, over its body, its folds and its guard arms.
-        fn branch_census(nest: &regalloc::NestAllocation) -> BranchCensus {
-            let scopes = core::iter::once(regalloc::Scope::Body)
-                .chain((0..nest.fold_count()).map(regalloc::Scope::Fold))
-                .chain((0..2 * nest.guard_count()).map(regalloc::Scope::GuardArm));
-            let mut census = BranchCensus {
-                guards: 0,
-                arms_branched: 0,
-                arm_entries: 0,
-            };
-            for scope in scopes {
-                for guard in nest.scope(scope).if_guards() {
-                    census.guards += usize::from(guard.has_guarded_arm());
-                    census.arms_branched += IfArm::ALL
-                        .iter()
-                        .filter(|&&arm| guard.is_guarded(arm))
-                        .count();
-                    census.arm_entries += guard.total_guarded_entries();
-                }
-            }
-            census
-        }
-
-        /// [`branch_census`] of the kernel at `root`, compiled the way
-        /// `compile` compiles it.
-        fn census_of(a: &ExprArena, root: ExprId) -> BranchCensus {
+        /// The branches of the kernel at `root`, compiled the way `compile`
+        /// compiles it.
+        fn census_of(a: &ExprArena, root: ExprId) -> BranchTraffic {
             let file = native_register_file(EmitCtx::default());
-            branch_census(&allocate_nest(native_schedule(a, root, batch()), &file))
+            BranchTraffic::of(&allocate_nest(native_schedule(a, root, batch()), &file))
         }
 
         /// A kernel shaped like the chrome sphere keeps every branch it earns,
@@ -6473,7 +6431,7 @@ mod tests {
             let chrome = chrome_shaped(&mut a);
             assert_eq!(
                 census_of(&a, chrome),
-                BranchCensus {
+                BranchTraffic {
                     guards: 3,
                     arms_branched: 6,
                     arm_entries: 70,
@@ -6485,7 +6443,7 @@ mod tests {
             let silhouette = silhouette_shaped(&mut b);
             assert_eq!(
                 census_of(&b, silhouette),
-                BranchCensus {
+                BranchTraffic {
                     guards: 0,
                     arms_branched: 0,
                     arm_entries: 0,

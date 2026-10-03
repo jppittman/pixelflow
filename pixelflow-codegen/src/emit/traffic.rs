@@ -21,7 +21,8 @@
 //! is written, and a trait method that disappears is a compile error rather
 //! than a silently dropped term.
 
-use super::regalloc::{Scope, ValueId};
+use super::guards::IfArm;
+use super::regalloc::{NestAllocation, Scope, ValueId};
 use super::{Binding, InstructionPlan, IsaBackend, Loc, PtrReg, Reg, Reload, WritePlan};
 use crate::error::CompileError;
 use alloc::vec::Vec;
@@ -76,6 +77,58 @@ impl ScopeTraffic {
     }
 }
 
+/// How much of the nest the emitter branches over: the structure of its
+/// `If` guards, which no pixel can show.
+///
+/// A guarded `If` and a blended one compute the same picture, so a render
+/// cannot tell a kernel that kept its branches from one that lost them; it
+/// only runs slower. These three counts are the part of a compile's decision
+/// that a golden is blind to, read off the tables the emitter branches on
+/// (`Allocation::if_guards`) rather than re-derived, so they are what was
+/// emitted by construction.
+///
+/// Three numbers because a count of guards alone is a weak gate: an `If` that
+/// stops earning a branch lowers `guards`, an arm that stops being one
+/// contiguous run lowers `arms_branched`, and a run that shrinks lowers
+/// `arm_entries` — an arm lost behind an unchanged guard count is exactly the
+/// failure the second and third exist to see.
+///
+/// Counted, never read by the emitter, like everything in this module.
+/// Control-plane quantities (they describe the program), so 64 bits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BranchTraffic {
+    /// `If`s with at least one arm under a branch.
+    pub guards: u64,
+    /// Arms under a branch: a guard buys one or both of its two.
+    pub arms_branched: u64,
+    /// Schedule entries under a branch, summed over every such arm (an entry
+    /// inside two nested arms counts in each).
+    pub arm_entries: u64,
+}
+
+impl BranchTraffic {
+    /// The branches `nest`'s tables hold, over its body, its folds and its
+    /// guard arms.
+    #[must_use]
+    pub(super) fn of(nest: &NestAllocation) -> Self {
+        let scopes = core::iter::once(Scope::Body)
+            .chain((0..nest.fold_count()).map(Scope::Fold))
+            .chain((0..2 * nest.guard_count()).map(Scope::GuardArm));
+        let mut branches = Self::default();
+        for scope in scopes {
+            for guard in nest.scope(scope).if_guards() {
+                branches.guards += u64::from(guard.has_guarded_arm());
+                branches.arms_branched += IfArm::ALL
+                    .iter()
+                    .filter(|&&arm| guard.is_guarded(arm))
+                    .count() as u64;
+                branches.arm_entries += guard.total_guarded_entries() as u64;
+            }
+        }
+        branches
+    }
+}
+
 /// The whole nest's traffic, plus the target facts a cost model needs to
 /// price it (a 64-byte spill is not a 16-byte one).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -106,6 +159,8 @@ pub struct EmitTraffic {
     /// Parked roots that hold a register across the scopes inside them
     /// rather than a slot.
     pub carried: u32,
+    /// The `If` branches the nest was emitted with.
+    pub branches: BranchTraffic,
 }
 
 impl EmitTraffic {
