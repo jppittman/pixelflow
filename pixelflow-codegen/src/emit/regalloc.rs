@@ -1863,7 +1863,68 @@ impl Class {
     }
 }
 
-fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
+/// How much walking [`plan_carries`] did: the defs and roots it visited,
+/// summed.
+///
+/// A count and not a clock, so a test can pin how planning grows with the nest
+/// (`planning_carries_grows_linearly_in_the_roots`) and fail the same way on
+/// every host. Allocation hands planning a counter nobody reads.
+#[derive(Default)]
+struct Steps(usize);
+
+impl Steps {
+    fn walk(&mut self, visited: usize) {
+        self.0 += visited;
+    }
+}
+
+/// Where each root of one scope sits in that scope's sorted roots, by
+/// `ValueId`: a dense table over the id space, so whether a value some scope
+/// reads is a root is one index and not a search.
+///
+/// Filled for one scope's roots and cleared by the same roots, so a scope costs
+/// what its roots cost however wide the id space is, and one walk over the
+/// scopes inside answers for every root of the scope at once.
+struct RootSlots(Vec<Option<usize>>);
+
+impl RootSlots {
+    /// Room for every id a root of `nest` can have.
+    fn for_nest(nest: &ScopedSchedule) -> Self {
+        let roots = core::iter::once(&nest.body.roots)
+            .chain(nest.folds.iter().map(|fold| &fold.roots))
+            .flatten();
+        let space = roots.map(|v| v.0 as usize + 1).max().unwrap_or(0);
+        Self(vec![None; space])
+    }
+
+    /// Give each of `roots` its place in the slice. They are distinct.
+    fn fill(&mut self, roots: &[ValueId]) {
+        for (slot, root) in roots.iter().enumerate() {
+            self.0[root.0 as usize] = Some(slot);
+        }
+    }
+
+    /// Take back what [`RootSlots::fill`] gave `roots`.
+    fn clear(&mut self, roots: &[ValueId]) {
+        for root in roots {
+            self.0[root.0 as usize] = None;
+        }
+    }
+
+    /// The slot `value` holds, if it is one of the roots filled. An id past
+    /// the table is no scope's root.
+    fn of(&self, value: ValueId) -> Option<usize> {
+        self.0.get(value.0 as usize).copied().flatten()
+    }
+}
+
+/// Decide which roots of `nest` are carried: rank every candidate by what a
+/// carry saves, then take them greedily while each class's budget holds.
+///
+/// A walk over the nest and a sort of the candidates. A root's weight is not
+/// a scan of the scopes inside per root — see [`RootSlots`] — and `steps`
+/// counts what the walk visits, so the cost can be pinned without a clock.
+fn plan_carries(nest: &ScopedSchedule, above_floor: Budget, steps: &mut Steps) -> CarryPlan {
     let folds = nest.folds.len();
     for (index, fold) in nest.folds.iter().enumerate() {
         assert!(
@@ -1977,14 +2038,6 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
             })
             .sum()
     };
-    // A root's class, read off its def in the scope that computes it.
-    let class_of = |scope: Scope, v: ValueId| -> Class {
-        schedule_of(scope)
-            .iter()
-            .find(|d| d.value == v)
-            .map(|d| d.op.class())
-            .unwrap_or_else(|| panic!("{v:?} is a root of {scope:?} but not in its schedule"))
-    };
 
     enum Root {
         Scope(Scope, ValueId),
@@ -2003,6 +2056,7 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
     // reload every time that scope runs; the carry is live across all of
     // them. Reads of either class count: a base pointer read by every trip
     // of a fold is exactly the root a carry is for.
+    let mut slots = RootSlots::for_nest(nest);
     for scope in scopes() {
         let within: Vec<Scope> = scopes()
             .filter(|s| *s != scope && inside(scope, *s))
@@ -2012,24 +2066,46 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
         // times are ordered by something other than map order.
         let mut roots: Vec<ValueId> = roots_of(scope).to_vec();
         roots.sort_by_key(|v| v.0);
-        for v in roots {
-            let weight: usize = within
-                .iter()
-                .map(|s| {
-                    schedule_of(*s)
-                        .iter()
-                        .flat_map(|d| all_operands(&d.op))
-                        .filter(|o| *o == v)
-                        .count()
-                        * trips_of(*s)
-                })
-                .sum();
-            if weight == 0 {
+        // `place_roots` names a root once; the slots rely on it.
+        roots.dedup();
+        slots.fill(&roots);
+        steps.walk(roots.len());
+
+        // One walk over the scopes inside weighs every root at once, a read
+        // adding the number of times its scope runs. A scan of them per root
+        // was the product of the two, and a font's worth of roots made it
+        // most of a compile.
+        let mut weights: Vec<usize> = vec![0; roots.len()];
+        for s in &within {
+            let schedule = schedule_of(*s);
+            let trips = trips_of(*s);
+            steps.walk(schedule.len());
+            for read in schedule.iter().flat_map(|d| all_operands(&d.op)) {
+                if let Some(slot) = slots.of(read) {
+                    weights[slot] += trips;
+                }
+            }
+        }
+        // A root's class, read off its def in the scope that computes it.
+        let mut classes: Vec<Option<Class>> = vec![None; roots.len()];
+        steps.walk(schedule_of(scope).len());
+        for d in schedule_of(scope) {
+            if let Some(slot) = slots.of(d.value) {
+                classes[slot].get_or_insert_with(|| d.op.class());
+            }
+        }
+        slots.clear(&roots);
+
+        for (slot, &v) in roots.iter().enumerate() {
+            if weights[slot] == 0 {
                 continue;
             }
+            let class = classes[slot]
+                .unwrap_or_else(|| panic!("{v:?} is a root of {scope:?} but not in its schedule"));
+            steps.walk(1 + live_across.len());
             candidates.push(Candidate {
-                weight,
-                class: class_of(scope, v),
+                weight: weights[slot],
+                class,
                 live_across: live_across.clone(),
                 root: Root::Scope(scope, v),
             });
@@ -2071,6 +2147,7 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
         fold_accumulator: vec![false; folds],
     };
     for candidate in candidates {
+        steps.walk(candidate.live_across.len());
         let class = candidate.class.ix();
         if candidate
             .live_across
@@ -2129,7 +2206,7 @@ impl RegisterAllocator for LinearScan {
                 .len()
                 .saturating_sub(RegisterFile::MIN_POINTERS) as usize,
         ];
-        let plan = plan_carries(&nest, above_floor);
+        let plan = plan_carries(&nest, above_floor, &mut Steps::default());
 
         // Outermost first, because that is the direction liveness flows: a
         // value a scope computes for the scopes inside it is live across
@@ -5501,6 +5578,93 @@ mod tests {
             Binder::from_slot(0).expect("slot 0 exists"),
             0..4,
         )
+    }
+
+    /// A body of `roots` constants, all handed to one fold that reads each of
+    /// them once: the shape where weighing a root by a scan of the fold is the
+    /// product of the two sizes.
+    fn a_fold_reading_every_root(roots: u32) -> ScopedSchedule {
+        let binder = def(roots + 1, ScheduledOp::Var(fold_meta().binder().var()));
+        let reads = (0..roots).map(|i| {
+            let read = ScheduledOp::Binary(OpKind::Add, binder.value, ValueId(i));
+            def(roots + 2 + i, read)
+        });
+        let mut body: Vec<Def> = (0..roots)
+            .map(|i| def(i, ScheduledOp::Const(1.0)))
+            .collect();
+        body.push(def(roots, ScheduledOp::Reduce(fold_meta(), ValueId(0))));
+        ScopedSchedule {
+            body: ScopeRegion {
+                roots: (0..roots).map(ValueId).collect(),
+                schedule: body,
+            },
+            folds: vec![ScopeFold {
+                parent: Scope::Body,
+                at: roots as usize,
+                roots: Vec::new(),
+                schedule: core::iter::once(binder.clone()).chain(reads).collect(),
+            }],
+            guard_arms: Vec::new(),
+        }
+    }
+
+    /// The roots go in the order of what a carry saves, then of their ids:
+    /// the fold's binder and accumulator outweigh a root read once a trip,
+    /// and the roots, all read alike, follow in id order until the budget is
+    /// spent.
+    #[test]
+    fn planning_carries_ranks_the_fold_before_the_roots_it_reads() {
+        const BUDGET: usize = 6;
+        let nest = a_fold_reading_every_root(16);
+        let plan = plan_carries(&nest, [BUDGET, 0], &mut Steps::default());
+
+        assert!(plan.fold_binder[0], "the binder is read twice a trip");
+        assert!(plan.fold_accumulator[0], "and the combine reloads the sum");
+        let carried: Vec<ValueId> = (0..BUDGET as u32 - 2).map(ValueId).collect();
+        assert_eq!(
+            plan.scope_roots[0], carried,
+            "what the fold's binder and accumulator leave of the budget goes \
+             to the lowest ids"
+        );
+    }
+
+    /// Weighing a scope's roots is one walk over the scopes inside it, not a
+    /// scan of them per root. Four times the roots is about four times the
+    /// steps; a scan per root made it sixteen times, and a font's worth of
+    /// roots was most of a compile.
+    ///
+    /// Counted, not timed: a clock would pass on a fast host and flake on a
+    /// loaded one, where a count is the same everywhere.
+    #[test]
+    fn planning_carries_grows_linearly_in_the_roots() {
+        const ROOTS: u32 = 64;
+        const GROWTH: usize = 4;
+        let steps_for = |roots: u32| {
+            let mut steps = Steps::default();
+            let plan = plan_carries(
+                &a_fold_reading_every_root(roots),
+                [usize::MAX, 0],
+                &mut steps,
+            );
+            assert_eq!(
+                plan.scope_roots[0].len(),
+                roots as usize,
+                "every root is carried"
+            );
+            steps.0
+        };
+        let (small, large) = (steps_for(ROOTS), steps_for(GROWTH as u32 * ROOTS));
+
+        assert!(
+            small >= ROOTS as usize,
+            "the count has to see the roots it is a count of: {small}"
+        );
+        assert!(
+            large <= (GROWTH + 1) * small,
+            "{ROOTS} roots took {small} steps and {} took {large}: more than \
+             linear",
+            GROWTH as u32 * ROOTS
+        );
     }
 
     /// A nest of three folds: two siblings off the body, and one nested
