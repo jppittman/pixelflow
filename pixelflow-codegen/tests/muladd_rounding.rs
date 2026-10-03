@@ -148,7 +148,11 @@ fn an_unspilled_muladd_rounds_once() {
     // the backend live in registers rather than reloaded — is what the bit
     // check below proves: only the fused, single-rounding form produces
     // `fused(A, B, C)`.
-    let jit = CompiledKernel::new(result.code, pixelflow_ir::LatticeShape::POINT);
+    let jit = CompiledKernel::new(
+        result.code,
+        result.traffic.branches,
+        pixelflow_ir::LatticeShape::POINT,
+    );
     let got = eval_point(&jit, A, B, &[C]);
     assert_bits("fused MulAdd", got, fused(A, B, C));
 }
@@ -240,7 +244,11 @@ fn a_spilled_muladd_rounds_twice_on_every_target() {
         .expect("compile spilled MulAdd");
     let stores: u32 = result.traffic.scopes.iter().map(|s| s.stores).sum();
     assert!(stores > 0, "scenario failed to create register pressure");
-    let jit = CompiledKernel::new(result.code, pixelflow_ir::LatticeShape::POINT);
+    let jit = CompiledKernel::new(
+        result.code,
+        result.traffic.branches,
+        pixelflow_ir::LatticeShape::POINT,
+    );
     let got = eval_point(&jit, HALF_A, HALF_B, &[C, 0.0]);
     assert_bits("decomposed MulAdd", got, decomposed(A, B, C));
 }

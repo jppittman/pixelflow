@@ -11,12 +11,14 @@
 //! (docs/plans/2026-09-16-collapse-is-a-fold.md).
 
 use crate::emit::executable::ExecutableCode;
+use crate::emit::traffic::BranchTraffic;
 use pixelflow_ir::LatticeShape;
 
 /// One kernel's emitted code, at one lattice shape. Owns the executable
 /// memory; no cache — the caller decides its lifetime.
 pub struct CompiledKernel {
     code: ExecutableCode,
+    branches: BranchTraffic,
     shape: LatticeShape,
 }
 
@@ -28,8 +30,12 @@ impl CompiledKernel {
     /// call fills exactly `shape` samples and nothing about that is decided
     /// at the call.
     #[must_use]
-    pub const fn new(code: ExecutableCode, shape: LatticeShape) -> Self {
-        Self { code, shape }
+    pub const fn new(code: ExecutableCode, branches: BranchTraffic, shape: LatticeShape) -> Self {
+        Self {
+            code,
+            branches,
+            shape,
+        }
     }
 
     /// The lattice this kernel was compiled for.
@@ -43,6 +49,15 @@ impl CompiledKernel {
     #[must_use]
     pub fn code_bytes(&self) -> &[u8] {
         self.code.as_bytes()
+    }
+
+    /// The `If` branches the code was emitted with — structure no pixel can
+    /// show, since a guarded `If` and a blended one compute the same
+    /// samples. Inspection only, like [`code_bytes`](Self::code_bytes): it is
+    /// what a test reads to fail on a kernel that lost an arm's branch.
+    #[must_use]
+    pub const fn branches(&self) -> BranchTraffic {
+        self.branches
     }
 
     /// Collapse: fill every sample of the shape this kernel was compiled at,
