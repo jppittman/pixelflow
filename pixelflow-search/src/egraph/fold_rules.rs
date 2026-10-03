@@ -19,14 +19,9 @@
 //! count, and [`Fold::halve`](pixelflow_ir::Fold::halve) declines
 //! on an odd count — `PeelFold` is that remainder's epilogue, run once per
 //! odd level the recursion hits (`log n` of them at most), not a fallback
-//! that reverts to unrolling one term at a time. `passes::expand_reduce`
-//! prefers the same decomposition, through the same two
-//! [`Fold`](pixelflow_ir::Fold) methods, so a surviving fold it
-//! unrolls takes the identical shape saturation would have reached inside
-//! the graph. It is on
-//! no production path: codegen emits a fold that survives extraction as a
-//! loop (`pixelflow_ir::passes::legalize`), and `expand_reduce` unrolls one
-//! only for a caller that asks.
+//! that reverts to unrolling one term at a time. No lowering pass unrolls a
+//! fold outside the graph: codegen emits one that survives extraction as a
+//! loop (`pixelflow_ir::passes::legalize` leaves it standing).
 //!
 //! ## A right-hand side is a plan
 //!
@@ -277,11 +272,10 @@ fn representative(egraph: &EGraph, class: EClassId) -> Option<&ENode> {
 /// `⊕_{[lo,hi) step s} f = ⊕_{[lo,hi-s) step s} f ⊕ f(hi-s)`.
 ///
 /// From the *back*, so running it to exhaustion over a `stride`-1 fold builds
-/// the same left-leaning chain `passes::expand_reduce` falls back to for an
-/// odd remainder. Peeling from the front is the same value in the opposite
-/// association, and the difference is not cosmetic: it measured 23–42% more
-/// emitted nodes on production glyphs, because the graph then has to
-/// reassociate an n-deep chain to reach the shape the cost model and the
+/// a left-leaning chain. Peeling from the front is the same value in the
+/// opposite association, and the difference is not cosmetic: it measured
+/// 23–42% more emitted nodes on production glyphs, because the graph then has
+/// to reassociate an n-deep chain to reach the shape the cost model and the
 /// fusion rules were tuned on, and spends its class budget doing it. See
 /// docs/plans/2026-09-09-a-fold-is-a-node.md §9.
 ///
@@ -400,8 +394,7 @@ impl Rewrite for PeelFold {
         )?;
         let rest = plan.reduce(rest, HeadRef::Class(*body));
         // `rest` first: the peel takes the *last* index, so the accumulator
-        // is on the left and the chain leans the way `expand_reduce` builds
-        // it.
+        // is on the left and the chain leans left.
         let root = plan.op(combiner, alloc::vec![rest, head]);
         Some(RewriteAction::Plan(plan.finish(root)))
     }
@@ -666,8 +659,8 @@ mod tests {
             })
             .expect("the class must now also hold the peeled sum");
         // `rest` on the left, the peeled term on the right: the peel takes
-        // the *last* index, so the chain leans the way `expand_reduce` builds
-        // it (§9 of the plan — the other association measured 23–42% worse).
+        // the *last* index, so the chain leans left (§9 of the plan — the
+        // other association measured 23–42% worse).
         assert_eq!(
             eg.find(sum[1]),
             body_class,

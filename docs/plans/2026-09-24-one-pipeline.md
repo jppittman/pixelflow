@@ -35,6 +35,9 @@
   `glyph_optimizes_estimate_free`, which keeps the every-glyph and
   94-glyph-run pins (the tier takes the glyph, and leaves no estimate). An
   open integral, and a quadrature, are unrepresentable.
+- **M13 landed** (2026-10-03): `expand_reduce`, `expand_reduce_owned` and
+  `ExpandReduce` are deleted, and `halve_fold_jit.rs` now extracts with loops
+  priced out so that it checks the chain `HalveFold` builds, not a loop.
 - **Created**: 2026-09-24; revised 2026-09-25
 - **Verified against**: `8b7b75a`. The inputs were:
   - four maps (optimizer, front end, backend and artifact, bound buffers);

@@ -200,8 +200,7 @@ op_table! {
     /// the range that binder runs over are a [`Fold`](crate::fold::Fold) in
     /// the node, not children — see `fold.rs` for the `Const`-child encoding
     /// it replaced. Legal through codegen, which emits a surviving fold as a
-    /// loop (`passes::legalize`); `expand_reduce` unrolls one only for a
-    /// caller that asks.
+    /// loop (`passes::legalize` leaves every one standing).
     Reduce = 49,
 
     // --- Uniforms (per-call scalars) ---

@@ -335,8 +335,7 @@ fn referent_variance(_key: crate::key::KernelKey) -> Variance {
 /// `nnue::factored::variance_histogram`, the classification behind
 /// `Extraction::chosen_variance`, reads the whole per-node table (the e-graph
 /// keeps the same fact per class, as `EGraph::variance`). In this crate
-/// `passes::unroll_reduce` and `passes::lower_dwrt`'s tabulation rule read it
-/// the same way.
+/// `passes::lower_dwrt`'s tabulation rule reads it the same way.
 #[must_use]
 pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> {
     use crate::arena::{ExprId, ExprNode};

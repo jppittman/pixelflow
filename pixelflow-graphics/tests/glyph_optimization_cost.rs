@@ -1,7 +1,7 @@
 //! **What a glyph costs the compiler, bounded — at the two places where
 //! "cost" means different things.**
 //!
-//! Legalization (`LowerDwrt`, `ExpandReduce`) is the *last* pass and a
+//! Legalization (`LowerDwrt`) is the *last* pass and a
 //! fallback: it takes whatever illegal shape survived saturation and makes it
 //! emittable. It owns nothing the e-graph does not also know — the chain rule
 //! and a fold's decompositions are rule sets — so running it earlier only
@@ -43,7 +43,7 @@ const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf"
 /// last, plus ~10%: `A` 1457, `O` 3633, `8` 8241.
 ///
 /// These are ~22–39% above the counts the same glyphs emitted when
-/// `ExpandReduce` ran *before* saturation, and that is the trade named in the
+/// the unroll ran *before* saturation, and that is the trade named in the
 /// module docs, not a regression: the e-graph stopped being handed the
 /// unrolled program (141,530 nodes for `8`, now 2,881) and pays for it in
 /// emitted size, which is the cheap side.
@@ -51,8 +51,8 @@ const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf"
 /// Raised again 2026-09-16 (`A` 1446 → 2076, `O` 3588 → 4092, `8` unchanged
 /// at 8124) for the same reason under a new name: bucketed trip counts
 /// (`docs/plans/2026-09-09-glyph-as-a-fold-execution.md` §S3). Each fold's
-/// trip count — the JIT cache's key, and the unroll count `ExpandReduce`
-/// reads — is now `pieces.next_power_of_two()`, not `pieces`, so `A`'s 11
+/// trip count — the JIT cache's key, and the unroll count the legalizer
+/// then read — is now `pieces.next_power_of_two()`, not `pieces`, so `A`'s 11
 /// pieces unroll as 16 and `O`'s 28 as 32; `8`'s piece count in this font
 /// is already a power of two, so it pays nothing and its ceiling is
 /// untouched. The padding rows are exact identities of both folds (pinned

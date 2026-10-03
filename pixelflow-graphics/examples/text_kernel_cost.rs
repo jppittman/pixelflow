@@ -9,7 +9,7 @@
 //!
 //! - `saturation_sees` is reference-linked and nothing else — exactly what
 //!   `pixelflow_search::runtime` hands the e-graph, since legalization
-//!   (`LowerDwrt`, `ExpandReduce`) runs *after* saturation as the fallback
+//!   (`LowerDwrt`) runs *after* saturation as the fallback
 //!   for shapes the rule set declined. It is the lever on optimization cost,
 //!   and holding it down is why the legalizer sits at the end.
 //! - `legalized` is the whole of `legalize` on the *unoptimized* arena, so

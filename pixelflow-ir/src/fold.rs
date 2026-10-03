@@ -115,8 +115,8 @@ impl Monoid {
 /// in front of it — and the monoid's identity when no term arrives.
 ///
 /// The one shape a fold of *distinct* terms has. Not [`Kernel::over`]'s,
-/// which folds one body over an index, and not an unrolled fold's, which
-/// pairs its terms (`passes`' `combine_halved`): those are one body `N`
+/// which folds one body over an index, and not a halved fold's, which
+/// pairs its terms (`Fold::halve`): those are one body `N`
 /// times. [`Kernel::fold`] builds through it.
 ///
 /// Generic over how a node is named, and handed each node to build as a
@@ -881,11 +881,11 @@ mod tests {
 
     /// **The load-bearing property.** Halving to exhaustion (falling back to
     /// [`Fold::peel_back`] for the odd remainder, the preference
-    /// `passes::expand_reduce` and `egraph::fold_rules::HalveFold` both give
-    /// it) must visit the same terms, in the same left-to-right order, as
-    /// [`Fold::peel`] does one at a time — for an even trip count (pure
-    /// halving, no remainder ever arises) and an odd one (forces the
-    /// peel-back epilogue at more than one level of the recursion).
+    /// `egraph::fold_rules::HalveFold` gives it) must visit the same terms,
+    /// in the same left-to-right order, as [`Fold::peel`] does one at a time
+    /// — for an even trip count (pure halving, no remainder ever arises) and
+    /// an odd one (forces the peel-back epilogue at more than one level of
+    /// the recursion).
     ///
     /// "Same order" here means the same *sequence* of leaves read
     /// left-to-right, not the same bracketing: halving `[lo,hi)` re-groups
@@ -898,7 +898,7 @@ mod tests {
     /// module doc of `egraph::fold_rules`) would sum to the identical value.
     /// So this checks the sequence directly — with "term" specialized to its
     /// own raw index and "combine" to list concatenation, `combine` below is
-    /// the shape `passes::expand_reduce::combine_halved` uses for real, just
+    /// the shape `egraph::fold_rules::HalveFold` builds for real, just
     /// instantiated to make the order legible without an arena or a JIT.
     #[test]
     fn halving_to_exhaustion_visits_the_same_terms_in_the_same_order_as_peeling() {
