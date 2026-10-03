@@ -3556,7 +3556,7 @@ fn operands_of(sop: &ScheduledOp, class: Class) -> impl Iterator<Item = ValueId>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit::{allocate_flat, tabulate_guards};
+    use crate::emit::{allocate_flat, lay_out};
     use pixelflow_ir::kind::OpKind;
 
     /// `nest` with its guards tabulated the way a compile tabulates them.
@@ -3564,7 +3564,7 @@ mod tests {
     /// The allocator is handed finished nests, and a literal a test writes by
     /// hand has no table until it is given one.
     fn guarded(mut nest: ScopedSchedule) -> ScopedSchedule {
-        tabulate_guards(&mut nest);
+        lay_out(&mut nest);
         nest
     }
 
@@ -3874,7 +3874,7 @@ mod tests {
     /// outer one too, so the narrower answer is always the safe one to keep.
     #[test]
     fn guarded_arms_prefers_the_narrowest_covering_arm() {
-        use super::super::guards::ArmPair;
+        use crate::program::ArmPair;
         let guard = |if_idx: usize, mask: u32, true_arm: (usize, usize)| IfGuard {
             if_idx,
             mask_vid: ValueId(mask),

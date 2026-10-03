@@ -15,7 +15,7 @@
 //! then keeping a fold as a loop is the lever; if optimization dominates then
 //! the e-graph items are. Nobody has split this since the guard-partition fix
 //! took a bake 31.5 s → 20.0 s, and the last two guesses about this hump were
-//! both wrong (`cluster_if_arms`, not regalloc; compile, not collapse), so
+//! both wrong (the guard-clustering search, not regalloc; compile, not collapse), so
 //! it is measured rather than reasoned about.
 //!
 //! **How many programs.** A fold's trip count is a `Fold` field, hashed into

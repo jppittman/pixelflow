@@ -69,7 +69,7 @@ pub mod avx512;
 pub(crate) mod coverage;
 pub mod encoded;
 pub mod executable;
-pub(crate) mod guards;
+pub(crate) use crate::program::guards;
 pub mod regalloc;
 pub mod storage;
 pub mod traffic;
@@ -80,9 +80,9 @@ pub use storage::{Slot, SourceOperand, StackFrame, Storage, StoreTarget};
 
 use pixelflow_ir::kind::OpKind;
 
+pub use crate::program::IfArm;
 pub use crate::program::ScheduledOp;
-pub use guards::IfArm;
-use guards::analyze_if_guards;
+use crate::program::layout::Layout;
 use traffic::{BranchTraffic, Counting, EmitTraffic};
 
 use alloc::vec::Vec;
@@ -1462,17 +1462,18 @@ struct MaskTest {
 }
 
 /// A loop-free schedule as a nest: one body, no folds, nothing carried across
-/// anything, its guards tabulated as [`tabulate_guards`] tabulates a scope's.
+/// anything, laid out as [`lay_out`] lays out a scope.
 ///
 /// What a test that builds a schedule by hand allocates: the allocator is
 /// handed a finished nest, tables included, so a bare schedule has to be
 /// given its table the way a compile gives one.
 #[cfg(test)]
 fn flat_nest(schedule: Vec<regalloc::Def>) -> regalloc::ScopedSchedule {
+    let (schedule, guards) = lay_out_flat(schedule);
     regalloc::ScopedSchedule {
         body: regalloc::ScopeRegion {
             roots: Vec::new(),
-            guards: flat_guards(&schedule),
+            guards,
             schedule,
         },
         folds: Vec::new(),
@@ -1724,7 +1725,7 @@ fn emit_scope<B: IsaBackend>(
 
     // If short-circuit guards, read off the allocation rather than
     // recomputed: `schedule` above is `allocation.schedule()` verbatim, and
-    // the table is the one this scope was built with (`tabulate_guards`),
+    // the table is the one this scope was built with (`lay_out`),
     // which the allocator placed split ranges around each arm by (see
     // `regalloc::Allocation::if_guards`). A root this scope parks is never
     // inside an arm — the analysis was told it is read outside the schedule
@@ -2931,16 +2932,6 @@ fn scope_schedule(
     variance: &[pixelflow_ir::variance::Variance],
 ) -> regalloc::ScopedSchedule {
     let (body, pending) = extract_folds(schedule, variance);
-    // Every scope's `If`s are guarded where a branch pays, so this is
-    // where an arm's entries are worth gathering into one run. A no-op
-    // unless it buys a branch. Before `attach_folds`, because it is a
-    // permutation and a fold's position is a fact about its parent's final
-    // order. The folds first: what a fold costs, which decides whether an
-    // arm owning it pays for a branch, is made of the folds inside it.
-    let (pending, inner): (Vec<PendingFold>, Vec<guards::FoldReads>) =
-        pending.into_iter().map(cluster_pending).unzip();
-    let reads = pending_reads(&body, &pending, &inner);
-    let body = guards::cluster_if_arms(body, &reads);
     let mut scoped = regalloc::ScopedSchedule {
         body: regalloc::ScopeRegion {
             roots: Vec::new(),
@@ -2950,34 +2941,38 @@ fn scope_schedule(
         folds: Vec::new(),
         // Not `extract_guards`'s job: that runs after this function returns
         // (`allocate_nest`), on the settled body and fold schedules
-        // `cluster_if_arms`/`attach_folds`/`place_roots` below produce —
-        // see `extract_guards`'s own doc for why it cannot run in here.
+        // `attach_folds`/`place_roots`/`lay_out` below produce — see
+        // `extract_guards`'s own doc for why it cannot run in here.
         guard_arms: Vec::new(),
     };
     attach_folds(&mut scoped, pending);
     place_roots(&mut scoped, variance);
-    tabulate_guards(&mut scoped);
+    lay_out(&mut scoped);
     scoped
 }
 
-/// Every scope's `If` guards, tabulated once over the nest as it will be
-/// allocated and emitted — the last step of [`scope_schedule`], and the only
-/// place the analysis is asked of a body or a fold.
+/// Put every scope's schedule in its final order and tabulate the branches
+/// over it — the last step of [`scope_schedule`], and the only place either is
+/// decided for a body or a fold.
 ///
-/// Last because a guard is a pair of schedule positions and the question it
-/// answers is about the scope's *final* schedule and *final* roots: what an
-/// arm may own depends on what the loops the scope opens read from it, and on
-/// the roots it parks for them — a skipped arm would leave a park unwritten
-/// for a loop that runs regardless — and none of that is settled until
-/// [`attach_folds`] and [`place_roots`] have run. Nothing after this edits
-/// either: the allocator reads the tables as its input and the emitter
-/// branches over the same ones.
+/// Last because both are questions about the scope's *final* contents: which
+/// arms are worth a branch depends on what the loops the scope opens read from
+/// it and on the roots it parks for them — a skipped arm would leave a park
+/// unwritten for a loop that runs regardless — and none of that is settled
+/// until [`attach_folds`] and [`place_roots`] have run. The order is *chosen*
+/// here, from who owns what (`program::layout`), rather than repaired
+/// beforehand and then hoped to survive the placement. Nothing after this
+/// edits a schedule or a table: the allocator reads them as its input and the
+/// emitter branches over the same ones.
 ///
 /// What a loop costs, which decides whether an arm owning it pays for a
 /// branch, is made of the loops inside it ([`guards::FoldReads`]), so the
 /// scopes go innermost first: a fold's index is always above its parent's,
-/// which makes the reverse of nest order a children-before-parents order.
-fn tabulate_guards(scoped: &mut regalloc::ScopedSchedule) {
+/// which makes the reverse of nest order a children-before-parents order. A
+/// scope's layout permutes its schedule, and a fold's `at` is a position in
+/// its parent's, so each scope's children are carried to the new order as the
+/// scope is laid out.
+fn lay_out(scoped: &mut regalloc::ScopedSchedule) {
     use regalloc::Scope;
 
     // One `FoldReads` per scope, the body's at 0 and `Fold(j)`'s at `j + 1`.
@@ -2986,21 +2981,20 @@ fn tabulate_guards(scoped: &mut regalloc::ScopedSchedule) {
         Scope::Fold(j) => j + 1,
         Scope::GuardArm(_) => unreachable!("a fold never opens in a guard arm"),
     };
-    let nest = &*scoped;
-    let schedule_of = |scope: Scope| match scope {
-        Scope::Body => nest.body.schedule.as_slice(),
-        Scope::Fold(j) => nest.folds[j].schedule.as_slice(),
-        Scope::GuardArm(_) => unreachable!("a fold never opens in a guard arm"),
-    };
-    let mut reads: Vec<guards::FoldReads> = (0..=nest.folds.len())
+    let mut reads: Vec<guards::FoldReads> = (0..=scoped.folds.len())
         .map(|_| guards::FoldReads::default())
         .collect();
-    for scope in (0..nest.folds.len())
+    for scope in (0..scoped.folds.len())
         .rev()
         .map(Scope::Fold)
         .chain(core::iter::once(Scope::Body))
     {
-        let schedule = schedule_of(scope);
+        let nest = &*scoped;
+        let (schedule, roots) = match scope {
+            Scope::Body => (&nest.body.schedule, &nest.body.roots),
+            Scope::Fold(j) => (&nest.folds[j].schedule, &nest.folds[j].roots),
+            Scope::GuardArm(_) => unreachable!("a fold never opens in a guard arm"),
+        };
         let opened = guards::FoldReads::new(
             schedule,
             nest.folds
@@ -3012,62 +3006,38 @@ fn tabulate_guards(scoped: &mut regalloc::ScopedSchedule) {
                     (schedule[fold.at].value, fold.schedule.as_slice(), inner)
                 }),
         );
+        let layout = Layout::of(schedule, roots, &opened);
+        debug_assert!(
+            layout.is_sound(schedule, roots, &opened),
+            "{scope:?}: a layout must keep every read after its value, and be its own fixed point"
+        );
+        let (ordered, branches) = (layout.apply(schedule), layout.guards);
+        let position = layout.position;
+        match scope {
+            Scope::Body => {
+                scoped.body.schedule = ordered;
+                scoped.body.guards = branches;
+            }
+            Scope::Fold(j) => {
+                scoped.folds[j].schedule = ordered;
+                scoped.folds[j].guards = branches;
+            }
+            Scope::GuardArm(_) => unreachable!("a fold never opens in a guard arm"),
+        }
+        for fold in scoped.folds.iter_mut().filter(|fold| fold.parent == scope) {
+            fold.at = position[fold.at];
+        }
         reads[slot(scope)] = opened;
     }
-    let guards_in = |scope: Scope, roots: &[regalloc::ValueId]| {
-        analyze_if_guards(schedule_of(scope), roots, &reads[slot(scope)])
-    };
-    let body = guards_in(Scope::Body, &nest.body.roots);
-    let folds: Vec<Vec<guards::IfGuard>> = nest
-        .folds
-        .iter()
-        .enumerate()
-        .map(|(j, fold)| guards_in(Scope::Fold(j), &fold.roots))
-        .collect();
-
-    scoped.body.guards = body;
-    for (fold, table) in scoped.folds.iter_mut().zip(folds) {
-        fold.guards = table;
-    }
 }
 
-/// The guards of a scope that parks nothing and opens no fold: a guard arm's
-/// schedule, which is a separate arena's and has no loop carved out of it, or
-/// a loop-free schedule taken as a scope of its own.
-fn flat_guards(schedule: &[regalloc::Def]) -> Vec<guards::IfGuard> {
-    analyze_if_guards(schedule, &[], &guards::FoldReads::default())
-}
-
-/// [`guards::cluster_if_arms`] over a pending fold's schedule and, one
-/// level down, each of its children's — innermost first, and handing back
-/// the folds the fold's own schedule opens, which the scope it opens in
-/// prices it by.
-fn cluster_pending(fold: PendingFold) -> (PendingFold, guards::FoldReads) {
-    let (children, inner): (Vec<PendingFold>, Vec<guards::FoldReads>) =
-        fold.children.into_iter().map(cluster_pending).unzip();
-    let reads = pending_reads(&fold.schedule, &children, &inner);
-    let clustered = PendingFold {
-        reduce_vid: fold.reduce_vid,
-        schedule: guards::cluster_if_arms(fold.schedule, &reads),
-        children,
-    };
-    (clustered, reads)
-}
-
-/// What each of `folds`, opened in `scope`, reads from it and costs, `inner`
-/// being what each fold's own schedule opens, in the same order.
-fn pending_reads(
-    scope: &[regalloc::Def],
-    folds: &[PendingFold],
-    inner: &[guards::FoldReads],
-) -> guards::FoldReads {
-    guards::FoldReads::new(
-        scope,
-        folds
-            .iter()
-            .zip(inner)
-            .map(|(fold, inner)| (fold.reduce_vid, fold.schedule.as_slice(), inner)),
-    )
+/// A scope that parks nothing and opens no fold — a guard arm's schedule, a
+/// separate arena's with no loop carved out of it, or a loop-free schedule
+/// taken as a scope of its own — in its final order, with the branches over
+/// it.
+fn lay_out_flat(schedule: Vec<regalloc::Def>) -> (Vec<regalloc::Def>, Vec<guards::IfGuard>) {
+    let layout = Layout::of(&schedule, &[], &guards::FoldReads::default());
+    (layout.apply(&schedule), layout.guards)
 }
 
 /// Whether a def is a placeholder already, and so not the placement's to
@@ -3412,9 +3382,10 @@ fn extract_folds_bound_by(
 /// Locate each [`PendingFold`]'s `Reduce` def in the body's schedule and
 /// record it as a [`regalloc::ScopeFold`].
 ///
-/// Searched by value rather than carried through as a position, because
-/// [`guards::cluster_if_arms`] is a schedule *permutation* — it moves a
-/// `Def`, never renames the `ValueId` it defines.
+/// Searched by value rather than carried through as a position: the scope's
+/// layout, which runs after this, permutes the schedule — it moves a `Def`,
+/// never renames the `ValueId` it defines — and carries each fold's position
+/// along itself ([`lay_out`]).
 fn attach_folds(scoped: &mut regalloc::ScopedSchedule, pending: Vec<PendingFold>) {
     for fold in pending {
         let at = scoped
@@ -4042,11 +4013,12 @@ fn schedule_guard_arm(
             def.op
         );
     }
+    let (schedule, guards) = lay_out_flat(schedule);
     regalloc::ScopeGuardArm {
         parent,
         at,
         arm,
-        guards: flat_guards(&schedule),
+        guards,
         schedule,
     }
 }
@@ -6177,8 +6149,8 @@ mod tests {
 
         /// An `If` whose true arm contains an `If`, with entries belonging
         /// to the root sitting inside both arms — so NEITHER level is
-        /// guardable as scheduled, and both become guardable once
-        /// [`guards::cluster_if_arms`] gathers each arm into one run.
+        /// guardable as scheduled, and both become guardable once the layout
+        /// gathers each arm into one run.
         ///
         /// Nesting is the case that can go wrong quietly: an inner `If`'s
         /// arms lie inside an outer arm, so partitioning the outside moves the
@@ -6252,23 +6224,6 @@ mod tests {
             outer + (x + y) + x * 4.0
         }
 
-        /// How many entries each `If` has under a guard, by schedule
-        /// position, for a schedule built the way `compile` builds it.
-        fn guarded_entries(a: &ExprArena, root: ExprId, cluster: bool) -> alloc::vec::Vec<usize> {
-            let schedule = native_schedule(a, root, POINT);
-            // Flat, not scoped: no fold is carved out, so none reads anything.
-            let folds = guards::FoldReads::default();
-            let schedule = if cluster {
-                guards::cluster_if_arms(schedule, &folds)
-            } else {
-                schedule
-            };
-            analyze_if_guards(&schedule, &[], &folds)
-                .iter()
-                .map(|g| g.total_guarded_entries())
-                .collect()
-        }
-
         /// The branches of the kernel at `root`, compiled the way `compile`
         /// compiles it.
         fn census_of(a: &ExprArena, root: ExprId) -> BranchTraffic {
@@ -6288,8 +6243,8 @@ mod tests {
         /// Three numbers, because an `If` count alone is a weak gate. The real
         /// chrome at 1920x1080 reads `(3, 6, 719)` under the scratch probe on
         /// AVX-512 and on AVX2: 3 of its 17 `If`s earn a guard, each over both
-        /// arms. With `cluster_if_arms` switched off it still reads 3 guards,
-        /// but 4 arms and 292 entries. This kernel is that shape in miniature
+        /// arms. With the old clustering search switched off it still read 3
+        /// guards, but 4 arms and 292 entries. This kernel is that shape in miniature
         /// — an `If` whose two arms each hold an `If`, with a value both
         /// worlds read first reached inside one of them — and reads the same
         /// three guards over six arms.
@@ -6448,32 +6403,33 @@ mod tests {
             }
         }
 
-        /// Both levels of a nested `If` are guarded once the schedule is
-        /// clustered, and neither was before — the reordering is the whole
-        /// difference.
+        /// Both levels of a nested `If` are guarded once the layout chooses the
+        /// order, and the order had to move for it: the arms are interleaved
+        /// with entries the root reads, so as written neither is one run.
         #[test]
-        fn clustering_guards_both_levels_of_a_nested_if() {
+        fn layout_guards_both_levels_of_a_nested_if() {
             let mut a = ExprArena::new();
             let (root, _outer, _inner) = nested_guarded_ifs(&mut a);
-
-            let before = guarded_entries(&a, root, false);
-            let after = guarded_entries(&a, root, true);
+            let schedule = native_schedule(&a, root, POINT);
+            let layout = Layout::of(&schedule, &[], &guards::FoldReads::default());
             assert!(
-                before.iter().sum::<usize>() < after.iter().sum::<usize>(),
-                "clustering bought nothing: {before:?} -> {after:?}"
+                !layout.is_identity(),
+                "the arms were already runs as written, which this fixture is not"
             );
             assert_eq!(
-                after.len(),
+                layout.guards.len(),
                 2,
-                "both the outer and the inner select must earn a guard, got {after:?}"
+                "both the outer and the inner select must earn a guard, got {:?}",
+                layout.guards
             );
             assert!(
-                after.iter().all(|&entries| entries > 0),
-                "a guard with an empty range is not a guard: {after:?}"
+                layout.guards.iter().all(|g| g.total_guarded_entries() > 0),
+                "a guard with an empty range is not a guard: {:?}",
+                layout.guards
             );
         }
 
-        /// The clustered kernel's answer, against the same expression
+        /// The laid-out kernel's answer, against the same expression
         /// evaluated in scalar `f32` with no guards: uniform masks (which take
         /// the branches) and mixed lanes (which fall through to the blend),
         /// exactly equal — every operation here is exact at these points, so
@@ -6749,7 +6705,7 @@ mod tests {
         ///
         /// One index later would be a register the skipped path never wrote;
         /// earlier is merely wasteful. The allocator gets the arm ranges from
-        /// the same `analyze_if_guards` the emitter branches on, which is
+        /// the same tables the emitter branches on, which is
         /// what makes "exactly" a statement about one answer rather than two.
         #[test]
         fn a_kept_reload_inside_a_guarded_arm_ends_at_the_arm() {
