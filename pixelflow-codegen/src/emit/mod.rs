@@ -82,11 +82,6 @@ use pixelflow_ir::fold::Fold;
 use pixelflow_ir::kind::OpKind;
 
 pub use guards::IfArm;
-// Production code reads guards off the allocation (`Allocation::if_guards`)
-// rather than calling this directly — see `emit_scope`. Only the tests, which
-// exercise the analysis against hand-built schedules the allocator never
-// sees, call it themselves.
-#[cfg(test)]
 use guards::analyze_if_guards;
 use traffic::{Counting, EmitTraffic};
 
@@ -1466,6 +1461,35 @@ struct MaskTest {
     arm: IfArm,
 }
 
+/// A loop-free schedule as a nest: one body, no folds, nothing carried across
+/// anything, its guards tabulated as [`tabulate_guards`] tabulates a scope's.
+///
+/// What a test that builds a schedule by hand allocates: the allocator is
+/// handed a finished nest, tables included, so a bare schedule has to be
+/// given its table the way a compile gives one.
+#[cfg(test)]
+fn flat_nest(schedule: Vec<regalloc::Def>) -> regalloc::ScopedSchedule {
+    regalloc::ScopedSchedule {
+        body: regalloc::ScopeRegion {
+            roots: Vec::new(),
+            guards: flat_guards(&schedule),
+            schedule,
+        },
+        folds: Vec::new(),
+        guard_arms: Vec::new(),
+    }
+}
+
+/// [`flat_nest`], allocated.
+#[cfg(test)]
+fn allocate_flat(
+    schedule: Vec<regalloc::Def>,
+    file: &regalloc::RegisterFile,
+) -> regalloc::NestAllocation {
+    use regalloc::RegisterAllocator;
+    regalloc::LinearScan.allocate_nest(flat_nest(schedule), file)
+}
+
 /// Allocate a straight-line schedule and emit it as one scope's body.
 ///
 /// Production compiles allocate the whole nest at once
@@ -1477,8 +1501,7 @@ fn emit_dag_body<B: IsaBackend>(
     schedule: Vec<regalloc::Def>,
     backend: &mut B,
 ) -> Result<(Vec<u8>, Reg, u32, u32), CompileError> {
-    use regalloc::RegisterAllocator;
-    let nest = regalloc::LinearScan.allocate(schedule, &backend.register_file());
+    let nest = allocate_flat(schedule, &backend.register_file());
     let (code, result, frame, spills) = emit_scope(
         nest.body(),
         backend,
@@ -1701,10 +1724,11 @@ fn emit_scope<B: IsaBackend>(
 
     // If short-circuit guards, read off the allocation rather than
     // recomputed: `schedule` above is `allocation.schedule()` verbatim, and
-    // the allocator already ran this same analysis against it to place split
-    // ranges around each arm (see `regalloc::Allocation::if_guards`). A
-    // root this scope parks is never inside an arm — the analysis was told
-    // it is read outside the schedule — so a guard can never skip a park.
+    // the table is the one this scope was built with (`tabulate_guards`),
+    // which the allocator placed split ranges around each arm by (see
+    // `regalloc::Allocation::if_guards`). A root this scope parks is never
+    // inside an arm — the analysis was told it is read outside the schedule
+    // — so a guard can never skip a park.
     let if_guards: &[guards::IfGuard] = allocation.if_guards();
     let sched_len = schedule.len();
 
@@ -1716,7 +1740,15 @@ fn emit_scope<B: IsaBackend>(
         (0..sched_len).map(|_| alloc::vec::Vec::new()).collect();
     let mut branch_ends: alloc::vec::Vec<alloc::vec::Vec<PendingBranch>> =
         (0..sched_len).map(|_| alloc::vec::Vec::new()).collect();
+    // Which guard, if any, belongs to the `If` at each schedule position: dense
+    // by position, built once, so each `If` is a lookup rather than a search.
+    let mut guard_at: alloc::vec::Vec<Option<usize>> = alloc::vec![None; sched_len];
     for (gi, guard) in if_guards.iter().enumerate() {
+        assert!(
+            guard_at[guard.if_idx].replace(gi).is_none(),
+            "two guards claim the `If` at schedule position {}",
+            guard.if_idx
+        );
         for arm in IfArm::ALL {
             let range = guard.range(arm);
             if range.0 != range.1 {
@@ -2328,7 +2360,7 @@ fn emit_scope<B: IsaBackend>(
 
         // If with a guard region: emit a uniform-mask short-circuit wrapper.
         if let ScheduledOp::Ternary(OpKind::If, mask_vid, true_vid, false_vid) = sched_op
-            && let Some(guard) = if_guards.iter().find(|g| g.if_idx == sched_idx)
+            && let Some(guard) = guard_at[sched_idx].map(|gi| &if_guards[gi])
             && guard.has_guarded_arm()
         {
             let mask_reg = match location_of(&locs, *mask_vid) {
@@ -3040,6 +3072,7 @@ fn scope_schedule(
         body: regalloc::ScopeRegion {
             roots: Vec::new(),
             schedule: body,
+            guards: Vec::new(),
         },
         folds: Vec::new(),
         // Not `extract_guards`'s job: that runs after this function returns
@@ -3050,7 +3083,86 @@ fn scope_schedule(
     };
     attach_folds(&mut scoped, pending);
     place_roots(&mut scoped, variance);
+    tabulate_guards(&mut scoped);
     scoped
+}
+
+/// Every scope's `If` guards, tabulated once over the nest as it will be
+/// allocated and emitted — the last step of [`scope_schedule`], and the only
+/// place the analysis is asked of a body or a fold.
+///
+/// Last because a guard is a pair of schedule positions and the question it
+/// answers is about the scope's *final* schedule and *final* roots: what an
+/// arm may own depends on what the loops the scope opens read from it, and on
+/// the roots it parks for them — a skipped arm would leave a park unwritten
+/// for a loop that runs regardless — and none of that is settled until
+/// [`attach_folds`] and [`place_roots`] have run. Nothing after this edits
+/// either: the allocator reads the tables as its input and the emitter
+/// branches over the same ones.
+///
+/// What a loop costs, which decides whether an arm owning it pays for a
+/// branch, is made of the loops inside it ([`guards::FoldReads`]), so the
+/// scopes go innermost first: a fold's index is always above its parent's,
+/// which makes the reverse of nest order a children-before-parents order.
+fn tabulate_guards(scoped: &mut regalloc::ScopedSchedule) {
+    use regalloc::Scope;
+
+    // One `FoldReads` per scope, the body's at 0 and `Fold(j)`'s at `j + 1`.
+    let slot = |scope: Scope| match scope {
+        Scope::Body => 0,
+        Scope::Fold(j) => j + 1,
+        Scope::GuardArm(_) => unreachable!("a fold never opens in a guard arm"),
+    };
+    let nest = &*scoped;
+    let schedule_of = |scope: Scope| match scope {
+        Scope::Body => nest.body.schedule.as_slice(),
+        Scope::Fold(j) => nest.folds[j].schedule.as_slice(),
+        Scope::GuardArm(_) => unreachable!("a fold never opens in a guard arm"),
+    };
+    let mut reads: Vec<guards::FoldReads> = (0..=nest.folds.len())
+        .map(|_| guards::FoldReads::default())
+        .collect();
+    for scope in (0..nest.folds.len())
+        .rev()
+        .map(Scope::Fold)
+        .chain(core::iter::once(Scope::Body))
+    {
+        let schedule = schedule_of(scope);
+        let opened = guards::FoldReads::new(
+            schedule,
+            nest.folds
+                .iter()
+                .enumerate()
+                .filter(|(_, fold)| fold.parent == scope)
+                .map(|(k, fold)| {
+                    let inner = &reads[slot(Scope::Fold(k))];
+                    (schedule[fold.at].value, fold.schedule.as_slice(), inner)
+                }),
+        );
+        reads[slot(scope)] = opened;
+    }
+    let guards_in = |scope: Scope, roots: &[regalloc::ValueId]| {
+        analyze_if_guards(schedule_of(scope), roots, &reads[slot(scope)])
+    };
+    let body = guards_in(Scope::Body, &nest.body.roots);
+    let folds: Vec<Vec<guards::IfGuard>> = nest
+        .folds
+        .iter()
+        .enumerate()
+        .map(|(j, fold)| guards_in(Scope::Fold(j), &fold.roots))
+        .collect();
+
+    scoped.body.guards = body;
+    for (fold, table) in scoped.folds.iter_mut().zip(folds) {
+        fold.guards = table;
+    }
+}
+
+/// The guards of a scope that parks nothing and opens no fold: a guard arm's
+/// schedule, which is a separate arena's and has no loop carved out of it, or
+/// a loop-free schedule taken as a scope of its own.
+fn flat_guards(schedule: &[regalloc::Def]) -> Vec<guards::IfGuard> {
+    analyze_if_guards(schedule, &[], &guards::FoldReads::default())
 }
 
 /// [`guards::cluster_if_arms`] over a pending fold's schedule and, one
@@ -3473,6 +3585,7 @@ fn attach_fold(
         at,
         roots: Vec::new(),
         schedule,
+        guards: Vec::new(),
     });
     for child in children {
         let at = scoped.folds[index]
@@ -4060,6 +4173,7 @@ fn schedule_guard_arm(
         parent,
         at,
         arm,
+        guards: flat_guards(&schedule),
         schedule,
     }
 }
@@ -5491,7 +5605,7 @@ mod tests {
 
     /// Build an allocation with the given placements, in schedule order.
     fn allocation_of(placements: &[(u32, regalloc::Where)]) -> regalloc::NestAllocation {
-        use regalloc::{Def, RegisterAllocator, ValueId};
+        use regalloc::{Def, ValueId};
         // Allocate a schedule of bare leaves to get a well-formed Allocation,
         // then pin each value where the test wants it.
         let schedule: alloc::vec::Vec<Def> = placements
@@ -5503,7 +5617,7 @@ mod tests {
                 op: ScheduledOp::Lanes(Binder::from_slot(0).expect("slot 0")),
             })
             .collect();
-        let mut a = regalloc::LinearScan.allocate(schedule, &TEST_FILE);
+        let mut a = allocate_flat(schedule, &TEST_FILE);
         for &(v, p) in placements {
             a.place(regalloc::Scope::Body, ValueId(v), p);
         }
@@ -6279,6 +6393,186 @@ mod tests {
                 .iter()
                 .map(|g| g.total_guarded_entries())
                 .collect()
+        }
+
+        /// What a nest's branches amount to, read the way the emitter reads
+        /// them: `Allocation::if_guards`, summed over every scope.
+        ///
+        /// A guard is value-identical to the blend it replaces, so no pixel
+        /// golden can see one lost or one added; this is the one place the
+        /// count is a fact a test can fail on. The three numbers are three
+        /// different ways to lose: an `If` that stopped earning a guard
+        /// (`guards`), an arm that stopped being one contiguous run
+        /// (`arms_branched`), and a run that shrank (`arm_entries`).
+        #[derive(Debug, PartialEq, Eq)]
+        struct BranchCensus {
+            /// `If`s with at least one arm under a branch.
+            guards: usize,
+            /// Arms under a branch: a guard buys one or both of its two.
+            arms_branched: usize,
+            /// Schedule entries under a branch, summed over every such arm
+            /// (an entry inside two nested arms counts in each).
+            arm_entries: usize,
+        }
+
+        /// The census of `nest`, over its body, its folds and its guard arms.
+        fn branch_census(nest: &regalloc::NestAllocation) -> BranchCensus {
+            let scopes = core::iter::once(regalloc::Scope::Body)
+                .chain((0..nest.fold_count()).map(regalloc::Scope::Fold))
+                .chain((0..2 * nest.guard_count()).map(regalloc::Scope::GuardArm));
+            let mut census = BranchCensus {
+                guards: 0,
+                arms_branched: 0,
+                arm_entries: 0,
+            };
+            for scope in scopes {
+                for guard in nest.scope(scope).if_guards() {
+                    census.guards += usize::from(guard.has_guarded_arm());
+                    census.arms_branched += IfArm::ALL
+                        .iter()
+                        .filter(|&&arm| guard.is_guarded(arm))
+                        .count();
+                    census.arm_entries += guard.total_guarded_entries();
+                }
+            }
+            census
+        }
+
+        /// [`branch_census`] of the kernel at `root`, compiled the way
+        /// `compile` compiles it.
+        fn census_of(a: &ExprArena, root: ExprId) -> BranchCensus {
+            let file = native_register_file(EmitCtx::default());
+            branch_census(&allocate_nest(native_schedule(a, root, batch()), &file))
+        }
+
+        /// A kernel shaped like the chrome sphere keeps every branch it earns,
+        /// and the sphere's silhouette alone earns none.
+        ///
+        /// Counts the guards the compile's own tables hold, through
+        /// `Allocation::if_guards`: what the emitter branches on, and what no
+        /// render can see, since a guarded `If` and a blended one produce the
+        /// same pixels. A decision that moves a guard's arm out of reach is a
+        /// slower kernel with the same picture, and this is where it shows.
+        ///
+        /// Three numbers, because an `If` count alone is a weak gate. The real
+        /// chrome at 1920x1080 reads `(3, 6, 719)` under the scratch probe on
+        /// AVX-512 and on AVX2: 3 of its 17 `If`s earn a guard, each over both
+        /// arms. With `cluster_if_arms` switched off it still reads 3 guards,
+        /// but 4 arms and 292 entries. This kernel is that shape in miniature
+        /// — an `If` whose two arms each hold an `If`, with a value both
+        /// worlds read first reached inside one of them — and reads the same
+        /// three guards over six arms.
+        ///
+        /// The control is the silhouette mask over arms cheaper than the
+        /// mispredict they would risk: one `If` and no guard, as the real
+        /// sphere over sky reads `(0, 0, 0)`. Counting `If`s would not tell
+        /// it from the other; the arms' cost does.
+        #[test]
+        fn a_chrome_shaped_kernel_keeps_its_branches() {
+            let mut a = ExprArena::new();
+            let chrome = chrome_shaped(&mut a);
+            assert_eq!(
+                census_of(&a, chrome),
+                BranchCensus {
+                    guards: 3,
+                    arms_branched: 6,
+                    arm_entries: 70,
+                },
+                "the chrome-shaped kernel's branches moved"
+            );
+
+            let mut b = ExprArena::new();
+            let silhouette = silhouette_shaped(&mut b);
+            assert_eq!(
+                census_of(&b, silhouette),
+                BranchCensus {
+                    guards: 0,
+                    arms_branched: 0,
+                    arm_entries: 0,
+                },
+                "arms under the mispredict bound earned a branch"
+            );
+        }
+
+        fn bin(a: &mut ExprArena, op: OpKind, l: ExprId, r: ExprId) -> ExprId {
+            a.push_binary(op, l, r)
+        }
+
+        /// The chrome sphere at the scale of one channel: `sphere.select(
+        /// world(mirrored), world(ray))`, each `world(r) = floor.select(
+        /// checker(r), sky(r))` (`pixelflow-graphics`'s `scene3d`, the scene
+        /// `examples/chrome_asm.rs` compiles). Three `If`s: the sphere's, and
+        /// one per world.
+        ///
+        /// Arithmetic only. A transcendental expands into `If`s of its own, so
+        /// a census over one would move whenever an expansion did, which is
+        /// not what it is there to say.
+        fn chrome_shaped(a: &mut ExprArena) -> ExprId {
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let zero = a.push_const(0.0);
+            let one = a.push_const(1.0);
+            let two = a.push_const(2.0);
+
+            // The sphere: the primary ray's discriminant, whose sign is the
+            // silhouette, and the bounce the mirrored ray takes off it.
+            let xx = bin(a, OpKind::Mul, x, x);
+            let yy = bin(a, OpKind::Mul, y, y);
+            let r2 = bin(a, OpKind::Add, xx, yy);
+            let disc = bin(a, OpKind::Sub, one, r2);
+            let hit = bin(a, OpKind::Gt, disc, zero);
+            let bounce = bin(a, OpKind::Mul, disc, two);
+            let bx = bin(a, OpKind::Mul, bounce, x);
+            let by = bin(a, OpKind::Mul, bounce, y);
+            let mx = bin(a, OpKind::Sub, x, bx);
+            let my = bin(a, OpKind::Sub, y, by);
+
+            // What both worlds read and neither owns: the horizon's tint, and
+            // where the floor is.
+            let tint = bin(a, OpKind::Mul, xx, yy);
+            let floor = a.push_const(-0.5);
+
+            let world = |a: &mut ExprArena, rx: ExprId, ry: ExprId| {
+                let height = bin(a, OpKind::Mul, rx, ry);
+                let on_floor = bin(a, OpKind::Lt, height, floor);
+                let u = bin(a, OpKind::Mul, rx, two);
+                let v = bin(a, OpKind::Mul, ry, two);
+                let uu = bin(a, OpKind::Mul, u, u);
+                let vv = bin(a, OpKind::Mul, v, v);
+                let checker = bin(a, OpKind::Sub, uu, vv);
+                let checker = bin(a, OpKind::Mul, checker, tint);
+                let checker = bin(a, OpKind::Add, checker, u);
+                let sky = bin(a, OpKind::Mul, ry, tint);
+                let sky = bin(a, OpKind::Add, sky, vv);
+                let sky = bin(a, OpKind::Mul, sky, sky);
+                let (checker, sky) = (worth_a_branch(a, checker), worth_a_branch(a, sky));
+                a.push_ternary(OpKind::If, on_floor, checker, sky)
+            };
+            let mirrored = world(a, mx, my);
+            let direct = world(a, x, y);
+            let sel = a.push_ternary(OpKind::If, hit, mirrored, direct);
+            let carried = bin(a, OpKind::Sub, x, y);
+            bin(a, OpKind::Add, sel, carried)
+        }
+
+        /// The sphere over the sky and nothing else: the same silhouette
+        /// mask, but arms that are a constant and a few instructions —
+        /// cheaper than the mispredict they would risk, so no guard anywhere.
+        fn silhouette_shaped(a: &mut ExprArena) -> ExprId {
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let zero = a.push_const(0.0);
+            let one = a.push_const(1.0);
+            let xx = bin(a, OpKind::Mul, x, x);
+            let yy = bin(a, OpKind::Mul, y, y);
+            let r2 = bin(a, OpKind::Add, xx, yy);
+            let disc = bin(a, OpKind::Sub, one, r2);
+            let hit = bin(a, OpKind::Gt, disc, zero);
+            let grey = a.push_const(0.5);
+            let sky = bin(a, OpKind::Add, y, one);
+            let sel = a.push_ternary(OpKind::If, hit, grey, sky);
+            let carried = bin(a, OpKind::Sub, x, y);
+            bin(a, OpKind::Add, sel, carried)
         }
 
         /// Trip count of [`a_fold_owned_by_an_arm_is_guarded`]'s fold.
