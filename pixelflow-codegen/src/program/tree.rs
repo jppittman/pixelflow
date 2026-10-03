@@ -104,7 +104,7 @@ impl Tree {
     }
 
     /// Whether `inner` is `outer` or below it.
-    #[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
+    #[cfg(test)]
     pub(crate) fn is_within(&self, inner: usize, outer: usize) -> bool {
         self.depth[inner] >= self.depth[outer]
             && self.ancestor_at(inner, self.depth[outer]) == outer

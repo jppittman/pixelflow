@@ -118,15 +118,22 @@ bounding box, 5 to 16x faster per texel.
 ## How the switch was checked before it was made
 
 The layout ran in shadow first: on every compile in a debug build (and in
-release under the `layout-shadow` feature) the old analysis, run on the order
-the layout chose, had to find exactly the runs the layout said, keep every arm
-it guarded on the order it was given, and leave a scope unmoved when it
-refused nothing for its order. It never disagreed, over the 95-kernel glyph
-table on both tiers, chrome, the silhouette and the units font at N=4/8/16/32.
-To make the order check non-vacuous it was also run on *unclustered*
-schedules (clustering off in a scratch build), where it found the 537 arms
-(N=4/8/16) and 693 arms (N=32) the search produced, from schedules in which
-the old analysis found none, and chrome's 4 became 6.
+release under a `layout-shadow` feature, since removed with the analysis it
+checked against) the old analysis, run on the order the layout chose, had to
+find exactly the runs the layout said, keep every arm it guarded on the order
+it was given, and leave a scope unmoved when it refused nothing for its order.
+It never disagreed, over the 95-kernel glyph table on both tiers, chrome, the
+silhouette and the units font at N=4/8/16/32. To make the order check
+non-vacuous it was also run on *unclustered* schedules (clustering off in a
+scratch build), where it found the 537 arms (N=4/8/16) and 693 arms (N=32) the
+search produced, from schedules in which the old analysis found none, and
+chrome's 4 became 6.
+
+With the analysis deleted, what stands in its place is the layout's own
+checks: every compile in a debug build asserts the layout keeps every read
+after its value and is its own fixed point, and the layout's unit tests (300
+random DAGs among them) check that each arm it branches over is exactly the run
+of the values that arm owns.
 
 The 352 extra glyph arms are all fold-owning arms the search left unguarded
 because hoisting breaks their order: 2,216 to 35,549 cycles over 19 to 38

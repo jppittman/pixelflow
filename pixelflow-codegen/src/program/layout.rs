@@ -37,14 +37,16 @@
 //! are all in order is returned as it came: the identity, by construction and
 //! not by a check that happens to hold.
 //!
-//! The order's validity is not argued here but asserted against the old
-//! analysis, which remains the oracle until it is deleted
-//! (`guards::assert_layout_agrees`): on the permuted schedule it must find
-//! exactly the arms this layout says are runs.
+//! The order's validity is checked, not argued: every compile in a debug build
+//! asserts that a layout keeps each read after its value and is its own fixed
+//! point (`Layout::is_sound`), and the tests below check, over hand-built and
+//! random schedules, that each arm a layout branches over is exactly the run of
+//! the values that arm owns. Until the search it replaced was deleted, the old
+//! analysis ran on every layout's output and had to find the same runs.
 
 use alloc::vec::Vec;
 
-use crate::emit::guards::{FoldReads, MISPREDICT_PENALTY_CYCLES};
+use crate::program::guards::{FoldReads, MISPREDICT_PENALTY_CYCLES};
 use crate::program::ownership::{Ownership, Positions};
 use crate::program::tree::Tree;
 use crate::program::{ArmPair, Def, IfGuard, ValueId};
@@ -306,18 +308,23 @@ impl Layout {
             .collect()
     }
 
-    #[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
     /// Whether the schedule is returned as it came.
     pub(crate) fn is_identity(&self) -> bool {
         self.order.iter().enumerate().all(|(new, &old)| new == old)
     }
 
-    #[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
-    /// Whether every read follows the value it reads, in the new order: the
-    /// property a layout must keep, and the one a wrong ownership silently
-    /// breaks.
-    pub(crate) fn is_topological(&self, schedule: &[Def], folds: &FoldReads) -> bool {
+    /// Whether this is a layout: every read still follows the value it reads,
+    /// and laying the result out again moves nothing — the property that makes
+    /// the tables derived from one pass the tables of the order it chose.
+    ///
+    /// A schedule that reads a value before it defines it (a hand-built
+    /// fixture) has no order to keep, and passes.
+    pub(crate) fn is_sound(&self, schedule: &[Def], roots: &[ValueId], folds: &FoldReads) -> bool {
+        if !reads_follow(0..schedule.len(), schedule, folds) {
+            return true;
+        }
         reads_follow(self.order.iter().copied(), schedule, folds)
+            && Self::of(&self.apply(schedule), roots, folds).is_identity()
     }
 
     /// What the layout walked (see the field).
@@ -327,7 +334,6 @@ impl Layout {
     }
 }
 
-#[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
 /// Whether, taking `schedule`'s defs in `order`, every read follows the value
 /// it reads. A value this schedule does not define (a live-in) is not read
 /// from here.
@@ -354,7 +360,7 @@ pub(crate) fn reads_follow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit::guards::analyze_if_guards;
+    use crate::program::IfGuard;
     use crate::program::ScheduledOp;
     use pixelflow_ir::kind::OpKind;
 
@@ -381,34 +387,57 @@ mod tests {
         def(value, ScheduledOp::Unary(op, ValueId(of)))
     }
 
-    /// The layout of `schedule`, and the values in its new order — after
-    /// the schedule has also been through `analyze_if_guards`, whose shadow
-    /// asserts the old analysis finds exactly these runs in the new order.
+    /// The layout of `schedule` and the values in its new order, after every
+    /// property a layout owes has been checked: it is one (every read follows
+    /// its value, and laying it out again moves nothing), and each arm it
+    /// branches over is exactly the run of the values that arm owns — no
+    /// stranger inside it, nothing the arm owns outside it.
     fn laid_out(schedule: &[Def]) -> (Layout, Vec<u32>) {
-        let guards = analyze_if_guards(schedule, &[], &FoldReads::default());
-        let layout = Layout::of(schedule, &[], &FoldReads::default());
-        assert!(layout.is_topological(schedule, &FoldReads::default()));
+        laid_out_with(schedule, &[], &FoldReads::default())
+    }
+
+    fn laid_out_with(schedule: &[Def], roots: &[ValueId], folds: &FoldReads) -> (Layout, Vec<u32>) {
+        let layout = Layout::of(schedule, roots, folds);
+        assert!(layout.is_sound(schedule, roots, folds));
+        let own = Ownership::of(schedule, roots, folds);
+        for pair in own.arms().chunks(2) {
+            let guard = layout
+                .guards
+                .iter()
+                .find(|g| schedule[layout.order[g.if_idx]].value == schedule[pair[0].if_pos].value);
+            for arm in pair {
+                let owned: Vec<ValueId> = (0..schedule.len())
+                    .filter(|&pos| own.is_within(own.region_of(pos), arm.region))
+                    .map(|pos| schedule[pos].value)
+                    .collect();
+                let run: Vec<ValueId> = guard
+                    .map(|g| g.range(arm.arm))
+                    .filter(|&(start, end)| start != end)
+                    .map(|(start, end)| {
+                        (start..end)
+                            .map(|new| schedule[layout.order[new]].value)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if run.is_empty() {
+                    continue;
+                }
+                let (mut run, mut owned) = (run, owned);
+                run.sort_unstable();
+                owned.sort_unstable();
+                assert_eq!(
+                    run, owned,
+                    "the {:?} arm of the If at {} is not exactly the run of what it owns",
+                    arm.arm, arm.if_pos
+                );
+                assert!(arm.cycles > MISPREDICT_PENALTY_CYCLES);
+            }
+        }
         let values = layout
             .order
             .iter()
             .map(|&old| schedule[old].value.0)
             .collect();
-        // Every branch the old analysis found, the layout keeps: matched by the
-        // `If`'s own value, since every fixture's `If`s share a mask.
-        for old in &guards {
-            let value = schedule[old.if_idx].value;
-            let kept = layout
-                .guards
-                .iter()
-                .find(|new| schedule[layout.order[new.if_idx]].value == value)
-                .expect("a branch the old analysis found is lost");
-            for arm in crate::program::IfArm::ALL {
-                assert!(
-                    !old.is_guarded(arm) || kept.is_guarded(arm),
-                    "{arm:?} arm lost its branch"
-                );
-            }
-        }
         (layout, values)
     }
 
@@ -460,6 +489,11 @@ mod tests {
     /// a little over earns its block.
     #[test]
     fn the_bound_is_strict() {
+        assert_eq!(
+            pixelflow_search::egraph::CostModel::latency_prior().cost(OpKind::Recip),
+            MISPREDICT_PENALTY_CYCLES,
+            "fixture assumes Recip sits exactly on the bound",
+        );
         let recip_only = alloc::vec![
             def(0, ScheduledOp::Var(0)),
             def(1, ScheduledOp::Var(1)),
@@ -590,10 +624,8 @@ mod tests {
         schedule
     }
 
-    /// Whatever the DAG, the layout is a topological order, every branch the
-    /// old analysis found survives it, and the old analysis finds exactly the
-    /// layout's runs on the order it chose (the last two are
-    /// `analyze_if_guards`'s own shadow, which runs on every call).
+    /// Whatever the DAG, the layout is a layout, and every arm it branches
+    /// over is exactly the run of the values that arm owns.
     #[test]
     fn a_random_dag_lays_out_validly() {
         for seed in 0..300 {
@@ -603,10 +635,10 @@ mod tests {
             let folds = FoldReads::default();
             let layout = Layout::of(&schedule, &roots, &folds);
             assert!(
-                layout.is_topological(&schedule, &folds),
-                "seed {seed}: not a topological order"
+                layout.is_sound(&schedule, &roots, &folds),
+                "seed {seed}: not a layout"
             );
-            let _ = analyze_if_guards(&schedule, &roots, &folds);
+            laid_out_with(&schedule, &roots, &folds);
         }
     }
 
@@ -634,6 +666,295 @@ mod tests {
         assert!(
             large <= small * 32,
             "16x the rungs must cost about 16x the steps, not 256x: {small} -> {large}"
+        );
+    }
+
+    // -- What a loop reads and costs -------------------------------------
+
+    /// A four-trip fold; the scope its body was carved into is not what these
+    /// tests look at, so the body names a hole.
+    fn reduce() -> ScheduledOp {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        let fold = Fold::new(
+            Monoid::SUM,
+            Binder::from_slot(0).expect("slot 0 exists"),
+            0..4,
+        );
+        ScheduledOp::Reduce(fold, ValueId(99))
+    }
+
+    fn at(values: &[u32], v: u32) -> usize {
+        values
+            .iter()
+            .position(|&x| x == v)
+            .expect("a layout keeps every def")
+    }
+
+    /// `W` is read by the true arm and by a sibling fold's body, which runs
+    /// whatever the mask: the arm may not own `W`. Its `Reduce` def names no
+    /// operand, so without the sibling's reads the arm owned it, and a
+    /// uniformly-false mask skipped the loop the sibling then read.
+    #[test]
+    fn an_arm_does_not_own_what_a_sibling_fold_reads() {
+        let schedule = alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, reduce()),
+            unary(2, OpKind::Rsqrt, 1),
+            def(3, ScheduledOp::Binary(OpKind::Mul, ValueId(1), ValueId(2))),
+            if_of(4, 0, 3, 0),
+            def(5, reduce()),
+            def(6, ScheduledOp::Binary(OpKind::Add, ValueId(4), ValueId(5))),
+        ];
+        // The sibling's body holds `W`'s id, as a placeholder read from its
+        // accumulator slot.
+        let sibling = [def(1, reduce())];
+        let folds = FoldReads::new(
+            &schedule,
+            [(ValueId(5), &sibling[..], &FoldReads::default())],
+        );
+
+        let (blind, _) = laid_out(&schedule);
+        let (seen, values) = laid_out_with(&schedule, &[], &folds);
+        let len = |g: &IfGuard| g.true_range().1 - g.true_range().0;
+        assert_eq!(len(&blind.guards[0]), 3, "the arm owned `W` unseen");
+        assert_eq!(len(&seen.guards[0]), 2, "`W` is not the arm's");
+        assert!(
+            at(&values, 1) < at(&values, 2),
+            "and it stays ahead of the arm"
+        );
+    }
+
+    /// `s` is read only by `W`'s body, and `W` is in the true arm: `s` is the
+    /// arm's, and goes with it, ahead of the loop that reads it.
+    #[test]
+    fn what_a_fold_reads_stays_ahead_of_the_fold() {
+        let schedule = alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Var(1)),
+            unary(2, OpKind::Rsqrt, 1),
+            def(3, ScheduledOp::Binary(OpKind::Add, ValueId(1), ValueId(1))),
+            def(4, reduce()),
+            def(5, ScheduledOp::Binary(OpKind::Mul, ValueId(2), ValueId(4))),
+            if_of(6, 0, 5, 0),
+            def(7, ScheduledOp::Binary(OpKind::Add, ValueId(6), ValueId(1))),
+        ];
+        let body = [def(3, ScheduledOp::Const(0.0))];
+        let folds = FoldReads::new(&schedule, [(ValueId(4), &body[..], &FoldReads::default())]);
+        let (_, values) = laid_out_with(&schedule, &[], &folds);
+        assert!(at(&values, 3) < at(&values, 4), "{values:?}");
+    }
+
+    /// A gather's base is a pointer operand, not a vector one, and it is a
+    /// read all the same: the `Context` the arm's `Broadcast` addresses
+    /// through goes ahead of its reader, not behind it.
+    #[test]
+    fn a_pointer_stays_ahead_of_its_reader() {
+        let schedule = alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Var(1)),
+            unary(2, OpKind::Rsqrt, 1),
+            def(3, ScheduledOp::Binary(OpKind::Add, ValueId(1), ValueId(1))),
+            def(4, ScheduledOp::Context(0)),
+            def(5, ScheduledOp::Broadcast(ValueId(2), ValueId(4))),
+            if_of(6, 0, 5, 0),
+            def(7, ScheduledOp::Binary(OpKind::Add, ValueId(6), ValueId(3))),
+        ];
+        let (_, values) = laid_out(&schedule);
+        assert!(at(&values, 4) < at(&values, 5), "{values:?}");
+    }
+
+    /// A value the schedule never defines is not a position: it must not be
+    /// mistaken for one, which would corrupt a run or overflow computing its
+    /// end.
+    #[test]
+    fn a_read_of_a_value_the_schedule_never_defines_is_ignored() {
+        let schedule = alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            unary(1, OpKind::Rsqrt, 3), // ValueId(3) has no Def
+            if_of(4, 0, 0, 1),
+        ];
+        let (layout, _) = laid_out(&schedule);
+        assert_eq!(layout.guards.len(), 1);
+        assert_eq!(layout.guards[0].false_range(), (1, 2));
+    }
+
+    /// The arm fold's trip count below: long enough that pricing the loop as
+    /// one instruction, or as nothing, is off by a factor this large.
+    const ARM_TRIPS: u32 = 64;
+
+    /// A sum of `trips` terms binding `slot`.
+    fn sum_over(slot: u8, trips: u32) -> pixelflow_ir::fold::Fold {
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        let binder = Binder::from_slot(slot).expect("a live binder slot");
+        Fold::new(Monoid::SUM, binder, 0..trips)
+    }
+
+    /// `select(X < 20, F, 0) + Y`, with `F` the `Reduce` def `fold` opening at
+    /// position 3 — the true arm's only entry of its own.
+    fn if_over_a_fold(fold: pixelflow_ir::fold::Fold, body_root: u32) -> Vec<Def> {
+        alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Const(20.0)),
+            def(2, ScheduledOp::Binary(OpKind::Lt, ValueId(0), ValueId(1))),
+            def(3, ScheduledOp::Reduce(fold, ValueId(body_root))),
+            def(4, ScheduledOp::Const(0.0)),
+            if_of(5, 2, 3, 4),
+            def(6, ScheduledOp::Var(1)),
+            def(7, ScheduledOp::Binary(OpKind::Add, ValueId(5), ValueId(6))),
+        ]
+    }
+
+    /// `|x − j|` per trip, `j` the binder of `fold` and `x` read from the
+    /// enclosing scope as `ValueId(0)`; the ids from `first` up are the body's
+    /// own.
+    fn distance_body(fold: pixelflow_ir::fold::Fold, first: u32) -> Vec<Def> {
+        let (j, diff, abs) = (first, first + 1, first + 2);
+        alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(j, ScheduledOp::Var(fold.binder().var())),
+            def(
+                diff,
+                ScheduledOp::Binary(OpKind::Sub, ValueId(0), ValueId(j))
+            ),
+            def(abs, ScheduledOp::Unary(OpKind::Abs, ValueId(diff))),
+        ]
+    }
+
+    /// The price of the one arm of `schedule`'s one `If` that has work.
+    fn true_arm_price(schedule: &[Def], roots: &[ValueId], folds: &FoldReads) -> usize {
+        let own = Ownership::of(schedule, roots, folds);
+        assert_eq!(own.arms().len(), 2);
+        own.arms()[0].cycles
+    }
+
+    /// An arm that owns a fold is priced by the loop: `n` trips of a `k`-cycle
+    /// body are `n·k`, plus the `n − 1` combines — not the `Reduce` def's
+    /// table price of 0, which refused the arm a branch however long the
+    /// loop. With the price, the arm clears the mispredict bound and is
+    /// guarded.
+    #[test]
+    fn an_arm_that_owns_a_fold_is_priced_by_its_trips() {
+        let cycles = pixelflow_search::egraph::CostModel::latency_prior();
+        let fold = sum_over(0, ARM_TRIPS);
+        let body = distance_body(fold, 10);
+        let schedule = if_over_a_fold(fold, 12);
+        let folds = FoldReads::new(&schedule, [(ValueId(3), &body[..], &FoldReads::default())]);
+
+        let n = ARM_TRIPS as usize;
+        let k = cycles.cost(OpKind::Sub) + cycles.cost(OpKind::Abs);
+        let combine = cycles.cost(OpKind::Add);
+        assert_eq!(
+            true_arm_price(&schedule, &[], &folds),
+            n * k + (n - 1) * combine,
+            "the arm is its loop: {n} trips of a {k}-cycle body, and a combine between each"
+        );
+        assert_eq!(
+            true_arm_price(&schedule, &[], &folds),
+            cycles.fold_cost(fold, k)
+        );
+        assert_eq!(
+            true_arm_price(&schedule, &[], &FoldReads::default()),
+            0,
+            "a Reduce def that opens no loop here is a slot read, and the table prices it 0"
+        );
+
+        let (layout, _) = laid_out_with(&schedule, &[], &folds);
+        assert_eq!(
+            layout.guards[0].true_range(),
+            (3, 4),
+            "the loop is skipped whole"
+        );
+        assert!(
+            Layout::of(&schedule, &[], &FoldReads::default())
+                .guards
+                .is_empty()
+        );
+    }
+
+    /// A table read whose address the lane binder does not reach is a
+    /// `Broadcast`, and in a fold's body it runs every trip: `Σ_j |x − t[j]|`
+    /// is priced `n` reads, as the extractor priced the arena's `RawGather`,
+    /// not `n` of a uniform's prologue leaf (0). Its base pointer is the
+    /// scope's root and read by the loop, so the arm is the loop alone.
+    #[test]
+    fn a_table_read_per_trip_is_priced_as_the_read_it_is() {
+        let cycles = pixelflow_search::egraph::CostModel::latency_prior();
+        let fold = sum_over(0, ARM_TRIPS);
+        let (x, ctx, j, t, diff, abs) = (0, 8, 10, 11, 12, 13);
+        let schedule = alloc::vec![
+            def(x, ScheduledOp::Var(0)),
+            def(1, ScheduledOp::Const(20.0)),
+            def(2, ScheduledOp::Binary(OpKind::Lt, ValueId(x), ValueId(1))),
+            def(ctx, ScheduledOp::Context(0)),
+            def(3, ScheduledOp::Reduce(fold, ValueId(abs))),
+            def(4, ScheduledOp::Const(0.0)),
+            if_of(5, 2, 3, 4),
+            def(6, ScheduledOp::Var(1)),
+            def(7, ScheduledOp::Binary(OpKind::Add, ValueId(5), ValueId(6))),
+        ];
+        let body = [
+            def(x, ScheduledOp::Var(0)),
+            def(ctx, ScheduledOp::Context(0)),
+            def(j, ScheduledOp::Var(fold.binder().var())),
+            def(t, ScheduledOp::Broadcast(ValueId(j), ValueId(ctx))),
+            def(
+                diff,
+                ScheduledOp::Binary(OpKind::Sub, ValueId(x), ValueId(t)),
+            ),
+            def(abs, ScheduledOp::Unary(OpKind::Abs, ValueId(diff))),
+        ];
+        let folds = FoldReads::new(&schedule, [(ValueId(3), &body[..], &FoldReads::default())]);
+        let roots = [ValueId(ctx)];
+
+        let k =
+            cycles.cost(OpKind::RawGather) + cycles.cost(OpKind::Sub) + cycles.cost(OpKind::Abs);
+        assert_eq!(
+            true_arm_price(&schedule, &roots, &folds),
+            cycles.fold_cost(fold, k)
+        );
+        let (layout, _) = laid_out_with(&schedule, &roots, &folds);
+        assert_eq!(
+            layout.guards[0].true_range(),
+            (4, 5),
+            "the loop, not its pointer"
+        );
+    }
+
+    /// A fold nested in the arm's fold is priced by its own trips inside every
+    /// trip of the outer one: `m · (n·k + …)`, recursively — the inner loop's
+    /// price comes from the outer body's own `FoldReads`.
+    #[test]
+    fn a_nested_fold_is_priced_by_the_product_of_its_trips() {
+        const OUTER_TRIPS: u32 = 4;
+        let cycles = pixelflow_search::egraph::CostModel::latency_prior();
+        let (outer, inner) = (sum_over(0, OUTER_TRIPS), sum_over(1, ARM_TRIPS));
+        // Outer body: `|I − i|`, `I` the inner fold, `i` the outer binder.
+        let outer_body = alloc::vec![
+            def(0, ScheduledOp::Var(0)),
+            def(20, ScheduledOp::Var(outer.binder().var())),
+            def(21, ScheduledOp::Reduce(inner, ValueId(32))),
+            def(
+                22,
+                ScheduledOp::Binary(OpKind::Sub, ValueId(21), ValueId(20))
+            ),
+            def(23, ScheduledOp::Unary(OpKind::Abs, ValueId(22))),
+        ];
+        let inner_body = distance_body(inner, 30);
+        let inside = FoldReads::new(
+            &outer_body,
+            [(ValueId(21), &inner_body[..], &FoldReads::default())],
+        );
+        let schedule = if_over_a_fold(outer, 23);
+        let folds = FoldReads::new(&schedule, [(ValueId(3), &outer_body[..], &inside)]);
+
+        let k = cycles.cost(OpKind::Sub) + cycles.cost(OpKind::Abs);
+        let inner_loop = cycles.fold_cost(inner, k);
+        let outer_loop = cycles.fold_cost(outer, inner_loop + k);
+        let price = true_arm_price(&schedule, &[], &folds);
+        assert_eq!(price, outer_loop);
+        assert!(
+            outer_loop >= (OUTER_TRIPS * ARM_TRIPS) as usize * k,
+            "every trip of the outer loop runs the whole inner one"
         );
     }
 }

@@ -3874,7 +3874,7 @@ mod tests {
     /// outer one too, so the narrower answer is always the safe one to keep.
     #[test]
     fn guarded_arms_prefers_the_narrowest_covering_arm() {
-        use super::super::guards::ArmPair;
+        use crate::program::ArmPair;
         let guard = |if_idx: usize, mask: u32, true_arm: (usize, usize)| IfGuard {
             if_idx,
             mask_vid: ValueId(mask),

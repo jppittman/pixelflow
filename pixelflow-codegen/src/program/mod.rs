@@ -7,6 +7,7 @@
 //! produces and what allocation and emission consume, which is why it lives
 //! under neither.
 
+pub(crate) mod guards;
 pub(crate) mod layout;
 pub(crate) mod ownership;
 pub(crate) mod tree;

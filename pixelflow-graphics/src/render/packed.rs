@@ -433,8 +433,8 @@ mod tests {
     /// guard both their arms. Pinned on guards and arms, not on entries — an
     /// entry count moves with every rewrite rule, an arm lost does not.
     ///
-    /// Without `cluster_if_arms` the same scene still reads three guards but
-    /// only four arms, and runs 3.5x slower on AVX-512 and 2.6x on AVX2
+    /// Without the clustering search that used to make arms contiguous, the
+    /// same scene still read three guards but only four arms, and runs 3.5x slower on AVX-512 and 2.6x on AVX2
     /// with the same pixels, which is why the arms are counted.
     #[test]
     fn the_chrome_sphere_keeps_its_branches() {
