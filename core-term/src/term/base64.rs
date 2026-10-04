@@ -80,4 +80,14 @@ mod tests {
     fn decoding_refuses_characters_outside_the_alphabet() {
         assert_eq!(decode("Zm9v!"), None);
     }
+
+    #[test]
+    fn it_should_decode_the_alphabets_plus_and_slash_digits() {
+        // No RFC 4648 test vector above exercises the 62nd ('+') or 63rd
+        // ('/') alphabet entries; 0xFB 0xEF 0xFF is the 3-byte input whose
+        // base64 encoding uses both.
+        let bytes: &[u8] = &[0xFB, 0xEF, 0xFF];
+        assert_eq!(encode(bytes), "++//");
+        assert_eq!(decode("++//").as_deref(), Some(bytes));
+    }
 }
