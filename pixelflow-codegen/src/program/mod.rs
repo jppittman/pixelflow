@@ -9,6 +9,7 @@
 
 pub(crate) mod guards;
 pub(crate) mod layout;
+pub(crate) mod lower;
 pub(crate) mod ownership;
 pub(crate) mod tree;
 
@@ -67,7 +68,7 @@ pub enum ScheduledOp {
     Ternary(OpKind, ValueId, ValueId, ValueId),
     /// Bit-shift by a compile-time immediate: `op` is `Shl` or `Shr`, the value
     /// is `ValueId`, and the shift count is folded out of the `Const` RHS by
-    /// `arena_to_schedule` (so it never becomes a scheduled value / register).
+    /// `lower::arena_to_schedule` (so it never becomes a scheduled value / register).
     ShiftImm(OpKind, ValueId, u8),
     /// Bound-memory gather: read the buffer whose base is the second operand
     /// at the lane index computed by the first. Lowered from
@@ -78,7 +79,7 @@ pub enum ScheduledOp {
     Gather(ValueId, ValueId),
     /// A `Gather` whose index is the same in every lane: one scalar load,
     /// broadcast. The same `RawGather(Buffer(slot), index)`, split from
-    /// [`ScheduledOp::Gather`] by `arena_to_schedule` on the index's
+    /// [`ScheduledOp::Gather`] by `lower::arena_to_schedule` on the index's
     /// variance — it lacks the lane binder's bit, so lane 0 *is* the index
     /// and the other lanes are copies of it. A glyph's per-piece table
     /// reads are addressed by its fold's own binder and nothing else, which
@@ -104,7 +105,7 @@ pub enum ScheduledOp {
     Context(u16),
     /// The lane fold's binder: the constant `[0, 1, …, L−1]`. The fold
     /// whose binder this is executes by lanes (its body is inlined into its
-    /// parent's schedule — see `arena_to_schedule`), so the binder is a
+    /// parent's schedule — see `lower::arena_to_schedule`), so the binder is a
     /// leaf here rather than a loop counter. Carries the binder so its
     /// variance bit is the fold's, which is what "lane-uniform" is read off.
     Lanes(Binder),
@@ -129,7 +130,7 @@ pub enum ScheduledOp {
     Seq(ValueId, ValueId),
     /// A surviving bounded fold: `⊕` over `fold`'s visited indices, whose
     /// body is the value named by the second field — in *this schedule's*
-    /// numbering (`arena_to_schedule` maps it like any other child), before
+    /// numbering (`lower::arena_to_schedule` maps it like any other child), before
     /// `extract_folds` carves the body out into its own
     /// [`ScopeFold`]. Kept only so `schedule_variance` can look
     /// the body's variance up (`Reduce`'s own result is the body's variance
