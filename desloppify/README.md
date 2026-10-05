@@ -1,11 +1,11 @@
 # desloppify
 
-Rule-driven code review. tree-sitter finds the code, a rate-limited agent
+Rule-driven code review. tree-sitter finds the code, an agent
 ([rig](https://github.com/0xPlaygrounds/rig)) reviews it.
 
 ```bash
 ANTHROPIC_API_KEY=... cargo run -p desloppify -- path/to/src
-GEMINI_API_KEY=...    cargo run -p desloppify -- --provider gemini --rpm 30 path/to/src
+GEMINI_API_KEY=...    cargo run -p desloppify -- --provider gemini path/to/src
 ```
 
 Prints `path:line: [rule] message` per finding; exits non-zero on any finding
@@ -29,6 +29,19 @@ or any snippet that could not be reviewed.
 | 4 | Fable | 3 Pro |
 
 The ladder is `Provider::model` in `src/model.rs`.
+
+## Retries — `src/rate_limit.rs`
+
+```rust
+pub trait RateLimiter: Send + Sync {
+    fn on_error(&self, error: &(dyn Error + Send + Sync + 'static)) -> Option<Duration>;
+}
+```
+
+After a failed call: `Some(wait)` retries after `wait`, `None` gives up and
+reports the error. `TokenBucket` is the one impl: each retry takes a token
+(`--retry-burst`, refilled one per `--retry-refill-secs`), and a retry that
+would wait past `--retry-max-wait-secs` gives up.
 
 ## Skills — `skills/<name>/SKILL.md`
 

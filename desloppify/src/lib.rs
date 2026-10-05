@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod language;
 pub mod model;
+pub mod rate_limit;
 pub mod review;
 pub mod rule;
 pub mod skills;

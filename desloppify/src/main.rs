@@ -1,13 +1,14 @@
-use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
 
 use desloppify::agent::Agent;
 use desloppify::model::Provider;
+use desloppify::rate_limit::TokenBucket;
 use desloppify::review::review;
 use desloppify::rule::Rule;
 use desloppify::skills::Skills;
@@ -20,9 +21,15 @@ struct Args {
     paths: Vec<PathBuf>,
     #[arg(long, value_enum, default_value_t = Provider::Anthropic)]
     provider: Provider,
-    /// Most requests sent per minute.
-    #[arg(long, default_value = "50")]
-    rpm: NonZeroU32,
+    /// Retries that may happen back to back.
+    #[arg(long, default_value_t = 10)]
+    retry_burst: u64,
+    /// Seconds to earn back one retry.
+    #[arg(long, default_value_t = 6)]
+    retry_refill_secs: u64,
+    /// Give up on a call rather than wait longer than this for a retry.
+    #[arg(long, default_value_t = 120)]
+    retry_max_wait_secs: u64,
     #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/rules"))]
     rules: PathBuf,
     #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/skills"))]
@@ -34,7 +41,12 @@ async fn main() -> Result<ExitCode> {
     let args = Args::parse();
     let skills = Skills::load(&args.skills)?;
     let rules = Arc::new(Rule::load_dir(&args.rules, &skills)?);
-    let agent = Arc::new(Agent::from_env(args.provider, args.rpm)?);
+    let limiter = TokenBucket::new(
+        args.retry_burst,
+        Duration::from_secs(args.retry_refill_secs),
+        Duration::from_secs(args.retry_max_wait_secs),
+    );
+    let agent = Arc::new(Agent::from_env(args.provider, Box::new(limiter))?);
 
     let mut files = Vec::new();
     for path in &args.paths {
