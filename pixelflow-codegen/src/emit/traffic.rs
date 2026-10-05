@@ -896,14 +896,13 @@ mod tests {
     fn the_scaffolds_traffic_does_not_move_with_the_pool() {
         use crate::emit::tests::schedule_for;
         use crate::emit::{
-            BYTES_PER_LANE, CONST_POOL_ALIGN, IsaBackend, aarch64, avx2, avx512,
-            compile_via_backend,
+            BYTES_PER_LANE, CONST_POOL_ALIGN, IsaBackend, aarch64, avx2, avx512, compile_schedule,
         };
 
         fn traffic<B: IsaBackend>(mut backend: B, arena: &ExprArena, root: ExprId) -> EmitTraffic {
             let lanes = backend.register_file().vector_bytes / BYTES_PER_LANE;
             let schedule = schedule_for(arena, root, SHAPE, lanes);
-            compile_via_backend(schedule, &mut backend)
+            compile_schedule(schedule, &mut backend)
                 .expect("compile")
                 .traffic
         }

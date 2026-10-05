@@ -21,7 +21,7 @@ use crate::program::{Def, ScheduledOp, ValueId};
 ///
 /// To [`operands`](crate::program::operands) a `Reduce` def is a
 /// leaf, and for the registers the def's own instruction reads that is right:
-/// once `extract_folds` has carved a fold's body into a scope of its own, the
+/// once `scopes::extract_folds` has carved a fold's body into a scope of its own, the
 /// def is only where the loop opens. But the loop *runs* there, and its body
 /// reads this scope — a sibling fold's result from its accumulator slot, a
 /// value invariant in the fold from the park this scope leaves it in. Nothing
@@ -40,7 +40,7 @@ use crate::program::{Def, ScheduledOp, ValueId};
 /// here is shared with the outer one too — the edges are transitive by
 /// construction. Every shared id is an edge, a leaf the body rebuilds for
 /// itself included: that over-approximates (such a leaf is kept out of an arm
-/// the fold does not run in), and asks nothing of which values `place_roots`
+/// the fold does not run in), and asks nothing of which values `scopes::place_roots`
 /// later parks and which it leaves to be rebuilt.
 ///
 /// **And what each loop costs.** To the latency table a `Reduce` costs 0 — a

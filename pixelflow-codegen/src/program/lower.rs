@@ -113,7 +113,7 @@ pub(crate) fn arena_to_schedule(
     // Which reads are the same in every lane. A `RawGather` whose index
     // lacks the lane binder's bit is one load broadcast, not a gather; the
     // bit is read here, where the two are split, because the schedule's
-    // own variance (`schedule_variance`) is computed after it is built. No
+    // own variance (`scopes::schedule_variance`) is computed after it is built. No
     // lane fold — a schedule built from an arena `collapse` never wrapped,
     // the emit tests' raw arenas — means nothing is known to be
     // lane-uniform, and every read stays a gather.
@@ -287,7 +287,7 @@ pub(crate) fn arena_to_schedule(
             // A surviving fold: `body` was already walked above (it is an
             // ordinary child, scheduled before its parent by the arena's own
             // topological order), so `map_child(body)` is that per-iteration
-            // value's `ValueId` in *this* numbering. `extract_folds` reads
+            // value's `ValueId` in *this* numbering. `scopes::extract_folds` reads
             // it back out into the fold's own `ScopeFold`; nothing after
             // that resolves it as an operand (see `ScheduledOp::Reduce`).
             ExprNode::Reduce { fold, body } => ScheduledOp::Reduce(fold, map_child(body)),

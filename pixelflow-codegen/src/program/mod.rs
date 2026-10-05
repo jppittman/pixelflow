@@ -11,7 +11,10 @@ pub(crate) mod guards;
 pub(crate) mod layout;
 pub(crate) mod lower;
 pub(crate) mod ownership;
+mod scopes;
 pub(crate) mod tree;
+#[cfg(test)]
+pub(crate) use scopes::lay_out;
 
 use alloc::vec::Vec;
 
@@ -131,10 +134,10 @@ pub enum ScheduledOp {
     /// A surviving bounded fold: `⊕` over `fold`'s visited indices, whose
     /// body is the value named by the second field — in *this schedule's*
     /// numbering (`lower::arena_to_schedule` maps it like any other child), before
-    /// `extract_folds` carves the body out into its own
-    /// [`ScopeFold`]. Kept only so `schedule_variance` can look
+    /// `scopes::extract_folds` carves the body out into its own
+    /// [`ScopeFold`]. Kept only so `scopes::schedule_variance` can look
     /// the body's variance up (`Reduce`'s own result is the body's variance
-    /// with the binder's own bit removed) and so `extract_folds` can find
+    /// with the binder's own bit removed) and so `scopes::extract_folds` can find
     /// the body's closure; the emitter never resolves it as an operand —
     /// the loop's result comes from `regalloc::Allocation::opens_at`
     /// naming the [`Scope::Fold`] this def opens, not from this
@@ -376,9 +379,9 @@ impl IfGuard {
 /// The values an operation reads *as registers*, in operand order.
 ///
 /// A `Reduce` is a leaf here, the same as `Uniform` — by the time one reaches
-/// a schedule this function walks, `extract_folds` has already carved its
+/// a schedule this function walks, `scopes::extract_folds` has already carved its
 /// body out into its own `ScopeFold`; the `ValueId` `ScheduledOp::Reduce`
-/// still carries is `schedule_variance`'s and `extract_folds`'s own concern
+/// still carries is `scopes::schedule_variance`'s and `scopes::extract_folds`'s own concern
 /// (they run before extraction, and after respectively, over different
 /// schedules), never an operand this scope's allocation resolves. What the
 /// loop it opens reads from this scope is a dependency all the same, and the
