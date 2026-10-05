@@ -14,8 +14,6 @@ use alloc::vec::Vec;
 use pixelflow_ir::kind::OpKind;
 use pixelflow_search::egraph::CostModel;
 
-pub use crate::program::IfArm;
-pub(crate) use crate::program::IfGuard;
 use crate::program::{Def, ScheduledOp, ValueId};
 
 /// What each fold a scope opens reads from that scope, keyed by the fold's

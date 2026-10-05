@@ -37,7 +37,7 @@ use alloc::vec::Vec;
 use pixelflow_ir::kind::OpKind;
 use pixelflow_search::egraph::CostModel;
 
-use crate::emit::guards::{FoldReads, def_cycles};
+use crate::program::guards::{FoldReads, def_cycles};
 use crate::program::tree::Tree;
 use crate::program::{Def, IfArm, ScheduledOp, ValueId};
 

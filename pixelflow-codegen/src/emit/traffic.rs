@@ -21,10 +21,10 @@
 //! is written, and a trait method that disappears is a compile error rather
 //! than a silently dropped term.
 
-use super::guards::IfArm;
 use super::regalloc::{NestAllocation, Scope, ValueId};
 use super::{Binding, InstructionPlan, IsaBackend, Loc, PtrReg, Reg, Reload, WritePlan};
 use crate::error::CompileError;
+use crate::program::IfArm;
 use alloc::vec::Vec;
 
 /// Emitted traffic within one scope of the nest.

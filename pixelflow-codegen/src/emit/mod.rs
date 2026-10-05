@@ -69,7 +69,6 @@ pub mod avx512;
 pub(crate) mod coverage;
 pub mod encoded;
 pub mod executable;
-pub(crate) use crate::program::guards;
 pub mod regalloc;
 pub mod storage;
 pub mod traffic;
@@ -81,6 +80,7 @@ pub use storage::{Slot, SourceOperand, StackFrame, Storage, StoreTarget};
 use pixelflow_ir::kind::OpKind;
 
 pub use crate::program::IfArm;
+use crate::program::IfGuard;
 pub use crate::program::ScheduledOp;
 use crate::program::layout::Layout;
 use traffic::{BranchTraffic, Counting, EmitTraffic};
@@ -1463,7 +1463,11 @@ struct MaskTest {
 /// given its table the way a compile gives one.
 #[cfg(test)]
 fn flat_nest(schedule: Vec<regalloc::Def>) -> regalloc::ScopedSchedule {
-    let layout = Layout::of(&schedule, &[], &guards::FoldReads::default());
+    let layout = Layout::of(
+        &schedule,
+        &[],
+        &crate::program::guards::FoldReads::default(),
+    );
     regalloc::ScopedSchedule {
         body: regalloc::ScopeRegion {
             roots: Vec::new(),
@@ -1710,7 +1714,7 @@ fn emit_scope<B: IsaBackend>(
     // `regalloc::Allocation::if_guards`). A root this scope parks is never
     // inside an arm — the analysis was told it is read outside the schedule
     // — so a guard can never skip a park.
-    let if_guards: &[guards::IfGuard] = allocation.if_guards();
+    let if_guards: &[IfGuard] = allocation.if_guards();
     let sched_len = schedule.len();
 
     struct PendingBranch {
@@ -1748,7 +1752,7 @@ fn emit_scope<B: IsaBackend>(
     // `ValueId` rather than its index in `if_guards`, because the node is
     // the identity and the index is a position in a scratch vector — and
     // because two guards can share a mask, so the mask would alias.
-    let arm_join = |guard: &guards::IfGuard, arm: IfArm| {
+    let arm_join = |guard: &IfGuard, arm: IfArm| {
         let if_value = schedule[guard.if_idx].value;
         let side = match arm {
             IfArm::True => "true",
@@ -2785,7 +2789,7 @@ fn scope_schedule(
 /// emitter branches over the same ones.
 ///
 /// What a loop costs, which decides whether an arm owning it pays for a
-/// branch, is made of the loops inside it ([`guards::FoldReads`]), so the
+/// branch, is made of the loops inside it ([`crate::program::guards::FoldReads`]), so the
 /// scopes go innermost first: a fold's index is always above its parent's,
 /// which makes the reverse of nest order a children-before-parents order. A
 /// scope's layout permutes its schedule, and a fold's `at` is a position in
@@ -2799,8 +2803,8 @@ fn lay_out(scoped: &mut regalloc::ScopedSchedule) {
         Scope::Body => 0,
         Scope::Fold(j) => j + 1,
     };
-    let mut reads: Vec<guards::FoldReads> = (0..=scoped.folds.len())
-        .map(|_| guards::FoldReads::default())
+    let mut reads: Vec<crate::program::guards::FoldReads> = (0..=scoped.folds.len())
+        .map(|_| crate::program::guards::FoldReads::default())
         .collect();
     for scope in (0..scoped.folds.len())
         .rev()
@@ -2812,7 +2816,7 @@ fn lay_out(scoped: &mut regalloc::ScopedSchedule) {
             Scope::Body => (&nest.body.schedule, &nest.body.roots),
             Scope::Fold(j) => (&nest.folds[j].schedule, &nest.folds[j].roots),
         };
-        let opened = guards::FoldReads::new(
+        let opened = crate::program::guards::FoldReads::new(
             schedule,
             nest.folds
                 .iter()
@@ -5738,7 +5742,7 @@ mod tests {
         /// of the scope that actually branches.
         fn guarded_scope(
             nest: &regalloc::NestAllocation,
-        ) -> Option<(regalloc::Allocation<'_>, guards::IfGuard)> {
+        ) -> Option<(regalloc::Allocation<'_>, IfGuard)> {
             let scopes = core::iter::once(regalloc::Scope::Body)
                 .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
             scopes.map(|s| nest.scope(s)).find_map(|view| {
@@ -6013,7 +6017,11 @@ mod tests {
             let mut a = ExprArena::new();
             let (root, _outer, _inner) = nested_guarded_ifs(&mut a);
             let schedule = native_schedule(&a, root, POINT);
-            let layout = Layout::of(&schedule, &[], &guards::FoldReads::default());
+            let layout = Layout::of(
+                &schedule,
+                &[],
+                &crate::program::guards::FoldReads::default(),
+            );
             assert!(
                 !layout.is_identity(),
                 "the arms were already runs as written, which this fixture is not"

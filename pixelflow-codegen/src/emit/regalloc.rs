@@ -12,8 +12,8 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::guards::IfGuard;
 use super::{Gpr, KReg, OperandSource, PtrReg, Reg, ScheduledOp, operand_sources, reloads_wanted};
+use crate::program::IfGuard;
 pub use crate::program::{Class, Def, Scope, ScopeFold, ScopeRegion, ScopedSchedule, ValueId};
 pub(crate) use crate::program::{all_operands, operands, pointer_operand, structural_children};
 
