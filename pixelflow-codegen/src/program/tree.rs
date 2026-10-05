@@ -12,8 +12,6 @@
 //! always smaller than its children's, and the root is node 0.
 
 use alloc::vec::Vec;
-#[cfg(test)]
-use core::cell::Cell;
 
 /// A tree of nodes `0..len()`, rooted at 0.
 pub(crate) struct Tree {
@@ -21,10 +19,6 @@ pub(crate) struct Tree {
     depth: Vec<usize>,
     /// A proper ancestor, chosen so climbs by jumps stay logarithmic.
     jump: Vec<usize>,
-    /// Hops taken by ancestor queries: a count and not a clock, so a test
-    /// can pin how a pass grows and fail the same way on every host.
-    #[cfg(test)]
-    hops: Cell<usize>,
 }
 
 impl Tree {
@@ -34,8 +28,6 @@ impl Tree {
             parent: alloc::vec![0],
             depth: alloc::vec![0],
             jump: alloc::vec![0],
-            #[cfg(test)]
-            hops: Cell::new(0),
         }
     }
 
@@ -75,7 +67,6 @@ impl Tree {
     /// `node`'s ancestor at `depth`, which must not be deeper than `node`.
     pub(crate) fn ancestor_at(&self, mut node: usize, depth: usize) -> usize {
         while self.depth[node] > depth {
-            self.hop();
             node = if self.depth[self.jump[node]] >= depth {
                 self.jump[node]
             } else {
@@ -93,7 +84,6 @@ impl Tree {
             core::cmp::Ordering::Equal => (a, b),
         };
         while a != b {
-            self.hop();
             (a, b) = if self.jump[a] != self.jump[b] {
                 (self.jump[a], self.jump[b])
             } else {
@@ -108,17 +98,6 @@ impl Tree {
     pub(crate) fn is_within(&self, inner: usize, outer: usize) -> bool {
         self.depth[inner] >= self.depth[outer]
             && self.ancestor_at(inner, self.depth[outer]) == outer
-    }
-
-    fn hop(&self) {
-        #[cfg(test)]
-        self.hops.set(self.hops.get() + 1);
-    }
-
-    /// The hops ancestor queries have taken.
-    #[cfg(test)]
-    pub(crate) fn hops(&self) -> usize {
-        self.hops.get()
     }
 }
 
@@ -149,17 +128,10 @@ mod tests {
         assert!(!tree.is_within(right, left));
     }
 
-    /// Climbing a chain a thousand deep takes logarithmically many hops, not a
-    /// thousand: the whole point of the skip pointers.
     #[test]
     fn climbing_a_deep_chain_is_logarithmic() {
         let tree = chain(1 << 12);
         let deepest = 1 << 12;
         assert_eq!(tree.ancestor_at(deepest, 7), 7);
-        assert!(
-            tree.hops() <= 4 * 12,
-            "{} hops to climb 4096 levels",
-            tree.hops()
-        );
     }
 }

@@ -6963,17 +6963,14 @@ mod tests {
     /// a main fold and a remainder fold and the `Reduce` that varies with the
     /// column is carved into both.
     ///
-    /// Three instruments live here, each answering a different question of
+    /// Two instruments live here, each answering a different question of
     /// the same kernels: [`the_sibling_fold_rows_emit_the_recorded_bytes_on_every_backend`]
-    /// (did any byte move, on any of the three emitters, from any host),
+    /// (did any byte move, on any of the three emitters, from any host) and
     /// [`sibling_column_folds_share_a_reduce_and_its_slots`] (the slot
     /// aliasing those folds have today, which is byte-visible and must be
-    /// reproduced or deliberately changed) and the `#[ignore]`d
-    /// `sibling_scopes_allocation` (what scoping and allocation cost as the
-    /// folds multiply).
+    /// reproduced or deliberately changed).
     mod sibling_folds {
         use super::*;
-        use crate::alloc_probe::{self, Measured};
         use regalloc::RegisterAllocator;
 
         /// The kernels, from `tests/support`; `examples/byte_probe.rs`
@@ -7547,122 +7544,6 @@ mod tests {
                         );
                     }
                 }
-            }
-        }
-
-        /// `folds` independent surviving folds on one binder slot, each over
-        /// `defs` values that vary with the column, summed.
-        ///
-        /// Each fold is seeded by a constant of its own (one root per fold)
-        /// and then alternates a product with `x` and a sum with the binder,
-        /// so no two folds share a body and nothing is for the optimizer to
-        /// factor. `n = folds · (defs + 1)` is proportional to `folds`.
-        fn sibling_scopes(folds: u32, defs: u32) -> (ExprArena, ExprId) {
-            use pixelflow_ir::fold::{Binder, Fold, Monoid};
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let binder = Binder::from_slot(0).expect("slot 0 exists");
-            let i = a.push_var(binder.var());
-            let results: Vec<ExprId> = (0..folds)
-                .map(|k| {
-                    let mut t = a.push_const(1.0 + k as f32);
-                    for step in 0..defs {
-                        let other = if step % 2 == 0 { x } else { i };
-                        let op = if step % 2 == 0 {
-                            OpKind::Mul
-                        } else {
-                            OpKind::Add
-                        };
-                        t = a.push_binary(op, t, other);
-                    }
-                    a.push_reduce(Fold::new(Monoid::SUM, binder, 0..2), t)
-                })
-                .collect();
-            // Summed pairwise, so a thousand folds is ten levels, not a
-            // thousand-deep chain for a recursive pass to walk.
-            let mut layer = results;
-            while layer.len() > 1 {
-                layer = layer
-                    .chunks(2)
-                    .map(|pair| match pair {
-                        [left, right] => a.push_binary(OpKind::Add, *left, *right),
-                        [alone] => *alone,
-                        _ => unreachable!("chunks(2) yields one or two"),
-                    })
-                    .collect();
-            }
-            (a, layer[0])
-        }
-
-        /// Values per fold in [`sibling_scopes_allocation`].
-        const DEFS_PER_FOLD: u32 = 8;
-
-        /// What the scoping and allocation stages ask of the heap as the
-        /// folds multiply, printed as a table: the baseline a change to
-        /// either is judged against.
-        ///
-        /// Not a gate (`#[ignore]`, and it asserts only that the instrument
-        /// sees what it counts): run it with
-        /// `cargo test --release -p pixelflow-codegen --lib sibling_scopes_allocation -- --ignored --nocapture`.
-        /// Per stage: bytes requested, allocations, and peak net growth
-        /// ([`alloc_probe`]'s definitions). `schedule` is lowering; `scope` is
-        /// [`regalloc::ScopedSchedule::from_schedule`], whose input is cloned
-        /// outside the scope and freed inside it (so its peak is net of that
-        /// input); `allocate` is `LinearScan::allocate_nest` over the scoped
-        /// nest, likewise; `emit` is the whole [`compile_schedule`] (scoping,
-        /// allocation and emission; the schedule it is given is not counted).
-        #[test]
-        #[ignore = "a measurement, not a check: run with --ignored --nocapture"]
-        fn sibling_scopes_allocation() {
-            let shape = LatticeShape::new([Target::Avx2.lanes(), 1]);
-            let lanes = Target::Avx2.lanes();
-            println!(
-                "{:>6} {:>7} {:>6}  {:>26} {:>26} {:>26} {:>26}",
-                "folds", "defs", "scopes", "schedule", "scope", "allocate", "emit"
-            );
-            println!(
-                "{:>22}  (each: requested bytes / allocations / peak bytes)",
-                ""
-            );
-            for folds in [16u32, 64, 256, 1024] {
-                let (a, root) = sibling_scopes(folds, DEFS_PER_FOLD);
-                let file = avx2::driver::Avx2Backend::new(EmitCtx::default()).register_file();
-
-                let (schedule, lowered) =
-                    alloc_probe::measure(|| schedule_for(&a, root, shape, lanes));
-                let defs = schedule.len();
-                let (scoped, scoping) = alloc_probe::measure({
-                    let schedule = schedule.clone();
-                    || regalloc::ScopedSchedule::from_schedule(schedule)
-                });
-                let scopes = scoped.folds.len() + 1;
-                let (nest, allocation) =
-                    alloc_probe::measure(|| regalloc::LinearScan.allocate_nest(scoped, &file));
-                assert_eq!(nest.fold_count() + 1, scopes);
-                let ((), emission) = alloc_probe::measure(|| {
-                    let mut backend = avx2::driver::Avx2Backend::new(EmitCtx::default());
-                    compile_schedule(schedule.clone(), &mut backend).expect("the fixture compiles");
-                });
-
-                // Sees what it counts: scoping copies every def at least once
-                // into the scope that holds it.
-                let floor = defs * core::mem::size_of::<regalloc::Def>();
-                assert!(
-                    scoping.requested >= floor,
-                    "scoping {folds} folds requested {} bytes, fewer than the {floor} its \
-                     {defs} defs occupy: the probe is not seeing the stage",
-                    scoping.requested
-                );
-
-                let cell =
-                    |m: Measured| format!("{} / {} / {}", m.requested, m.allocations, m.peak);
-                println!(
-                    "{folds:>6} {defs:>7} {scopes:>6}  {:>26} {:>26} {:>26} {:>26}",
-                    cell(lowered),
-                    cell(scoping),
-                    cell(allocation),
-                    cell(emission)
-                );
             }
         }
     }

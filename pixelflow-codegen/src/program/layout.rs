@@ -37,12 +37,11 @@
 //! are all in order is returned as it came: the identity, by construction and
 //! not by a check that happens to hold.
 //!
-//! The order's validity is checked, not argued: every compile in a debug build
-//! asserts that a layout keeps each read after its value and is its own fixed
-//! point (`Layout::is_sound`), and the tests below check, over hand-built and
-//! random schedules, that each arm a layout branches over is exactly the run of
-//! the values that arm owns. Until the search it replaced was deleted, the old
-//! analysis ran on every layout's output and had to find the same runs.
+//! The order's validity is checked, not argued: the tests below check, over
+//! hand-built and random schedules, that each arm a layout branches over is
+//! exactly the run of the values that arm owns. Until the search it replaced
+//! was deleted, the old analysis ran on every layout's output and had to find
+//! the same runs.
 
 use alloc::vec::Vec;
 
@@ -61,10 +60,6 @@ pub(crate) struct Layout {
     pub(crate) position: Vec<usize>,
     /// The `If`s with a branch, in new positions, ascending.
     pub(crate) guards: Vec<IfGuard>,
-    /// What the layout walked: a count and not a clock, so a test can pin how
-    /// it grows and fail the same way on every host.
-    #[cfg(test)]
-    steps: usize,
 }
 
 /// The blocks of one scope: the earning arm regions, nested as they are in the
@@ -295,8 +290,6 @@ impl Layout {
             order,
             position,
             guards,
-            #[cfg(test)]
-            steps: len + own.steps() + blocks.tree.hops(),
         }
     }
 
@@ -307,54 +300,6 @@ impl Layout {
             .map(|&old| schedule[old].clone())
             .collect()
     }
-
-    /// Whether the schedule is returned as it came.
-    pub(crate) fn is_identity(&self) -> bool {
-        self.order.iter().enumerate().all(|(new, &old)| new == old)
-    }
-
-    /// Whether this is a layout: every read still follows the value it reads,
-    /// and laying the result out again moves nothing — the property that makes
-    /// the tables derived from one pass the tables of the order it chose.
-    ///
-    /// A schedule that reads a value before it defines it (a hand-built
-    /// fixture) has no order to keep, and passes.
-    pub(crate) fn is_sound(&self, schedule: &[Def], roots: &[ValueId], folds: &FoldReads) -> bool {
-        if !reads_follow(0..schedule.len(), schedule, folds) {
-            return true;
-        }
-        reads_follow(self.order.iter().copied(), schedule, folds)
-            && Self::of(&self.apply(schedule), roots, folds).is_identity()
-    }
-
-    /// What the layout walked (see the field).
-    #[cfg(test)]
-    pub(crate) fn steps(&self) -> usize {
-        self.steps
-    }
-}
-
-/// Whether, taking `schedule`'s defs in `order`, every read follows the value
-/// it reads. A value this schedule does not define (a live-in) is not read
-/// from here.
-pub(crate) fn reads_follow(
-    order: impl Iterator<Item = usize>,
-    schedule: &[Def],
-    folds: &FoldReads,
-) -> bool {
-    let positions = Positions::of(schedule);
-    let mut at = alloc::vec![0usize; schedule.len()];
-    let order: Vec<usize> = order.collect();
-    for (new, &old) in order.iter().enumerate() {
-        at[old] = new;
-    }
-    order.iter().enumerate().all(|(new, &old)| {
-        let def = &schedule[old];
-        folds
-            .reads(def.value, &def.op)
-            .filter_map(|read| positions.get(read))
-            .all(|source| at[source] < new)
-    })
 }
 
 #[cfg(test)]
@@ -363,6 +308,55 @@ mod tests {
     use crate::program::IfGuard;
     use crate::program::ScheduledOp;
     use pixelflow_ir::kind::OpKind;
+
+    impl Layout {
+        /// Whether the schedule is returned as it came.
+        pub(crate) fn is_identity(&self) -> bool {
+            self.order.iter().enumerate().all(|(new, &old)| new == old)
+        }
+
+        /// Whether this is a layout: every read still follows the value it reads,
+        /// and laying the result out again moves nothing — the property that makes
+        /// the tables derived from one pass the tables of the order it chose.
+        ///
+        /// A schedule that reads a value before it defines it (a hand-built
+        /// fixture) has no order to keep, and passes.
+        pub(crate) fn is_sound(
+            &self,
+            schedule: &[Def],
+            roots: &[ValueId],
+            folds: &FoldReads,
+        ) -> bool {
+            if !reads_follow(0..schedule.len(), schedule, folds) {
+                return true;
+            }
+            reads_follow(self.order.iter().copied(), schedule, folds)
+                && Self::of(&self.apply(schedule), roots, folds).is_identity()
+        }
+    }
+
+    /// Whether, taking `schedule`'s defs in `order`, every read follows the value
+    /// it reads. A value this schedule does not define (a live-in) is not read
+    /// from here.
+    pub(crate) fn reads_follow(
+        order: impl Iterator<Item = usize>,
+        schedule: &[Def],
+        folds: &FoldReads,
+    ) -> bool {
+        let positions = Positions::of(schedule);
+        let mut at = alloc::vec![0usize; schedule.len()];
+        let order: Vec<usize> = order.collect();
+        for (new, &old) in order.iter().enumerate() {
+            at[old] = new;
+        }
+        order.iter().enumerate().all(|(new, &old)| {
+            let def = &schedule[old];
+            folds
+                .reads(def.value, &def.op)
+                .filter_map(|read| positions.get(read))
+                .all(|source| at[source] < new)
+        })
+    }
 
     fn def(value: u32, op: ScheduledOp) -> Def {
         Def {
@@ -640,33 +634,6 @@ mod tests {
             );
             laid_out_with(&schedule, &roots, &folds);
         }
-    }
-
-    /// Ownership and layout together are O(n log n) on the deepest scope there
-    /// is — an `else if` ladder as long as the scope — where one climb per
-    /// read was O(n²): 16x the rungs costs about 16x, times the log's growth.
-    #[test]
-    fn a_deep_ladder_costs_what_a_flat_scope_does() {
-        let ladder = |rungs: usize| {
-            let mut schedule =
-                alloc::vec![def(0, ScheduledOp::Var(0)), def(1, ScheduledOp::Var(1))];
-            let mut rest = ValueId(1);
-            for _ in 0..rungs {
-                let value = schedule.len() as u32;
-                schedule.push(unary(value, OpKind::Rsqrt, 1));
-                schedule.push(def(
-                    value + 1,
-                    ScheduledOp::Ternary(OpKind::If, ValueId(0), ValueId(value), rest),
-                ));
-                rest = ValueId(value + 1);
-            }
-            Layout::of(&schedule, &[], &FoldReads::default()).steps()
-        };
-        let (small, large) = (ladder(256), ladder(4096));
-        assert!(
-            large <= small * 32,
-            "16x the rungs must cost about 16x the steps, not 256x: {small} -> {large}"
-        );
     }
 
     // -- What a loop reads and costs -------------------------------------

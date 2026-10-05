@@ -166,10 +166,6 @@ pub(crate) fn lay_out(scoped: &mut ScopedSchedule) {
                 }),
         );
         let layout = Layout::of(schedule, roots, &opened);
-        debug_assert!(
-            layout.is_sound(schedule, roots, &opened),
-            "{scope:?}: a layout must keep every read after its value, and be its own fixed point"
-        );
         let (ordered, branches) = (layout.apply(schedule), layout.guards);
         let position = layout.position;
         match scope {

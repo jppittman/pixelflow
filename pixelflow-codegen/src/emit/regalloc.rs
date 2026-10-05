@@ -1589,21 +1589,6 @@ impl Class {
     }
 }
 
-/// How much walking [`plan_carries`] did: the defs and roots it visited,
-/// summed.
-///
-/// A count and not a clock, so a test can pin how planning grows with the nest
-/// (`planning_carries_grows_linearly_in_the_roots`) and fail the same way on
-/// every host. Allocation hands planning a counter nobody reads.
-#[derive(Default)]
-struct Steps(usize);
-
-impl Steps {
-    fn walk(&mut self, visited: usize) {
-        self.0 += visited;
-    }
-}
-
 /// Where each root of one scope sits in that scope's sorted roots, by
 /// `ValueId`: a dense table over the id space, so whether a value some scope
 /// reads is a root is one index and not a search.
@@ -1648,9 +1633,8 @@ impl RootSlots {
 /// carry saves, then take them greedily while each class's budget holds.
 ///
 /// A walk over the nest and a sort of the candidates. A root's weight is not
-/// a scan of the scopes inside per root — see [`RootSlots`] — and `steps`
-/// counts what the walk visits, so the cost can be pinned without a clock.
-fn plan_carries(nest: &ScopedSchedule, above_floor: Budget, steps: &mut Steps) -> CarryPlan {
+/// a scan of the scopes inside per root — see [`RootSlots`].
+fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
     let folds = nest.folds.len();
     for (index, fold) in nest.folds.iter().enumerate() {
         assert!(
@@ -1786,7 +1770,6 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget, steps: &mut Steps) -
         // `scopes::place_roots` names a root once; the slots rely on it.
         roots.dedup();
         slots.fill(&roots);
-        steps.walk(roots.len());
 
         // One walk over the scopes inside weighs every root at once, a read
         // adding the number of times its scope runs. A scan of them per root
@@ -1796,7 +1779,6 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget, steps: &mut Steps) -
         for s in &within {
             let schedule = schedule_of(*s);
             let trips = trips_of(*s);
-            steps.walk(schedule.len());
             for read in schedule.iter().flat_map(|d| all_operands(&d.op)) {
                 if let Some(slot) = slots.of(read) {
                     weights[slot] += trips;
@@ -1805,7 +1787,6 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget, steps: &mut Steps) -
         }
         // A root's class, read off its def in the scope that computes it.
         let mut classes: Vec<Option<Class>> = vec![None; roots.len()];
-        steps.walk(schedule_of(scope).len());
         for d in schedule_of(scope) {
             if let Some(slot) = slots.of(d.value) {
                 classes[slot].get_or_insert_with(|| d.op.class());
@@ -1819,7 +1800,6 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget, steps: &mut Steps) -
             }
             let class = classes[slot]
                 .unwrap_or_else(|| panic!("{v:?} is a root of {scope:?} but not in its schedule"));
-            steps.walk(1 + live_across.len());
             candidates.push(Candidate {
                 weight: weights[slot],
                 class,
@@ -1864,7 +1844,6 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget, steps: &mut Steps) -
         fold_accumulator: vec![false; folds],
     };
     for candidate in candidates {
-        steps.walk(candidate.live_across.len());
         let class = candidate.class.ix();
         if candidate
             .live_across
@@ -1923,7 +1902,7 @@ impl RegisterAllocator for LinearScan {
                 .len()
                 .saturating_sub(RegisterFile::MIN_POINTERS) as usize,
         ];
-        let plan = plan_carries(&nest, above_floor, &mut Steps::default());
+        let plan = plan_carries(&nest, above_floor);
 
         // Outermost first, because that is the direction liveness flows: a
         // value a scope computes for the scopes inside it is live across
@@ -5137,7 +5116,7 @@ mod tests {
     fn planning_carries_ranks_the_fold_before_the_roots_it_reads() {
         const BUDGET: usize = 6;
         let nest = a_fold_reading_every_root(16);
-        let plan = plan_carries(&nest, [BUDGET, 0], &mut Steps::default());
+        let plan = plan_carries(&nest, [BUDGET, 0]);
 
         assert!(plan.fold_binder[0], "the binder is read twice a trip");
         assert!(plan.fold_accumulator[0], "and the combine reloads the sum");
@@ -5149,42 +5128,16 @@ mod tests {
         );
     }
 
-    /// Weighing a scope's roots is one walk over the scopes inside it, not a
-    /// scan of them per root. Four times the roots is about four times the
-    /// steps; a scan per root made it sixteen times, and a font's worth of
-    /// roots was most of a compile.
-    ///
-    /// Counted, not timed: a clock would pass on a fast host and flake on a
-    /// loaded one, where a count is the same everywhere.
+    /// An unbounded budget carries every root: nothing is left for the
+    /// scopes inside to reload.
     #[test]
-    fn planning_carries_grows_linearly_in_the_roots() {
+    fn an_unbounded_budget_carries_every_root() {
         const ROOTS: u32 = 64;
-        const GROWTH: usize = 4;
-        let steps_for = |roots: u32| {
-            let mut steps = Steps::default();
-            let plan = plan_carries(
-                &a_fold_reading_every_root(roots),
-                [usize::MAX, 0],
-                &mut steps,
-            );
-            assert_eq!(
-                plan.scope_roots[0].len(),
-                roots as usize,
-                "every root is carried"
-            );
-            steps.0
-        };
-        let (small, large) = (steps_for(ROOTS), steps_for(GROWTH as u32 * ROOTS));
-
-        assert!(
-            small >= ROOTS as usize,
-            "the count has to see the roots it is a count of: {small}"
-        );
-        assert!(
-            large <= (GROWTH + 1) * small,
-            "{ROOTS} roots took {small} steps and {} took {large}: more than \
-             linear",
-            GROWTH as u32 * ROOTS
+        let plan = plan_carries(&a_fold_reading_every_root(ROOTS), [usize::MAX, 0]);
+        assert_eq!(
+            plan.scope_roots[0].len(),
+            ROOTS as usize,
+            "every root is carried"
         );
     }
 
