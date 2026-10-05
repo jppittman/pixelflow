@@ -115,7 +115,9 @@ assembly is not context-sensitive and there is nothing to nest.
   is that instruction's argument, like a register or an immediate. So positions
   are items and references are fields; two relationships, two spellings.
 - **A branch is an ordinary instruction.** `struct Jmp { target }`,
-  `struct Jcc { condition, target }` on x86; `B`, `BCond`, `CbzW16` on aarch64 —
+  `struct Jcc { condition, target }` on x86; `B`, `BCond`, `CbzW16` on aarch64
+  (*2026-10-05: `CbzW16` is now `BranchIfW16Zero`, a fixed two-word
+  `cbnz w16, .+8; b target` — `CBZ`'s ±1 MiB did not reach an arm that long*) —
   each an `AsmInsn` like any other, wrapped by the backend's `Inst` enum exactly
   as `MovLoadPtr` already was. `AsmInsn::label_ref` is the one method that was
   added: it says which label the instruction is waiting on and how to fill in
