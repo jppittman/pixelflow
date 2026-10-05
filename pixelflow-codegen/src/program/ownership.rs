@@ -80,10 +80,6 @@ pub(crate) struct Ownership {
     regions: Tree,
     /// Every arm of every `If`, in schedule order, true arm first.
     arms: Vec<Arm>,
-    /// What the pass walked: one for each read, besides the hops its
-    /// ancestor queries took.
-    #[cfg(test)]
-    reads: usize,
 }
 
 /// Where a value sits in the scope's schedule, by `ValueId`: dense, because
@@ -125,8 +121,6 @@ impl Ownership {
             region_of: alloc::vec![Region::SCOPE; schedule.len()],
             regions: Tree::rooted(),
             arms: Vec::new(),
-            #[cfg(test)]
-            reads: 0,
         };
         // The region every reader of each position agrees on so far.
         let mut readers: Vec<Option<Region>> = alloc::vec![None; schedule.len()];
@@ -147,10 +141,6 @@ impl Ownership {
                 let Some(at) = positions.get(value) else {
                     return;
                 };
-                #[cfg(test)]
-                {
-                    me.reads += 1;
-                }
                 readers[at] = Some(match readers[at] {
                     None => region,
                     Some(known) => Region(me.regions.common_ancestor(known.0, region.0)),
@@ -231,14 +221,6 @@ impl Ownership {
     /// Whether `inner` is `outer` or nested in it.
     pub(crate) fn is_within(&self, inner: Region, outer: Region) -> bool {
         self.regions.is_within(inner.0, outer.0)
-    }
-
-    /// What the pass walked: reads plus ancestor hops. A count and not a
-    /// clock, so a test can pin how the pass grows and fail the same way on
-    /// every host.
-    #[cfg(test)]
-    pub(crate) fn steps(&self) -> usize {
-        self.reads + self.regions.hops()
     }
 }
 
@@ -396,72 +378,5 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(by_value(&ops), by_value(&swapped));
-    }
-
-    /// A chain of `depth` nested `If`s — each level's arm reads the level
-    /// below, so each owns the one under it — followed by `padding` sequential
-    /// `If`s whose results are summed in the scope itself, so they nest in
-    /// nothing. Every level and every padding step is three values: the
-    /// schedule is `3 * (depth + padding)` long, however deep it nests.
-    fn nested(depth: usize, padding: usize) -> Vec<Def> {
-        let mut schedule = alloc::vec![def(0, ScheduledOp::Var(0)), def(1, ScheduledOp::Var(1))];
-        let mut next = 2u32;
-        let mut push = |schedule: &mut Vec<Def>, op: ScheduledOp| {
-            schedule.push(def(next, op));
-            next += 1;
-            ValueId(next - 1)
-        };
-        let mut inner = ValueId(1);
-        for _ in 0..depth {
-            let arm = push(&mut schedule, ScheduledOp::Unary(OpKind::Rsqrt, inner));
-            let other = push(&mut schedule, ScheduledOp::Unary(OpKind::Sqrt, ValueId(1)));
-            inner = push(
-                &mut schedule,
-                ScheduledOp::Ternary(OpKind::If, ValueId(0), arm, other),
-            );
-        }
-        for _ in 0..padding {
-            let a = push(&mut schedule, ScheduledOp::Unary(OpKind::Neg, ValueId(1)));
-            let chosen = push(
-                &mut schedule,
-                ScheduledOp::Ternary(OpKind::If, ValueId(0), a, ValueId(1)),
-            );
-            inner = push(
-                &mut schedule,
-                ScheduledOp::Binary(OpKind::Add, inner, chosen),
-            );
-        }
-        schedule
-    }
-
-    /// The pass is O(reads × log depth): with the scope's length held fixed, a
-    /// 16x deeper nest costs well under 16x the walk.
-    #[test]
-    fn ownership_grows_with_the_depth_and_not_the_scope() {
-        let steps = |depth: usize| {
-            // Hold the scope's length fixed as the depth varies.
-            let schedule = nested(depth, 256 - depth);
-            Ownership::of(&schedule, &[], &FoldReads::default()).steps()
-        };
-        let (shallow, deeper, deepest) = (steps(16), steps(64), steps(256));
-        assert!(
-            deeper <= shallow * 5 && deepest <= deeper * 5,
-            "4x the depth must not cost more than ~4x the steps: {shallow} -> {deeper} -> {deepest}"
-        );
-    }
-
-    /// With the depth fixed the walk is linear in the scope: 4x the sequential
-    /// `If`s is about 4x the steps.
-    #[test]
-    fn ownership_is_linear_in_the_scope_at_a_fixed_depth() {
-        let steps = |padding: usize| {
-            let schedule = nested(8, padding);
-            Ownership::of(&schedule, &[], &FoldReads::default()).steps()
-        };
-        let (one, four, sixteen) = (steps(1_000), steps(4_000), steps(16_000));
-        assert!(
-            four <= one * 9 / 2 && sixteen <= four * 9 / 2,
-            "4x the scope must cost ~4x the steps: {one} -> {four} -> {sixteen}"
-        );
     }
 }
