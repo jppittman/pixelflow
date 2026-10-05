@@ -79,22 +79,20 @@ pub use storage::{Slot, SourceOperand, StackFrame, Storage, StoreTarget};
 
 use pixelflow_ir::kind::OpKind;
 
+// The driver lives in pipeline.rs; these two keep their public paths.
+pub use crate::pipeline::{compile, origin};
 pub use crate::program::IfArm;
 use crate::program::IfGuard;
 pub use crate::program::ScheduledOp;
 #[cfg(test)]
 use crate::program::layout::Layout;
-use crate::program::lower::arena_to_schedule;
 use traffic::{BranchTraffic, Counting, EmitTraffic};
 
 use alloc::vec::Vec;
 
 use crate::error::CompileError;
 use crate::isa::Isa;
-use pixelflow_ir::arena::{UniformDecl, UniformId, UniformIdentity};
 use pixelflow_ir::fold::{Binder, Monoid};
-use pixelflow_ir::passes::lattice::{Collapse, Domain};
-use pixelflow_ir::variance::LatticeShape;
 
 /// The one contract every backend's instruction types satisfy.
 pub trait AsmInsn: Copy {
@@ -1136,85 +1134,7 @@ impl EmitCtx {
             max_regs: Some(max_regs),
         }
     }
-
-    /// Compile an [`ExprArena`] DAG under this configuration.
-    ///
-    /// The configured spelling of [`compile`]. It is a method rather than a
-    /// `compile_with_ctx` free function because the suffix was only ever
-    /// standing in for a receiver: the config is the thing that varies, so the
-    /// config is what should be on the left.
-    ///
-    /// # Errors
-    ///
-    /// If the arena contains a construct no pass can lower, or the emitter
-    /// cannot allocate a frame for it.
-    pub fn compile(
-        self,
-        arena: &pixelflow_ir::arena::ExprArena,
-        root: pixelflow_ir::arena::ExprId,
-        shape: LatticeShape,
-    ) -> Result<CompileResult, CompileError> {
-        let lanes = native_register_file(self.clone()).vector_bytes / BYTES_PER_LANE;
-        let collapse = Collapse {
-            domain: Domain {
-                shape,
-                origin: origin(),
-            },
-            lanes,
-        };
-        let (arena, root) = pixelflow_ir::passes::legalize(arena, root, &collapse)
-            .map_err(CompileError::Legalize)?;
-        let origin_ids = origin_slots(&arena);
-        let schedule = arena_to_schedule(&arena, root, origin_ids);
-        compile_native(regalloc::ScopedSchedule::from_schedule(schedule), self)
-    }
 }
-
-/// A lane is one `f32`.
-const BYTES_PER_LANE: u32 = 4;
-
-/// The two per-call scalars every collapse reads: where the lattice's sample
-/// `(0, 0)` lies, `x0` then `y0`.
-///
-/// Declared as uniforms by `passes::lattice::collapse`, so the arena names
-/// them the way it names any per-call scalar and the emitter loads them the
-/// way it loads any uniform — once per call, broadcast. What is particular
-/// to them is *where*: not in the link's block, whose layout is the
-/// caller's, but in a block of their own, the context entry after the
-/// link's (see [`KernelFn`](executable::KernelFn)). One identity per axis for
-/// the whole process, minted once, so every arena declares the same two
-/// instances and [`origin_slots`] can find them by identity afterwards.
-pub fn origin() -> [UniformDecl; 2] {
-    static ORIGIN: std::sync::OnceLock<[UniformDecl; 2]> = std::sync::OnceLock::new();
-    *ORIGIN.get_or_init(|| {
-        [0.0, 0.0].map(|default| UniformDecl {
-            id: UniformIdentity::mint(),
-            default,
-        })
-    })
-}
-
-/// The uniform slots [`origin`]'s two instances hold in a legalized arena —
-/// the two `passes::lattice::collapse` declared, which is why they are always
-/// present.
-fn origin_slots(arena: &pixelflow_ir::arena::ExprArena) -> [UniformId; 2] {
-    origin().map(|decl| {
-        let slot = arena
-            .uniforms()
-            .iter()
-            .position(|d| d.id == decl.id)
-            .unwrap_or_else(|| panic!("a legalized arena declares the origin; this one does not"));
-        UniformId(slot as u64)
-    })
-}
-
-// =============================================================================
-// Functional Emitter (x86-64)
-// =============================================================================
-
-// =============================================================================
-// High-level API
-// =============================================================================
 
 /// Compile result with metadata for ML training.
 ///
@@ -2742,7 +2662,7 @@ fn location_of(locs: &[Option<Binding>], vid: regalloc::ValueId) -> Binding {
 ///
 /// Genuinely host-bound code lives in [`executable`] (the `KernelFn` ABI types
 /// and the `mmap`/`mprotect` that makes bytes callable) and nowhere else.
-fn compile_native(
+pub(crate) fn compile_native(
     program: regalloc::ScopedSchedule,
     ctx: EmitCtx,
 ) -> Result<CompileResult, CompileError> {
@@ -2757,48 +2677,12 @@ fn compile_native(
 /// width a kernel is legalized at before it is scheduled, and what the
 /// allocator's tests allocate against without emitting. The same `match`, so
 /// the two cannot name different backends.
-fn native_register_file(ctx: EmitCtx) -> regalloc::RegisterFile {
+pub(crate) fn native_register_file(ctx: EmitCtx) -> regalloc::RegisterFile {
     match crate::isa::detect() {
         Isa::Avx2 => avx2::driver::Avx2Backend::new(ctx).register_file(),
         Isa::Avx512 => avx512::driver::Avx512Backend::new(ctx).register_file(),
         Isa::Neon => aarch64::driver::Aarch64Backend::new(ctx).register_file(),
     }
-}
-
-/// Compile an [`ExprArena`] DAG into a **collapse** kernel for a lattice of
-/// `shape`: the kernel is wrapped in the lattice's folds by
-/// [`pixelflow_ir::passes::legalize`], and every fold is emitted as a loop
-/// inside the code — one call fills the whole extent with no per-row or
-/// per-batch Rust↔JIT boundary. Matches the
-/// [`KernelFn`](executable::KernelFn) ABI `(ctx, out, pitch)`.
-///
-/// The context is one base pointer per declared buffer, in the arena's slot
-/// order, followed by the uniform block's base pointer (`f32` values in the
-/// arena's uniform-slot order, read once per call) and then the origin
-/// block's: `x0`, `y0`.
-///
-/// # Panics
-///
-/// Panics if the arena names a retired coordinate axis (`Var(2)`/`Var(3)`,
-/// the old Z and W). This is the boundary the check belongs on, because it
-/// is the *only* one every route to machine code passes through — the
-/// shape-keyed cache is one caller, and the benchmark harnesses, the corpus
-/// tools and several tests come straight here. `collapse` substitutes only
-/// `X` and `Y`, so a retired axis would survive into the schedule as a `Var`
-/// no fold binds, and the allocator's refusal there names a binder, not an
-/// axis; this one names the axis.
-pub fn compile(
-    arena: &pixelflow_ir::arena::ExprArena,
-    root: pixelflow_ir::arena::ExprId,
-    shape: LatticeShape,
-) -> Result<CompileResult, CompileError> {
-    assert!(
-        arena.retired_axis(root).is_none(),
-        "emit::compile: the arena names Var({:?}), a coordinate axis a \
-         lattice no longer has; a per-call scalar is a Uniform",
-        arena.retired_axis(root)
-    );
-    EmitCtx::default().compile(arena, root, shape)
 }
 
 /// Drive a schedule to a complete collapse kernel via an [`IsaBackend`]: the
@@ -2979,7 +2863,9 @@ const FRAME_HEADROOM: usize = 64;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pixelflow_ir::arena::{ExprArena, ExprId};
+    use crate::pipeline::{BYTES_PER_LANE, schedule_for};
+    use pixelflow_ir::LatticeShape;
+    use pixelflow_ir::arena::{ExprArena, ExprId, UniformId};
 
     /// Lanes in one SIMD batch at the tier this host selected.
     fn lanes() -> usize {
@@ -3066,27 +2952,6 @@ mod tests {
         y: f32,
     ) -> Vec<f32> {
         collapse_into(code, buffers, uniforms, (x, y), batch())
-    }
-
-    /// `passes::legalize` at `shape` for a target of `lanes` lanes, then
-    /// `arena_to_schedule`: everything a compile entry point runs before the
-    /// emitter is handed a schedule.
-    pub(super) fn schedule_for(
-        a: &ExprArena,
-        root: ExprId,
-        shape: LatticeShape,
-        lanes: u32,
-    ) -> Vec<regalloc::Def> {
-        let collapse = Collapse {
-            domain: Domain {
-                shape,
-                origin: origin(),
-            },
-            lanes,
-        };
-        let (a, root) = pixelflow_ir::passes::legalize(a, root, &collapse).expect("legalize");
-        let ids = origin_slots(&a);
-        arena_to_schedule(&a, root, ids)
     }
 
     /// [`schedule_for`] at this host's own lane count.
@@ -4037,48 +3902,6 @@ mod tests {
     // What the nest does and does not partition
     // =========================================================================
 
-    /// A constant shared between a lattice-invariant expression and a varying
-    /// one is computed by the outer scope and parked for the inner one, like
-    /// any other value the inner scope reads but does not vary.
-    ///
-    /// It used to be computed in both: `place_roots` left a leaf where it was,
-    /// on the theory that nothing is saved by parking a value one instruction
-    /// rebuilds. Two instructions on x86, per read, per trip — and a parked
-    /// root is carried in a register when one is free, which is none.
-    #[test]
-    fn a_leaf_feeding_both_scopes_is_parked_by_the_outer_one() {
-        let (a, root) = shared_leaf_kernel();
-        let schedule = native_schedule(&a, root, batch());
-        let scoped = regalloc::ScopedSchedule::from_schedule(schedule);
-
-        let k = scoped
-            .body
-            .schedule
-            .iter()
-            .find(|d| matches!(d.op, ScheduledOp::Const(v) if v == 3.5))
-            .map(|d| d.value)
-            .expect("the body computes the constant");
-        assert!(
-            scoped.body.roots.contains(&k),
-            "the body parks it for the fold: roots {:?}",
-            scoped.body.roots
-        );
-        let inner: alloc::vec::Vec<&ScheduledOp> = scoped
-            .folds
-            .iter()
-            .flat_map(|f| f.schedule.iter())
-            .filter(|d| d.value == k)
-            .map(|d| &d.op)
-            .collect();
-        assert!(
-            !inner.is_empty()
-                && inner
-                    .iter()
-                    .all(|op| matches!(op, ScheduledOp::Const(v) if *v == 0.0)),
-            "the fold reads it through a placeholder, never its own copy: {inner:?}"
-        );
-    }
-
     /// The placement is total over every scope's schedule, a parked
     /// placeholder's entry included — which reads the park, the enclosing
     /// scope's answer, rather than a range of this scope's own.
@@ -4555,63 +4378,6 @@ mod tests {
     // =========================================================================
     // Arena compilation tests
     // =========================================================================
-
-    // These tests call the private `arena_to_schedule` directly rather than
-    // through `compile`: value numbering and dead-node filtering are
-    // schedule-shape invariants with no output-value signature (a regression
-    // here wastes registers/instructions, it doesn't change what a compiled
-    // kernel computes), so there is no public black-box assertion that would
-    // catch a break here.
-
-    /// Every operand a schedule names is defined earlier in it, and no value
-    /// twice: the numbering is topological and total, which is what the emit
-    /// loop walks.
-    #[test]
-    fn arena_to_schedule_defines_every_operand_before_it_is_read() {
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let y = arena.push_var(1);
-        let sum = arena.push_binary(OpKind::Add, x, y);
-
-        let schedule = native_schedule(&arena, sum, POINT);
-        assert!(!schedule.is_empty(), "a collapse schedules something");
-        let mut defined: alloc::vec::Vec<regalloc::ValueId> = alloc::vec::Vec::new();
-        for def in &schedule {
-            for operand in crate::program::structural_children(&def.op) {
-                assert!(
-                    defined.contains(&operand),
-                    "{operand:?} is read by {:?} before it is defined",
-                    def.value
-                );
-            }
-            assert!(
-                !defined.contains(&def.value),
-                "{:?} is defined twice",
-                def.value
-            );
-            defined.push(def.value);
-        }
-    }
-
-    /// A node nothing reaches never becomes a schedule entry.
-    #[test]
-    fn arena_to_schedule_filters_unreachable() {
-        let length = |garbage: bool| {
-            let mut arena = ExprArena::new();
-            let x = arena.push_var(0);
-            if garbage {
-                let _unreachable = arena.push_const(999.0);
-            }
-            let y = arena.push_var(1);
-            let sum = arena.push_binary(OpKind::Add, x, y);
-            native_schedule(&arena, sum, POINT).len()
-        };
-        assert_eq!(
-            length(true),
-            length(false),
-            "unreachable garbage node should be filtered"
-        );
-    }
 
     #[test]
     fn arena_compile_simple() {
@@ -6151,62 +5917,6 @@ mod tests {
             }
         }
 
-        /// `x + u·u`: the uniform's load and the product that depends on it
-        /// alone are per-call work. Asserted on the nest — which scope holds
-        /// them — not on timing.
-        #[test]
-        fn a_uniform_and_what_depends_on_it_alone_land_in_the_body() {
-            let mut a = ExprArena::new();
-            let u = a.declare_uniform(decl(3.0));
-            let x = a.push_var(0);
-            let uu = a.push_uniform(u);
-            let sq = a.push_binary(OpKind::Mul, uu, uu);
-            let root = a.push_binary(OpKind::Add, x, sq);
-
-            let schedule = native_schedule(&a, root, batch());
-            let scoped = regalloc::ScopedSchedule::from_schedule(schedule);
-
-            // The kernel's own uniform, told from the origin's two by the
-            // block it is read from: the link's, at the context slot after
-            // the (empty) buffer table, rather than the origin block after
-            // that. The block's pointer is a `Context` def of its own,
-            // loaded once per call in the body.
-            let link_block = scoped
-                .body
-                .schedule
-                .iter()
-                .find(|d| matches!(d.op, ScheduledOp::Context(0)))
-                .map(|d| d.value)
-                .expect("the link's block pointer is loaded once per call");
-            let kernel_uniform = |op: &ScheduledOp| matches!(op, ScheduledOp::Uniform(base, _) if *base == link_block);
-            assert!(
-                scoped.body.schedule.iter().any(|d| kernel_uniform(&d.op)),
-                "the broadcast load is once per call"
-            );
-            let sq_vid = scoped
-                .body
-                .schedule
-                .iter()
-                .find(|d| match d.op {
-                    ScheduledOp::Binary(OpKind::Mul, l, r) => l == r,
-                    _ => false,
-                })
-                .map(|d| d.value)
-                .expect("u·u is computed once per call");
-            assert!(
-                scoped.body.roots.contains(&sq_vid),
-                "the product is parked for the scopes inside, not recomputed"
-            );
-            assert!(
-                !scoped
-                    .folds
-                    .iter()
-                    .flat_map(|f| f.schedule.iter())
-                    .any(|d| kernel_uniform(&d.op)),
-                "the folds read the parked product, never the block"
-            );
-        }
-
         /// `x + u₀ + 2·u₁`, compiled once and run under two blocks: the
         /// values come from the block at the call, and the uniform-only
         /// product was hoisted.
@@ -6673,30 +6383,6 @@ mod tests {
     /// `arena_to_schedule` by the index's variance.
     mod broadcast {
         use super::*;
-
-        fn count(schedule: &[regalloc::Def], pred: fn(&ScheduledOp) -> bool) -> usize {
-            schedule.iter().filter(|d| pred(&d.op)).count()
-        }
-
-        /// The split: a read addressed by the row alone is a `Broadcast`,
-        /// one addressed by the column — which the lane binder reaches — a
-        /// `Gather`. The same arena one leaf apart.
-        #[test]
-        fn the_lane_bit_decides_broadcast_or_gather() {
-            for (axis, want) in [(1u8, (1, 0)), (0u8, (0, 1))] {
-                let mut a = ExprArena::new();
-                let buf = table(&mut a, 8);
-                let idx = a.push_var(axis);
-                let leaf = a.push_buffer(buf);
-                let root = a.push_binary(OpKind::RawGather, leaf, idx);
-                let schedule = native_schedule(&a, root, batch());
-                let got = (
-                    count(&schedule, |op| matches!(op, ScheduledOp::Broadcast(..))),
-                    count(&schedule, |op| matches!(op, ScheduledOp::Gather(..))),
-                );
-                assert_eq!(got, want, "(broadcasts, gathers) for Var({axis})");
-            }
-        }
 
         /// Every lane holds the one element the row names, and another row
         /// another element: the broadcast reads through the same context

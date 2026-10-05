@@ -319,7 +319,30 @@ pub(crate) fn arena_to_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pixelflow_ir::arena::ExprArena;
+    use crate::pipeline::schedule_for;
+    use pixelflow_ir::LatticeShape;
+    use pixelflow_ir::arena::{ExprArena, ExprId};
+
+    /// Lanes in one SIMD batch at the tier this host selected.
+    fn lanes() -> usize {
+        crate::isa::jit_vector_bytes() / core::mem::size_of::<f32>()
+    }
+
+    /// One sample, so the lattice's origin *is* the point the kernel is
+    /// evaluated at: what a test about arithmetic rather than about the loop
+    /// nest compiles for.
+    const POINT: LatticeShape = LatticeShape::new([1, 1]);
+
+    /// One full batch of one row: `x` runs `x0 .. x0 + lanes()`, which is
+    /// what a test about per-lane behaviour needs.
+    fn batch() -> LatticeShape {
+        LatticeShape::new([lanes() as u32, 1])
+    }
+
+    /// [`schedule_for`] at this host's own lane count.
+    fn native_schedule(a: &ExprArena, root: ExprId, shape: LatticeShape) -> Vec<Def> {
+        schedule_for(a, root, shape, lanes() as u32)
+    }
 
     /// The uniform slots a schedule built by hand names for the origin.
     ///
@@ -406,5 +429,82 @@ mod tests {
             count(&schedule, |op| matches!(op, ScheduledOp::Broadcast(..))),
             0
         );
+    }
+
+    // These tests call the private `arena_to_schedule` directly rather than
+    // through `compile`: value numbering and dead-node filtering are
+    // schedule-shape invariants with no output-value signature (a regression
+    // here wastes registers/instructions, it doesn't change what a compiled
+    // kernel computes), so there is no public black-box assertion that would
+    // catch a break here.
+
+    /// Every operand a schedule names is defined earlier in it, and no value
+    /// twice: the numbering is topological and total, which is what the emit
+    /// loop walks.
+    #[test]
+    fn arena_to_schedule_defines_every_operand_before_it_is_read() {
+        let mut arena = ExprArena::new();
+        let x = arena.push_var(0);
+        let y = arena.push_var(1);
+        let sum = arena.push_binary(OpKind::Add, x, y);
+
+        let schedule = native_schedule(&arena, sum, POINT);
+        assert!(!schedule.is_empty(), "a collapse schedules something");
+        let mut defined: alloc::vec::Vec<ValueId> = alloc::vec::Vec::new();
+        for def in &schedule {
+            for operand in crate::program::structural_children(&def.op) {
+                assert!(
+                    defined.contains(&operand),
+                    "{operand:?} is read by {:?} before it is defined",
+                    def.value
+                );
+            }
+            assert!(
+                !defined.contains(&def.value),
+                "{:?} is defined twice",
+                def.value
+            );
+            defined.push(def.value);
+        }
+    }
+
+    /// A node nothing reaches never becomes a schedule entry.
+    #[test]
+    fn arena_to_schedule_filters_unreachable() {
+        let length = |garbage: bool| {
+            let mut arena = ExprArena::new();
+            let x = arena.push_var(0);
+            if garbage {
+                let _unreachable = arena.push_const(999.0);
+            }
+            let y = arena.push_var(1);
+            let sum = arena.push_binary(OpKind::Add, x, y);
+            native_schedule(&arena, sum, POINT).len()
+        };
+        assert_eq!(
+            length(true),
+            length(false),
+            "unreachable garbage node should be filtered"
+        );
+    }
+
+    /// The split: a read addressed by the row alone is a `Broadcast`,
+    /// one addressed by the column — which the lane binder reaches — a
+    /// `Gather`. The same arena one leaf apart.
+    #[test]
+    fn the_lane_bit_decides_broadcast_or_gather() {
+        for (axis, want) in [(1u8, (1, 0)), (0u8, (0, 1))] {
+            let mut a = ExprArena::new();
+            let buf = table(&mut a, 8);
+            let idx = a.push_var(axis);
+            let leaf = a.push_buffer(buf);
+            let root = a.push_binary(OpKind::RawGather, leaf, idx);
+            let schedule = native_schedule(&a, root, batch());
+            let got = (
+                count(&schedule, |op| matches!(op, ScheduledOp::Broadcast(..))),
+                count(&schedule, |op| matches!(op, ScheduledOp::Gather(..))),
+            );
+            assert_eq!(got, want, "(broadcasts, gathers) for Var({axis})");
+        }
     }
 }

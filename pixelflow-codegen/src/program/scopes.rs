@@ -565,3 +565,148 @@ fn attach_fold(scoped: &mut ScopedSchedule, fold: PendingFold, parent: Scope, at
         attach_fold(scoped, child, Scope::Fold(index), at);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::schedule_for;
+    use pixelflow_ir::LatticeShape;
+    use pixelflow_ir::arena::{ExprArena, ExprId, UniformDecl, UniformIdentity};
+    use pixelflow_ir::kind::OpKind;
+
+    /// Lanes in one SIMD batch at the tier this host selected.
+    fn lanes() -> usize {
+        crate::isa::jit_vector_bytes() / core::mem::size_of::<f32>()
+    }
+
+    /// One full batch of one row: `x` runs `x0 .. x0 + lanes()`, which is
+    /// what a test about per-lane behaviour needs.
+    fn batch() -> LatticeShape {
+        LatticeShape::new([lanes() as u32, 1])
+    }
+
+    /// [`schedule_for`] at this host's own lane count.
+    fn native_schedule(a: &ExprArena, root: ExprId, shape: LatticeShape) -> Vec<Def> {
+        schedule_for(a, root, shape, lanes() as u32)
+    }
+
+    /// `y·k + x·k`: one constant, read by a row-invariant term and a
+    /// column-varying one, so the inner scope needs a value the outer one
+    /// computes.
+    fn shared_leaf_kernel() -> (ExprArena, ExprId) {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let y = a.push_var(1);
+        let k = a.push_const(3.5);
+        let invariant = a.push_binary(OpKind::Mul, y, k);
+        let varying = a.push_binary(OpKind::Mul, x, k);
+        let root = a.push_binary(OpKind::Add, invariant, varying);
+        (a, root)
+    }
+
+    fn decl(default: f32) -> UniformDecl {
+        UniformDecl {
+            id: UniformIdentity::mint(),
+            default,
+        }
+    }
+
+    /// A constant shared between a lattice-invariant expression and a varying
+    /// one is computed by the outer scope and parked for the inner one, like
+    /// any other value the inner scope reads but does not vary.
+    ///
+    /// It used to be computed in both: `place_roots` left a leaf where it was,
+    /// on the theory that nothing is saved by parking a value one instruction
+    /// rebuilds. Two instructions on x86, per read, per trip — and a parked
+    /// root is carried in a register when one is free, which is none.
+    #[test]
+    fn a_leaf_feeding_both_scopes_is_parked_by_the_outer_one() {
+        let (a, root) = shared_leaf_kernel();
+        let schedule = native_schedule(&a, root, batch());
+        let scoped = ScopedSchedule::from_schedule(schedule);
+
+        let k = scoped
+            .body
+            .schedule
+            .iter()
+            .find(|d| matches!(d.op, ScheduledOp::Const(v) if v == 3.5))
+            .map(|d| d.value)
+            .expect("the body computes the constant");
+        assert!(
+            scoped.body.roots.contains(&k),
+            "the body parks it for the fold: roots {:?}",
+            scoped.body.roots
+        );
+        let inner: alloc::vec::Vec<&ScheduledOp> = scoped
+            .folds
+            .iter()
+            .flat_map(|f| f.schedule.iter())
+            .filter(|d| d.value == k)
+            .map(|d| &d.op)
+            .collect();
+        assert!(
+            !inner.is_empty()
+                && inner
+                    .iter()
+                    .all(|op| matches!(op, ScheduledOp::Const(v) if *v == 0.0)),
+            "the fold reads it through a placeholder, never its own copy: {inner:?}"
+        );
+    }
+
+    /// `x + u·u`: the uniform's load and the product that depends on it
+    /// alone are per-call work. Asserted on the nest — which scope holds
+    /// them — not on timing.
+    #[test]
+    fn a_uniform_and_what_depends_on_it_alone_land_in_the_body() {
+        let mut a = ExprArena::new();
+        let u = a.declare_uniform(decl(3.0));
+        let x = a.push_var(0);
+        let uu = a.push_uniform(u);
+        let sq = a.push_binary(OpKind::Mul, uu, uu);
+        let root = a.push_binary(OpKind::Add, x, sq);
+
+        let schedule = native_schedule(&a, root, batch());
+        let scoped = ScopedSchedule::from_schedule(schedule);
+
+        // The kernel's own uniform, told from the origin's two by the
+        // block it is read from: the link's, at the context slot after
+        // the (empty) buffer table, rather than the origin block after
+        // that. The block's pointer is a `Context` def of its own,
+        // loaded once per call in the body.
+        let link_block = scoped
+            .body
+            .schedule
+            .iter()
+            .find(|d| matches!(d.op, ScheduledOp::Context(0)))
+            .map(|d| d.value)
+            .expect("the link's block pointer is loaded once per call");
+        let kernel_uniform =
+            |op: &ScheduledOp| matches!(op, ScheduledOp::Uniform(base, _) if *base == link_block);
+        assert!(
+            scoped.body.schedule.iter().any(|d| kernel_uniform(&d.op)),
+            "the broadcast load is once per call"
+        );
+        let sq_vid = scoped
+            .body
+            .schedule
+            .iter()
+            .find(|d| match d.op {
+                ScheduledOp::Binary(OpKind::Mul, l, r) => l == r,
+                _ => false,
+            })
+            .map(|d| d.value)
+            .expect("u·u is computed once per call");
+        assert!(
+            scoped.body.roots.contains(&sq_vid),
+            "the product is parked for the scopes inside, not recomputed"
+        );
+        assert!(
+            !scoped
+                .folds
+                .iter()
+                .flat_map(|f| f.schedule.iter())
+                .any(|d| kernel_uniform(&d.op)),
+            "the folds read the parked product, never the block"
+        );
+    }
+}

@@ -20,6 +20,7 @@ extern crate alloc;
 pub mod emit;
 pub mod error;
 pub mod isa;
+mod pipeline;
 mod program;
 
 pub mod compiled_kernel;
