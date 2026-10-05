@@ -283,7 +283,7 @@ const ORIGIN: [f32; 2] = [0.5, 0.5];
 /// it is only `Body` (`Scope::Body`, `scopes[0]`, what runs once per call) or
 /// `Fold(j)` (`scopes[j + 1]`), one per surviving fold, the lattice's row,
 /// column and lane folds among them (`pixelflow-codegen`'s `traffic`
-/// module). `attach_folds` (`pixelflow-codegen/src/emit/mod.rs`) attaches a
+/// module). `attach_folds` (`pixelflow-codegen/src/program/scopes.rs`) attaches a
 /// parent before its children, so `scopes[1]` is always the OUTERMOST
 /// surviving fold — the lattice's own row (Y) loop — and `scopes[2..]` are
 /// everything nested inside it: the column and lane folds `pack`

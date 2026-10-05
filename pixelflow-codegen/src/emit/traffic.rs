@@ -21,10 +21,10 @@
 //! is written, and a trait method that disappears is a compile error rather
 //! than a silently dropped term.
 
-use super::guards::IfArm;
 use super::regalloc::{NestAllocation, Scope, ValueId};
 use super::{Binding, InstructionPlan, IsaBackend, Loc, PtrReg, Reg, Reload, WritePlan};
 use crate::error::CompileError;
+use crate::program::IfArm;
 use alloc::vec::Vec;
 
 /// Emitted traffic within one scope of the nest.
@@ -894,16 +894,13 @@ mod tests {
     /// it is the only count that may.
     #[test]
     fn the_scaffolds_traffic_does_not_move_with_the_pool() {
-        use crate::emit::tests::schedule_for;
-        use crate::emit::{
-            BYTES_PER_LANE, CONST_POOL_ALIGN, IsaBackend, aarch64, avx2, avx512,
-            compile_via_backend,
-        };
+        use crate::emit::{CONST_POOL_ALIGN, IsaBackend, aarch64, avx2, avx512, compile_schedule};
+        use crate::pipeline::{BYTES_PER_LANE, schedule_for};
 
         fn traffic<B: IsaBackend>(mut backend: B, arena: &ExprArena, root: ExprId) -> EmitTraffic {
             let lanes = backend.register_file().vector_bytes / BYTES_PER_LANE;
             let schedule = schedule_for(arena, root, SHAPE, lanes);
-            compile_via_backend(schedule, &mut backend)
+            compile_schedule(schedule, &mut backend)
                 .expect("compile")
                 .traffic
         }

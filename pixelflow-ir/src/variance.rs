@@ -3,7 +3,8 @@
 //! Which variables an expression depends on, as a bitset. This is the shared
 //! type used by both the e-graph's extractor (`pixelflow-search`, which prices
 //! a node by [`LatticeShape::evals`] of it) and codegen's loop placement
-//! (`pixelflow-codegen`'s `schedule_variance` and `place_roots`).
+//! (`pixelflow-codegen`'s `schedule_variance` and `place_roots`, in
+//! `program/scopes.rs`).
 //!
 //! ## Variable Mapping
 //!

@@ -9,8 +9,12 @@
 
 pub(crate) mod guards;
 pub(crate) mod layout;
+pub(crate) mod lower;
 pub(crate) mod ownership;
+mod scopes;
 pub(crate) mod tree;
+#[cfg(test)]
+pub(crate) use scopes::lay_out;
 
 use alloc::vec::Vec;
 
@@ -67,7 +71,7 @@ pub enum ScheduledOp {
     Ternary(OpKind, ValueId, ValueId, ValueId),
     /// Bit-shift by a compile-time immediate: `op` is `Shl` or `Shr`, the value
     /// is `ValueId`, and the shift count is folded out of the `Const` RHS by
-    /// `arena_to_schedule` (so it never becomes a scheduled value / register).
+    /// `lower::arena_to_schedule` (so it never becomes a scheduled value / register).
     ShiftImm(OpKind, ValueId, u8),
     /// Bound-memory gather: read the buffer whose base is the second operand
     /// at the lane index computed by the first. Lowered from
@@ -78,7 +82,7 @@ pub enum ScheduledOp {
     Gather(ValueId, ValueId),
     /// A `Gather` whose index is the same in every lane: one scalar load,
     /// broadcast. The same `RawGather(Buffer(slot), index)`, split from
-    /// [`ScheduledOp::Gather`] by `arena_to_schedule` on the index's
+    /// [`ScheduledOp::Gather`] by `lower::arena_to_schedule` on the index's
     /// variance — it lacks the lane binder's bit, so lane 0 *is* the index
     /// and the other lanes are copies of it. A glyph's per-piece table
     /// reads are addressed by its fold's own binder and nothing else, which
@@ -104,7 +108,7 @@ pub enum ScheduledOp {
     Context(u16),
     /// The lane fold's binder: the constant `[0, 1, …, L−1]`. The fold
     /// whose binder this is executes by lanes (its body is inlined into its
-    /// parent's schedule — see `arena_to_schedule`), so the binder is a
+    /// parent's schedule — see `lower::arena_to_schedule`), so the binder is a
     /// leaf here rather than a loop counter. Carries the binder so its
     /// variance bit is the fold's, which is what "lane-uniform" is read off.
     Lanes(Binder),
@@ -129,11 +133,11 @@ pub enum ScheduledOp {
     Seq(ValueId, ValueId),
     /// A surviving bounded fold: `⊕` over `fold`'s visited indices, whose
     /// body is the value named by the second field — in *this schedule's*
-    /// numbering (`arena_to_schedule` maps it like any other child), before
-    /// `extract_folds` carves the body out into its own
-    /// [`ScopeFold`]. Kept only so `schedule_variance` can look
+    /// numbering (`lower::arena_to_schedule` maps it like any other child), before
+    /// `scopes::extract_folds` carves the body out into its own
+    /// [`ScopeFold`]. Kept only so `scopes::schedule_variance` can look
     /// the body's variance up (`Reduce`'s own result is the body's variance
-    /// with the binder's own bit removed) and so `extract_folds` can find
+    /// with the binder's own bit removed) and so `scopes::extract_folds` can find
     /// the body's closure; the emitter never resolves it as an operand —
     /// the loop's result comes from `regalloc::Allocation::opens_at`
     /// naming the [`Scope::Fold`] this def opens, not from this
@@ -375,9 +379,9 @@ impl IfGuard {
 /// The values an operation reads *as registers*, in operand order.
 ///
 /// A `Reduce` is a leaf here, the same as `Uniform` — by the time one reaches
-/// a schedule this function walks, `extract_folds` has already carved its
+/// a schedule this function walks, `scopes::extract_folds` has already carved its
 /// body out into its own `ScopeFold`; the `ValueId` `ScheduledOp::Reduce`
-/// still carries is `schedule_variance`'s and `extract_folds`'s own concern
+/// still carries is `scopes::schedule_variance`'s and `scopes::extract_folds`'s own concern
 /// (they run before extraction, and after respectively, over different
 /// schedules), never an operand this scope's allocation resolves. What the
 /// loop it opens reads from this scope is a dependency all the same, and the

@@ -12,10 +12,10 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::guards::IfGuard;
 use super::{Gpr, KReg, OperandSource, PtrReg, Reg, ScheduledOp, operand_sources, reloads_wanted};
+use crate::program::IfGuard;
 pub use crate::program::{Class, Def, Scope, ScopeFold, ScopeRegion, ScopedSchedule, ValueId};
-pub(crate) use crate::program::{all_operands, operands, pointer_operand, structural_children};
+pub(crate) use crate::program::{all_operands, operands, pointer_operand};
 
 /// The complete platform-dependent surface of register allocation.
 ///
@@ -1783,7 +1783,7 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget, steps: &mut Steps) -
         // times are ordered by something other than map order.
         let mut roots: Vec<ValueId> = roots_of(scope).to_vec();
         roots.sort_by_key(|v| v.0);
-        // `place_roots` names a root once; the slots rely on it.
+        // `scopes::place_roots` names a root once; the slots rely on it.
         roots.dedup();
         slots.fill(&roots);
         steps.walk(roots.len());
@@ -3346,7 +3346,8 @@ fn operands_of(sop: &ScheduledOp, class: Class) -> impl Iterator<Item = ValueId>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit::{allocate_flat, lay_out};
+    use crate::emit::allocate_flat;
+    use crate::program::lay_out;
     use pixelflow_ir::kind::OpKind;
 
     /// `nest` with its guards tabulated the way a compile tabulates them.

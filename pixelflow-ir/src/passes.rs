@@ -99,7 +99,7 @@ pub fn legalize(
     let root = lattice::pack(&mut arena, root, collapse.lanes);
     // No reduce pass. A `Reduce` is legal for codegen (stage 2c —
     // `pixelflow-codegen` emits a surviving fold as a loop), and since
-    // `extract_folds` carves a fold inside a fold's body as a loop inside a
+    // `extract_folds` (`program/scopes.rs`) carves a fold inside a fold's body as a loop inside a
     // loop, so is the shape `Kernel::by_ref` produces whenever two folds are
     // composed by name and `expand_refs` splices one into the other. That
     // shape was the last thing unrolled here (`expand_nested_reduce`, now
