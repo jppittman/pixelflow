@@ -33,11 +33,35 @@
 //! optimizer or the linker shows up and the first column cannot see it. The
 //! two `named_*` kernels hold a reference (`Kernel::by_ref`), so they are
 //! the rows a change to how references are optimized is expected to move.
+//!
+//! **Sibling folds.** Every row above is point-shaped, with no `Reduce`
+//! surviving, so the whole of what a loop nest does (a fold's slots, the
+//! scopes it opens, the roots parked for them, a branch inside a loop body)
+//! never reaches the emitter under them, and a refactor of scoping,
+//! allocation, frames or labels could move every one of those and leave all
+//! nine lines identical. The rows after them are the ones that can see it:
+//! kernels with a surviving `Reduce` that varies with the column, compiled
+//! at a width whose remainder makes the column fold two sibling folds that
+//! share one `Reduce`. Each prints the same line the old rows do and then
+//! the rest of what the compile reports: `CompileResult`'s counts and every
+//! scope's `EmitTraffic`, indented under it. Never a wall time: the output
+//! is diffed.
+//!
+//! The kernels are `tests/support/sibling_rows.rs`, the file the byte
+//! golden in `emit::tests::sibling_folds` includes, so the two measure one
+//! definition of each row. The golden pins all three backends from any
+//! host; this prints the host's own, through the production path as well.
 
 use pixelflow_codegen::emit::compile;
+use pixelflow_codegen::emit::traffic::{BranchTraffic, ScopeTraffic};
 use pixelflow_codegen::fnv1a64;
 use pixelflow_codegen::jit_cache;
 use pixelflow_ir::{ExprArena, ExprId, Kernel, LatticeShape, OpKind, Uniform};
+
+/// The kernels that reach sibling folds.
+mod sibling_rows {
+    include!("../tests/support/sibling_rows.rs");
+}
 
 fn xy(a: &mut ExprArena) -> (ExprId, ExprId) {
     (a.push_var(0), a.push_var(1))
@@ -179,9 +203,9 @@ fn cases() -> Vec<(&'static str, ExprArena, ExprId)> {
 }
 
 /// The production compile's bytes, or why there are none.
-fn through_the_jit(arena: &ExprArena, root: ExprId) -> String {
+fn through_the_jit(arena: &ExprArena, root: ExprId, shape: LatticeShape) -> String {
     let kernel = Kernel::from_parts(arena.clone(), root);
-    match jit_cache::compile(&kernel, LatticeShape::POINT) {
+    match jit_cache::compile(&kernel, shape) {
         Ok(linked) => {
             let bytes = linked.kernel.code_bytes();
             format!("jit_len={:<6} jit_fnv={:016x}", bytes.len(), fnv1a64(bytes))
@@ -190,9 +214,128 @@ fn through_the_jit(arena: &ExprArena, root: ExprId) -> String {
     }
 }
 
+/// A sibling-fold kernel and the lattice it is compiled over.
+struct SiblingRow {
+    name: &'static str,
+    arena: ExprArena,
+    root: ExprId,
+    shape: LatticeShape,
+}
+
+/// The rows that reach sibling folds, named as the golden names them.
+///
+/// `wL` is one batch of the host's own lane count, so a run here and a run
+/// on the other tier differ in which rows have a remainder fold and in the
+/// bytes; the names do not.
+fn sibling_cases() -> Vec<SiblingRow> {
+    use pixelflow_codegen::jit_vector_bytes;
+    use sibling_rows::{REMAINDER_WIDTH, ROWS};
+    const BYTES_PER_LANE: usize = 4;
+
+    let one_batch = (jit_vector_bytes() / BYTES_PER_LANE) as u32;
+    let row = |name, (arena, root): (ExprArena, ExprId), columns| SiblingRow {
+        name,
+        arena,
+        root,
+        shape: LatticeShape::new([columns, ROWS]),
+    };
+    vec![
+        row("glyph_like_w1", sibling_rows::glyph_like(), 1),
+        row("glyph_like_wL", sibling_rows::glyph_like(), one_batch),
+        row(
+            "glyph_like_w37",
+            sibling_rows::glyph_like(),
+            REMAINDER_WIDTH,
+        ),
+        row(
+            "two_sibling_folds_w37",
+            sibling_rows::two_sibling_folds(),
+            REMAINDER_WIDTH,
+        ),
+        row(
+            "parked_roots_w37",
+            sibling_rows::parked_roots(sibling_rows::PARKED_TERMS),
+            REMAINDER_WIDTH,
+        ),
+        row(
+            "guarded_if_in_fold_w37",
+            sibling_rows::guarded_if_in_fold(),
+            REMAINDER_WIDTH,
+        ),
+    ]
+}
+
+/// `guards/arms/entries`: what a compile branched over.
+fn branches(b: BranchTraffic) -> String {
+    format!("{}/{}/{}", b.guards, b.arms_branched, b.arm_entries)
+}
+
+/// One scope's counts, in a fixed order.
+fn counts(t: &ScopeTraffic) -> String {
+    format!(
+        "instructions={} loads_transient={} loads_kept={} remats={} stores={} writes={} bytes={}",
+        t.instructions, t.loads_transient, t.loads_kept, t.remats, t.stores, t.writes, t.bytes
+    )
+}
+
+/// A sibling row: the old rows' line, then everything a compile reports.
+fn print_sibling_row(row: &SiblingRow) {
+    let SiblingRow {
+        name,
+        arena,
+        root,
+        shape,
+    } = row;
+    let production = {
+        let kernel = Kernel::from_parts(arena.clone(), *root);
+        match jit_cache::compile(&kernel, *shape) {
+            Ok(linked) => {
+                let bytes = linked.kernel.code_bytes();
+                format!(
+                    "jit_len={:<6} jit_fnv={:016x} jit_branches={}",
+                    bytes.len(),
+                    fnv1a64(bytes),
+                    branches(linked.kernel.branches())
+                )
+            }
+            Err(e) => format!("jit ERROR {e:?}"),
+        }
+    };
+    match compile(arena, *root, *shape) {
+        Ok(r) => {
+            let bytes = r.code.as_bytes();
+            println!(
+                "{name:<24} len={:<6} fnv={:016x} spills={} hoisted={} {production}",
+                bytes.len(),
+                fnv1a64(bytes),
+                r.spill_count,
+                r.hoisted_values
+            );
+            let t = &r.traffic;
+            println!(
+                "    compile: spill_count={} spill_bytes={} hoisted_values={} max_regs={} \
+                 vector_bytes={} pool={}",
+                r.spill_count, r.spill_bytes, r.hoisted_values, r.max_regs, t.vector_bytes, t.pool
+            );
+            println!(
+                "    traffic: carried={} trailing={} branches={} scopes={}",
+                t.carried,
+                t.trailing,
+                branches(t.branches),
+                t.scopes.len()
+            );
+            println!("    scaffold: {}", counts(&t.scaffold));
+            for (scope, (traffic, trips)) in t.scopes.iter().zip(&t.trips).enumerate() {
+                println!("    scope {scope}: trips={trips} {}", counts(traffic));
+            }
+        }
+        Err(e) => println!("{name:<24} ERROR {e:?} {production}"),
+    }
+}
+
 fn main() {
     for (name, arena, root) in cases() {
-        let jit = through_the_jit(&arena, root);
+        let jit = through_the_jit(&arena, root, LatticeShape::POINT);
         match compile(&arena, root, LatticeShape::POINT) {
             Ok(r) => {
                 let bytes = r.code.as_bytes();
@@ -208,5 +351,8 @@ fn main() {
             // still a data point, and the other rows are still worth having.
             Err(e) => println!("{name:<14} ERROR {e:?} {jit}"),
         }
+    }
+    for row in sibling_cases() {
+        print_sibling_row(&row);
     }
 }

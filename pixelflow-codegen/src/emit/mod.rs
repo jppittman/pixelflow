@@ -6957,4 +6957,713 @@ mod tests {
             );
         }
     }
+
+    /// What the point-shaped rows cannot reach: a *surviving* `Reduce` under
+    /// a lattice with a remainder, where the column fold is strip-mined into
+    /// a main fold and a remainder fold and the `Reduce` that varies with the
+    /// column is carved into both.
+    ///
+    /// Three instruments live here, each answering a different question of
+    /// the same kernels: [`the_sibling_fold_rows_emit_the_recorded_bytes_on_every_backend`]
+    /// (did any byte move, on any of the three emitters, from any host),
+    /// [`sibling_column_folds_share_a_reduce_and_its_slots`] (the slot
+    /// aliasing those folds have today, which is byte-visible and must be
+    /// reproduced or deliberately changed) and the `#[ignore]`d
+    /// `sibling_scopes_allocation` (what scoping and allocation cost as the
+    /// folds multiply).
+    mod sibling_folds {
+        use super::*;
+        use crate::alloc_probe::{self, Measured};
+        use regalloc::RegisterAllocator;
+
+        /// The kernels, from `tests/support`; `examples/byte_probe.rs`
+        /// includes the same file, so the probe and this module measure one
+        /// definition of each row.
+        mod rows {
+            include!("../../tests/support/sibling_rows.rs");
+        }
+
+        /// One of the three emitters, built the way a compile builds it.
+        ///
+        /// A kernel is legalized at the lane count of the target it is
+        /// emitted for, and nothing here asks the host: the count is the
+        /// ISA's, stated once in [`Target::lanes`] and checked against the
+        /// backend's own register file every time one is built, so a table
+        /// cannot name a width the backend does not have. Bytes are only
+        /// generated, never run, so every target emits on every host.
+        #[derive(Clone, Copy, Debug)]
+        enum Target {
+            Avx2,
+            Avx512,
+            Aarch64,
+        }
+
+        impl Target {
+            const ALL: [Self; 3] = [Self::Avx2, Self::Avx512, Self::Aarch64];
+
+            /// Lanes in one batch: a 256-, 512- or 128-bit vector of `f32`.
+            const fn lanes(self) -> u32 {
+                match self {
+                    Self::Avx2 => 8,
+                    Self::Avx512 => 16,
+                    Self::Aarch64 => 4,
+                }
+            }
+
+            /// `subject` compiled for this target, under `ctx`.
+            fn compile(self, ctx: EmitCtx, subject: Subject<'_>) -> CompileResult {
+                let lanes = self.lanes();
+                match self {
+                    Self::Avx2 => compile_on(avx2::driver::Avx2Backend::new(ctx), lanes, subject),
+                    Self::Avx512 => {
+                        compile_on(avx512::driver::Avx512Backend::new(ctx), lanes, subject)
+                    }
+                    Self::Aarch64 => {
+                        compile_on(aarch64::driver::Aarch64Backend::new(ctx), lanes, subject)
+                    }
+                }
+            }
+        }
+
+        /// What is compiled: a kernel's arena and root, over a lattice.
+        #[derive(Clone, Copy)]
+        struct Subject<'a> {
+            arena: &'a ExprArena,
+            root: ExprId,
+            shape: LatticeShape,
+        }
+
+        /// `subject` legalized for `lanes` lanes, scheduled, scoped and emitted
+        /// by `backend`, which must be the width `lanes` says.
+        fn compile_on<B: IsaBackend>(
+            mut backend: B,
+            lanes: u32,
+            subject: Subject<'_>,
+        ) -> CompileResult {
+            assert_eq!(
+                backend.register_file().vector_bytes / BYTES_PER_LANE,
+                lanes,
+                "the backend is not the width this test legalized for"
+            );
+            let Subject { arena, root, shape } = subject;
+            compile_schedule(schedule_for(arena, root, shape, lanes), &mut backend)
+                .expect("a sibling-fold row compiles on every backend")
+        }
+
+        /// The width a row is compiled at, which for two of the three is a
+        /// fact about the target's lanes and so cannot be one number.
+        #[derive(Clone, Copy)]
+        enum Width {
+            /// One sample: all remainder, and the main column fold is empty.
+            One,
+            /// Exactly one batch: all main, no remainder fold exists.
+            OneBatch,
+            /// [`rows::REMAINDER_WIDTH`]: a main fold and a remainder fold.
+            Remainder,
+        }
+
+        impl Width {
+            fn at(self, target: Target) -> LatticeShape {
+                let columns = match self {
+                    Self::One => 1,
+                    Self::OneBatch => target.lanes(),
+                    Self::Remainder => rows::REMAINDER_WIDTH,
+                };
+                LatticeShape::new([columns, rows::ROWS])
+            }
+        }
+
+        /// A kernel and the width it is compiled at.
+        struct Row {
+            name: &'static str,
+            build: fn() -> (ExprArena, ExprId),
+            width: Width,
+        }
+
+        fn parked_roots() -> (ExprArena, ExprId) {
+            rows::parked_roots(rows::PARKED_TERMS)
+        }
+
+        /// The glyph-like fold at the three widths that decide how many
+        /// sibling column folds exist (an empty main and a remainder; a main
+        /// alone; both), and each other kernel where both exist.
+        const ROWS: [Row; 6] = [
+            Row {
+                name: "glyph_like_w1",
+                build: rows::glyph_like,
+                width: Width::One,
+            },
+            Row {
+                name: "glyph_like_wL",
+                build: rows::glyph_like,
+                width: Width::OneBatch,
+            },
+            Row {
+                name: "glyph_like_w37",
+                build: rows::glyph_like,
+                width: Width::Remainder,
+            },
+            Row {
+                name: "two_sibling_folds_w37",
+                build: rows::two_sibling_folds,
+                width: Width::Remainder,
+            },
+            Row {
+                name: "parked_roots_w37",
+                build: parked_roots,
+                width: Width::Remainder,
+            },
+            Row {
+                name: "guarded_if_in_fold_w37",
+                build: rows::guarded_if_in_fold,
+                width: Width::Remainder,
+            },
+        ];
+
+        /// A target's emitted code: its length in bytes and the FNV-1a 64
+        /// digest of those bytes ([`crate::fnv1a64`]).
+        type Bytes = (usize, u64);
+
+        /// `ROWS`' bytes at `28ddbeaf`, per target in [`Target::ALL`]'s order
+        /// (AVX2, AVX-512, aarch64).
+        ///
+        /// **A refactor does not edit this table; an intentional byte change
+        /// does, in a commit of its own that says why.** A commit that edits
+        /// it beside other work cannot be told apart from one that moved
+        /// bytes by accident, which is the thing it exists to catch. When it
+        /// fails, the failure prints the whole recomputed table.
+        const GOLDEN: [[Bytes; 3]; 6] = [
+            [
+                (1016, 0x46ec89671d0d59d7),
+                (984, 0x04d391d2df13c4d6),
+                (592, 0x9eb350d1994f17af),
+            ],
+            [
+                (728, 0x4379d55663a9294e),
+                (664, 0xf22ace44c2fda4c8),
+                (400, 0xaa96d96596a05551),
+            ],
+            [
+                (1056, 0xf4f28a978e99b9ec),
+                (992, 0x66e9f1ebf718d0cd),
+                (608, 0x14a21aabd82fe2e8),
+            ],
+            [
+                (1056, 0x15c0a9e0e3472c74),
+                (1056, 0x662f9c26c2bbcafc),
+                (656, 0x0e7016ed19878723),
+            ],
+            [
+                (247328, 0x919cb6c0efe53a92),
+                (278032, 0x282aa77769f9e2ff),
+                (188496, 0x578f9987a3386dcc),
+            ],
+            [
+                (3012, 0x90101b60330eb1ce),
+                (2932, 0x3943e837c9f115d3),
+                (2144, 0x92246f5ac70b7ef7),
+            ],
+        ];
+
+        /// **Every sibling-fold row emits the same bytes on all three
+        /// backends, on any host.**
+        ///
+        /// `byte_probe` answers this for the host's own tier, on a host that
+        /// has it; this answers it for AVX2, AVX-512 *and* NEON on whatever
+        /// runs the test, since the bytes are only generated. That is what
+        /// puts aarch64 byte identity under CI on a Linux x86 runner, and
+        /// what makes "did this refactor move bytes" a check that fails for
+        /// everyone rather than a diff one person ran once.
+        ///
+        /// Host-independent by construction, and the tests that follow it
+        /// hold it to that: nothing here reads [`crate::isa::detect`],
+        /// `PIXELFLOW_ISA`, [`crate::isa::jit_vector_bytes`] or the CPU. Each
+        /// target is legalized at its own lane count and emitted by its own
+        /// backend with the default context.
+        #[test]
+        fn the_sibling_fold_rows_emit_the_recorded_bytes_on_every_backend() {
+            let mut recomputed = Vec::new();
+            let mut moved = Vec::new();
+            for (row, pins) in ROWS.iter().zip(GOLDEN) {
+                let (a, root) = (row.build)();
+                let mut emitted = Vec::new();
+                for (target, pin) in Target::ALL.into_iter().zip(pins) {
+                    let subject = Subject {
+                        arena: &a,
+                        root,
+                        shape: row.width.at(target),
+                    };
+                    let result = target.compile(EmitCtx::default(), subject);
+                    let code = result.code.as_bytes();
+                    let actual = (code.len(), crate::fnv1a64(code));
+                    if actual != pin {
+                        moved.push(format!(
+                            "{} on {target:?}: pinned {pin:x?}, emitted {actual:x?}",
+                            row.name
+                        ));
+                    }
+                    emitted.push(format!("({}, {:#018x})", actual.0, actual.1));
+                }
+                recomputed.push(format!("            [{}],", emitted.join(", ")));
+            }
+            assert!(
+                moved.is_empty(),
+                "emitted bytes moved from the table recorded at 28ddbeaf:\n{}\n\n\
+                 if the change is intentional, re-baseline GOLDEN in its own \
+                 commit with:\n{}",
+                moved.join("\n"),
+                recomputed.join("\n")
+            );
+        }
+
+        /// A backend that forwards to another and writes down every frame
+        /// offset each scope addresses, scope by scope.
+        ///
+        /// What a test can see of "which slot" without decoding an
+        /// instruction: the driver hands every slot it uses to the backend as
+        /// a displacement, so the displacements the backend was given *are*
+        /// the frame the emitted code addresses. Seen are the fold loop's own
+        /// slot traffic, the reloads and resolves of a value that lives in a
+        /// slot, and a `Write`'s binders.
+        struct Addressed<'a, B: IsaBackend> {
+            inner: &'a mut B,
+            open: Vec<Vec<u32>>,
+            closed: Vec<(regalloc::Scope, Vec<u32>)>,
+        }
+
+        impl<'a, B: IsaBackend> Addressed<'a, B> {
+            fn new(inner: &'a mut B) -> Self {
+                Self {
+                    inner,
+                    open: Vec::new(),
+                    closed: Vec::new(),
+                }
+            }
+
+            /// `offset` was addressed by the scope being emitted.
+            fn note(&mut self, offset: u32) {
+                if let Some(open) = self.open.last_mut() {
+                    open.push(offset);
+                }
+            }
+
+            /// The slot a binding names, if it names one.
+            fn note_binding(&mut self, binding: Option<Binding>) {
+                if let Some(Binding::Loc(Loc::Slot(slot))) = binding {
+                    self.note(slot.offset());
+                }
+            }
+
+            /// Every offset any scope addressed.
+            fn addressed(&self) -> alloc::collections::BTreeSet<u32> {
+                self.closed
+                    .iter()
+                    .flat_map(|(_, offsets)| offsets.iter().copied())
+                    .collect()
+            }
+
+            /// The offsets `scope` addressed itself, the scopes nested in it
+            /// not included.
+            fn addressed_by(&self, scope: regalloc::Scope) -> alloc::collections::BTreeSet<u32> {
+                self.closed
+                    .iter()
+                    .filter(|(closed, _)| *closed == scope)
+                    .flat_map(|(_, offsets)| offsets.iter().copied())
+                    .collect()
+            }
+        }
+
+        impl<B: IsaBackend> IsaBackend for Addressed<'_, B> {
+            fn jump(&mut self, asm: &mut Assembly, label: Label) {
+                self.inner.jump(asm, label);
+            }
+
+            fn register_file(&self) -> regalloc::RegisterFile {
+                self.inner.register_file()
+            }
+
+            fn begin(&mut self, schedule: &[regalloc::Def]) -> Result<(), CompileError> {
+                self.inner.begin(schedule)
+            }
+
+            fn frame_ready(&mut self, frame_size: u32) {
+                self.inner.frame_ready(frame_size);
+            }
+
+            fn emit_plan(
+                &mut self,
+                code: &mut Vec<u8>,
+                plan: &InstructionPlan,
+            ) -> Result<(), CompileError> {
+                for reload in &plan.reloads {
+                    match reload {
+                        Reload::FromStack { slot, .. } | Reload::Ptr { slot, .. } => {
+                            self.note(slot.offset());
+                        }
+                        Reload::Const { .. } => {}
+                    }
+                }
+                self.inner.emit_plan(code, plan)
+            }
+
+            fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg) {
+                self.inner.emit_mov(code, dst, src);
+            }
+
+            fn emit_store(
+                &mut self,
+                code: &mut Vec<u8>,
+                src: Reg,
+                offset: u32,
+            ) -> Result<(), CompileError> {
+                self.note(offset);
+                self.inner.emit_store(code, src, offset)
+            }
+
+            fn ptr_store(&mut self, code: &mut Vec<u8>, src: PtrReg, offset: u32) {
+                self.note(offset);
+                self.inner.ptr_store(code, src, offset);
+            }
+
+            fn ptr_load(&mut self, code: &mut Vec<u8>, dst: PtrReg, offset: u32) {
+                self.note(offset);
+                self.inner.ptr_load(code, dst, offset);
+            }
+
+            fn ptr_mov(&mut self, code: &mut Vec<u8>, dst: PtrReg, src: PtrReg) {
+                self.inner.ptr_mov(code, dst, src);
+            }
+
+            fn emit_resolve(
+                &mut self,
+                code: &mut Vec<u8>,
+                vid: regalloc::ValueId,
+                target: Reg,
+                locs: &[Option<Binding>],
+            ) -> Reg {
+                self.note_binding(locs.get(vid.0 as usize).copied().flatten());
+                self.inner.emit_resolve(code, vid, target, locs)
+            }
+
+            fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
+                self.inner.branch_if_arm_is_dead(asm, test, label);
+            }
+
+            fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {
+                self.inner.frame_alloc(code, bytes);
+            }
+
+            fn frame_free(&mut self, code: &mut Vec<u8>, bytes: u32) {
+                self.inner.frame_free(code, bytes);
+            }
+
+            fn anchor(&mut self, asm: &mut Assembly) {
+                self.inner.anchor(asm);
+            }
+
+            fn finish(&mut self, asm: &mut Assembly) {
+                self.inner.finish(asm);
+            }
+
+            fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
+                self.note(offset);
+                self.inner.slot_store(code, src, offset);
+            }
+
+            fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
+                self.note(offset);
+                self.inner.slot_load(code, dst, offset);
+            }
+
+            fn scope_begin(&mut self) {
+                self.open.push(Vec::new());
+                self.inner.scope_begin();
+            }
+
+            fn scope_end(&mut self, scope: regalloc::Scope, bytes: u32) {
+                let offsets = self.open.pop().expect("scope_end without a scope_begin");
+                self.closed.push((scope, offsets));
+                self.inner.scope_end(scope, bytes);
+            }
+
+            fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
+                self.inner.add_scalar(code, dst, scratch, scalar);
+            }
+
+            fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
+                self.inner.load_const(code, dst, val);
+            }
+
+            fn alu(&mut self, code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2]) {
+                self.inner.alu(code, op, dst, srcs);
+            }
+
+            // Forwarded itself, not left to the trait's default over `alu`,
+            // for the reason `Counting` states: only AVX-512 overrides it.
+            fn test_ge(
+                &mut self,
+                code: &mut Vec<u8>,
+                dst: Reg,
+                srcs: [Reg; 2],
+                mask_scratch: Option<KReg>,
+            ) {
+                self.inner.test_ge(code, dst, srcs, mask_scratch);
+            }
+
+            fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan) {
+                self.note_binding(Some(write.row));
+                self.note_binding(Some(write.col));
+                self.inner.emit_write(code, write);
+            }
+
+            fn emit_ret(&mut self, code: &mut Vec<u8>) {
+                self.inner.emit_ret(code);
+            }
+        }
+
+        /// **Two sibling column folds are one loop run under two parents, and
+        /// they share one accumulator slot and one binder slot: the later
+        /// fold's.**
+        ///
+        /// At a width with a remainder the column fold is strip-mined into a
+        /// main fold and a remainder fold, and a `Reduce` varying with the
+        /// column is carved into *both*. The two `ScopeFold`s carry the same
+        /// `Reduce` `ValueId`, and the driver keys a fold's accumulator slot
+        /// and binder slot by that id (`fold_map` and `binder_map` in
+        /// [`compile_via_backend`], each a `collect()` that keeps the last `j`
+        /// for a repeated key). So the earlier fold's slots, `m + 2j·vb` and
+        /// `m + (2j + 1)·vb`, are never addressed: its loop reads, steps and
+        /// stores the later fold's, and its consumers read the later's. The
+        /// two folds never run at once, which is the whole reason it is sound.
+        ///
+        /// Accidental, and byte-visible: it decides every displacement above
+        /// the first fold slot (the frame is `m + 2·fold_count·vb` and the
+        /// parks follow). A change to scoping, allocation, frames or labels
+        /// that gave each fold its own slots would move bytes and be sound,
+        /// and must be a deliberate, separately re-baselined change; one that
+        /// *meant* not to move them and did is what this catches before the
+        /// byte golden has to.
+        ///
+        /// Seen from both ends. The nest says two folds carry one `Reduce`
+        /// and are siblings. The driver, run unmodified under a backend that
+        /// records the displacements it is handed, addresses the later fold's
+        /// slots from both parents and the earlier fold's from none, at the
+        /// floor pool (where neither is carried, so both are in memory) and
+        /// at the whole one.
+        #[test]
+        fn sibling_column_folds_share_a_reduce_and_its_slots() {
+            let (a, root) = rows::glyph_like();
+            let shape = LatticeShape::new([rows::REMAINDER_WIDTH, rows::ROWS]);
+            let schedule = schedule_for(&a, root, shape, Target::Avx2.lanes());
+
+            let floor = EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH);
+            for (pool, ctx) in [("floor", floor), ("whole", EmitCtx::default())] {
+                let mut backend = avx2::driver::Avx2Backend::new(ctx);
+                let file = backend.register_file();
+                let nest = regalloc::LinearScan.allocate_nest(
+                    regalloc::ScopedSchedule::from_schedule(schedule.clone()),
+                    &file,
+                );
+
+                // The nest: exactly one `Reduce` is carved into two folds.
+                let mut carved: alloc::collections::BTreeMap<regalloc::ValueId, Vec<usize>> =
+                    alloc::collections::BTreeMap::new();
+                for j in 0..nest.fold_count() {
+                    carved.entry(nest.fold_reduce_vid(j)).or_default().push(j);
+                }
+                let shared: Vec<(regalloc::ValueId, Vec<usize>)> = carved
+                    .into_iter()
+                    .filter(|(_, folds)| folds.len() > 1)
+                    .collect();
+                let [(reduce, folds)] = shared.as_slice() else {
+                    panic!("{pool}: expected one Reduce carved into several folds: {shared:?}");
+                };
+                let &[earlier, later] = folds.as_slice() else {
+                    panic!("{pool}: {reduce:?} is carved into {folds:?}, not into two folds");
+                };
+
+                // Siblings: separate parents, neither inside the other.
+                let ancestors = |mut scope: regalloc::Scope| {
+                    let mut chain = Vec::new();
+                    while let regalloc::Scope::Fold(j) = scope {
+                        chain.push(j);
+                        scope = nest.fold_parent(j);
+                    }
+                    chain
+                };
+                let (earlier_parent, later_parent) =
+                    (nest.fold_parent(earlier), nest.fold_parent(later));
+                assert_ne!(
+                    earlier_parent, later_parent,
+                    "{pool}: two folds under one parent would be nested loops, not siblings"
+                );
+                assert!(
+                    !ancestors(earlier_parent).contains(&later)
+                        && !ancestors(later_parent).contains(&earlier),
+                    "{pool}: one fold is inside the other"
+                );
+
+                // The driver, observed.
+                let mut recorder = Addressed::new(&mut backend);
+                let result = compile_via_backend(
+                    regalloc::ScopedSchedule::from_schedule(schedule.clone()),
+                    &mut recorder,
+                )
+                .expect("the glyph-like row compiles");
+                // `spill_bytes` is the frame's `m`, where the fold slots begin.
+                let fold_slot = |j: usize, root: u32| {
+                    result.spill_bytes + (2 * j as u32 + root) * file.vector_bytes
+                };
+                let (own, shared_acc, shared_binder) = (
+                    [fold_slot(earlier, 0), fold_slot(earlier, 1)],
+                    fold_slot(later, 0),
+                    fold_slot(later, 1),
+                );
+
+                let touched = recorder.addressed();
+                for slot in own {
+                    assert!(
+                        !touched.contains(&slot),
+                        "{pool}: the earlier fold's own slot {slot} was addressed; the \
+                         series must reproduce the later fold's slots being shared, or \
+                         re-baseline that on purpose"
+                    );
+                }
+                // Each parent runs its loop through the later fold's
+                // accumulator slot (held there, or stored on the way out when
+                // carried), and its binder's where that is not carried.
+                for (which, parent) in [("earlier", earlier_parent), ("later", later_parent)] {
+                    let by_parent = recorder.addressed_by(parent);
+                    assert!(
+                        by_parent.contains(&shared_acc),
+                        "{pool}: the {which} fold's parent never addressed the shared \
+                         accumulator slot {shared_acc} ({by_parent:?})"
+                    );
+                    if pool == "floor" {
+                        assert!(
+                            by_parent.contains(&shared_binder),
+                            "{pool}: the {which} fold's parent never addressed the shared \
+                             binder slot {shared_binder} ({by_parent:?})"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// `folds` independent surviving folds on one binder slot, each over
+        /// `defs` values that vary with the column, summed.
+        ///
+        /// Each fold is seeded by a constant of its own (one root per fold)
+        /// and then alternates a product with `x` and a sum with the binder,
+        /// so no two folds share a body and nothing is for the optimizer to
+        /// factor. `n = folds · (defs + 1)` is proportional to `folds`.
+        fn sibling_scopes(folds: u32, defs: u32) -> (ExprArena, ExprId) {
+            use pixelflow_ir::fold::{Binder, Fold, Monoid};
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let binder = Binder::from_slot(0).expect("slot 0 exists");
+            let i = a.push_var(binder.var());
+            let results: Vec<ExprId> = (0..folds)
+                .map(|k| {
+                    let mut t = a.push_const(1.0 + k as f32);
+                    for step in 0..defs {
+                        let other = if step % 2 == 0 { x } else { i };
+                        let op = if step % 2 == 0 {
+                            OpKind::Mul
+                        } else {
+                            OpKind::Add
+                        };
+                        t = a.push_binary(op, t, other);
+                    }
+                    a.push_reduce(Fold::new(Monoid::SUM, binder, 0..2), t)
+                })
+                .collect();
+            // Summed pairwise, so a thousand folds is ten levels, not a
+            // thousand-deep chain for a recursive pass to walk.
+            let mut layer = results;
+            while layer.len() > 1 {
+                layer = layer
+                    .chunks(2)
+                    .map(|pair| match pair {
+                        [left, right] => a.push_binary(OpKind::Add, *left, *right),
+                        [alone] => *alone,
+                        _ => unreachable!("chunks(2) yields one or two"),
+                    })
+                    .collect();
+            }
+            (a, layer[0])
+        }
+
+        /// Values per fold in [`sibling_scopes_allocation`].
+        const DEFS_PER_FOLD: u32 = 8;
+
+        /// What the scoping and allocation stages ask of the heap as the
+        /// folds multiply, printed as a table: the baseline a change to
+        /// either is judged against.
+        ///
+        /// Not a gate (`#[ignore]`, and it asserts only that the instrument
+        /// sees what it counts): run it with
+        /// `cargo test --release -p pixelflow-codegen --lib sibling_scopes_allocation -- --ignored --nocapture`.
+        /// Per stage: bytes requested, allocations, and peak net growth
+        /// ([`alloc_probe`]'s definitions). `schedule` is lowering; `scope` is
+        /// [`regalloc::ScopedSchedule::from_schedule`], whose input is cloned
+        /// outside the scope and freed inside it (so its peak is net of that
+        /// input); `allocate` is `LinearScan::allocate_nest` over the scoped
+        /// nest, likewise; `emit` is the whole [`compile_schedule`] (scoping,
+        /// allocation and emission; the schedule it is given is not counted).
+        #[test]
+        #[ignore = "a measurement, not a check: run with --ignored --nocapture"]
+        fn sibling_scopes_allocation() {
+            let shape = LatticeShape::new([Target::Avx2.lanes(), 1]);
+            let lanes = Target::Avx2.lanes();
+            println!(
+                "{:>6} {:>7} {:>6}  {:>26} {:>26} {:>26} {:>26}",
+                "folds", "defs", "scopes", "schedule", "scope", "allocate", "emit"
+            );
+            println!(
+                "{:>22}  (each: requested bytes / allocations / peak bytes)",
+                ""
+            );
+            for folds in [16u32, 64, 256, 1024] {
+                let (a, root) = sibling_scopes(folds, DEFS_PER_FOLD);
+                let file = avx2::driver::Avx2Backend::new(EmitCtx::default()).register_file();
+
+                let (schedule, lowered) =
+                    alloc_probe::measure(|| schedule_for(&a, root, shape, lanes));
+                let defs = schedule.len();
+                let (scoped, scoping) = alloc_probe::measure({
+                    let schedule = schedule.clone();
+                    || regalloc::ScopedSchedule::from_schedule(schedule)
+                });
+                let scopes = scoped.folds.len() + 1;
+                let (nest, allocation) =
+                    alloc_probe::measure(|| regalloc::LinearScan.allocate_nest(scoped, &file));
+                assert_eq!(nest.fold_count() + 1, scopes);
+                let ((), emission) = alloc_probe::measure(|| {
+                    let mut backend = avx2::driver::Avx2Backend::new(EmitCtx::default());
+                    compile_schedule(schedule.clone(), &mut backend).expect("the fixture compiles");
+                });
+
+                // Sees what it counts: scoping copies every def at least once
+                // into the scope that holds it.
+                let floor = defs * core::mem::size_of::<regalloc::Def>();
+                assert!(
+                    scoping.requested >= floor,
+                    "scoping {folds} folds requested {} bytes, fewer than the {floor} its \
+                     {defs} defs occupy: the probe is not seeing the stage",
+                    scoping.requested
+                );
+
+                let cell =
+                    |m: Measured| format!("{} / {} / {}", m.requested, m.allocations, m.peak);
+                println!(
+                    "{folds:>6} {defs:>7} {scopes:>6}  {:>26} {:>26} {:>26} {:>26}",
+                    cell(lowered),
+                    cell(scoping),
+                    cell(allocation),
+                    cell(emission)
+                );
+            }
+        }
+    }
 }
