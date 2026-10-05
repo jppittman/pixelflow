@@ -107,13 +107,10 @@ pub struct BranchTraffic {
 }
 
 impl BranchTraffic {
-    /// The branches `nest`'s tables hold, over its body, its folds and its
-    /// guard arms.
+    /// The branches `nest`'s tables hold, over its body and its folds.
     #[must_use]
     pub(super) fn of(nest: &NestAllocation) -> Self {
-        let scopes = core::iter::once(Scope::Body)
-            .chain((0..nest.fold_count()).map(Scope::Fold))
-            .chain((0..2 * nest.guard_count()).map(Scope::GuardArm));
+        let scopes = core::iter::once(Scope::Body).chain((0..nest.fold_count()).map(Scope::Fold));
         let mut branches = Self::default();
         for scope in scopes {
             for guard in nest.scope(scope).if_guards() {
@@ -165,20 +162,13 @@ pub struct EmitTraffic {
 
 impl EmitTraffic {
     /// Order what [`Counting`] recorded per scope, in whatever order the
-    /// scopes finished, into `scopes`' index: the body first, then the folds,
-    /// then every guard arm. `count` is the number of scopes; one nothing was
-    /// recorded for is empty. `fold_count` is how many of `Scope::Fold`'s
-    /// indices there are, which is what separates a fold's index space from a
-    /// guard arm's (see [`scope_ix`]).
+    /// scopes finished, into `scopes`' index: the body first, then the folds.
+    /// `count` is the number of scopes; one nothing was recorded for is empty.
     #[must_use]
-    pub fn by_index(
-        recorded: Vec<(Scope, ScopeTraffic)>,
-        count: usize,
-        fold_count: usize,
-    ) -> Vec<ScopeTraffic> {
+    pub fn by_index(recorded: Vec<(Scope, ScopeTraffic)>, count: usize) -> Vec<ScopeTraffic> {
         let mut scopes = alloc::vec![ScopeTraffic::default(); count];
         for (scope, traffic) in recorded {
-            scopes[scope_ix(scope, fold_count)] = traffic;
+            scopes[scope_ix(scope)] = traffic;
         }
         scopes
     }
@@ -212,16 +202,11 @@ impl EmitTraffic {
     }
 }
 
-/// The index a scope's count is kept under: the body first, then the folds,
-/// then every guard arm — `fold_count` is what offsets a guard arm's own
-/// index past the folds' (folds and guard arms are separate index spaces,
-/// [`Scope::Fold`] and [`Scope::GuardArm`], so flattening them into one dense
-/// range needs to know where the first ends).
-fn scope_ix(scope: Scope, fold_count: usize) -> usize {
+/// The index a scope's count is kept under: the body first, then the folds.
+fn scope_ix(scope: Scope) -> usize {
     match scope {
         Scope::Body => 0,
         Scope::Fold(j) => j + 1,
-        Scope::GuardArm(i) => 1 + fold_count + i,
     }
 }
 
@@ -611,7 +596,7 @@ mod tests {
             (Scope::Fold(0), rows)
         ];
         let traffic = EmitTraffic {
-            scopes: EmitTraffic::by_index(recorded, 3, 2),
+            scopes: EmitTraffic::by_index(recorded, 3),
             trips: alloc::vec![1, 6, 42],
             ..EmitTraffic::default()
         };

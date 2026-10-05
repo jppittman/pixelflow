@@ -402,8 +402,9 @@ a-glyph-is-a-formula §4.3.
    `lower_dwrt`'s tabulation rule only (`passes.rs:788`). It also serves
    `unroll_reduce`, which is off the production path.
 2. `node_variance` in the extractor (`extract.rs:1729-1759`).
-3. `schedule_variance` in codegen (`emit/mod.rs:2746-2819`). It differs from #1
-   only on `Guard`, which `collapse` refuses anyway (`passes/lattice.rs:156`).
+3. `schedule_variance` in codegen (`emit/mod.rs:2746-2819`). It differed from #1
+   only on `Guard`, which `collapse` refused anyway (`passes/lattice.rs:156`);
+   the node was retired 2026-10-05, so the two now agree.
 4. `rebuild_body`'s `varies` flag (`fold_rules.rs:288-327`).
 5. `Substitution` in `unroll_reduce` (`passes.rs:510-525`). Research-only.
 6. `DepsAnalysis` (`egraph/deps.rs`). Dead, and deleted in step 2.
@@ -486,6 +487,9 @@ Not on this list:
   instrument that measures the exclusivity-versus-demand gap.
 - **G1/G2 `Guard`** (unreachable: `collapse` panics on it, `passes/lattice.rs:156`)
   is decided in the demand-regions CL, with its replacement in view.
+  **Decided 2026-10-05: retired** (commits "retire the guard-arm scope", "retire ExprNode::Guard"). Nothing produced one, and the
+  emitter equalled `If` only for a batch-uniform mask; the places above where
+  `variance` and `stays_put` differ on a `Guard` are history.
 
 ## 8. Build order
 

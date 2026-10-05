@@ -12,11 +12,9 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::guards::{IfArm, IfGuard};
+use super::guards::IfGuard;
 use super::{Gpr, KReg, OperandSource, PtrReg, Reg, ScheduledOp, operand_sources, reloads_wanted};
-pub use crate::program::{
-    Class, Def, Scope, ScopeFold, ScopeGuardArm, ScopeRegion, ScopedSchedule, ValueId,
-};
+pub use crate::program::{Class, Def, Scope, ScopeFold, ScopeRegion, ScopedSchedule, ValueId};
 pub(crate) use crate::program::{all_operands, operands, pointer_operand, structural_children};
 
 /// The complete platform-dependent surface of register allocation.
@@ -1024,12 +1022,6 @@ pub struct NestAllocation {
     /// The surviving folds, indexed by [`Scope::Fold`]. Flat storage; the tree
     /// is each entry's [`FoldScope::parent`].
     folds: Vec<FoldScope>,
-    /// The surviving `Guard`s' arms, indexed by [`Scope::GuardArm`]. Paired:
-    /// [`RegisterAllocator::allocate_nest`] pushes a `Guard`'s
-    /// [`IfArm::True`] entry immediately before its
-    /// [`IfArm::False`] one, so `guard_arms[2*k]`/`guard_arms[2*k + 1]`
-    /// are one `Guard`'s two arms — see [`NestAllocation::guard_count`].
-    guard_arms: Vec<GuardArmScope>,
 }
 
 /// A surviving `Reduce`'s loop body: a scope, plus where it opens.
@@ -1054,29 +1046,6 @@ struct FoldScope {
     /// lives across its back edge, and where a value lives is a *placement*.
     /// A fold scope given only an evaluation order would be the one scope that
     /// exists for a carried value with nowhere to record where that value is.
-    code: ScopeCode,
-}
-
-/// One arm of a surviving `Guard`: a scope, plus where it opens and which
-/// arm it is.
-///
-/// No `roots` field, unlike [`FoldScope`] — a guard arm's schedule comes
-/// from a wholly separate arena (its `KernelKey`'s referent), so it reads
-/// nothing from its parent but the branch condition, which the parent
-/// resolves *before* branching, not as a value inside this scope. Its own
-/// result is not carried anywhere either (see the module's non-goals for
-/// this stage): the parent reads it from a slot the driver dedicates to the
-/// `Guard`, exactly as it reads a fold's accumulator from one.
-#[derive(Debug)]
-struct GuardArmScope {
-    /// The scope whose schedule holds the `Guard` def this is an arm of.
-    parent: Scope,
-    /// The `Guard` def's position in `parent`'s schedule.
-    at: usize,
-    /// Which of the `Guard`'s two arms this is.
-    arm: IfArm,
-    /// Everything else a scope has — this arm's own evaluation order,
-    /// placements and scratch, exactly as a fold's body has its own.
     code: ScopeCode,
 }
 
@@ -1106,46 +1075,6 @@ impl NestAllocation {
     #[must_use]
     pub fn fold_count(&self) -> usize {
         self.folds.len()
-    }
-
-    /// How many surviving `Guard`s this nest has — half of
-    /// [`NestAllocation::guard_arms`]'s length, since every guard pushes
-    /// its `True` and `False` arm together (see that field's doc).
-    #[must_use]
-    pub fn guard_count(&self) -> usize {
-        self.guard_arms.len() / 2
-    }
-
-    /// The `ValueId` guard `k`'s `Guard` def names — the identity the driver
-    /// dedicates a result slot to, mirroring [`NestAllocation::fold_reduce_vid`].
-    ///
-    /// # Panics
-    /// If `k` names no guard in this nest, or its parent's schedule does not
-    /// reach the position it opens at.
-    #[must_use]
-    pub fn guard_reduce_vid(&self, k: usize) -> ValueId {
-        let arm = &self.guard_arms[2 * k];
-        self.code(arm.parent)
-            .and_then(|c| c.schedule.get(arm.at))
-            .map(|def| def.value)
-            .unwrap_or_else(|| {
-                panic!(
-                    "Guard({k})'s parent {:?} has no def at {}",
-                    arm.parent, arm.at
-                )
-            })
-    }
-
-    /// The scope guard `k`'s two arms open inside.
-    ///
-    /// # Panics
-    /// If `k` names no guard in this nest.
-    #[must_use]
-    pub fn guard_parent(&self, k: usize) -> Scope {
-        self.guard_arms
-            .get(2 * k)
-            .unwrap_or_else(|| panic!("Guard({k}) is not a guard of this nest"))
-            .parent
     }
 
     /// The scope fold `j`'s loop opens inside.
@@ -1222,7 +1151,6 @@ impl NestAllocation {
         match scope {
             Scope::Body => Some(&self.body),
             Scope::Fold(i) => self.folds.get(i).map(|f| &f.code),
-            Scope::GuardArm(i) => self.guard_arms.get(i).map(|g| &g.code),
         }
     }
 
@@ -1232,15 +1160,12 @@ impl NestAllocation {
         match scope {
             Scope::Body => None,
             Scope::Fold(i) => self.folds.get(i).map(|f| f.parent),
-            Scope::GuardArm(i) => self.guard_arms.get(i).map(|g| g.parent),
         }
     }
 
     /// Every scope of this nest, in no particular order.
     fn scopes(&self) -> impl Iterator<Item = Scope> + use<'_> {
-        core::iter::once(Scope::Body)
-            .chain((0..self.folds.len()).map(Scope::Fold))
-            .chain((0..self.guard_arms.len()).map(Scope::GuardArm))
+        core::iter::once(Scope::Body).chain((0..self.folds.len()).map(Scope::Fold))
     }
 
     /// Whether `outer` contains `inner` — i.e. `outer`'s code runs `inner`.
@@ -1296,7 +1221,6 @@ impl NestAllocation {
         let code = match scope {
             Scope::Body => &mut self.body,
             Scope::Fold(i) => &mut self.folds[i].code,
-            Scope::GuardArm(i) => &mut self.guard_arms[i].code,
         };
         code.placements[v.0 as usize] = Some(Placement::new(Span { from, at }));
     }
@@ -1415,16 +1339,6 @@ impl<'a> Allocation<'a> {
     ///
     /// Only a fold answers: it starts at a def, which is exactly what makes
     /// the nest a tree, so this is the query that distinguishes the two.
-    ///
-    /// A guard arm also opens at a def — its parent's `Guard` — but answers
-    /// `None` here regardless: this query exists for the one walk that reads
-    /// it, `emit_scope`'s climb to the binders every enclosing fold's `Write`
-    /// needs, and a guard arm's own body can never contain a `Write` (its
-    /// arena is wholly separate and never reaches `passes::lattice::collapse`
-    /// — see [`Scope::GuardArm`]'s doc), so that walk has nothing to learn by
-    /// climbing past one. Its ancestors above the guard are still real folds,
-    /// but a *different* [`Allocation`] — the one for the scope the guard
-    /// itself sits in — is what would climb into them.
     #[must_use]
     pub fn opens_at(&self) -> Option<(Scope, usize)> {
         match self.scope {
@@ -1432,7 +1346,7 @@ impl<'a> Allocation<'a> {
                 let fold = &self.nest.folds[i];
                 Some((fold.parent, fold.at))
             }
-            Scope::Body | Scope::GuardArm(_) => None,
+            Scope::Body => None,
         }
     }
 
@@ -1461,30 +1375,17 @@ impl<'a> Allocation<'a> {
             .map(Scope::Fold)
     }
 
-    /// [`Allocation::fold_opening_at`] for a `Guard`'s arm: the scope `arm`
-    /// opens at position `at` of this schedule, or `None` when this scope is
-    /// not the one that opens it — either an enclosing scope's `Guard`, read
-    /// here as a placeholder, or a position with no `Guard` at all.
-    #[must_use]
-    pub fn guard_opening_at(&self, at: usize, arm: IfArm) -> Option<Scope> {
-        self.nest
-            .guard_arms
-            .iter()
-            .position(|g| g.parent == self.scope && g.at == at && g.arm == arm)
-            .map(Scope::GuardArm)
-    }
-
     /// This fold scope's own roots and where its loop keeps them — what the
     /// emitter opening the loop seeds, tests, combines into and steps.
     ///
     /// # Panics
-    /// If this scope is not a fold: the body and a guard arm have no binder
-    /// or accumulator, so the question has no answer there.
+    /// If this scope is not a fold: the body has no binder or accumulator, so
+    /// the question has no answer there.
     #[must_use]
     pub fn fold_roots(&self) -> FoldRoots {
         match self.scope {
             Scope::Fold(j) => self.nest.fold_roots(j),
-            Scope::Body | Scope::GuardArm(_) => {
+            Scope::Body => {
                 panic!(
                     "{:?} is not a fold, so it has no binder or accumulator",
                     self.scope
@@ -1667,20 +1568,10 @@ fn var_in(schedule: &[Def], var: u8) -> Option<ValueId> {
 }
 
 /// The scope index the count is kept under: the body first, then the folds.
-///
-/// A guard arm never reaches this: [`plan_carries`] and
-/// [`LinearScan::allocate_nest`]'s `carried_into`/`parked_by` bookkeeping are
-/// about what a scope *carries into the scopes inside it*, and a guard arm
-/// carries nothing in and opens nothing of its own (see [`Scope::GuardArm`]'s
-/// doc) — so nothing ever indexes either by one.
 fn scope_ix(scope: Scope) -> usize {
     match scope {
         Scope::Body => 0,
         Scope::Fold(j) => j + 1,
-        Scope::GuardArm(_) => unreachable!(
-            "scope_ix: a guard arm carries nothing into scopes inside it and \
-             opens none of its own, so plan_carries and allocate_nest never index one"
-        ),
     }
 }
 
@@ -1768,7 +1659,6 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget, steps: &mut Steps) -
                 // parents come first. Also makes a parent cycle unsayable.
                 Scope::Fold(j) => j < index,
                 Scope::Body => true,
-                Scope::GuardArm(_) => unreachable!("a fold's parent is never a guard arm"),
             },
             "Fold({index})'s parent {:?} is not an earlier scope",
             fold.parent
@@ -1779,14 +1669,12 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget, steps: &mut Steps) -
         match scope {
             Scope::Body => &nest.body.schedule,
             Scope::Fold(j) => &nest.folds[j].schedule,
-            Scope::GuardArm(_) => unreachable!("plan_carries never asks about a guard arm"),
         }
     };
     let roots_of = |scope: Scope| -> &[ValueId] {
         match scope {
             Scope::Body => &nest.body.roots,
             Scope::Fold(j) => &nest.folds[j].roots,
-            Scope::GuardArm(_) => unreachable!("plan_carries never asks about a guard arm"),
         }
     };
     let meta_of = |j: usize| -> &pixelflow_ir::fold::Fold {
@@ -1808,13 +1696,11 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget, steps: &mut Steps) -
         trips.push(match nest.folds[j].parent {
             Scope::Fold(p) => own * trips[p],
             Scope::Body => own,
-            Scope::GuardArm(_) => unreachable!("a fold's parent is never a guard arm"),
         });
     }
     let trips_of = |scope: Scope| match scope {
         Scope::Body => 1,
         Scope::Fold(j) => trips[j],
-        Scope::GuardArm(_) => unreachable!("plan_carries never asks about a guard arm"),
     };
     // The folds from `k` up to `j`, `k` first, if `j` encloses `k` (or is
     // it); empty otherwise.
@@ -1828,7 +1714,6 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget, steps: &mut Steps) -
                     at = p;
                 }
                 Scope::Body => return Vec::new(),
-                Scope::GuardArm(_) => unreachable!("a fold's parent is never a guard arm"),
             }
         }
         chain
@@ -1839,9 +1724,6 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget, steps: &mut Steps) -
             (Scope::Body, _) => true,
             (Scope::Fold(_), Scope::Body) => false,
             (Scope::Fold(o), Scope::Fold(i)) => !chain_up_to(i, o).is_empty(),
-            (Scope::GuardArm(_), _) | (_, Scope::GuardArm(_)) => {
-                unreachable!("plan_carries never asks about a guard arm")
-            }
         }
     };
     let scopes = || core::iter::once(Scope::Body).chain((0..folds).map(Scope::Fold));
@@ -2175,9 +2057,6 @@ impl RegisterAllocator for LinearScan {
             let parent_code: &ScopeCode = match fold.parent {
                 Scope::Body => &body_code,
                 Scope::Fold(j) => &folds[j].code,
-                Scope::GuardArm(_) => {
-                    unreachable!("a fold's parent is never a guard arm (no fold nests in one)")
-                }
             };
             let carried_into_parent = carried_into[scope_ix(fold.parent)];
             let ScheduledOp::Reduce(fold_meta, _) = &parent_code.schedule[fold.at].op else {
@@ -2296,59 +2175,9 @@ impl RegisterAllocator for LinearScan {
             });
         }
 
-        // Every surviving `Guard`'s two arms. Independent of `plan_carries`
-        // and the `CarryPlan` above: an arm's schedule is wholly
-        // self-contained (see `ScopeGuardArm`'s doc), so it has no roots to
-        // rank against anything and nothing of the fold machinery above
-        // applies — it needs only the register pool free at the point its
-        // `Guard` def sits, exactly the pool a fold body would get if it
-        // opened there instead (`Scan::scan`'s pre-emptive eviction at a
-        // `Guard` def, mirroring what it already does at a `Reduce`, is what
-        // makes "the whole pool minus the ancestors' carries" sound here: no
-        // parent value survives in a register across this position for the
-        // arm to clobber).
-        let mut guard_arms: Vec<GuardArmScope> = Vec::with_capacity(nest.guard_arms.len());
-        for arm in nest.guard_arms {
-            let parent_code: &ScopeCode = match arm.parent {
-                Scope::Body => &body_code,
-                Scope::Fold(j) => &folds[j].code,
-                Scope::GuardArm(_) => {
-                    unreachable!("a guard arm's parent is never a guard arm (none nest in one)")
-                }
-            };
-            let carried_into_parent = carried_into[scope_ix(arm.parent)];
-            let parent_scratch = &parent_code.scratch[arm.at];
-            let mut taken_at_def: Vec<Reg> = Vec::new();
-            taken_at_def.extend(parent_scratch.temps.iter().flatten().copied());
-            taken_at_def.extend(parent_scratch.reloads.iter().flatten().copied());
-            taken_at_def.extend(parent_scratch.guard_mask);
-            taken_at_def.extend(parent_scratch.guard_temp);
-            taken_at_def.extend(parent_scratch.result);
-            let inside = file.inside(carried_into_parent.union(Carried {
-                vectors: RegSet::of(&taken_at_def),
-                pointers: GprSet::EMPTY,
-            }));
-            // An arm parks nothing and opens no fold: its schedule is a
-            // separate arena's, which `extract_guards` carves nothing out of.
-            let scan = self.scan(arm.schedule, &inside, Boundary::CLOSED, arm.guards);
-            guard_arms.push(GuardArmScope {
-                parent: arm.parent,
-                at: arm.at,
-                arm: arm.arm,
-                code: ScopeCode {
-                    placements: record(&scan, &BTreeMap::new()),
-                    schedule: scan.schedule,
-                    scratch: scan.scratch,
-                    roots: Vec::new(),
-                    guards: scan.guards,
-                },
-            });
-        }
-
         NestAllocation {
             body: body_code,
             folds,
-            guard_arms,
         }
     }
 }
@@ -2578,15 +2407,6 @@ struct Boundary<'a> {
     live_in: &'a BTreeMap<ValueId, Where>,
     /// The values this scope computes for the scopes inside it.
     roots: &'a [ValueId],
-}
-
-impl Boundary<'_> {
-    /// A scope nothing crosses into or out of: a guard arm, whose schedule is
-    /// a separate arena's and which opens no fold.
-    const CLOSED: Boundary<'static> = Boundary {
-        live_in: &BTreeMap::new(),
-        roots: &[],
-    };
 }
 
 /// What a pass reads about a scope beyond its schedule: its [`Boundary`],
@@ -3096,16 +2916,7 @@ impl LinearScan {
             //
             // Not for a live-in `Reduce`: that is a placeholder for a loop an
             // enclosing scope already ran, and nothing runs here.
-            //
-            // A `Guard` earns the identical treatment for the identical
-            // reason: its two arms are each a wholly separate, freshly
-            // allocated scope (`LinearScan::allocate_nest`'s guard-arm loop)
-            // that starts fresh over the pool minus only what is carried in,
-            // with no visibility into what this scope holds resident and no
-            // reason not to reuse any of it.
-            if matches!(def.op, ScheduledOp::Reduce(..) | ScheduledOp::Guard(..))
-                && !pass.live_in[def.value.0 as usize]
-            {
+            if matches!(def.op, ScheduledOp::Reduce(..)) && !pass.live_in[def.value.0 as usize] {
                 for slot in 0..pass.owner.len() {
                     if pass.owner[slot].is_some() {
                         pass.split_out(slot, i);
@@ -3307,14 +3118,8 @@ impl LinearScan {
                 )
             } else if let ScheduledOp::Reduce(..)
             | ScheduledOp::Write { .. }
-            | ScheduledOp::Seq(..)
-            | ScheduledOp::Guard(..) = def.op
+            | ScheduledOp::Seq(..) = def.op
             {
-                // A `Guard`'s result, the same way and for the same reason as
-                // a `Reduce`'s: two different scopes (its two arms) each
-                // store it, so no single one of them owns "the destination
-                // register" — the driver dedicates it a slot instead (see
-                // `ScheduledOp::Guard`'s doc and the module's non-goals).
                 pass.place(def.value, i, Where::Spilled);
                 None
             } else {
@@ -3451,28 +3256,14 @@ impl LinearScan {
             // the same way, in place of this instruction — so it reserves
             // through the same gate rather than a second one, even though
             // `sites[i]` (built from `If`s alone) never names it.
-            // A `Guard`'s own branch needs exactly the same two registers,
-            // for exactly the same reason, at exactly the same point — its
-            // mask test and branch are emitted in place of this instruction
-            // too.
-            let is_reduce_or_guard =
-                matches!(def.op, ScheduledOp::Reduce(..) | ScheduledOp::Guard(..));
-            if !sites[i].is_empty() || is_reduce_or_guard {
+            let is_reduce = matches!(def.op, ScheduledOp::Reduce(..));
+            if !sites[i].is_empty() || is_reduce {
                 // A `Reduce`'s own trip test builds its mask fresh into a
                 // temp every time (`t0` in `emit_scope`'s loop, never a
                 // reload of some value already computed elsewhere), so
-                // `sites[i]` — the only other source `guard_mask` answers
-                // for — is what decides here for both: empty for a `Reduce`
-                // (it never asks), and, for a `Guard`, its own one operand,
-                // added because `sites` is built from `If`s alone and
-                // does not already name it.
-                let guard_op_mask = match def.op {
-                    ScheduledOp::Guard(mask, ..) => Some(mask),
-                    _ => None,
-                };
-                if sites[i].iter().any(|m| !pass.is_resident(*m))
-                    || guard_op_mask.is_some_and(|m| !pass.is_resident(m))
-                {
+                // `sites[i]` — the only source `guard_mask` answers for —
+                // is empty for a `Reduce` (it never asks).
+                if sites[i].iter().any(|m| !pass.is_resident(*m)) {
                     scratch_for[i].guard_mask = Some(Reg(pass.reserve(i, &mut taken, &live_here)));
                 }
                 for _ in 0..file.guard_temps {
@@ -3524,8 +3315,7 @@ impl LinearScan {
             if i + 1 == dag.len()
                 && !unit_root
                 && !pass.is_resident(def.value)
-                && (pass.live_in[def.value.0 as usize]
-                    || matches!(def.op, ScheduledOp::Reduce(..) | ScheduledOp::Guard(..)))
+                && (pass.live_in[def.value.0 as usize] || matches!(def.op, ScheduledOp::Reduce(..)))
             {
                 scratch_for[i].result = Some(Reg(pass.reserve(i, &mut taken, &live_here)));
             }
@@ -3784,11 +3574,18 @@ mod tests {
         allocate_flat(schedule, &TEST_FILE)
     }
 
+    /// A scope nothing crosses into or out of. A `const` item, so the
+    /// `&BTreeMap::new()` borrow is `'static`.
+    const CLOSED: Boundary<'static> = Boundary {
+        live_in: &BTreeMap::new(),
+        roots: &[],
+    };
+
     /// A scope that enters with nothing parked, hands nothing off and holds
     /// no guard: `sites` is per instruction, so it is the caller's.
     fn no_reads(sites: &[Vec<ValueId>]) -> Reads<'_> {
         Reads {
-            boundary: Boundary::CLOSED,
+            boundary: CLOSED,
             sites,
             arms: &[],
         }
@@ -4743,7 +4540,6 @@ mod tests {
                         def(51, ScheduledOp::Binary(OpKind::Add, ValueId(50), root)),
                     ],
                 }],
-                guard_arms: Vec::new(),
             }),
             &TEST_FILE,
         );
@@ -4789,7 +4585,6 @@ mod tests {
                         def(51, ScheduledOp::Binary(OpKind::Add, ValueId(50), c)),
                     ],
                 }],
-                guard_arms: Vec::new(),
             }),
             &NEST_FILE,
         );
@@ -5330,7 +5125,6 @@ mod tests {
                 schedule: core::iter::once(binder.clone()).chain(reads).collect(),
                 guards: Vec::new(),
             }],
-            guard_arms: Vec::new(),
         })
     }
 
@@ -5445,7 +5239,6 @@ mod tests {
                         schedule: vec![def(50, ScheduledOp::Unary(OpKind::Neg, ValueId(10)))],
                     },
                 ],
-                guard_arms: Vec::new(),
             }),
             &NEST_FILE,
         )
@@ -5506,7 +5299,6 @@ mod tests {
                             def(52, ScheduledOp::Binary(OpKind::Add, ValueId(51), b)),
                         ],
                     }],
-                    guard_arms: Vec::new(),
                 }),
                 &file,
             );
@@ -5581,7 +5373,6 @@ mod tests {
                     guards: Vec::new(),
                     schedule: vec![def(50, ScheduledOp::Unary(OpKind::Neg, read))],
                 }],
-                guard_arms: Vec::new(),
             }),
             &NEST_FILE,
         );
@@ -5649,7 +5440,6 @@ mod tests {
                             def(51, ScheduledOp::Gather(ValueId(50), base)),
                         ],
                     }],
-                    guard_arms: Vec::new(),
                 }),
                 &file,
             );
@@ -5738,7 +5528,6 @@ mod tests {
                             def(53, ScheduledOp::Gather(ValueId(52), pointer)),
                         ],
                     }],
-                    guard_arms: Vec::new(),
                 }),
                 &file,
             );
@@ -5904,7 +5693,6 @@ mod tests {
                     guards: Vec::new(),
                     schedule: vec![leaf(50)],
                 }],
-                guard_arms: Vec::new(),
             }),
             &NEST_FILE,
         );
@@ -5948,7 +5736,6 @@ mod tests {
                     guards: Vec::new(),
                     schedule: inner,
                 }],
-                guard_arms: Vec::new(),
             }),
             &NEST_FILE,
         );
@@ -6059,7 +5846,6 @@ mod tests {
                         def(5, ScheduledOp::Const(0.0)),
                     ],
                 }],
-                guard_arms: Vec::new(),
             }),
             &NEST_FILE,
         );

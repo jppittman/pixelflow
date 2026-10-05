@@ -1050,13 +1050,7 @@ pub fn operand_sources(op: &ScheduledOp, resident: [bool; 3]) -> [OperandSource;
         | ScheduledOp::ShiftImm(..)
         | ScheduledOp::Gather(..)
         | ScheduledOp::Broadcast(..)
-        | ScheduledOp::Write { .. }
-        // A `Guard`'s one register operand is its mask — its own arm
-        // resolution never reaches `resolve_operands`/`operand_sources`
-        // (`emit_scope` special-cases it before either is called, the same
-        // way it special-cases `Reduce`), but the mask is still resolved the
-        // ordinary way, from wherever the allocator put it.
-        | ScheduledOp::Guard(..) => 1,
+        | ScheduledOp::Write { .. } => 1,
         ScheduledOp::Binary(..) => 2,
         ScheduledOp::Ternary(..) => 3,
     };
@@ -1169,7 +1163,7 @@ impl EmitCtx {
         let (arena, root) = pixelflow_ir::passes::legalize(arena, root, &collapse)
             .map_err(CompileError::Legalize)?;
         let origin_ids = origin_slots(&arena);
-        let schedule = arena_to_schedule(&arena, root, Some(origin_ids));
+        let schedule = arena_to_schedule(&arena, root, origin_ids);
         compile_native(schedule, self)
     }
 }
@@ -1469,15 +1463,14 @@ struct MaskTest {
 /// given its table the way a compile gives one.
 #[cfg(test)]
 fn flat_nest(schedule: Vec<regalloc::Def>) -> regalloc::ScopedSchedule {
-    let (schedule, guards) = lay_out_flat(schedule);
+    let layout = Layout::of(&schedule, &[], &guards::FoldReads::default());
     regalloc::ScopedSchedule {
         body: regalloc::ScopeRegion {
             roots: Vec::new(),
-            guards,
-            schedule,
+            schedule: layout.apply(&schedule),
+            guards: layout.guards,
         },
         folds: Vec::new(),
-        guard_arms: Vec::new(),
     }
 }
 
@@ -1511,7 +1504,6 @@ fn emit_dag_body<B: IsaBackend>(
             override_size: None,
             fold_slots: &alloc::collections::BTreeMap::new(),
             binder_slots: &alloc::collections::BTreeMap::new(),
-            guard_slots: &alloc::collections::BTreeMap::new(),
             slot_base: 0,
         },
     )?;
@@ -1545,12 +1537,6 @@ struct FramePlan<'a> {
     /// a fact about the scope reading it, found by walking that scope's
     /// enclosing folds.
     binder_slots: &'a alloc::collections::BTreeMap<regalloc::ValueId, u32>,
-    /// Each surviving `Guard`'s result slot, by its `Guard`'s own `ValueId`:
-    /// the accumulator-slot analogue for a branch rather than a loop — a slot
-    /// outside any single scope's frame, because the scope the `Guard` def
-    /// sits in and both of its two arms all address it. Empty wherever
-    /// nothing here can open a guard arm.
-    guard_slots: &'a alloc::collections::BTreeMap<regalloc::ValueId, u32>,
     /// Where this scope's own spill slots start. Zero for the body, which
     /// has the frame to itself. A fold's body is the case that is not that:
     /// it runs nested inside its parent's schedule, with the parent's
@@ -1589,7 +1575,6 @@ fn emit_scope<B: IsaBackend>(
         override_size: frame_override,
         fold_slots,
         binder_slots,
-        guard_slots,
         slot_base,
     } = frame;
     let file = backend.register_file();
@@ -1642,13 +1627,8 @@ fn emit_scope<B: IsaBackend>(
     // regardless, thrown away here). Harmless to pin one this scope never
     // reaches — `pin_slot` on a `ValueId` nothing here reads is simply never
     // read back.
-    // A surviving `Guard`'s result, the same idea again: two arms and the
-    // scope its def sits in must all agree on one address, so the driver's
-    // `guard_slots` overrides whatever this scope's own `FrameLayout::resolve`
-    // gave it too.
     let mut fold_pins: alloc::vec::Vec<(regalloc::ValueId, u32)> = fold_slots
         .iter()
-        .chain(guard_slots.iter())
         .map(|(vid, &offset)| (*vid, offset))
         .collect();
     // The binders of this scope's own fold and every enclosing fold, each
@@ -2210,7 +2190,6 @@ fn emit_scope<B: IsaBackend>(
                     override_size: Some(frame_size),
                     fold_slots,
                     binder_slots,
-                    guard_slots,
                     slot_base: nested_slot_base,
                 },
             )?;
@@ -2259,100 +2238,6 @@ fn emit_scope<B: IsaBackend>(
             {
                 backend.slot_store(&mut asm.code, a, acc_slot);
             }
-            continue;
-        }
-
-        // A surviving `Guard`: a mask test, a branch, the taken arm's own
-        // scope, a join — exactly §3's plan
-        // (docs/plans/2026-09-12-emit-should-just-emit.md), and built from
-        // the same primitives as the `Reduce` loop just above (recurse into
-        // `emit_scope` for a nested scope's code) and the guarded-`If`
-        // block below (`branch_if_arm_is_dead`, `Label`, a join). The
-        // difference from both: only one arm ever runs (a branch, not a
-        // loop), and *neither* arm is this schedule's own code (both are
-        // wholly separate scopes, unlike a blend's two operands sitting
-        // right here as values). `guard_opening_at` finds each arm's scope
-        // by the position of this def, the way `fold_opening_at` finds a
-        // fold's; `None` for the True arm means an enclosing scope's
-        // `Guard` was carved to a placeholder here (its value read from the
-        // pinned slot below, `fold_pins`), exactly as an enclosing scope's
-        // `Reduce` is above.
-        if let ScheduledOp::Guard(mask_vid, ..) = sched_op {
-            let Some(true_scope) = allocation.guard_opening_at(sched_idx, IfArm::True) else {
-                continue;
-            };
-            let false_scope = allocation
-                .guard_opening_at(sched_idx, IfArm::False)
-                .expect("a Guard's True arm opens here without its False arm");
-            let guard_slot = *guard_slots.get(vid).unwrap_or_else(|| {
-                panic!("{vid:?}'s Guard def has no result slot — the driver did not assign one")
-            });
-
-            let mask_reg = match location_of(&locs, *mask_vid) {
-                Binding::Loc(Loc::Reg(r)) => r,
-                _ => backend.emit_resolve(&mut asm.code, *mask_vid, guard_mask(), &locs),
-            };
-            let part = |part: &str| Label::new(&alloc::format!("v{}_{part}", vid.0));
-            let (arm_false, join) = (part("arm_false"), part("arm_join"));
-            let test = |arm| MaskTest {
-                reg: mask_reg,
-                scratch: guard_temp,
-                mask_scratch: mask_guard_temp,
-                arm,
-            };
-            // Jump to the False arm when every lane agrees the mask is
-            // false — the True arm's own test, exactly as a guarded
-            // `If`'s "only_false" branch is reached (mask-uniformly-
-            // true takes the *other* branch there because both arms sit in
-            // the same flat schedule and one is skipped forward over; here
-            // there is no flat schedule to skip through, only two separate
-            // scopes to choose between, so a single branch on "is the True
-            // arm dead" suffices).
-            backend.branch_if_arm_is_dead(&mut asm, test(IfArm::True), arm_false);
-
-            let (true_code, true_result, _, _) = emit_scope(
-                allocation.sibling(true_scope),
-                backend,
-                parks,
-                FramePlan {
-                    override_size: Some(frame_size),
-                    fold_slots,
-                    binder_slots,
-                    guard_slots,
-                    slot_base: nested_slot_base,
-                },
-            )?;
-            asm.code.extend_from_slice(&true_code);
-            backend.slot_store(
-                &mut asm.code,
-                true_result.expect("a guard arm computes a value"),
-                guard_slot,
-            );
-            backend.jump(&mut asm, join);
-
-            asm.bind(arm_false);
-            let (false_code, false_result, _, _) = emit_scope(
-                allocation.sibling(false_scope),
-                backend,
-                parks,
-                FramePlan {
-                    override_size: Some(frame_size),
-                    fold_slots,
-                    binder_slots,
-                    guard_slots,
-                    slot_base: nested_slot_base,
-                },
-            )?;
-            asm.code.extend_from_slice(&false_code);
-            backend.slot_store(
-                &mut asm.code,
-                false_result.expect("a guard arm computes a value"),
-                guard_slot,
-            );
-
-            // Every reader finds the result in `guard_slot`: a `Guard` is
-            // never a root (`stays_put`), so nothing hands it over.
-            asm.bind(join);
             continue;
         }
 
@@ -2543,10 +2428,7 @@ fn shift_immediate(op: OpKind, count: f32) -> u8 {
 ///   [`ScheduledOp::Lanes`], the iota every lane-varying value is built on.
 ///
 /// `origin` is the uniform slots of the two [`origin`] scalars, which read
-/// from the context entry after the link's block rather than from it — or
-/// `None` for an arena that declares no origin at all, because
-/// `passes::lattice::collapse` never wrapped it (a guard's arm, see
-/// [`schedule_guard_arm`]). Then every uniform is the link's.
+/// from the context entry after the link's block rather than from it.
 ///
 /// # Panics
 ///
@@ -2555,31 +2437,7 @@ fn shift_immediate(op: OpKind, count: f32) -> u8 {
 fn arena_to_schedule(
     arena: &pixelflow_ir::arena::ExprArena,
     root: pixelflow_ir::arena::ExprId,
-    origin: Option<[UniformId; 2]>,
-) -> Vec<regalloc::Def> {
-    arena_to_schedule_from(arena, root, origin, 0)
-}
-
-/// [`arena_to_schedule`], numbering `ValueId`s from `starting_id` rather than
-/// `0`.
-///
-/// Every production call site schedules one whole nest's worth of
-/// `ValueId`s at once, all sharing one numbering — a fold's schedule is
-/// *carved out of* its parent's by [`extract_folds`], keeping the parent's
-/// ids, so nothing needs a second range. A `Guard`'s arm is the one
-/// exception: its schedule is built fresh, from a wholly separate arena
-/// (`schedule_guard_arm`), so its own `0..N` would collide with whatever
-/// `ValueId`s the enclosing nest already uses — and a collision here is not
-/// merely a wrong number, it is `regalloc::Allocation::parked_by_an_enclosing_scope`
-/// answering `true` for an arm value that happens to share a number with
-/// some unrelated ancestor's root, reading that root's park slot instead of
-/// computing its own value. `schedule_guard_arm` is the one caller that needs
-/// this, offsetting each arm past every id already in use in the nest so far.
-fn arena_to_schedule_from(
-    arena: &pixelflow_ir::arena::ExprArena,
-    root: pixelflow_ir::arena::ExprId,
-    origin: Option<[UniformId; 2]>,
-    starting_id: u32,
+    origin: [UniformId; 2],
 ) -> Vec<regalloc::Def> {
     use pixelflow_ir::arena::{ExprId, ExprNode};
     use regalloc::ValueId;
@@ -2623,7 +2481,7 @@ fn arena_to_schedule_from(
     // `Write` node, whose defs are its lane folds').
     let mut id_map = alloc::vec![ValueId(u32::MAX); len];
     let mut schedule = Vec::new();
-    let mut next_id = starting_id;
+    let mut next_id = 0;
 
     let buffers = u16::try_from(arena.buffers().len())
         .expect("buffer table index fits the context slot immediate");
@@ -2683,8 +2541,7 @@ fn arena_to_schedule_from(
             // The block's base is a `Context` def made here on first use,
             // ahead of this def so the schedule stays topological.
             ExprNode::Uniform(u) => {
-                let axis = origin.and_then(|slots| slots.iter().position(|&o| o == u));
-                let (ctx_slot, offset) = match axis {
+                let (ctx_slot, offset) = match origin.iter().position(|&o| o == u) {
                     Some(axis) => (buffers + 1, axis as u64),
                     None => (buffers, u.0),
                 };
@@ -2786,15 +2643,6 @@ fn arena_to_schedule_from(
             // it back out into the fold's own `ScopeFold`; nothing after
             // that resolves it as an operand (see `ScheduledOp::Reduce`).
             ExprNode::Reduce { fold, body } => ScheduledOp::Reduce(fold, map_child(body)),
-            // G2: a `Guard` is not lowered away like `Reduce`/`Ref` above —
-            // it is meant to be *emitted*, not expanded. Its mask is the one
-            // real child in this arena, mapped like any other operand; its
-            // two arms are names (`KernelKey`s) rather than `ExprId`s, so
-            // there is nothing here to `map_child` for them. What emits it
-            // is `allocate_nest`'s `extract_guards` (resolves and schedules
-            // each arm as its own scope) plus `emit_scope`'s `Guard` arm
-            // (the branch itself), not this function.
-            ExprNode::Guard { mask, on, off } => ScheduledOp::Guard(map_child(mask), on, off),
             ExprNode::Write { .. } => unreachable!("a Write node is skipped above"),
         };
         // Numbered after the op is built: a `Uniform` may have pushed its
@@ -2867,30 +2715,6 @@ fn schedule_variance(schedule: &[regalloc::Def]) -> Vec<pixelflow_ir::variance::
             ScheduledOp::Reduce(fold, body) => {
                 v[body.0 as usize].without(Variance::from_var(fold.binder().var()))
             }
-            // Exactly the mask's, not `Variance::ALL`: an arm's schedule
-            // comes from a wholly separate arena (`extract_guards`, which
-            // runs after `scope_schedule` — see `allocate_nest`) that
-            // `passes::lattice::collapse` never wrapped, so an arm cannot
-            // reference *any* binder of the enclosing nest at all — warping
-            // does not yet reach into a guard's arms
-            // (docs/plans/2026-09-12-emit-should-just-emit.md §8, an open
-            // question this stage does not settle). Whichever arm the mask
-            // picks, the picked arm's own value is structurally invariant in
-            // every binder this schedule has; only the *choice* of arm can
-            // vary, and that varies exactly as the mask does.
-            //
-            // `Variance::ALL` was tried here first and is wrong, not merely
-            // imprecise: `Write`/`Reduce`/`Seq` all union their operands'
-            // variance, so an `ALL` leaf poisons every structural ancestor up
-            // to the root into looking like it depends on binder bits that
-            // do not exist in this nest at all. `extract_folds_bound_by`'s
-            // scope-placement filter (`bits() & deeper == 0`) then reads that
-            // poisoned variance and strips the *ancestor* `Reduce`/`Seq`
-            // nodes themselves out of an outer fold's own remaining
-            // schedule — not overly conservative, wrong: the outer loop's
-            // own structure goes missing, and `attach_folds` fails to find
-            // a child fold's `Reduce` def where extraction said it would be.
-            ScheduledOp::Guard(mask, ..) => v[mask.0 as usize],
             // A store reads its row and column for the address, so it sits
             // inside both their folds — which is the whole of why the
             // lattice's loops can be placed by the same rule as everything
@@ -2939,11 +2763,6 @@ fn scope_schedule(
             guards: Vec::new(),
         },
         folds: Vec::new(),
-        // Not `extract_guards`'s job: that runs after this function returns
-        // (`allocate_nest`), on the settled body and fold schedules
-        // `attach_folds`/`place_roots`/`lay_out` below produce — see
-        // `extract_guards`'s own doc for why it cannot run in here.
-        guard_arms: Vec::new(),
     };
     attach_folds(&mut scoped, pending);
     place_roots(&mut scoped, variance);
@@ -2979,7 +2798,6 @@ fn lay_out(scoped: &mut regalloc::ScopedSchedule) {
     let slot = |scope: Scope| match scope {
         Scope::Body => 0,
         Scope::Fold(j) => j + 1,
-        Scope::GuardArm(_) => unreachable!("a fold never opens in a guard arm"),
     };
     let mut reads: Vec<guards::FoldReads> = (0..=scoped.folds.len())
         .map(|_| guards::FoldReads::default())
@@ -2993,7 +2811,6 @@ fn lay_out(scoped: &mut regalloc::ScopedSchedule) {
         let (schedule, roots) = match scope {
             Scope::Body => (&nest.body.schedule, &nest.body.roots),
             Scope::Fold(j) => (&nest.folds[j].schedule, &nest.folds[j].roots),
-            Scope::GuardArm(_) => unreachable!("a fold never opens in a guard arm"),
         };
         let opened = guards::FoldReads::new(
             schedule,
@@ -3022,7 +2839,6 @@ fn lay_out(scoped: &mut regalloc::ScopedSchedule) {
                 scoped.folds[j].schedule = ordered;
                 scoped.folds[j].guards = branches;
             }
-            Scope::GuardArm(_) => unreachable!("a fold never opens in a guard arm"),
         }
         for fold in scoped.folds.iter_mut().filter(|fold| fold.parent == scope) {
             fold.at = position[fold.at];
@@ -3031,19 +2847,9 @@ fn lay_out(scoped: &mut regalloc::ScopedSchedule) {
     }
 }
 
-/// A scope that parks nothing and opens no fold — a guard arm's schedule, a
-/// separate arena's with no loop carved out of it, or a loop-free schedule
-/// taken as a scope of its own — in its final order, with the branches over
-/// it.
-fn lay_out_flat(schedule: Vec<regalloc::Def>) -> (Vec<regalloc::Def>, Vec<guards::IfGuard>) {
-    let layout = Layout::of(&schedule, &[], &guards::FoldReads::default());
-    (layout.apply(&schedule), layout.guards)
-}
-
 /// Whether a def is a placeholder already, and so not the placement's to
 /// park: a binder's `Var` (found where its fold keeps it), a `Reduce` that
-/// is not this scope's own (read from its accumulator slot), or a `Guard`
-/// (its own `ValueId` forced to a slot, mirroring that accumulator).
+/// is not this scope's own (read from its accumulator slot).
 ///
 /// A `Const` used to be here too, as "cheaper rebuilt than reloaded". It is
 /// not: rebuilding one is two instructions on x86, and a value parked for the
@@ -3051,10 +2857,7 @@ fn lay_out_flat(schedule: Vec<regalloc::Def>) -> (Vec<regalloc::Def>, Vec<guards
 /// Whether a constant is worth a register is the allocator's question, priced
 /// like every other root's, so nothing here answers it.
 fn stays_put(op: &ScheduledOp) -> bool {
-    matches!(
-        op,
-        ScheduledOp::Var(_) | ScheduledOp::Reduce(..) | ScheduledOp::Guard(..)
-    )
+    matches!(op, ScheduledOp::Var(_) | ScheduledOp::Reduce(..))
 }
 
 /// The second half of [`scope_schedule`]: in every fold, each def whose
@@ -3107,9 +2910,6 @@ fn place_roots(
                     ancestors.push((up, binds[p]));
                     up = scoped.folds[p].parent;
                 }
-                Scope::GuardArm(_) => {
-                    unreachable!("a fold's parent is never a guard arm (none nest in one)")
-                }
             }
         }
         let mut moved: Vec<(Scope, regalloc::ValueId)> = Vec::new();
@@ -3139,9 +2939,6 @@ fn place_roots(
             let roots = match computing {
                 Scope::Body => &mut scoped.body.roots,
                 Scope::Fold(p) => &mut scoped.folds[p].roots,
-                Scope::GuardArm(_) => {
-                    unreachable!("place_roots never computes an ancestor as a guard arm")
-                }
             };
             if !roots.contains(&vid) {
                 roots.push(vid);
@@ -3171,9 +2968,6 @@ fn binder_of_fold(scoped: &regalloc::ScopedSchedule, j: usize) -> u8 {
     let def = match fold.parent {
         Scope::Body => &scoped.body.schedule[fold.at],
         Scope::Fold(p) => &scoped.folds[p].schedule[fold.at],
-        Scope::GuardArm(_) => {
-            unreachable!("a fold's parent is never a guard arm (none nest in one)")
-        }
     };
     let ScheduledOp::Reduce(meta, _) = &def.op else {
         panic!("Fold({j}) opens at a def that is not a Reduce")
@@ -3309,21 +3103,15 @@ fn extract_folds_bound_by(
         // one level down. One that does not is a placeholder like any other
         // hoisted value, remembered so the level below does not mistake it
         // for a fold of its own.
-        //
-        // A `Guard` is the exception to stopping: `stays_put` says a fold
-        // emits one wherever it reaches it, hoisted or not, so its mask is
-        // this fold's to read and the walk goes through.
         let mut mark = alloc::vec![false; n];
         let mut placeholder_here = alloc::vec![false; n];
         let op_of = |v: regalloc::ValueId| position[v.0 as usize].map(|p| &schedule[p].op);
         let is_fold = |v: regalloc::ValueId| matches!(op_of(v), Some(ScheduledOp::Reduce(..)));
-        let stops =
-            |v: regalloc::ValueId| hoisted(v) && !matches!(op_of(v), Some(ScheduledOp::Guard(..)));
         let mut stack = Vec::new();
         mark[body_vid.0 as usize] = true;
         // The root too: a body that *is* another fold's result reads that
         // result from its slot, and the whole schedule is the placeholder.
-        if stops(body_vid) {
+        if hoisted(body_vid) {
             placeholder_here[body_vid.0 as usize] = is_fold(body_vid);
         } else {
             stack.push(body_vid);
@@ -3344,7 +3132,7 @@ fn extract_folds_bound_by(
                     continue;
                 }
                 mark[operand.0 as usize] = true;
-                if stops(operand) {
+                if hoisted(operand) {
                     placeholder_here[operand.0 as usize] = is_fold(operand);
                     continue;
                 }
@@ -3663,13 +3451,6 @@ pub fn resolve_operands(
             "resolve_operands: a Reduce def reached the generic resolver -- \
              emit_scope must special-case it before calling this"
         ),
-        // Same unreachable precondition, for the same reason: `emit_scope`
-        // special-cases a `Guard` def (its branch, its two arms, its result
-        // store) before this function is ever called.
-        ScheduledOp::Guard(..) => unreachable!(
-            "resolve_operands: a Guard def reached the generic resolver -- \
-             emit_scope must special-case it before calling this"
-        ),
         ScheduledOp::Binary(op_kind, left, right) => {
             // `left` goes to `dst` when it needs reloading (`operand_sources`'
             // one free target) and `right` to a reservation. Every backend's
@@ -3881,146 +3662,8 @@ fn allocate_nest(
     // `Reduce`'s own result depends on its body's, and the body's def is
     // about to move (`extract_folds`, next) out of this array entirely.
     let variance = schedule_variance(&schedule);
-    let mut scoped = scope_schedule(schedule, &variance);
-    // After `scope_schedule`, not inside it: a guard arm's schedule is not
-    // carved out of this nest's own the way a fold's is (`extract_folds`) —
-    // it comes from resolving a wholly separate `KernelKey` — and
-    // `place_roots`'s LICM is keyed on *this* nest's own binder variance
-    // array, which has no meaning for a value in an arm's arena. See
-    // `extract_guards`'s own doc.
-    extract_guards(&mut scoped);
+    let scoped = scope_schedule(schedule, &variance);
     regalloc::LinearScan.allocate_nest(scoped, file)
-}
-
-/// Resolve every surviving `Guard`'s two arms and attach them to `scoped` as
-/// [`regalloc::ScopeGuardArm`]s.
-///
-/// Runs once over the body and every fold's own schedule (both already
-/// settled by [`scope_schedule`] — the folds carved out, their arms
-/// clustered, their roots placed), looking for a [`ScheduledOp::Guard`] def
-/// at each position. Unlike [`extract_folds`], there is no schedule to carve
-/// a subset out of: an arm's `KernelKey` names a kernel in a wholly separate
-/// arena, so its schedule is built fresh, from scratch, by
-/// [`schedule_guard_arm`] — extraction and attachment are the same step here,
-/// which is why this function does both rather than handing a
-/// `Vec<PendingGuardArm>` to a second pass the way [`attach_folds`] follows
-/// [`extract_folds`].
-///
-/// Pushes a `Guard`'s `True` arm immediately before its `False` one, which is
-/// the pairing [`regalloc::NestAllocation::guard_count`] relies on.
-fn extract_guards(scoped: &mut regalloc::ScopedSchedule) {
-    // Every arm gets `ValueId`s past every id already in use anywhere in the
-    // nest — see `arena_to_schedule_from`'s doc for why a collision is a
-    // correctness bug, not merely an odd number. One counter for every arm
-    // of every guard, not one per arm: two arms sharing ids with each other
-    // is harmless (neither ever parks anything the other reads), but keeping
-    // one counter is simpler than arguing that case is fine.
-    let max_vid = |schedule: &[regalloc::Def]| {
-        schedule
-            .iter()
-            .map(|d| d.value.0)
-            .max()
-            .map_or(0, |m| m + 1)
-    };
-    let mut next_id = max_vid(&scoped.body.schedule);
-    for fold in &scoped.folds {
-        next_id = next_id.max(max_vid(&fold.schedule));
-    }
-
-    let mut arms: alloc::vec::Vec<regalloc::ScopeGuardArm> = alloc::vec::Vec::new();
-    let mut schedule_arm = |parent, at, arm, key| {
-        let scheduled = schedule_guard_arm(parent, at, arm, key, next_id);
-        next_id = scheduled
-            .schedule
-            .iter()
-            .map(|d| d.value.0)
-            .max()
-            .map_or(next_id, |m| m + 1);
-        arms.push(scheduled);
-    };
-    for (at, def) in scoped.body.schedule.iter().enumerate() {
-        if let ScheduledOp::Guard(_, on, off) = def.op {
-            schedule_arm(regalloc::Scope::Body, at, guards::IfArm::True, on);
-            schedule_arm(regalloc::Scope::Body, at, guards::IfArm::False, off);
-        }
-    }
-    for (j, fold) in scoped.folds.iter().enumerate() {
-        for (at, def) in fold.schedule.iter().enumerate() {
-            if let ScheduledOp::Guard(_, on, off) = def.op {
-                let parent = regalloc::Scope::Fold(j);
-                schedule_arm(parent, at, guards::IfArm::True, on);
-                schedule_arm(parent, at, guards::IfArm::False, off);
-            }
-        }
-    }
-    scoped.guard_arms = arms;
-}
-
-/// Resolve `key`, legalize it short of the lattice, and schedule it as one
-/// arm of a `Guard`.
-///
-/// **Short of the lattice**: only `expand_refs`/`lower_dwrt`, never
-/// `passes::lattice::{collapse, pack}`. A guard arm is inlined *at its site*
-/// in an already-collapsed schedule — it is a value the enclosing kernel
-/// consumes, not a second output plane — so wrapping it in its own row/column
-/// /lane folds and `Write` would be a second, nonsensical lattice around a
-/// value that already lives inside one. `passes::lattice::collapse` already
-/// refuses a reachable `Guard` for exactly this reason (its own doc): coordinate
-/// warping does not yet reach into a guard's arms at all — a question
-/// docs/plans/2026-09-12-emit-should-just-emit.md's §8 leaves open — so an
-/// arm referencing a raw coordinate `Var` fails loudly right here, in
-/// `arena_to_schedule`'s own "a coordinate that survived collapse" panic,
-/// rather than silently.
-///
-/// # Panics
-///
-/// - If `key` resolves to nothing (an arm must be interned before it can
-///   reach codegen).
-/// - If lowering finds a `Dwrt` with no derivative rule.
-/// - If the arm's own schedule contains a nested `Reduce` or `Guard` — not
-///   supported in this stage (G2's stated non-goal): a guard arm is a
-///   straight-line expression, not a second loop nest or a second branch.
-fn schedule_guard_arm(
-    parent: regalloc::Scope,
-    at: usize,
-    arm: guards::IfArm,
-    key: pixelflow_ir::key::KernelKey,
-    starting_id: u32,
-) -> regalloc::ScopeGuardArm {
-    let kernel = pixelflow_ir::store::KernelStore::resolve(key).unwrap_or_else(|| {
-        panic!(
-            "schedule_guard_arm: {key:?} names no kernel in the KernelStore -- \
-             a Guard's arm must be interned (KernelStore::intern) before it \
-             reaches codegen"
-        )
-    });
-    let (arena, root) = kernel.parts();
-    let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
-    let (arena, root) = pixelflow_ir::passes::lower_dwrt_owned(&arena, root).unwrap_or_else(|e| {
-        panic!("schedule_guard_arm: {key:?}'s arm has no derivative rule: {e}")
-    });
-    // No origin: the arm's arena was never wrapped by `collapse`, so it
-    // declares none, and every uniform it reads is the link's. Said as the
-    // type, not as two sentinel slot numbers a real slot could one day reach.
-    let schedule = arena_to_schedule_from(&arena, root, None, starting_id);
-    for def in &schedule {
-        assert!(
-            !matches!(def.op, ScheduledOp::Reduce(..) | ScheduledOp::Guard(..)),
-            "schedule_guard_arm: {key:?}'s arm schedules a {:?} -- a guard \
-             arm nesting a fold or another guard is not supported in this \
-             stage (G2, docs/plans/2026-09-12-emit-should-just-emit.md); a \
-             guard's arm must be a straight-line expression",
-            def.op
-        );
-    }
-    let (schedule, guards) = lay_out_flat(schedule);
-    regalloc::ScopeGuardArm {
-        parent,
-        at,
-        arm,
-        guards,
-        schedule,
-    }
 }
 
 /// Drive a schedule to a complete collapse kernel via an [`IsaBackend`]: the
@@ -4053,21 +3696,11 @@ fn compile_via_backend<B: IsaBackend>(
     // earlier scope (asserted where the nest is built), so every `top_of`
     // lookup below is already populated.
     let scopes = core::iter::once(regalloc::Scope::Body)
-        .chain((0..nest.fold_count()).map(regalloc::Scope::Fold))
-        .chain((0..nest.guard_count()).flat_map(|k| {
-            [
-                regalloc::Scope::GuardArm(2 * k),
-                regalloc::Scope::GuardArm(2 * k + 1),
-            ]
-        }));
+        .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
     for scope in scopes {
         let base = match scope {
             regalloc::Scope::Body => 0,
             regalloc::Scope::Fold(j) => top_of[&nest.fold_parent(j)],
-            // Both of a guard's arms open at the same position, in the same
-            // parent, as the fold that would have opened there instead — see
-            // `Scope::GuardArm`'s doc.
-            regalloc::Scope::GuardArm(i) => top_of[&nest.guard_parent(i / 2)],
         };
         let allocation = nest.scope(scope);
         let top = if allocation.schedule().is_empty() {
@@ -4091,23 +3724,13 @@ fn compile_via_backend<B: IsaBackend>(
     let binder_map: alloc::collections::BTreeMap<regalloc::ValueId, u32> = (0..nest.fold_count())
         .map(|j| (nest.fold_reduce_vid(j), fold_slot(j, 1)))
         .collect();
-    // Each surviving `Guard`'s one result, the same idea, right after the
-    // fold slots: an address outside any single scope's frame, because the
-    // scope that opens the branch and the two arms that each store into it
-    // all address the same one (see `ScheduledOp::Guard`'s doc — this is
-    // its accumulator-slot analogue).
-    let guard_slot_base = m + 2 * nest.fold_count() as u32 * vector_bytes;
-    let guard_slot = |k: usize| guard_slot_base + k as u32 * vector_bytes;
-    let guard_map: alloc::collections::BTreeMap<regalloc::ValueId, u32> = (0..nest.guard_count())
-        .map(|k| (nest.guard_reduce_vid(k), guard_slot(k)))
-        .collect();
-    // Every root of every scope, parked above the fold and guard slots. No
-    // root is a fold's or a guard's own result — `stays_put` keeps both out
-    // of `roots` — so each one takes a park slot of its own. A value two
-    // sibling scopes both compute (a row's main batches and its remainder
-    // share their closures) is one root with one slot: the two never run at
-    // once, and each writes it before its own scopes read it.
-    let park_base = guard_slot_base + nest.guard_count() as u32 * vector_bytes;
+    // Every root of every scope, parked above the fold slots. No root is a
+    // fold's own result — `stays_put` keeps it out of `roots` — so each one
+    // takes a park slot of its own. A value two sibling scopes both compute
+    // (a row's main batches and its remainder share their closures) is one
+    // root with one slot: the two never run at once, and each writes it
+    // before its own scopes read it.
+    let park_base = m + 2 * nest.fold_count() as u32 * vector_bytes;
     let mut parks: alloc::collections::BTreeMap<regalloc::ValueId, u32> =
         alloc::collections::BTreeMap::new();
     let scopes = core::iter::once(regalloc::Scope::Body)
@@ -4115,13 +3738,13 @@ fn compile_via_backend<B: IsaBackend>(
     for scope in scopes {
         for &root in nest.scope(scope).roots() {
             // Loud, because the other outcome is silent: `emit_scope`'s
-            // `Reduce` and `Guard` arms end their def before the hand-off, so
-            // a park for either would never be written and every scope
-            // inside would read whatever the slot held.
+            // `Reduce` arm ends its def before the hand-off, so a park for it
+            // would never be written and every scope inside would read
+            // whatever the slot held.
             assert!(
-                !fold_map.contains_key(&root) && !guard_map.contains_key(&root),
-                "{root:?} is a fold's or a guard's result, which `stays_put` \
-                 keeps out of every scope's roots"
+                !fold_map.contains_key(&root),
+                "{root:?} is a fold's result, which `stays_put` keeps out of \
+                 every scope's roots"
             );
             if parks.contains_key(&root) {
                 continue;
@@ -4140,7 +3763,6 @@ fn compile_via_backend<B: IsaBackend>(
             override_size: Some(m),
             fold_slots: &fold_map,
             binder_slots: &binder_map,
-            guard_slots: &guard_map,
             slot_base: 0,
         },
     )?;
@@ -4179,28 +3801,8 @@ fn compile_via_backend<B: IsaBackend>(
         let parent_trips = match parent {
             regalloc::Scope::Body => trips[0],
             regalloc::Scope::Fold(p) => trips[p + 1],
-            regalloc::Scope::GuardArm(_) => {
-                unreachable!("a fold's parent is never a guard arm (none nest in one)")
-            }
         };
         trips.push(parent_trips * len);
-    }
-    // Every guard arm, the same idea: it runs at most once per time its
-    // parent's own def is reached, so its trip count is its parent's,
-    // conservatively — as if the branch always ran that arm, since which
-    // arm actually runs is a runtime property this static count does not
-    // see (G3's coherence prior is what will eventually price that). Both
-    // arms share the same parent, so the same count twice.
-    for k in 0..nest.guard_count() {
-        let parent_trips = match nest.guard_parent(k) {
-            regalloc::Scope::Body => trips[0],
-            regalloc::Scope::Fold(p) => trips[p + 1],
-            regalloc::Scope::GuardArm(_) => {
-                unreachable!("a guard's parent is never a guard arm (none nest in one)")
-            }
-        };
-        trips.push(parent_trips);
-        trips.push(parent_trips);
     }
 
     // A parked root that holds a register at the head of the scopes inside
@@ -4218,7 +3820,7 @@ fn compile_via_backend<B: IsaBackend>(
         max_regs: file.scratch.len(),
         hoisted_values: parks.len() as u32,
         traffic: EmitTraffic {
-            scopes: EmitTraffic::by_index(scopes, trips.len(), nest.fold_count()),
+            scopes: EmitTraffic::by_index(scopes, trips.len()),
             trips,
             scaffold,
             trailing,
@@ -4347,7 +3949,7 @@ mod tests {
         };
         let (a, root) = pixelflow_ir::passes::legalize(a, root, &collapse).expect("legalize");
         let ids = origin_slots(&a);
-        arena_to_schedule(&a, root, Some(ids))
+        arena_to_schedule(&a, root, ids)
     }
 
     /// [`schedule_for`] at this host's own lane count.
@@ -4360,7 +3962,7 @@ mod tests {
     /// A raw arena declares no uniform at all, so [`origin_slots`] has
     /// nothing to find; the tests below that feed the scheduler an
     /// unlegalized arena on purpose name the slots themselves.
-    const RAW_ORIGIN: Option<[UniformId; 2]> = Some([UniformId(0), UniformId(1)]);
+    const RAW_ORIGIN: [UniformId; 2] = [UniformId(0), UniformId(1)];
 
     /// A `Dwrt` that reaches the scheduler (a caller bypassed the lowering
     /// pipeline) must fail loudly at the schedule boundary, not as a cryptic
@@ -8602,124 +8204,6 @@ mod tests {
                 "a MulAdd DAG did not reach the AVX2 backend as FusedMulAdd \
                  (no VEX.0F38 B8 in {code:02x?})"
             );
-        }
-    }
-
-    /// G2's end-to-end gate: a hand-built `Guard` reaching the JIT emitter
-    /// compiles, and both of its arms run and produce the right value —
-    /// chosen at *runtime*, by a per-call uniform, so one compiled kernel
-    /// exercises both "every lane takes the True arm" and "every lane takes
-    /// the False arm" (docs/plans/2026-09-12-emit-should-just-emit.md).
-    mod guard_arms {
-        use super::*;
-        use pixelflow_ir::kernel::Uniform;
-        use pixelflow_ir::passes::lattice;
-        use pixelflow_ir::{Kernel, KernelStore};
-
-        /// A binder slot the lattice's row/col/lane folds never claim — far
-        /// past the three `collapse` picks — used only as a placeholder
-        /// `Var` while `collapse`/`pack` build the `Write` around it.
-        ///
-        /// Why a placeholder at all: `lattice::collapse` refuses any
-        /// *reachable* `Guard` outright (its own doc — coordinate warping
-        /// does not reach into a guard's arms yet, this plan's §8), so a
-        /// `Guard` cannot be the kernel `collapse` wraps. `Write` is
-        /// `pub(crate)` in `pixelflow-ir` on purpose ("Constructible only by
-        /// the legalize passes", CLAUDE.md's own citation of it), so nothing
-        /// outside that crate may build one directly either. What *is*
-        /// public is `substitute_vars_with` — the same primitive
-        /// `Kernel::at` warps coordinates with — so this builds the `Write`
-        /// around an inert marker first and substitutes the `Guard` in
-        /// afterward, the one route to a guarded `Write` this stage has.
-        const MARKER: u8 = 40;
-
-        /// Compile a `Guard(flag == 1.0, on, off)` at [`POINT`], and return a
-        /// closure that runs it for a given `flag` value.
-        fn compile_guard(on: Kernel, off: Kernel) -> impl Fn(f32) -> f32 {
-            let on_key = KernelStore::intern(&on);
-            let off_key = KernelStore::intern(&off);
-
-            // `Uniform::new` is the properly-declared route to a fresh
-            // uniform slot — `ExprArena::uniform_slot_for` is `pub(crate)`,
-            // and `push_uniform` asserts its `UniformId` is one the table
-            // already knows, so a raw slot number picked by hand is refused
-            // rather than silently aliasing `collapse`'s own two (x0, y0).
-            // `Uniform::kernel()` builds its own tiny arena declaring it;
-            // cloning that arena inherits the declaration and gives a
-            // legitimately mutable `ExprArena` to keep building on.
-            let flag = Uniform::new(0.0);
-            let flag_kernel = flag.kernel();
-            let (flag_arena, flag_root) = flag_kernel.parts();
-            let mut arena = flag_arena.clone();
-
-            // The mask: `flag == 1.0` — `Variance::CONST`, so every lane
-            // agrees on it by construction, which is what makes both a
-            // "true" and a "false" run reachable from the same compiled
-            // kernel.
-            let one = arena.push_const(1.0);
-            let mask = arena.push_binary(OpKind::Eq, flag_root, one);
-            let guard = arena.push_guard(mask, on_key, off_key);
-
-            let marker = arena.push_var(MARKER);
-            let domain = lattice::Domain {
-                shape: POINT,
-                origin: origin(),
-            };
-            let write_root = lattice::collapse(&mut arena, marker, domain);
-            let packed_root = lattice::pack(&mut arena, write_root, lanes() as u32);
-            let root = arena.substitute_vars_with(packed_root, &[(MARKER, guard)]);
-
-            let ids = origin_slots(&arena);
-            let schedule = arena_to_schedule(&arena, root, Some(ids));
-            let code = compile_native(schedule, EmitCtx::default())
-                .expect("a hand-built Guard should compile")
-                .code;
-
-            move |flag_value: f32| -> f32 {
-                let uniforms = [flag_value];
-                let origin_vals = [0.0f32, 0.0f32];
-                let mut out = [f32::NAN; 1];
-                let ctx: [*const f32; 2] = [uniforms.as_ptr(), origin_vals.as_ptr()];
-                // SAFETY: this arena declares no buffers and one uniform
-                // (`flag`, at slot 0), so `ctx[0]` is a one-`f32` uniform
-                // block and `ctx[1]` the origin block; `out` holds the one
-                // sample a `POINT`-shaped lattice writes.
-                unsafe {
-                    code.call(ctx.as_ptr(), out.as_mut_ptr(), 1);
-                }
-                out[0]
-            }
-        }
-
-        /// The mask uniformly true: every lane (there is one, at `POINT`)
-        /// takes the `on` arm.
-        #[test]
-        fn a_uniformly_true_mask_takes_the_on_arm() {
-            let run = compile_guard(Kernel::constant(6.0), Kernel::constant(9.0));
-            assert_eq!(run(1.0), 6.0);
-        }
-
-        /// The mask uniformly false: every lane takes the `off` arm — the
-        /// same compiled kernel as above, a different runtime value, which
-        /// is the whole point of a *runtime* branch (as opposed to a
-        /// compile-time choice extraction would have made for a constant
-        /// mask).
-        #[test]
-        fn a_uniformly_false_mask_takes_the_off_arm() {
-            let run = compile_guard(Kernel::constant(6.0), Kernel::constant(9.0));
-            assert_eq!(run(0.0), 9.0);
-        }
-
-        /// Each arm doing real (if small) arithmetic, not just naming a
-        /// `Const` — so the test exercises an arm's own scope actually
-        /// computing something, not merely handing back a leaf.
-        #[test]
-        fn each_arm_computes_its_own_arithmetic() {
-            let on = Kernel::constant(2.0).mul(&Kernel::constant(3.0));
-            let off = Kernel::constant(10.0).sub(&Kernel::constant(1.0));
-            let run = compile_guard(on, off);
-            assert_eq!(run(1.0), 6.0, "on arm: 2.0 * 3.0");
-            assert_eq!(run(0.0), 9.0, "off arm: 10.0 - 1.0");
         }
     }
 }

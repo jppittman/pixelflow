@@ -1013,9 +1013,8 @@ mod tests {
 
     /// `ExprNode`'s crate-wide budget (see the static assertion in
     /// `arena.rs`) is a ceiling every variant shares, not a per-variant
-    /// promise — it grew from 16 to 24 when `Guard` arrived with two
-    /// `KernelKey`s, and a `Fold` fits a `Reduce` node in that same 24.
-    /// Pinned here as a byte count rather than left to the crate-wide
+    /// promise — a `Reduce` node, a `Fold` plus one `ExprId`, is what holds
+    /// the node at 24 bytes. Pinned here as a byte count rather than left to the crate-wide
     /// assertion alone, so a future field that also fits the crate-wide
     /// check but pushes `Fold` itself past what a `Reduce` node ought to
     /// need fails here with a number, not just "too big".
@@ -1028,9 +1027,8 @@ mod tests {
         );
         assert!(
             core::mem::size_of::<Fold>() + core::mem::size_of::<crate::arena::ExprId>() <= 24,
-            "a Reduce node is a Fold plus one ExprId, and fits the width a \
-             Guard already needs — a fact about Reduce, not a budget Fold's \
-             fields were chosen to meet"
+            "a Reduce node is a Fold plus one ExprId, and fits in 24 bytes — a \
+             fact about Reduce, not a budget Fold's fields were chosen to meet"
         );
         assert!(
             core::mem::size_of::<crate::arena::ExprNode>() <= 32,
