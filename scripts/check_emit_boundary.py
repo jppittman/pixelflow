@@ -37,12 +37,15 @@ likes). `#[cfg(not(test))]` and `#[cfg(any(test, ..))]` are NOT exempt: the
 first is production code, the second is production code too.
 
 Known loopholes, which a text scan cannot see: crate-root re-exports such as
-`pixelflow_ir::LatticeShape`; `use ... as alias` renames; macro-generated
-paths; a method call into the driver from non-test emit code; and a file that
-is `#[cfg(test)]` only by its parent's `mod` declaration, with no `#![cfg(test)]`
-of its own (`emit/coverage.rs`), which is scanned as production -- a false
-positive there would be loud, never silent. An unrecognised shape is always
-scanned, never skipped: the failure direction is more text, not less.
+`pixelflow_ir::LatticeShape`; `use ... as alias` renames, `use` globs and a
+module imported then named by its short path (`use crate::program as p;
+p::lower::x()`); macro-generated paths; and a method call into the driver from
+non-test emit code. A file that is test-only by its parent's `mod`
+declaration (`emit/coverage.rs`) is scanned as production, and so is a file
+whose own `#![cfg(test)]` is an inner attribute (only `#[cfg(test)]` is
+recognised) -- a false positive there is loud, never silent. An unrecognised
+shape is always scanned, never skipped: the failure direction is more text,
+not less.
 
 There is no baseline file. Zero hits is the bar, and an exemption is a
 reviewed edit to this script.
@@ -62,6 +65,7 @@ ITEM_KEYWORDS = (
     "fn", "mod", "impl", "struct", "enum", "trait", "type", "use", "const",
     "static", "extern", "union", "macro_rules",
 )
+BLOCK_KEYWORDS = ("if", "match", "for", "loop", "while")
 CFG_TEST = re.compile(
     r"#\s*\[\s*cfg\s*\(\s*(test|all\s*\(\s*(?:[^()]*,\s*)?test\b[^)]*\))\s*\)\s*\]"
 )
@@ -226,6 +230,30 @@ def item_extent(t, i):
             if d == 0:
                 return p
         return n
+    if word in BLOCK_KEYWORDS or (word == "" and t.startswith("{", k)):
+        # A block-like statement (`if`, `match`, `for`, `loop`, `while`,
+        # `unsafe { .. }`) ends at the `}` of its first block, not at the next
+        # `,` or `;`, which belongs to the statement after it. An `else` chain
+        # past that `}` stays scanned: more text, never less.
+        while p < n:
+            c = t[p]
+            if c in "([":
+                depth += 1
+            elif c in ")]":
+                depth -= 1
+                if depth < 0:
+                    return p
+            elif c == "{" and depth == 0:
+                d = 1
+                p += 1
+                while p < n and d:
+                    d += (t[p] == "{") - (t[p] == "}")
+                    p += 1
+                return p
+            elif c in ",;" and depth == 0:
+                return p + 1
+            p += 1
+        return n
     while p < n:
         c = t[p]
         if c in "([{":
@@ -278,10 +306,13 @@ def rules(program_submodules):
         (rf"\bprogram\s*::\s*\{{[^;]*?\b(?:{sub})\b", False),
         (r"\bprogram\s*::\s*\*", False),
         (r"\b(?:crate|super)\s*::\s*(?:jit_cache|compiled_kernel)\b", False),
+        (r"\b(?:crate|super)\s*::\s*\{[^;]*?\b(?:jit_cache|compiled_kernel)\b", False),
         (r"\b(?:crate|super)\s*::\s*pipeline\b", True),
+        (r"\b(?:crate|super)\s*::\s*\{[^;]*?\bpipeline\b", True),
     ]
     program = [
         (r"\b(?:crate|super)\s*::\s*(?:emit|isa|pipeline|jit_cache|compiled_kernel)\b", False),
+        (r"\b(?:crate|super)\s*::\s*\{[^;]*?\b(?:emit|isa|pipeline|jit_cache|compiled_kernel)\b", False),
         (r"\bregalloc\b", False),
         (r"\bexecutable\b", False),
         (r"\bExecutableCode\b", False),
@@ -311,7 +342,12 @@ def check_tree():
     subs = program_submodules(SRC / "program")
     failures, files = 0, 0
     for scope, directory in (("E", SRC / "emit"), ("P", SRC / "program")):
-        for path in sorted(directory.rglob("*.rs")):
+        found = sorted(directory.rglob("*.rs"))
+        if not found:
+            # A renamed or emptied scope would otherwise scan nothing and say OK.
+            print(f"FAIL: {directory.relative_to(SRC)}/ holds no .rs files", file=sys.stderr)
+            return 1
+        for path in found:
             files += 1
             for line, token in scan(path.read_text(), scope, subs):
                 failures += 1
@@ -416,6 +452,36 @@ def self_test():
     case("the exemption ends at the statement", "pub use crate::pipeline::compile;\nuse crate::pipeline::origin;\n", 1)
     case("pub use of the cache is still flagged", "pub use crate::jit_cache::compile;\n", 1)
     case("pub use of the search is still flagged", "pub use pixelflow_search::egraph::CostModel;\n", 1)
+    case("grouped crate:: use of the driver", "use crate::{error, pipeline::compile};\n", 1)
+    case("grouped crate:: use of the cache", "use crate::{jit_cache::compile};\n", 1)
+    case("multi-line grouped crate:: use", "use crate::{\n    error,\n    compiled_kernel::K,\n};\n", 1)
+    case("grouped super::super:: use of the driver", "use super::super::{pipeline};\n", 1)
+    case("grouped crate:: use of other things is fine", "use crate::{error::CompileError, program::Def};\n", 0)
+    case("a name that only starts with pipeline", "use crate::{pipeline_stats::X};\n", 0)
+    case("pub use of a grouped driver path is exempt", "pub use crate::{pipeline::{compile, origin}};\n", 0)
+    case("P: grouped crate:: use of the emitter", "use crate::{emit::x};\n", 1, "P")
+    case("P: grouped crate:: use of the isa", "use crate::{error, isa::Isa};\n", 1, "P")
+    case("P: grouped crate:: use of other things is fine", "use crate::{error::CompileError};\n", 0, "P")
+    case(
+        "cfg(test) if statement, then a violation",
+        "fn f() {\n  #[cfg(test)]\n  if c { x(); }\n  crate::pipeline::compile();\n}\n",
+        1,
+    )
+    case(
+        "cfg(test) match statement, then a violation",
+        "fn f() {\n  #[cfg(test)]\n  match c { _ => {} }\n  crate::pipeline::compile();\n}\n",
+        1,
+    )
+    case(
+        "cfg(test) unsafe block, then a violation",
+        "fn f() {\n  #[cfg(test)]\n  unsafe { g(); }\n  crate::pipeline::compile();\n}\n",
+        1,
+    )
+    case(
+        "cfg(test) if statement hides what is inside it",
+        "fn f() {\n  #[cfg(test)]\n  if c { crate::pipeline::compile(); }\n}\n",
+        0,
+    )
     case("P: emit", "use crate::emit::guards::X;\n", 1, "P")
     case("P: regalloc", "fn f(d: regalloc::Def) {}\n", 1, "P")
     case("P: executable and ExecutableCode", "use executable::ExecutableCode;\n", 2, "P")
