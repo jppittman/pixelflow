@@ -24,7 +24,7 @@
 //! piece table, with the table travelling in the kernel — shifted to texel
 //! centres the way `GlyphAtlas` bakes it, made a unit with `Kernel::by_ref`,
 //! and chosen between by a balanced `if id < k` tree over one uniform. That
-//! is the shape `docs/plans/2026-09-25-the-language-is-kernel.md` §4 compiles
+//! is the shape `docs/plans/2026-09-25-the-language-is-kernel.md` §1.7 compiles
 //! a font as. Each glyph's fold varies with the column, so it is a surviving
 //! fold of its own to scope, allocate and frame, which is what makes this the
 //! fixture for a change to how those scale (the optimizer unrolls a glyph with

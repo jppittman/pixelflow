@@ -199,9 +199,10 @@ pub(crate) fn measure<R>(scope: impl FnOnce() -> R) -> (R, Measured) {
 mod tests {
     use super::*;
     use std::hint::black_box;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::{Duration, Instant};
 
     /// Threads allocating and freeing throughout the measured scope.
     const NOISY_THREADS: usize = 4;
@@ -210,22 +211,30 @@ mod tests {
     const KNOWN: usize = 4096;
     /// What each noisy allocation asks for.
     const NOISE: usize = 1 << 16;
+    /// How long the scope waits for the noisy threads before calling the test
+    /// broken rather than hanging a CI job on a thread that died.
+    const NOISE_DEADLINE: Duration = Duration::from_secs(30);
 
     /// **A known allocation reads as exactly its bytes, while other threads
     /// allocate throughout.**
     ///
-    /// The noisy threads are started before the scope and joined after it, and
-    /// a barrier holds the scope until every one of them is mid-loop, so their
-    /// traffic overlaps the whole measurement. Were the tally process-global
-    /// they would be counted; were the allocator to disturb them, they would
-    /// fail the lengths they check themselves.
+    /// The noisy threads are started before the scope and joined after it. The
+    /// scope does not begin its allocation until every one of them has
+    /// finished a round of its own, and they keep looping until it is over, so
+    /// their traffic is certain to overlap the measurement rather than
+    /// assumed to. Were the tally process-global they would be counted; were
+    /// the allocator to disturb them, they would fail the lengths they check
+    /// themselves.
     #[test]
     fn a_known_allocation_reads_as_its_bytes_while_other_threads_allocate() {
         let stop = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(Barrier::new(NOISY_THREADS + 1));
+        // How many noisy threads have finished a first round: the scope waits
+        // for all of them, so "the noise ran" is a precondition, not a hope.
+        let warmed = Arc::new(AtomicUsize::new(0));
         let noisy: Vec<_> = (0..NOISY_THREADS)
             .map(|_| {
-                let (stop, ready) = (stop.clone(), ready.clone());
+                let (stop, ready, warmed) = (stop.clone(), ready.clone(), warmed.clone());
                 thread::spawn(move || {
                     ready.wait();
                     let mut rounds = 0usize;
@@ -233,6 +242,9 @@ mod tests {
                         let block = black_box(vec![1u8; NOISE]);
                         assert_eq!(block.len(), NOISE);
                         rounds += 1;
+                        if rounds == 1 {
+                            warmed.fetch_add(1, Ordering::Release);
+                        }
                     }
                     rounds
                 })
@@ -240,7 +252,18 @@ mod tests {
             .collect();
         ready.wait();
 
-        let (kept, measured) = measure(|| black_box(Vec::<u8>::with_capacity(KNOWN)));
+        let (kept, measured) = measure(|| {
+            // Spinning allocates nothing, so it adds nothing to the tally.
+            let deadline = Instant::now() + NOISE_DEADLINE;
+            while warmed.load(Ordering::Acquire) < NOISY_THREADS {
+                assert!(
+                    Instant::now() < deadline,
+                    "the noisy threads never started, so this proved nothing"
+                );
+                thread::yield_now();
+            }
+            black_box(Vec::<u8>::with_capacity(KNOWN))
+        });
         // Past the scope, so neither the keeping nor the freeing is counted.
         assert!(kept.capacity() >= KNOWN);
         drop(kept);

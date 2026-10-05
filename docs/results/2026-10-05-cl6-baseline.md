@@ -364,23 +364,29 @@ the heap for 170 MiB in all (the optimizer before it, 286 MiB). With a
 remainder column fold (tile 17: 62 scopes) the compile peaks at 14.5 MiB and
 the process at 35 MiB. The largest row measured, every inked glyph with a
 remainder (94 glyphs, 180 scopes), peaks at 148 MiB of heap and 137 MiB
-resident, and requests 1,083 MiB (1.06 GiB) over the compile. Against the plan's bar of
-about 1 GB of peak on the 32-glyph row, that is two orders of magnitude under
-it, at `28ddbeaf`, before 6a, with no 6b.
+resident, and requests 1,083 MiB (1.06 GiB) over the compile.
+
+The decision rule these numbers are read against was set while planning CL6
+and is not in the tree, so it is stated here: 6b (about 2,300 mechanical
+lines renaming every dense array's key to a scope-local id) is deferred when
+peak is under about 1 GB on the 32-glyph row *and* the structural guarantee
+(arrays sized by the scope, by construction) is not wanted. The 32-glyph row
+is two orders of magnitude under that bar, at `28ddbeaf`, before 6a, with no
+6b.
 
 Our reading, which is the owner's to take or leave:
 
 - **On memory alone, 6b does not clear the bar for the production glyph
-  programs.** The "5 GB zeroing and 0.6 GB resident" the review derived from
-  the code are not what these programs ask: the worst row asks about 1.06 GiB
-  and holds 148 MiB. The plan's own rule defers 6b when peak is under 1 GB on the
-  32-glyph row *and* the structural guarantee is not wanted; the first
-  conjunct holds today by 100x, and the second is a judgement about design,
-  not measurement.
-- **The scaling the review feared is real, and it is not these programs'.**
+  programs.** The "5 GB zeroing and 0.6 GB resident" that planning derived
+  from reading the code are not what these programs ask: the worst row asks
+  about 1.06 GiB and holds 148 MiB. The rule above defers 6b when peak is
+  under 1 GB on the 32-glyph row *and* the structural guarantee is not
+  wanted; the first conjunct holds today by 100x, and the second is a
+  judgement about design, not measurement.
+- **The scaling planning feared is real, and it is not these programs'.**
   Scoping and allocation are quadratic in the surviving folds (growth 15.1x
   to 15.8x per 4x between 256 and 1,024 folds), and a nest of 1,024 folds
-  asks for 3.5 GiB and holds 720 MiB: the review's figures are about right at
+  asks for 3.5 GiB and holds 720 MiB: the planning figures are about right at
   that scale. A 32-glyph font is 32 to 62 folds; a 94-glyph font 91 to 180.
   What the structural guarantee buys is that the next order of magnitude of
   folds does not cost 16x, not that today's font is in trouble.
@@ -389,7 +395,7 @@ Our reading, which is the owner's to take or leave:
   the pieces are straight-line terms and no fold survives, so it has three
   scopes of tens of thousands of defs each, not dozens of folds. It was built
   by a test-only `kernel!` copy that an example cannot include without a new
-  dependency, so no figure here is for it. If the review's numbers came from
+  dependency, so no figure here is for it. If the planning numbers came from
   it, they are for a shape this baseline does not cover.
 
 ## The gate, on this change
