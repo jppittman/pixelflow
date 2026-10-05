@@ -34,14 +34,24 @@ fn branches_of(ch: char, px: u32) -> (u64, u64) {
     (b.guards, b.arms_branched)
 }
 
-/// A glyph's coverage mask is the control: its `If`s have arms under the
-/// mispredict bound, and a branch there costs more than the blend it replaces
-/// (a coverage mask measured 3.6x slower guarded). A compile that guarded one
-/// would draw the same glyph, slower — the opposite failure to the chrome
-/// sphere's, which `render::packed`'s pins hold.
+/// A glyph branches over exactly three arms, whatever the glyph: the arms
+/// that own a loop over its pieces, so a texel outside the glyph skips the loop.
+///
+/// Each costs thousands of cycles — far past the mispredict bound, which is
+/// what keeps the cheap arms (a coverage mask's few ops, measured 3.6x
+/// *slower* guarded) out — and none was a branch before the layout chose the
+/// order: the old search could not make them one run, so they stayed blended
+/// and every texel paid for every piece. The count is the pin: a lost arm is
+/// the loop back on every texel (5-16x slower per texel), a gained one is a
+/// branch on work too cheap to pay for it. The chrome sphere's pins, in
+/// `render::packed`, hold the same property for a scene.
 #[test]
-fn a_glyph_earns_no_branch() {
+fn a_glyph_branches_over_its_piece_loops() {
     for (ch, px) in [('@', 16), ('8', 32), ('O', 32)] {
-        assert_eq!(branches_of(ch, px), (0, 0), "{ch} at {px}px took a branch");
+        assert_eq!(
+            branches_of(ch, px),
+            (3, 3),
+            "{ch} at {px}px: the loops over its pieces are not all behind a branch"
+        );
     }
 }

@@ -433,8 +433,8 @@ mod tests {
     /// guard both their arms. Pinned on guards and arms, not on entries — an
     /// entry count moves with every rewrite rule, an arm lost does not.
     ///
-    /// Without `cluster_if_arms` the same scene still reads three guards but
-    /// only four arms, and runs 3.5x slower on AVX-512 and 2.6x on AVX2
+    /// Without the clustering search that used to make arms contiguous, the
+    /// same scene still read three guards but only four arms, and runs 3.5x slower on AVX-512 and 2.6x on AVX2
     /// with the same pixels, which is why the arms are counted.
     #[test]
     fn the_chrome_sphere_keeps_its_branches() {
@@ -446,11 +446,20 @@ mod tests {
         );
     }
 
-    /// The control: a silhouette over the sky earns no guard, its arms being
-    /// under the mispredict bound — the glyph and silhouette arms that a
-    /// branch makes slower, not faster.
+    /// The silhouette over the sky: one `If`, and one arm worth a branch.
+    ///
+    /// The arm is over the mispredict bound and was refused, before the layout
+    /// chose the order, because its values were not one run; the layout gives it
+    /// its branch. A spatially coherent mask earns one: the sphere's silhouette
+    /// is uniform in most batches. Pinned on guards and arms (entries are
+    /// recorded in `docs/results`).
     #[test]
-    fn the_sphere_silhouette_earns_no_branch() {
-        assert_eq!(branches_of(&silhouette()), (0, 0, 0));
+    fn the_sphere_silhouette_branches_over_its_one_costly_arm() {
+        let (guards, arms, entries) = branches_of(&silhouette());
+        assert_eq!(
+            (guards, arms),
+            (1, 1),
+            "the silhouette's branches moved ({entries} entries)"
+        );
     }
 }

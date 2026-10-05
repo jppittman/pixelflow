@@ -68,46 +68,75 @@ on time as well as on bytes.
 | pin | what it holds |
 |---|---|
 | `render::packed::tests::the_chrome_sphere_keeps_its_branches` | chrome, through `jit_cache::compile`: (3 guards, 6 arms) on every tier |
-| `render::packed::tests::the_sphere_silhouette_earns_no_branch` | silhouette: (0, 0, 0) |
-| `tests/glyph_branches.rs` | a glyph's coverage mask earns no branch (a branch there measured 3.6x slower) |
+| `render::packed::tests::the_sphere_silhouette_branches_over_its_one_costly_arm` | silhouette: (1 guard, 1 arm) since the layout switch; (0, 0, 0) before it |
+| `tests/glyph_branches.rs` | a glyph (in-tree fallback font): (0, 0) before the layout switch, **(3, 3) after** (the three arms that own a loop over its pieces) |
 | `emit::tests::a_chrome_shaped_kernel_keeps_its_branches` | the same shape at the scale of one channel: (3, 6, 70), with a silhouette-shaped control (0, 0, 0) |
 
 Entries are recorded here, not pinned: the count moves with every rewrite
 rule, while an arm gained or lost is the failure the pins exist to catch.
 
-## What the layout stage will change (measured in shadow, 2026-10-03)
+## After the switch (layout in production, 2026-10-03)
 
-`program::layout` chooses the order from ownership instead of repairing it, and
-the old analysis checks it on every compile in a debug build (and under the
-`layout-shadow` feature in release): it must find, in the laid-out order,
-exactly the runs the layout says, keep every arm it guarded itself, and leave a
-scope unmoved when it refused nothing for its order. It never disagreed. What
-the layout *realizes*, against what is emitted today:
+`program::layout` chooses every scope's order and tables; `cluster_if_arms` is
+no longer called. Same fixtures, same host, base and after built from the same
+tree and run alternately (median of 3 rounds; the silhouette, whose bytes
+moved by 64, median of 6 rounds of 61 frames).
 
-| fixture | emitted today | layout, on today's (clustered) schedule | layout, on the unclustered schedule |
-|---|---|---|---|
-| chrome (final scope) | 6 arms | 6 arms, order unmoved | 6 arms (clustering off: 4) |
-| sphere silhouette | 0 arms | **1 arm** | 1 arm |
-| units font N=4+8+16 | 537 arms | 537 arms, order unmoved | **537 arms** (clustering off: 0) |
-| units font N=32 | 693 arms | | **693 arms** (clustering off: 0) |
-| 95-kernel glyph table, both tiers | 224 arms | **576 arms** | 576 arms (clustering off: 24) |
+**Structure (`EmitTraffic::branches`)**
 
-The last column is the point: from a schedule nothing has repaired, the layout
-finds exactly the arms `cluster_if_arms` produced, in the one pass, and the
-units font at N=32 compiles in 3.0 s with the search off, against 135 s with it.
+| fixture | base | after |
+|---|---|---|
+| chrome 1080p, both tiers | (3, 6, 719), 6,224 B / 6,192 B | **identical bytes**, `74b7beb5086e6818` / `1503af84be6a9e42` |
+| units font N=4 / 8 / 16 / 32 | (77, 80, 15,886) / (172, 179, 44,674) / (263, 278, 79,708) / (662, 693, 239,876) | **the same four triples** |
+| units font bytes N=4 / 8 / 16 / 32, AVX-512 | 113,264 / 254,176 / 377,216 / 970,796 | 111,664 / 250,880 / 373,168 / 959,948 (-1.4% to -1.1%) |
+| units font compile, N=32 | ~135 s (AVX-512) | **2.06 s** AVX-512, 1.89 s AVX2 |
+| sphere silhouette | (0, 0, 0), 1,132 B / 1,212 B | (1, 1, 37), 1,196 B / 1,276 B |
+| 95-kernel glyph table | 224 arms; 176 of 190 rows change | 576 arms |
+| `byte_probe` | | sizes and spills identical on every row; hashes differ on `both_regions` (both tiers) and `row_invariant` (AVX2) |
 
-Two rows move what is emitted, so the switch is a measured change and not a
-refactor:
+The structure is what clustering produced wherever clustering produced it, and
+the three additions are the ones the shadow predicted: the 352 glyph arms and
+the silhouette's one.
 
-- **The 95-kernel glyph table, 224 -> 576 arms.** All 352 additions are arms
-  clustering left unguarded because their values are not one run after
-  hoisting, and every one is a fold-owning arm: 2,216 to 35,549 cycles over 19
-  to 38 entries (the old arms are 201 to 497 cycles over 52 to 130). No arm
-  under 200 cycles is realized, so no coverage-mask arm (a handful of ops, 3.6x
-  slower guarded) is. They skip a loop over a glyph's pieces when the pixel is
-  outside the bounding box. Whether that wins is the glyph ns/texel gate's to
-  say.
-- **The sphere silhouette, 0 -> 1 arm.** One arm is over the bound and refused
-  today for its order. The pin `the_sphere_silhouette_earns_no_branch` holds
-  today's answer; it flips with the switch, and ns/px on this fixture decides
-  whether the new answer stays.
+**Time** (ns per pixel or texel; ratio = after / base, so under 1 is faster)
+
+| fixture | AVX-512 | AVX2 |
+|---|---|---|
+| chrome 1T / 4T | 0.98 / 0.88 (same bytes: noise) | 0.98 / 0.98 |
+| sphere silhouette 1T / 4T | 1.05 / 1.04 | 0.96 / 0.93 |
+| glyph `@` `8` `O` at 16 px | 191 -> 35, 191 -> 30, 96 -> 18 | 284 -> 26, 282 -> 20, 143 -> 13 |
+| glyph `@` `8` `O` at 32 px | 191 -> 15, 204 -> 12, 97 -> 8 | 281 -> 22, 280 -> 17, 140 -> 11 |
+| all 95 glyphs at 16 px / 32 px | 74 -> 16 / 72 -> 7.0 | 103 -> 10.8 / 103 -> 9.6 |
+
+The silhouette is the one fixture that moved the wrong way on one tier, by an
+amount (4-5%) inside this host's run-to-run spread (the base's 1T runs span
+1.10 to 1.44 ns/px) and of the opposite sign on AVX2. Its single new branch
+guards 37 entries behind a spatially coherent mask. The glyph rows are the
+352 fold-owning arms skipping a loop over a glyph's pieces outside its
+bounding box, 5 to 16x faster per texel.
+
+## How the switch was checked before it was made
+
+The layout ran in shadow first: on every compile in a debug build (and in
+release under a `layout-shadow` feature, since removed with the analysis it
+checked against) the old analysis, run on the order the layout chose, had to
+find exactly the runs the layout said, keep every arm it guarded on the order
+it was given, and leave a scope unmoved when it refused nothing for its order.
+It never disagreed, over the 95-kernel glyph table on both tiers, chrome, the
+silhouette and the units font at N=4/8/16/32. To make the order check
+non-vacuous it was also run on *unclustered* schedules (clustering off in a
+scratch build), where it found the 537 arms (N=4/8/16) and 693 arms (N=32) the
+search produced, from schedules in which the old analysis found none, and
+chrome's 4 became 6.
+
+With the analysis deleted, what stands in its place is the layout's own
+checks: every compile in a debug build asserts the layout keeps every read
+after its value and is its own fixed point, and the layout's unit tests (300
+random DAGs among them) check that each arm it branches over is exactly the run
+of the values that arm owns.
+
+The 352 extra glyph arms are all fold-owning arms the search left unguarded
+because hoisting breaks their order: 2,216 to 35,549 cycles over 19 to 38
+entries, against 201 to 497 cycles for the 224 arms emitted before. None under
+200 cycles is realized, so no coverage-mask arm (a handful of ops, 3.6x slower
+guarded) is.

@@ -24,12 +24,13 @@
 //! skip pointers, so a ladder of `else if`s a thousand deep costs what a flat
 //! scope does.
 //!
-//! This replaces a search. `guards::if_arms` recovered the same sets per `If`
+//! This replaced a search. The old analysis recovered the same sets per `If`
 //! by closing a cone under "every consumer is in the set", which is a walk of
-//! the whole scope for every `If`. The two are asserted equal wherever the
-//! old one still runs (`guards::assert_ownership_agrees`), and are different
-//! computations of one relation on purpose: the old one reads the order's
-//! cones, this one reads only the edges.
+//! the whole scope for every `If`. The two were asserted equal on every compile
+//! (and on 300 random DAGs) until the search was deleted; what keeps this pass
+//! honest now is its own tests, which pin the relation case by case, and the
+//! layout built on it, whose every branch is checked to be exactly the run of
+//! the values its arm owns.
 
 use alloc::vec::Vec;
 
@@ -226,6 +227,7 @@ impl Ownership {
         &self.regions
     }
 
+    #[cfg(test)]
     /// Whether `inner` is `outer` or nested in it.
     pub(crate) fn is_within(&self, inner: Region, outer: Region) -> bool {
         self.regions.is_within(inner.0, outer.0)
