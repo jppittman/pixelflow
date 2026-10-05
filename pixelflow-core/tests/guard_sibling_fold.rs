@@ -8,7 +8,7 @@
 //! `cluster_if_arms` did the same by search). All of them used to read
 //! dependencies off
 //! `regalloc::operands` alone, which treats a `Reduce` def as a leaf: once
-//! `extract_folds` has carved a fold's body into its own scope, nothing in the
+//! `extract_folds` (`program/scopes.rs`) has carved a fold's body into its own scope, nothing in the
 //! enclosing scope's schedule recorded what that body reads. They now read it
 //! from `guards::FoldReads` as well, which makes the def a consumer of what its
 //! fold reads. Two miscompiles came of the missing edges, each pinned below
@@ -18,7 +18,7 @@
 //!    `out = select(X < T, W·sin(X/10), 0) + D`, with `W = Σ_j |X − j/2|` and
 //!    `D = Σ_k |W − 40k|`. `D`'s body reads `W`'s accumulator through a
 //!    placeholder, so `W`'s only consumer in the batch scope was the arm's
-//!    `Mul`; `W`'s `Reduce` is never a scope root (`stays_put`), so the
+//!    `Mul`; `W`'s `Reduce` is never a scope root (`stays_put` in `program/scopes.rs`), so the
 //!    `OUTSIDE` pin did not cover it either. `sin`'s expansion alone prices
 //!    the arm past the 16-cycle bound, and it was guarded — `W`'s whole loop
 //!    inside the skipped range. On a batch whose mask is

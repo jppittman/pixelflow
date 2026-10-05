@@ -301,7 +301,7 @@ pub(crate) fn mask_or() -> &'static dyn Op {
 // `Shl`/`Shr` do keep `Const` shift operands, because extraction emits `Const`
 // leaves verbatim — so the emitter's immediate-only contract holds. The count's
 // RANGE is a separate matter, enforced where the `Const` narrows to an
-// immediate (`emit::shift_immediate`) rather than assumed here.
+// immediate (`shift_immediate` in `program/lower.rs`) rather than assumed here.
 struct IntTrunc;
 impl Op for IntTrunc {
     fn kind(&self) -> OpKind {

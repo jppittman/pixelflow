@@ -17,6 +17,15 @@ a hard and a soft `If`, and let extraction choose between them.
 > the guard-versus-blend choice is a bound-gated pass over the finished DAG, not
 > an extraction choice — so §§4–5 are **superseded** by that decision. The
 > measurement that follows and §6's stage table stay as written history.
+>
+> **The emitter now names nothing upstream of it.** Lowering and scoping live in
+> `program/lower.rs` and `program/scopes.rs`, the driver in
+> `pixelflow-codegen/src/pipeline.rs`, and `emit/` is handed a finished
+> `ScopedSchedule`; `scripts/check-emit-boundary.sh` (CI job `emit-boundary`)
+> fails a change that makes `emit/` name the optimizer, the passes, the
+> `program/` stages or the driver, or `program/` name the allocator or a
+> register. (The one exemption is the `pub use` in `emit/mod.rs` that keeps
+> the public paths `emit::compile` and `emit::origin`.)
 
 ## The measurement that forces this
 

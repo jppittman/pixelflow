@@ -407,7 +407,7 @@ impl CostModel {
     /// count where it has that price in hand (`extract.rs`'s
     /// `fold_body_multiple`). Codegen's guard analysis prices a loop a
     /// `If` arm owns with it whole, the body priced over the loop's own
-    /// schedule (`pixelflow-codegen`'s `emit::guards::FoldReads`) — an arm is
+    /// schedule (`pixelflow-codegen`'s `program::guards::FoldReads`) — an arm is
     /// worth a branch by what running it costs, and a loop costs its trips.
     ///
     /// Saturating: a nest of long folds over an expensive body is a price
@@ -467,7 +467,7 @@ mod every_op_is_priceable {
     /// The prices that are load-bearing rather than advisory.
     ///
     /// `Dwrt` is priced prohibitively so extraction never selects an unlowered
-    /// derivative — `arena_to_schedule` panics on one that reaches codegen, and
+    /// derivative — `arena_to_schedule` (`program/lower.rs`) panics on one that reaches codegen, and
     /// that panic is supposed to be unreachable. When the table was positional
     /// and `index()` was sparse, `Dwrt` came back 10, which is cheaper than
     /// `Div`. `Shr` got Dwrt's 1000 in the same shift, which taught the
