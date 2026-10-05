@@ -2916,16 +2916,7 @@ impl LinearScan {
             //
             // Not for a live-in `Reduce`: that is a placeholder for a loop an
             // enclosing scope already ran, and nothing runs here.
-            //
-            // A `Guard` earns the identical treatment for the identical
-            // reason: its two arms are each a wholly separate, freshly
-            // allocated scope (`LinearScan::allocate_nest`'s guard-arm loop)
-            // that starts fresh over the pool minus only what is carried in,
-            // with no visibility into what this scope holds resident and no
-            // reason not to reuse any of it.
-            if matches!(def.op, ScheduledOp::Reduce(..) | ScheduledOp::Guard(..))
-                && !pass.live_in[def.value.0 as usize]
-            {
+            if matches!(def.op, ScheduledOp::Reduce(..)) && !pass.live_in[def.value.0 as usize] {
                 for slot in 0..pass.owner.len() {
                     if pass.owner[slot].is_some() {
                         pass.split_out(slot, i);
@@ -3127,14 +3118,8 @@ impl LinearScan {
                 )
             } else if let ScheduledOp::Reduce(..)
             | ScheduledOp::Write { .. }
-            | ScheduledOp::Seq(..)
-            | ScheduledOp::Guard(..) = def.op
+            | ScheduledOp::Seq(..) = def.op
             {
-                // A `Guard`'s result, the same way and for the same reason as
-                // a `Reduce`'s: two different scopes (its two arms) each
-                // store it, so no single one of them owns "the destination
-                // register" — the driver dedicates it a slot instead (see
-                // `ScheduledOp::Guard`'s doc and the module's non-goals).
                 pass.place(def.value, i, Where::Spilled);
                 None
             } else {
@@ -3271,28 +3256,14 @@ impl LinearScan {
             // the same way, in place of this instruction — so it reserves
             // through the same gate rather than a second one, even though
             // `sites[i]` (built from `If`s alone) never names it.
-            // A `Guard`'s own branch needs exactly the same two registers,
-            // for exactly the same reason, at exactly the same point — its
-            // mask test and branch are emitted in place of this instruction
-            // too.
-            let is_reduce_or_guard =
-                matches!(def.op, ScheduledOp::Reduce(..) | ScheduledOp::Guard(..));
-            if !sites[i].is_empty() || is_reduce_or_guard {
+            let is_reduce = matches!(def.op, ScheduledOp::Reduce(..));
+            if !sites[i].is_empty() || is_reduce {
                 // A `Reduce`'s own trip test builds its mask fresh into a
                 // temp every time (`t0` in `emit_scope`'s loop, never a
                 // reload of some value already computed elsewhere), so
-                // `sites[i]` — the only other source `guard_mask` answers
-                // for — is what decides here for both: empty for a `Reduce`
-                // (it never asks), and, for a `Guard`, its own one operand,
-                // added because `sites` is built from `If`s alone and
-                // does not already name it.
-                let guard_op_mask = match def.op {
-                    ScheduledOp::Guard(mask, ..) => Some(mask),
-                    _ => None,
-                };
-                if sites[i].iter().any(|m| !pass.is_resident(*m))
-                    || guard_op_mask.is_some_and(|m| !pass.is_resident(m))
-                {
+                // `sites[i]` — the only source `guard_mask` answers for —
+                // is empty for a `Reduce` (it never asks).
+                if sites[i].iter().any(|m| !pass.is_resident(*m)) {
                     scratch_for[i].guard_mask = Some(Reg(pass.reserve(i, &mut taken, &live_here)));
                 }
                 for _ in 0..file.guard_temps {
@@ -3344,8 +3315,7 @@ impl LinearScan {
             if i + 1 == dag.len()
                 && !unit_root
                 && !pass.is_resident(def.value)
-                && (pass.live_in[def.value.0 as usize]
-                    || matches!(def.op, ScheduledOp::Reduce(..) | ScheduledOp::Guard(..)))
+                && (pass.live_in[def.value.0 as usize] || matches!(def.op, ScheduledOp::Reduce(..)))
             {
                 scratch_for[i].result = Some(Reg(pass.reserve(i, &mut taken, &live_here)));
             }

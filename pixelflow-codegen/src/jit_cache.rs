@@ -133,7 +133,7 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // docs/plans/2026-09-25-the-language-is-kernel.md §4, O1).
     //
     // It bails for constructs the e-graph does not model
-    // (`egraph::insert`'s `Declined`: a `Guard`, a `Param`, an op
+    // (`egraph::insert`'s `Declined`: a `Param`, an op
     // `Vocabulary::Runtime` does not resolve, such as a `RawGather`) in a
     // term with no unit; those still compile — from the *expanded* arena, so
     // a reference never reaches the emitter — just without the extra fusion,

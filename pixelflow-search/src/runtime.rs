@@ -369,9 +369,7 @@ fn holds_a_ref(arena: &ExprArena) -> bool {
 }
 
 /// The keys of the references reachable from `root`, in walk order, each
-/// once. A `Guard`'s arms are names too, but not children: the e-graph
-/// declines a `Guard`, so they are left to `passes::expand_refs` at
-/// legalization, as they always were.
+/// once.
 fn refs_reachable(arena: &ExprArena, root: ExprId) -> Vec<KernelKey> {
     let mut seen = vec![false; arena.len()];
     let mut stack = vec![root];
@@ -1063,17 +1061,16 @@ mod tests {
     }
 
     /// **A decline narrows.** A unit the e-graph cannot hold — here, one
-    /// holding a `Guard` — is linked as written, while the unit beside it is
-    /// still optimized: one declining unit no longer costs the program every
-    /// other unit's optimization.
+    /// holding a `Seq`, an op no vocabulary resolves — is linked as written,
+    /// while the unit beside it is still optimized: one declining unit no
+    /// longer costs the program every other unit's optimization.
     #[test]
     fn a_declining_unit_does_not_cost_the_others_their_optimization() {
-        let on = KernelStore::intern(&Kernel::x().sqrt());
-        let off = KernelStore::intern(&Kernel::y().neg());
-        let mut guarded = ExprArena::new();
-        let x = guarded.push_var(0);
-        let guard = guarded.push_guard(x, on, off);
-        let declines = Kernel::from_parts(guarded, guard);
+        let mut sequenced = ExprArena::new();
+        let x = sequenced.push_var(0);
+        let y = sequenced.push_var(1);
+        let seq = sequenced.push_binary(OpKind::Seq, x, y);
+        let declines = Kernel::from_parts(sequenced, seq);
         // X·0 + Y: folds to Y, which only an optimized unit can say.
         let folds = Kernel::x().mul(&Kernel::constant(0.0)).add(&Kernel::y());
         let program = declines.by_ref().add(&folds.by_ref());
@@ -1088,7 +1085,9 @@ mod tests {
         };
         let kinds = [out.node(a), out.node(b)];
         assert!(
-            kinds.iter().any(|n| matches!(n, ExprNode::Guard { .. })),
+            kinds
+                .iter()
+                .any(|n| matches!(n, ExprNode::Binary(OpKind::Seq, ..))),
             "the declining unit is linked as written: {}",
             out.display(*out_root)
         );
@@ -2259,7 +2258,6 @@ pub(crate) mod production_telemetry {
                 other @ (ExprNode::Param(_)
                 | ExprNode::Nary(..)
                 | ExprNode::Ref(_)
-                | ExprNode::Guard { .. }
                 | ExprNode::Write { .. }) => {
                     panic!("extracted arena contains {other:?}")
                 }

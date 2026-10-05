@@ -139,13 +139,6 @@ pub enum ScheduledOp {
     /// naming the [`Scope::Fold`] this def opens, not from this
     /// `ValueId`.
     Reduce(Fold, ValueId),
-    /// A surviving `Guard`: the mask, and its two arms' names. Nothing emits
-    /// it: no scope is opened for either arm.
-    Guard(
-        ValueId,
-        pixelflow_ir::key::KernelKey,
-        pixelflow_ir::key::KernelKey,
-    ),
 }
 
 impl ScheduledOp {
@@ -408,13 +401,6 @@ pub(crate) fn operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use
         | ScheduledOp::Gather(a, _)
         | ScheduledOp::Broadcast(a, _) => (Some(*a), None, None),
         ScheduledOp::Write { value, .. } => (Some(*value), None, None),
-        // A `Guard`'s mask is the one register operand its own def reads —
-        // its two arms are names into a wholly separate arena, not values in
-        // this schedule, exactly as a `Reduce`'s body is not (see the doc
-        // above) but without even that much: an arm's operands are its own
-        // scope's concern (`LinearScan::allocate_nest`'s guard-arm loop),
-        // never this scope's.
-        ScheduledOp::Guard(mask, _, _) => (Some(*mask), None, None),
         ScheduledOp::Binary(_, a, b) => (Some(*a), Some(*b), None),
         ScheduledOp::Ternary(_, a, b, c) => (Some(*a), Some(*b), Some(*c)),
     };

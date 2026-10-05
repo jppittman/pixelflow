@@ -167,12 +167,6 @@ pub(crate) fn def_cycles(def: &Def, folds: &FoldReads, cycles: &CostModel) -> us
         // body is every trip.
         ScheduledOp::Gather(_, _) | ScheduledOp::Broadcast(_, _) => cycles.cost(OpKind::RawGather),
         ScheduledOp::Reduce(..) => folds.cycles(def.value),
-        // A hard branch whose arms are scopes of their own, which no walk of
-        // this schedule reaches (G2,
-        // docs/plans/2026-09-12-emit-should-just-emit.md): unpriced rather
-        // than guessed at, so an arm holding one is priced by what else it
-        // owns.
-        ScheduledOp::Guard(..) => 0,
     }
 }
 

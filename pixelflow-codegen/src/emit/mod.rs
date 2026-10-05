@@ -1050,13 +1050,7 @@ pub fn operand_sources(op: &ScheduledOp, resident: [bool; 3]) -> [OperandSource;
         | ScheduledOp::ShiftImm(..)
         | ScheduledOp::Gather(..)
         | ScheduledOp::Broadcast(..)
-        | ScheduledOp::Write { .. }
-        // A `Guard`'s one register operand is its mask — its own arm
-        // resolution never reaches `resolve_operands`/`operand_sources`
-        // (`emit_scope` special-cases it before either is called, the same
-        // way it special-cases `Reduce`), but the mask is still resolved the
-        // ordinary way, from wherever the allocator put it.
-        | ScheduledOp::Guard(..) => 1,
+        | ScheduledOp::Write { .. } => 1,
         ScheduledOp::Binary(..) => 2,
         ScheduledOp::Ternary(..) => 3,
     };
@@ -2649,7 +2643,6 @@ fn arena_to_schedule(
             // it back out into the fold's own `ScopeFold`; nothing after
             // that resolves it as an operand (see `ScheduledOp::Reduce`).
             ExprNode::Reduce { fold, body } => ScheduledOp::Reduce(fold, map_child(body)),
-            ExprNode::Guard { mask, on, off } => ScheduledOp::Guard(map_child(mask), on, off),
             ExprNode::Write { .. } => unreachable!("a Write node is skipped above"),
         };
         // Numbered after the op is built: a `Uniform` may have pushed its
@@ -2722,7 +2715,6 @@ fn schedule_variance(schedule: &[regalloc::Def]) -> Vec<pixelflow_ir::variance::
             ScheduledOp::Reduce(fold, body) => {
                 v[body.0 as usize].without(Variance::from_var(fold.binder().var()))
             }
-            ScheduledOp::Guard(mask, ..) => v[mask.0 as usize],
             // A store reads its row and column for the address, so it sits
             // inside both their folds — which is the whole of why the
             // lattice's loops can be placed by the same rule as everything
@@ -2857,8 +2849,7 @@ fn lay_out(scoped: &mut regalloc::ScopedSchedule) {
 
 /// Whether a def is a placeholder already, and so not the placement's to
 /// park: a binder's `Var` (found where its fold keeps it), a `Reduce` that
-/// is not this scope's own (read from its accumulator slot), or a `Guard`
-/// (its own `ValueId` forced to a slot, mirroring that accumulator).
+/// is not this scope's own (read from its accumulator slot).
 ///
 /// A `Const` used to be here too, as "cheaper rebuilt than reloaded". It is
 /// not: rebuilding one is two instructions on x86, and a value parked for the
@@ -2866,10 +2857,7 @@ fn lay_out(scoped: &mut regalloc::ScopedSchedule) {
 /// Whether a constant is worth a register is the allocator's question, priced
 /// like every other root's, so nothing here answers it.
 fn stays_put(op: &ScheduledOp) -> bool {
-    matches!(
-        op,
-        ScheduledOp::Var(_) | ScheduledOp::Reduce(..) | ScheduledOp::Guard(..)
-    )
+    matches!(op, ScheduledOp::Var(_) | ScheduledOp::Reduce(..))
 }
 
 /// The second half of [`scope_schedule`]: in every fold, each def whose
@@ -3115,21 +3103,15 @@ fn extract_folds_bound_by(
         // one level down. One that does not is a placeholder like any other
         // hoisted value, remembered so the level below does not mistake it
         // for a fold of its own.
-        //
-        // A `Guard` is the exception to stopping: `stays_put` says a fold
-        // emits one wherever it reaches it, hoisted or not, so its mask is
-        // this fold's to read and the walk goes through.
         let mut mark = alloc::vec![false; n];
         let mut placeholder_here = alloc::vec![false; n];
         let op_of = |v: regalloc::ValueId| position[v.0 as usize].map(|p| &schedule[p].op);
         let is_fold = |v: regalloc::ValueId| matches!(op_of(v), Some(ScheduledOp::Reduce(..)));
-        let stops =
-            |v: regalloc::ValueId| hoisted(v) && !matches!(op_of(v), Some(ScheduledOp::Guard(..)));
         let mut stack = Vec::new();
         mark[body_vid.0 as usize] = true;
         // The root too: a body that *is* another fold's result reads that
         // result from its slot, and the whole schedule is the placeholder.
-        if stops(body_vid) {
+        if hoisted(body_vid) {
             placeholder_here[body_vid.0 as usize] = is_fold(body_vid);
         } else {
             stack.push(body_vid);
@@ -3150,7 +3132,7 @@ fn extract_folds_bound_by(
                     continue;
                 }
                 mark[operand.0 as usize] = true;
-                if stops(operand) {
+                if hoisted(operand) {
                     placeholder_here[operand.0 as usize] = is_fold(operand);
                     continue;
                 }
@@ -3467,13 +3449,6 @@ pub fn resolve_operands(
         // hoisted placeholder never reaches here either.
         ScheduledOp::Reduce(..) => unreachable!(
             "resolve_operands: a Reduce def reached the generic resolver -- \
-             emit_scope must special-case it before calling this"
-        ),
-        // Same unreachable precondition, for the same reason: `emit_scope`
-        // special-cases a `Guard` def (its branch, its two arms, its result
-        // store) before this function is ever called.
-        ScheduledOp::Guard(..) => unreachable!(
-            "resolve_operands: a Guard def reached the generic resolver -- \
              emit_scope must special-case it before calling this"
         ),
         ScheduledOp::Binary(op_kind, left, right) => {
