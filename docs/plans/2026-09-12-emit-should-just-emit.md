@@ -4,7 +4,7 @@
 a hard and a soft `If`, and let extraction choose between them.
 
 > **Status (2026-10-05): G2 retired, G3 withdrawn, G4 moot.** G1 and G2 landed
-> (#1287) and were deleted in `f995645a` and `ef401704`, because nothing produced a
+> (#1287) and were deleted in commits "retire the guard-arm scope" and "retire ExprNode::Guard", because nothing produced a
 > `Guard` and it did not mean what this plan says. The G2 emitter branched to
 > the off arm only when *every* lane's mask was false and otherwise ran the
 > on arm for all lanes, with no blend, so it equalled `If` only for a

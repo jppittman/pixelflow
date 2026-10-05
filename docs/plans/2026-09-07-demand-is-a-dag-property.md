@@ -244,7 +244,7 @@ masks merge; and extraction *chooses* a guarded form rather than codegen
 recovering one from whatever form was extracted.
 
 > **2026-10-05:** the two-`KernelKey` `Guard` node, the one-armed idea's first
-> form in the arena, was retired (`f995645a`, `ef401704`): nothing produced it, and it
+> form in the arena, was retired (commits "retire the guard-arm scope", "retire ExprNode::Guard"): nothing produced it, and it
 > equalled `If` only for a batch-uniform mask. C2b remains unbuilt.
 
 ## 5. Guards and index ranges are one thing

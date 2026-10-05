@@ -353,7 +353,7 @@ the graph, priced by extraction.
 
 > **2026-10-05:** the `Guard { mask, on, off }` node this section cites as
 > precedent was retired (nothing produced it, and its emitter equalled `If`
-> only for a batch-uniform mask; `f995645a`, `ef401704`). The `Apply` design does not
+> only for a batch-uniform mask; commits "retire the guard-arm scope", "retire ExprNode::Guard"). The `Apply` design does not
 > depend on it: `KernelKey` stays, as `Ref` still names a kernel by it.
 
 ### What this reorders
