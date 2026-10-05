@@ -1,0 +1,7 @@
+{
+  "level": 2,
+  "language": "rust",
+  "query": "(function_item) @target",
+  "skills": ["rust-idioms"],
+  "prompt": "Flag comments that restate what the next line does instead of why it does it, and comments left over from generation (\"Step 1:\", \"Now we...\", \"Here we...\"). Do not flag rustdoc on public items."
+}

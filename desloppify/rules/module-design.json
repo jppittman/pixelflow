@@ -1,0 +1,6 @@
+{
+  "level": 3,
+  "language": "rust",
+  "skills": ["rust-idioms"],
+  "prompt": "Flag design-level slop in this module: a free-function family that wants to be a type (`foo`, `foo_with_ctx`, `foo_scanline`), a second implementation of a category grown as a copy instead of a trait impl, a mode flag doing what a type should, or a convention written in a comment that a type could enforce. Report the line where each problem is most visible."
+}
