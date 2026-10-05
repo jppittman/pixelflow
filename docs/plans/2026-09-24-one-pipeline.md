@@ -221,6 +221,10 @@ This holds by construction exactly when `P` depends on nothing but
    idempotent; the macro hands it a different starting term.
 4. **A process-global `KernelStore` resolves `Guard` arms and `Ref`s**
    (`emit/mod.rs:4060-4066`; `passes.rs:318`; `variance.rs:312`).
+   - **2026-10-05:** the `Guard` half is gone (C4, `ef401704`):
+     `schedule_guard_arm` was codegen's only direct use of the store. Its
+     remaining consumers are `expand_refs`, a `Ref`'s variance, the unit walk
+     in `pixelflow-search` and `by_ref`.
    - No production code builds a `Guard` or calls `by_ref`.
      - Since O1 the store is load-bearing for `P` wherever `by_ref` is
        called: the unit walk finds each unit's body there. C1's font is
@@ -665,7 +669,7 @@ on every combinator (`:258-270`); that is exprarena-on-dag Stage D's to remove.
 | C1 | move the `detect()` calls inside the emitter and `legalize` | `emit/mod.rs:1163`, `:3875`, `:3887` | `EmitCtx { max_regs, isa }`; `jit_cache` calls `detect()` once. `EmitCtx` loses `derive(Default)` |
 | C2 | move the mmap inside `compile_via_backend` | `emit/mod.rs:4278` | the caller maps; `EmitCtx::compile` = assemble + `from_code` |
 | C3 | move `jit_cache::compile`'s body | `jit_cache.rs:144-155` | `program` (A3) |
-| C4 | delete `Guard` | `arena.rs:758-769`; `emit/mod.rs:4060-4066`; about 20 files | nothing. If the demand track needs a guard node, its arms live in the arena |
+| C4 | delete `Guard` | `arena.rs:758-769`; `emit/mod.rs:4060-4066`; about 20 files | nothing. If the demand track needs a guard node, its arms live in the arena. **Done** (2026-10-05, `f995645a` and `ef401704`) |
 
 **`emit::compile` stays outside the law, by name.** It is the kept raw
 research entry (`emit/mod.rs:3916`, 22 files). CLAUDE.md's "never obtained
@@ -850,7 +854,12 @@ and M6 land there, in B5, with the macro tier's saturation.
 - M16's gate is that no production kernel quadratures, which
   `glyph_is_closed` already implies for glyphs.
 
-**CL7: C4, `Guard` deleted.**
+**CL7: C4, `Guard` deleted.** **Done** (2026-10-05, `f995645a` and `ef401704`): the
+emitter's arm scopes first, then the IR node and every matcher. Gated
+byte-identical against the parent: `byte_probe` on both x86 tiers,
+`demand_move_byte_check`, a per-glyph hash walk over the ASCII range and
+`optimizer_equivalence`; the chrome (3 guards, 6 arms) and silhouette (1, 1)
+branch pins and `glyph_branches` did not move.
 
 **CL8: the glyph's table is a kernel backed by uniforms (Q2).**
 - A8, G1–G3, B3, B4, B6 and U4.

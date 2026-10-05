@@ -486,6 +486,9 @@ Not on this list:
   instrument that measures the exclusivity-versus-demand gap.
 - **G1/G2 `Guard`** (unreachable: `collapse` panics on it, `passes/lattice.rs:156`)
   is decided in the demand-regions CL, with its replacement in view.
+  **Decided 2026-10-05: retired** (`f995645a`, `ef401704`). Nothing produced one, and the
+  emitter equalled `If` only for a batch-uniform mask; the places above where
+  `variance` and `stays_put` differ on a `Guard` are history.
 
 ## 8. Build order
 

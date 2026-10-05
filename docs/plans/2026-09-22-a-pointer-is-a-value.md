@@ -119,6 +119,12 @@ computes — what such a value is built from is that scope's business. A
 `Guard` is the one exception, because `stays_put` has a fold emit one
 wherever it reaches it, so its mask is the fold's to read.
 
+> **2026-10-05:** the `Guard` handling this plan mentions — the pre-emptive
+> eviction at a `Guard` and the fold carve going through one — was deleted with
+> the node (`f995645a`, `ef401704`). The pointer pool and `Scratch::ptr_reload` are
+> untouched; the `If` guard registers and arm-bounded reload ranges named
+> above are the surviving machinery.
+
 ## 5. Not here
 
 - The fold binders as integers in GPRs (the `cvttss2si` per address). Same
