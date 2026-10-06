@@ -17,8 +17,6 @@
 // paths are fine as they are and rewriting ~200 imports would buy nothing.
 extern crate alloc;
 
-#[cfg(test)]
-mod alloc_probe;
 pub mod emit;
 pub mod error;
 pub mod isa;

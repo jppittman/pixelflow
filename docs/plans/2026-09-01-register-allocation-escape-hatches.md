@@ -224,6 +224,12 @@ Slots stay abstract in that output — a `SlotId`, not an offset — so
 `FrameLayout` remains the memory manager and gains the ability to *coalesce*
 disjoint live ranges onto one slot, which it cannot do today.
 
+> **2026-10-06:** `FrameLayout` is deleted. The allocator lays the frame out
+> itself, beside its placements (`NestAllocation::new` in
+> `pixelflow-codegen/src/emit/regalloc.rs`): every spill slot, fold slot and
+> park address is in `allocate_nest`'s result, and the emitter reads them and
+> computes none. Coalescing, when it comes, is that constructor's to do.
+
 Register pressure *falls* even though more values are allocated: most ops need
 no temp, so the pool roughly doubles on x86 and quintuples on AVX-512.
 
@@ -774,6 +780,10 @@ quickly.
 > `FrameLayout` stays per scope; hoist slots stay the collapse driver's.
 > Unifying them means the layout owns the scaffold's coordinate slots too — a
 > frame-ABI change, recorded rather than half-done.
+>
+> *2026-10-06:* unified, the other way round — the driver's slot arithmetic
+> and `FrameLayout` both moved into the allocator (`NestAllocation::new`),
+> byte-identically; there is no collapse scaffold left to own anything.
 >
 > **Why this is the step before the policy, not the policy.** The two
 > measured negatives above — frequency weighting (+37%: pricing one side of the
