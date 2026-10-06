@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 use crate::agent::Agent;
 use crate::language::Language;
 use crate::rule::Rule;
-use crate::snippet::snippets;
+use crate::snippet::{Snippet, snippets};
 
 const REVIEWER: &str = "\
 You are a code reviewer applying exactly one rule, given below. Report only \
@@ -40,48 +40,74 @@ struct Reply {
     message: String,
 }
 
-pub async fn review(agent: Arc<Agent>, rules: Arc<Vec<Rule>>, files: &[PathBuf]) -> Result<Report> {
-    let mut calls = JoinSet::new();
+/// One agent call: a rule (by index) over one snippet of one file.
+pub struct Call {
+    pub rule: usize,
+    pub path: PathBuf,
+    pub snippet: Snippet,
+}
+
+/// Every call a review of `files` under `rules` makes, without making any.
+pub fn plan(rules: &[Rule], files: &[PathBuf]) -> Result<Vec<Call>> {
+    let mut calls = Vec::new();
     for path in files {
         let Some(language) = Language::of(path) else {
             continue;
         };
         let source =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        for (index, rule) in rules.iter().enumerate() {
-            for snippet in snippets(rule, language, &source)
-                .with_context(|| format!("parsing {}", path.display()))?
-            {
-                let (agent, rules, path) = (agent.clone(), rules.clone(), path.clone());
-                calls.spawn(async move {
-                    let rule = &rules[index];
-                    let prompt = format!("File: {}\n\n{}", path.display(), snippet.numbered);
-                    let preamble = format!("{REVIEWER}\n\n{}", rule.instructions);
-                    let replies =
-                        async { parse(&agent.ask(rule.level, &preamble, &prompt).await?) }
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "rule {} on {}:{}",
-                                    rule.id,
-                                    path.display(),
-                                    snippet.first_line
-                                )
-                            })?;
-                    Ok::<_, anyhow::Error>(
-                        replies
-                            .into_iter()
-                            .map(|r| Finding {
-                                rule: rule.id.clone(),
-                                path: path.clone(),
-                                line: r.line,
-                                message: r.message,
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                });
-            }
+        for (index, rule) in rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.files.contains(path))
+        {
+            let snippets = snippets(rule, language, &source)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            calls.extend(snippets.into_iter().map(|snippet| Call {
+                rule: index,
+                path: path.clone(),
+                snippet,
+            }));
         }
+    }
+    Ok(calls)
+}
+
+pub async fn review(agent: Arc<Agent>, rules: Arc<Vec<Rule>>, plan: Vec<Call>) -> Result<Report> {
+    let mut calls = JoinSet::new();
+    for Call {
+        rule: index,
+        path,
+        snippet,
+    } in plan
+    {
+        let (agent, rules) = (agent.clone(), rules.clone());
+        calls.spawn(async move {
+            let rule = &rules[index];
+            let prompt = format!("File: {}\n\n{}", path.display(), snippet.numbered);
+            let preamble = format!("{REVIEWER}\n\n{}", rule.instructions);
+            let replies = async { parse(&agent.ask(rule.level, &preamble, &prompt).await?) }
+                .await
+                .with_context(|| {
+                    format!(
+                        "rule {} on {}:{}",
+                        rule.id,
+                        path.display(),
+                        snippet.first_line
+                    )
+                })?;
+            Ok::<_, anyhow::Error>(
+                replies
+                    .into_iter()
+                    .map(|r| Finding {
+                        rule: rule.id.clone(),
+                        path: path.clone(),
+                        line: r.line,
+                        message: r.message,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        });
     }
 
     let mut report = Report::default();

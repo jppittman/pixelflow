@@ -1,0 +1,8 @@
+{
+  "level": 3,
+  "scope": "file",
+  "skills": [
+    "pixelflow-architecture"
+  ],
+  "prompt": "Flag invariants that live in a comment or a naming convention when a type could make the wrong value unrepresentable: \"must be\", \"always\", \"never\", \"only ever\", \"assumes\", \"in X space\", \"this is a mask, not a number\", \"caller must ensure\"; one integer or float type carrying several meanings depending on its range or a flag; a runtime check defending a property a type would guarantee. Prioritize where a wrong value would be silently accepted and produce plausible output. Say what type would carry the invariant. Do not flag `unsafe` SAFETY contracts or checks on external input."
+}

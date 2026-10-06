@@ -1,0 +1,13 @@
+{
+  "level": 3,
+  "scope": "file",
+  "exclude": [
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests/**"
+  ],
+  "skills": [
+    "style-guide"
+  ],
+  "prompt": "Flag dispatch where a fold was available: an `if`/`else` whose two arms compute what one expression could (a value clamped, a sign normalized, an `Option` defaulted) so that both cases stay live downstream for no reason. Also flag `else if` chains testing an enum or a fixed set of conditions that should be a `match`, and `if`/`else` arms that send execution to genuinely different behaviors (those are dispatch and should say so with a `match` over an enum). Explain which cases could be collapsed and how. Do not flag guard clauses that return early."
+}

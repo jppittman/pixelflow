@@ -16,16 +16,21 @@
 //! (`"functions"`, `"function_names"`, `"function_bodies"`, `"types"`,
 //! `"comments"`), or `{"language": "rust", "query": "... @target"}` for
 //! anything else. A named part applies to every language that has it; a query
-//! to its own language. `review` says whether each captured part is reviewed
+//! to its own language. `paths` and `exclude` are globs over file paths
+//! relative to where the review runs (`pixelflow-*/**`, `**/tests/**`); a
+//! rule with no `paths` reads every file. `review` says whether each captured part is reviewed
 //! on its own (`"each"`, the default) or all of a file's are reviewed in one
-//! call (`"together"`) — the way to ask about consistency across them.
+//! call (`"together"`) — the way to ask about consistency across them — or
+//! the whole file is reviewed, pointed at the captured lines, if it has any
+//! (`"file"`) — for a match that needs its surroundings to be judged.
 //!
 //! Everything is checked when the rule loads: a bad query or an unknown skill
 //! fails there, not halfway through a review.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 
 use crate::language::Language;
@@ -66,9 +71,15 @@ enum NamedScope {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Review {
+    /// One call per capture.
     #[default]
     Each,
+    /// One call per file, holding all its captures.
     Together,
+    /// One call per file that has a capture, holding the whole file and
+    /// naming the captured lines: the query picks where to look, the file is
+    /// the context to judge it in.
+    File,
 }
 
 #[derive(Deserialize)]
@@ -79,8 +90,51 @@ struct RuleFile {
     #[serde(default)]
     review: Option<Review>,
     #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default)]
+    exclude: Vec<String>,
+    #[serde(default)]
     skills: Vec<String>,
     prompt: String,
+}
+
+/// The files a rule reads, by path relative to where the review runs.
+pub struct Files {
+    /// `None` reads every file.
+    include: Option<GlobSet>,
+    exclude: GlobSet,
+}
+
+impl Files {
+    fn new(include: &[String], exclude: &[String]) -> Result<Self> {
+        let include = match include {
+            [] => None,
+            globs => Some(glob_set(globs)?),
+        };
+        Ok(Self {
+            include,
+            exclude: glob_set(exclude)?,
+        })
+    }
+
+    #[must_use]
+    pub fn contains(&self, path: &Path) -> bool {
+        // `./src/a.rs` and `src/a.rs` are one file to a glob's author.
+        let path: PathBuf = path
+            .components()
+            .filter(|c| *c != Component::CurDir)
+            .collect();
+        let included = self.include.as_ref().is_none_or(|set| set.is_match(&path));
+        included && !self.exclude.is_match(&path)
+    }
+}
+
+fn glob_set(globs: &[String]) -> Result<GlobSet> {
+    let mut set = GlobSetBuilder::new();
+    for glob in globs {
+        set.add(GlobBuilder::new(glob).literal_separator(true).build()?);
+    }
+    Ok(set.build()?)
 }
 
 pub struct CompiledQuery {
@@ -115,6 +169,7 @@ pub enum Scope {
 pub struct Rule {
     pub id: String,
     pub level: ModelLevel,
+    pub files: Files,
     pub scope: Scope,
     /// The skills' text followed by the rule's prompt.
     pub instructions: String,
@@ -168,6 +223,7 @@ impl Rule {
         Ok(Self {
             id,
             level: file.level,
+            files: Files::new(&file.paths, &file.exclude)?,
             scope,
             instructions,
         })

@@ -1,0 +1,13 @@
+{
+  "level": 2,
+  "scope": "file",
+  "exclude": [
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests/**"
+  ],
+  "skills": [
+    "style-guide"
+  ],
+  "prompt": "Flag nesting that guard clauses would flatten: an `if`/`if let`/`match` whose main path is indented inside the happy branch while the other branch only bails out; an `else` after a branch that already returns, breaks or continues; `if let Some(x) = ... { ... } else { return }` that `let ... else` or `?` would turn into straight-line code. Report the line of the construct to flatten. Do not flag a single shallow `if` or a `match` whose arms are all real work."
+}

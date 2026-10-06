@@ -1,0 +1,19 @@
+{
+  "level": 3,
+  "scope": "file",
+  "paths": [
+    "pixelflow-ir/**",
+    "pixelflow-codegen/**",
+    "pixelflow-search/**",
+    "pixelflow-compiler/**"
+  ],
+  "exclude": [
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests/**"
+  ],
+  "skills": [
+    "pixelflow-architecture"
+  ],
+  "prompt": "Flag hand-rolled expansions worse than an instruction the targets already have (`(x + 0.5).floor()` for round, `1/sqrt(x)` where rsqrt is meant, a compare-and-select emulating min/max), and hot-path instructions spent making an op match scalar IEEE behavior on edge cases the codebase's contract does not promise. Also flag a function returning a clamped value outside its documented domain where the contract says NaN."
+}

@@ -8,6 +8,9 @@ ANTHROPIC_API_KEY=... cargo run -p desloppify -- path/to/src
 GEMINI_API_KEY=...    cargo run -p desloppify -- --provider gemini path/to/src
 ```
 
+`--dry-run` counts the calls each rule would make and makes none — check it
+before pointing a frontier level at a whole tree.
+
 Prints `path:line: [rule] message` per finding; exits non-zero on any finding
 or any snippet that could not be reviewed.
 
@@ -22,7 +25,8 @@ or any snippet that could not be reviewed.
 |---|---|
 | `level` | 1–4: how capable a model the question needs |
 | `scope` | the rule's input: `"file"`; a named part — `"functions"`, `"function_names"`, `"function_bodies"`, `"types"`, `"comments"` — in every language that has it; or `{"language": "rust", "query": "... @target"}` |
-| `review` | `"each"` (default): one call per captured part. `"together"`: all of a file's parts in one call, for questions about consistency across them |
+| `review` | `"each"` (default): one call per captured part. `"together"`: all of a file's parts in one call, for questions about consistency across them. `"file"`: the whole file, naming the captured lines, if it has any — for a match that needs its surroundings |
+| `paths`, `exclude` | optional globs over paths relative to where the review runs (`pixelflow-*/**`, `**/tests/**`); no `paths` means every file |
 | `skills` | optional skill names to put ahead of the prompt |
 | `prompt` | what to flag |
 
@@ -37,6 +41,38 @@ Named parts are per-language tree-sitter queries in `Language::query`
 | 4 | Fable | 3 Pro |
 
 The ladder is `Provider::model` in `src/model.rs`.
+
+## Shipped rules
+
+Drawn from `CLAUDE.md`, `AGENTS.md`, `docs/STYLE.md` and `.claude/agents/`.
+Only rules needing judgment are here: what a deterministic check can catch
+(`cfg` encapsulation, `let _ =` on `#[must_use]`, conventional commits) is
+already a CI job or a lint, and stays there.
+
+| Rule | Level | Scope | Source |
+|---|---|---|---|
+| `boolean-argument` | 1 | `bool` params | STYLE: boolean arguments |
+| `too-many-arguments` | 1 | fns with ≥4 params | STYLE: argument count |
+| `magic-numbers` | 1 | file | STYLE: magic numbers |
+| `panicking-unwrap` | 1 | file, at each `unwrap`/`expect` | CLAUDE.md: no silent failures |
+| `test-names-it-should` | 1 | a file's test names together | STYLE: "it should" names |
+| `comment-says-why` | 2 | file | STYLE: comments |
+| `guard-clauses` | 2 | file | STYLE: guard clauses |
+| `silent-failure` | 2 | file | CLAUDE.md: errors handled, fail loud |
+| `naming-consistency` | 2 | a file's fn names together | CLAUDE.md: name vs namespace |
+| `control-plane-64-bit` | 2 | pixelflow types | CLAUDE.md: control plane is 64-bit |
+| `no-terminal-logic-in-pixelflow` | 2 | pixelflow files | CLAUDE.md: no terminal logic |
+| `simd-is-codegens` | 2 | pixelflow files outside the emitters | CLAUDE.md: SIMD is an implementation detail |
+| `per-frame-allocation` | 2 | render-path crates | CLAUDE.md: zero allocations |
+| `actor-lane-choice` | 2 | actor crates | CLAUDE.md: actor lanes |
+| `fold-before-dispatch` | 3 | file | CLAUDE.md / STYLE: fold before dispatch |
+| `trait-first` | 3 | file | CLAUDE.md / STYLE: trait first |
+| `invariant-in-comment` | 3 | file | CLAUDE.md: denote before you build |
+| `mask-is-not-a-number` | 3 | kernel crates | CLAUDE.md: floating point at the edges |
+| `hardware-instruction-first` | 3 | kernel crates | CLAUDE.md: take what the hardware gives |
+
+Skills: `style-guide` (STYLE.md distilled) and `pixelflow-architecture`
+(CLAUDE.md's constraints).
 
 ## Rate limiting — `src/rate_limit/`
 

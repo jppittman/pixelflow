@@ -3,7 +3,7 @@
   "scope": "function_names",
   "review": "together",
   "skills": [
-    "rust-idioms"
+    "style-guide"
   ],
   "prompt": "These are all the function names in one file. Flag names that break the file's own conventions (one verb for one idea: don't mix `get_`/`fetch_`/`load_` for the same thing), and names that stack concepts into a namespace (`compile_arena_dag_jet`, an accreting `foo`/`foo_with_ctx`/`foo_scanline` family). Report the line of each offending name."
 }

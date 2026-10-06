@@ -1,0 +1,13 @@
+{
+  "level": 1,
+  "scope": "file",
+  "exclude": [
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests/**"
+  ],
+  "skills": [
+    "style-guide"
+  ],
+  "prompt": "Flag numeric literals other than 0, 1 and 2 whose meaning is not obvious from the line they are on: thresholds, sizes, counts, bit masks, timeouts, protocol values. Suggest a constant name for each. Do not flag literals in tests, in `const`/`static` definitions, unit conversions that are obvious (`1000` ms per second), or the coefficients of a documented mathematical formula."
+}

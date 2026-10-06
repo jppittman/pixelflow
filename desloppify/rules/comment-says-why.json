@@ -1,0 +1,13 @@
+{
+  "level": 2,
+  "scope": "file",
+  "exclude": [
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests/**"
+  ],
+  "skills": [
+    "style-guide"
+  ],
+  "prompt": "Flag `//` comments that say what the code does instead of why it is the way it is: comments restating the next line, step narration (\"Step 1:\", \"Now we...\", \"Here we...\"), history (\"previously\", \"changed to\", \"updated to\", \"no longer\"), and commented-out code. Where a 'what' comment covers a block that would be clearer as a named helper, say so: the comment is that helper's rustdoc. Do not flag rustdoc (`///`, `//!`), SAFETY comments, or comments explaining a non-obvious reason, trade-off, or workaround."
+}

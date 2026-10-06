@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 use desloppify::agent::{self, Agent};
 use desloppify::model::Provider;
 use desloppify::rate_limit::{Adaptive, AdaptiveConfig, RateLimiter, TokenBucket};
-use desloppify::review::review;
+use desloppify::review::{Call, plan, review};
 use desloppify::rule::Rule;
 use desloppify::skills::Skills;
 
@@ -60,6 +60,9 @@ struct Args {
     /// Most calls in flight at once, retries included.
     #[arg(long, default_value = "8")]
     jobs: NonZeroUsize,
+    /// Count the calls each rule would make, and make none.
+    #[arg(long)]
+    dry_run: bool,
     #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/rules"))]
     rules: PathBuf,
     #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/skills"))]
@@ -71,14 +74,20 @@ async fn main() -> Result<ExitCode> {
     let args = Args::parse();
     let skills = Skills::load(&args.skills)?;
     let rules = Arc::new(Rule::load_dir(&args.rules, &skills)?);
-    let agent = Arc::new(Agent::from_env(args.provider, limiter(&args), args.jobs)?);
 
     let mut files = Vec::new();
     for path in &args.paths {
         collect(path, &mut files)?;
     }
+    let plan = plan(&rules, &files)?;
 
-    let report = review(agent, rules, &files).await?;
+    if args.dry_run {
+        print_plan(&rules, &plan);
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let agent = Arc::new(Agent::from_env(args.provider, limiter(&args), args.jobs)?);
+    let report = review(agent, rules, plan).await?;
     for f in &report.findings {
         println!(
             "{}:{}: [{}] {}",
@@ -97,6 +106,18 @@ async fn main() -> Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// Calls per rule, with each rule's level, and the total.
+fn print_plan(rules: &[Rule], plan: &[Call]) {
+    let mut counts = vec![0_u64; rules.len()];
+    for call in plan {
+        counts[call.rule] += 1;
+    }
+    for (rule, count) in rules.iter().zip(&counts) {
+        println!("{count:>8}  level {}  {}", u64::from(rule.level), rule.id);
+    }
+    println!("{:>8}  total", plan.len());
 }
 
 fn limiter(args: &Args) -> Box<dyn RateLimiter> {
@@ -121,7 +142,8 @@ fn limiter(args: &Args) -> Box<dyn RateLimiter> {
     }
 }
 
-/// Every file under `path`, skipping hidden entries and build output.
+/// Every file under `path`, skipping hidden entries and build output
+/// (`target`, and variants like `target.noindex`).
 fn collect(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     if path.is_file() {
         files.push(path.to_owned());
@@ -133,7 +155,7 @@ fn collect(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_default();
-        if name.starts_with('.') || name == "target" {
+        if name.starts_with('.') || name.starts_with("target") {
             continue;
         }
         collect(&entry, files)?;

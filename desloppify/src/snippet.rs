@@ -28,6 +28,21 @@ impl Snippet {
         }
     }
 
+    /// All of `source`, headed by the first lines of `captures`; `None` if
+    /// there are no captures.
+    fn pointing_at(captures: &[Self], source: &str) -> Option<Self> {
+        let lines: Vec<String> = captures.iter().map(|c| c.first_line.to_string()).collect();
+        if lines.is_empty() {
+            return None;
+        }
+        let whole = Self::new(1, source);
+        let numbered = format!("Review lines {}.\n\n{}", lines.join(", "), whole.numbered);
+        Some(Self {
+            first_line: 1,
+            numbered,
+        })
+    }
+
     fn join(parts: Vec<Self>) -> Option<Self> {
         let first_line = parts.first()?.first_line;
         let numbered = parts
@@ -55,6 +70,9 @@ pub fn snippets(rule: &Rule, language: Language, source: &str) -> anyhow::Result
     Ok(match review {
         Review::Each => captures,
         Review::Together => Snippet::join(captures).into_iter().collect(),
+        Review::File => Snippet::pointing_at(&captures, source)
+            .into_iter()
+            .collect(),
     })
 }
 

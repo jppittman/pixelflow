@@ -1,0 +1,11 @@
+{
+  "level": 1,
+  "scope": {
+    "language": "rust",
+    "query": "(function_item parameters: (parameters (parameter) (parameter) (parameter) (parameter))) @target"
+  },
+  "skills": [
+    "style-guide"
+  ],
+  "prompt": "This function takes four or more arguments (not counting `self`). Flag it if some of them belong together \u2014 they travel together to other functions, or describe one thing (a point, a size, a config) \u2014 and name the struct they would form. Do not flag it if the arguments are genuinely unrelated and grouping would be artificial; say nothing then."
+}
