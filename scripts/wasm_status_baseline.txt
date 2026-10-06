@@ -1,0 +1,22 @@
+# Crates that do not build for wasm32-unknown-unknown today, one per line,
+# named exactly as scripts/check-wasm-status.sh labels them.
+#
+# This is a baseline, not a wishlist. Both directions are a failure:
+#
+#   * A crate that fails and is NOT listed here is a regression -- wasm32
+#     buildability got worse and nobody noticed. That is the case this check
+#     exists for, and the case the old inline script could not report at all.
+#   * A crate that builds and IS listed here means the gap closed. Delete the
+#     line. Progress is worth a one-line diff, and a baseline nobody prunes
+#     stops describing anything.
+#
+# Why these two fail is not a bug to fix here: pixelflow-codegen's
+# `isa/mod.rs` opens with a `compile_error!` on any target that is not x86-64
+# or aarch64, because the JIT emits machine code for those two and there is no
+# portable or scalar tier (CLAUDE.md, "Workspace Structure"). Everything that
+# depends on it inherits the refusal. Closing the gap means a wasm32 backend
+# in pixelflow-codegen, which is tracked work, not a CI change -- so this
+# check's job is to hold the line where it is, not to glow red about a
+# decision the codebase made on purpose.
+pixelflow-core
+pixelflow-runtime web driver
