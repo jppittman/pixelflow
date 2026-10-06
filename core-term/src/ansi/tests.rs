@@ -894,6 +894,23 @@ fn it_should_abort_csi_ignore_on_esc_and_process_subsequent_csi() {
 }
 
 #[test]
+fn it_should_dispatch_non_esc_c0_control_received_while_discarding_a_malformed_csi() {
+    // A C0 control other than ESC, received while discarding a malformed
+    // CSI's tail, is dispatched as its own command (like the other CSI
+    // sub-states) rather than being swallowed as more garbage.
+    let bytes = b"\x1B[38:2\x07A";
+    let commands = process_bytes(bytes);
+    assert_eq!(
+        commands,
+        vec![
+            Command(AnsiCommand::Error(b':')),
+            Command(AnsiCommand::C0Control(C0Control::BEL)),
+            Char('A'),
+        ]
+    );
+}
+
+#[test]
 fn it_should_stay_in_escape_state_on_repeated_esc() {
     // A second ESC while already in the Escape state re-arms rather than
     // being dispatched as an (invalid) C0 control.

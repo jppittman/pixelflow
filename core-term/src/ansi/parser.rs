@@ -553,3 +553,42 @@ impl AnsiTokenByte for AnsiToken {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_should_report_ground_for_a_new_parser_and_leave_ground_on_escape() {
+        let mut parser = AnsiParser::new();
+        assert!(parser.is_ground());
+
+        parser.process_token(AnsiToken::C0Control(C0Control::ESC as u8));
+        assert!(!parser.is_ground());
+    }
+
+    #[test]
+    fn it_should_return_to_ground_once_an_escape_sequence_is_dispatched() {
+        let mut parser = AnsiParser::new();
+        parser.process_token(AnsiToken::C0Control(C0Control::ESC as u8));
+        parser.process_token(AnsiToken::Print('c'));
+        assert!(parser.is_ground());
+    }
+
+    #[test]
+    fn it_should_accept_every_byte_in_the_printable_ascii_range() {
+        for byte in b' '..=b'~' {
+            assert!(
+                is_printable_ascii(byte),
+                "byte {byte:#04x} is in the printable ASCII range"
+            );
+        }
+    }
+
+    #[test]
+    fn it_should_reject_c0_controls_and_del_as_not_printable_ascii() {
+        assert!(!is_printable_ascii(0x00));
+        assert!(!is_printable_ascii(0x1F));
+        assert!(!is_printable_ascii(0x7F), "DEL is not printable ASCII");
+    }
+}
