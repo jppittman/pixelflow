@@ -3,10 +3,13 @@
 use std::error::Error;
 use std::time::Duration;
 
+use std::num::NonZeroUsize;
+
 use anyhow::Result;
 use rig_core::ProviderError;
 use rig_core::completion::CompletionRequest;
 use rig_core::providers::{anthropic::Anthropic, gemini::Gemini};
+use tokio::sync::Semaphore;
 
 use crate::model::{ModelLevel, Provider};
 use crate::rate_limit::{BoxError, RateLimiter, Signal};
@@ -26,12 +29,20 @@ pub struct Agent {
     provider: Provider,
     client: Client,
     limiter: Box<dyn RateLimiter>,
+    /// Bounds the calls waiting on the limiter, so a pace it sets reaches
+    /// the next call rather than the end of a queue booked at the old one.
+    in_flight: Semaphore,
 }
 
 impl Agent {
     /// An agent for `provider`, credentialed from its usual environment
-    /// variable, calling and retrying as `limiter` allows.
-    pub fn from_env(provider: Provider, limiter: Box<dyn RateLimiter>) -> Result<Self> {
+    /// variable, calling and retrying as `limiter` allows with at most `jobs`
+    /// calls in flight.
+    pub fn from_env(
+        provider: Provider,
+        limiter: Box<dyn RateLimiter>,
+        jobs: NonZeroUsize,
+    ) -> Result<Self> {
         let client = match provider {
             Provider::Anthropic => Client::Anthropic(Anthropic::from_env()?),
             Provider::Gemini => Client::Gemini(Gemini::from_env()?),
@@ -40,11 +51,13 @@ impl Agent {
             provider,
             client,
             limiter,
+            in_flight: Semaphore::new(jobs.get()),
         })
     }
 
     /// Ask the model for `level` to answer `prompt` under `preamble`.
     pub async fn ask(&self, level: ModelLevel, preamble: &str, prompt: &str) -> Result<String> {
+        let _permit = self.in_flight.acquire().await?;
         let model = self.provider.model(level);
         let mut last: Option<BoxError> = None;
         loop {

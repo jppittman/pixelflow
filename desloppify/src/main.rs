@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -56,6 +57,9 @@ struct Args {
     /// Give up on a call rather than wait longer than this for it.
     #[arg(long, default_value_t = 300)]
     max_wait_secs: u64,
+    /// Most calls in flight at once, retries included.
+    #[arg(long, default_value = "8")]
+    jobs: NonZeroUsize,
     #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/rules"))]
     rules: PathBuf,
     #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/skills"))]
@@ -67,7 +71,7 @@ async fn main() -> Result<ExitCode> {
     let args = Args::parse();
     let skills = Skills::load(&args.skills)?;
     let rules = Arc::new(Rule::load_dir(&args.rules, &skills)?);
-    let agent = Arc::new(Agent::from_env(args.provider, limiter(&args))?);
+    let agent = Arc::new(Agent::from_env(args.provider, limiter(&args), args.jobs)?);
 
     let mut files = Vec::new();
     for path in &args.paths {
