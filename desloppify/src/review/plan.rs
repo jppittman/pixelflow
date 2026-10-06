@@ -1,13 +1,14 @@
 //! Deciding the calls.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use super::{Call, Source};
 use crate::language::Language;
-use crate::rule::{Rule, Surroundings};
-use crate::snippet::snippets;
+use crate::rule::{Review, Rule, Scope, Surroundings};
+use crate::snippet::{Snippet, snippets};
 
 /// File names that make a file its directory's module root.
 const ROOT_FILES: [&str; 3] = ["mod.rs", "lib.rs", "main.rs"];
@@ -41,6 +42,9 @@ fn module_root(path: &Path) -> Result<Option<Source>> {
 
 pub(super) fn plan(rules: &[Rule], files: &[PathBuf]) -> Result<Vec<Call>> {
     let mut calls = Vec::new();
+    // Crate-wide rules gather each file's captures here, keyed by rule and
+    // crate, and become one call per crate once every file is read.
+    let mut crates: BTreeMap<(usize, PathBuf), Vec<(PathBuf, Snippet)>> = BTreeMap::new();
     for path in files {
         let Some(language) = Language::of(path) else {
             continue;
@@ -57,6 +61,11 @@ pub(super) fn plan(rules: &[Rule], files: &[PathBuf]) -> Result<Vec<Call>> {
             if snippets.is_empty() {
                 continue;
             }
+            if is_crate_wide(rule) {
+                let gathered = crates.entry((index, crate_of(path))).or_default();
+                gathered.extend(snippets.into_iter().map(|s| (path.clone(), s)));
+                continue;
+            }
             let root = match rule.context {
                 Surroundings::None => None,
                 Surroundings::ModuleRoot => module_root(path)?,
@@ -69,5 +78,43 @@ pub(super) fn plan(rules: &[Rule], files: &[PathBuf]) -> Result<Vec<Call>> {
             }));
         }
     }
+    calls.extend(crates.into_iter().map(|((rule, krate), files)| Call {
+        rule,
+        path: krate,
+        snippet: under_headers(files),
+        root: None,
+    }));
     Ok(calls)
+}
+
+fn is_crate_wide(rule: &Rule) -> bool {
+    matches!(
+        rule.scope,
+        Scope::Captures {
+            review: Review::Crate,
+            ..
+        }
+    )
+}
+
+/// The directory of the nearest `Cargo.toml` above `path`; the current
+/// directory if there is none.
+fn crate_of(path: &Path) -> PathBuf {
+    path.ancestors()
+        .skip(1)
+        .find(|dir| dir.join("Cargo.toml").is_file())
+        .map_or_else(PathBuf::new, Path::to_path_buf)
+}
+
+/// Every file's snippet, each under a `== path ==` header.
+fn under_headers(files: Vec<(PathBuf, Snippet)>) -> Snippet {
+    let numbered = files
+        .iter()
+        .map(|(path, snippet)| format!("== {} ==\n{}", path.display(), snippet.numbered))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Snippet {
+        first_line: 1,
+        numbered,
+    }
 }

@@ -8,8 +8,11 @@ ANTHROPIC_API_KEY=... cargo run -p desloppify -- path/to/src
 GEMINI_API_KEY=...    cargo run -p desloppify -- --provider gemini path/to/src
 ```
 
-`--dry-run` counts the calls each rule would make and makes none — check it
-before pointing a frontier level at a whole tree.
+`--dry-run` makes no calls and prints, per rule and per level, the calls a
+run would make and roughly how many input tokens they send (four characters a
+token) — what a provider bills, so check it before pointing a level at a
+tree. The design is many small, cheap calls: most rules send one function at
+level 1, and only rules that need a whole file, or a whole crate, pay for one.
 
 Each rule is applied by its own call, which sees one rule and a little code,
 so no reviewer forgets a rule. Then one level-4 call, the lead, reads every
@@ -41,8 +44,8 @@ scripted `Ask`.
 | Field | |
 |---|---|
 | `level` | 1–4: how capable a model the question needs |
-| `scope` | the rule's input: `"file"`; a named part — `"functions"`, `"function_names"`, `"function_bodies"`, `"types"`, `"comments"` — in every language that has it; or `{"language": "rust", "query": "... @target"}` |
-| `review` | `"each"` (default): one call per captured part. `"together"`: all of a file's parts in one call, for questions about consistency across them. `"file"`: the whole file, naming the captured lines, if it has any — for a match that needs its surroundings |
+| `scope` | the rule's input: `"file"`; a named part — `"functions"`, `"function_signatures"`, `"function_names"`, `"function_bodies"`, `"types"`, `"comments"` — in every language that has it; or `{"language": "rust", "query": "... @target"}` |
+| `review` | `"each"` (default): one call per captured part. `"function"`: each function holding a match, naming the matched lines. `"together"`: all of a file's parts in one call. `"file"`: the whole file, naming the matched lines, if it has any. `"crate"`: every part from every file in a crate in one call, under `== path ==` headers |
 | `context` | `"module_root"`: each call also sees the root (`mod.rs`/`lib.rs`/`main.rs`) of the reviewed file's module — the contract an implementation file is judged against |
 | `paths`, `exclude` | optional globs over paths relative to where the review runs (`pixelflow-*/**`, `**/tests/**`); no `paths` means every file |
 | `skills` | optional skill names to put ahead of the prompt |
@@ -67,34 +70,33 @@ Only rules needing judgment are here: what a deterministic check can catch
 (`cfg` encapsulation, `let _ =` on `#[must_use]`, conventional commits) is
 already a CI job or a lint, and stays there.
 
-| Rule | Level | Scope | Source |
+| Rule | Level | Reviews | Source |
 |---|---|---|---|
-| `boolean-argument` | 1 | `bool` params | STYLE: boolean arguments |
-| `too-many-arguments` | 1 | fns with ≥4 params | STYLE: argument count |
-| `magic-numbers` | 1 | file | STYLE: magic numbers |
-| `panicking-unwrap` | 1 | file, at each `unwrap`/`expect` | CLAUDE.md: no silent failures |
-| `test-names-it-should` | 1 | a file's test names together | STYLE: "it should" names |
-| `comment-says-why` | 2 | file | STYLE: comments |
-| `hidden-parser` | 2 | file, at each string split/trim/strip/parse | parse, don't poke at strings |
-| `guard-clauses` | 2 | file | STYLE: guard clauses |
-| `silent-failure` | 2 | file | CLAUDE.md: errors handled, fail loud |
-| `naming-consistency` | 2 | a file's fn names together | CLAUDE.md: name vs namespace |
-| `control-plane-64-bit` | 2 | pixelflow types | CLAUDE.md: control plane is 64-bit |
-| `no-terminal-logic-in-pixelflow` | 2 | pixelflow files | CLAUDE.md: no terminal logic |
-| `simd-is-codegens` | 2 | pixelflow files outside the emitters | CLAUDE.md: SIMD is an implementation detail |
-| `per-frame-allocation` | 2 | render-path crates | CLAUDE.md: zero allocations |
-| `actor-lane-choice` | 2 | actor crates | CLAUDE.md: actor lanes |
-| `fold-before-dispatch` | 3 | file | CLAUDE.md / STYLE: fold before dispatch |
-| `trait-first` | 3 | file | CLAUDE.md / STYLE: trait first |
+| `boolean-argument` | 1 | each of query matches | STYLE: boolean arguments |
+| `comment-says-why` | 1 | each of functions | STYLE: comments |
+| `control-plane-64-bit` | 1 | each of types | CLAUDE.md: control plane is 64-bit |
+| `guard-clauses` | 1 | each of functions | STYLE: guard clauses; open cases only go down |
+| `hidden-parser` | 1 | each function holding query matches | parse, don't poke at strings |
+| `interface-lives-in-mod-rs` | 1 | a file's query matches together | behavioral contracts |
+| `magic-numbers` | 1 | each of functions | STYLE: magic numbers |
+| `no-terminal-logic-in-pixelflow` | 1 | file | CLAUDE.md: no terminal logic |
+| `no-tests-inside-the-implementation` | 1 | a file's query matches together | behavioral contracts |
+| `panicking-unwrap` | 1 | each function holding query matches | CLAUDE.md: no silent failures |
+| `per-frame-allocation` | 1 | each of functions | CLAUDE.md: zero allocations |
+| `silent-failure` | 1 | each of functions | CLAUDE.md: fail loud |
+| `simd-is-codegens` | 1 | file | CLAUDE.md: SIMD is an implementation detail |
+| `test-names-it-should` | 1 | a file's query matches together | STYLE: "it should" names |
+| `actor-lane-choice` | 2 | file | CLAUDE.md: actor lanes |
+| `behavior-through-the-trait` | 2 | a file's query matches together | behavioral contracts |
+| `fold-before-dispatch` | 2 | each of functions | CLAUDE.md / STYLE: fold before dispatch |
+| `hardware-instruction-first` | 2 | each of functions | CLAUDE.md: take what the hardware gives |
+| `mask-is-not-a-number` | 2 | each of functions | CLAUDE.md: floating point at the edges |
+| `tests-target-the-contract` | 2 | file | behavioral contracts |
+| `effects-are-returned` | 3 | whole file at query matches | behavioral contracts |
+| `function-shapes` | 3 | a crate's function signatures together | names vs namespaces, argument structs, denotation, extraction |
 | `invariant-in-comment` | 3 | file | CLAUDE.md: denote before you build |
-| `mask-is-not-a-number` | 3 | kernel crates | CLAUDE.md: floating point at the edges |
-| `hardware-instruction-first` | 3 | kernel crates | CLAUDE.md: take what the hardware gives |
-| `interface-lives-in-mod-rs` | 1 | impl files, at anything wider than `pub(super)` | behavioral contracts |
-| `behavior-through-the-trait` | 2 | public inherent methods | behavioral contracts |
-| `tests-target-the-contract` | 2 | test files | behavioral contracts |
-| `no-tests-inside-the-implementation` | 1 | test modules under `src/` | behavioral contracts |
-| `mod-rs-is-a-contract` | 3 | `mod.rs`, `lib.rs` | behavioral contracts |
-| `effects-are-returned` | 3 | traits and trait impls | behavioral contracts |
+| `mod-rs-is-a-contract` | 3 | file | behavioral contracts |
+| `trait-first` | 3 | file | CLAUDE.md / STYLE: trait first |
 
 Skills: `style-guide` (STYLE.md distilled), `pixelflow-architecture`
 (CLAUDE.md's constraints) and `behavioral-contracts` (the module shape of

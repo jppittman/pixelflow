@@ -34,27 +34,21 @@ fn boolean_argument_query_ignores_other_parameters() {
 }
 
 #[test]
-fn function_names_reviewed_together_are_one_snippet_with_each_line_numbered() {
-    let source = "fn get_a() {}\n\nfn fetch_b() {}\n";
-    let found = snippets(&rule("naming-consistency"), Language::Rust, source).unwrap();
+fn function_shapes_sees_signatures_without_bodies() {
+    let source = "pub fn a(x: u8) -> u8 {\n    x\n}\nfn b() {}\n";
+    let found = snippets(&rule("function-shapes"), Language::Rust, source).unwrap();
     assert_eq!(found.len(), 1);
-    assert_eq!(found[0].numbered, "    1 | get_a\n  ...\n    3 | fetch_b\n");
+    assert_eq!(
+        found[0].numbered,
+        "    1 | pub fn a(x: u8) -> u8\n  ...\n    4 | fn b()\n"
+    );
 }
 
 #[test]
-fn types_scope_points_at_each_type_in_the_file() {
+fn types_scope_reviews_each_type_alone() {
     let source = "struct A { id: u32 }\nfn f() {}\nenum B { X }\n";
     let found = snippets(&rule("control-plane-64-bit"), Language::Rust, source).unwrap();
-    assert_eq!(found.len(), 1);
-    assert!(found[0].numbered.starts_with("Review lines 1, 3.\n"));
-}
-
-#[test]
-fn too_many_arguments_query_captures_four_parameters_but_not_three_or_self() {
-    let source = "fn three(a: u8, b: u8, c: u8) {}\nfn four(a: u8, b: u8, c: u8, d: u8) {}\nimpl S { fn m(&self, a: u8, b: u8, c: u8) {} }\n";
-    let found = snippets(&rule("too-many-arguments"), Language::Rust, source).unwrap();
-    assert_eq!(found.len(), 1);
-    assert!(found[0].numbered.contains("fn four"));
+    assert_eq!(found.len(), 2);
 }
 
 #[test]
@@ -104,15 +98,14 @@ fn excluded_paths_are_not_read() {
 }
 
 #[test]
-fn file_review_sends_the_whole_file_naming_matched_lines_and_skips_files_without_any() {
+fn function_review_sends_each_function_holding_a_match_naming_its_lines() {
     let unwrap = rule("panicking-unwrap");
-    let source = "fn f() {\n    let a = x.unwrap();\n    let b = y.expect(\"y\");\n}\n";
+    let source = "fn f() {\n    let a = x.unwrap();\n    let b = y.expect(\"y\");\n}\nfn g() {}\n";
     let found = snippets(&unwrap, Language::Rust, source).unwrap();
     assert_eq!(found.len(), 1);
-    assert!(
-        found[0]
-            .numbered
-            .starts_with("Review lines 2, 3.\n\n    1 | fn f() {\n")
+    assert_eq!(
+        found[0].numbered,
+        "Review lines 2, 3.\n\n    1 | fn f() {\n    2 |     let a = x.unwrap();\n    3 |     let b = y.expect(\"y\");\n    4 | }\n"
     );
     assert!(
         snippets(&unwrap, Language::Rust, "fn g() {}\n")
@@ -122,19 +115,22 @@ fn file_review_sends_the_whole_file_naming_matched_lines_and_skips_files_without
 }
 
 #[test]
-fn interface_rule_points_at_everything_wider_than_pub_super() {
-    let source = "pub fn a() {}\npub(super) fn b() {}\nfn c() {}\npub(crate) struct S;\n";
+fn interface_rule_shows_signatures_of_everything_wider_than_pub_super() {
+    let source = "pub fn a() {\n}\npub(super) fn b() {}\nfn c() {}\npub(crate) struct S;\n";
     let found = snippets(&rule("interface-lives-in-mod-rs"), Language::Rust, source).unwrap();
     assert_eq!(found.len(), 1);
-    assert!(found[0].numbered.starts_with("Review lines 1, 4.\n"));
+    assert_eq!(
+        found[0].numbered,
+        "    1 | pub fn a()\n  ...\n    5 | pub(crate) struct S;\n"
+    );
 }
 
 #[test]
-fn trait_rule_points_at_public_inherent_methods_but_not_trait_impls() {
-    let source = "impl S {\n    pub fn a() {}\n    pub(super) fn b() {}\n}\nimpl T for S {\n    fn c() {}\n}\n";
+fn trait_rule_shows_public_inherent_method_signatures_but_not_trait_impls() {
+    let source = "impl S {\n    pub fn a() {}\n    pub(super) fn b() {}\n}\nimpl T for S {\n    pub fn c() {}\n}\n";
     let found = snippets(&rule("behavior-through-the-trait"), Language::Rust, source).unwrap();
     assert_eq!(found.len(), 1);
-    assert!(found[0].numbered.starts_with("Review lines 2.\n"));
+    assert_eq!(found[0].numbered, "    2 | pub fn a()\n");
 }
 
 #[test]
@@ -155,4 +151,13 @@ fn module_root_context_attaches_the_mod_rs_to_an_implementation_file() {
     assert_eq!(root.path, dir.join("mod.rs"));
     assert_eq!(root.text, "mod leaf;\n");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn functions_inside_a_cfg_test_module_are_not_reviewed() {
+    let source =
+        "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nmod inner {\n    fn b() {}\n}\n";
+    let found = snippets(&rule("guard-clauses"), Language::Rust, source).unwrap();
+    let names: Vec<_> = found.iter().map(|s| s.first_line).collect();
+    assert_eq!(names, [1, 7]);
 }

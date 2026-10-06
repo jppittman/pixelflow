@@ -1,6 +1,6 @@
 {
-  "level": 3,
-  "scope": "file",
+  "level": 2,
+  "scope": "functions",
   "paths": [
     "pixelflow-ir/**",
     "pixelflow-codegen/**",
@@ -11,9 +11,6 @@
     "**/benches/**",
     "**/examples/**",
     "**/tests/**"
-  ],
-  "skills": [
-    "pixelflow-architecture"
   ],
   "prompt": "Flag code that treats a comparison result or mask as a number: a true mask spelled `1.0` (or any constant other than via `OpKind::mask`), arithmetic on a mask, a bitwise-domain result passed through a numeric fold or a finiteness check that would read all-ones as NaN. Also flag constant folding of an op whose result differs by target (Min/Max with NaN or signed zeros, Gt/Ge with NaN, Round ties, Recip/Rsqrt, TruncToInt out of range, out-of-range shifts) at build time."
 }

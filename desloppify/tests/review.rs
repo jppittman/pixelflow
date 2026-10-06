@@ -290,3 +290,45 @@ async fn the_lead_review_is_one_frontier_call_over_every_finding_with_its_rule()
         "{brief}"
     );
 }
+
+#[tokio::test]
+async fn a_crate_wide_rule_makes_one_call_per_crate_and_findings_keep_their_file() {
+    let tree = Tree::new(
+        "crate",
+        &[(
+            "shapes",
+            r#"{"level": 3, "scope": "function_signatures", "review": "crate", "prompt": "p"}"#,
+        )],
+        &[
+            ("k/Cargo.toml", "[package]\n"),
+            ("k/src/a.rs", "fn a(x: u8) {}\n"),
+            ("k/src/b.rs", "fn b() {}\n"),
+        ],
+    );
+    let b = tree.path("k/src/b.rs");
+    let reply = format!(
+        r#"[{{"path": "{}", "line": 1, "message": "m"}}]"#,
+        b.display()
+    );
+    let rules = tree.rules();
+    let calls = plan(&rules, &[tree.path("k/src/a.rs"), b.clone()]).unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].path, tree.path("k"));
+    let shown = &calls[0].snippet.numbered;
+    assert!(shown.contains("a.rs ==\n    1 | fn a(x: u8)\n"), "{shown}");
+    assert!(shown.contains("b.rs ==\n    1 | fn b()\n"), "{shown}");
+
+    let replying = Arc::new(Replying(reply));
+    let report = review(replying, Arc::new(rules), calls).await.unwrap();
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(report.findings[0].path, b);
+}
+
+/// Answers every prompt with the same reply.
+struct Replying(String);
+
+impl Ask for Replying {
+    async fn ask(&self, _: ModelLevel, _: &str, _: &str) -> Result<String> {
+        Ok(self.0.clone())
+    }
+}

@@ -37,12 +37,46 @@ impl Language {
     pub fn query(self, part: Part) -> Option<&'static str> {
         match (self, part) {
             (Self::Rust, Part::Functions) => Some("(function_item) @target"),
+            (Self::Rust, Part::FunctionSignatures) => {
+                Some("[(function_item body: (_) @cut) (function_signature_item)] @target")
+            }
             (Self::Rust, Part::FunctionNames) => Some("(function_item name: (identifier) @target)"),
             (Self::Rust, Part::FunctionBodies) => Some("(function_item body: (block) @target)"),
             (Self::Rust, Part::Types) => {
                 Some("[(struct_item) (enum_item) (union_item) (trait_item) (type_item)] @target")
             }
             (Self::Rust, Part::Comments) => Some("[(line_comment) (block_comment)] @target"),
+        }
+    }
+
+    /// The node kinds that are a function in this language: what a
+    /// [`Review::Function`](crate::rule::Review::Function) capture is shown
+    /// inside.
+    #[must_use]
+    pub fn function_kinds(self) -> &'static [&'static str] {
+        match self {
+            Self::Rust => &["function_item"],
+        }
+    }
+
+    /// Whether `node` is a test module: in Rust, a `mod` with a
+    /// `#[cfg(test)]` attribute.
+    #[must_use]
+    pub fn is_test_module(self, node: tree_sitter::Node, source: &str) -> bool {
+        match self {
+            Self::Rust => {
+                node.kind() == "mod_item"
+                    && std::iter::successors(
+                        node.prev_named_sibling(),
+                        tree_sitter::Node::prev_named_sibling,
+                    )
+                    .take_while(|n| n.kind() == "attribute_item")
+                    .any(|attr| {
+                        source[attr.byte_range()]
+                            .replace(' ', "")
+                            .contains("cfg(test)")
+                    })
+            }
         }
     }
 }

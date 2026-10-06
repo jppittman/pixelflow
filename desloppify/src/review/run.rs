@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::task::JoinSet;
 
-use super::reply::{REVIEWER, parse};
+use super::reply::{parse, preamble, prompt};
 use super::{Call, Finding, Report};
 use crate::agent::Ask;
 use crate::rule::Rule;
@@ -16,33 +16,19 @@ pub(super) async fn review<A: Ask>(
     plan: Vec<Call>,
 ) -> Result<Report> {
     let mut calls = JoinSet::new();
-    for Call {
-        rule: index,
-        path,
-        snippet,
-        root,
-    } in plan
-    {
+    for call in plan {
         let (agent, rules) = (agent.clone(), rules.clone());
         calls.spawn(async move {
-            let rule = &rules[index];
-            let mut prompt = format!("File: {}\n\n{}", path.display(), snippet.numbered);
-            if let Some(root) = &root {
-                prompt.push_str(&format!(
-                    "\nFor context only, not under review — its module root, {}:\n\n{}",
-                    root.path.display(),
-                    root.text
-                ));
-            }
-            let preamble = format!("{REVIEWER}\n\n{}", rule.instructions);
+            let rule = &rules[call.rule];
+            let (preamble, prompt) = (preamble(rule), prompt(&call));
             let replies = async { parse(&agent.ask(rule.level, &preamble, &prompt).await?) }
                 .await
                 .with_context(|| {
                     format!(
                         "rule {} on {}:{}",
                         rule.id,
-                        path.display(),
-                        snippet.first_line
+                        call.path.display(),
+                        call.snippet.first_line
                     )
                 })?;
             Ok::<_, anyhow::Error>(
@@ -50,7 +36,7 @@ pub(super) async fn review<A: Ask>(
                     .into_iter()
                     .map(|r| Finding {
                         rule: rule.id.clone(),
-                        path: path.clone(),
+                        path: r.path.unwrap_or_else(|| call.path.clone()),
                         line: r.line,
                         message: r.message,
                     })

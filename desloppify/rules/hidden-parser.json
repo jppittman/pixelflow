@@ -1,19 +1,16 @@
 {
-  "level": 2,
+  "level": 1,
   "scope": {
     "language": "rust",
     "query": "(call_expression function: (field_expression field: (field_identifier) @method (#match? @method \"^(split|split_once|splitn|rsplit|rsplit_once|split_whitespace|strip_prefix|strip_suffix|trim|trim_start|trim_end|trim_matches|starts_with|ends_with|find|rfind|char_indices|lines|parse)$\"))) @target"
   },
-  "review": "file",
+  "review": "function",
   "exclude": [
     "**/tests/**",
     "**/benches/**",
     "**/examples/**",
     "**/tests.rs",
     "**/*_tests.rs"
-  ],
-  "skills": [
-    "style-guide"
   ],
   "prompt": "The lines named do string surgery. Flag code that is a parser without saying so: text with structure (a config or manifest format, a table, a key=value list, a header, a command line, a version string, a model's reply) taken apart with split/trim/strip/find/index and `parse::<T>()`, often with rows or fields that fail to parse silently skipped. Also flag dispatch on string contents (`starts_with`/`==` chains) where a `FromStr` enum should exist. For each, name the format and say what replaces the hand parsing: `serde` with a real format crate (`toml`, `serde_json`, `csv`), a `FromStr` impl producing an enum or struct once at the boundary, or a grammar for a real language. Point out silent skipping of malformed input. Do not flag one-off trimming of user input, splitting a path, or reading a single number from an environment variable."
 }

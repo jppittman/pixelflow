@@ -48,6 +48,11 @@ use crate::skills::Skills;
 /// The capture a query must name: the code each review sees.
 pub const TARGET_CAPTURE: &str = "target";
 
+/// A capture a query may name inside its target: the target's text stops
+/// where this one starts. A function's signature is its `@target` with its
+/// body as `@cut`.
+pub const CUT_CAPTURE: &str = "cut";
+
 /// Every `*.json` rule in `dir`, sorted by id.
 ///
 /// # Errors
@@ -97,11 +102,13 @@ pub enum Scope {
     },
 }
 
-/// A query compiled for its language, with the index of its `@target`.
+/// A query compiled for its language, with the indexes of its `@target`
+/// and, if it has one, its `@cut`.
 pub struct CompiledQuery {
     pub language: Language,
     pub query: tree_sitter::Query,
     pub target: u32,
+    pub cut: Option<u32>,
 }
 
 /// A part of the code every language may have, found by a per-language query
@@ -111,6 +118,9 @@ pub struct CompiledQuery {
 pub enum Part {
     Functions,
     FunctionNames,
+    /// A function's signature — attributes, visibility, name, parameters,
+    /// return type — without its body.
+    FunctionSignatures,
     FunctionBodies,
     Types,
     Comments,
@@ -125,10 +135,19 @@ pub enum Review {
     Each,
     /// One call per file, holding all its captures.
     Together,
+    /// One call per function that holds a capture, showing the whole
+    /// function and naming the captured lines: the query picks where to
+    /// look, the function is the context to judge it in. A capture outside
+    /// any function is shown alone.
+    Function,
     /// One call per file that has a capture, holding the whole file and
-    /// naming the captured lines: the query picks where to look, the file is
-    /// the context to judge it in.
+    /// naming the captured lines, for a match that needs more than its
+    /// function to be judged.
     File,
+    /// One call per crate, holding every capture from every file in it, each
+    /// file under a `== path ==` header: for patterns only visible across a
+    /// whole crate, such as the shapes of all its function signatures.
+    Crate,
 }
 
 /// What a call sees besides the code under review.

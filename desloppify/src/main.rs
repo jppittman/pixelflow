@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 use desloppify::agent;
 use desloppify::model::Provider;
 use desloppify::rate_limit::{self, AdaptiveConfig, RateLimiter, SystemClock, TokenBucketConfig};
-use desloppify::review::{Call, Report, plan, review, synthesize};
+use desloppify::review::{Call, Report, estimated_tokens, plan, review, synthesize};
 use desloppify::rule::{self, Rule};
 use desloppify::skills;
 
@@ -120,16 +120,33 @@ fn print_findings(report: &Report) {
     }
 }
 
-/// Calls per rule, with each rule's level, and the total.
+/// Calls and estimated input tokens per rule, then per level.
 fn print_plan(rules: &[Rule], plan: &[Call]) {
-    let mut counts = vec![0_u64; rules.len()];
+    let mut per_rule = vec![(0_u64, 0_u64); rules.len()];
     for call in plan {
-        counts[call.rule] += 1;
+        let (calls, tokens) = &mut per_rule[call.rule];
+        *calls += 1;
+        *tokens += estimated_tokens(rules, call);
     }
-    for (rule, count) in rules.iter().zip(&counts) {
-        println!("{count:>8}  level {}  {}", u64::from(rule.level), rule.id);
+    println!("{:>8}  {:>12}  level  rule", "calls", "~in tokens");
+    for (rule, (calls, tokens)) in rules.iter().zip(&per_rule) {
+        println!(
+            "{calls:>8}  {tokens:>12}  {:>5}  {}",
+            u64::from(rule.level),
+            rule.id
+        );
     }
-    println!("{:>8}  total", plan.len());
+    let mut per_level = std::collections::BTreeMap::new();
+    for (rule, (calls, tokens)) in rules.iter().zip(&per_rule) {
+        let (c, t) = per_level
+            .entry(u64::from(rule.level))
+            .or_insert((0_u64, 0_u64));
+        *c += calls;
+        *t += tokens;
+    }
+    for (level, (calls, tokens)) in per_level {
+        println!("{calls:>8}  {tokens:>12}  {level:>5}  (level total)");
+    }
 }
 
 fn limiter(args: &Args) -> Box<dyn RateLimiter> {

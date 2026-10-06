@@ -5,7 +5,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use super::{CompiledQuery, Part, Review, Rule, Scope, Surroundings, TARGET_CAPTURE, files};
+use super::{
+    CUT_CAPTURE, CompiledQuery, Part, Review, Rule, Scope, Surroundings, TARGET_CAPTURE, files,
+};
 use crate::language::Language;
 use crate::model::ModelLevel;
 use crate::skills::Skills;
@@ -48,10 +50,12 @@ fn compile(language: Language, source: &str) -> Result<CompiledQuery> {
     let Some(target) = query.capture_index_for_name(TARGET_CAPTURE) else {
         bail!("query has no @{TARGET_CAPTURE} capture");
     };
+    let cut = query.capture_index_for_name(CUT_CAPTURE);
     Ok(CompiledQuery {
         language,
         query,
         target,
+        cut,
     })
 }
 

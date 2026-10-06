@@ -1,12 +1,8 @@
 {
-  "level": 2,
+  "level": 1,
   "scope": "types",
-  "review": "file",
   "paths": [
     "pixelflow-*/**"
-  ],
-  "skills": [
-    "pixelflow-architecture"
   ],
   "prompt": "Flag fields, type aliases and newtypes that hold an index, id, count, extent, length, offset or bound describing a program (expression/value ids, fold or loop ends, binder slots, class ids, arena indices) with a type narrower than 64 bits (`u8`, `u16`, `u32`, `i32`, or their aliases), unless the type's own doc cites a profiler measurement justifying it. Do not flag the data plane: `f32` values, `u32` pixels, and ISA-defined encoding fields (immediates, displacements, register numbers)."
 }

@@ -4,7 +4,7 @@
     "language": "rust",
     "query": "(call_expression function: (field_expression field: (field_identifier) @method (#match? @method \"^(unwrap|expect)$\"))) @target"
   },
-  "review": "file",
+  "review": "function",
   "exclude": [
     "**/tests/**",
     "**/benches/**",

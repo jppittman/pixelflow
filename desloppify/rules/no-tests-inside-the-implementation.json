@@ -2,9 +2,9 @@
   "level": 1,
   "scope": {
     "language": "rust",
-    "query": "(mod_item name: (identifier) @name (#match? @name \"^tests?$|_tests?$\")) @target"
+    "query": "(mod_item name: (identifier) @name body: (_) @cut (#match? @name \"^tests?$|_tests?$\")) @target"
   },
-  "review": "file",
+  "review": "together",
   "exclude": [
     "**/tests/**",
     "**/benches/**",
@@ -15,5 +15,5 @@
   "skills": [
     "behavioral-contracts"
   ],
-  "prompt": "The lines named declare a test module inside the source tree, where it can see the module's private items. Tests belong in the crate's `tests/` directory, where only the exported interface is visible. Flag each test module, and for its tests say which exported entry point they should drive instead. If a test module here only re-checks a pure function's output through its public signature, still flag it: its location lets the next test reach in."
+  "prompt": "Shown are test modules declared inside the source tree, where they can see the module's private items. Tests belong in the crate's `tests/` directory, where only the exported interface is visible. Flag each one: its tests should move there and drive the exported API."
 }
