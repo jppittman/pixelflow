@@ -1724,13 +1724,6 @@ impl<'a> Allocation<'a> {
         })
     }
 
-    /// The nest's [`spill_bytes`](NestAllocation::spill_bytes): one frame
-    /// for every scope, so one answer.
-    #[must_use]
-    pub(crate) fn spill_bytes(&self) -> u32 {
-        self.nest.spill_bytes
-    }
-
     fn code(&self) -> &'a ScopeCode {
         self.nest
             .code(self.scope)

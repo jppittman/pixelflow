@@ -1019,10 +1019,6 @@ trait IsaBackend {
     /// Per-compile setup before any code is emitted (e.g. seed a constant pool).
     fn begin(&mut self, schedule: &[regalloc::Def]) -> Result<(), CompileError>;
 
-    /// Called once the frame layout is known, BEFORE any body instruction is
-    /// emitted.
-    fn frame_ready(&mut self, _frame_size: u32) {}
-
     /// Emit one resolved instruction (with its reloads/store).
     fn emit_plan(&mut self, code: &mut Vec<u8>, plan: &InstructionPlan)
     -> Result<(), CompileError>;
@@ -1395,8 +1391,6 @@ fn emit_scope<B: IsaBackend>(
                 )
             })
     };
-
-    backend.frame_ready(allocation.spill_bytes());
 
     // If short-circuit guards, read off the allocation rather than
     // recomputed: `schedule` above is `allocation.schedule()` verbatim, and
@@ -6842,10 +6836,6 @@ mod tests {
 
             fn begin(&mut self, schedule: &[regalloc::Def]) -> Result<(), CompileError> {
                 self.inner.begin(schedule)
-            }
-
-            fn frame_ready(&mut self, frame_size: u32) {
-                self.inner.frame_ready(frame_size);
             }
 
             fn emit_plan(
