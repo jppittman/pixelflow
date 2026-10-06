@@ -552,6 +552,17 @@ mod tests {
     }
 
     #[test]
+    fn it_should_describe_the_expected_shape_string_when_deserializing_the_wrong_json_type() {
+        let result: Result<CursorShape, _> = serde_json::from_str("42");
+        let err = result.expect_err("a JSON number is not a valid CursorShape encoding");
+        assert!(
+            err.to_string()
+                .contains("a string representing a CursorShape"),
+            "deserialize error should describe the expected value, got: {err}"
+        );
+    }
+
+    #[test]
     fn it_should_default_the_unfocused_shape_independently_from_the_focused_shape() {
         let cursor = Cursor::default();
         // The default config gives focused and unfocused cursors distinct shapes

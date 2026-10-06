@@ -201,6 +201,11 @@ mod tests {
             "Width of ZWJ (U+200D) should be 0"
         );
         assert_eq!(
+            get_char_display_width('\u{200B}'),
+            0,
+            "Width of ZWSP (U+200B) should be 0"
+        );
+        assert_eq!(
             get_char_display_width('\u{0301}'),
             0,
             "Width of Combining Acute Accent (U+0301) should be 0"
