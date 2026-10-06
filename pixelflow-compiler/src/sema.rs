@@ -351,10 +351,17 @@ const RETIRED_COORDINATES: [&str; 2] = ["Z", "W"];
 /// The projection of the retired axis.
 const RETIRED_PROJECTION: &str = "DZ";
 
-/// Method names that meant something in a tier that is gone. `.at()` warped
-/// a manifold-typed parameter, `.constant()`/`.collapse()` evaluated one to
-/// a field; a kernel composes `Kernel` values instead.
-const RETIRED_METHODS: [&str; 3] = ["at", "constant", "collapse"];
+/// Method names that meant something in a tier that is gone.
+/// `.constant()`/`.collapse()` evaluated a manifold-typed parameter to a
+/// field, and there are no manifold-typed parameters.
+const RETIRED_METHODS: [&str; 2] = ["constant", "collapse"];
+
+/// The contramap: `f.at(x, y)` is the field `f` observed at `(x, y)`
+/// (`ExprArena::warp`). Not an `OpKind` — it builds no node of its own, it
+/// rewrites its receiver — and not a library composition, which takes
+/// `f32`s: its receiver keeps its type, a mask observed elsewhere being
+/// still a mask.
+pub(crate) const AT: &str = "at";
 
 /// The one method that is neither an `OpKind` nor a library composition:
 /// the identity on an arena value.
@@ -1112,9 +1119,13 @@ impl<'a> FnAnalyzer<'a> {
                 format!(
                     "`.{method_name}()` inside a kernel body sampled a manifold-typed \
                      parameter, and there are none\n\
-                     help: compose `Kernel` values instead: `Kernel::at` is the warp"
+                     help: every expression is already a field: use it as it stands, or \
+                     observe it elsewhere with `.at(x, y)`"
                 ),
             ));
+        }
+        if method_name == AT {
+            return self.type_of_at(call);
         }
         // Arena expressions are values, so `.clone()` is the identity.
         if method_name == CLONE && arg_count == 0 {
@@ -1133,6 +1144,51 @@ impl<'a> FnAnalyzer<'a> {
         }
 
         Err(self.unknown_method(call))
+    }
+
+    /// `f.at(x, y)`: the field `f` observed at `(x, y)` — contramap. A field
+    /// is an `f32` or a `bool` and keeps its type; the coordinates are `f32`
+    /// fields of the outer ones.
+    ///
+    /// Every expression is a field over the two axes, a constant one
+    /// included, so every `f32` or `bool` may be observed elsewhere: a
+    /// `let`, a helper's parameter, a fold's body, a whole `if`. What is
+    /// refused is what is not a field: a kernel is observed by applying it,
+    /// and a record is its fields. A count never reaches here — naming one
+    /// where a value is expected is refused as it is named, with the
+    /// `as f32` that makes it a field.
+    fn type_of_at(&mut self, call: &MethodCallExpr) -> syn::Result<Ty> {
+        let [x, y] = call.args.as_slice() else {
+            return Err(syn::Error::new(
+                call.method.span(),
+                format!(
+                    "`.at` observes a field at the two coordinates, `f.at(x, y)`, and {} {} \
+                     supplied",
+                    call.args.len(),
+                    if call.args.len() == 1 { "was" } else { "were" },
+                ),
+            ));
+        };
+        let field = self.type_of(&call.receiver)?;
+        match field {
+            Ty::F32 | Ty::Bool => {}
+            Ty::Usize => unreachable!(
+                "a count is refused where it is named in a value position \
+                 (`a_count_is_not_a_value`), so no receiver types as one"
+            ),
+            Ty::Kernel => {
+                return Err(syn::Error::new(
+                    call.method.span(),
+                    "a kernel is observed by applying it: `k(x, y)` is `k` at `(x, y)`, which \
+                     is what `k.at(x, y)` would mean",
+                ));
+            }
+            Ty::Record(record) => return Err(self.record_is_not_a_value(&call.receiver, record)),
+        }
+        let what = "`.at` observes a field at two `f32` coordinates";
+        self.expect(x, Ty::F32, what)?;
+        self.expect(y, Ty::F32, what)?;
+        Ok(field)
     }
 
     /// The operands of an `OpKind` method against its typing.
@@ -1203,7 +1259,7 @@ impl<'a> FnAnalyzer<'a> {
         // Find similar method for suggestion - collect all known methods
         let all_methods: Vec<&str> = known_method_names()
             .chain(LIBRARY_METHODS.iter().map(|(name, _)| *name))
-            .chain(std::iter::once(CLONE))
+            .chain([CLONE, AT])
             .collect();
 
         let suggestion = all_methods
@@ -2669,17 +2725,77 @@ mod tests {
         assert!(err.contains("no entry emits nothing"), "got: {err}");
     }
 
-    /// A retired method is refused by name, with the way out.
+    /// A retired method is refused by name, with the way out: every
+    /// expression is already a field, and `.at` observes one elsewhere.
     #[test]
     fn a_retired_method_is_refused() {
-        for input in [
-            quote! { || X.at(Y, X) },
-            quote! { || X.constant() },
-            quote! { || X.collapse() },
-        ] {
+        for input in [quote! { || X.constant() }, quote! { || X.collapse() }] {
             let err = refusal(input);
-            assert!(err.contains("Kernel::at"), "got: {err}");
+            assert!(err.contains("`.at(x, y)`"), "got: {err}");
         }
+    }
+
+    // ───────────────────────────── the contramap ─────────────────────────────
+
+    /// `.at` keeps its receiver's type: an `f32` field observed elsewhere is
+    /// an `f32`, and a mask is still a mask — an `if` chooses by it, and an
+    /// arithmetic operand it is not. Any field: a `let`, a helper's
+    /// parameter, an `if`, a fold.
+    #[test]
+    fn at_keeps_its_receivers_type() {
+        accepted(quote! { || { let d = X * X; d.at(X + 1.0, Y) - d } });
+        accepted(quote! { || if (X < Y).at(Y, X) { 1.0 } else { 0.0 } });
+        accepted(quote! { || (if X < Y { X } else { Y }).at(Y, X) });
+        accepted(quote! { || (0..4).map(|i| X + i as f32).sum().at(Y, X) });
+        accepted(quote! {
+            fn east(d: f32, x: f32, y: f32) -> f32 { d.at(x + 1.0, y) }
+            pub fn e() -> f32 { east(X, X, Y) }
+        });
+        let err = refusal(quote! { || (X < Y).at(Y, X) + 1.0 });
+        assert!(
+            err.contains("mismatched types"),
+            "a mask stays a mask, got: {err}"
+        );
+    }
+
+    /// `.at` takes the two coordinates, each an `f32` field.
+    #[test]
+    fn at_takes_two_f32_coordinates() {
+        for input in [quote! { || X.at(Y) }, quote! { || X.at(Y, X, Y) }] {
+            let err = refusal(input);
+            assert!(
+                err.contains("observes a field at the two coordinates"),
+                "got: {err}"
+            );
+        }
+        let err = refusal(quote! { || X.at(X < Y, Y) });
+        assert!(err.contains("two `f32` coordinates"), "got: {err}");
+    }
+
+    /// What is not a field is not observed elsewhere, and each refusal says
+    /// what to write instead: a count becomes a field by `as f32`, a kernel
+    /// is observed by applying it, and a record is its fields.
+    #[test]
+    fn at_refuses_what_is_not_a_field() {
+        let err = refusal(quote! { || (0..4).map(|i| i.at(X, Y)).sum() });
+        assert!(err.contains("`i as f32`"), "a count, got: {err}");
+
+        let err = refusal(quote! {
+            pub fn e(k: impl Fn(f32, f32) -> f32) -> f32 { k.at(X, Y) }
+        });
+        assert!(
+            err.contains("a kernel is observed by applying it"),
+            "a kernel, got: {err}"
+        );
+
+        let err = refusal(quote! {
+            struct P { a: f32 }
+            pub fn e(p: P) -> f32 { p.at(X, Y) }
+        });
+        assert!(
+            err.contains("a record is its fields"),
+            "a record, got: {err}"
+        );
     }
 
     // ─────────────────────── folds and the binder type ───────────────────────

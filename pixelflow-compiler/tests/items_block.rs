@@ -33,7 +33,9 @@ kernel! {
 
     pub fn ring(cx: f32, cy: f32, r: f32) -> f32 { radius2_at(X, Y, cx, cy) - sq(r) }
 
-    /// The same helper over shifted coordinates: today's `.at(X + 1, Y - 1)`.
+    /// The same helper over shifted coordinates: `radius2(cx, cy)` at
+    /// `(X + 1, Y - 1)`. A function is warped by applying it; a field, by
+    /// `.at` (`at_is_contramap.rs`).
     pub fn shifted_radius2(cx: f32, cy: f32) -> f32 { radius2_at(X + 1.0, Y - 1.0, cx, cy) }
 
     pub fn nearest_axis() -> f32 { nearer(X.abs() < Y.abs(), X, Y) }
