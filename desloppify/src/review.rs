@@ -48,18 +48,14 @@ pub async fn review(agent: Arc<Agent>, rules: Arc<Vec<Rule>>, files: &[PathBuf])
         };
         let source =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        for (index, rule) in rules
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.language == language)
-        {
-            for snippet in
-                snippets(rule, &source).with_context(|| format!("parsing {}", path.display()))?
+        for (index, rule) in rules.iter().enumerate() {
+            for snippet in snippets(rule, language, &source)
+                .with_context(|| format!("parsing {}", path.display()))?
             {
                 let (agent, rules, path) = (agent.clone(), rules.clone(), path.clone());
                 calls.spawn(async move {
                     let rule = &rules[index];
-                    let prompt = format!("File: {}\n\n{}", path.display(), snippet.numbered());
+                    let prompt = format!("File: {}\n\n{}", path.display(), snippet.numbered);
                     let preamble = format!("{REVIEWER}\n\n{}", rule.instructions);
                     let replies =
                         async { parse(&agent.ask(rule.level, &preamble, &prompt).await?) }

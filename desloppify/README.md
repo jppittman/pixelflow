@@ -13,13 +13,21 @@ or any snippet that could not be reviewed.
 
 ## Rules — `rules/<id>.json`
 
+```json
+{ "level": 2, "scope": "function_names", "review": "together",
+  "skills": ["rust-idioms"], "prompt": "Flag ..." }
+```
+
 | Field | |
 |---|---|
 | `level` | 1–4: how capable a model the question needs |
-| `language` | `rust` (add a grammar in `src/language.rs` for more) |
-| `query` | optional tree-sitter query; each `@target` capture is one review. Absent → the whole file |
+| `scope` | the rule's input: `"file"`; a named part — `"functions"`, `"function_names"`, `"function_bodies"`, `"types"`, `"comments"` — in every language that has it; or `{"language": "rust", "query": "... @target"}` |
+| `review` | `"each"` (default): one call per captured part. `"together"`: all of a file's parts in one call, for questions about consistency across them |
 | `skills` | optional skill names to put ahead of the prompt |
 | `prompt` | what to flag |
+
+Named parts are per-language tree-sitter queries in `Language::query`
+(`src/language.rs`); a new language adds a grammar and its queries there.
 
 | Level | Anthropic | Gemini |
 |---|---|---|

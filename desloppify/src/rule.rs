@@ -1,20 +1,26 @@
-//! Rules: what to look at, how hard to think about it, and what to ask.
+//! Rules: what code to look at, how hard to think about it, and what to ask.
 //!
 //! A rule is `rules/<id>.json`:
 //!
 //! ```json
 //! {
-//!   "level": 1,
-//!   "language": "rust",
-//!   "query": "(function_item) @target",
+//!   "level": 2,
+//!   "scope": "function_names",
+//!   "review": "together",
 //!   "skills": ["rust-idioms"],
 //!   "prompt": "Flag ..."
 //! }
 //! ```
 //!
-//! `query` is a tree-sitter query whose `@target` captures are reviewed one at
-//! a time; without one, the rule reviews each whole file in its language.
-//! Everything is checked when the rule loads — a bad query or an unknown skill
+//! `scope` is the rule's input: `"file"`, a named part of the code
+//! (`"functions"`, `"function_names"`, `"function_bodies"`, `"types"`,
+//! `"comments"`), or `{"language": "rust", "query": "... @target"}` for
+//! anything else. A named part applies to every language that has it; a query
+//! to its own language. `review` says whether each captured part is reviewed
+//! on its own (`"each"`, the default) or all of a file's are reviewed in one
+//! call (`"together"`) — the way to ask about consistency across them.
+//!
+//! Everything is checked when the rule loads: a bad query or an unknown skill
 //! fails there, not halfway through a review.
 
 use std::path::Path;
@@ -26,34 +32,90 @@ use crate::language::Language;
 use crate::model::ModelLevel;
 use crate::skills::Skills;
 
-/// The capture a rule's query must name: the code each review sees.
+/// The capture a query must name: the code each review sees.
 pub const TARGET_CAPTURE: &str = "target";
+
+/// A part of the code every language may have, found by a per-language query
+/// (`Language::query`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Part {
+    Functions,
+    FunctionNames,
+    FunctionBodies,
+    Types,
+    Comments,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ScopeFile {
+    Named(NamedScope),
+    Query { language: Language, query: String },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NamedScope {
+    File,
+    #[serde(untagged)]
+    Part(Part),
+}
+
+/// How a file's captures are grouped into calls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Review {
+    #[default]
+    Each,
+    Together,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuleFile {
     level: ModelLevel,
-    language: Language,
+    scope: ScopeFile,
     #[serde(default)]
-    query: Option<String>,
+    review: Option<Review>,
     #[serde(default)]
     skills: Vec<String>,
     prompt: String,
 }
 
-pub enum Target {
+pub struct CompiledQuery {
+    pub language: Language,
+    pub query: tree_sitter::Query,
+    pub target: u32,
+}
+
+impl CompiledQuery {
+    fn new(language: Language, source: &str) -> Result<Self> {
+        let query = tree_sitter::Query::new(&language.grammar(), source)?;
+        let Some(target) = query.capture_index_for_name(TARGET_CAPTURE) else {
+            bail!("query has no @{TARGET_CAPTURE} capture");
+        };
+        Ok(Self {
+            language,
+            query,
+            target,
+        })
+    }
+}
+
+pub enum Scope {
     WholeFile,
-    Query {
-        query: tree_sitter::Query,
-        target: u32,
+    /// One query per language the rule applies to.
+    Captures {
+        queries: Vec<CompiledQuery>,
+        review: Review,
     },
 }
 
 pub struct Rule {
     pub id: String,
     pub level: ModelLevel,
-    pub language: Language,
-    pub target: Target,
+    pub scope: Scope,
     /// The skills' text followed by the rule's prompt.
     pub instructions: String,
 }
@@ -68,15 +130,29 @@ impl Rule {
         let text = std::fs::read_to_string(path)?;
         let file: RuleFile = serde_json::from_str(&text)?;
 
-        let target = match file.query {
-            None => Target::WholeFile,
-            Some(source) => {
-                let query = tree_sitter::Query::new(&file.language.grammar(), &source)?;
-                let Some(target) = query.capture_index_for_name(TARGET_CAPTURE) else {
-                    bail!("query has no @{TARGET_CAPTURE} capture");
-                };
-                Target::Query { query, target }
+        let queries = match file.scope {
+            ScopeFile::Named(NamedScope::File) => {
+                if file.review.is_some() {
+                    bail!("`review` needs a scope that captures parts; a file is already one");
+                }
+                None
             }
+            ScopeFile::Named(NamedScope::Part(part)) => Some(
+                Language::ALL
+                    .into_iter()
+                    .filter_map(|l| l.query(part).map(|q| CompiledQuery::new(l, q)))
+                    .collect::<Result<Vec<_>>>()?,
+            ),
+            ScopeFile::Query { language, query } => {
+                Some(vec![CompiledQuery::new(language, &query)?])
+            }
+        };
+        let scope = match queries {
+            None => Scope::WholeFile,
+            Some(queries) => Scope::Captures {
+                queries,
+                review: file.review.unwrap_or_default(),
+            },
         };
 
         let mut instructions = String::new();
@@ -92,8 +168,7 @@ impl Rule {
         Ok(Self {
             id,
             level: file.level,
-            language: file.language,
-            target,
+            scope,
             instructions,
         })
     }

@@ -1,6 +1,8 @@
 {
   "level": 1,
-  "language": "rust",
-  "query": "(function_item parameters: (parameters (parameter type: (primitive_type) @type (#eq? @type \"bool\")))) @target",
+  "scope": {
+    "language": "rust",
+    "query": "(function_item parameters: (parameters (parameter type: (primitive_type) @type (#eq? @type \"bool\")))) @target"
+  },
   "prompt": "Flag a `bool` parameter that selects between two behaviors. Suggest an enum or two functions. Do not flag a `bool` that is data (a field value being set, a flag being stored)."
 }

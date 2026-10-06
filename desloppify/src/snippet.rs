@@ -2,54 +2,82 @@
 
 use streaming_iterator::StreamingIterator;
 
-use crate::rule::{Rule, Target};
+use crate::language::Language;
+use crate::rule::{CompiledQuery, Review, Rule, Scope};
+
+/// Between captures reviewed together.
+const GAP: &str = "  ...\n";
 
 pub struct Snippet {
     /// 1-based line of the snippet's first line in its file.
     pub first_line: u64,
-    pub text: String,
+    /// The code, each line prefixed by its line number in the file so the
+    /// model can point at lines.
+    pub numbered: String,
 }
 
 impl Snippet {
-    /// The snippet with each line prefixed by its line number in the file, so
-    /// the model can point at lines.
-    #[must_use]
-    pub fn numbered(&self) -> String {
-        (self.first_line..)
-            .zip(self.text.lines())
+    fn new(first_line: u64, text: &str) -> Self {
+        let numbered = (first_line..)
+            .zip(text.lines())
             .map(|(n, line)| format!("{n:>5} | {line}\n"))
-            .collect()
+            .collect();
+        Self {
+            first_line,
+            numbered,
+        }
+    }
+
+    fn join(parts: Vec<Self>) -> Option<Self> {
+        let first_line = parts.first()?.first_line;
+        let numbered = parts
+            .into_iter()
+            .map(|p| p.numbered)
+            .collect::<Vec<_>>()
+            .join(GAP);
+        Some(Self {
+            first_line,
+            numbered,
+        })
     }
 }
 
-/// The snippets `rule` reviews in `source`.
-pub fn snippets(rule: &Rule, source: &str) -> anyhow::Result<Vec<Snippet>> {
-    let Target::Query { query, target } = &rule.target else {
-        return Ok(vec![Snippet {
-            first_line: 1,
-            text: source.to_owned(),
-        }]);
+/// The snippets `rule` reviews in `source`, a file in `language`. Empty when
+/// the rule does not apply to the language.
+pub fn snippets(rule: &Rule, language: Language, source: &str) -> anyhow::Result<Vec<Snippet>> {
+    let Scope::Captures { queries, review } = &rule.scope else {
+        return Ok(vec![Snippet::new(1, source)]);
     };
+    let Some(query) = queries.iter().find(|q| q.language == language) else {
+        return Ok(Vec::new());
+    };
+    let captures = captures(query, source)?;
+    Ok(match review {
+        Review::Each => captures,
+        Review::Together => Snippet::join(captures).into_iter().collect(),
+    })
+}
 
+fn captures(query: &CompiledQuery, source: &str) -> anyhow::Result<Vec<Snippet>> {
     let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&rule.language.grammar())?;
+    parser.set_language(&query.language.grammar())?;
     let tree = parser
         .parse(source, None)
         .ok_or_else(|| anyhow::anyhow!("tree-sitter gave no tree"))?;
 
     let mut cursor = tree_sitter::QueryCursor::new();
-    let mut captures = cursor.captures(query, tree.root_node(), source.as_bytes());
+    let mut matches = cursor.captures(&query.query, tree.root_node(), source.as_bytes());
     let mut snippets = Vec::new();
-    while let Some((m, index)) = captures.next() {
+    while let Some((m, index)) = matches.next() {
         let capture = m.captures()[*index];
-        if capture.index != *target {
+        if capture.index != query.target {
             continue;
         }
         let node = capture.node;
-        snippets.push(Snippet {
-            first_line: node.start_position().row as u64 + 1,
-            text: source[node.start_byte()..node.end_byte()].to_owned(),
-        });
+        snippets.push(Snippet::new(
+            node.start_position().row as u64 + 1,
+            &source[node.byte_range()],
+        ));
     }
     Ok(snippets)
 }
