@@ -21,15 +21,15 @@ struct Args {
     paths: Vec<PathBuf>,
     #[arg(long, value_enum, default_value_t = Provider::Anthropic)]
     provider: Provider,
-    /// Retries that may happen back to back.
+    /// Calls that may go out back to back.
     #[arg(long, default_value_t = 10)]
-    retry_burst: u64,
-    /// Seconds to earn back one retry.
-    #[arg(long, default_value_t = 6)]
-    retry_refill_secs: u64,
-    /// Give up on a call rather than wait longer than this for a retry.
-    #[arg(long, default_value_t = 120)]
-    retry_max_wait_secs: u64,
+    burst: u64,
+    /// Milliseconds to earn back one call.
+    #[arg(long, default_value_t = 1200)]
+    refill_ms: u64,
+    /// Give up on a call rather than wait longer than this for it.
+    #[arg(long, default_value_t = 300)]
+    max_wait_secs: u64,
     #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/rules"))]
     rules: PathBuf,
     #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/skills"))]
@@ -42,9 +42,9 @@ async fn main() -> Result<ExitCode> {
     let skills = Skills::load(&args.skills)?;
     let rules = Arc::new(Rule::load_dir(&args.rules, &skills)?);
     let limiter = TokenBucket::new(
-        args.retry_burst,
-        Duration::from_secs(args.retry_refill_secs),
-        Duration::from_secs(args.retry_max_wait_secs),
+        args.burst,
+        Duration::from_millis(args.refill_ms),
+        Duration::from_secs(args.max_wait_secs),
     );
     let agent = Arc::new(Agent::from_env(args.provider, Box::new(limiter))?);
 

@@ -30,18 +30,19 @@ or any snippet that could not be reviewed.
 
 The ladder is `Provider::model` in `src/model.rs`.
 
-## Retries — `src/rate_limit.rs`
+## Rate limiting — `src/rate_limit.rs`
 
 ```rust
 pub trait RateLimiter: Send + Sync {
-    fn on_error(&self, error: &(dyn Error + Send + Sync + 'static)) -> Option<Duration>;
+    fn wait(&self, last: Option<BoxError>) -> Result<Duration, BoxError>;
 }
 ```
 
-After a failed call: `Some(wait)` retries after `wait`, `None` gives up and
-reports the error. `TokenBucket` is the one impl: each retry takes a token
-(`--retry-burst`, refilled one per `--retry-refill-secs`), and a retry that
-would wait past `--retry-max-wait-secs` gives up.
+Asked before every call: `None` before a first attempt, `Some(error)` before
+retrying a failure. `Ok(wait)` sleeps then calls; `Err` gives up. Errors that
+can't succeed on retry (401, malformed request) never reach it.
+`TokenBucket` takes a token per call (`--burst`, one more per `--refill-ms`)
+and refuses a call that would wait past `--max-wait-secs`.
 
 ## Skills — `skills/<name>/SKILL.md`
 

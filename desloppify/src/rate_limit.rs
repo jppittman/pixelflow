@@ -1,20 +1,23 @@
-//! Retry budgets: after a failed call, whether to retry it and when.
+//! Pacing calls to a provider: before each call, how long to wait.
 
 use std::error::Error;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
+
 pub trait RateLimiter: Send + Sync {
-    /// A call just failed with `error`. How long to wait before retrying it,
-    /// or `None` to give up and report the error.
-    fn on_error(&self, error: &(dyn Error + Send + Sync + 'static)) -> Option<Duration>;
+    /// How long to wait before the next call. `last` is `None` before a first
+    /// attempt and the failure being retried otherwise. `Err` refuses the
+    /// call, handing back `last` (or an error of its own if there was none).
+    fn wait(&self, last: Option<BoxError>) -> Result<Duration, BoxError>;
 }
 
-/// Every retry takes a token. The bucket holds at most `capacity` and gains
-/// one every `refill`; a retry with no token waits for the next one, unless
-/// that wait exceeds `max_wait`, in which case it gives up.
+/// Every call takes a token. The bucket holds at most `capacity` and gains
+/// one every `refill`; a call with no token waits for the next one, unless
+/// that wait exceeds `max_wait`, in which case it is refused.
 ///
-/// It does not look at the error: a failure is a failure.
+/// It does not look at the error: a retry is a call like any other.
 pub struct TokenBucket {
     capacity: u64,
     refill: Duration,
@@ -23,10 +26,14 @@ pub struct TokenBucket {
 }
 
 struct Bucket {
-    /// Negative while retries are queued waiting for tokens.
+    /// Negative while calls are queued waiting for tokens.
     tokens: f64,
     updated: Instant,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("rate limit: no token within {0:?}")]
+pub struct Exhausted(Duration);
 
 impl TokenBucket {
     /// A full bucket.
@@ -46,7 +53,7 @@ impl TokenBucket {
 }
 
 impl RateLimiter for TokenBucket {
-    fn on_error(&self, _error: &(dyn Error + Send + Sync + 'static)) -> Option<Duration> {
+    fn wait(&self, last: Option<BoxError>) -> Result<Duration, BoxError> {
         // The bucket is plain numbers, valid after any panic mid-update.
         let mut bucket = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
@@ -57,10 +64,10 @@ impl RateLimiter for TokenBucket {
         let shortfall = (1.0 - bucket.tokens).max(0.0);
         let wait = self.refill.mul_f64(shortfall);
         if wait > self.max_wait {
-            return None;
+            return Err(last.unwrap_or_else(|| Box::new(Exhausted(self.max_wait))));
         }
         bucket.tokens -= 1.0;
-        Some(wait)
+        Ok(wait)
     }
 }
 
@@ -70,31 +77,31 @@ mod tests {
 
     const HOUR: Duration = Duration::from_secs(3600);
 
-    fn failure() -> std::io::Error {
-        std::io::Error::other("429")
+    fn failure() -> Option<BoxError> {
+        Some(Box::new(std::io::Error::other("429")))
     }
 
     #[test]
-    fn full_bucket_retries_at_once_until_empty() {
+    fn full_bucket_lets_calls_through_until_empty() {
         let bucket = TokenBucket::new(2, HOUR, Duration::ZERO);
-        assert_eq!(bucket.on_error(&failure()), Some(Duration::ZERO));
-        assert_eq!(bucket.on_error(&failure()), Some(Duration::ZERO));
-        assert_eq!(bucket.on_error(&failure()), None);
+        assert_eq!(bucket.wait(None).unwrap(), Duration::ZERO);
+        assert_eq!(bucket.wait(failure()).unwrap(), Duration::ZERO);
+        assert!(bucket.wait(None).is_err());
     }
 
     #[test]
     fn empty_bucket_waits_for_the_next_token_and_queues_behind_it() {
         let bucket = TokenBucket::new(0, HOUR, 3 * HOUR);
-        let first = bucket.on_error(&failure()).unwrap();
-        let second = bucket.on_error(&failure()).unwrap();
+        let first = bucket.wait(None).unwrap();
+        let second = bucket.wait(None).unwrap();
         assert!(first <= HOUR && first > HOUR - Duration::from_secs(1));
         assert!(second > first + HOUR - Duration::from_secs(1));
     }
 
     #[test]
-    fn retry_past_max_wait_gives_up_without_taking_a_token() {
+    fn refusal_hands_back_the_error_it_was_given() {
         let bucket = TokenBucket::new(0, HOUR, Duration::from_secs(1));
-        assert_eq!(bucket.on_error(&failure()), None);
-        assert_eq!(bucket.on_error(&failure()), None);
+        assert_eq!(bucket.wait(failure()).unwrap_err().to_string(), "429");
+        assert!(bucket.wait(None).unwrap_err().is::<Exhausted>());
     }
 }
