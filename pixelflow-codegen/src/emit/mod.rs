@@ -29,8 +29,10 @@
 //!
 //! ## Spilling
 //!
-//! Values the scratch pool cannot hold go to stack slots, laid out by
-//! [`FrameLayout`] at the backend's vector stride:
+//! Values the scratch pool cannot hold go to stack slots. The allocator lays
+//! the whole frame out beside its placements, at the backend's vector stride
+//! ([`regalloc::NestAllocation`]), and the emitter reads every address from
+//! it (`regalloc::Allocation::slot_of`) and computes none:
 //! - A value with a slot is stored to it right after its **definition**, which
 //!   every path that reads the value has run — including through an `If`
 //!   guard, which can only skip a definition by skipping every read of it.
@@ -680,174 +682,6 @@ impl SourceOperand for Binding {
     }
 }
 
-/// Stack addresses for one scope of an allocation.
-///
-/// [`regalloc::Where`] says *that* a value spills; this says *where*. The
-/// two are separate decisions, and this is the arrow between them: it consumes
-/// one scope's [`Allocation`](regalloc::Allocation) and produces the [`Binding`]
-/// the emitter encodes for every value in it.
-///
-/// Slots are laid out at the backend's own vector stride, so every offset
-/// downstream is a real displacement. The stride was once a universal 16 that
-/// each wider backend divided back out at its every load, store and prologue —
-/// a convention that held only so long as nothing handed this a non-multiple
-/// of 16, and would have aliased two live values onto one slot the moment
-/// something did.
-///
-/// Per scope, not per nest. A value parked by an enclosing region lives in a
-/// **hoist slot**, which outlives every region's frame and is addressed by the
-/// collapse driver rather than laid out here — so this skips those, and the
-/// driver pins them afterwards. Unifying the two is the next piece of work; it
-/// is not this one.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FrameLayout {
-    /// Dense by `ValueId.0`: where each value lives when this scope first
-    /// reaches it — at its definition for the values this scope computes.
-    /// Total over the scope's schedule; the emitter carries it forward from
-    /// here as the placement's later ranges take effect.
-    locs: alloc::vec::Vec<Option<Binding>>,
-    /// Dense by `ValueId.0`: the address of the value's slot, for every value
-    /// this scope ever spills.
-    ///
-    /// Separate from `locs` because a placement is a schedule: a value can
-    /// hold a register for part of this scope and its slot for the rest, so
-    /// *that* it needs an address is a property of its whole life here, not of
-    /// the one point its definition sits at.
-    slot: alloc::vec::Vec<Option<Slot>>,
-    /// Total frame size in bytes, a whole number of slots.
-    pub frame_size: u32,
-    /// How many values this frame gives a slot to.
-    pub slots: u32,
-}
-
-impl FrameLayout {
-    /// Give every spilled value in this scope a stack address, from `base` up.
-    ///
-    /// Pure: (scope allocation, slot stride, base) → layout. The collapse
-    /// driver runs this twice for one region and relies on both runs agreeing.
-    ///
-    /// `base` is what keeps a nested scope off its parent's slots — see
-    /// [`StackFrame::with_base`]. [`Self::frame_size`] is the resulting total
-    /// extent, base included, so a parent's frame size is exactly the base to
-    /// hand whatever runs inside it.
-    pub fn resolve(
-        allocation: regalloc::Allocation<'_>,
-        vector_bytes: u32,
-        base: u32,
-    ) -> Result<Self, CompileError> {
-        let schedule = allocation.schedule();
-        let len = schedule
-            .iter()
-            .map(|def| def.value.0 as usize + 1)
-            .max()
-            .unwrap_or(0);
-        let mut locs: alloc::vec::Vec<Option<Binding>> = alloc::vec![None; len];
-
-        let mut frame = StackFrame::with_base(vector_bytes, base);
-        let mut slot: alloc::vec::Vec<Option<Slot>> = alloc::vec![None; len];
-        let mut slots = 0u32;
-        for (i, def) in schedule.iter().enumerate() {
-            // A value an enclosing region parked is read here from its hoist
-            // slot, which is not this frame's to place. Its entry in this
-            // schedule is a placeholder that emits nothing.
-            if allocation.parked_by_an_enclosing_scope(def.value) {
-                continue;
-            }
-            let v = def.value;
-            // A slot is owed for the whole of this scope if the value is in
-            // one at *any* point of it — not only at the point it is defined,
-            // which is where a value that keeps its register for a while and
-            // then loses it would have been missed.
-            let spills_here = allocation.where_at(v, i) == regalloc::Where::Spilled
-                || allocation
-                    .transitions(v)
-                    .any(|(_, at)| at == regalloc::Where::Spilled);
-            if spills_here {
-                let s = frame.alloc_slot()?;
-                slot[v.0 as usize] = Some(s);
-                slots += 1;
-            }
-            locs[v.0 as usize] = Some(match allocation.where_at(v, i) {
-                regalloc::Where::Reg(r) => Binding::from(Reg(r.0)),
-                regalloc::Where::Ptr(p) => Binding::Loc(Loc::Ptr(p)),
-                regalloc::Where::Remat(bits) => Binding::Remat(bits),
-                regalloc::Where::Spilled => Binding::from(
-                    slot[v.0 as usize].unwrap_or_else(|| unreachable!("just given a slot")),
-                ),
-            });
-        }
-
-        Ok(Self {
-            locs,
-            slot,
-            frame_size: frame.frame_size(),
-            slots,
-        })
-    }
-
-    /// Where `v` lives when the allocator says `at`.
-    ///
-    /// The arrow this type *is*: [`regalloc::Where`] says a value is in a slot,
-    /// and this says which one. Total for every value with an address —
-    /// `resolve` gave one to each value that spills anywhere in this scope,
-    /// and the driver pins a hoist slot for each value an enclosing scope
-    /// parked.
-    ///
-    /// # Panics
-    /// If `at` is `Spilled` and `v` has no slot in this frame.
-    #[must_use]
-    pub fn binding(&self, v: regalloc::ValueId, at: regalloc::Where) -> Binding {
-        match at {
-            regalloc::Where::Reg(r) => Binding::from(Reg(r.0)),
-            regalloc::Where::Ptr(p) => Binding::Loc(Loc::Ptr(p)),
-            regalloc::Where::Remat(bits) => Binding::Remat(bits),
-            regalloc::Where::Spilled => Binding::from(self.slot_of(v).unwrap_or_else(|| {
-                panic!("{v:?} is spilled somewhere in this scope but has no slot")
-            })),
-        }
-    }
-
-    /// The slot of `v`, if it has one here.
-    #[must_use]
-    pub fn slot_of(&self, v: regalloc::ValueId) -> Option<Slot> {
-        self.slot.get(v.0 as usize).copied().flatten()
-    }
-
-    /// Where `v` lives.
-    ///
-    /// # Panics
-    /// If `v` is not in the allocation this was resolved from.
-    #[must_use]
-    pub fn of(&self, v: regalloc::ValueId) -> Binding {
-        self.locs
-            .get(v.0 as usize)
-            .copied()
-            .flatten()
-            .unwrap_or_else(|| panic!("{v:?} has no binding in this frame"))
-    }
-
-    /// Every value's binding, dense by `ValueId.0`, for the hot emit loop.
-    #[must_use]
-    pub fn bindings(&self) -> &[Option<Binding>] {
-        &self.locs
-    }
-
-    /// Give `v` a slot this frame did not lay out.
-    ///
-    /// The collapse-loop LICM parks a hoisted value in a slot the enclosing
-    /// prologue wrote, which outlives every region's frame — so a scope inside
-    /// reads and writes *that* address rather than one of its own. Only the
-    /// address is pinned: where the value is at each point remains the
-    /// placement's answer.
-    pub fn pin_slot(&mut self, v: regalloc::ValueId, slot: Slot) {
-        let idx = v.0 as usize;
-        if idx >= self.slot.len() {
-            self.slot.resize(idx + 1, None);
-        }
-        self.slot[idx] = Some(slot);
-    }
-}
-
 /// One unary instruction as a backend's `emit_unary` takes it: the op, its
 /// two registers, and the allocator's temp for the instruction, which the ops
 /// that build a mask or a correction term write and the rest ignore.
@@ -1185,10 +1019,6 @@ trait IsaBackend {
     /// Per-compile setup before any code is emitted (e.g. seed a constant pool).
     fn begin(&mut self, schedule: &[regalloc::Def]) -> Result<(), CompileError>;
 
-    /// Called once the frame layout is known, BEFORE any body instruction is
-    /// emitted.
-    fn frame_ready(&mut self, _frame_size: u32) {}
-
     /// Emit one resolved instruction (with its reloads/store).
     fn emit_plan(&mut self, code: &mut Vec<u8>, plan: &InstructionPlan)
     -> Result<(), CompileError>;
@@ -1260,7 +1090,7 @@ trait IsaBackend {
     /// and the label that names it.
     fn finish(&mut self, asm: &mut Assembly);
 
-    /// Save / restore a value in a slot outside any scope's own spill frame:
+    /// Save / restore a value in a slot outside any scope's own spill slots:
     /// a fold's binder or accumulator, a root parked for the scopes inside.
     fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32);
     fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32);
@@ -1407,7 +1237,9 @@ fn allocate_flat(
     file: &regalloc::RegisterFile,
 ) -> regalloc::NestAllocation {
     use regalloc::RegisterAllocator;
-    regalloc::LinearScan.allocate_nest(flat_nest(schedule), file)
+    regalloc::LinearScan
+        .allocate_nest(flat_nest(schedule), file)
+        .expect("a test nest fits the frame")
 }
 
 /// What a test that lowers a kernel allocates: the schedule is scoped by the
@@ -1418,7 +1250,9 @@ fn allocate_nest(
     file: &regalloc::RegisterFile,
 ) -> regalloc::NestAllocation {
     use regalloc::RegisterAllocator;
-    regalloc::LinearScan.allocate_nest(regalloc::ScopedSchedule::from_schedule(schedule), file)
+    regalloc::LinearScan
+        .allocate_nest(regalloc::ScopedSchedule::from_schedule(schedule), file)
+        .expect("a test nest fits the frame")
 }
 
 /// [`compile_via_backend`] on a lowered schedule: what a test that compiles
@@ -1434,159 +1268,86 @@ fn compile_schedule<B: IsaBackend>(
 /// Allocate a straight-line schedule and emit it as one scope's body.
 ///
 /// Production compiles allocate the whole nest at once
-/// ([`regalloc::RegisterAllocator::allocate_nest`]) so every scope's frame
-/// is known before any of them is emitted; this is the one-scope
+/// ([`regalloc::RegisterAllocator::allocate_nest`]) so every scope's
+/// addresses are known before any of them is emitted; this is the one-scope
 /// convenience the emitter's own tests are written against.
 #[cfg(test)]
 fn emit_dag_body<B: IsaBackend>(
     schedule: Vec<regalloc::Def>,
     backend: &mut B,
-) -> Result<(Vec<u8>, Reg, u32, u32), CompileError> {
+) -> Result<(Vec<u8>, Reg), CompileError> {
     let nest = allocate_flat(schedule, &backend.register_file());
-    let (code, result, frame, spills) = emit_scope(
-        nest.body(),
-        backend,
-        &alloc::collections::BTreeMap::new(),
-        FramePlan {
-            override_size: None,
-            fold_slots: &alloc::collections::BTreeMap::new(),
-            binder_slots: &alloc::collections::BTreeMap::new(),
-            slot_base: 0,
-        },
-    )?;
-    Ok((
-        code,
-        result.expect("a value-rooted schedule has a result"),
-        frame,
-        spills,
-    ))
+    let (code, result) = emit_scope(nest.body(), backend)?;
+    Ok((code, result.expect("a value-rooted schedule has a result")))
 }
 
-/// Where one scope's memory is, as its driver decided it — the answers
-/// [`emit_scope`] cannot work out for itself because they are all facts
-/// about the *nest*, not about the scope.
-#[derive(Clone, Copy)]
-struct FramePlan<'a> {
-    /// Frame size to latch instead of this scope's own. The driver hands
-    /// every scope the same `m` so they all address the shared park slots
-    /// consistently. `None` for a scope that is the whole function.
-    override_size: Option<u32>,
-    /// Each surviving fold's accumulator slot, by its `Reduce`'s own
-    /// `ValueId`: a slot outside any single scope's frame, because the scope
-    /// that opens the loop and the loop itself both address it. Empty
-    /// wherever nothing here can open a fold.
-    fold_slots: &'a alloc::collections::BTreeMap<regalloc::ValueId, u32>,
-    /// Each surviving fold's binder slot, by the same `Reduce` `ValueId`: the
-    /// loop seeds and steps the binder there when the allocator did not carry
-    /// it, and a scope inside reads it there through the binder's `Var`. Keyed
-    /// by the fold rather than by that `Var` because sibling folds binding
-    /// the same slot share one `Var` node — which loop's counter it names is
-    /// a fact about the scope reading it, found by walking that scope's
-    /// enclosing folds.
-    binder_slots: &'a alloc::collections::BTreeMap<regalloc::ValueId, u32>,
-    /// Where this scope's own spill slots start. Zero for the body, which
-    /// has the frame to itself. A fold's body is the case that is not that:
-    /// it runs nested inside its parent's schedule, with the parent's
-    /// spilled values still live across it, so it is based at the parent's
-    /// `layout.frame_size` and the two cannot alias.
-    slot_base: u32,
+/// Where `v` lives when the allocator says `at`: the arrow from a
+/// [`regalloc::Where`] to the [`Binding`] the emitter encodes. The allocator
+/// says a value is in a slot, and its frame says which one
+/// ([`regalloc::Allocation::slot_of`]) — total for every value with an
+/// address, which is every value spilled anywhere in the scope.
+///
+/// # Panics
+/// If `at` is `Spilled` and `v` has no slot in this scope.
+fn binding(
+    allocation: regalloc::Allocation<'_>,
+    v: regalloc::ValueId,
+    at: regalloc::Where,
+) -> Binding {
+    match at {
+        regalloc::Where::Reg(r) => Binding::from(Reg(r.0)),
+        regalloc::Where::Ptr(p) => Binding::Loc(Loc::Ptr(p)),
+        regalloc::Where::Remat(bits) => Binding::Remat(bits),
+        regalloc::Where::Spilled => {
+            Binding::from(allocation.slot_of(v).unwrap_or_else(|| {
+                panic!("{v:?} is spilled somewhere in this scope but has no slot")
+            }))
+        }
+    }
 }
 
 /// Emit one scope from a finished allocation.
 ///
-/// `parks` is where every root of the nest is parked, by its `ValueId`: the
-/// slot the scope computing it writes after the def, and the scopes inside
-/// read it from — unless the allocator carried it into them in a register,
-/// which their placement says. Which roots this scope *reads* (an ancestor
-/// computed them: its entries for them are placeholders that emit nothing)
-/// and which it *computes* (its own `roots`) are the allocation's answers,
-/// so one map serves every scope.
+/// Every address is the allocation's: where each root of the nest is parked
+/// ([`regalloc::Allocation::park`]) — the slot the scope computing it writes
+/// after the def, and the scopes inside read it from unless the allocator
+/// carried it into them in a register, which their placement says. Which
+/// roots this scope *reads* (an ancestor computed them: its entries for them
+/// are placeholders that emit nothing) and which it *computes* (its own
+/// `roots`) are the allocation's answers too.
 ///
-/// `fold_slots` is the same idea for a surviving `Reduce`'s accumulator,
-/// addressed by its own `ValueId`, at a slot that outlives both this scope's
-/// frame and the fold's own (see `ScheduledOp::Reduce`'s arm below, and
+/// A surviving `Reduce`'s accumulator is the same idea, addressed by its own
+/// `ValueId` ([`regalloc::Allocation::accumulator_slot`]), at a slot that
+/// outlives both this scope's slots and the fold's own (see
+/// `ScheduledOp::Reduce`'s arm below, and
 /// docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md's "the design
-/// decision that makes this tractable"); `binder_slots` likewise for its
-/// binder.
+/// decision that makes this tractable");
+/// [`regalloc::Allocation::binder_slot`] likewise for its binder.
 ///
-/// Returns the code, the register the scope's result is in — `None` when
+/// Returns the code and the register the scope's result is in — `None` when
 /// the root is an effect and not a value: a `Write`, a `Seq`, a fold over
-/// the unit monoid — the frame size latched, and how many values spilled.
+/// the unit monoid.
 fn emit_scope<B: IsaBackend>(
     allocation: regalloc::Allocation<'_>,
     backend: &mut B,
-    parks: &alloc::collections::BTreeMap<regalloc::ValueId, u32>,
-    frame: FramePlan<'_>,
-) -> Result<(Vec<u8>, Option<Reg>, u32, u32), CompileError> {
-    let FramePlan {
-        override_size: frame_override,
-        fold_slots,
-        binder_slots,
-        slot_base,
-    } = frame;
+) -> Result<(Vec<u8>, Option<Reg>), CompileError> {
     let file = backend.register_file();
     backend.scope_begin();
     // Allocation happened before this call — once per scope, over the whole
-    // nest. The allocator chooses the evaluation order, so everything here —
-    // guard ranges, program points, the emit loop itself — reads the schedule
-    // it handed back rather than the one it was given.
+    // nest, its frame included. The allocator chooses the evaluation order,
+    // so everything here — guard ranges, program points, the emit loop
+    // itself — reads the schedule it handed back rather than the one it was
+    // given.
     let schedule = allocation.schedule();
-    let mut layout = FrameLayout::resolve(allocation, file.vector_bytes, slot_base)?;
-    let real_spill_count = layout.slots;
-    // This scope's top is exactly the base for anything nested inside it.
-    let nested_slot_base = layout.frame_size;
 
-    // The roots this scope reads from an enclosing scope's park, and the
-    // ones it parks for the scopes inside. A value an enclosing scope parked
-    // has no address in this frame — its slot is the park, which outlives
-    // every scope's frame. Only the address is pinned: whether the value is
-    // in that slot or in a register, at each point, is the placement's
-    // answer.
-    let preloaded: alloc::collections::BTreeMap<regalloc::ValueId, u32> = schedule
-        .iter()
-        .map(|def| def.value)
-        .filter(|v| allocation.parked_by_an_enclosing_scope(*v))
-        .map(|v| {
-            let slot = *parks
-                .get(&v)
-                .unwrap_or_else(|| panic!("{v:?} is parked by an enclosing scope but has no slot"));
-            (v, slot)
-        })
-        .collect();
-    let parked: alloc::collections::BTreeMap<regalloc::ValueId, u32> = allocation
-        .roots()
-        .iter()
-        .map(|v| {
-            let slot = *parks
-                .get(v)
-                .unwrap_or_else(|| panic!("{v:?} is a root of this scope but has no slot"));
-            (*v, slot)
-        })
-        .collect();
-    for (vid, &offset) in &preloaded {
-        layout.pin_slot(*vid, Slot::new(offset, file.vector_bytes));
-    }
-    // A surviving fold's roots, the same idea in the other direction. Its
-    // `Reduce` def is a genuine computation *in* this scope (scanned, never a
-    // placeholder), but its slot is the driver's dedicated fold slot, not
-    // whatever offset this scope's own `FrameLayout::resolve` gave it
-    // (`ScheduledOp::Reduce`'s scan-time `Where::Spilled` earns it one
-    // regardless, thrown away here). Harmless to pin one this scope never
-    // reaches — `pin_slot` on a `ValueId` nothing here reads is simply never
-    // read back.
-    let mut fold_pins: alloc::vec::Vec<(regalloc::ValueId, u32)> = fold_slots
-        .iter()
-        .map(|(vid, &offset)| (*vid, offset))
-        .collect();
     // The binders of this scope's own fold and every enclosing fold, each
     // where that loop keeps it — innermost first, so a binder shadowing an
     // enclosing one is the nearer loop's. A `Write` reads its row and column
     // from here, and a binder's `Var` (found here by the binder's number —
     // sibling folds binding the same slot share one `Var` node, so which
     // counter it names is this scope's question) is a placeholder whose def
-    // emits nothing: the loop seeded it. Only one the allocator did not
-    // carry has a slot to pin; pinning a carried one would earn the register
-    // a store nothing reads.
+    // emits nothing: the loop seeded it, and the allocator's table already
+    // names the slot it reads it from when that loop did not carry it.
     let mut enclosing: alloc::vec::Vec<(Binder, Binding)> = alloc::vec::Vec::new();
     let mut binder_placeholders: alloc::vec::Vec<regalloc::ValueId> = alloc::vec::Vec::new();
     let mut opened = allocation;
@@ -1600,15 +1361,10 @@ fn emit_scope<B: IsaBackend>(
         let at_binder = match opened.fold_roots().binder {
             regalloc::Where::Reg(r) => Binding::from(r),
             regalloc::Where::Ptr(_) => unreachable!("a fold's binder is a vector"),
-            regalloc::Where::Spilled | regalloc::Where::Remat(_) => {
-                let offset = *binder_slots.get(&def.value).unwrap_or_else(|| {
-                    panic!(
-                        "{:?}'s fold has no binder slot — the driver did not assign one",
-                        def.value
-                    )
-                });
-                Binding::from(Slot::new(offset, file.vector_bytes))
-            }
+            regalloc::Where::Spilled | regalloc::Where::Remat(_) => Binding::from(Slot::new(
+                allocation.binder_slot(def.value),
+                file.vector_bytes,
+            )),
         };
         if !enclosing.iter().any(|(b, _)| *b == binder) {
             enclosing.push((binder, at_binder));
@@ -1620,14 +1376,8 @@ fn emit_scope<B: IsaBackend>(
             && !binder_placeholders.contains(&bv)
         {
             binder_placeholders.push(bv);
-            if let Binding::Loc(Loc::Slot(slot)) = at_binder {
-                fold_pins.push((bv, slot.offset()));
-            }
         }
         opened = parent;
-    }
-    for &(vid, offset) in &fold_pins {
-        layout.pin_slot(vid, Slot::new(offset, file.vector_bytes));
     }
     let binder_at = |binder: Binder| -> Binding {
         enclosing
@@ -1641,14 +1391,6 @@ fn emit_scope<B: IsaBackend>(
                 )
             })
     };
-
-    let frame_size = frame_override.unwrap_or(layout.frame_size);
-    if frame_size < layout.frame_size {
-        return Err(CompileError::Internal(
-            "frame override smaller than the layout's frame",
-        ));
-    }
-    backend.frame_ready(frame_size);
 
     // If short-circuit guards, read off the allocation rather than
     // recomputed: `schedule` above is `allocation.schedule()` verbatim, and
@@ -1709,23 +1451,28 @@ fn emit_scope<B: IsaBackend>(
     // this is that schedule played out. Each range of each value's life
     // becomes one write here at the point it starts — O(total ranges), not a
     // lookup per operand per instruction.
-    let mut locs: alloc::vec::Vec<Option<Binding>> = layout.bindings().to_vec();
-    // A surviving fold's root in its slot — an accumulator, or a binder the
-    // allocator did not carry — is read back from its dedicated slot rather
-    // than wherever this scope's own `FrameLayout::resolve` happened to put
-    // it. `resolve` gave it a real address (its scan-time `Where::Spilled`
-    // earns one like any other spilled value), but a throwaway one — a
-    // `Reduce` def's own emission never goes through the ordinary
-    // operand/destination machinery this table serves everyone else, and a
-    // binder's placeholder emits nothing, so nothing but this override ever
-    // reads or writes it. Only for a value this scope has: a pin this scope
-    // never reaches has no entry here to override.
-    for &(vid, offset) in &fold_pins {
-        if let Some(entry) = locs.get_mut(vid.0 as usize)
-            && entry.is_some()
-        {
-            *entry = Some(Binding::from(Slot::new(offset, file.vector_bytes)));
+    //
+    // Seeded with where each value is when this scope first reaches it — at
+    // its definition, for the values this scope computes. A value an
+    // enclosing scope parked is left out: it is live-in, and the head
+    // reconciliation below is what brings it to where this scope expects it.
+    // A surviving fold's root in memory — an accumulator, or a binder the
+    // allocator did not carry — reads as its dedicated fold slot here, which
+    // is where the allocator's table puts it; a `Reduce` def's own emission
+    // never goes through the ordinary operand/destination machinery this
+    // table serves everyone else, and a binder's placeholder emits nothing.
+    let len = schedule
+        .iter()
+        .map(|def| def.value.0 as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut locs: alloc::vec::Vec<Option<Binding>> = alloc::vec![None; len];
+    for (i, def) in schedule.iter().enumerate() {
+        let v = def.value;
+        if allocation.parked_by_an_enclosing_scope(v) {
+            continue;
         }
+        locs[v.0 as usize] = Some(binding(allocation, v, allocation.where_at(v, i)));
     }
     let mut moves: alloc::vec::Vec<alloc::vec::Vec<(regalloc::ValueId, Binding)>> =
         (0..sched_len).map(|_| alloc::vec::Vec::new()).collect();
@@ -1737,7 +1484,7 @@ fn emit_scope<B: IsaBackend>(
     let mut store_after_def: alloc::vec::Vec<Option<u32>> = alloc::vec![None; sched_len];
     for (i, def) in schedule.iter().enumerate() {
         let v = def.value;
-        if preloaded.contains_key(&v) {
+        if allocation.parked_by_an_enclosing_scope(v) {
             // Live-in: an enclosing scope left it somewhere, and the head
             // reconciliation below brings it to where this scope expects it.
             continue;
@@ -1746,9 +1493,9 @@ fn emit_scope<B: IsaBackend>(
             if index <= i {
                 continue; // The definition itself; the instruction writes it.
             }
-            moves[index].push((v, layout.binding(v, at)));
+            moves[index].push((v, binding(allocation, v, at)));
         }
-        if let Some(slot) = layout.slot_of(v)
+        if let Some(slot) = allocation.slot_of(v)
             && matches!(
                 locs[v.0 as usize],
                 Some(Binding::Loc(Loc::Reg(_) | Loc::Ptr(_)))
@@ -1802,12 +1549,12 @@ fn emit_scope<B: IsaBackend>(
     // every root it computes, and a scope inside reads only the subset that
     // reaches it.
     for vid in schedule.iter().map(|def| def.value) {
-        if !preloaded.contains_key(&vid) {
+        if !allocation.parked_by_an_enclosing_scope(vid) {
             continue;
         }
         let placement = allocation.placement(vid);
         let at_head = allocation.at_head(vid);
-        let head = layout.binding(vid, at_head);
+        let head = binding(allocation, vid, at_head);
         if placement.at(regalloc::Point::TAIL) != at_head {
             let in_register = |at: &regalloc::Where| {
                 matches!(at, regalloc::Where::Reg(_) | regalloc::Where::Ptr(_))
@@ -1822,7 +1569,7 @@ fn emit_scope<B: IsaBackend>(
                                 "a value that never leaves a register never changes register"
                             )
                         });
-                    locs[vid.0 as usize] = Some(layout.binding(vid, from_memory));
+                    locs[vid.0 as usize] = Some(binding(allocation, vid, from_memory));
                     let got = backend.emit_resolve(&mut asm.code, vid, r, &locs);
                     debug_assert_eq!(got, r, "a value out of a register reloads into the target");
                 }
@@ -1835,7 +1582,7 @@ fn emit_scope<B: IsaBackend>(
                                 "a value that never leaves a register never changes register"
                             )
                         });
-                    locs[vid.0 as usize] = Some(layout.binding(vid, from_memory));
+                    locs[vid.0 as usize] = Some(binding(allocation, vid, from_memory));
                     ptr_into(backend, &mut asm.code, vid, p, &locs);
                 }
                 Binding::Loc(Loc::Slot(_)) | Binding::Remat(_) => {}
@@ -1858,7 +1605,7 @@ fn emit_scope<B: IsaBackend>(
                     vid: regalloc::ValueId,
                     at: Loc|
      -> Result<(), CompileError> {
-        let Some(&offset) = parked.get(&vid) else {
+        let Some(offset) = allocation.park(vid) else {
             return Ok(());
         };
         let head = allocation
@@ -1976,7 +1723,7 @@ fn emit_scope<B: IsaBackend>(
         // A parked value's placeholder def emits nothing — the enclosing
         // scope already parked the value in its slot; consumers reload from
         // there.
-        if preloaded.contains_key(vid) {
+        if allocation.parked_by_an_enclosing_scope(*vid) {
             continue;
         }
 
@@ -2046,14 +1793,8 @@ fn emit_scope<B: IsaBackend>(
                 continue;
             };
             let fold_alloc = allocation.sibling(fold_scope);
-            let acc_slot = *fold_slots.get(vid).unwrap_or_else(|| {
-                panic!(
-                    "{vid:?}'s Reduce def has no accumulator slot — the driver did not assign one"
-                )
-            });
-            let binder_slot = *binder_slots.get(vid).unwrap_or_else(|| {
-                panic!("{vid:?}'s Reduce def has no binder slot — the driver did not assign one")
-            });
+            let acc_slot = allocation.accumulator_slot(*vid);
+            let binder_slot = allocation.binder_slot(*vid);
             // Two transient temps (`Scratch::REDUCE_TEMPS`): the trip test's
             // bound and its mask, reused by the combine's reload and the
             // step's scratch. Neither outlives the instruction it serves,
@@ -2129,17 +1870,7 @@ fn emit_scope<B: IsaBackend>(
             );
 
             // The body, in its own scope.
-            let (fold_code, body_result, _, _) = emit_scope(
-                fold_alloc,
-                backend,
-                parks,
-                FramePlan {
-                    override_size: Some(frame_size),
-                    fold_slots,
-                    binder_slots,
-                    slot_base: nested_slot_base,
-                },
-            )?;
+            let (fold_code, body_result) = emit_scope(fold_alloc, backend)?;
             asm.code.extend_from_slice(&fold_code);
 
             // Combine: fold the body's result into the accumulator — an
@@ -2273,9 +2004,7 @@ fn emit_scope<B: IsaBackend>(
         // Resident by construction: the hand-off is a read at the definition
         // (`regalloc::Pass::new`), so the allocator gave it a register — a
         // constant's definition included, which otherwise emits nothing.
-        if parked.contains_key(vid) {
-            hand_off(backend, &mut asm.code, *vid, written)?;
-        }
+        hand_off(backend, &mut asm.code, *vid, written)?;
     }
 
     // No "did every branch get its landing point" assertion here any more:
@@ -2305,7 +2034,7 @@ fn emit_scope<B: IsaBackend>(
 
     let code = asm.finish();
     backend.scope_end(allocation.scope(), code.len() as u32);
-    Ok((code, result_reg, frame_size, real_spill_count))
+    Ok((code, result_reg))
 }
 
 /// Resolve a scheduled operation into a concrete instruction plan.
@@ -2695,106 +2424,25 @@ fn compile_via_backend<B: IsaBackend>(
     use regalloc::RegisterAllocator;
 
     let file = backend.register_file();
-    let nest = regalloc::LinearScan.allocate_nest(program, &file);
-    let body_alloc = nest.body();
+    let nest = regalloc::LinearScan.allocate_nest(program, &file)?;
 
     // Every byte below is emitted through this decorator, so the counts it
     // hands back cover the whole function by construction (see `traffic`).
     let mut counting = Counting::new(backend);
 
-    // Every scope shares one stack frame: spill slots in [0, m), and the
-    // park and fold slots above. `m` is the tree max — a fold's frame is
-    // based at its parent's top, since its loop runs *in the middle of* its
-    // parent's schedule with the parent's spilled values live across it —
-    // rounded to a whole slot so the slots above stay naturally aligned.
-    // Allocation and frame layout are pure, so pre-sizing here computes
-    // exactly the frames the emissions below will.
-    let vector_bytes = file.vector_bytes;
-    let mut top_of: alloc::collections::BTreeMap<regalloc::Scope, u32> =
-        alloc::collections::BTreeMap::new();
-    let mut m = 0u32;
-    // The body, then the folds in nest order: a fold's parent is always an
-    // earlier scope (asserted where the nest is built), so every `top_of`
-    // lookup below is already populated.
-    let scopes = core::iter::once(regalloc::Scope::Body)
-        .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
-    for scope in scopes {
-        let base = match scope {
-            regalloc::Scope::Body => 0,
-            regalloc::Scope::Fold(j) => top_of[&nest.fold_parent(j)],
-        };
-        let allocation = nest.scope(scope);
-        let top = if allocation.schedule().is_empty() {
-            base
-        } else {
-            FrameLayout::resolve(allocation, vector_bytes, base)?.frame_size
-        };
-        top_of.insert(scope, top);
-        m = m.max(top);
-    }
-    let m = m.next_multiple_of(vector_bytes);
-    // Each surviving fold's two roots get a slot the same way a park does —
-    // one that outlives both the scope reading it (wherever the `Reduce`
-    // def is) and the fold's own frame: the accumulator's, then the
-    // binder's, both by the fold's `Reduce`. Whether either is used is the
-    // allocator's answer, read where the loop is emitted.
-    let fold_slot = |j: usize, root: usize| m + (2 * j + root) as u32 * vector_bytes;
-    let fold_map: alloc::collections::BTreeMap<regalloc::ValueId, u32> = (0..nest.fold_count())
-        .map(|j| (nest.fold_reduce_vid(j), fold_slot(j, 0)))
-        .collect();
-    let binder_map: alloc::collections::BTreeMap<regalloc::ValueId, u32> = (0..nest.fold_count())
-        .map(|j| (nest.fold_reduce_vid(j), fold_slot(j, 1)))
-        .collect();
-    // Every root of every scope, parked above the fold slots. No root is a
-    // fold's own result — `scopes::stays_put` keeps it out of `roots` — so each one
-    // takes a park slot of its own. A value two sibling scopes both compute
-    // (a row's main batches and its remainder share their closures) is one
-    // root with one slot: the two never run at once, and each writes it
-    // before its own scopes read it.
-    let park_base = m + 2 * nest.fold_count() as u32 * vector_bytes;
-    let mut parks: alloc::collections::BTreeMap<regalloc::ValueId, u32> =
-        alloc::collections::BTreeMap::new();
-    let scopes = core::iter::once(regalloc::Scope::Body)
-        .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
-    for scope in scopes {
-        for &root in nest.scope(scope).roots() {
-            // Loud, because the other outcome is silent: `emit_scope`'s
-            // `Reduce` arm ends its def before the hand-off, so a park for it
-            // would never be written and every scope inside would read
-            // whatever the slot held.
-            assert!(
-                !fold_map.contains_key(&root),
-                "{root:?} is a fold's result, which `stays_put` keeps out of \
-                 every scope's roots"
-            );
-            if parks.contains_key(&root) {
-                continue;
-            }
-            let slot = park_base + parks.len() as u32 * vector_bytes;
-            parks.insert(root, slot);
-        }
-    }
-    let total = park_base + parks.len() as u32 * vector_bytes;
-
-    let (body, _, _, spill_count) = emit_scope(
-        body_alloc,
-        &mut counting,
-        &parks,
-        FramePlan {
-            override_size: Some(m),
-            fold_slots: &fold_map,
-            binder_slots: &binder_map,
-            slot_base: 0,
-        },
-    )?;
+    // Every scope shares one stack frame, laid out by the allocator beside
+    // its placements (`regalloc::NestAllocation::new`): spill slots below
+    // `spill_bytes`, each fold's two slots and the parks above, `frame_bytes`
+    // in all. The body's emission reaches every fold nested in it.
+    let (body, _) = emit_scope(nest.body(), &mut counting)?;
 
     // The function around it: the frame, the anchor for whatever the body's
     // constants are relative to, and what trails the return.
     let mut asm = Assembly::with_capacity(body.len() + FRAME_HEADROOM);
-    counting.frame_alloc(&mut asm.code, total);
+    counting.frame_alloc(&mut asm.code, nest.frame_bytes());
     counting.anchor(&mut asm);
     asm.code.extend_from_slice(&body);
-    counting.frame_free(&mut asm.code, total);
+    counting.frame_free(&mut asm.code, nest.frame_bytes());
     counting.emit_ret(&mut asm.code);
     let ret_end = asm.code.len();
     counting.finish(&mut asm);
@@ -2829,17 +2477,17 @@ fn compile_via_backend<B: IsaBackend>(
     // A parked root that holds a register at the head of the scopes inside
     // its own is carried rather than reloaded per iteration — read off the
     // placement, which is where the answer lives.
-    let carried = parks
-        .keys()
-        .filter(|root| nest.carried(**root).is_some())
+    let carried = nest
+        .parks()
+        .filter(|root| nest.carried(*root).is_some())
         .count() as u32;
     let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
     Ok(CompileResult {
         code: exec,
-        spill_count,
-        spill_bytes: m,
+        spill_count: nest.body().spill_slots(),
+        spill_bytes: nest.spill_bytes(),
         max_regs: file.scratch.len(),
-        hoisted_values: parks.len() as u32,
+        hoisted_values: nest.parks().count() as u32,
         traffic: EmitTraffic {
             scopes: EmitTraffic::by_index(scopes, trips.len()),
             trips,
@@ -3902,6 +3550,43 @@ mod tests {
     // What the nest does and does not partition
     // =========================================================================
 
+    /// A value an enclosing scope parked is addressed, in every scope that
+    /// reads it, at that scope's park: the allocator's table says so, and
+    /// the emitter asks nothing else.
+    #[test]
+    fn a_parked_placeholder_is_addressed_at_its_park() {
+        let (a, root) = shared_leaf_kernel();
+        let file = native_register_file(EmitCtx::default());
+        let nest = allocate_nest(native_schedule(&a, root, batch()), &file);
+        let mut placeholders = 0;
+        for j in 0..nest.fold_count() {
+            let view = nest.scope(regalloc::Scope::Fold(j));
+            for def in view.schedule() {
+                if !view.parked_by_an_enclosing_scope(def.value) {
+                    continue;
+                }
+                placeholders += 1;
+                let mut parking = view;
+                let park = loop {
+                    let (parent, _) = parking
+                        .opens_at()
+                        .expect("an enclosing scope parks the value");
+                    parking = parking.sibling(parent);
+                    if let Some(park) = parking.park(def.value) {
+                        break park;
+                    }
+                };
+                assert_eq!(
+                    view.slot_of(def.value),
+                    Some(Slot::new(park, file.vector_bytes)),
+                    "Fold({j}) addresses {:?} somewhere other than its park",
+                    def.value
+                );
+            }
+        }
+        assert!(placeholders > 0, "the fixture's folds read no park at all");
+    }
+
     /// The placement is total over every scope's schedule, a parked
     /// placeholder's entry included — which reads the park, the enclosing
     /// scope's answer, rather than a range of this scope's own.
@@ -3955,143 +3640,13 @@ mod tests {
     }
 
     // =========================================================================
-    // FrameLayout unit tests — the Placement -> address arrow
-    // =========================================================================
-
-    /// Build an allocation with the given placements, in schedule order.
-    fn allocation_of(placements: &[(u32, regalloc::Where)]) -> regalloc::NestAllocation {
-        use regalloc::{Def, ValueId};
-        // Allocate a schedule of bare leaves to get a well-formed Allocation,
-        // then pin each value where the test wants it.
-        let schedule: alloc::vec::Vec<Def> = placements
-            .iter()
-            .map(|&(v, _)| Def {
-                value: ValueId(v),
-                // An operand-free vector leaf that is not a constant — see
-                // `regalloc::tests::leaf`.
-                op: ScheduledOp::Lanes(Binder::from_slot(0).expect("slot 0")),
-            })
-            .collect();
-        let mut a = allocate_flat(schedule, &TEST_FILE);
-        for &(v, p) in placements {
-            a.place(regalloc::Scope::Body, ValueId(v), p);
-        }
-        a
-    }
-
-    #[test]
-    fn an_allocation_with_no_spills_needs_no_frame() {
-        let a = allocation_of(&[(0, regalloc::Where::Reg(Reg(4)))]);
-        let layout = FrameLayout::resolve(a.body(), 16, 0).unwrap();
-        assert_eq!(layout.frame_size, 0);
-        assert_eq!(layout.of(regalloc::ValueId(0)), Loc::Reg(Reg(4)).into());
-    }
-
-    #[test]
-    fn one_spill_takes_one_slot() {
-        let a = allocation_of(&[(5, regalloc::Where::Spilled)]);
-        let layout = FrameLayout::resolve(a.body(), 16, 0).unwrap();
-        assert_eq!(layout.frame_size, 16);
-        assert_eq!(
-            layout.of(regalloc::ValueId(5)),
-            Loc::Slot(Slot::new(0, 16)).into()
-        );
-    }
-
-    /// Slots are laid out at the backend's own stride, so the offsets a wide
-    /// backend encodes are real displacements rather than 16-byte units it has
-    /// to scale back up.
-    #[test]
-    fn slots_are_laid_out_at_the_backends_vector_stride() {
-        let spilled = [
-            (1, regalloc::Where::Spilled),
-            (2, regalloc::Where::Spilled),
-            (3, regalloc::Where::Spilled),
-        ];
-        for (vector_bytes, expected) in
-            [(16u32, [0, 16, 32]), (32, [0, 32, 64]), (64, [0, 64, 128])]
-        {
-            let a = allocation_of(&spilled);
-            let layout = FrameLayout::resolve(a.body(), vector_bytes, 0).unwrap();
-            assert_eq!(layout.frame_size, 3 * vector_bytes);
-            for (i, off) in expected.iter().enumerate() {
-                assert_eq!(
-                    layout.of(regalloc::ValueId(i as u32 + 1)),
-                    Loc::Slot(Slot::new(*off, vector_bytes)).into(),
-                    "vector_bytes={vector_bytes}"
-                );
-            }
-        }
-    }
-
-    /// A rematerialized constant occupies no slot at all.
-    #[test]
-    fn rematerialized_values_take_no_frame_space() {
-        let a = allocation_of(&[
-            (0, regalloc::Where::Remat(1.0f32.to_bits())),
-            (1, regalloc::Where::Spilled),
-        ]);
-        let layout = FrameLayout::resolve(a.body(), 16, 0).unwrap();
-        assert_eq!(layout.frame_size, 16, "only the spill takes a slot");
-        assert_eq!(
-            layout.of(regalloc::ValueId(0)),
-            Binding::Remat(1.0f32.to_bits())
-        );
-        assert_eq!(
-            layout.of(regalloc::ValueId(1)),
-            Loc::Slot(Slot::new(0, 16)).into()
-        );
-    }
-
-    /// The collapse LICM pins a hoisted value to the slot its prologue wrote,
-    /// which is not one this frame laid out.
-    #[test]
-    fn a_slot_can_be_pinned_over_the_frames_own_layout() {
-        let a = allocation_of(&[(0, regalloc::Where::Reg(Reg(4)))]);
-        let mut layout = FrameLayout::resolve(a.body(), 16, 0).unwrap();
-        let v = regalloc::ValueId(0);
-        assert_eq!(layout.slot_of(v), None, "a resident value needs no slot");
-        let pin = Slot::new(256, 16);
-        layout.pin_slot(v, pin);
-        assert_eq!(layout.slot_of(v), Some(pin));
-        assert_eq!(
-            layout.binding(v, regalloc::Where::Spilled),
-            Loc::Slot(pin).into()
-        );
-        assert_eq!(
-            layout.binding(v, regalloc::Where::Reg(Reg(7))),
-            Loc::Reg(Reg(7)).into(),
-            "pinning an address says nothing about where the value is"
-        );
-    }
-
-    // =========================================================================
     // resolve_operands unit tests — the spill logic that was buggy
     // =========================================================================
 
-    /// Helper: build minimal assignment + spill maps for resolve_operands
-    /// tests. Every register an instruction may use is handed to it in
-    /// `TEST_SCRATCH`, exactly as the allocator hands one its reservations.
-    const TEST_FILE: regalloc::RegisterFile = regalloc::RegisterFile {
-        fixed: &[],
-        scratch: regalloc::RegSet::range(4, regalloc::RegisterFile::MIN_SCRATCH),
-        temps_for: regalloc::no_temps,
-        guard_temps: 0,
-        vector_bytes: 16,
-        gpr_ctx: None,
-        gpr_out: None,
-        gpr_pitch: None,
-        gpr_scratch: regalloc::GprSet::EMPTY,
-        gpr_temps_for: regalloc::no_temps,
-        pointers: regalloc::GprSet::EMPTY,
-        mask_scratch: regalloc::MaskSet::EMPTY,
-        mask_temps_for: regalloc::no_temps,
-        mask_guard_temps: 0,
-    }
-    .checked();
-
     /// The two reload registers these `resolve_operands` tests hand the
     /// instruction, standing in for the allocator's per-instruction
+    /// reservations. Every register an instruction may use is handed to it
+    /// in `TEST_SCRATCH`, exactly as the allocator hands one its
     /// reservations.
     const RELOAD: [Reg; 2] = [Reg(11), Reg(12)];
 
@@ -7283,10 +6838,6 @@ mod tests {
                 self.inner.begin(schedule)
             }
 
-            fn frame_ready(&mut self, frame_size: u32) {
-                self.inner.frame_ready(frame_size);
-            }
-
             fn emit_plan(
                 &mut self,
                 code: &mut Vec<u8>,
@@ -7425,10 +6976,11 @@ mod tests {
         /// At a width with a remainder the column fold is strip-mined into a
         /// main fold and a remainder fold, and a `Reduce` varying with the
         /// column is carved into *both*. The two `ScopeFold`s carry the same
-        /// `Reduce` `ValueId`, and the driver keys a fold's accumulator slot
-        /// and binder slot by that id (`fold_map` and `binder_map` in
-        /// [`compile_via_backend`], each a `collect()` that keeps the last `j`
-        /// for a repeated key). So the earlier fold's slots, `m + 2j·vb` and
+        /// `Reduce` `ValueId`, and the allocator keys a fold's accumulator
+        /// slot and binder slot by that id (`accumulator_slots` and
+        /// `binder_slots` in `regalloc::NestAllocation::new`, each a
+        /// `collect()` that keeps the last `j` for a repeated key). So the
+        /// earlier fold's slots, `m + 2j·vb` and
         /// `m + (2j + 1)·vb`, are never addressed: its loop reads, steps and
         /// stores the later fold's, and its consumers read the later's. The
         /// two folds never run at once, which is the whole reason it is sound.
@@ -7457,10 +7009,12 @@ mod tests {
             for (pool, ctx) in [("floor", floor), ("whole", EmitCtx::default())] {
                 let mut backend = avx2::driver::Avx2Backend::new(ctx);
                 let file = backend.register_file();
-                let nest = regalloc::LinearScan.allocate_nest(
-                    regalloc::ScopedSchedule::from_schedule(schedule.clone()),
-                    &file,
-                );
+                let nest = regalloc::LinearScan
+                    .allocate_nest(
+                        regalloc::ScopedSchedule::from_schedule(schedule.clone()),
+                        &file,
+                    )
+                    .expect("the glyph-like row fits the frame");
 
                 // The nest: exactly one `Reduce` is carved into two folds.
                 let mut carved: alloc::collections::BTreeMap<regalloc::ValueId, Vec<usize>> =
@@ -7508,13 +7062,13 @@ mod tests {
                 )
                 .expect("the glyph-like row compiles");
                 // `spill_bytes` is the frame's `m`, where the fold slots begin.
-                let fold_slot = |j: usize, root: u32| {
+                let root_slot = |j: usize, root: u32| {
                     result.spill_bytes + (2 * j as u32 + root) * file.vector_bytes
                 };
                 let (own, shared_acc, shared_binder) = (
-                    [fold_slot(earlier, 0), fold_slot(earlier, 1)],
-                    fold_slot(later, 0),
-                    fold_slot(later, 1),
+                    [root_slot(earlier, 0), root_slot(earlier, 1)],
+                    root_slot(later, 0),
+                    root_slot(later, 1),
                 );
 
                 let touched = recorder.addressed();
