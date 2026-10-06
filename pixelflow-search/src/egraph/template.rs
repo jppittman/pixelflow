@@ -73,11 +73,7 @@ fn match_root(
         | ExprData::Buffer(_)
         | ExprData::Uniform(_)
         | ExprData::Ref(_)
-        | ExprData::Reduce(_)
-        // No rule this harness generates ever writes a `Guard` into a
-        // pattern — the e-graph declines one on `insert` (G1), so nothing
-        // could ever have matched here in the first place.
-        | ExprData::Guard { .. } => false,
+        | ExprData::Reduce(_) => false,
         ExprData::Op(_) => match_op(egraph, pat, node, bindings),
     }
 }
@@ -96,8 +92,7 @@ fn match_class(
         | ExprData::Buffer(_)
         | ExprData::Uniform(_)
         | ExprData::Ref(_)
-        | ExprData::Reduce(_)
-        | ExprData::Guard { .. } => false,
+        | ExprData::Reduce(_) => false,
         ExprData::Op(_) => {
             for node in egraph.nodes(class) {
                 let mut trial = bindings.clone();
@@ -152,7 +147,7 @@ fn collect_metavars(node: Node<'_, ExprData>, out: &mut std::collections::BTreeS
         | ExprData::Buffer(_)
         | ExprData::Uniform(_)
         | ExprData::Ref(_) => {}
-        ExprData::Reduce(_) | ExprData::Op(_) | ExprData::Guard { .. } => {
+        ExprData::Reduce(_) | ExprData::Op(_) => {
             for c in node.children() {
                 collect_metavars(c, out);
             }

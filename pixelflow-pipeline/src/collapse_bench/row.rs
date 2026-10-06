@@ -44,7 +44,8 @@ pub struct StaticFeatures {
     /// of a kernel, so it is kept out of the derived dynamic figures below and
     /// recorded here instead.
     pub scaffold: ScopeRow,
-    /// Frame slots holding a value with an address (`FrameLayout::slots`).
+    /// Frame slots holding a value with an address: the body's
+    /// `regalloc::Allocation::spill_slots`.
     pub spill_slots: u32,
     /// Stack bytes the frame occupies.
     pub frame_bytes: u32,

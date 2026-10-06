@@ -17,6 +17,10 @@ pub use table::*;
 // Instruction Encoding Helpers
 // =============================================================================
 
+/// An A64 instruction is one 32-bit word, and a branch displacement counts
+/// them.
+const WORD_BYTES: usize = 4;
+
 /// Write a 32-bit instruction to the code buffer.
 #[inline]
 pub fn emit32(code: &mut Vec<u8>, inst: u32) {
@@ -90,7 +94,7 @@ pub enum Inst {
 
     B(B),
     BCond(BCond),
-    CbzW16(CbzW16),
+    BranchIfW16Zero(BranchIfW16Zero),
     AdrpAdd(AdrpAdd),
 }
 
@@ -220,9 +224,11 @@ impl Inst {
             // written by the assembler and there is nothing to encode here.
             Inst::B(_) => 0x1400_0000,
             Inst::BCond(b) => 0x5400_0000 | b.condition as u32,
-            Inst::CbzW16(_) => 0x3400_0010,
             // Two words, not one — `encode` is for single-word instructions
             // only, same exclusion as `Ldr`/`Str` above.
+            Inst::BranchIfW16Zero(_) => {
+                panic!("BranchIfW16Zero must be emitted via emit_into or AsmProgram")
+            }
             Inst::AdrpAdd(_) => {
                 panic!("AdrpAdd must be emitted via emit_into or AsmProgram")
             }
@@ -297,10 +303,10 @@ impl From<BCond> for Inst {
     }
 }
 
-impl From<CbzW16> for Inst {
+impl From<BranchIfW16Zero> for Inst {
     #[inline(always)]
-    fn from(b: CbzW16) -> Self {
-        Inst::CbzW16(b)
+    fn from(b: BranchIfW16Zero) -> Self {
+        Inst::BranchIfW16Zero(b)
     }
 }
 
@@ -320,7 +326,7 @@ impl crate::emit::AsmInsn for Inst {
         match self {
             Inst::B(b) => b.label_ref(),
             Inst::BCond(b) => b.label_ref(),
-            Inst::CbzW16(b) => b.label_ref(),
+            Inst::BranchIfW16Zero(b) => b.label_ref(),
             Inst::AdrpAdd(a) => a.label_ref(),
             _ => None,
         }
@@ -331,7 +337,7 @@ impl crate::emit::AsmInsn for Inst {
         match self {
             Inst::B(b) => b.emit_into(code),
             Inst::BCond(b) => b.emit_into(code),
-            Inst::CbzW16(b) => b.emit_into(code),
+            Inst::BranchIfW16Zero(b) => b.emit_into(code),
             Inst::AdrpAdd(a) => a.emit_into(code),
             Inst::Ldr(ldr) => ldr.emit_into(code),
             Inst::Str(str) => str.emit_into(code),
@@ -1273,31 +1279,6 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
     "unknown".into()
 }
 
-// =============================================================================
-// dump_jit_asm — compile expression and return disassembly
-// =============================================================================
-
-/// Compile an expression from an [`ExprArena`] for a lattice of `shape` and
-/// return its disassembly.
-///
-/// This is a diagnostic entry point: it compiles the expression through the
-/// normal JIT pipeline, then disassembles the resulting machine code instead
-/// of executing it. Useful for inspecting what the JIT generates.
-///
-/// # Errors
-///
-/// Returns [`crate::error::CompileError`] if compilation fails (same errors as
-/// [`compile`](super::compile)).
-#[cfg(target_arch = "aarch64")]
-pub fn dump_jit_asm(
-    arena: &pixelflow_ir::arena::ExprArena,
-    root: pixelflow_ir::arena::ExprId,
-    shape: pixelflow_ir::LatticeShape,
-) -> Result<String, crate::error::CompileError> {
-    let result = super::compile(arena, root, shape)?;
-    Ok(disassemble_code(result.code.as_bytes()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2142,9 +2123,12 @@ pub(crate) mod driver {
         /// `scratch` is this instruction's own reservation, live for these two
         /// instructions only — the allocator makes it because this backend's
         /// `guard_temps` asks for one.
-        /// Both polarities end in `cbz w16`, so the arm chooses the
-        /// *reduction*: a horizontal max is zero exactly when no lane is set,
-        /// and an inverted horizontal min is zero exactly when every lane is.
+        ///
+        /// Both polarities end in [`BranchIfW16Zero`] — `cbnz w16, .+8; b
+        /// label`, two words whatever the arm's length — so the arm chooses
+        /// the *reduction*: a horizontal max is zero exactly when no lane is
+        /// set, and an inverted horizontal min is zero exactly when every lane
+        /// is.
         fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
             let scratch = guard_scratch(test.scratch, test.reg);
             match test.arm {
@@ -2161,7 +2145,7 @@ pub(crate) mod driver {
                     .assemble(&mut asm.code);
                 }
             }
-            asm.push(CbzW16 { target: label });
+            asm.push(BranchIfW16Zero { target: label });
         }
 
         // AAPCS64: x0 = ctx (read-only in the body's gathers and uniform
@@ -2649,7 +2633,7 @@ pub fn add(code: &mut Vec<u8>, dst: impl Into<Gpr>, src: impl Into<Gpr>, operand
 /// `mvn w<dst>, w<src>` — bitwise NOT of a 32-bit general register.
 ///
 /// `ORN Wd, WZR, Wm`; the guard path uses it to turn "all lanes set" into
-/// zero so a following `cbz` tests it.
+/// zero so the branch on W16 that follows ([`BranchIfW16Zero`]) tests it.
 #[inline(always)]
 pub fn mvn_w(code: &mut Vec<u8>, dst: impl Into<Gpr>, src: impl Into<Gpr>) {
     let dst = dst.into();
@@ -2670,8 +2654,9 @@ pub fn ret(code: &mut Vec<u8>) {
 /// Where a branch keeps its displacement, and how far it reaches.
 ///
 /// A64 has no single `rel32`: `B` carries a 26-bit word displacement in the low
-/// bits, and `B.cond`/`CBZ` carry a 19-bit one starting at bit 5. Two fields,
-/// two ranges — so which one a branch uses is part of what the branch *is*.
+/// bits, and `B.cond`/`CBZ`/`CBNZ` carry a 19-bit one starting at bit 5. Two
+/// fields, two ranges — so which one a branch uses is part of what the branch
+/// *is*, and a branch whose reach must not depend on what it spans is a `B`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct DispField {
     /// Bit position of the field's low end.
@@ -2683,7 +2668,7 @@ struct DispField {
 impl DispField {
     /// `B`'s imm26, at bit 0 — ±128 MiB.
     const IMM26: Self = Self { shift: 0, bits: 26 };
-    /// `B.cond`'s and `CBZ`'s imm19, at bit 5 — ±1 MiB.
+    /// `B.cond`'s and `CBZ`/`CBNZ`'s imm19, at bit 5 — ±1 MiB.
     const IMM19: Self = Self { shift: 5, bits: 19 };
 
     /// Overwrite this field of the instruction word at `at` so the branch
@@ -2694,9 +2679,9 @@ impl DispField {
     ///
     /// If the displacement is not a whole number of instructions, or does not
     /// fit. The first is a bug in this crate; the second is a real limit of the
-    /// encoding, though unreachable for anything that compiles — the widest
-    /// body this emitter has produced is 34,993 instructions against `B.cond`'s
-    /// 262,144-word reach.
+    /// encoding. A guard no longer meets it: [`BranchIfW16Zero`] jumps with a
+    /// `B`, ±128 MiB (2026-10-05; before that an arm past `CBZ`'s 262,144
+    /// words panicked here), and no emitter verb branches with a `B.cond`.
     fn write(self, code: &mut [u8], at: usize, target: usize) {
         let bytes = target as i64 - at as i64;
         assert!(
@@ -2909,29 +2894,72 @@ impl AsmInsn for BCond {
     }
 }
 
-/// `cbz w16, target` — taken when W16 is zero. ±1 MiB.
+/// The branch-test scratch's register number — W16, which the guard path
+/// reduces a mask into with `umaxv`/`uminv` + `fmov`.
+const BRANCH_TEST_REG: u32 = 16;
+
+/// `CBZ Wt`'s opcode with the register and displacement fields clear:
+/// `sf = 0` (a W register) and `011010`, then `op` in bit 24.
+const CBZ_W_OPCODE: u32 = 0x3400_0000;
+/// `op`, bit 24 of `CBZ`/`CBNZ`: clear branches on zero, set on non-zero. The
+/// whole difference between the two instructions.
+const CB_OP_NONZERO: u32 = 1 << 24;
+
+/// How far the `CBNZ` of a [`BranchIfW16Zero`] jumps, in words: over the `B`
+/// that follows it, to the instruction after the pair.
+const CBNZ_SKIPS_B: u32 = 2;
+
+/// `cbnz w16, .+8` — the first word of a [`BranchIfW16Zero`]. Never patched:
+/// its displacement is the pair's own size, not a label's position.
+const CBNZ_W16_OVER_B: u32 =
+    CBZ_W_OPCODE | CB_OP_NONZERO | (CBNZ_SKIPS_B << DispField::IMM19.shift) | BRANCH_TEST_REG;
+
+/// `cbnz w16, .+8` + `b target`, sharing one [`Label`]: branch to `target`
+/// when W16 is zero, from anywhere within `B`'s ±128 MiB.
+///
+/// **Two instructions, because `CBZ` does not reach.** It spends 19 bits on a
+/// word displacement — ±1 MiB — and an arm is as long as the code it owns, a
+/// bound nothing here puts under 1 MiB: a text run's glyph kernels under one
+/// guard are megabytes of NEON. `CBNZ` steps over the `B` when the mask says
+/// the arm is live, and falls into the `B` when it says the arm is dead, so
+/// this is exactly `cbz w16, target` at `B`'s reach.
+///
+/// **Always both, never the one-word `CBZ` where it would reach.** Which form
+/// fits depends on the arm's length, which depends on where every instruction
+/// inside it landed, and this instruction's own size is one of those — so
+/// choosing the short form is branch relaxation, layout iterated to a fixed
+/// point to save four bytes per guard. The pair's size is fixed before a
+/// single byte is laid out, like [`AdrpAdd`]'s, and there is nothing to relax.
 ///
 /// W16 rather than a register operand because W16 *is* the branch-test scratch
 /// in this backend's ABI: the guard path reduces a mask into it with
 /// `umaxv`/`uminv` + `fmov`, and nothing else may hold a value there. A
 /// register parameter would suggest a choice the ABI does not offer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct CbzW16 {
+pub struct BranchIfW16Zero {
     /// Where it goes.
     pub target: Label,
 }
 
-impl AsmInsn for CbzW16 {
+impl AsmInsn for BranchIfW16Zero {
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
-        emit32(code, 0x3400_0010);
+        emit32(code, CBNZ_W16_OVER_B);
+        // The jump is `B`'s own word, so there is one encoding of `B` here and
+        // `label_ref` below only says where its displacement lives.
+        B {
+            target: self.target,
+        }
+        .emit_into(code);
     }
 
     #[inline]
     fn label_ref(self) -> Option<LabelRef> {
         Some(LabelRef {
             label: self.target,
-            patch: |code, at, target| DispField::IMM19.write(code, at, target),
+            // `at` is the `CBNZ`; the `B` it steps over sits one word later,
+            // and a displacement is measured from the branch's own address.
+            patch: |code, at, target| DispField::IMM26.write(code, at + WORD_BYTES, target),
         })
     }
 }
@@ -2939,11 +2967,16 @@ impl AsmInsn for CbzW16 {
 #[cfg(test)]
 mod label_tests {
     use super::*;
-    use crate::emit::{AsmProgram, Item, Label};
+    use crate::emit::{AsmProgram, Assembly, EmitCtx, IfArm, IsaBackend, Item, Label, MaskTest};
 
     /// One known word, so a test can measure distances in instructions without
     /// depending on any real encoding.
     const NOP: Inst = Inst::Raw(0xD503_201F);
+
+    /// The one-word `cbz w16, .+0` that a guard used to end in: `Rt = 16`,
+    /// `op = 0`. What the pair replaced, spelled out so the test can say what
+    /// changed about it.
+    const OLD_CBZ_W16: u32 = 0x3400_0010;
 
     fn assemble(items: impl IntoIterator<Item = Item<Inst>>) -> Vec<u8> {
         let mut code = Vec::new();
@@ -2999,17 +3032,136 @@ mod label_tests {
         assert_eq!(w & 0xFF00_001F, 0x5400_0002);
     }
 
+    /// A branch displacement field read back with its sign, from the ARM ARM's
+    /// layout rather than from `DispField`, so agreeing with it is evidence.
+    fn imm19(word: u32) -> i64 {
+        i64::from((((word >> 5) & 0x7_FFFF) << 13) as i32 >> 13)
+    }
+
+    fn imm26(word: u32) -> i64 {
+        i64::from(((word & 0x03FF_FFFF) << 6) as i32 >> 6)
+    }
+
+    /// Where control goes after the `CBNZ`+`B` pair at word `at`, given W16 —
+    /// the instructions' manual semantics, read off the emitted words: `CBNZ`
+    /// branches when its register is non-zero, `B` always branches.
+    fn pair_lands_at(words: &[u32], at: usize, w16: u32) -> i64 {
+        let (cb, b) = (words[at], words[at + 1]);
+        let branches_on_nonzero = (cb >> 24) & 1 == 1;
+        if (w16 != 0) == branches_on_nonzero {
+            return at as i64 + imm19(cb);
+        }
+        at as i64 + 1 + imm26(b)
+    }
+
     #[test]
-    fn cbz_keeps_its_register() {
+    fn a_branch_on_w16_is_cbnz_over_b() {
         let exit = Label::new("end");
         let code = assemble([
-            Item::Inst(CbzW16 { target: exit }.into()),
+            Item::Inst(BranchIfW16Zero { target: exit }.into()),
             Item::Inst(NOP),
             Item::Label(exit),
         ]);
-        let w = word_at(&code, 0);
-        assert_eq!((w >> 5) & 0x7FFFF, 2);
-        assert_eq!(w & 0xFF00_001F, 0x3400_0010, "still cbz w16");
+        assert_eq!(code.len(), 3 * WORD_BYTES, "cbnz, b, nop");
+        let (cbnz, b) = (word_at(&code, 0), word_at(&code, 4));
+
+        assert_eq!(imm19(cbnz), 2, "steps over the B");
+        // The CBZ it replaces with its opcode bit flipped: same width, same
+        // register, same field — only the sense of the test changed.
+        assert_eq!(cbnz ^ (OLD_CBZ_W16 | (2 << 5)), 1 << 24);
+        assert_eq!(cbnz & 0xFF00_001F, 0x3500_0010, "cbnz w16");
+
+        assert_eq!(b & 0xFC00_0000, 0x1400_0000, "an unconditional B");
+        assert_eq!(imm26(b), 2, "from the B itself, two words to the label");
+    }
+
+    /// The words a guard emits for an arm `filler` instructions long, built
+    /// the way the emitter builds it: the backend's verb, the arm's body, the
+    /// label bound past it, then the assembler's patch pass.
+    fn guard_over_arm(arm: IfArm, filler: usize) -> Vec<u32> {
+        let mut backend = driver::Aarch64Backend::new(EmitCtx::default());
+        let mut asm = Assembly::default();
+        let past_arm = Label::new("past_arm");
+        let test = MaskTest {
+            reg: Reg(0),
+            scratch: Some(Reg(1)),
+            mask_scratch: None,
+            arm,
+        };
+        backend.branch_if_arm_is_dead(&mut asm, test, past_arm);
+        for _ in 0..filler {
+            asm.push(NOP);
+        }
+        asm.bind(past_arm);
+        asm.finish()
+            .as_chunks::<WORD_BYTES>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect()
+    }
+
+    /// The guard's jump is `B`, so an arm's length is not bounded by `CBZ`'s
+    /// ±1 MiB: the same two words, with the same `CBNZ`, whether the arm is
+    /// three instructions or past what `imm19` can say.
+    #[test]
+    fn a_guard_reaches_past_what_cbz_could() {
+        // The first forward distance `imm19` cannot hold, in words.
+        let imm19_limit = 1usize << (DispField::IMM19.bits - 1);
+        // `umaxv; fmov` for a true arm; `uminv; fmov; mvn` for a false one.
+        for (arm, reduction) in [(IfArm::True, 2), (IfArm::False, 3)] {
+            for filler in [3, imm19_limit + 17] {
+                let words = guard_over_arm(arm, filler);
+                let (cbnz_at, b_at) = (reduction, reduction + 1);
+                assert_eq!(
+                    words.len(),
+                    b_at + 1 + filler,
+                    "{arm:?}/{filler}: two words"
+                );
+
+                assert_eq!(imm19(words[cbnz_at]), 2, "{arm:?}/{filler}");
+                assert_eq!(
+                    words[cbnz_at], CBNZ_W16_OVER_B,
+                    "{arm:?}/{filler}: the CBNZ is never patched"
+                );
+                assert_eq!(words[b_at] & 0xFC00_0000, 0x1400_0000, "{arm:?}/{filler}");
+
+                // The label sits one word past the last filler word, and the
+                // B measures from itself.
+                let exact = words.len() - b_at;
+                assert_eq!(imm26(words[b_at]), exact as i64, "{arm:?}/{filler}");
+                assert_eq!(exact, filler + 1, "{arm:?}/{filler}");
+                assert_eq!(
+                    exact >= imm19_limit,
+                    filler > imm19_limit,
+                    "{arm:?}/{filler}: the large arm, and only it, is past imm19"
+                );
+
+                // Jump to the label iff W16 is zero — the old CBZ's meaning.
+                let label = words.len() as i64;
+                let arm_body = (b_at + 1) as i64;
+                assert_eq!(pair_lands_at(&words, cbnz_at, 0), label, "{arm:?}/{filler}");
+                for live in [1, 0x8000_0000, u32::MAX] {
+                    assert_eq!(
+                        pair_lands_at(&words, cbnz_at, live),
+                        arm_body,
+                        "{arm:?}/{filler}/{live:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `Inst::encode` is for single-word instructions; the pair is two, like
+    /// `AdrpAdd`, and says so rather than handing back half of itself.
+    #[test]
+    #[should_panic(expected = "BranchIfW16Zero")]
+    fn a_branch_on_w16_has_no_single_word_encoding() {
+        let word = Inst::from(BranchIfW16Zero {
+            target: Label::new("end"),
+        })
+        .encode();
+        unreachable!("encode handed back {word:#010x} for a two-word instruction");
     }
 
     /// A label may name a position no instruction occupies — the end of the

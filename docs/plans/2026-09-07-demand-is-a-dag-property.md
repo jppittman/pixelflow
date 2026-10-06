@@ -243,6 +243,10 @@ rule is the inverse of `SelectHoistUnary`, applied when
 masks merge; and extraction *chooses* a guarded form rather than codegen
 recovering one from whatever form was extracted.
 
+> **2026-10-05:** the two-`KernelKey` `Guard` node, the one-armed idea's first
+> form in the arena, was retired (commits "retire the guard-arm scope", "retire ExprNode::Guard"): nothing produced it, and it
+> equalled `If` only for a batch-uniform mask. C2b remains unbuilt.
+
 ## 5. Guards and index ranges are one thing
 
 A Y-only mask `y_lo ≤ Y < y_hi` *is* an index range. L3 put that range

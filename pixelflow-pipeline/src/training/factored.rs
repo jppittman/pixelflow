@@ -621,10 +621,6 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
                         "a bounded fold reached arena_to_kernel_code — kernel code has no \
                          syntax for a binder"
                     ),
-                    ExprNode::Guard { mask: _, on, off } => panic!(
-                        "Guard(on={on:?}, off={off:?}) reached arena_to_kernel_code — kernel \
-                         code has no syntax for a hard branch yet (G1: never chosen)"
-                    ),
                     ExprNode::Write { .. } => panic!(
                         "a Write reached arena_to_kernel_code — kernel code has no syntax \
                          for a store; it is post-legalize vocabulary"

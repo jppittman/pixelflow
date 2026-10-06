@@ -599,20 +599,6 @@ fn node(arena: &ExprArena, id: ExprId, context: &EntryContext) -> TokenStream {
             };
             quote! { __arena.push_reduce(#emitted, #body) }
         }
-        // Unreachable for the same reason `Ref` is: there is no
-        // `kernel!` surface syntax for a hard branch. `Guard` is built
-        // directly against an `ExprArena` (`ExprArena::push_guard`), not
-        // lowered from a macro body — and even if it were, its `on`/
-        // `off` keys would name kernels interned in the *build host's*
-        // process, which the emitted program does not share, exactly as
-        // `Ref`'s panic says.
-        ExprNode::Guard { mask, on, off } => {
-            panic!(
-                "kernel! produced ExprNode::Guard(mask={mask:?}, on={on:?}, off={off:?}) \
-                 — there is no surface syntax for a hard branch yet; it is built directly \
-                 against an ExprArena, not lowered from a kernel! body"
-            )
-        }
         // A store is post-legalize vocabulary: the passes that wrap a
         // kernel in the lattice's folds build one, after extraction,
         // and no kernel! body can spell it.

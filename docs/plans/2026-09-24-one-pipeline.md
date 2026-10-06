@@ -178,8 +178,9 @@ saturate_R = folds_R ∘ main_(R∖folds) ∘ closing_R        one rule set, thr
   (`runtime.rs:305-312`).
 - **Extraction reads `s`.** It prices every fold by its trips (§1.4).
 - **Legalization and emission read `t`.**
-  - Legalization reads it through `pack`'s lane count (`native_register_file`
-    → `detect()`, `emit/mod.rs:1163`).
+  - Legalization reads it through `pack`'s lane count (`EmitCtx::compile`
+    in `pixelflow-codegen/src/pipeline.rs` asks `native_register_file`,
+    which asks `detect()`).
   - Emission reads `s` as well: fold bounds, remainder arms, carry ranking
     (§4).
 - **Gap L4 (Q6).** `legalize_t` builds the lattice's folds after
@@ -212,16 +213,21 @@ This holds by construction exactly when `P` depends on nothing but
 `(k, s, t)`. **F: today it depends on seven other things.**
 
 1. **The tier is read inside the emitter.** Both `compile_native` and
-   `native_register_file` call `isa::detect()` (`emit/mod.rs:3875`, `:3887`).
+   `native_register_file` call `isa::detect()` (both in
+   `pixelflow-codegen/src/emit/mod.rs`).
 2. **The bytes are mapped inside the emitter**, by
-   `ExecutableCode::from_code` (`emit/mod.rs:4278`).
+   `ExecutableCode::from_code` (inside `compile_via_backend`).
 3. **The macro saturates, then the JIT saturates again**
    (`pixelflow-compiler/src/lib.rs:163-165`; `jit_cache.rs:145`). The same
    kernel gives different bytes in 4 of 7 cases. The runtime optimizer is
    idempotent; the macro hands it a different starting term.
 4. **A process-global `KernelStore` resolves `Guard` arms and `Ref`s**
    (`emit/mod.rs:4060-4066`; `passes.rs:318`; `variance.rs:312`).
-   - No production code builds a `Guard` or calls `by_ref`.
+   - **2026-10-05:** the `Guard` half is gone (C4, "retire ExprNode::Guard"):
+     `schedule_guard_arm` was codegen's only direct use of the store. Its
+     remaining consumers are `expand_refs`, a `Ref`'s variance, the unit walk
+     in `pixelflow-search` and `by_ref`.
+   - No production code calls `by_ref`.
      - Since O1 the store is load-bearing for `P` wherever `by_ref` is
        called: the unit walk finds each unit's body there. C1's font is
        the first production caller.
@@ -662,13 +668,14 @@ on every combinator (`:258-270`); that is exprarena-on-dag Stage D's to remove.
 
 | # | move or delete | where (F) | becomes |
 |---|---|---|---|
-| C1 | move the `detect()` calls inside the emitter and `legalize` | `emit/mod.rs:1163`, `:3875`, `:3887` | `EmitCtx { max_regs, isa }`; `jit_cache` calls `detect()` once. `EmitCtx` loses `derive(Default)` |
-| C2 | move the mmap inside `compile_via_backend` | `emit/mod.rs:4278` | the caller maps; `EmitCtx::compile` = assemble + `from_code` |
+| C1 | move the `detect()` calls inside the emitter and `legalize` | `EmitCtx::compile` (`pipeline.rs`); `compile_native`, `native_register_file` (`emit/mod.rs`) | `EmitCtx { max_regs, isa }`; `jit_cache` calls `detect()` once. `EmitCtx` loses `derive(Default)` |
+| C2 | move the mmap inside `compile_via_backend` | `compile_via_backend` (`emit/mod.rs`) | the caller maps; `EmitCtx::compile` = assemble + `from_code` |
 | C3 | move `jit_cache::compile`'s body | `jit_cache.rs:144-155` | `program` (A3) |
-| C4 | delete `Guard` | `arena.rs:758-769`; `emit/mod.rs:4060-4066`; about 20 files | nothing. If the demand track needs a guard node, its arms live in the arena |
+| C4 | delete `Guard` | `arena.rs:758-769`; `emit/mod.rs:4060-4066`; about 20 files | nothing. If the demand track needs a guard node, its arms live in the arena. **Done** (2026-10-05, commits "retire the guard-arm scope" and "retire ExprNode::Guard") |
 
-**`emit::compile` stays outside the law, by name.** It is the kept raw
-research entry (`emit/mod.rs:3916`, 22 files). CLAUDE.md's "never obtained
+**`pipeline::compile` stays outside the law, by name.** It is the kept raw
+research entry (`pixelflow-codegen/src/pipeline.rs`, public as
+`emit::compile`, 22 files). CLAUDE.md's "never obtained
 unoptimized" is corrected to "through `jit_cache` or `program`".
 
 **How the bytes load (I).** They load through `ExecutableCode::from_code`.
@@ -850,7 +857,12 @@ and M6 land there, in B5, with the macro tier's saturation.
 - M16's gate is that no production kernel quadratures, which
   `glyph_is_closed` already implies for glyphs.
 
-**CL7: C4, `Guard` deleted.**
+**CL7: C4, `Guard` deleted.** **Done** (2026-10-05, commits "retire the guard-arm scope" and "retire ExprNode::Guard"): the
+emitter's arm scopes first, then the IR node and every matcher. Gated
+byte-identical against the parent: `byte_probe` on both x86 tiers,
+`demand_move_byte_check`, a per-glyph hash walk over the ASCII range and
+`optimizer_equivalence`; the chrome (3 guards, 6 arms) and silhouette (1, 1)
+branch pins and `glyph_branches` did not move.
 
 **CL8: the glyph's table is a kernel backed by uniforms (Q2).**
 - A8, G1–G3, B3, B4, B6 and U4.

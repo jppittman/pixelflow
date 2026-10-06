@@ -73,8 +73,8 @@ pub struct Domain {
 ///
 /// # Panics
 ///
-/// - If a `Ref`, a `Guard` or a `Dwrt` (any arity) is reachable from
-///   `root`. A `Ref`/`Guard` is a name:
+/// - If a `Ref` or a `Dwrt` (any arity) is reachable from
+///   `root`. A `Ref` is a name:
 ///   [`substitute_vars_with`](ExprArena::substitute_vars_with) copies it
 ///   through without reaching the referent's `Var(0)`, so the warp below
 ///   would silently never reach it. A `Dwrt` must be taken with respect to
@@ -136,7 +136,7 @@ const PASS_ORDER: &str = "expand_refs -> lower_dwrt -> collapse -> pack -> expan
 /// Which binder slots [`collapse`] must not choose — bound by a reachable
 /// `Reduce`, or read by a reachable `Var` in the binder range — found in one
 /// walk of `root`'s reachable subgraph that also refuses, by panicking and
-/// naming [`PASS_ORDER`], any reachable `Ref`, `Guard` or `Dwrt` (see
+/// naming [`PASS_ORDER`], any reachable `Ref` or `Dwrt` (see
 /// [`collapse`]'s own doc for why each is refused).
 fn reachable_taken_binders(arena: &ExprArena, root: ExprId) -> [bool; Binder::COUNT] {
     let mut taken = [false; Binder::COUNT];
@@ -153,11 +153,6 @@ fn reachable_taken_binders(arena: &ExprArena, root: ExprId) -> [bool; Binder::CO
                  and substitute_vars_with copies it through without \
                  reaching the referent's Var(0), so the coordinate warp \
                  would silently never reach it; run expand_refs first \
-                 ({PASS_ORDER})"
-            ),
-            ExprNode::Guard { .. } => panic!(
-                "collapse: a Guard is reachable from root — a name, for the \
-                 same reason as a Ref above; run expand_refs first \
                  ({PASS_ORDER})"
             ),
             ExprNode::Unary(OpKind::Dwrt, _)

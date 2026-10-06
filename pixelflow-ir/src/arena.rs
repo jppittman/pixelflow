@@ -63,11 +63,6 @@ enum NodeData {
     Ternary(OpKind),
     Nary(OpKind),
     Reduce(Fold),
-    /// `Guard`'s two names. The mask is the node's one DAG edge, exactly as
-    /// [`Reduce`](Self::Reduce)'s body and [`Write`](Self::Write)'s value
-    /// are — see [`ExprNode::Guard`]'s doc for why the arms are names and
-    /// not edges.
-    Guard(KernelKey, KernelKey),
     /// `Write`'s three binders. The value is the node's one DAG edge, as
     /// for [`Reduce`](Self::Reduce) — see [`ExprNode::Write`]'s doc.
     Write(Binder, Binder, Binder),
@@ -407,32 +402,6 @@ pub enum ExprNode {
         fold: Fold,
         body: ExprId,
     },
-    /// The hard lowering of [`OpKind::If`]: a branch, where only the
-    /// taken arm's body runs, denoting the exact same function as the soft
-    /// (blend) form (docs/plans/2026-09-12-emit-should-just-emit.md §1).
-    ///
-    /// `mask` is a real child — it lives in *this* arena and is evaluated
-    /// unconditionally, the same value an `If` would test. `on` and `off`
-    /// are content-addressed names, not children: `passes::expand_refs` runs
-    /// unconditionally in every compile entry point and would splice an
-    /// `ExprNode::Ref` child in before codegen ever saw it, destroying the
-    /// very boundary a branch needs (its arm's extent must stay exactly the
-    /// named kernel, nothing spliced in early). Fields make a non-`Ref` arm
-    /// unrepresentable rather than forbidden by a comment — the same move
-    /// [`Fold`] made when a reduction's metadata stopped being a `Const`
-    /// child (see [`Reduce`](Self::Reduce)'s doc). So this node has one
-    /// child — the mask — and two names, exactly as `Reduce` has one child
-    /// and metadata that is not a child.
-    ///
-    /// G1: constructible, but nothing here chooses one. `passes::expand_refs`
-    /// leaves `on`/`off` untouched (they are not `Ref` nodes to rewrite);
-    /// codegen expanding them as regions and extraction pricing the choice
-    /// are G2/G3.
-    Guard {
-        mask: ExprId,
-        on: KernelKey,
-        off: KernelKey,
-    },
     /// A store: the one effect in the language, and the body of the folds a
     /// lattice is (docs/plans/2026-09-16-collapse-is-a-fold.md §2.4).
     ///
@@ -449,7 +418,7 @@ pub enum ExprNode {
     /// are over [`Monoid::SEQ`](crate::fold::Monoid::SEQ). Constructible only
     /// by the legalize passes that wrap a kernel in the lattice
     /// ([`ExprArena::push_write`] is `pub(crate)`); the e-graph declines one
-    /// and `kernel!` cannot name one, exactly as for [`Guard`](Self::Guard).
+    /// and `kernel!` cannot name one.
     /// One child, the value, as `Reduce` has its body.
     Write {
         row: Binder,
@@ -885,19 +854,6 @@ impl ExprArena {
         self.intern(NodeData::Ref(key), &[])
     }
 
-    /// Push a `Guard(mask, on, off)` leaf-with-one-child — the hard lowering
-    /// of `If`: only the arm the mask selects runs.
-    ///
-    /// `mask` must already exist in this arena; `on` and `off` name kernels
-    /// in the [`KernelStore`](crate::store::KernelStore), exactly as
-    /// [`push_ref`](Self::push_ref)'s key does, and are not checked here for
-    /// the same reason. No production path calls this yet — it is
-    /// constructible so `Guard` has a way into an arena at all, ahead of the
-    /// codegen (G2) and extraction (G3) that give it a meaning beyond one.
-    pub fn push_guard(&mut self, mask: ExprId, on: KernelKey, off: KernelKey) -> ExprId {
-        self.intern(NodeData::Guard(on, off), &[mask])
-    }
-
     /// Get the declaration for a uniform slot.
     ///
     /// # Panics
@@ -1087,11 +1043,6 @@ impl ExprArena {
                 let body = kids.next().expect("a Reduce node has one DAG child");
                 ExprNode::Reduce { fold, body }
             }
-            NodeData::Guard(on, off) => {
-                let mut kids = dag_children(n);
-                let mask = kids.next().expect("a Guard node has one DAG child");
-                ExprNode::Guard { mask, on, off }
-            }
             NodeData::Write(row, col, lane) => {
                 let mut kids = dag_children(n);
                 let value = kids.next().expect("a Write node has one DAG child");
@@ -1133,17 +1084,6 @@ impl ExprArena {
             | NodeData::Ternary(op)
             | NodeData::Nary(op) => op,
             NodeData::Reduce(_) => OpKind::Reduce,
-            // A branch is not an operation any vocabulary names yet: no
-            // extraction can choose one (G1), so no cost table or emitter
-            // needs an `OpKind` to dispatch on. Giving it one now would let
-            // it into a cost model or emitter switch that has no rule for
-            // it; asking for its mask directly is always available and
-            // needs no `kind`.
-            NodeData::Guard(..) => panic!(
-                "ExprArena::kind: a Guard is a branch, not an operation — no \
-                 OpKind describes it (G3 gives extraction a price for the \
-                 choice); ask about its mask directly"
-            ),
             // A store is an effect, not an operation: it computes nothing a
             // cost table could price or an arithmetic rule could rewrite,
             // and the one consumer that executes it (the emitter, on the
@@ -1198,13 +1138,6 @@ impl ExprArena {
                 let mut kids = dag_children(n);
                 ExprChildren::One(kids.next().expect("a Reduce node has one DAG child"))
             }
-            // One child — the mask — exactly as `Reduce` yields its body and
-            // `Ref` yields nothing: `on`/`off` are names, not edges, so no
-            // walk over children can reach into either arm.
-            NodeData::Guard(..) => {
-                let mut kids = dag_children(n);
-                ExprChildren::One(kids.next().expect("a Guard node has one DAG child"))
-            }
             // One child, the value stored. The binders are the node's own
             // metadata, as a `Reduce`'s fold is: an index, not an operand.
             NodeData::Write(..) => {
@@ -1257,7 +1190,6 @@ impl ExprArena {
                     }
                 }
                 ExprNode::Reduce { body, .. } => stack.push((*body, d + 1)),
-                ExprNode::Guard { mask, .. } => stack.push((*mask, d + 1)),
                 ExprNode::Write { value, .. } => stack.push((*value, d + 1)),
             }
         }
@@ -1296,7 +1228,6 @@ impl ExprArena {
                     }
                 }
                 ExprNode::Reduce { body, .. } => stack.push(*body),
-                ExprNode::Guard { mask, .. } => stack.push(*mask),
                 ExprNode::Write { value, .. } => stack.push(*value),
             }
         }
@@ -1349,7 +1280,6 @@ impl ExprArena {
                     }
                 }
                 ExprNode::Reduce { body, .. } => stack.push(*body),
-                ExprNode::Guard { mask, .. } => stack.push(*mask),
                 ExprNode::Write { value, .. } => stack.push(*value),
             }
         }
@@ -1394,7 +1324,6 @@ impl ExprArena {
                     }
                 }
                 ExprNode::Reduce { body, .. } => stack.push(*body),
-                ExprNode::Guard { mask, .. } => stack.push(*mask),
                 ExprNode::Write { value, .. } => stack.push(*value),
             }
         }
@@ -1523,13 +1452,6 @@ impl ExprArena {
                         ExprNode::Reduce { fold, body } => {
                             let body = m(body);
                             self.push_reduce(fold, body)
-                        }
-                        // Same as `Ref`: `on`/`off` are content-addressed, so
-                        // they mean the same kernel in every arena and need
-                        // no remapping. Only the mask, a real child, moves.
-                        ExprNode::Guard { mask, on, off } => {
-                            let mask = m(mask);
-                            self.push_guard(mask, on, off)
                         }
                         ExprNode::Write {
                             row,
@@ -1766,18 +1688,6 @@ impl ExprArena {
                             let body = m(body);
                             self.push_reduce(fold, body)
                         }
-                        // `on`/`off` are names, not expressions reachable
-                        // here, so a coordinate warp cannot reach inside
-                        // either arm — exactly the situation `Ref` is in
-                        // (`Kernel::at`'s doc), and for the same reason: only
-                        // the mask, a real child of this arena, is rewritten.
-                        // A composable way to warp a `Guard`'s arms is a
-                        // question for whichever stage first exposes `Guard`
-                        // to `Kernel`-level composition (not G1).
-                        ExprNode::Guard { mask, on, off } => {
-                            let mask = m(mask);
-                            self.push_guard(mask, on, off)
-                        }
                         ExprNode::Write {
                             row,
                             col,
@@ -1934,13 +1844,6 @@ impl ExprArena {
                     let body = m(*body);
                     out.push_reduce(*fold, body)
                 }
-                // `on`/`off` name kernels outside this arena entirely, so
-                // there is no buffer/uniform slot of theirs to relink here —
-                // only the mask, a real child, can hold one.
-                ExprNode::Guard { mask, on, off } => {
-                    let mask = m(*mask);
-                    out.push_guard(mask, *on, *off)
-                }
                 ExprNode::Write {
                     row,
                     col,
@@ -2020,16 +1923,6 @@ impl ExprArena {
                         stack.push(Task::WriteStr(")"));
                         stack.push(Task::Visit(*body));
                         write!(f, "{}[{fold}](", OpKind::Reduce.name())?;
-                    }
-                    ExprNode::Guard { mask, on, off } => {
-                        stack.push(Task::WriteStr(")"));
-                        stack.push(Task::Visit(*mask));
-                        write!(
-                            f,
-                            "Guard[on={:#018x}, off={:#018x}](",
-                            on.bits(),
-                            off.bits()
-                        )?;
                     }
                     ExprNode::Write {
                         row,
@@ -2163,25 +2056,6 @@ impl ExprArena {
                     for i in 0..len {
                         stack.push((self.nary_children[ss + i], other.nary_children[os + i]));
                     }
-                }
-                // Same treatment as `Ref`: `on`/`off` are keys, compared
-                // directly, and only the mask recurses.
-                (
-                    ExprNode::Guard {
-                        mask: s_mask,
-                        on: s_on,
-                        off: s_off,
-                    },
-                    ExprNode::Guard {
-                        mask: o_mask,
-                        on: o_on,
-                        off: o_off,
-                    },
-                ) => {
-                    if s_on != o_on || s_off != o_off {
-                        return false;
-                    }
-                    stack.push((*s_mask, *o_mask));
                 }
                 (
                     ExprNode::Write {
@@ -2704,131 +2578,6 @@ mod tests {
         assert_eq!(compact.len(), 3, "X, the read uniform, the sum");
         assert_eq!(compact.uniforms(), a.uniforms(), "every slot, in order");
         assert!(compact.subtree_eq(compact_root, &a, root));
-    }
-}
-
-/// `ExprNode::Guard` (docs/plans/2026-09-12-emit-should-just-emit.md, stage
-/// G1): constructible, but its arms are names — `KernelKey`s — rather than
-/// children, so every property here is checked against `ExprArena::push_guard`
-/// directly. Nothing resolves the keys (no `KernelStore` entries exist for
-/// them in these tests), which is fine: every property below is about the
-/// *node*, not its referents.
-#[cfg(test)]
-mod guard_tests {
-    use super::*;
-    use crate::key::KernelKey;
-
-    #[test]
-    fn children_yields_exactly_the_mask() {
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let zero = arena.push_const(0.0);
-        let mask = arena.push_binary(OpKind::Lt, x, zero);
-        let on = KernelKey::from_bits(1);
-        let off = KernelKey::from_bits(2);
-        let guard = arena.push_guard(mask, on, off);
-
-        let children: Vec<ExprId> = arena.children(guard).collect();
-        assert_eq!(
-            children,
-            alloc::vec![mask],
-            "one child: the mask, nothing else"
-        );
-        assert_eq!(arena.children(guard).len(), 1);
-        assert!(matches!(
-            arena.node(guard),
-            ExprNode::Guard { mask: m, on: o, off: f } if m == mask && o == on && f == off
-        ));
-    }
-
-    /// `kind()` gives every real operation an `OpKind`; a `Guard` is not one
-    /// yet (no vocabulary, cost table, or emitter has a rule for it — G3 is
-    /// what would give extraction a price to choose between it and
-    /// `If`). Pinning the exact panic keeps that reason from silently
-    /// becoming "not implemented".
-    #[test]
-    #[should_panic(expected = "a Guard is a branch, not an operation")]
-    fn kind_refuses_a_guard() {
-        let mut arena = ExprArena::new();
-        let mask = arena.push_const(1.0);
-        let guard = arena.push_guard(mask, KernelKey::from_bits(1), KernelKey::from_bits(2));
-        let _kind = arena.kind(guard);
-    }
-
-    /// Traversals that walk a `Reduce`'s body the same way walk a `Guard`'s
-    /// mask: `depth`, `has_var`, `has_degenerate`, `node_count_subtree`.
-    #[test]
-    fn traversals_reach_the_mask_but_not_the_arm_names() {
-        let mut arena = ExprArena::new();
-        let x = arena.push_var(0);
-        let zero = arena.push_const(0.0);
-        let mask = arena.push_binary(OpKind::Gt, x, zero);
-        let guard = arena.push_guard(mask, KernelKey::from_bits(7), KernelKey::from_bits(8));
-
-        assert!(arena.has_var(guard), "the mask reads X");
-        assert_eq!(arena.depth(guard), 1 + arena.depth(mask));
-        // self + mask's own two nodes (Gt, X — the Const(0.0) is shared? no,
-        // each push is distinct here) reachable from the guard.
-        assert_eq!(
-            arena.node_count_subtree(guard),
-            1 + arena.node_count_subtree(mask)
-        );
-
-        let mut degenerate_arena = ExprArena::new();
-        let bad_mask = degenerate_arena.push_const(f32::NAN);
-        let degenerate_guard =
-            degenerate_arena.push_guard(bad_mask, KernelKey::from_bits(1), KernelKey::from_bits(2));
-        assert!(degenerate_arena.has_degenerate(degenerate_guard));
-    }
-
-    /// Two `Guard`s over the same mask and the same two arm keys are one
-    /// term; a different key on either side breaks that.
-    #[test]
-    fn subtree_eq_compares_arms_by_key_and_recurses_into_the_mask() {
-        let mut a = ExprArena::new();
-        let mask_a = a.push_var(0);
-        let on = KernelKey::from_bits(10);
-        let off = KernelKey::from_bits(20);
-        let guard_a = a.push_guard(mask_a, on, off);
-
-        let mut b = ExprArena::new();
-        let mask_b = b.push_var(0);
-        let guard_b = b.push_guard(mask_b, on, off);
-        assert!(a.subtree_eq(guard_a, &b, guard_b));
-
-        let mut c = ExprArena::new();
-        let mask_c = c.push_var(0);
-        let guard_c = c.push_guard(mask_c, KernelKey::from_bits(99), off);
-        assert!(
-            !a.subtree_eq(guard_a, &c, guard_c),
-            "a different `on` key differs"
-        );
-
-        let mut d = ExprArena::new();
-        let mask_d = d.push_var(1); // a different mask
-        let guard_d = d.push_guard(mask_d, on, off);
-        assert!(
-            !a.subtree_eq(guard_a, &d, guard_d),
-            "a different mask differs"
-        );
-    }
-
-    #[test]
-    fn display_shows_mask_and_both_arm_keys() {
-        let mut arena = ExprArena::new();
-        let mask = arena.push_var(0);
-        let guard = arena.push_guard(mask, KernelKey::from_bits(0x11), KernelKey::from_bits(0x22));
-        let shown = format!("{}", arena.display(guard));
-        assert!(shown.contains("Guard"));
-        assert!(shown.contains("Var(0)"), "the mask is shown: {shown}");
-        assert!(
-            shown.contains("0x0000000000000011"),
-            "on's key is shown: {shown}"
-        );
-        assert!(
-            shown.contains("0x0000000000000022"),
-            "off's key is shown: {shown}"
-        );
     }
 }
 

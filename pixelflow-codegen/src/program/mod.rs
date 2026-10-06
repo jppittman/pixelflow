@@ -7,15 +7,14 @@
 //! produces and what allocation and emission consume, which is why it lives
 //! under neither.
 
-// Dormant until layout consumes it: carried by debug builds, tests and the
-// `layout-shadow` feature, which is where the check against the old
-// exclusivity analysis runs.
-#[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
+pub(crate) mod guards;
 pub(crate) mod layout;
-#[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
+pub(crate) mod lower;
 pub(crate) mod ownership;
-#[cfg(any(test, debug_assertions, feature = "layout-shadow"))]
+mod scopes;
 pub(crate) mod tree;
+#[cfg(test)]
+pub(crate) use scopes::lay_out;
 
 use alloc::vec::Vec;
 
@@ -72,7 +71,7 @@ pub enum ScheduledOp {
     Ternary(OpKind, ValueId, ValueId, ValueId),
     /// Bit-shift by a compile-time immediate: `op` is `Shl` or `Shr`, the value
     /// is `ValueId`, and the shift count is folded out of the `Const` RHS by
-    /// `arena_to_schedule` (so it never becomes a scheduled value / register).
+    /// `lower::arena_to_schedule` (so it never becomes a scheduled value / register).
     ShiftImm(OpKind, ValueId, u8),
     /// Bound-memory gather: read the buffer whose base is the second operand
     /// at the lane index computed by the first. Lowered from
@@ -83,7 +82,7 @@ pub enum ScheduledOp {
     Gather(ValueId, ValueId),
     /// A `Gather` whose index is the same in every lane: one scalar load,
     /// broadcast. The same `RawGather(Buffer(slot), index)`, split from
-    /// [`ScheduledOp::Gather`] by `arena_to_schedule` on the index's
+    /// [`ScheduledOp::Gather`] by `lower::arena_to_schedule` on the index's
     /// variance — it lacks the lane binder's bit, so lane 0 *is* the index
     /// and the other lanes are copies of it. A glyph's per-piece table
     /// reads are addressed by its fold's own binder and nothing else, which
@@ -109,7 +108,7 @@ pub enum ScheduledOp {
     Context(u16),
     /// The lane fold's binder: the constant `[0, 1, …, L−1]`. The fold
     /// whose binder this is executes by lanes (its body is inlined into its
-    /// parent's schedule — see `arena_to_schedule`), so the binder is a
+    /// parent's schedule — see `lower::arena_to_schedule`), so the binder is a
     /// leaf here rather than a loop counter. Carries the binder so its
     /// variance bit is the fold's, which is what "lane-uniform" is read off.
     Lanes(Binder),
@@ -134,36 +133,16 @@ pub enum ScheduledOp {
     Seq(ValueId, ValueId),
     /// A surviving bounded fold: `⊕` over `fold`'s visited indices, whose
     /// body is the value named by the second field — in *this schedule's*
-    /// numbering (`arena_to_schedule` maps it like any other child), before
-    /// `extract_folds` carves the body out into its own
-    /// [`ScopeFold`]. Kept only so `schedule_variance` can look
+    /// numbering (`lower::arena_to_schedule` maps it like any other child), before
+    /// `scopes::extract_folds` carves the body out into its own
+    /// [`ScopeFold`]. Kept only so `scopes::schedule_variance` can look
     /// the body's variance up (`Reduce`'s own result is the body's variance
-    /// with the binder's own bit removed) and so `extract_folds` can find
+    /// with the binder's own bit removed) and so `scopes::extract_folds` can find
     /// the body's closure; the emitter never resolves it as an operand —
     /// the loop's result comes from `regalloc::Allocation::opens_at`
     /// naming the [`Scope::Fold`] this def opens, not from this
     /// `ValueId`.
     Reduce(Fold, ValueId),
-    /// A surviving `Guard`: the mask, and its two arms' names. `mask` is a
-    /// real value in *this* schedule (`arena_to_schedule` maps it like any
-    /// other child); the two `KernelKey`s are not — they name kernels whose
-    /// bodies live in wholly separate arenas, resolved through
-    /// `KernelStore::resolve` by `extract_guards`, which schedules each arm
-    /// as its own [`Scope::GuardArm`], exactly as `extract_folds`
-    /// carves a [`ScheduledOp::Reduce`]'s body into its own
-    /// [`Scope::Fold`] — except an arm is not carved *out of*
-    /// anything here, since nothing of it was ever in this schedule to carve.
-    /// The emitter never resolves this def's operands the ordinary way: its
-    /// own `ValueId` is forced to a slot (`regalloc`'s `Scan`, mirroring a
-    /// `Reduce`'s accumulator), and the two arms' scopes — found by
-    /// `regalloc::Allocation::guard_opening_at` — are each emitted as a
-    /// nested scope bracketed by a branch instead of a loop
-    /// (docs/plans/2026-09-12-emit-should-just-emit.md §3).
-    Guard(
-        ValueId,
-        pixelflow_ir::key::KernelKey,
-        pixelflow_ir::key::KernelKey,
-    ),
 }
 
 impl ScheduledOp {
@@ -206,22 +185,6 @@ pub enum Scope {
     /// `NestAllocation::folds`. It opens in the *middle* of its parent's
     /// schedule, which is what makes the nest a tree.
     Fold(usize),
-    /// One arm of a surviving `Guard`, indexing
-    /// `NestAllocation::guard_arms`. Also opens in the middle of its
-    /// parent's schedule — at the `Guard` def, exactly as a fold opens at
-    /// its `Reduce` — but it is a branch, not a loop: it runs at most once
-    /// per time its parent's def is reached, carries nothing in (a guard
-    /// arm's arena is wholly separate from its parent's — a name, not a
-    /// closure), and hands back one result the parent stores to a shared
-    /// slot (docs/plans/2026-09-12-emit-should-just-emit.md §3). Additive
-    /// to [`Scope::Fold`] rather than unified with it: the two are the same
-    /// shape to the frame layout (a region opening mid-schedule) but
-    /// different in what crosses the boundary, and every existing `Fold`
-    /// consumer already assumes a `Reduce` at the opening def — keeping
-    /// this a separate variant means those consumers need no change to
-    /// keep answering exactly as they did before a `Guard` ever reached
-    /// this allocator (the G2 byte-identity gate).
-    GuardArm(usize),
 }
 
 /// A schedule split by scope: the body the call runs once, and the folds
@@ -244,13 +207,6 @@ pub struct ScopedSchedule {
     /// The surviving folds, in [`Scope::Fold`] order — every one of them,
     /// the lattice's own included.
     pub folds: Vec<ScopeFold>,
-    /// The surviving `Guard`s' arms, in [`Scope::GuardArm`] order. Built
-    /// separately from `folds` — after `RegisterAllocator::allocate_nest`'s
-    /// caller has already carved the folds out and clustered their arms —
-    /// because a guard arm's schedule does not come from carving anything
-    /// out of this nest's own; it comes from resolving a wholly separate
-    /// `KernelKey` (see [`Scope::GuardArm`]'s doc).
-    pub guard_arms: Vec<ScopeGuardArm>,
 }
 
 /// One scope of a [`ScopedSchedule`] that opens nowhere: the body.
@@ -278,26 +234,6 @@ pub struct ScopeFold {
     /// The loop body, in topological order.
     pub schedule: Vec<Def>,
     /// The body's `If` guards, as [`ScopeRegion::guards`].
-    pub(crate) guards: Vec<IfGuard>,
-}
-
-/// One arm of a surviving `Guard`, as an input to
-/// `RegisterAllocator::allocate_nest`: a scope that opens in the middle of
-/// another scope, exactly like [`ScopeFold`], but with no `roots` — its
-/// schedule is wholly self-contained (a separate arena's own, freshly
-/// numbered), so it has nothing to read from its parent beyond the branch
-/// condition the parent resolves before ever reaching this scope.
-pub struct ScopeGuardArm {
-    /// The scope whose schedule holds the `Guard` def this is an arm of.
-    pub parent: Scope,
-    /// The `Guard` def's position in `parent`'s schedule.
-    pub at: usize,
-    /// Which of the `Guard`'s two arms this is.
-    pub arm: IfArm,
-    /// This arm's own evaluation order, in topological order, ending at the
-    /// value the parent stores to the `Guard`'s result slot.
-    pub schedule: Vec<Def>,
-    /// The arm's `If` guards, as [`ScopeRegion::guards`].
     pub(crate) guards: Vec<IfGuard>,
 }
 
@@ -443,9 +379,9 @@ impl IfGuard {
 /// The values an operation reads *as registers*, in operand order.
 ///
 /// A `Reduce` is a leaf here, the same as `Uniform` — by the time one reaches
-/// a schedule this function walks, `extract_folds` has already carved its
+/// a schedule this function walks, `scopes::extract_folds` has already carved its
 /// body out into its own `ScopeFold`; the `ValueId` `ScheduledOp::Reduce`
-/// still carries is `schedule_variance`'s and `extract_folds`'s own concern
+/// still carries is `scopes::schedule_variance`'s and `scopes::extract_folds`'s own concern
 /// (they run before extraction, and after respectively, over different
 /// schedules), never an operand this scope's allocation resolves. What the
 /// loop it opens reads from this scope is a dependency all the same, and the
@@ -469,13 +405,6 @@ pub(crate) fn operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use
         | ScheduledOp::Gather(a, _)
         | ScheduledOp::Broadcast(a, _) => (Some(*a), None, None),
         ScheduledOp::Write { value, .. } => (Some(*value), None, None),
-        // A `Guard`'s mask is the one register operand its own def reads —
-        // its two arms are names into a wholly separate arena, not values in
-        // this schedule, exactly as a `Reduce`'s body is not (see the doc
-        // above) but without even that much: an arm's operands are its own
-        // scope's concern (`LinearScan::allocate_nest`'s guard-arm loop),
-        // never this scope's.
-        ScheduledOp::Guard(mask, _, _) => (Some(*mask), None, None),
         ScheduledOp::Binary(_, a, b) => (Some(*a), Some(*b), None),
         ScheduledOp::Ternary(_, a, b, c) => (Some(*a), Some(*b), Some(*c)),
     };

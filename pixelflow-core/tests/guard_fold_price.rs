@@ -27,7 +27,7 @@
 //!
 //! That the guard forms is not visible from here — nothing outside
 //! `pixelflow-codegen` can name a guard — and is pinned there
-//! (`emit::guards`' unit tests price the arm; `emit`'s test
+//! (`program::guards`' unit tests price the arm; `emit`'s test
 //! `a_fold_owned_by_an_arm_is_guarded` finds the branch in the allocated
 //! nest).
 

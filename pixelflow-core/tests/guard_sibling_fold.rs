@@ -2,11 +2,13 @@
 //! arm depends on it — or it depends on something outside the arm — through
 //! the fold's *body* rather than through a register operand.
 //!
-//! `pixelflow-codegen/src/emit/guards.rs` decides which schedule entries a
-//! `If`'s arm owns (`if_arms`), and reorders a scope so an arm is one
-//! contiguous run (`cluster_if_arms`). Both used to read dependencies off
+//! `pixelflow-codegen`'s `program::ownership` decides which schedule entries an
+//! `If`'s arm owns and `program::layout` orders a scope so an arm is one
+//! contiguous run (before them, `emit/guards.rs`'s `if_arms` and
+//! `cluster_if_arms` did the same by search). All of them used to read
+//! dependencies off
 //! `regalloc::operands` alone, which treats a `Reduce` def as a leaf: once
-//! `extract_folds` has carved a fold's body into its own scope, nothing in the
+//! `extract_folds` (`program/scopes.rs`) has carved a fold's body into its own scope, nothing in the
 //! enclosing scope's schedule recorded what that body reads. They now read it
 //! from `guards::FoldReads` as well, which makes the def a consumer of what its
 //! fold reads. Two miscompiles came of the missing edges, each pinned below
@@ -16,7 +18,7 @@
 //!    `out = select(X < T, W·sin(X/10), 0) + D`, with `W = Σ_j |X − j/2|` and
 //!    `D = Σ_k |W − 40k|`. `D`'s body reads `W`'s accumulator through a
 //!    placeholder, so `W`'s only consumer in the batch scope was the arm's
-//!    `Mul`; `W`'s `Reduce` is never a scope root (`stays_put`), so the
+//!    `Mul`; `W`'s `Reduce` is never a scope root (`stays_put` in `program/scopes.rs`), so the
 //!    `OUTSIDE` pin did not cover it either. `sin`'s expansion alone prices
 //!    the arm past the 16-cycle bound, and it was guarded — `W`'s whole loop
 //!    inside the skipped range. On a batch whose mask is
@@ -27,10 +29,10 @@
 //!    `out = select(X < T, W·sin(X/10), 0)` with `W = Σ_j |X + Y − j/2|`.
 //!    `X + Y` is a batch-scope root read only by `W`'s body, so to the `If`
 //!    it was a stranger — outside its cone, since `W`'s `Reduce` had no
-//!    operands — and `partition_around` sank it past the `If`, *after* `W`'s
+//!    operands — and the clustering search sank it past the `If`, *after* `W`'s
 //!    loop. `W` then read the previous batch's `X + Y` on every batch, whether
-//!    or not any guard fired; `is_topological` walked the same leaf-`Reduce`
-//!    operands and did not notice. No sibling fold is involved.
+//!    or not any guard fired; its own topological check walked the same
+//!    leaf-`Reduce` operands and did not notice. No sibling fold is involved.
 //!
 //! Section 3 is the same two hazards reached another way — through a fold
 //! nested in the reader, from the mask or the other arm, in a fold's own

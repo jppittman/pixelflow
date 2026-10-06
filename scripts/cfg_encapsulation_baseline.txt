@@ -15,7 +15,6 @@ core-term/src/main.rs	#[cfg(not(unix))]	let log_file = OpenOptions::new()
 core-term/src/main.rs	#[cfg(not(unix))]	{
 core-term/src/main.rs	#[cfg(unix)]	let log_file = {
 core-term/src/main.rs	#[cfg(unix)]	{
-pixelflow-codegen/src/emit/aarch64.rs	#[cfg(target_arch = "aarch64")]	pub fn dump_jit_asm(
 pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "aarch64")]	{
 pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "x86_64")]	{
 pixelflow-codegen/src/emit/executable.rs	#[cfg(target_os = "linux")]	linux::test_sync_empty();
