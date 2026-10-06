@@ -46,34 +46,3 @@ impl Language {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const PARTS: [Part; 5] = [
-        Part::Functions,
-        Part::FunctionNames,
-        Part::FunctionBodies,
-        Part::Types,
-        Part::Comments,
-    ];
-
-    #[test]
-    fn every_part_query_compiles_and_captures_target() {
-        for language in Language::ALL {
-            for part in PARTS {
-                let Some(source) = language.query(part) else {
-                    continue;
-                };
-                let query = tree_sitter::Query::new(&language.grammar(), source)
-                    .unwrap_or_else(|e| panic!("{language:?} {part:?}: {e}"));
-                assert!(
-                    query
-                        .capture_index_for_name(crate::rule::TARGET_CAPTURE)
-                        .is_some()
-                );
-            }
-        }
-    }
-}

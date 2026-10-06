@@ -7,12 +7,12 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 
-use desloppify::agent::{self, Agent};
+use desloppify::agent;
 use desloppify::model::Provider;
-use desloppify::rate_limit::{Adaptive, AdaptiveConfig, RateLimiter, TokenBucket};
+use desloppify::rate_limit::{self, AdaptiveConfig, RateLimiter, SystemClock, TokenBucketConfig};
 use desloppify::review::{Call, plan, review};
-use desloppify::rule::Rule;
-use desloppify::skills::Skills;
+use desloppify::rule::{self, Rule};
+use desloppify::skills;
 
 const SECONDS_PER_MINUTE: f64 = 60.0;
 /// The adaptive limiter never cuts below one call a minute.
@@ -72,8 +72,8 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
     let args = Args::parse();
-    let skills = Skills::load(&args.skills)?;
-    let rules = Arc::new(Rule::load_dir(&args.rules, &skills)?);
+    let skills = skills::load(&args.skills)?;
+    let rules = Arc::new(rule::load_dir(&args.rules, &skills)?);
 
     let mut files = Vec::new();
     for path in &args.paths {
@@ -86,7 +86,7 @@ async fn main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let agent = Arc::new(Agent::from_env(args.provider, limiter(&args), args.jobs)?);
+    let agent = Arc::new(agent::from_env(args.provider, limiter(&args), args.jobs)?);
     let report = review(agent, rules, plan).await?;
     for f in &report.findings {
         println!(
@@ -123,12 +123,15 @@ fn print_plan(rules: &[Rule], plan: &[Call]) {
 fn limiter(args: &Args) -> Box<dyn RateLimiter> {
     let max_wait = Duration::from_secs(args.max_wait_secs);
     match args.limiter {
-        Limiter::TokenBucket => Box::new(TokenBucket::new(
-            args.burst,
-            Duration::from_millis(args.refill_ms),
-            max_wait,
+        Limiter::TokenBucket => Box::new(rate_limit::token_bucket(
+            TokenBucketConfig {
+                capacity: args.burst,
+                refill: Duration::from_millis(args.refill_ms),
+                max_wait,
+            },
+            SystemClock,
         )),
-        Limiter::Adaptive => Box::new(Adaptive::new(
+        Limiter::Adaptive => Box::new(rate_limit::adaptive(
             AdaptiveConfig {
                 floor: FLOOR_RPM / SECONDS_PER_MINUTE,
                 start: args.rpm / SECONDS_PER_MINUTE,
@@ -138,6 +141,7 @@ fn limiter(args: &Args) -> Box<dyn RateLimiter> {
                 max_wait,
             },
             agent::classify,
+            SystemClock,
         )),
     }
 }

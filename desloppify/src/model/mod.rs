@@ -62,21 +62,3 @@ impl Provider {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn level_round_trips_through_json_as_an_integer() {
-        let level: ModelLevel = serde_json::from_str("3").unwrap();
-        assert_eq!(level, ModelLevel::Strong);
-        assert_eq!(serde_json::to_string(&level).unwrap(), "3");
-    }
-
-    #[test]
-    fn level_outside_one_to_four_is_refused() {
-        assert!(serde_json::from_str::<ModelLevel>("0").is_err());
-        assert!(serde_json::from_str::<ModelLevel>("5").is_err());
-    }
-}

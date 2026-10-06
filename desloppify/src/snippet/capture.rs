@@ -1,20 +1,13 @@
-//! The code a single review sees.
+//! Finding snippets with tree-sitter.
 
 use streaming_iterator::StreamingIterator;
 
+use super::Snippet;
 use crate::language::Language;
 use crate::rule::{CompiledQuery, Review, Rule, Scope};
 
 /// Between captures reviewed together.
 const GAP: &str = "  ...\n";
-
-pub struct Snippet {
-    /// 1-based line of the snippet's first line in its file.
-    pub first_line: u64,
-    /// The code, each line prefixed by its line number in the file so the
-    /// model can point at lines.
-    pub numbered: String,
-}
 
 impl Snippet {
     fn new(first_line: u64, text: &str) -> Self {
@@ -57,9 +50,11 @@ impl Snippet {
     }
 }
 
-/// The snippets `rule` reviews in `source`, a file in `language`. Empty when
-/// the rule does not apply to the language.
-pub fn snippets(rule: &Rule, language: Language, source: &str) -> anyhow::Result<Vec<Snippet>> {
+pub(super) fn snippets(
+    rule: &Rule,
+    language: Language,
+    source: &str,
+) -> anyhow::Result<Vec<Snippet>> {
     let Scope::Captures { queries, review } = &rule.scope else {
         return Ok(vec![Snippet::new(1, source)]);
     };

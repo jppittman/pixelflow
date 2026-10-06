@@ -53,13 +53,21 @@ A tight contract's signature refuses wrong shapes on its own:
   `bool` mode flag, or `&mut self` on what claims to be a query all admit
   behaviors the contract never stated.
 
-## Tests are written against the contract
+## Tests only ever see the exported API
 
-Tests drive the trait — through the public type, or generically
-(`fn contract<P: AnsiParser>(p: P)`) so every implementation is held to it — and
-observe the returned effects. A test that reaches a `pub(super)` field or a
-private helper is testing the implementation, and breaks when it is refactored
-without the contract changing.
+Every test is a black-box test. Even when what it checks is a specific
+internal behavior — the cursor stopping at the margin, the AIMD rate halving
+— it drives the module's exported interface and observes what that interface
+returns: feed `EmulatorInput`s and read the snapshot or the returned
+`EmulatorAction`s; call `RateLimiter::wait` and read the waits. Never a
+`pub(super)` field, a private helper, or a `#[cfg(test)] mod tests` inside an
+implementation file that can see them.
+
+When a behavior cannot be observed or controlled through the interface, that
+is a finding about the interface, not a license to reach in: make the input
+explicit (time becomes a `Clock` the constructor takes; randomness a seed)
+or the effect a returned value. A test generic over the trait
+(`fn contract<P: AnsiParser>(p: P)`) holds every implementation to it.
 
 ## Worked examples
 

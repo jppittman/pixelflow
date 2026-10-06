@@ -6,14 +6,14 @@ use std::path::PathBuf;
 
 use desloppify::language::Language;
 use desloppify::review::plan;
-use desloppify::rule::Rule;
-use desloppify::skills::Skills;
+use desloppify::rule::{self, Rule};
+use desloppify::skills;
 use desloppify::snippet::snippets;
 
 fn shipped() -> Vec<Rule> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let skills = Skills::load(&root.join("skills")).unwrap();
-    Rule::load_dir(&root.join("rules"), &skills).unwrap()
+    let skills = skills::load(&root.join("skills")).unwrap();
+    rule::load_dir(&root.join("rules"), &skills).unwrap()
 }
 
 fn rule(id: &str) -> Rule {

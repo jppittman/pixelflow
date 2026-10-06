@@ -14,6 +14,16 @@ before pointing a frontier level at a whole tree.
 Prints `path:line: [rule] message` per finding; exits non-zero on any finding
 or any snippet that could not be reviewed.
 
+## Layout
+
+desloppify follows its own rules: every module is a directory whose `mod.rs`
+is the contract — traits (`agent::Ask`, `rate_limit::RateLimiter`,
+`rate_limit::Clock`), the types they mention, and constructors returning
+`impl Trait` — and every other file is `pub(super)` implementation. All tests
+are in `tests/` and use only the exported API; time is an injected `Clock`
+so the limiters are tested without sleeping, and `review` is tested with a
+scripted `Ask`.
+
 ## Rules — `rules/<id>.json`
 
 ```json
@@ -74,6 +84,7 @@ already a CI job or a lint, and stays there.
 | `interface-lives-in-mod-rs` | 1 | impl files, at anything wider than `pub(super)` | behavioral contracts |
 | `behavior-through-the-trait` | 2 | public inherent methods | behavioral contracts |
 | `tests-target-the-contract` | 2 | test files | behavioral contracts |
+| `no-tests-inside-the-implementation` | 1 | test modules under `src/` | behavioral contracts |
 | `mod-rs-is-a-contract` | 3 | `mod.rs`, `lib.rs` | behavioral contracts |
 | `effects-are-returned` | 3 | traits and trait impls | behavioral contracts |
 
