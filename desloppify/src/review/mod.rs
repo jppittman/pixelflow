@@ -1,11 +1,15 @@
 //! A review: every rule over every file it applies to, one call per snippet.
 //!
 //! [`plan`] decides the calls without making any; [`review`] makes them
-//! through an [`Ask`] and gathers what comes back.
+//! through an [`Ask`] and gathers what comes back; [`synthesize`] has one
+//! frontier call read everything gathered and write the review a person
+//! reads. Each reviewer sees one rule and a little code, so none forgets a
+//! rule; the lead sees every finding, so the review reads as one.
 
 mod plan;
 mod reply;
 mod run;
+mod synthesize;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -84,4 +88,24 @@ pub async fn review<A: Ask>(
     plan: Vec<Call>,
 ) -> Result<Report> {
     run::review(agent, rules, plan).await
+}
+
+/// The review a person reads, written by one call at
+/// [`ModelLevel::Frontier`](crate::model::ModelLevel::Frontier) from every
+/// finding in `report`: grouped by file, duplicates across rules merged,
+/// trivial or mistaken findings dropped (and counted), recurring patterns
+/// called out. The call is told the prompt of each rule that found something
+/// and how many reviews failed. It returns the reply verbatim.
+///
+/// `Ok(None)`, with no call made, when `report` has no findings.
+///
+/// # Errors
+///
+/// The call failed.
+pub async fn synthesize<A: Ask>(
+    agent: &A,
+    rules: &[Rule],
+    report: &Report,
+) -> Result<Option<String>> {
+    synthesize::synthesize(agent, rules, report).await
 }

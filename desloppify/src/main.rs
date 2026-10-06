@@ -10,7 +10,7 @@ use clap::{Parser, ValueEnum};
 use desloppify::agent;
 use desloppify::model::Provider;
 use desloppify::rate_limit::{self, AdaptiveConfig, RateLimiter, SystemClock, TokenBucketConfig};
-use desloppify::review::{Call, plan, review};
+use desloppify::review::{Call, Report, plan, review, synthesize};
 use desloppify::rule::{self, Rule};
 use desloppify::skills;
 
@@ -60,6 +60,10 @@ struct Args {
     /// Most calls in flight at once, retries included.
     #[arg(long, default_value = "8")]
     jobs: NonZeroUsize,
+    /// Print each finding as `path:line: [rule] message` instead of the
+    /// lead reviewer's synthesized review.
+    #[arg(long)]
+    findings_only: bool,
     /// Count the calls each rule would make, and make none.
     #[arg(long)]
     dry_run: bool,
@@ -87,7 +91,24 @@ async fn main() -> Result<ExitCode> {
     }
 
     let agent = Arc::new(agent::from_env(args.provider, limiter(&args), args.jobs)?);
-    let report = review(agent, rules, plan).await?;
+    let report = review(agent.clone(), rules.clone(), plan).await?;
+    for failure in &report.failures {
+        eprintln!("error: {failure:#}");
+    }
+    if args.findings_only {
+        print_findings(&report);
+    } else if let Some(review) = synthesize(&*agent, &rules, &report).await? {
+        println!("{review}");
+    }
+    let clean = report.findings.is_empty() && report.failures.is_empty();
+    Ok(if clean {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+fn print_findings(report: &Report) {
     for f in &report.findings {
         println!(
             "{}:{}: [{}] {}",
@@ -97,15 +118,6 @@ async fn main() -> Result<ExitCode> {
             f.message
         );
     }
-    for failure in &report.failures {
-        eprintln!("error: {failure:#}");
-    }
-    let clean = report.findings.is_empty() && report.failures.is_empty();
-    Ok(if clean {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
 }
 
 /// Calls per rule, with each rule's level, and the total.

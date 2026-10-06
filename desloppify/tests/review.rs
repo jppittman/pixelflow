@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, bail};
 use desloppify::agent::Ask;
 use desloppify::model::ModelLevel;
-use desloppify::review::{plan, review};
+use desloppify::review::{Report, plan, review, synthesize};
 use desloppify::rule::{self, Rule};
 use desloppify::skills;
 
@@ -252,4 +252,41 @@ fn files_in_no_known_language_or_outside_a_rules_paths_plan_nothing() {
     let calls = plan(&tree.rules(), &files).unwrap();
     assert_eq!(calls.len(), 1);
     assert!(calls[0].path.ends_with("inside/a.rs"));
+}
+
+#[tokio::test]
+async fn a_report_without_findings_is_not_synthesized() {
+    let agent = Scripted::new(|_| Ok("unused".into()));
+    let review = synthesize(&*agent, &[], &Report::default()).await.unwrap();
+    assert!(review.is_none());
+    assert!(agent.asked.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_lead_review_is_one_frontier_call_over_every_finding_with_its_rule() {
+    let tree = Tree::new(
+        "lead",
+        &[(
+            "everything",
+            r#"{"level": 1, "scope": "file", "prompt": "Flag everything."}"#,
+        )],
+        &[("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")],
+    );
+    let reviewer = Scripted::new(|_| Ok(r#"[{"line": 1, "message": "needs work"}]"#.into()));
+    let report = run(&tree, &["a.rs", "b.rs"], reviewer).await;
+
+    let lead = Scripted::new(|_| Ok("# Review\n".into()));
+    let review = synthesize(&*lead, &tree.rules(), &report).await.unwrap();
+    assert_eq!(review.as_deref(), Some("# Review\n"));
+
+    let asked = lead.asked.lock().unwrap();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].level, ModelLevel::Frontier);
+    let brief = &asked[0].prompt;
+    assert!(brief.contains("`everything`: Flag everything."), "{brief}");
+    assert!(brief.contains("a.rs") && brief.contains("b.rs"), "{brief}");
+    assert!(
+        brief.contains("- line 1 [everything]: needs work"),
+        "{brief}"
+    );
 }

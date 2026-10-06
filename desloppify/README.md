@@ -11,7 +11,14 @@ GEMINI_API_KEY=...    cargo run -p desloppify -- --provider gemini path/to/src
 `--dry-run` counts the calls each rule would make and makes none — check it
 before pointing a frontier level at a whole tree.
 
-Prints `path:line: [rule] message` per finding; exits non-zero on any finding
+Each rule is applied by its own call, which sees one rule and a little code,
+so no reviewer forgets a rule. Then one level-4 call, the lead, reads every
+finding and writes the review: grouped by file, duplicates across rules
+merged, trivial or mistaken findings dropped and counted, recurring patterns
+called out. `--findings-only` prints the raw findings instead, one
+`path:line: [rule] message` per line.
+
+Exits non-zero on any finding
 or any snippet that could not be reviewed.
 
 ## Layout
@@ -68,6 +75,7 @@ already a CI job or a lint, and stays there.
 | `panicking-unwrap` | 1 | file, at each `unwrap`/`expect` | CLAUDE.md: no silent failures |
 | `test-names-it-should` | 1 | a file's test names together | STYLE: "it should" names |
 | `comment-says-why` | 2 | file | STYLE: comments |
+| `hidden-parser` | 2 | file, at each string split/trim/strip/parse | parse, don't poke at strings |
 | `guard-clauses` | 2 | file | STYLE: guard clauses |
 | `silent-failure` | 2 | file | CLAUDE.md: errors handled, fail loud |
 | `naming-consistency` | 2 | a file's fn names together | CLAUDE.md: name vs namespace |

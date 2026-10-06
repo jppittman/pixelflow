@@ -11,9 +11,18 @@ description: The repository's code style (docs/STYLE.md and CLAUDE.md "Code Styl
   *why* the current code is the way it is. No history in comments ("previously",
   "changed to", "updated to") and no commented-out code — that is version
   control's job.
-- **Guard clauses and early returns.** A function reads as a proof: discharge,
-  discharge, discharge, conclude. `let ... else`, `?`, and `return` delete a
-  case; nothing rejoins, so no `else` accumulates.
+- **Guard clauses and early returns.** The number of open cases — unhandled
+  inputs, unchecked invariants — should only go down as you read down a
+  function. The top is the hardest part to understand, because everything is
+  still possible; each guard discharges one case and exits, so by the bottom
+  exactly one case is left and what to do is obvious. `let ... else`, `?`, and
+  `return` delete a case; nothing rejoins, so no `else` accumulates and the
+  code doesn't drift rightward.
+- **Parse, don't poke at strings.** Splitting, trimming, prefix-stripping and
+  `parse::<T>()` on structured text is a parser, whether or not it is called
+  one. Parse once, at the boundary, into a type — a `serde` struct over a real
+  format (`toml`, `json`), a `FromStr` enum, or a grammar — and let the rest of
+  the code match on the type, never on the string.
 - **Fold before you dispatch.** A fold leaves fewer live cases than it found
   (`if x > 0.0 { x = -x }` needs no `else`). Dispatch keeps every case alive for
   everything downstream. Collapse cases wherever they collapse; use `match` for
