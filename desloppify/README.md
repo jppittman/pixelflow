@@ -1,18 +1,27 @@
 # desloppify
 
-Rule-driven code review. tree-sitter finds the code, an agent
-([rig](https://github.com/0xPlaygrounds/rig)) reviews it.
+Rule-driven code review. tree-sitter finds the code, a model reviews it.
 
 ```bash
+cargo run -p desloppify -- --backend dry-run path/to/src      # price it, no calls
+cargo run -p desloppify -- --backend claude-code path/to/src  # the Claude Code CLI
 ANTHROPIC_API_KEY=... cargo run -p desloppify -- path/to/src
-GEMINI_API_KEY=...    cargo run -p desloppify -- --provider gemini path/to/src
+GEMINI_API_KEY=...    cargo run -p desloppify -- --backend gemini path/to/src
 ```
 
-`--dry-run` makes no calls and prints, per rule and per level, the calls a
-run would make and roughly how many input tokens they send (four characters a
-token) — what a provider bills, so check it before pointing a level at a
-tree. The design is many small, cheap calls: most rules send one function at
-level 1, and only rules that need a whole file, or a whole crate, pay for one.
+Every backend implements one contract, `agent::Ask`, and reports the tokens
+each call used; a run ends with calls and tokens per rule and per level on
+stderr. `dry-run` is a backend like the others — it finds nothing and prices
+each call at four characters a token — so a dry run goes through exactly the
+pipeline a real one does. `claude-code` runs `claude -p` per call from an
+empty directory with no tools, MCP servers or settings; the cheap levels run
+with thinking off (it was most of their output, and output costs the most),
+the design levels at medium and high effort. Reviewers' replies are held to
+a JSON schema by the backend (`--json-schema`, or the API's structured
+output), so nothing parses around a model's prose.
+
+The design is many small, cheap calls: most rules send one function at level
+1, and only rules that need a whole file, or a whole crate, pay for one.
 
 Each rule is applied by its own call, which sees one rule and a little code,
 so no reviewer forgets a rule. Then one level-4 call, the lead, reads every
