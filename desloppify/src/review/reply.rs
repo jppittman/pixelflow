@@ -10,12 +10,39 @@ use crate::rule::Rule;
 
 const REVIEWER: &str = "\
 You are a code reviewer applying exactly one rule, given below. Report only \
-violations of that rule, in the code you are shown. Reply with only a JSON \
-array, no prose: one {\"line\": <line number>, \"message\": \"<what and why>\"} \
-per violation, using the line numbers printed in the code. When the code \
-comes from several files, each under a `== path ==` header, add \"path\": \
-\"<that path>\" to each violation. Reply [] if the code does not violate the \
-rule.";
+violations of that rule, in the code you are shown: one finding per \
+violation, with the line number printed in the code and what is wrong and \
+why. When the code comes from several files, each under a `== path ==` \
+header, give each finding that header's path. Report no findings if the code \
+does not violate the rule.";
+
+/// The shape every reviewer's reply must have.
+pub(super) fn schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "line": { "type": "integer" },
+                        "message": { "type": "string" }
+                    },
+                    "required": ["line", "message"]
+                }
+            }
+        },
+        "required": ["findings"]
+    })
+}
+
+/// A reply in [`schema`]'s shape.
+#[derive(Deserialize)]
+struct Replies {
+    findings: Vec<Reply>,
+}
 
 #[derive(Deserialize)]
 pub(super) struct Reply {
@@ -44,14 +71,10 @@ pub(super) fn prompt(call: &Call) -> String {
     prompt
 }
 
-/// The findings in a reply, tolerating the code fence models like to add.
+/// The findings in a reply, which the backend was asked to make satisfy
+/// [`schema`].
 pub(super) fn parse(reply: &str) -> Result<Vec<Reply>> {
-    let body = reply.trim();
-    let body = body
-        .strip_prefix("```json")
-        .or_else(|| body.strip_prefix("```"))
-        .unwrap_or(body);
-    let body = body.strip_suffix("```").unwrap_or(body);
-    serde_json::from_str(body.trim())
-        .with_context(|| format!("reply is not a findings array: {reply}"))
+    let replies: Replies = serde_json::from_str(reply)
+        .with_context(|| format!("reply is not a findings object: {reply}"))?;
+    Ok(replies.findings)
 }

@@ -11,12 +11,13 @@ mod reply;
 mod run;
 mod synthesize;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::agent::Ask;
+use crate::agent::{Answer, Ask, Usage};
 use crate::rule::Rule;
 use crate::snippet::Snippet;
 
@@ -57,6 +58,9 @@ pub struct Report {
     /// reply was not a JSON findings array. Each names its rule, file and
     /// first line.
     pub failures: Vec<anyhow::Error>,
+    /// Tokens used, by rule id: every call that was answered, whether or not
+    /// its answer could be read. A call that failed used nothing.
+    pub usage: BTreeMap<String, Usage>,
 }
 
 /// Every call a review of `files` under `rules` makes, in file order then
@@ -75,9 +79,10 @@ pub fn plan(rules: &[Rule], files: &[PathBuf]) -> Result<Vec<Call>> {
 ///
 /// Each call's system prompt is the reviewer's instructions followed by its
 /// rule's; its user prompt names the file and holds the snippet, then any
-/// module root, marked as context only. A reply is a JSON array of
-/// `{"line", "message"}`, optionally inside a code fence; anything else is a
-/// failure, as is a call that errs. One call failing does not stop the others.
+/// module root, marked as context only. Each call asks for a reply in a
+/// fixed JSON shape — `{"findings": [{"line", "message", "path"?}]}` — which
+/// the backend has the model satisfy; a reply that does not is a failure, as
+/// is a call that errs. One call failing does not stop the others.
 ///
 /// # Errors
 ///
@@ -95,7 +100,7 @@ pub async fn review<A: Ask>(
 /// finding in `report`: grouped by file, duplicates across rules merged,
 /// trivial or mistaken findings dropped (and counted), recurring patterns
 /// called out. The call is told the prompt of each rule that found something
-/// and how many reviews failed. It returns the reply verbatim.
+/// and how many reviews failed. It returns the reply verbatim, with its usage.
 ///
 /// `Ok(None)`, with no call made, when `report` has no findings.
 ///
@@ -106,16 +111,6 @@ pub async fn synthesize<A: Ask>(
     agent: &A,
     rules: &[Rule],
     report: &Report,
-) -> Result<Option<String>> {
+) -> Result<Option<Answer>> {
     synthesize::synthesize(agent, rules, report).await
-}
-
-/// Roughly how many input tokens `call` sends: its system and user prompts
-/// at four characters a token. An estimate for comparing rules and levels
-/// before a run, not a bill: tokenizers differ, and replies are not counted.
-#[must_use]
-pub fn estimated_tokens(rules: &[Rule], call: &Call) -> u64 {
-    const CHARS_PER_TOKEN: u64 = 4;
-    let rule = &rules[call.rule];
-    (reply::preamble(rule).len() + reply::prompt(call).len()) as u64 / CHARS_PER_TOKEN
 }

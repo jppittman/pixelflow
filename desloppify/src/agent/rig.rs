@@ -10,8 +10,8 @@ use rig_core::completion::CompletionRequest;
 use rig_core::providers::{anthropic::Anthropic, gemini::Gemini};
 use tokio::sync::Semaphore;
 
-use super::Ask;
-use crate::model::{ModelLevel, Provider};
+use super::{Answer, Ask, Question, Usage};
+use crate::model::Provider;
 use crate::rate_limit::{BoxError, RateLimiter, Signal};
 
 /// Enough for a list of findings; the reply is JSON, not prose.
@@ -54,9 +54,14 @@ impl RigAgent {
 }
 
 impl Ask for RigAgent {
-    async fn ask(&self, level: ModelLevel, preamble: &str, prompt: &str) -> Result<String> {
+    async fn ask(&self, question: &Question<'_>) -> Result<Answer> {
         let _permit = self.in_flight.acquire().await?;
-        let model = self.provider.model(level);
+        let model = self.provider.model(question.level);
+        let schema = question
+            .schema
+            .map(|s| schemars::Schema::try_from(s.clone()))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("invalid output schema: {e}"))?;
         let mut last: Option<BoxError> = None;
         loop {
             let wait = self
@@ -64,20 +69,21 @@ impl Ask for RigAgent {
                 .wait(last.take())
                 .map_err(|e| anyhow::anyhow!(e))?;
             tokio::time::sleep(wait).await;
-            let request = CompletionRequest::new(prompt)
-                .preamble(preamble)
-                .max_tokens(MAX_REPLY_TOKENS);
+            let request = CompletionRequest::new(question.prompt)
+                .preamble(question.system)
+                .max_tokens(MAX_REPLY_TOKENS)
+                .output_schema(schema.clone());
             let reply = match &self.client {
                 Client::Anthropic(client) => client
                     .completion(model)
                     .call(request)
                     .await
-                    .map(|r| r.text()),
+                    .map(|r| answer(&r.text(), &r.usage)),
                 Client::Gemini(client) => client
                     .completion(model)
                     .call(request)
                     .await
-                    .map(|r| r.text()),
+                    .map(|r| answer(&r.text(), &r.usage)),
             };
             let error = match reply {
                 Ok(text) => return Ok(text),
@@ -113,4 +119,15 @@ fn retry_after(error: &ProviderError) -> Option<Duration> {
         .parse()
         .ok()?;
     Some(Duration::from_secs(seconds))
+}
+
+fn answer(text: &str, usage: &rig_core::completion::Usage) -> Answer {
+    Answer {
+        text: text.to_owned(),
+        usage: Usage {
+            calls: 1,
+            input: usage.input_tokens.unwrap_or_default(),
+            output: usage.output_tokens.unwrap_or_default(),
+        },
+    }
 }

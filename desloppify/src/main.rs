@@ -7,10 +7,12 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 
-use desloppify::agent;
+use std::collections::BTreeMap;
+
+use desloppify::agent::{self, Ask, Usage};
 use desloppify::model::Provider;
 use desloppify::rate_limit::{self, AdaptiveConfig, RateLimiter, SystemClock, TokenBucketConfig};
-use desloppify::review::{Call, Report, estimated_tokens, plan, review, synthesize};
+use desloppify::review::{Call, Report, plan, review, synthesize};
 use desloppify::rule::{self, Rule};
 use desloppify::skills;
 
@@ -23,6 +25,19 @@ const GROWTH_RPM_PER_MINUTE: f64 = 10.0;
 /// Providers count requests per minute, so a minute after a cut every reply
 /// to a call made at the old rate is in.
 const COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Who answers the calls.
+#[derive(Clone, Copy, ValueEnum)]
+enum Backend {
+    /// Anthropic's API, from `ANTHROPIC_API_KEY`.
+    Anthropic,
+    /// Gemini's API, from `GEMINI_API_KEY`.
+    Gemini,
+    /// The Claude Code CLI, `claude -p`, on the account it is logged in to.
+    ClaudeCode,
+    /// No model: price the review without making a call.
+    DryRun,
+}
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Limiter {
@@ -38,8 +53,8 @@ struct Args {
     /// Files or directories to review.
     #[arg(required = true)]
     paths: Vec<PathBuf>,
-    #[arg(long, value_enum, default_value_t = Provider::Anthropic)]
-    provider: Provider,
+    #[arg(long, value_enum, default_value_t = Backend::Anthropic)]
+    backend: Backend,
     #[arg(long, value_enum, default_value_t = Limiter::Adaptive)]
     limiter: Limiter,
     /// Adaptive: calls per minute to start at.
@@ -64,9 +79,6 @@ struct Args {
     /// lead reviewer's synthesized review.
     #[arg(long)]
     findings_only: bool,
-    /// Count the calls each rule would make, and make none.
-    #[arg(long)]
-    dry_run: bool,
     #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/rules"))]
     rules: PathBuf,
     #[arg(long, default_value = concat!(env!("CARGO_MANIFEST_DIR"), "/skills"))]
@@ -85,27 +97,74 @@ async fn main() -> Result<ExitCode> {
     }
     let plan = plan(&rules, &files)?;
 
-    if args.dry_run {
-        print_plan(&rules, &plan);
-        return Ok(ExitCode::SUCCESS);
+    match args.backend {
+        Backend::Anthropic => run(api(Provider::Anthropic, &args)?, &args, rules, plan).await,
+        Backend::Gemini => run(api(Provider::Gemini, &args)?, &args, rules, plan).await,
+        Backend::ClaudeCode => run(agent::claude_code(args.jobs), &args, rules, plan).await,
+        Backend::DryRun => run(agent::dry_run(), &args, rules, plan).await,
     }
+}
 
-    let agent = Arc::new(agent::from_env(args.provider, limiter(&args), args.jobs)?);
+fn api(provider: Provider, args: &Args) -> Result<impl Ask> {
+    agent::from_env(provider, limiter(args), args.jobs)
+}
+
+async fn run<A: Ask>(
+    agent: A,
+    args: &Args,
+    rules: Arc<Vec<Rule>>,
+    plan: Vec<Call>,
+) -> Result<ExitCode> {
+    let agent = Arc::new(agent);
     let report = review(agent.clone(), rules.clone(), plan).await?;
     for failure in &report.failures {
         eprintln!("error: {failure:#}");
     }
-    if args.findings_only {
-        print_findings(&report);
-    } else if let Some(review) = synthesize(&*agent, &rules, &report).await? {
-        println!("{review}");
+    let lead = if args.findings_only {
+        None
+    } else {
+        synthesize(&*agent, &rules, &report).await?
+    };
+    match &lead {
+        Some(review) => println!("{}", review.text),
+        None => print_findings(&report),
     }
+    print_usage(&rules, &report, lead.map(|l| l.usage));
     let clean = report.findings.is_empty() && report.failures.is_empty();
     Ok(if clean {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// Calls and tokens per rule, per level, and the lead's, to stderr.
+fn print_usage(rules: &[Rule], report: &Report, lead: Option<Usage>) {
+    let row = |usage: &Usage, level: &str, name: &str| {
+        eprintln!(
+            "{:>8}  {:>12}  {:>10}  {level:>5}  {name}",
+            usage.calls, usage.input, usage.output
+        );
+    };
+    eprintln!(
+        "{:>8}  {:>12}  {:>10}  level  rule",
+        "calls", "in tokens", "out tokens"
+    );
+    let mut per_level: BTreeMap<u64, Usage> = BTreeMap::new();
+    for rule in rules {
+        let Some(usage) = report.usage.get(&rule.id) else {
+            continue;
+        };
+        let level = u64::from(rule.level);
+        row(usage, &level.to_string(), &rule.id);
+        *per_level.entry(level).or_default() += *usage;
+    }
+    for (level, usage) in &per_level {
+        row(usage, &level.to_string(), "(level total)");
+    }
+    if let Some(lead) = lead {
+        row(&lead, "4", "(lead review)");
+    }
 }
 
 fn print_findings(report: &Report) {
@@ -117,35 +176,6 @@ fn print_findings(report: &Report) {
             f.rule,
             f.message
         );
-    }
-}
-
-/// Calls and estimated input tokens per rule, then per level.
-fn print_plan(rules: &[Rule], plan: &[Call]) {
-    let mut per_rule = vec![(0_u64, 0_u64); rules.len()];
-    for call in plan {
-        let (calls, tokens) = &mut per_rule[call.rule];
-        *calls += 1;
-        *tokens += estimated_tokens(rules, call);
-    }
-    println!("{:>8}  {:>12}  level  rule", "calls", "~in tokens");
-    for (rule, (calls, tokens)) in rules.iter().zip(&per_rule) {
-        println!(
-            "{calls:>8}  {tokens:>12}  {:>5}  {}",
-            u64::from(rule.level),
-            rule.id
-        );
-    }
-    let mut per_level = std::collections::BTreeMap::new();
-    for (rule, (calls, tokens)) in rules.iter().zip(&per_rule) {
-        let (c, t) = per_level
-            .entry(u64::from(rule.level))
-            .or_insert((0_u64, 0_u64));
-        *c += calls;
-        *t += tokens;
-    }
-    for (level, (calls, tokens)) in per_level {
-        println!("{calls:>8}  {tokens:>12}  {level:>5}  (level total)");
     }
 }
 

@@ -5,17 +5,25 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
-use desloppify::agent::Ask;
+use desloppify::agent::{self, Answer, Ask, Question, Usage};
 use desloppify::model::ModelLevel;
 use desloppify::review::{Report, plan, review, synthesize};
 use desloppify::rule::{self, Rule};
 use desloppify::skills;
+
+/// What every scripted call reports using.
+const ONE_CALL: Usage = Usage {
+    calls: 1,
+    input: 100,
+    output: 10,
+};
 
 /// What a call was asked.
 struct Asked {
     level: ModelLevel,
     preamble: String,
     prompt: String,
+    constrained: bool,
 }
 
 /// Answers every prompt with `reply(prompt)`, recording what it was asked.
@@ -34,13 +42,17 @@ impl Scripted {
 }
 
 impl Ask for Scripted {
-    async fn ask(&self, level: ModelLevel, preamble: &str, prompt: &str) -> Result<String> {
+    async fn ask(&self, question: &Question<'_>) -> Result<Answer> {
         self.asked.lock().unwrap().push(Asked {
-            level,
-            preamble: preamble.to_owned(),
-            prompt: prompt.to_owned(),
+            level: question.level,
+            preamble: question.system.to_owned(),
+            prompt: question.prompt.to_owned(),
+            constrained: question.schema.is_some(),
         });
-        (self.reply)(prompt)
+        Ok(Answer {
+            text: (self.reply)(question.prompt)?,
+            usage: ONE_CALL,
+        })
     }
 }
 
@@ -103,7 +115,10 @@ async fn findings_come_back_sorted_by_path_then_line_with_their_rule() {
         &[("b.rs", "fn b() {}\n"), ("a.rs", "fn a() {}\n")],
     );
     let agent = Scripted::new(|_| {
-        Ok(r#"[{"line": 9, "message": "late"}, {"line": 1, "message": "early"}]"#.into())
+        Ok(
+            r#"{"findings": [{"line": 9, "message": "late"}, {"line": 1, "message": "early"}]}"#
+                .into(),
+        )
     });
     let report = run(&tree, &["b.rs", "a.rs"], agent).await;
 
@@ -131,16 +146,17 @@ async fn findings_come_back_sorted_by_path_then_line_with_their_rule() {
 }
 
 #[tokio::test]
-async fn a_fenced_reply_is_read_like_a_bare_one() {
+async fn reviewers_are_held_to_the_findings_schema_and_a_reply_outside_it_fails() {
     let tree = Tree::new(
-        "fenced",
+        "schema",
         &[("everything", WHOLE_FILE)],
         &[("a.rs", "fn a() {}\n")],
     );
-    let agent = Scripted::new(|_| Ok("```json\n[{\"line\": 1, \"message\": \"m\"}]\n```".into()));
-    let report = run(&tree, &["a.rs"], agent).await;
-    assert_eq!(report.findings.len(), 1);
-    assert_eq!(report.findings[0].message, "m");
+    let agent = Scripted::new(|_| Ok(r#"[{"line": 1, "message": "a bare array"}]"#.into()));
+    let report = run(&tree, &["a.rs"], agent.clone()).await;
+    assert!(agent.asked.lock().unwrap()[0].constrained);
+    assert!(report.findings.is_empty());
+    assert_eq!(report.failures.len(), 1);
 }
 
 #[tokio::test]
@@ -154,7 +170,7 @@ async fn a_prose_reply_is_a_failure_and_the_other_calls_still_count() {
         if prompt.contains("bad.rs") {
             return Ok("Looks fine to me!".into());
         }
-        Ok(r#"[{"line": 1, "message": "m"}]"#.into())
+        Ok(r#"{"findings": [{"line": 1, "message": "m"}]}"#.into())
     });
     let report = run(&tree, &["good.rs", "bad.rs"], agent).await;
     assert_eq!(report.findings.len(), 1);
@@ -190,12 +206,16 @@ async fn each_call_carries_its_rules_level_prompt_and_numbered_code() {
         )],
         &[("a.rs", "fn a() {}\nfn b() {}\n")],
     );
-    let agent = Scripted::new(|_| Ok("[]".into()));
+    let agent = Scripted::new(|_| Ok(r#"{"findings": []}"#.into()));
     run(&tree, &["a.rs"], agent.clone()).await;
 
     let asked = agent.asked.lock().unwrap();
     assert_eq!(asked.len(), 1);
     assert_eq!(asked[0].level, ModelLevel::Frontier);
+    assert!(
+        asked[0].constrained,
+        "a reviewer replies in the findings schema"
+    );
     assert!(asked[0].preamble.ends_with("Find the bug."));
     assert!(asked[0].prompt.contains("a.rs"));
     assert!(asked[0].prompt.contains("    2 | fn b() {}\n"));
@@ -211,7 +231,7 @@ async fn a_module_root_rule_shows_the_root_as_context_and_a_root_file_alone() {
         )],
         &[("m/mod.rs", "mod leaf;\n"), ("m/leaf.rs", "fn leaf() {}\n")],
     );
-    let agent = Scripted::new(|_| Ok("[]".into()));
+    let agent = Scripted::new(|_| Ok(r#"{"findings": []}"#.into()));
     run(&tree, &["m/leaf.rs", "m/mod.rs"], agent.clone()).await;
 
     let asked = agent.asked.lock().unwrap();
@@ -272,16 +292,22 @@ async fn the_lead_review_is_one_frontier_call_over_every_finding_with_its_rule()
         )],
         &[("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")],
     );
-    let reviewer = Scripted::new(|_| Ok(r#"[{"line": 1, "message": "needs work"}]"#.into()));
+    let reviewer =
+        Scripted::new(|_| Ok(r#"{"findings": [{"line": 1, "message": "needs work"}]}"#.into()));
     let report = run(&tree, &["a.rs", "b.rs"], reviewer).await;
 
     let lead = Scripted::new(|_| Ok("# Review\n".into()));
-    let review = synthesize(&*lead, &tree.rules(), &report).await.unwrap();
-    assert_eq!(review.as_deref(), Some("# Review\n"));
+    let review = synthesize(&*lead, &tree.rules(), &report)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(review.text, "# Review\n");
+    assert_eq!(review.usage, ONE_CALL);
 
     let asked = lead.asked.lock().unwrap();
     assert_eq!(asked.len(), 1);
     assert_eq!(asked[0].level, ModelLevel::Frontier);
+    assert!(!asked[0].constrained, "the lead writes prose");
     let brief = &asked[0].prompt;
     assert!(brief.contains("`everything`: Flag everything."), "{brief}");
     assert!(brief.contains("a.rs") && brief.contains("b.rs"), "{brief}");
@@ -307,7 +333,7 @@ async fn a_crate_wide_rule_makes_one_call_per_crate_and_findings_keep_their_file
     );
     let b = tree.path("k/src/b.rs");
     let reply = format!(
-        r#"[{{"path": "{}", "line": 1, "message": "m"}}]"#,
+        r#"{{"findings": [{{"path": "{}", "line": 1, "message": "m"}}]}}"#,
         b.display()
     );
     let rules = tree.rules();
@@ -328,7 +354,70 @@ async fn a_crate_wide_rule_makes_one_call_per_crate_and_findings_keep_their_file
 struct Replying(String);
 
 impl Ask for Replying {
-    async fn ask(&self, _: ModelLevel, _: &str, _: &str) -> Result<String> {
-        Ok(self.0.clone())
+    async fn ask(&self, _: &Question<'_>) -> Result<Answer> {
+        Ok(Answer {
+            text: self.0.clone(),
+            usage: ONE_CALL,
+        })
     }
+}
+
+#[tokio::test]
+async fn usage_is_totalled_per_rule_including_calls_whose_reply_was_unreadable() {
+    let tree = Tree::new(
+        "usage",
+        &[("everything", WHOLE_FILE)],
+        &[("good.rs", "fn good() {}\n"), ("bad.rs", "fn bad() {}\n")],
+    );
+    let agent = Scripted::new(|prompt| {
+        if prompt.contains("bad.rs") {
+            return Ok("not json".into());
+        }
+        Ok(r#"{"findings": []}"#.into())
+    });
+    let report = run(&tree, &["good.rs", "bad.rs"], agent).await;
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(
+        report.usage["everything"],
+        Usage {
+            calls: 2,
+            input: 200,
+            output: 20
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_failed_call_uses_nothing() {
+    let tree = Tree::new(
+        "unused",
+        &[("everything", WHOLE_FILE)],
+        &[("a.rs", "fn a() {}\n")],
+    );
+    let agent = Scripted::new(|_| bail!("down"));
+    let report = run(&tree, &["a.rs"], agent).await;
+    assert_eq!(
+        report.usage.get("everything").copied().unwrap_or_default(),
+        Usage::default()
+    );
+}
+
+#[tokio::test]
+async fn a_dry_run_finds_nothing_and_prices_each_call_by_its_prompt() {
+    let tree = Tree::new(
+        "dry",
+        &[("everything", WHOLE_FILE)],
+        &[("a.rs", "fn a() {}\n"), ("b.rs", "fn b() {}\n")],
+    );
+    let rules = tree.rules();
+    let calls = plan(&rules, &[tree.path("a.rs"), tree.path("b.rs")]).unwrap();
+    let report = review(Arc::new(agent::dry_run()), Arc::new(rules), calls)
+        .await
+        .unwrap();
+    assert!(report.findings.is_empty() && report.failures.is_empty());
+    let usage = report.usage["everything"];
+    assert_eq!(usage.calls, 2);
+    assert_eq!(usage.output, 0);
+    // Each call carries the reviewer's instructions, the rule and a file.
+    assert!(usage.input > 2 * 100, "{usage:?}");
 }

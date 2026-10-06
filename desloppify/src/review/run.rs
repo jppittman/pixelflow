@@ -5,9 +5,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::task::JoinSet;
 
-use super::reply::{parse, preamble, prompt};
+use super::reply::{parse, preamble, prompt, schema};
 use super::{Call, Finding, Report};
-use crate::agent::Ask;
+use crate::agent::{Ask, Question, Usage};
 use crate::rule::Rule;
 
 pub(super) async fn review<A: Ask>(
@@ -21,17 +21,27 @@ pub(super) async fn review<A: Ask>(
         calls.spawn(async move {
             let rule = &rules[call.rule];
             let (preamble, prompt) = (preamble(rule), prompt(&call));
-            let replies = async { parse(&agent.ask(rule.level, &preamble, &prompt).await?) }
-                .await
-                .with_context(|| {
-                    format!(
-                        "rule {} on {}:{}",
-                        rule.id,
-                        call.path.display(),
-                        call.snippet.first_line
-                    )
-                })?;
-            Ok::<_, anyhow::Error>(
+            let context = || {
+                format!(
+                    "rule {} on {}:{}",
+                    rule.id,
+                    call.path.display(),
+                    call.snippet.first_line
+                )
+            };
+            // A call that answered was paid for, even if its answer is unreadable.
+            let schema = schema();
+            let question = Question {
+                level: rule.level,
+                system: &preamble,
+                prompt: &prompt,
+                schema: Some(&schema),
+            };
+            let answer = match agent.ask(&question).await {
+                Ok(answer) => answer,
+                Err(error) => return (call.rule, Usage::default(), Err(error.context(context()))),
+            };
+            let findings = parse(&answer.text).with_context(context).map(|replies| {
                 replies
                     .into_iter()
                     .map(|r| Finding {
@@ -40,14 +50,17 @@ pub(super) async fn review<A: Ask>(
                         line: r.line,
                         message: r.message,
                     })
-                    .collect::<Vec<_>>(),
-            )
+                    .collect::<Vec<_>>()
+            });
+            (call.rule, answer.usage, findings)
         });
     }
 
     let mut report = Report::default();
     while let Some(joined) = calls.join_next().await {
-        match joined? {
+        let (rule, usage, findings) = joined?;
+        *report.usage.entry(rules[rule].id.clone()).or_default() += usage;
+        match findings {
             Ok(findings) => report.findings.extend(findings),
             Err(failure) => report.failures.push(failure),
         }

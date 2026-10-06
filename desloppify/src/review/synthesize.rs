@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use super::{Finding, Report};
-use crate::agent::Ask;
+use crate::agent::{Answer, Ask, Question};
 use crate::model::ModelLevel;
 use crate::rule::Rule;
 
@@ -28,15 +28,18 @@ pub(super) async fn synthesize<A: Ask>(
     agent: &A,
     rules: &[Rule],
     report: &Report,
-) -> Result<Option<String>> {
+) -> Result<Option<Answer>> {
     if report.findings.is_empty() {
         return Ok(None);
     }
     let prompt = brief(rules, report);
-    agent
-        .ask(ModelLevel::Frontier, LEAD, &prompt)
-        .await
-        .map(Some)
+    let question = Question {
+        level: ModelLevel::Frontier,
+        system: LEAD,
+        prompt: &prompt,
+        schema: None,
+    };
+    agent.ask(&question).await.map(Some)
 }
 
 /// The rules that found something, then the findings by file.
