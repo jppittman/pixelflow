@@ -1,14 +1,21 @@
 //! The agent: a provider, paced by a rate limiter.
 
+use std::error::Error;
+use std::time::Duration;
+
 use anyhow::Result;
+use rig_core::ProviderError;
 use rig_core::completion::CompletionRequest;
 use rig_core::providers::{anthropic::Anthropic, gemini::Gemini};
 
 use crate::model::{ModelLevel, Provider};
-use crate::rate_limit::{BoxError, RateLimiter};
+use crate::rate_limit::{BoxError, RateLimiter, Signal};
 
 /// Enough for a list of findings; the reply is JSON, not prose.
 const MAX_REPLY_TOKENS: u64 = 4096;
+
+const TOO_MANY_REQUESTS: u16 = 429;
+const RETRY_AFTER: &str = "retry-after";
 
 enum Client {
     Anthropic(Anthropic),
@@ -71,5 +78,72 @@ impl Agent {
             }
             last = Some(Box::new(error));
         }
+    }
+}
+
+/// What a provider's failure says about the call rate: a 429 is a throttle,
+/// anything else (an outage, a timeout) is not. Either may carry the
+/// seconds form of `Retry-After`; the date form is rare enough from model
+/// providers to ignore.
+#[must_use]
+pub fn classify(error: &(dyn Error + 'static)) -> Signal {
+    let Some(error) = error.downcast_ref::<ProviderError>() else {
+        return Signal::Failed { retry_after: None };
+    };
+    let retry_after = retry_after(error);
+    match error.provider_response_status().map(|s| s.as_u16()) {
+        Some(TOO_MANY_REQUESTS) => Signal::Throttled { retry_after },
+        _ => Signal::Failed { retry_after },
+    }
+}
+
+fn retry_after(error: &ProviderError) -> Option<Duration> {
+    let seconds = error
+        .provider_response_headers()?
+        .get(RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reply(status: u16, retry_after: Option<&str>) -> BoxError {
+        let status = http::StatusCode::from_u16(status).unwrap();
+        let headers = retry_after.map(|value| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(RETRY_AFTER, value.parse().unwrap());
+            headers
+        });
+        Box::new(ProviderError::from_http_response(status, "").with_response_headers(headers))
+    }
+
+    #[test]
+    fn a_429_is_a_throttle_with_its_retry_after() {
+        assert_eq!(
+            classify(&*reply(429, Some("7"))),
+            Signal::Throttled {
+                retry_after: Some(Duration::from_secs(7))
+            }
+        );
+        assert_eq!(
+            classify(&*reply(429, Some("Wed, 21 Oct 2015 07:28:00 GMT"))),
+            Signal::Throttled { retry_after: None }
+        );
+    }
+
+    #[test]
+    fn an_outage_is_a_failure() {
+        assert_eq!(
+            classify(&*reply(503, None)),
+            Signal::Failed { retry_after: None }
+        );
+        let other: BoxError = Box::new(std::io::Error::other("reset"));
+        assert_eq!(classify(&*other), Signal::Failed { retry_after: None });
     }
 }

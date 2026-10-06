@@ -4,14 +4,32 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
-use desloppify::agent::Agent;
+use desloppify::agent::{self, Agent};
 use desloppify::model::Provider;
-use desloppify::rate_limit::TokenBucket;
+use desloppify::rate_limit::{Adaptive, AdaptiveConfig, RateLimiter, TokenBucket};
 use desloppify::review::review;
 use desloppify::rule::Rule;
 use desloppify::skills::Skills;
+
+const SECONDS_PER_MINUTE: f64 = 60.0;
+/// The adaptive limiter never cuts below one call a minute.
+const FLOOR_RPM: f64 = 1.0;
+/// Calls per minute the adaptive limiter gains per minute unthrottled: a
+/// halved 50 rpm is back in two and a half minutes.
+const GROWTH_RPM_PER_MINUTE: f64 = 10.0;
+/// Providers count requests per minute, so a minute after a cut every reply
+/// to a call made at the old rate is in.
+const COOLDOWN: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Limiter {
+    /// Find the provider's limit: slow down on 429s, speed up without them.
+    Adaptive,
+    /// A fixed budget: `--burst` calls, one more every `--refill-ms`.
+    TokenBucket,
+}
 
 /// Review code against the rules in `rules/`.
 #[derive(Parser)]
@@ -21,10 +39,18 @@ struct Args {
     paths: Vec<PathBuf>,
     #[arg(long, value_enum, default_value_t = Provider::Anthropic)]
     provider: Provider,
-    /// Calls that may go out back to back.
+    #[arg(long, value_enum, default_value_t = Limiter::Adaptive)]
+    limiter: Limiter,
+    /// Adaptive: calls per minute to start at.
+    #[arg(long, default_value_t = 50.0)]
+    rpm: f64,
+    /// Adaptive: calls per minute never to exceed.
+    #[arg(long, default_value_t = 1000.0)]
+    max_rpm: f64,
+    /// Token bucket: calls that may go out back to back.
     #[arg(long, default_value_t = 10)]
     burst: u64,
-    /// Milliseconds to earn back one call.
+    /// Token bucket: milliseconds to earn back one call.
     #[arg(long, default_value_t = 1200)]
     refill_ms: u64,
     /// Give up on a call rather than wait longer than this for it.
@@ -41,12 +67,7 @@ async fn main() -> Result<ExitCode> {
     let args = Args::parse();
     let skills = Skills::load(&args.skills)?;
     let rules = Arc::new(Rule::load_dir(&args.rules, &skills)?);
-    let limiter = TokenBucket::new(
-        args.burst,
-        Duration::from_millis(args.refill_ms),
-        Duration::from_secs(args.max_wait_secs),
-    );
-    let agent = Arc::new(Agent::from_env(args.provider, Box::new(limiter))?);
+    let agent = Arc::new(Agent::from_env(args.provider, limiter(&args))?);
 
     let mut files = Vec::new();
     for path in &args.paths {
@@ -72,6 +93,28 @@ async fn main() -> Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+fn limiter(args: &Args) -> Box<dyn RateLimiter> {
+    let max_wait = Duration::from_secs(args.max_wait_secs);
+    match args.limiter {
+        Limiter::TokenBucket => Box::new(TokenBucket::new(
+            args.burst,
+            Duration::from_millis(args.refill_ms),
+            max_wait,
+        )),
+        Limiter::Adaptive => Box::new(Adaptive::new(
+            AdaptiveConfig {
+                floor: FLOOR_RPM / SECONDS_PER_MINUTE,
+                start: args.rpm / SECONDS_PER_MINUTE,
+                ceiling: args.max_rpm / SECONDS_PER_MINUTE,
+                increase: GROWTH_RPM_PER_MINUTE / (SECONDS_PER_MINUTE * SECONDS_PER_MINUTE),
+                cooldown: COOLDOWN,
+                max_wait,
+            },
+            agent::classify,
+        )),
+    }
 }
 
 /// Every file under `path`, skipping hidden entries and build output.

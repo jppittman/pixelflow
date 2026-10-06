@@ -606,6 +606,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "http",
  "rig-core",
  "serde",
  "serde_json",

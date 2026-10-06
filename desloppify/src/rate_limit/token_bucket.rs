@@ -1,17 +1,9 @@
-//! Pacing calls to a provider: before each call, how long to wait.
+//! A fixed budget: a token bucket.
 
-use std::error::Error;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
-
-pub trait RateLimiter: Send + Sync {
-    /// How long to wait before the next call. `last` is `None` before a first
-    /// attempt and the failure being retried otherwise. `Err` refuses the
-    /// call, handing back `last` (or an error of its own if there was none).
-    fn wait(&self, last: Option<BoxError>) -> Result<Duration, BoxError>;
-}
+use super::{BoxError, Exhausted, RateLimiter};
 
 /// Every call takes a token. The bucket holds at most `capacity` and gains
 /// one every `refill`; a call with no token waits for the next one, unless
@@ -30,10 +22,6 @@ struct Bucket {
     tokens: f64,
     updated: Instant,
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("rate limit: no token within {0:?}")]
-pub struct Exhausted(Duration);
 
 impl TokenBucket {
     /// A full bucket.
