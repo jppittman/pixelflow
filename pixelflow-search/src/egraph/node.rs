@@ -4,6 +4,7 @@ use super::ops::Op;
 use alloc::vec::Vec;
 use pixelflow_ir::arena::{BufferDecl, UniformDecl};
 use pixelflow_ir::fold::Fold;
+use pixelflow_ir::{KernelKey, Variance};
 
 /// Identifier for an equivalence class in the e-graph.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -75,6 +76,23 @@ pub enum ENode {
     /// Hash-consing therefore does what it should: two folds are one node iff
     /// they fold the same body, under the same algebra, over the same range.
     Reduce { fold: Fold, body: EClassId },
+    /// A **unit**: a kernel named by content, optimized by itself and linked
+    /// in after extraction (`crate::runtime`;
+    /// docs/plans/2026-09-25-the-language-is-kernel.md §4, O1). A leaf here,
+    /// opaque to every rule as a [`ENode::Uniform`] is: its body is not in
+    /// this graph, so no rewrite can reach inside it, and extraction hands
+    /// back the name.
+    ///
+    /// It carries `variance`, its referent's, because that is the one fact a
+    /// rule reads off a leaf — `FactorFold`'s side condition, and the binder
+    /// substitution `PeelFold`/`HalveFold` skip a binder-free class by — and
+    /// the one fact extraction prices a leaf's evaluations by. A unit is
+    /// closed (its variance names no binder), so every rewrite conditioned
+    /// on binder-invariance is the one it would be with the body inlined.
+    /// Only the runtime tier's unit walk admits one (`EGraph::admit_unit`);
+    /// [`insert`](super::insert) declines a reference the graph was not told
+    /// is a unit.
+    Ref { key: KernelKey, variance: Variance },
 }
 
 impl ENode {
@@ -130,7 +148,8 @@ impl ENode {
             | ENode::Const(_)
             | ENode::Buffer(_)
             | ENode::Uniform(_)
-            | ENode::Param(_) => &[],
+            | ENode::Param(_)
+            | ENode::Ref { .. } => &[],
             ENode::Op { children, .. } => children,
             ENode::Reduce { body, .. } => core::slice::from_ref(body),
         }
@@ -144,7 +163,8 @@ impl ENode {
             | ENode::Const(_)
             | ENode::Buffer(_)
             | ENode::Uniform(_)
-            | ENode::Param(_) => &mut [],
+            | ENode::Param(_)
+            | ENode::Ref { .. } => &mut [],
             ENode::Op { children, .. } => children,
             ENode::Reduce { body, .. } => core::slice::from_mut(body),
         }
@@ -156,6 +176,56 @@ impl ENode {
             ENode::Op { children, .. } if children.len() == 2 => Some((children[0], children[1])),
             _ => None,
         }
+    }
+
+    /// Which variables this node depends on, given what each child class
+    /// depends on — the forward transfer function of variance.
+    ///
+    /// A leaf names its own variable (or none); an operation unions its
+    /// children; a fold removes the index it binds. The one definition both
+    /// consumers read: the e-graph's per-class fact (`EGraph::variance`),
+    /// which feeds it the children's facts, and the extractor's
+    /// `node_variance`, which feeds it the variance of the forms it chose.
+    ///
+    /// Monotone in `child`: a larger answer for a child can only give a
+    /// larger answer here, so an over-approximation in gives an
+    /// over-approximation out.
+    pub(crate) fn variance(&self, mut child: impl FnMut(EClassId) -> Variance) -> Variance {
+        match self {
+            ENode::Var(v) => var_variance(*v),
+            // A buffer's contents are fixed for the kernel's lifetime — a
+            // read of one varies with its index, which is the `Gather`'s
+            // other children, unioned by the `Op` arm. A uniform or a
+            // builder's parameter is one number for the whole lattice.
+            ENode::Const(_) | ENode::Buffer(_) | ENode::Uniform(_) | ENode::Param(_) => {
+                Variance::CONST
+            }
+            // A unit varies as its referent does, which the leaf carries
+            // because its body is not here to ask.
+            ENode::Ref { variance, .. } => *variance,
+            ENode::Op { children, .. } => children
+                .iter()
+                .fold(Variance::CONST, |acc, &c| acc.union(child(c))),
+            // The one node that *shrinks* the set: its index is bound, so it
+            // is not free in the result.
+            ENode::Reduce { fold, body } => {
+                child(*body).without(Variance::from_var(fold.binder().var()))
+            }
+        }
+    }
+}
+
+/// The variance of a `Var` leaf: its own bit.
+///
+/// 0→X, 1→Y, 2 and 3 the retired axes, then the reduction index slots up to
+/// [`Variance::VARIABLES`]. An index past them is not a variable the bitset
+/// can name, so it is conservatively [`Variance::ALL`] — an answer that can
+/// only decline an invariance, never claim one.
+fn var_variance(v: u8) -> Variance {
+    if v < Variance::VARIABLES {
+        Variance::from_var(v)
+    } else {
+        Variance::ALL
     }
 }
 
@@ -175,6 +245,18 @@ impl PartialEq for ENode {
             // Identity and default, bitwise (`UniformDecl`'s own equality).
             (ENode::Uniform(a), ENode::Uniform(b)) => a == b,
             (ENode::Param(a), ENode::Param(b)) => a == b,
+            // The key is the referent; its variance is a function of it, so
+            // comparing both is comparing the key, checked.
+            (
+                ENode::Ref {
+                    key: k1,
+                    variance: v1,
+                },
+                ENode::Ref {
+                    key: k2,
+                    variance: v2,
+                },
+            ) => k1 == k2 && v1 == v2,
             (
                 ENode::Op {
                     op: op1,
@@ -233,6 +315,34 @@ impl core::hash::Hash for ENode {
                 fold.hash(state);
                 body.hash(state);
             }
+            ENode::Ref { key, variance } => {
+                7u8.hash(state);
+                key.hash(state);
+                variance.hash(state);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The coordinates and every reduction slot get a bit each; past the
+    /// word the analysis gives up and says everything.
+    #[test]
+    fn a_var_leaf_names_its_own_bit() {
+        let leaf = |v: u8| ENode::Var(v).variance(|_| Variance::ALL);
+        assert_eq!(leaf(0), Variance::X);
+        assert_eq!(leaf(1), Variance::Y);
+        // Above the axes: the retired Z/W indices and every binder slot, one
+        // bit each.
+        assert_eq!(leaf(3), Variance::from_var(3));
+        assert_eq!(leaf(8), Variance::from_var(8));
+        assert_eq!(
+            leaf(Variance::VARIABLES - 1),
+            Variance::from_var(Variance::VARIABLES - 1)
+        );
+        assert_eq!(leaf(Variance::VARIABLES), Variance::ALL);
     }
 }

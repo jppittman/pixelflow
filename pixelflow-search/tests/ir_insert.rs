@@ -169,10 +169,13 @@ fn a_param_is_held_by_the_macro_vocabulary_and_declined_by_the_runtime_one() {
     );
 }
 
-/// A reference is declined, not mishandled. `passes::expand_refs` runs before
-/// saturation in every pipeline, so one arriving here is a pipeline-order bug
-/// — and the e-graph must say so rather than insert a leaf it cannot rewrite,
-/// which would silently make an inlining rule look like it had nothing to do.
+/// A reference the graph was not told is a unit is declined, not mishandled.
+/// The runtime tier's unit walk admits each unit it holds the body of
+/// (`EGraph::admit_unit`, crate-private — its own test is in `insert.rs`), and
+/// only then does a `Ref` insert, as a leaf carrying its referent's variance.
+/// A graph nobody told — any vocabulary, any caller outside that walk — has no
+/// variance to give the leaf, and must say so rather than insert one it
+/// cannot reason about.
 #[test]
 fn a_reference_is_declined_by_every_vocabulary() {
     let named = Kernel::x().mul(&Kernel::constant(3.0)).by_ref();
@@ -185,30 +188,6 @@ fn a_reference_is_declined_by_every_vocabulary() {
             insert(arena, root, &mut eg, vocab),
             Err(Declined::Ref(key)),
             "{vocab:?} must decline a reference"
-        );
-    }
-}
-
-/// A `Guard` is declined too, for a reason specific to this stage rather than
-/// a standing one: extraction has no price for choosing a `Guard` over the
-/// `Select` it equals yet (G3, docs/plans/2026-09-12-emit-should-just-emit.md),
-/// so there is nothing for the e-graph to gain by holding one, and its arms
-/// are unrepresentable as structure for the same reason a `Ref`'s referent
-/// is — nothing here can rewrite inside a name.
-#[test]
-fn a_guard_is_declined_by_every_vocabulary() {
-    let on = KernelStore::intern(&Kernel::x().sqrt());
-    let off = KernelStore::intern(&Kernel::y().neg());
-    let mut arena = ExprArena::new();
-    let mask = arena.push_var(0);
-    let guard = arena.push_guard(mask, on, off);
-
-    for vocab in [Vocabulary::Runtime, Vocabulary::Templates] {
-        let mut eg = EGraph::new();
-        assert_eq!(
-            insert(&arena, guard, &mut eg, vocab),
-            Err(Declined::Guard),
-            "{vocab:?} must decline a Guard"
         );
     }
 }
@@ -242,11 +221,12 @@ fn a_write_and_a_seq_are_declined_by_every_vocabulary() {
     }
 }
 
-/// And the runtime tier as a whole does not decline it: `ExpandRefs` runs
-/// first, so what reaches the e-graph is the referent's body and the kernel
-/// optimizes exactly as the spliced composition does.
+/// And the runtime tier as a whole does not decline it: the referent is a
+/// unit, saturated and extracted by itself and linked back in, so its body is
+/// optimized exactly as the spliced composition's would be and no `Ref`
+/// survives into what the emitter gets.
 #[test]
-fn the_runtime_pipeline_expands_before_it_saturates() {
+fn the_runtime_pipeline_optimizes_a_named_body() {
     let body = Kernel::x().mul(&Kernel::constant(0.0)).add(&Kernel::y());
     let named = body.by_ref();
     let (arena, root) = named.parts();
@@ -297,7 +277,9 @@ fn project_then_embed_round_trips() {
 }
 
 /// `embed` owns buffer declaration: one slot per distinct identity, however
-/// many leaves name it.
+/// many leaves name it — and, because the arena hash-conses, two leaves
+/// naming the *same* identity are the same value (`Buffer(slot)`, slot equal
+/// both times) and so land on the very same node, not merely the same slot.
 #[test]
 fn embed_declares_one_slot_per_buffer_identity() {
     let decl = BufferDecl {
@@ -313,7 +295,11 @@ fn embed_declares_one_slot_per_buffer_identity() {
         1,
         "one identity must claim exactly one slot"
     );
-    assert_ne!(a, b, "each leaf is its own node, sharing one slot");
+    assert_eq!(
+        a, b,
+        "two Buffer leaves over the same identity are structurally identical \
+         (the same slot both times), so hash-consing interns them to one node"
+    );
 }
 
 /// Projection reports the arity the node actually has, so a caller rebuilding

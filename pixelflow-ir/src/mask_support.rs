@@ -177,12 +177,13 @@ fn support_of(arena: &ExprArena, id: ExprId, shape: LatticeShape, depth: u32) ->
         // rectangle is the intersection. `BitAnd` and not a boolean `And`
         // because a comparison yields an all-ones pattern and the language
         // combines masks bitwise (CLAUDE.md, "Floating point at the edges").
-        ExprNode::Binary(OpKind::BitAnd, a, b) => support_of(arena, *a, shape, depth + 1)
-            .intersect(support_of(arena, *b, shape, depth + 1)),
-        ExprNode::Binary(OpKind::BitOr, a, b) => {
-            support_of(arena, *a, shape, depth + 1).hull(support_of(arena, *b, shape, depth + 1))
+        ExprNode::Binary(OpKind::BitAnd, a, b) => {
+            support_of(arena, a, shape, depth + 1).intersect(support_of(arena, b, shape, depth + 1))
         }
-        ExprNode::Binary(op, a, b) => comparison_support(arena, *op, *a, *b, shape).unwrap_or(all),
+        ExprNode::Binary(OpKind::BitOr, a, b) => {
+            support_of(arena, a, shape, depth + 1).hull(support_of(arena, b, shape, depth + 1))
+        }
+        ExprNode::Binary(op, a, b) => comparison_support(arena, op, a, b, shape).unwrap_or(all),
         _ => all,
     }
 }
@@ -242,14 +243,14 @@ fn reverse(op: OpKind) -> Option<OpKind> {
 /// form, which is a larger D1 than the plan schedules.
 fn axis_of(arena: &ExprArena, id: ExprId) -> Option<usize> {
     match arena.node(id) {
-        ExprNode::Var(i) if (*i as usize) < COORD_AXES => Some(*i as usize),
+        ExprNode::Var(i) if (i as usize) < COORD_AXES => Some(i as usize),
         _ => None,
     }
 }
 
 fn constant_of(arena: &ExprArena, id: ExprId) -> Option<f32> {
     match arena.node(id) {
-        ExprNode::Const(v) => Some(*v),
+        ExprNode::Const(v) => Some(v),
         _ => None,
     }
 }

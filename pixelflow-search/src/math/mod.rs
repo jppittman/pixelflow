@@ -128,25 +128,6 @@ pub fn all_rules() -> Vec<Box<dyn Rewrite>> {
     rules
 }
 
-/// Core arithmetic rules only (fast, always applicable).
-///
-/// Use this for quick optimization passes where trig/exp rules
-/// aren't needed.
-pub fn core_rules() -> Vec<Box<dyn Rewrite>> {
-    algebra_rules()
-}
-
-/// Transcendental function rules (trig, exp, log).
-///
-/// Use this when optimizing expressions with transcendental functions.
-pub fn transcendental_rules() -> Vec<Box<dyn Rewrite>> {
-    let mut rules = Vec::new();
-    rules.extend(parity_rules());
-    rules.extend(trig_rules());
-    rules.extend(exp_rules());
-    rules
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,14 +138,13 @@ mod tests {
 
     /// Insert an arena subtree into an e-graph, returning its e-class.
     fn expr_to_egraph(arena: &ExprArena, id: ExprId, egraph: &mut EGraph) -> EClassId {
-        match *arena.node(id) {
+        match arena.node(id) {
             ExprNode::Var(idx) => egraph.add(ENode::Var(idx)),
             ExprNode::Const(val) => egraph.add(ENode::Const(val.to_bits())),
             ExprNode::Param(i) => panic!("Param({i}) reached math tests"),
             ExprNode::Buffer(b) => panic!("Buffer({}) reached math tests", b.0),
             ExprNode::Ref(k) => panic!("Ref({k:?}) reached math tests"),
             ExprNode::Reduce { .. } => panic!("a bounded fold reached math tests"),
-            ExprNode::Guard { .. } => panic!("a Guard reached math tests (G1: never chosen)"),
             ExprNode::Write { .. } => panic!("a Write reached math tests"),
             ExprNode::Uniform(u) => egraph.add(ENode::Uniform(*arena.uniform_decl(u))),
             ExprNode::Unary(kind, a) => {
@@ -197,7 +177,7 @@ mod tests {
                     children: vec![ca, cb, cc],
                 })
             }
-            ExprNode::Nary(kind, _, _) => panic!("unsupported n-ary op in math test: {kind:?}"),
+            ExprNode::Nary(kind, _) => panic!("unsupported n-ary op in math test: {kind:?}"),
         }
     }
 
@@ -212,6 +192,7 @@ mod tests {
             ENode::Buffer(decl) => panic!("Buffer({decl:?}) reached math tests"),
             ENode::Param(i) => panic!("Param({i}) reached math tests"),
             ENode::Reduce { .. } => panic!("a bounded fold reached math tests"),
+            ENode::Ref { key, .. } => panic!("unit {key:?} reached math tests"),
             ENode::Uniform(decl) => {
                 let slot = arena.declare_uniform(decl);
                 arena.push_uniform(slot)

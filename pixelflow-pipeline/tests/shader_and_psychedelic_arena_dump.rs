@@ -206,7 +206,7 @@ fn psychedelic_kernel() -> (ExprArena, ExprId) {
 /// grow a test-only serializer).
 fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Path) {
     use std::fmt::Write as _;
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut reachable = vec![false; len];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -240,16 +240,16 @@ fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Pat
             ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
             ExprNode::Buffer(b) => writeln!(out, "B {}", b.0),
             ExprNode::Uniform(u) => writeln!(out, "Un {}", u.0),
-            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, *a)),
+            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, a)),
             ExprNode::Binary(k, a, b) => {
-                writeln!(out, "Bi {k:?} {} {}", d(&dense, *a), d(&dense, *b))
+                writeln!(out, "Bi {k:?} {} {}", d(&dense, a), d(&dense, b))
             }
             ExprNode::Ternary(k, a, b, c) => writeln!(
                 out,
                 "T {k:?} {} {} {}",
-                d(&dense, *a),
-                d(&dense, *b),
-                d(&dense, *c)
+                d(&dense, a),
+                d(&dense, b),
+                d(&dense, c)
             ),
             other => panic!("{name}: unsupported node in dump: {other:?}"),
         }
@@ -262,7 +262,7 @@ fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Pat
 }
 
 fn reachable_count(arena: &ExprArena, root: ExprId) -> usize {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut seen = vec![false; len];
     let mut stack = vec![root];
     let mut n = 0;

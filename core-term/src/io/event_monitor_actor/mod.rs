@@ -293,6 +293,7 @@ impl Drop for PtyTroupeHandle {
 mod tests {
     use super::*;
     use crate::ansi::commands::AnsiCommand;
+    use crate::ansi::{AnsiBatch, AnsiSink};
     use crate::io::pty::PtyConfig;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
@@ -301,13 +302,13 @@ mod tests {
     /// PtySender double that records parsed output and the child-exit signal.
     #[derive(Clone, Default)]
     struct CaptureSink {
-        commands: Arc<Mutex<Vec<AnsiCommand>>>,
+        text: Arc<Mutex<String>>,
         child_exited: Arc<AtomicBool>,
     }
 
     impl PtySender for CaptureSink {
-        fn send(&self, cmds: Vec<AnsiCommand>) -> Result<(), anyhow::Error> {
-            self.commands.lock().unwrap().extend(cmds);
+        fn send(&self, mut batch: AnsiBatch) -> Result<(), anyhow::Error> {
+            batch.drain_into(&mut Record(&mut self.text.lock().unwrap()));
             Ok(())
         }
         fn send_child_exited(&self) -> Result<(), anyhow::Error> {
@@ -316,17 +317,20 @@ mod tests {
         }
     }
 
+    /// Reads a batch the way the app does, keeping only the printed text.
+    struct Record<'a>(&'a mut String);
+
+    impl AnsiSink for Record<'_> {
+        fn text(&mut self, run: &str) {
+            self.0.push_str(run);
+        }
+
+        fn command(&mut self, _command: AnsiCommand) {}
+    }
+
     impl CaptureSink {
         fn printed_text(&self) -> String {
-            self.commands
-                .lock()
-                .unwrap()
-                .iter()
-                .filter_map(|cmd| match cmd {
-                    AnsiCommand::Print(c) => Some(*c),
-                    _ => None,
-                })
-                .collect()
+            self.text.lock().unwrap().clone()
         }
 
         fn wait_for(&self, timeout: Duration, pred: impl Fn(&Self) -> bool) -> bool {
@@ -350,6 +354,7 @@ mod tests {
             args,
             initial_cols: 80,
             initial_rows: 24,
+            working_directory: None,
         })
         .expect("Failed to spawn PTY");
 
@@ -429,6 +434,7 @@ mod tests {
             args: &[],
             initial_cols: 80,
             initial_rows: 24,
+            working_directory: None,
         })
         .expect("pty");
         let sink = CaptureSink::default();
@@ -464,6 +470,7 @@ mod tests {
             args: &[],
             initial_cols: 80,
             initial_rows: 24,
+            working_directory: None,
         })
         .expect("pty");
         let sink = CaptureSink::default();

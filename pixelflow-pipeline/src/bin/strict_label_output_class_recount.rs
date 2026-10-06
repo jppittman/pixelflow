@@ -154,6 +154,7 @@ fn render_chosen(eg: &EGraph, choices: &[Option<usize>], class: EClassId) -> Str
         ENode::Buffer(_) => "buf".to_string(),
         ENode::Uniform(_) => "uniform".to_string(),
         ENode::Param(i) => format!("p{i}"),
+        ENode::Ref { key, .. } => format!("unit{:016x}", key.bits()),
         ENode::Op { op, children } => {
             let kids: Vec<String> = children
                 .iter()
@@ -161,12 +162,9 @@ fn render_chosen(eg: &EGraph, choices: &[Option<usize>], class: EClassId) -> Str
                 .collect();
             format!("{:?}({})", op.kind(), kids.join(", "))
         }
-        ENode::Reduce { fold, body } => format!(
-            "Reduce[{}..{}]({})",
-            fold.range().start,
-            fold.range().end,
-            render_chosen(eg, choices, *body)
-        ),
+        ENode::Reduce { fold, body } => {
+            format!("Reduce[{fold}]({})", render_chosen(eg, choices, *body))
+        }
     }
 }
 
@@ -231,9 +229,8 @@ fn origin_label(eg: &EGraph, rules: &RuleSet, tag: ENodeId) -> String {
 
 fn seed_has_const_one(arena: &ExprArena) -> bool {
     arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Const(v) if v.to_bits() == 1.0_f32.to_bits()))
+        .nodes()
+        .any(|(_, n)| matches!(n, ExprNode::Const(v) if v.to_bits() == 1.0_f32.to_bits()))
 }
 
 struct Labels {
@@ -342,7 +339,7 @@ fn tally_expression(
         if rname == "pythagorean" {
             let row = pyth.get_or_insert_with(|| PythagoreanRow {
                 name: name.to_string(),
-                node_count: arena.nodes_raw().len(),
+                node_count: arena.len(),
                 seed_has_const_one: seed_has_const_one(arena),
                 fired: 0,
                 minted: 0,
@@ -448,7 +445,7 @@ fn main() {
     let started = Instant::now();
 
     for (i, (name, arena, root)) in selected.iter().enumerate() {
-        let class_cap = config_for_node_count(arena.nodes_raw().len()).max_classes;
+        let class_cap = config_for_node_count(arena.len()).max_classes;
         let t0 = Instant::now();
         let mut optimizer = Optimizer::production()
             .cost(costs.clone())

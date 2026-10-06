@@ -44,7 +44,8 @@ pub struct StaticFeatures {
     /// of a kernel, so it is kept out of the derived dynamic figures below and
     /// recorded here instead.
     pub scaffold: ScopeRow,
-    /// Frame slots holding a value with an address (`FrameLayout::slots`).
+    /// Frame slots holding a value with an address: the body's
+    /// `regalloc::Allocation::spill_slots`.
     pub spill_slots: u32,
     /// Stack bytes the frame occupies.
     pub frame_bytes: u32,
@@ -54,7 +55,7 @@ pub struct StaticFeatures {
     pub carried: u32,
     /// Registers the allocator could hand out.
     pub pool: u32,
-    /// Bytes one spilled register occupies — 16 for SSE2/NEON, 64 for AVX-512.
+    /// Bytes one spilled register occupies — 16 for NEON, 32 for AVX2, 64 for AVX-512.
     pub vector_bytes: u32,
     /// Σ over scopes of (memory ops in scope × executions per call).
     pub dyn_memory_ops: u64,

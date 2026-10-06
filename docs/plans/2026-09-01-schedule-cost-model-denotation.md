@@ -278,7 +278,8 @@ schedule choice.** The order of work is fixed by that dependency:
    in the cache key; three-region schedule; hoisted values allocatable to
    registers). This is where schedule *alternatives* first exist in codegen.
 2. Level as an e-graph object: the variance analysis already exists
-   (`pixelflow-ir/src/variance.rs`, `DepsAnalysis`); the step is making the
+   (`pixelflow-ir/src/variance.rs`, and per e-class `EGraph::variance`, which
+   replaced `DepsAnalysis` on 2026-09-23); the step is making the
    level a per-node attribute the extractor prices, and the `(class, level)`
    DP of §2.1 with `trips` from the lattice. This is `analytic` — worth
    building and measuring on its own, with no learned part.

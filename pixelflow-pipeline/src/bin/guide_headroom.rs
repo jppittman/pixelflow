@@ -396,7 +396,7 @@ fn main() {
 
         measurements.push(ExprMeasurement {
             name: name.clone(),
-            node_count: arena.nodes_raw().len(),
+            node_count: arena.len(),
             total_applications,
             labeler_load_bearing: labeler_lb,
             strict_load_bearing: strict_lb,

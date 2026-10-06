@@ -110,16 +110,18 @@ pub enum Shape<'a, R> {
     Uniform(UniformDecl),
     /// A kernel named by content — a leaf here, because its body is in the
     /// [`KernelStore`](crate::store::KernelStore) and not in this term. An
-    /// e-graph insert declines one, for the reason it declines a `Param`:
-    /// there is no value to reason about until something resolves it.
+    /// e-graph insert holds one as an opaque leaf only when the graph was
+    /// told it is a unit and given its variance (the runtime tier's unit
+    /// walk), and otherwise declines it, for the reason it declines a
+    /// `Param`: there is nothing to reason about until something resolves it.
     ///
     /// (The `Ref` in [`Ir::Ref`] is unrelated — that is how a representation
     /// *names* one of its own nodes; this is a name for a whole kernel.)
     Ref(KernelKey),
     /// An operation over `children`.
     Op(OpKind, Children<'a, R>),
-    /// A bounded fold: `⊕_{k} body[fold.binder() := k]`, `k` ranging over
-    /// `fold`'s own visited indices (see [`Fold`](crate::Fold)'s doc).
+    /// A fold: `⊕_{k} body[fold.binder() := k]` over its range's visited
+    /// indices (see [`Fold`](crate::Fold)'s doc).
     ///
     /// Deliberately *not* a [`Shape::Op`]. A fold's algebra, binder and range
     /// are metadata, not operands: handing them to a walker as children is
@@ -128,22 +130,6 @@ pub enum Shape<'a, R> {
     /// rule in the set. The one child is the body, and the binder is bound in
     /// it — this is the only shape in the language that binds anything.
     Reduce { fold: Fold, body: R },
-    /// The hard lowering of a [`Select`](OpKind::Select): a branch, denoting
-    /// the same function as the soft (blend) form
-    /// (docs/plans/2026-09-12-emit-should-just-emit.md §1). Mirrors
-    /// [`ExprNode::Guard`](crate::arena::ExprNode::Guard).
-    ///
-    /// `mask` is the one real child; `on`/`off` are content-addressed names,
-    /// not terms in this language at all — the same leaf-of-a-whole-kernel
-    /// deal as [`Shape::Ref`], and for the same reason: an e-graph `insert`
-    /// declines a `Guard` exactly as it declines a `Ref`, since there is no
-    /// structure behind either name to reason about until something
-    /// resolves it (extraction cannot choose a `Guard` yet — that is G3).
-    Guard {
-        mask: R,
-        on: KernelKey,
-        off: KernelKey,
-    },
     /// A store — mirrors [`ExprNode::Write`](crate::arena::ExprNode::Write).
     /// One child, the value; the binders are metadata, as a fold's are. An
     /// e-graph `insert` declines one: an effect is not a value any rule may

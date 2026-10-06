@@ -419,21 +419,13 @@ pub fn induce<I: Ir>(
                 let class = *memo.get(&body).expect("post-order maps children first");
                 ENode::Reduce { fold, body: class }
             }
-            // Not a term the graph ever held: `passes::expand_refs` runs
-            // before any insertion, so a witness term carrying a reference
-            // came from somewhere that skipped the pipeline.
+            // Not a term a witness graph holds: only the runtime tier's
+            // unit walk admits a reference (as a unit's opaque leaf), so a
+            // witness term carrying one came from somewhere that skipped
+            // the pipeline.
             Shape::Ref(key) => {
                 return Err(TermMiss {
                     node: format!("{key:?} (a reference; expand_refs first)"),
-                    mapped: memo.len(),
-                });
-            }
-            // Not a term the graph ever held either: `insert` declines a
-            // `Guard` (G1 — extraction has no price for one yet), so no
-            // e-class was ever built for it.
-            Shape::Guard { on, off, .. } => {
-                return Err(TermMiss {
-                    node: format!("Guard(on={on:?}, off={off:?}) (insert declines a Guard)"),
                     mapped: memo.len(),
                 });
             }
@@ -506,12 +498,6 @@ fn post_order_term<I: Ir>(term: &I, root: I::Ref) -> Vec<I::Ref> {
                     // A fold's one child is its body. Missing it would leave
                     // the body unmapped and the fold unmatchable.
                     Shape::Reduce { body, .. } => stack.push(Task::Visit(body)),
-                    // Likewise a `Guard`'s one child is its mask. `induce`
-                    // bails out with a `TermMiss` the moment it projects a
-                    // `Guard` regardless (`insert` never builds one), but
-                    // this walk should still visit what structure there is
-                    // rather than silently skip it.
-                    Shape::Guard { mask, .. } => stack.push(Task::Visit(mask)),
                     Shape::Write { value, .. } => stack.push(Task::Visit(value)),
                     _ => {}
                 }

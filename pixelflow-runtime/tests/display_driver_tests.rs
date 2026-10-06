@@ -7,7 +7,7 @@ use pixelflow_runtime::api::public::{
     EngineEventManagement, WindowDescriptor,
 };
 use pixelflow_runtime::display::messages::{DisplayControl, DisplayEvent, DisplayMgmt, WindowId};
-use pixelflow_runtime::input::{KeySymbol, Modifiers, MouseButton};
+use pixelflow_runtime::input::{KeySymbol, Modifiers, MouseButton, Selection};
 
 // ============================================================================
 // DisplayControl Tests
@@ -135,9 +135,11 @@ fn display_event_scroll_with_float_deltas() {
 #[test]
 fn display_event_paste_data_works() {
     let event = DisplayEvent::PasteData {
+        selection: Selection::Clipboard,
         text: "Hello, clipboard!".to_string(),
     };
-    if let DisplayEvent::PasteData { text } = event {
+    if let DisplayEvent::PasteData { selection, text } = event {
+        assert_eq!(selection, Selection::Clipboard);
         assert_eq!(text, "Hello, clipboard!");
     } else {
         panic!("PasteData variant check failed");
@@ -377,8 +379,11 @@ fn app_management_resize_request() {
 
 #[test]
 fn app_management_clipboard() {
-    let cmd = AppManagement::CopyToClipboard("test text".to_string());
-    if let AppManagement::CopyToClipboard(text) = cmd {
+    let cmd = AppManagement::Copy {
+        selection: pixelflow_runtime::input::Selection::Clipboard,
+        text: "test text".to_string(),
+    };
+    if let AppManagement::Copy { text, .. } = cmd {
         assert_eq!(text, "test text");
     } else {
         panic!("Wrong variant");

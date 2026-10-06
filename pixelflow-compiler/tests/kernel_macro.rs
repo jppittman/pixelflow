@@ -74,7 +74,6 @@ fn macro_negation() {
 // ============================================================================
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_sin() {
     // sin(0) = 0
     let m = kernel!(|| X.sin());
@@ -83,7 +82,6 @@ fn macro_sin() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_sin_pi_half() {
     // sin(π/2) ≈ 1
     let m = kernel!(|| X.sin());
@@ -92,7 +90,6 @@ fn macro_sin_pi_half() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_cos() {
     // cos(0) = 1
     let m = kernel!(|| X.cos());
@@ -140,7 +137,6 @@ fn macro_round() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_log10() {
     let m = kernel!(|| X.log10());
     let val = eval1(&m, 1000.0);
@@ -152,7 +148,6 @@ fn macro_log10() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_pow() {
     let m = kernel!(|| X.pow(Y));
     let val = eval2(&m, 2.0, 10.0);
@@ -220,7 +215,6 @@ fn kernel_raw_supports_the_same_primitive_and_library_methods_as_kernel() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn kernel_raw_supports_pow_and_log10() {
     let pow = eval2(&kernel_raw!(|| X.pow(Y)), 2.0, 10.0);
     assert!((pow - 2.0_f32.powf(10.0)).abs() / pow < 0.02);
@@ -261,7 +255,6 @@ fn two_params_is_a_builder() {
 // ============================================================================
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_atan2_matches_reference_at_boundary_and_interior_points() {
     let m = kernel!(|| Y.atan2(X));
     // atan2(1, 1) = π/4 — polynomial has ~0.06 error at t=1 boundary
@@ -282,7 +275,6 @@ fn macro_atan2_matches_reference_at_boundary_and_interior_points() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_atan2_quadrants() {
     let m = kernel!(|| Y.atan2(X));
 
@@ -321,7 +313,6 @@ fn macro_atan2_quadrants() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_atan() {
     let m = kernel!(|| X.atan());
     // atan(0.5) ≈ 0.4636 — well within polynomial range
@@ -337,7 +328,6 @@ fn macro_atan() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_asin() {
     let m = kernel!(|| X.asin());
     // asin(0) = 0
@@ -353,7 +343,6 @@ fn macro_asin() {
 }
 
 #[test]
-#[cfg(not(target_feature = "avx512f"))] // transcendentals: not in AVX-512 Stage-1 op set
 fn macro_acos() {
     let m = kernel!(|| X.acos());
     // acos(0.5) = π/3 ≈ 1.047 — exercises large-ratio path (ratio ≈ 1.73)
@@ -372,35 +361,56 @@ fn macro_acos() {
 }
 
 // ============================================================================
-// Builders choose fold or uniform by the argument's type
+// Every parameter is a uniform; a constant is a `const` item
+// (docs/plans/2026-09-25-the-language-is-kernel.md §1.4)
 // ============================================================================
 
-/// `f32` folds, exactly as it always has: the built kernel declares no
-/// argument.
+kernel! {
+    const CX: f32 = 1.0;
+    const R: f32 = 2.0;
+    /// The closure below with its values spelled as constants of the program.
+    pub fn folded() -> f32 { (X - CX) * R }
+}
+
+/// A constant is spelled as a `const` item, and it folds: the kernel declares
+/// no argument. An `f32` argument no longer does, whatever the call site
+/// passes: it is a uniform with the call's value as its default, and a bake
+/// reads that value. This test used to pin the opposite — that an `f32`
+/// argument folded — which is the call-site-type rule §1.4 retires.
 #[test]
-fn an_f32_argument_still_folds() {
+fn a_const_item_folds_and_an_f32_argument_is_a_uniform() {
+    let folded = folded();
+    assert!(folded.uniforms().is_empty());
+    assert!((eval1(&folded, 5.0) - 8.0).abs() < 1e-5);
+
     let k = kernel!(|cx: f32, r: f32| (X - cx) * r)(1.0, 2.0);
-    assert!(k.parts().0.uniforms().is_empty());
+    let defaults: Vec<f32> = k.uniforms().iter().map(|u| u.default).collect();
+    assert_eq!(defaults, [1.0, 2.0], "each parameter is an argument");
     assert!((eval1(&k, 5.0) - 8.0).abs() < 1e-5);
 }
 
-/// A `Uniform` handle makes the same parameter an argument of the compiled
-/// kernel: the bake reads its default, a block moves it, and one handle
-/// passed twice is one argument.
+/// A parameter is an argument of the compiled kernel: the bake reads the
+/// call's value, a block moves it, and a parameter read twice is one
+/// argument. The closure form has no `Args` record, so its program is
+/// rebound by position, through the one core method; this test used to set
+/// the argument through a `Uniform` handle passed at the call site.
 #[test]
 fn a_uniform_argument_is_bound_per_call() {
-    use pixelflow_core::{Manifold, Uniform};
-    let cx = Uniform::new(1.0);
-    let k = kernel!(|cx: f32, r: f32| (X - cx) * r)(cx, 2.0);
-    assert_eq!(k.parts().0.uniforms(), &[cx.decl()]);
+    use pixelflow_core::Manifold;
+    let k = kernel!(|cx: f32, r: f32| (X - cx) * r)(1.0, 2.0);
     assert!((eval1(&k, 5.0) - 8.0).abs() < 1e-5, "default cx = 1");
 
     let program = Manifold::compile(&k, [1, 1]);
     let mut block = program.block();
-    block.set(cx, 3.0).expect("cx is the argument");
+    block.set_declared([3.0, 2.0]).expect("cx and r");
     let moved = program.bind(&[]).with_uniforms(&block).eval_at(5.0, 0.0);
     assert!((moved - 4.0).abs() < 1e-5, "(5 − 3)·2");
 
-    let twice = kernel!(|a: f32, b: f32| a * b)(cx, cx);
-    assert_eq!(twice.parts().0.uniforms().len(), 1);
+    let squared = kernel!(|a: f32| a * a)(3.0);
+    assert_eq!(
+        squared.uniforms().len(),
+        1,
+        "one parameter read twice is one argument"
+    );
+    assert_eq!(eval1(&squared, 0.0), 9.0);
 }

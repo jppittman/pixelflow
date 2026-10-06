@@ -1,6 +1,6 @@
 //! # Abstract Syntax Tree
 //!
-//! The AST represents the structure of a kernel expression after parsing.
+//! The AST represents the structure of a kernel block after parsing.
 //!
 //! ## Design Philosophy
 //!
@@ -15,46 +15,350 @@
 //!
 //! ```text
 //! KernelDef
-//!   ├── params: [(name, type), ...]    // Closure parameters (scalars)
-//!   └── body: Expr                     // The kernel expression
+//!   ├── spelling: Closure | Items     // how the macro's value is spelled
+//!   ├── records: [RecordItem, ...]    // `struct R { a: f32, b: f32 }`
+//!   ├── consts: [ConstItem, ...]      // `const NAME: f32 = expr;`
+//!   └── fns: [FnItem, ...]            // `pub fn` entries and private helpers
+//!
+//! FnItem
+//!   ├── vis                           // `pub` makes an entry; private is a helper
+//!   ├── structural: [name, ...]       // an entry's `const N: usize` parameters
+//!   ├── params: [(name, type), ...]   // scalar and record parameters
+//!   ├── ret: type                     // declared; absent only for the closure sugar
+//!   └── body: Expr
 //!
 //! Expr
 //!   ├── Ident(name)                    // Variable reference: X, cx, etc.
-//!   ├── Literal(value)                 // Numeric literal: 1.0, 2.5
+//!   ├── Literal(value)                 // Numeric literal: 1.0, 2.5, 4
 //!   ├── Binary(op, lhs, rhs)           // a + b, x * y
 //!   ├── Unary(op, operand)             // -x
-//!   ├── Call(method, receiver, args)   // x.sqrt(), a.max(b)
+//!   ├── MethodCall(receiver, method, args) // x.sqrt(), a.max(b)
+//!   ├── Call(func, args)               // DX(e), a helper: f(x, y)
+//!   ├── If(cond, then, else)           // if c { a } else { b }
+//!   ├── Fold(reduction, range, binder, body) // (0..N).map(|i| e).sum()
+//!   ├── Cast(operand)                  // i as f32
+//!   ├── Field(base, member)            // p.x0, a record's field
 //!   ├── Block(stmts, expr)             // { let dx = ...; dx * dx }
 //!   └── Paren(inner)                   // (a + b)
 //! ```
 
 use proc_macro2::Span;
+use syn::ext::IdentExt;
 use syn::{Ident, Type};
 
-/// A complete kernel definition.
+/// A complete kernel definition: the items of a `kernel!` block.
+///
+/// The closure form `|a: f32, …| e` is sugar for a block with one entry, so
+/// every stage after the parser sees one shape; only emission asks how the
+/// result is spelled.
 #[derive(Debug, Clone)]
 pub struct KernelDef {
-    /// Parameters captured from the closure syntax.
+    /// How the macro's value is spelled.
+    pub spelling: Spelling,
+    /// The block's records, in declaration order: [`RecordId`] indexes this.
+    pub records: Vec<RecordItem>,
+    /// The block's `const` items, in declaration order.
+    pub consts: Vec<ConstItem>,
+    /// The block's `fn` items — entries and helpers — in declaration order.
+    pub fns: Vec<FnItem>,
+}
+
+impl KernelDef {
+    /// The record a declared type names, if it names one of the block's.
+    ///
+    /// The one resolution of a record's name: `sema` types a parameter by
+    /// it, and lowering and emission lay a record parameter out by it, so no
+    /// two stages can disagree about which record a type is.
+    pub fn record_named(&self, ty: &Type) -> Option<RecordId> {
+        let Type::Path(path) = ty else {
+            return None;
+        };
+        if path.qself.is_some() {
+            return None;
+        }
+        let ident = path.path.get_ident()?;
+        self.records
+            .iter()
+            .position(|record| record.name == *ident)
+            .map(RecordId)
+    }
+
+    /// The record `id` names.
+    pub fn record(&self, id: RecordId) -> &RecordItem {
+        &self.records[id.0]
+    }
+}
+
+/// Which of the block's records a type is: an index into
+/// [`KernelDef::records`], in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecordId(pub usize);
+
+/// `struct R { a: f32, b: f32 }`: a record of named `f32` fields
+/// (docs/plans/2026-09-25-the-language-is-kernel.md §1.3).
+///
+/// Emitted as a host `#[repr(C)]` struct of the same name, fields and
+/// visibility. In a body a record is its fields: an entry's record parameter
+/// is one uniform per field, in field order, and a helper's is its
+/// argument's fields.
+#[derive(Debug, Clone)]
+pub struct RecordItem {
+    /// Its attributes (any but `repr` and `cfg`), re-emitted on the host
+    /// struct.
+    pub attrs: Vec<syn::Attribute>,
+    pub vis: syn::Visibility,
+    pub name: Ident,
+    /// The fields, in declaration order: the order a record parameter's
+    /// uniforms are declared in.
+    pub fields: Vec<RecordField>,
+}
+
+/// One named field of a record. `sema` requires its type to be `f32`.
+#[derive(Debug, Clone)]
+pub struct RecordField {
+    /// Its attributes (any but `repr` and `cfg`), re-emitted on the host
+    /// struct's field.
+    pub attrs: Vec<syn::Attribute>,
+    pub vis: syn::Visibility,
+    pub name: Ident,
+    pub ty: Type,
+}
+
+/// How a `kernel!` invocation spells its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spelling {
+    /// `kernel!(|a: f32, …| e)`: one entry, and the expansion is an
+    /// expression — a `Kernel` with no parameters, a closure over their
+    /// `f32`s with some, each one a uniform.
+    Closure,
+    /// `kernel! { struct …; const …; fn …; pub fn … }`: the expansion is
+    /// items — a host struct per record, a host `const` per `pub const`, and
+    /// per entry a host `fn` and, when it has parameters, its `Args` record.
+    Items,
+}
+
+/// A `const NAME: f32 = expr;` or `const NAME: usize = expr;` item,
+/// evaluated at expansion.
+#[derive(Debug, Clone)]
+pub struct ConstItem {
+    /// Doc comments, re-emitted on a `pub const`'s host twin.
+    pub attrs: Vec<syn::Attribute>,
+    /// `pub` makes the value a host `const` too.
+    pub vis: syn::Visibility,
+    pub name: Ident,
+    /// The declared type; sema requires `f32` or `usize`.
+    pub ty: Type,
+    pub init: Expr,
+}
+
+/// A `fn` item: an entry when `pub`, a helper otherwise.
+#[derive(Debug, Clone)]
+pub struct FnItem {
+    /// Doc comments, re-emitted on an entry's host function.
+    pub attrs: Vec<syn::Attribute>,
+    /// `pub` makes an entry — the macro emits a host function for it. A
+    /// private `fn` is a helper, inlined at each call.
+    pub vis: syn::Visibility,
+    pub name: Ident,
+    /// An entry's structural parameters, its `const N: usize` generics, in
+    /// declaration order (plan §1.4). Each value is its own program: the
+    /// host function is generic over them, and a body reads one as a count,
+    /// in a range's bounds or as `N as f32`. A helper has none.
+    pub structural: Vec<Ident>,
     pub params: Vec<Param>,
+    /// The declared return type. `None` only for the closure sugar, whose
+    /// type is inferred.
+    pub ret: Option<Type>,
     /// The kernel body expression.
     pub body: Expr,
 }
 
-/// A captured scalar parameter.
-///
-/// There is one parameter kind, because there is one thing a parameter can
-/// be: a number folded into the arena when the builder runs. Kernels compose
-/// as `Kernel` values (`Kernel::at`/`sum`/`select`/arithmetic), not by
-/// splicing a manifold through a macro slot.
+/// What a `fn` item is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// A program: it may read `X` and `Y`, and the macro emits a host
+    /// function for it.
+    Entry,
+    /// A function of its arguments only, inlined at each call.
+    Helper,
+}
+
+impl FnItem {
+    /// An entry is any `fn` with a visibility; a helper has none.
+    pub fn role(&self) -> Role {
+        match self.vis {
+            syn::Visibility::Inherited => Role::Helper,
+            _ => Role::Entry,
+        }
+    }
+
+    /// Whether a parameter is kernel-typed: the entry is then a composition,
+    /// built when its host function is called (plan Phase D-a).
+    pub fn takes_a_kernel(&self) -> bool {
+        self.params.iter().any(Param::is_kernel)
+    }
+
+    /// Whether the entry has an `Args` record (plan §1.4): it has uniform
+    /// parameters and nothing else. An entry that takes a kernel has none —
+    /// its program declares the kernel's uniforms after its own, and the
+    /// record could rebind only a program whose argument declares none.
+    /// Binding a composed program is O3 of the plan.
+    pub fn has_args_record(&self) -> bool {
+        !self.params.is_empty() && !self.takes_a_kernel()
+    }
+
+    /// The name of an entry's `Args` record: the entry's name in
+    /// UpperCamelCase, then `Args` — `shifted_radius` has
+    /// `ShiftedRadiusArgs` (plan §1.4). `sema` refuses one that collides,
+    /// and emission names the record by it.
+    pub fn args_record(&self) -> Ident {
+        let camel: String = self
+            .name
+            .unraw()
+            .to_string()
+            .split('_')
+            .flat_map(|word| {
+                let mut letters = word.chars();
+                letters
+                    .next()
+                    .map(|first| first.to_uppercase().chain(letters))
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
+        Ident::new(&format!("{camel}Args"), self.name.span())
+    }
+}
+
+/// A declared parameter: a scalar, one of the block's records, or a kernel.
 #[derive(Debug, Clone)]
 pub struct Param {
     /// Parameter name.
     pub name: Ident,
-    /// The declared scalar type (`f32`, `i32`).
+    /// The declared type (`f32`, a record or `impl Fn(f32, f32) -> f32`;
+    /// `bool` in a helper).
     pub ty: Box<Type>,
 }
 
+impl Param {
+    /// Whether the parameter is kernel-typed, `impl Fn(f32, f32) -> f32`.
+    pub fn is_kernel(&self) -> bool {
+        FunctionType::of(&self.ty) == FunctionType::Kernel
+    }
+}
+
+/// What a declared type is as a function.
+///
+/// The language has one function type, `impl Fn(f32, f32) -> f32`: a kernel
+/// supplied at run time, a function of the two coordinates (plan §1.3,
+/// §1.4, Phase D-a). The one classification of a type as that: `sema` types
+/// a parameter by it and refuses every other spelling of a function, naming
+/// this one, and lowering and emission find an entry's kernel-typed
+/// parameters by it, so no two stages can disagree about which they are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionType {
+    /// Not a function.
+    NotOne,
+    /// `impl Fn(f32, f32) -> f32`.
+    Kernel,
+    /// A function spelled some other way: what differs from the one
+    /// spelling.
+    Misspelled(&'static str),
+}
+
+impl FunctionType {
+    /// The classification of `ty`.
+    pub fn of(ty: &Type) -> Self {
+        match ty {
+            Type::Paren(inner) => Self::of(&inner.elem),
+            Type::Group(inner) => Self::of(&inner.elem),
+            Type::ImplTrait(bounds) => Self::of_bounds(&bounds.bounds),
+            Type::TraitObject(_) => Self::Misspelled(
+                "`impl`, not `dyn`: a kernel-typed parameter is `impl Fn(f32, f32) -> f32`, \
+                 and the host passes a `&Kernel` for it",
+            ),
+            Type::BareFn(_) => Self::Misspelled(
+                "`impl Fn`, not a function pointer: a kernel is a program built at run time, \
+                 not a Rust function",
+            ),
+            Type::Reference(reference) => match Self::of(&reference.elem) {
+                Self::NotOne => Self::NotOne,
+                Self::Kernel | Self::Misspelled(_) => Self::Misspelled(
+                    "by value, `impl Fn(f32, f32) -> f32`, not by reference: the host \
+                     function passes a `&Kernel` for it",
+                ),
+            },
+            _ => Self::NotOne,
+        }
+    }
+
+    /// `impl B`: a kernel when `B` is `Fn(f32, f32) -> f32`, alone.
+    fn of_bounds(
+        bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
+    ) -> Self {
+        let mut bounds = bounds.iter();
+        let (Some(syn::TypeParamBound::Trait(bound)), None) = (bounds.next(), bounds.next()) else {
+            return Self::Misspelled(
+                "one bound, `Fn(f32, f32) -> f32`, and no other: a kernel is a function of \
+                 the two coordinates and nothing more",
+            );
+        };
+        if bound.lifetimes.is_some() || !matches!(bound.modifier, syn::TraitBoundModifier::None) {
+            return Self::Misspelled("`Fn(f32, f32) -> f32`, with no lifetimes and no `?`");
+        }
+        let segment = match bound.path.segments.iter().collect::<Vec<_>>().as_slice() {
+            [segment] if bound.path.leading_colon.is_none() => *segment,
+            _ => return Self::Misspelled("`Fn`, by its own name"),
+        };
+        match segment.ident.to_string().as_str() {
+            "Fn" => {}
+            "FnMut" | "FnOnce" => {
+                return Self::Misspelled(
+                    "`Fn`: a kernel is applied, and nothing a body does mutates or consumes it",
+                );
+            }
+            _ => {
+                return Self::Misspelled(
+                    "an `impl` type is a kernel, `impl Fn(f32, f32) -> f32`, and nothing else",
+                );
+            }
+        }
+        let syn::PathArguments::Parenthesized(signature) = &segment.arguments else {
+            return Self::Misspelled("`Fn(f32, f32) -> f32`, its signature written out");
+        };
+        let takes_the_coordinates =
+            signature.inputs.len() == 2 && signature.inputs.iter().all(is_f32);
+        if !takes_the_coordinates {
+            return Self::Misspelled(
+                "`Fn(f32, f32)`: a kernel is a function of the two coordinates, applied as \
+                 `k(x, y)`",
+            );
+        }
+        match &signature.output {
+            syn::ReturnType::Type(_, output) if is_f32(output) => Self::Kernel,
+            _ => Self::Misspelled(
+                "`-> f32`: a kernel's value is an `f32`; a mask is a `bool` a body computes, \
+                 never a kernel's value",
+            ),
+        }
+    }
+}
+
+/// Whether `ty` is `f32`, by its own name.
+fn is_f32(ty: &Type) -> bool {
+    match ty {
+        Type::Path(path) => path.qself.is_none() && path.path.is_ident("f32"),
+        Type::Group(inner) => is_f32(&inner.elem),
+        _ => false,
+    }
+}
+
 /// An expression in the kernel body.
+///
+/// Every variant is syntax the language gives a meaning to. What it does not
+/// — a tuple, a field, a range, a path from outside the block — the parser
+/// refuses at the token, with a span; nothing is carried along to be refused
+/// by a later stage.
 #[derive(Debug, Clone)]
 pub enum Expr {
     /// A variable reference (X, Y, cx, etc.).
@@ -66,34 +370,75 @@ pub enum Expr {
     /// A binary operation (a + b, x * y, etc.).
     Binary(BinaryExpr),
 
-    /// A unary operation (-x, !b).
+    /// A unary operation (-x).
     Unary(UnaryExpr),
 
     /// A method call (x.sqrt(), a.max(b), etc.).
     MethodCall(MethodCallExpr),
 
-    /// A free function call (V(m), DX(expr), sin(x), etc.).
+    /// A free function call: a projection (`DX(e)`) or a helper (`f(x, y)`).
     Call(CallExpr),
+
+    /// The choice: `if c { a } else { b }`.
+    If(IfExpr),
+
+    /// A fold over a constant range: `(0..N).map(|i| e).sum()`.
+    Fold(FoldExpr),
+
+    /// A conversion: `i as f32`.
+    Cast(CastExpr),
+
+    /// A record's field: `p.x0`.
+    Field(FieldExpr),
 
     /// A block expression ({ let dx = ...; dx * dx }).
     Block(BlockExpr),
 
-    /// A tuple expression: (a, b, c)
-    Tuple(TupleExpr),
-
     /// A parenthesized expression ((a + b)).
     Paren(Box<Expr>),
-
-    /// Passthrough for expressions we don't specially handle.
-    /// The codegen phase will emit these verbatim.
-    Verbatim(syn::Expr),
 }
 
+impl Expr {
+    /// Where the expression is, for a diagnostic to point at: an operator's
+    /// token, a name, a block's braces.
+    pub fn span(&self) -> Span {
+        match self {
+            Expr::Ident(e) => e.span,
+            Expr::Literal(e) => e.span,
+            Expr::Binary(e) => e.span,
+            Expr::Unary(e) => e.span,
+            Expr::MethodCall(e) => e.span,
+            Expr::Call(e) => e.span,
+            Expr::If(e) => e.span,
+            Expr::Fold(e) => e.span,
+            Expr::Cast(e) => e.span,
+            Expr::Field(e) => e.span,
+            Expr::Block(e) => e.span,
+            Expr::Paren(inner) => inner.span(),
+        }
+    }
+
+    /// The name this expression is, through any parentheses, or `None` if
+    /// it is not a name. A `usize` and a record are both written only by
+    /// name: nothing in a body computes a count (plan §1.6) or builds a
+    /// record (Phase D, D7).
+    pub fn named(&self) -> Option<&Ident> {
+        match self {
+            Expr::Paren(inner) => inner.named(),
+            Expr::Ident(ident) => Some(&ident.name),
+            _ => None,
+        }
+    }
+}
+
+/// `base.member`: one field of a record. The base is a record by name — a
+/// parameter or a `let` alias of one — which `sema` checks, with the
+/// member one of the record's fields.
 #[derive(Debug, Clone)]
-pub struct TupleExpr {
-    pub elems: Vec<Expr>,
-    // Kept for AST-node uniformity; not all node types' spans are read today.
-    #[allow(dead_code)]
+pub struct FieldExpr {
+    pub base: Box<Expr>,
+    pub member: Ident,
+    /// The member's span.
     pub span: Span,
 }
 
@@ -101,18 +446,100 @@ pub struct TupleExpr {
 #[derive(Debug, Clone)]
 pub struct IdentExpr {
     pub name: Ident,
-    // Kept for AST-node uniformity; not all node types' spans are read today.
-    #[allow(dead_code)]
+    /// The name's span.
     pub span: Span,
 }
 
-/// A literal expression.
+/// A numeric literal: the number it denotes, decided by the parser.
+///
+/// The parser rounds a float once, as rustc does, so no later stage holds
+/// the source text or rounds it again. An integer is kept exactly as
+/// written, because its type depends on where it stands: a value where a
+/// value is expected ([`LiteralExpr::f32_value`]), a count in a range's
+/// bounds or a `usize` const ([`LiteralExpr::usize_value`]). Every stage
+/// asks those two questions here, so no two stages can answer them
+/// differently.
 #[derive(Debug, Clone)]
 pub struct LiteralExpr {
-    pub lit: syn::Lit,
-    // Kept for AST-node uniformity; not all node types' spans are read today.
-    #[allow(dead_code)]
+    pub value: Literal,
     pub span: Span,
+}
+
+/// What a numeric literal denotes, before its position gives it a type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Literal {
+    /// A float literal, or an integer suffixed `f32` (a float literal to
+    /// rustc): the `f32` it rounds to, once.
+    F32(f32),
+    /// An unsuffixed integer literal: exactly the integer written.
+    Int(u128),
+}
+
+impl LiteralExpr {
+    /// The `f32` this literal denotes where a value is expected.
+    ///
+    /// An integer is refused unless an `f32` holds it exactly: at most
+    /// [`f32::MANTISSA_DIGITS`] significant bits. An integer's digits claim
+    /// exactness, and rustc has no rounding of its own to borrow here: it
+    /// refuses an unsuffixed integer where an `f32` is expected. `16777217`
+    /// (2²⁴ + 1) is the first integer refused; `1099511627776` (2⁴⁰) is
+    /// accepted.
+    pub fn f32_value(&self) -> syn::Result<f32> {
+        match self.value {
+            Literal::F32(value) => Ok(value),
+            // Exact, and finite: below 2¹²⁸, an integer with at most
+            // `MANTISSA_DIGITS` significant bits is at most `f32::MAX`.
+            Literal::Int(n) if significant_bits(n) <= f32::MANTISSA_DIGITS => Ok(n as f32),
+            Literal::Int(n) => Err(syn::Error::new(
+                self.span,
+                format!(
+                    "`{n}` is not exactly representable as an `f32`\n\
+                     \n\
+                     note: an `f32` holds an integer exactly only when it has at most {} \
+                     significant bits\n\
+                     \n\
+                     help: write the `f32` you mean as a float literal, e.g. `{n}.0`, \
+                     which rounds to the nearest one",
+                    f32::MANTISSA_DIGITS,
+                ),
+            )),
+        }
+    }
+
+    /// The `usize` this literal denotes in a range's bounds or a `usize`
+    /// const: an integer, at most `usize::MAX`. A `usize` is 64 bits on
+    /// every target this language compiles for (x86-64 and aarch64), and
+    /// the control plane is 64-bit.
+    pub fn usize_value(&self) -> syn::Result<u64> {
+        let Literal::Int(n) = self.value else {
+            return Err(syn::Error::new(
+                self.span,
+                "mismatched types: expected `usize`, found a float literal\n\
+                 \n\
+                 note: a range's bounds and a `usize` const are counts, written as integers",
+            ));
+        };
+        u64::try_from(n).map_err(|_| {
+            syn::Error::new(
+                self.span,
+                format!(
+                    "literal out of range for `usize`\n\
+                     \n\
+                     note: `{n}` is past `usize::MAX`, {}",
+                    u64::MAX
+                ),
+            )
+        })
+    }
+}
+
+/// The bits between an integer's highest and lowest set bits, inclusive:
+/// what a binary significand must hold to represent it exactly.
+fn significant_bits(n: u128) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+    u128::BITS - n.leading_zeros() - n.trailing_zeros()
 }
 
 /// Binary operators we recognize.
@@ -122,15 +549,14 @@ pub enum BinaryOp {
     Sub,
     Mul,
     Div,
-    Rem,
-    // Comparison (for future use, currently handled via method calls)
+    // Comparisons: `f32`s in, a `bool` out.
     Lt,
     Le,
     Gt,
     Ge,
     Eq,
     Ne,
-    // Boolean/bitwise operations
+    // `bool`s combine.
     BitAnd,
     BitOr,
 }
@@ -141,8 +567,7 @@ pub struct BinaryExpr {
     pub op: BinaryOp,
     pub lhs: Box<Expr>,
     pub rhs: Box<Expr>,
-    // Kept for AST-node uniformity; not all node types' spans are read today.
-    #[allow(dead_code)]
+    /// The operator's span.
     pub span: Span,
 }
 
@@ -150,7 +575,6 @@ pub struct BinaryExpr {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Neg,
-    Not,
 }
 
 /// A unary expression.
@@ -158,8 +582,7 @@ pub enum UnaryOp {
 pub struct UnaryExpr {
     pub op: UnaryOp,
     pub operand: Box<Expr>,
-    // Kept for AST-node uniformity; not all node types' spans are read today.
-    #[allow(dead_code)]
+    /// The operator's span.
     pub span: Span,
 }
 
@@ -172,21 +595,98 @@ pub struct MethodCallExpr {
     pub method: Ident,
     /// Method arguments (empty for sqrt, one arg for max, etc.).
     pub args: Vec<Expr>,
-    // Kept for AST-node uniformity; not all node types' spans are read today.
-    #[allow(dead_code)]
+    /// The method name's span.
     pub span: Span,
 }
 
-/// A free function call expression (V(m), DX(expr), etc.).
+/// A free function call expression (DX(expr), a helper, etc.).
 #[derive(Debug, Clone)]
 pub struct CallExpr {
-    /// The function being called (V, DX, DY, etc.).
+    /// The function being called (V, DX, DY, a helper's name).
     pub func: Ident,
     /// Function arguments.
     pub args: Vec<Expr>,
-    // Kept for AST-node uniformity; not all node types' spans are read today.
-    #[allow(dead_code)]
+    /// The function name's span.
     pub span: Span,
+}
+
+/// `if cond { then } else { otherwise }`. The `else` is required: a body is
+/// an expression, and there is no unit. An `else if` chain is an `If` in
+/// the `else` position.
+#[derive(Debug, Clone)]
+pub struct IfExpr {
+    pub cond: Box<Expr>,
+    pub then_branch: BlockExpr,
+    pub else_branch: Box<Expr>,
+    /// The `if` token's span.
+    pub span: Span,
+}
+
+/// `(lo..hi).map(|i| e).sum()` and its siblings: the fold of `e` over
+/// `i ∈ [lo, hi)` under a monoid, or the monoid's identity when the range is
+/// empty (docs/plans/2026-09-25-the-language-is-kernel.md §1.5).
+///
+/// The closure's parameter is the binder and its body is the fold's body.
+/// The closure is not a value, and has no meaning anywhere else. The bounds
+/// are constant, evaluated by `sema` at expansion, and the binder is a
+/// `usize`, which a body makes a value of only by `i as f32`.
+#[derive(Debug, Clone)]
+pub struct FoldExpr {
+    pub reduction: Reduction,
+    pub range: RangeExpr,
+    /// The closure's parameter: the index the body reads.
+    pub binder: Ident,
+    pub body: Box<Expr>,
+    /// The span of the method that names the reduction (`sum`, `fold`,
+    /// `any`, …).
+    pub span: Span,
+}
+
+/// The half-open `lo..hi` a fold ranges over.
+#[derive(Debug, Clone)]
+pub struct RangeExpr {
+    pub lo: Box<Expr>,
+    pub hi: Box<Expr>,
+    /// The `..` token's span.
+    pub span: Span,
+}
+
+/// Which monoid a fold combines its terms under, as the source spells it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reduction {
+    /// `.map(|i| e).sum()`: `+`, identity 0.
+    Sum,
+    /// `.map(|i| e).product()`: `×`, identity 1.
+    Product,
+    /// `.map(|i| e).fold(f32::INFINITY, f32::min)`: identity +∞.
+    Min,
+    /// `.map(|i| e).fold(f32::NEG_INFINITY, f32::max)`: identity −∞.
+    Max,
+    /// `.any(|i| m)`: a mask's `|`, identity all-clear.
+    Any,
+    /// `.all(|i| m)`: a mask's `&`, identity all-set.
+    All,
+}
+
+/// `operand as f32`, the language's one conversion. The target is always
+/// `f32` — the parser refuses any other — so it is not stored. `sema`
+/// accepts one operand: a `usize`, by name, a fold's index, a `usize` const
+/// or an entry's structural parameter.
+#[derive(Debug, Clone)]
+pub struct CastExpr {
+    pub operand: Box<Expr>,
+    /// The `as` token's span.
+    pub span: Span,
+}
+
+impl CastExpr {
+    /// The name being converted, through any parentheses, or `None` if the
+    /// operand is not a name. Only a name can be a `usize`: nothing in a
+    /// body computes one (plan §1.6), so a `usize` expression is always a
+    /// fold's index, a `usize` const or a structural parameter.
+    pub fn named(&self) -> Option<&Ident> {
+        self.operand.named()
+    }
 }
 
 /// A statement in a block.
@@ -194,6 +694,12 @@ pub struct CallExpr {
 pub enum Stmt {
     /// A let binding: `let dx = X - cx;`
     Let(Box<LetStmt>),
+    /// `let (a, b) = (e1, e2);`, flattened: each name bound to its
+    /// expression, and all at once — every expression is evaluated where the
+    /// statement stands, before any of its names binds, as Rust evaluates the
+    /// tuple before taking it apart (D7's front half). There is no tuple
+    /// left behind to be a value.
+    LetTuple(Vec<LetStmt>),
     /// An expression statement: `foo();`
     Expr(Expr),
 }
@@ -204,7 +710,7 @@ pub struct LetStmt {
     pub name: Ident,
     pub ty: Option<Type>,
     pub init: Expr,
-    // Kept for AST-node uniformity; not all node types' spans are read today.
+    // Kept for AST-node uniformity; the name carries its own span.
     #[allow(dead_code)]
     pub span: Span,
 }
@@ -215,8 +721,7 @@ pub struct BlockExpr {
     pub stmts: Vec<Stmt>,
     /// The final expression (if any).
     pub expr: Option<Box<Expr>>,
-    // Kept for AST-node uniformity; not all node types' spans are read today.
-    #[allow(dead_code)]
+    /// The braces' span.
     pub span: Span,
 }
 
@@ -228,7 +733,6 @@ impl BinaryOp {
             syn::BinOp::Sub(_) => Some(BinaryOp::Sub),
             syn::BinOp::Mul(_) => Some(BinaryOp::Mul),
             syn::BinOp::Div(_) => Some(BinaryOp::Div),
-            syn::BinOp::Rem(_) => Some(BinaryOp::Rem),
             syn::BinOp::Lt(_) => Some(BinaryOp::Lt),
             syn::BinOp::Le(_) => Some(BinaryOp::Le),
             syn::BinOp::Gt(_) => Some(BinaryOp::Gt),
@@ -247,7 +751,6 @@ impl UnaryOp {
     pub fn from_syn(op: &syn::UnOp) -> Option<Self> {
         match op {
             syn::UnOp::Neg(_) => Some(UnaryOp::Neg),
-            syn::UnOp::Not(_) => Some(UnaryOp::Not),
             _ => None,
         }
     }
@@ -264,7 +767,6 @@ mod tests {
             (syn::parse_quote!(-), BinaryOp::Sub),
             (syn::parse_quote!(*), BinaryOp::Mul),
             (syn::parse_quote!(/), BinaryOp::Div),
-            (syn::parse_quote!(%), BinaryOp::Rem),
             (syn::parse_quote!(<), BinaryOp::Lt),
             (syn::parse_quote!(<=), BinaryOp::Le),
             (syn::parse_quote!(>), BinaryOp::Gt),
@@ -279,17 +781,52 @@ mod tests {
         }
     }
 
+    /// `%` has no IR op and `+=` assigns: neither is a kernel operator.
     #[test]
     fn binary_op_from_syn_rejects_an_unsupported_syn_binop() {
-        let syn_op: syn::BinOp = syn::parse_quote!(+=);
-        assert_eq!(BinaryOp::from_syn(&syn_op), None);
+        for unsupported in [
+            syn::parse_quote!(+=),
+            syn::parse_quote!(%),
+            syn::parse_quote!(^),
+            syn::parse_quote!(&&),
+        ] {
+            let syn_op: syn::BinOp = unsupported;
+            assert_eq!(BinaryOp::from_syn(&syn_op), None, "{syn_op:?}");
+        }
     }
 
+    /// `!` has no IR op, so it is not a kernel operator either.
     #[test]
-    fn unary_op_from_syn_maps_neg_and_not_to_their_own_variants() {
+    fn unary_op_from_syn_maps_neg_and_nothing_else() {
         let neg: syn::UnOp = syn::parse_quote!(-);
         let not: syn::UnOp = syn::parse_quote!(!);
         assert_eq!(UnaryOp::from_syn(&neg), Some(UnaryOp::Neg));
-        assert_eq!(UnaryOp::from_syn(&not), Some(UnaryOp::Not));
+        assert_eq!(UnaryOp::from_syn(&not), None);
+    }
+
+    /// An entry's `Args` record is its name in UpperCamelCase, then `Args`;
+    /// a raw identifier is named by what it spells.
+    #[test]
+    fn an_entrys_args_record_is_its_name_in_upper_camel_case() {
+        for (entry, args) in [
+            ("circle", "CircleArgs"),
+            ("shifted_radius2", "ShiftedRadius2Args"),
+            ("a__b_", "ABArgs"),
+            ("r#type", "TypeArgs"),
+        ] {
+            let item: FnItem = FnItem {
+                attrs: Vec::new(),
+                vis: syn::parse_quote!(pub),
+                name: syn::parse_str(entry).expect("an identifier"),
+                structural: Vec::new(),
+                params: Vec::new(),
+                ret: None,
+                body: Expr::Paren(Box::new(Expr::Ident(IdentExpr {
+                    name: syn::parse_quote!(X),
+                    span: Span::call_site(),
+                }))),
+            };
+            assert_eq!(item.args_record().to_string(), args, "{entry}");
+        }
     }
 }

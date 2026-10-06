@@ -7,7 +7,6 @@
 //! A bare array makes each consumer responsible for turning an op into a
 //! subscript, and every consumer that did got it wrong the same way.
 
-use crate::traits::EmitStyle;
 use core::ops::{Index, IndexMut};
 
 /// The op table: the single place an operation is declared.
@@ -136,7 +135,16 @@ op_table! {
     Ne = 35,
 
     // --- Control Flow ---
-    Select = 36,
+    /// `If(m, a, b)` is `if m then a else b`: two live cases, so it is
+    /// dispatch, not a fold — everything downstream carries both arms. A
+    /// batch whose mask is uniform takes one arm, and that is a jump; only
+    /// a mask that varies by lane blends, and the bitwise blend is the
+    /// fallback for that one case, not the definition. It was named
+    /// `Select` until docs/plans/2026-09-25-the-language-is-kernel.md D18:
+    /// that name hid the `if`, and the emitter built on the misreading —
+    /// blend by default, a branch bought per node in `emit/guards.rs` —
+    /// cost 73% of a glyph bake (docs/BACKLOG.md, X1).
+    If = 36,
 
     // --- Structure ---
     Tuple = 37,
@@ -186,14 +194,13 @@ op_table! {
     RawGather = 48,
 
     // --- Reduction (lattice fold) ---
-    /// Fold a body over a bounded domain. Encoded
-    /// `Nary(Reduce, [Const(combiner), Const(reduce_var), Const(extent), body])`:
-    /// `combiner` is the monoid op index (`Add`/`Mul`/`Min`/`Max`), `body`
-    /// references `Var(reduce_var)` (a binder-space index), and the fold runs over
-    /// `0..extent`. The combiner is a *child* (a parameter), not baked into the
-    /// opcode, so one `Reduce` covers every monoid and can later take an
-    /// arbitrary combiner function. Lowered to an unrolled accumulation by
-    /// `expand_reduce` before codegen — the analogue of `Gather -> RawGather`.
+    /// Fold a body over a bounded domain: the kind of an
+    /// `ExprNode::Reduce { fold, body }`, whose one child is `body`. The
+    /// monoid it folds under, the binder `body` reads through its `Var`, and
+    /// the range that binder runs over are a [`Fold`](crate::fold::Fold) in
+    /// the node, not children — see `fold.rs` for the `Const`-child encoding
+    /// it replaced. Legal through codegen, which emits a surviving fold as a
+    /// loop (`passes::legalize` leaves every one standing).
     Reduce = 49,
 
     // --- Uniforms (per-call scalars) ---
@@ -281,7 +288,7 @@ impl OpKind {
     ///   `FRECPE` + one `FRECPS` refinement. The exact `1.0 / x` the folder
     ///   computes is not any of those answers.
     /// - `MulAdd` where one rounding differs from two: `vfmadd`/`FMLA` round
-    ///   the product and sum together, SSE2's `mulps`+`addps` rounds twice.
+    ///   the product and sum together, a decomposed `mul`+`add` rounds twice.
     ///   `mul_add(1.0000001, 4097.0, 4097.0)` is `8194.001` fused, `8194.0`
     ///   split.
     ///
@@ -317,7 +324,7 @@ impl OpKind {
                 (a - libm::truncf(*a)).abs() == 0.5 || (a.is_sign_negative() && *a > -0.5)
             }),
             // Reciprocal ESTIMATES, and every target estimates differently:
-            // SSE2/AVX2 `rcpps`/`vrcpps` give ~12 bits, AVX-512 `vrcp14ps`
+            // AVX2 `vrcpps` gives ~12 bits, AVX-512 `vrcp14ps`
             // ~14, and aarch64 emits `FRECPE` plus one `FRECPS` Newton step.
             // `eval_unary`'s exact `1.0 / x` matches none of them, so there is
             // no host whose answer is worth baking. Unconditional: an estimate
@@ -441,7 +448,7 @@ impl OpKind {
             | Self::RawGather
             | Self::Seq => 2,
 
-            Self::MulAdd | Self::Select | Self::Gather => 3,
+            Self::MulAdd | Self::If | Self::Gather => 3,
 
             // The body. The algebra, the binder and the range are the node's
             // own metadata ([`Fold`](crate::Fold)) rather than three `Const`
@@ -490,7 +497,14 @@ impl OpKind {
             Self::Ge => "ge",
             Self::Eq => "eq",
             Self::Ne => "ne",
-            Self::Select => "select",
+            // Spelled as the `kernel!` method that lowers to it, which keeps its
+            // name until Phase B of docs/plans/2026-09-25-the-language-is-kernel.md
+            // renames it `if`. This string is also what the training corpus
+            // fingerprint, the arena's `Display` and `cost_by_name` carry, so
+            // renaming the variant does not reach it. (`variant_name`, which
+            // `kernel!`'s expansion spells `OpKind::` paths with, and the derived
+            // `Debug`, which Guide datasets and checkpoints persist, did follow.)
+            Self::If => "select",
             Self::Tuple => "tuple",
             Self::TruncToInt => "trunc_to_int",
             Self::IntToFloat => "int_to_float",
@@ -550,7 +564,8 @@ impl OpKind {
             "ge" => Some(Self::Ge),
             "eq" => Some(Self::Eq),
             "ne" => Some(Self::Ne),
-            "select" => Some(Self::Select),
+            // The method's spelling, and the persisted one — see `name`.
+            "select" => Some(Self::If),
             "tuple" => Some(Self::Tuple),
             "trunc_to_int" => Some(Self::TruncToInt),
             "int_to_float" => Some(Self::IntToFloat),
@@ -574,13 +589,14 @@ impl OpKind {
     /// True for ops a kernel body may call as `.method(args)` — the surface
     /// set [`OpKind::from_method_call`] resolves into.
     ///
-    /// Stricter than "not [`EmitStyle::Special`]": [`Self::Add`]/[`Self::Sub`]/
-    /// [`Self::Mul`]/[`Self::Div`] are real, non-special ops but are spelled
-    /// `+ - * /`, never `.add(y)`, and [`Self::TruncToInt`]/[`Self::IAdd`]/
-    /// [`Self::Shl`]/[`Self::Shr`]/[`Self::BitAnd`]/[`Self::BitOr`]/
-    /// [`Self::IntToFloat`] are primitives that only ever arise from lowering
-    /// passes (`Gather`/`Reduce` expansion), never from surface syntax a
-    /// kernel body writes directly.
+    /// Stricter than "not structural". The structural ops — leaves, memory,
+    /// binders, `Dwrt` and `Seq` — have no method spelling at all; beyond
+    /// them, [`Self::Add`]/[`Self::Sub`]/[`Self::Mul`]/[`Self::Div`] are real
+    /// ops but are spelled `+ - * /`, never `.add(y)`, and
+    /// [`Self::TruncToInt`]/[`Self::IAdd`]/[`Self::Shl`]/[`Self::Shr`]/
+    /// [`Self::BitAnd`]/[`Self::BitOr`]/[`Self::IntToFloat`] are primitives
+    /// that only ever arise from lowering passes (`Gather`/`Reduce`
+    /// expansion), never from surface syntax a kernel body writes directly.
     #[must_use]
     const fn is_dsl_method(self) -> bool {
         matches!(
@@ -615,7 +631,7 @@ impl OpKind {
                 | Self::Eq
                 | Self::Ne
                 | Self::MulAdd
-                | Self::Select
+                | Self::If
         )
     }
 
@@ -631,6 +647,11 @@ impl OpKind {
     /// This is the one place `(name, arity) -> op` is decided; a compiler
     /// front end that re-lists method names itself is a second place for that
     /// mapping to drift from this one.
+    ///
+    /// `.select(a, b)` resolves to [`OpKind::If`], the node `if m { a } else
+    /// { b }` lowers to. `if` is the spelling; the method keeps working
+    /// until Phase B of docs/plans/2026-09-25-the-language-is-kernel.md
+    /// removes it (D15).
     #[must_use]
     pub fn from_method_call(name: &str, arg_count: usize) -> Option<Self> {
         let op = Self::from_name(name)?;
@@ -664,7 +685,7 @@ impl OpKind {
             | Self::Ge
             | Self::Eq
             | Self::Ne
-            | Self::Select => 4,
+            | Self::If => 4,
             Self::Mul | Self::MulAdd | Self::Recip | Self::Rsqrt => 5,
             // Bit-manip primitives: single cheap integer/convert instructions.
             Self::TruncToInt
@@ -744,7 +765,7 @@ impl OpKind {
     /// - Tuple (structural, not computational)
     /// - MulAdd (fused — should only arise from rewrite rules)
     /// - Lt/Le/Gt/Ge/Eq/Ne (return masks, not floats — type-invalid in arithmetic)
-    /// - Select (needs mask input — only valid composed with a comparison)
+    /// - If (needs mask input — only valid composed with a comparison)
     /// - Buffer/Gather (memory ops — require a bound buffer, not synthesizable)
     /// - Uniform/Param (unbound scalar slots — a value arrives per call or
     ///   from a builder, so a generator cannot synthesize one that evaluates)
@@ -762,7 +783,7 @@ impl OpKind {
                 | Self::Ge
                 | Self::Eq
                 | Self::Ne
-                | Self::Select
+                | Self::If
                 | Self::Buffer
                 | Self::Gather
                 | Self::RawGather
@@ -771,79 +792,6 @@ impl OpKind {
                 | Self::Param
                 | Self::Seq
         )
-    }
-
-    /// Get the emit style for code generation.
-    #[must_use]
-    pub const fn emit_style(self) -> EmitStyle {
-        match self {
-            // Special cases handled separately
-            Self::Var | Self::Const | Self::Tuple | Self::Param => EmitStyle::Special,
-
-            // Unary prefix: (-a)
-            Self::Neg => EmitStyle::UnaryPrefix,
-
-            // Unary method: (a).sqrt()
-            Self::Sqrt
-            | Self::Rsqrt
-            | Self::Abs
-            | Self::Recip
-            | Self::Floor
-            | Self::Ceil
-            | Self::Round
-            | Self::Sin
-            | Self::Cos
-            | Self::Tan
-            | Self::Asin
-            | Self::Acos
-            | Self::Atan
-            | Self::Exp
-            | Self::Exp2
-            | Self::Ln
-            | Self::Log2
-            | Self::Log10
-            | Self::TruncToInt
-            | Self::IntToFloat => EmitStyle::UnaryMethod,
-
-            // Binary infix: (a + b)
-            Self::Add => EmitStyle::BinaryInfix("+"),
-            Self::Sub => EmitStyle::BinaryInfix("-"),
-            Self::Mul => EmitStyle::BinaryInfix("*"),
-            Self::Div => EmitStyle::BinaryInfix("/"),
-
-            // Binary method: (a).min(b)
-            Self::Min
-            | Self::Max
-            | Self::Atan2
-            | Self::Pow
-            | Self::Lt
-            | Self::Le
-            | Self::Gt
-            | Self::Ge
-            | Self::Eq
-            | Self::Ne
-            | Self::IAdd
-            | Self::Shl
-            | Self::Shr
-            | Self::BitAnd
-            | Self::BitOr => EmitStyle::BinaryMethod,
-
-            // Differentiation: never emitted (rewritten away in the e-graph).
-            Self::Dwrt => EmitStyle::Special,
-
-            // Memory ops and uniforms: emitted by the JIT binding path, not
-            // as method calls.
-            Self::Buffer | Self::Gather | Self::RawGather | Self::Uniform => EmitStyle::Special,
-
-            // Reduction: lowered to unrolled arithmetic before codegen.
-            Self::Reduce => EmitStyle::Special,
-
-            // Sequencing: an effect no kernel body spells.
-            Self::Seq => EmitStyle::Special,
-
-            // Ternary method: (a).mul_add(b, c)
-            Self::MulAdd | Self::Select => EmitStyle::TernaryMethod,
-        }
     }
 
     /// Evaluate a unary operation on a constant argument.
@@ -887,8 +835,8 @@ impl OpKind {
     /// A comparison lane: all bits set for true, all clear for false.
     ///
     /// This is not a stylistic choice about how to spell a boolean — it is the
-    /// only representation the consumers accept. `Select` is a *bitwise* blend
-    /// on every backend (`andps`/`andnps`/`orps` on SSE2 and AVX2, one
+    /// only representation the consumers accept. `If`'s lane-varying path is a *bitwise* blend
+    /// on every backend (`vandps`/`vandnps`/`vorps` on AVX2, one
     /// `vpternlogd 0xCA` on AVX-512, `BSL` on aarch64), and `BitAnd`/`BitOr`
     /// are literal bitwise ops, so a mask lane's job is to be a per-bit
     /// stencil. `1.0` is not one: `0xFFFFFFFF & 0x3f800000` is `0x3f800000`,
@@ -912,7 +860,7 @@ impl OpKind {
     ///
     /// Comparisons produce masks ([`Self::mask`] — all-ones, which reads as
     /// NaN); the integer-domain primitives reinterpret lanes as `i32` and are
-    /// how exp/log lower to arithmetic; `Select`/`BitAnd`/`BitOr` pass patterns
+    /// how exp/log lower to arithmetic; `If`/`BitAnd`/`BitOr` pass patterns
     /// through. For all of them a non-finite float reading is the intended
     /// output rather than an overflow, which is what separates them from
     /// `1e38 * 1e38` — the case a folder is right to refuse.
@@ -926,7 +874,7 @@ impl OpKind {
                 | Self::Ge
                 | Self::Eq
                 | Self::Ne
-                | Self::Select
+                | Self::If
                 | Self::BitAnd
                 | Self::BitOr
                 | Self::TruncToInt
@@ -997,19 +945,19 @@ impl OpKind {
         match self {
             // One rounding, always. `MulAdd` denotes `x*y + z`; whether a
             // target spells it as one instruction (`vfmadd`, `FMLA`) or as a
-            // multiply and an add (SSE2, or any backend under register
-            // pressure — see `ResolvedOp::DecomposedMulAdd`) is a last-bit
+            // multiply and an add (any backend under register pressure —
+            // see `ResolvedOp::DecomposedMulAdd`) is a last-bit
             // precision difference inside the contract, not a divergence, so
             // it folds unconditionally. `libm::fmaf` rather than `x * y + z`
             // because the latter is whatever the compiler that built THIS
             // crate chose to contract it into: under `-fp-contract=fast` a
             // fold's answer must not depend on the folder's build profile.
             Self::MulAdd => Some(libm::fmaf(x, y, z)),
-            // The bitwise blend every backend emits — `andps`/`andnps`/`orps`
-            // on SSE2 and AVX2, one `vpternlogd 0xCA` on AVX-512, `BSL` on
+            // The bitwise blend every backend emits for a lane-varying mask — `vandps`/`vandnps`/`vorps`
+            // on AVX2, one `vpternlogd 0xCA` on AVX-512, `BSL` on
             // aarch64. Spelling it `if x != 0.0` would be right only for a
             // canonical [`Self::mask`] and silently wrong for anything else.
-            Self::Select => Some(f32::from_bits(
+            Self::If => Some(f32::from_bits(
                 (x.to_bits() & y.to_bits()) | (!x.to_bits() & z.to_bits()),
             )),
             _ => None,
@@ -1217,16 +1165,14 @@ impl<T> IndexMut<OpKind> for OpMap<T> {
     }
 }
 
-// EmitStyle is imported from crate::traits - single source of truth
-
 /// Every op name the surface language accepts as a method — see
 /// [`OpKind::is_dsl_method`] for exactly which ops that is and why it is
-/// narrower than "not `Special`".
+/// narrower than "not structural".
 ///
 /// This used to walk a parallel array of one zero-sized type per op, each
 /// implementing an `OpMeta`/`Op`/arity-marker trait family, purely to answer
-/// this question. `OpKind` already knows every op's name and emit style, so
-/// the family and its 230-line module are gone.
+/// this question. `OpKind` already knows every op's name, so the family and
+/// its 230-line module are gone.
 pub fn known_method_names() -> impl Iterator<Item = &'static str> {
     OpKind::all()
         .filter(|op| op.is_dsl_method())
@@ -1353,7 +1299,7 @@ mod op_map {
 
 #[cfg(test)]
 mod method_names {
-    use super::{EmitStyle, OpKind, known_method_names};
+    use super::{OpKind, known_method_names};
 
     /// Every advertised name must resolve. Not every advertised name is its
     /// own canonical spelling — `from_name` is deliberately non-injective, and
@@ -1385,17 +1331,29 @@ mod method_names {
         }
     }
 
+    /// Leaves, memory, binders and effects: no kernel body spells one as
+    /// `.method(args)`.
     #[test]
-    fn excludes_every_op_whose_emit_style_is_special() {
+    fn excludes_every_structural_op() {
         let names: std::collections::HashSet<&str> = known_method_names().collect();
 
-        for op in OpKind::all() {
-            if matches!(op.emit_style(), EmitStyle::Special) {
-                assert!(
-                    !names.contains(op.name()),
-                    "{op:?} has EmitStyle::Special and must not have a method spelling"
-                );
-            }
+        for op in [
+            OpKind::Var,
+            OpKind::Const,
+            OpKind::Tuple,
+            OpKind::Param,
+            OpKind::Dwrt,
+            OpKind::Buffer,
+            OpKind::Gather,
+            OpKind::RawGather,
+            OpKind::Uniform,
+            OpKind::Reduce,
+            OpKind::Seq,
+        ] {
+            assert!(
+                !names.contains(op.name()),
+                "{op:?} is structural and must not have a method spelling"
+            );
         }
     }
 
@@ -1404,7 +1362,7 @@ mod method_names {
         let names: Vec<&str> = known_method_names().collect();
         assert!(
             names.contains(&"min"),
-            "Min is not EmitStyle::Special and should surface as a known method"
+            "Min is an ordinary binary op and should surface as a known method"
         );
     }
 
@@ -1456,11 +1414,11 @@ mod from_method_call {
     #[test]
     fn resolves_a_ternary_method_at_two_args() {
         assert_eq!(OpKind::from_method_call("mul_add", 2), Some(OpKind::MulAdd));
-        assert_eq!(OpKind::from_method_call("select", 2), Some(OpKind::Select));
+        assert_eq!(OpKind::from_method_call("select", 2), Some(OpKind::If));
     }
 
     #[test]
-    fn resolves_neg_as_a_method_despite_its_operator_emit_style() {
+    fn resolves_neg_as_a_method_despite_its_prefix_operator_spelling() {
         assert_eq!(OpKind::from_method_call("neg", 0), Some(OpKind::Neg));
     }
 
@@ -1613,7 +1571,7 @@ mod algebraic_properties {
         OpKind::Ge,
         OpKind::Eq,
         OpKind::Ne,
-        OpKind::Select,
+        OpKind::If,
         OpKind::Buffer,
         OpKind::Gather,
         OpKind::RawGather,
@@ -1641,7 +1599,7 @@ mod algebraic_properties {
         OpKind::Ge,
         OpKind::Eq,
         OpKind::Ne,
-        OpKind::Select,
+        OpKind::If,
         OpKind::BitAnd,
         OpKind::BitOr,
         OpKind::TruncToInt,
@@ -1730,7 +1688,7 @@ mod algebraic_properties {
                 | OpKind::RawGather
                 | OpKind::Seq => 2,
 
-                OpKind::MulAdd | OpKind::Select | OpKind::Gather => 3,
+                OpKind::MulAdd | OpKind::If | OpKind::Gather => 3,
 
                 OpKind::Reduce => 1,
             };
@@ -1764,12 +1722,11 @@ mod from_name {
     use super::OpKind;
 
     #[test]
-    fn round_trip_every_ops_own_name_including_special_emit_style_ops() {
-        // `method_names::every_returned_name_round_trips_through_from_name`
-        // only walks `known_method_names()`, which deliberately excludes
-        // every `EmitStyle::Special` op (Var/Const/Tuple/Dwrt/Buffer/Gather/
-        // RawGather/Reduce) — so those ops' `from_name` arms need their own
-        // coverage here.
+    fn round_trip_every_ops_own_name_including_structural_ops() {
+        // `method_names::every_returned_name_resolves` only walks
+        // `known_method_names()`, which deliberately excludes every
+        // structural op (`method_names::excludes_every_structural_op`) — so
+        // those ops' `from_name` arms need their own coverage here.
         for op in OpKind::all() {
             assert_eq!(
                 OpKind::from_name(op.name()),
@@ -1918,23 +1875,17 @@ mod eval_ternary_arms {
     }
 
     #[test]
-    fn blend_y_and_z_bitwise_by_the_x_mask_for_select() {
+    fn blend_y_and_z_bitwise_by_the_x_mask_for_if() {
         let true_mask = OpKind::mask(true);
         let false_mask = OpKind::mask(false);
         let y = 7.0f32;
         let z = 9.0f32;
         assert_eq!(
-            OpKind::Select
-                .eval_ternary(true_mask, y, z)
-                .unwrap()
-                .to_bits(),
+            OpKind::If.eval_ternary(true_mask, y, z).unwrap().to_bits(),
             y.to_bits()
         );
         assert_eq!(
-            OpKind::Select
-                .eval_ternary(false_mask, y, z)
-                .unwrap()
-                .to_bits(),
+            OpKind::If.eval_ternary(false_mask, y, z).unwrap().to_bits(),
             z.to_bits()
         );
     }

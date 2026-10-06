@@ -19,5 +19,15 @@ saturation-telemetry = ["pixelflow-codegen/saturation-telemetry"]
 pixelflow-ir = { path = "../pixelflow-ir" }
 pixelflow-codegen = { path = "../pixelflow-codegen" }
 
+[[test]]
+# Reads the saturation telemetry records its compile writes, which exist only
+# under `saturation-telemetry` — declared so `cargo test -p pixelflow-core`
+# without the feature skips it instead of failing to find a record.
+name = "units_past_the_class_limit"
+required-features = ["saturation-telemetry"]
+
 [dev-dependencies]
 pixelflow-ir = { path = "../pixelflow-ir" }
+# tests/fold_factoring.rs reads the runtime tier's extraction for the kernels
+# it bakes, so it can pin that the texels it judges are the factored form.
+pixelflow-search = { path = "../pixelflow-search" }

@@ -19,59 +19,47 @@ extern crate alloc;
 
 pub mod emit;
 pub mod error;
+pub mod isa;
+mod pipeline;
+mod program;
 
 pub mod compiled_kernel;
 pub use compiled_kernel::CompiledKernel;
-pub use emit::executable::{Extent2D, Point4, TileSlice};
 pub use error::CompileError;
+// The one vector width in the workspace: the tier's, decided at startup by
+// the CPU (see `isa`). `pixelflow-core` asks for it here rather than carrying
+// a vector type of its own to assert against — which is how the two crates'
+// widths used to drift, each keyed on its own reading of `target_feature`.
+pub use isa::jit_vector_bytes;
+
+/// FNV-1a's 64-bit offset basis.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+/// FNV-1a's 64-bit prime.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// FNV-1a over bytes: the digest the byte-identity probes print, so two runs
+/// diffed line by line say whether a change moved any code, and the one
+/// definition `pixelflow-pipeline`'s content identities are built from
+/// (`schema::fnv1a64_const` is this function).
+///
+/// Not API. It is `pub` only because an example is a crate of its own, and
+/// this is the lowest crate every probe that digests emitted code, and the
+/// pipeline, already depend on; the only property it needs is that different
+/// bytes give different digests, and a dependency for that would be silly.
+/// A `const fn` so a schema identity can be derived at compile time.
+#[doc(hidden)]
+#[must_use]
+pub const fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = FNV_OFFSET_BASIS;
+    // `while`, not an iterator: iterators are not callable in a `const fn`.
+    let mut i = 0;
+    while i < bytes.len() {
+        hash = (hash ^ bytes[i] as u64).wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+    hash
+}
 
 // x86-64 and aarch64 are the architectures with emitters.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub mod jit_cache;
-
-/// Byte width of the SIMD vector this build's JIT emits and calls — i.e. the
-/// size of one [`KernelFn`](emit::executable::KernelFn) argument vector.
-///
-/// The JIT has no dependency on `pixelflow-core`, so it cannot name `Field`
-/// directly. This const is the single source of truth for the width the emitter
-/// and the `KernelFn` ABI agree on. Callers that bridge `Field` to a JIT kernel
-/// assert `size_of::<Field>() == JIT_VECTOR_BYTES` at compile time, turning any
-/// width disagreement into a clear build error rather than a raw `transmute` size
-/// error (or, worse, a silent miscompile).
-///
-/// A genuine 3-way split, checked against `target_feature` — the flag that
-/// actually governs what the compiler may emit. `pixelflow-core` gates
-/// `NativeF32Storage` on exactly the same predicate, which is what keeps the
-/// two crates' widths in step.
-///
-/// They once did not. `pixelflow-core` used to AND in a build-script cfg set by
-/// probing the *build host's* CPU, on the theory that it was a safety net
-/// against a host told to target a feature it lacks. It was not: a build script
-/// is per-crate and the cfg it emits does not cross a crate boundary, so this
-/// crate went on emitting 512-bit code while core's `Field` quietly narrowed to
-/// 256 — the disagreement that net was supposed to prevent, caused by the net
-/// itself. Building `+avx512f` on a non-AVX-512 host failed on the `transmute`
-/// in core's `lattice`. Host CPU is the wrong question for a target decision;
-/// running wide code on a narrow host is gated by `cargo xtask isa-matrix`,
-/// which builds every level and runs only what `host_has_feature` allows.
-///
-/// 64 (512-bit, AVX-512) when compiled with `target_feature = "avx512f"`,
-/// routing to `Avx512Backend`; 32 (256-bit, AVX2) when compiled with
-/// `target_feature = "avx2"` and not `"avx512f"`, routing to `Avx2Backend`;
-/// otherwise 16 (128-bit, SSE2/NEON). This matches `pixelflow-core`'s
-/// `Field` width under the same build flags.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-pub const JIT_VECTOR_BYTES: usize = 64;
-/// See the AVX-512 variant above.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    not(target_feature = "avx512f")
-))]
-pub const JIT_VECTOR_BYTES: usize = 32;
-/// See the AVX-512 variant above.
-#[cfg(not(any(
-    all(target_arch = "x86_64", target_feature = "avx512f"),
-    all(target_arch = "x86_64", target_feature = "avx2")
-)))]
-pub const JIT_VECTOR_BYTES: usize = 16;

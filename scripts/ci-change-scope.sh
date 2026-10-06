@@ -8,9 +8,10 @@
 # except `check-doc-paths.sh`, which reads docs and so is exactly the job a
 # docs-only CL most needs.
 #
-# The six metadata jobs (CL metadata, driver-cfg coverage, bin declarations,
-# platform-cfg encapsulation, provenance-journal scope, doc source paths) still
-# run on every CL because they are seconds each and none of them needs a build.
+# The metadata jobs (CL metadata, driver-cfg coverage, bin declarations,
+# platform-cfg encapsulation, provenance-journal scope, doc source paths, emit
+# boundary, append-only LFS paths) still run on every CL because they are
+# seconds each and none of them needs a build.
 #
 # An empty diff, an unreadable range, or any path outside the pattern is NOT
 # docs-only: the conservative answer is to run everything.

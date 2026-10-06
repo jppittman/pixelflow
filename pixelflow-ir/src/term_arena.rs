@@ -11,14 +11,14 @@
 
 use alloc::vec::Vec;
 
-use crate::arena::{BufferDecl, BufferId, ExprArena, ExprId, ExprNode};
+use crate::arena::{BufferDecl, BufferId, ExprArena, ExprChildren, ExprId, ExprNode};
 use crate::term::{Children, Ir, Shape};
 
 impl Ir for ExprArena {
     type Ref = ExprId;
 
     fn project(&self, r: ExprId) -> Shape<'_, ExprId> {
-        match *self.node(r) {
+        match self.node(r) {
             ExprNode::Var(i) => Shape::Var(i),
             ExprNode::Const(v) => Shape::Const(v),
             ExprNode::Param(i) => Shape::Param(i),
@@ -28,11 +28,18 @@ impl Ir for ExprArena {
             ExprNode::Unary(op, a) => Shape::Op(op, Children::One(a)),
             ExprNode::Binary(op, a, b) => Shape::Op(op, Children::Two(a, b)),
             ExprNode::Ternary(op, a, b, c) => Shape::Op(op, Children::Three(a, b, c)),
-            ExprNode::Nary(op, start, len) => {
-                Shape::Op(op, Children::Many(self.nary_children_slice(start, len)))
+            // `self.children(r)` is the general accessor; an `Nary` node's
+            // arm is always `ExprChildren::Nary`, so this recovers the slice
+            // `Shape::Op`'s `Children::Many` needs without naming the n-ary
+            // slab's offsets here (docs/plans/2026-09-09-exprarena-on-dag.md,
+            // Stage A).
+            ExprNode::Nary(op, ..) => {
+                let ExprChildren::Nary(slice) = self.children(r) else {
+                    unreachable!("an ExprNode::Nary's children() is always ExprChildren::Nary")
+                };
+                Shape::Op(op, Children::Many(slice))
             }
             ExprNode::Reduce { fold, body } => Shape::Reduce { fold, body },
-            ExprNode::Guard { mask, on, off } => Shape::Guard { mask, on, off },
             ExprNode::Write {
                 row,
                 col,
@@ -76,7 +83,6 @@ impl Ir for ExprArena {
                 },
             },
             Shape::Reduce { fold, body } => self.push_reduce(fold, body),
-            Shape::Guard { mask, on, off } => self.push_guard(mask, on, off),
             Shape::Write {
                 row,
                 col,
@@ -142,9 +148,6 @@ impl ExprArena {
                     Shape::Reduce { body, .. } if memo[body.0 as usize].is_none() => {
                         alloc::vec![body]
                     }
-                    Shape::Guard { mask, .. } if memo[mask.0 as usize].is_none() => {
-                        alloc::vec![mask]
-                    }
                     Shape::Write { value, .. } if memo[value.0 as usize].is_none() => {
                         alloc::vec![value]
                     }
@@ -175,10 +178,6 @@ impl ExprArena {
                 Shape::Reduce { fold, body } => {
                     let body = memo[body.0 as usize].expect("rebuild_into: body before fold");
                     out.embed(Shape::Reduce { fold, body })
-                }
-                Shape::Guard { mask, on, off } => {
-                    let mask = memo[mask.0 as usize].expect("rebuild_into: mask before guard");
-                    out.embed(Shape::Guard { mask, on, off })
                 }
                 Shape::Write {
                     row,

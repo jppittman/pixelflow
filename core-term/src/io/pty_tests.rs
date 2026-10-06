@@ -116,13 +116,14 @@ fn read_from_pty_with_timeout(pty: &mut NixPty, expected_str: &str) -> Result<St
 }
 
 #[test]
-fn pty_spawn_successful() {
+fn spawned_pty_relays_the_childs_stdout_to_the_master_fd() {
     // Use sh -c to be more robust across platforms and ensure output flushing
     let config = PtyConfig {
         command_executable: "/bin/sh",
         args: &["-c", "echo hello pty world"],
         initial_cols: DEFAULT_COLS,
         initial_rows: DEFAULT_ROWS,
+        working_directory: None,
     };
 
     match NixPty::spawn_with_config(&config) {
@@ -154,7 +155,7 @@ fn pty_spawn_successful() {
 }
 
 #[test]
-fn pty_read_write_interaction() {
+fn bytes_written_to_the_pty_are_read_back_from_the_childs_stdout() {
     let shell_command = "read r_line; echo \"input was: $r_line\"";
     let config = PtyConfig {
         command_executable: "/bin/sh",
@@ -163,6 +164,7 @@ fn pty_read_write_interaction() {
         args: &["-c", shell_command],
         initial_cols: DEFAULT_COLS,
         initial_rows: DEFAULT_ROWS,
+        working_directory: None,
     };
 
     let mut pty = match NixPty::spawn_with_config(&config) {
@@ -205,6 +207,7 @@ fn pty_child_acquires_controlling_terminal() {
         args: &["-c", "echo ctty-ok > /dev/tty"],
         initial_cols: DEFAULT_COLS,
         initial_rows: DEFAULT_ROWS,
+        working_directory: None,
     };
 
     let mut pty = NixPty::spawn_with_config(&config).expect("Failed to spawn PTY");
@@ -223,6 +226,7 @@ fn pty_child_gets_default_sigpipe() {
         args: &["-c", "yes | head -c 4 > /dev/null && echo pipe-done"],
         initial_cols: DEFAULT_COLS,
         initial_rows: DEFAULT_ROWS,
+        working_directory: None,
     };
 
     let mut pty = NixPty::spawn_with_config(&config).expect("Failed to spawn PTY");
@@ -232,13 +236,14 @@ fn pty_child_gets_default_sigpipe() {
 }
 
 #[test]
-fn pty_resize_successful() {
+fn pty_resize_returns_ok_for_a_running_child() {
     // Use `sleep` from PATH to be cross-platform (macOS has /bin/sleep, Linux /usr/bin/sleep)
     let config = PtyConfig {
         command_executable: "sleep",
         args: &["0.1"], // Arg for sleep is just the duration
         initial_cols: DEFAULT_COLS,
         initial_rows: DEFAULT_ROWS,
+        working_directory: None,
     };
 
     let pty = match NixPty::spawn_with_config(&config) {
@@ -276,6 +281,7 @@ fn pty_child_termination_on_drop() {
         args: &["2"], // Arg for sleep is just the duration
         initial_cols: DEFAULT_COLS,
         initial_rows: DEFAULT_ROWS,
+        working_directory: None,
     };
 
     let pty = match NixPty::spawn_with_config(&config) {
@@ -331,13 +337,14 @@ fn pty_child_termination_on_drop() {
 }
 
 #[test]
-fn pty_spawn_invalid_command() {
+fn pty_spawn_returns_an_error_for_a_nonexistent_command() {
     let non_existent_cmd = "/path/to/absolutely/nonexistent/command_39291az";
     let config = PtyConfig {
         command_executable: non_existent_cmd,
         args: &[],
         initial_cols: DEFAULT_COLS,
         initial_rows: DEFAULT_ROWS,
+        working_directory: None,
     };
 
     // With `std::process::Command`, spawning a non-existent command should return an error immediately,
@@ -371,4 +378,35 @@ fn pty_spawn_invalid_command() {
             );
         }
     }
+}
+
+#[test]
+fn the_child_starts_in_the_configured_working_directory() {
+    let dir = std::env::temp_dir().canonicalize().expect("temp dir");
+    let config = PtyConfig {
+        command_executable: "/bin/sh",
+        args: &["-c", "pwd -P"],
+        initial_cols: DEFAULT_COLS,
+        initial_rows: DEFAULT_ROWS,
+        working_directory: Some(&dir),
+    };
+    let mut pty = NixPty::spawn_with_config(&config).expect("spawn in the temp dir");
+
+    let expected = dir.to_str().expect("temp dir is UTF-8");
+    let output = read_from_pty_with_timeout(&mut pty, expected)
+        .unwrap_or_else(|err_msg| panic!("working directory test failed: {}", err_msg));
+    assert!(output.contains(expected));
+}
+
+#[test]
+fn a_working_directory_that_cannot_be_entered_fails_the_spawn() {
+    let missing = std::path::Path::new("/nonexistent/core-term/working-directory");
+    let config = PtyConfig {
+        command_executable: "/bin/sh",
+        args: &["-c", "true"],
+        initial_cols: DEFAULT_COLS,
+        initial_rows: DEFAULT_ROWS,
+        working_directory: Some(missing),
+    };
+    assert!(NixPty::spawn_with_config(&config).is_err());
 }

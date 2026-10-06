@@ -7,11 +7,13 @@
 > round hits it before it completes, so the rules never run on them. The classical cap
 > is now `clamp(8 × inserted_classes, CLASSICAL_CLASS_FLOOR, CLASSICAL_CLASS_CEILING)`
 > with the application budget and safety ceiling scaling with it at this document's own
-> ratios — **and the ceiling is pinned at the floor**, because raising `'8'` off the
-> floor re-fuses its quadratic solver and puts the waist smear the FreeType oracle found
-> back on screen at 13–21 px. See "Revision: the classical cap grows with the inserted
-> input" at the end; everything else here stands, with the flat 5,000 read as the
-> classical **floor**.
+> ratios. Until 2026-09-29 the ceiling was pinned at the floor, because raising `'8'`
+> off the floor re-fused its quadratic solver and put the waist smear the FreeType
+> oracle found back on screen at 13–21 px. **Unpinned 2026-09-29**: the ceiling is the
+> calibrated 50,000 (2,000,000 applications, a 3,000 s safety ceiling), because that
+> glyph kernel is gone. See "Revision: the classical cap grows with the inserted input"
+> and "Unpinned" at the end; everything else here stands, with the flat 5,000 read as
+> the classical **floor**, which every input of at most 625 inserted classes still gets.
 
 **Calibration only. No code in this commit.** This document fixes the constants and
 names; the implementation is a separate change.
@@ -350,7 +352,7 @@ kernels (`ref_apps` at `ClassCap`, 1 round) describe the cap, not the kernels.
 
 | dimension | classical, before | **classical, now** | how |
 |---|---:|---:|---|
-| class cap | 5,000 | **`clamp(8 × inserted_classes, 5,000, CLASSICAL_CLASS_CEILING)`**, the ceiling **pinned at 5,000** (calibrated: 50,000) | `SaturationConfig::classical_for(inserted)` via `config_for_input(InputSize { nodes, classes })`; `Optimizer::run` reads `egraph.num_classes()` on entry, which is the inserted count |
+| class cap | 5,000 | **`clamp(8 × inserted_classes, 5,000, CLASSICAL_CLASS_CEILING)`**, the ceiling 50,000 (pinned at 5,000 until 2026-09-29) | `SaturationConfig::classical_for(inserted)` via `config_for_input(InputSize { nodes, classes })`; `Optimizer::run` reads `egraph.num_classes()` on entry, which is the inserted count |
 | application budget | 200,000 | **40 × the resolved cap** (200,000 at the floor, 2,000,000 at the ceiling) | `APPLICATIONS_PER_CLASS`, this document's ratio, now derived at every cap rather than copied at three |
 | safety ceiling | 300 s | **1.5 ms × the application budget** (300 s at the floor, 50 min at the ceiling) | `SAFETY_CEILING_PER_APPLICATION`: the 1 application/ms floor throughput above, rounded up by half, which reproduces 30 s / 120 s / 300 s at the three presets |
 | iteration cap | 100 | 100 | unchanged |
@@ -400,7 +402,7 @@ ratio of applications to classes at stop stays under 2 at every cap, and the 40-
 budget remains the tail's deterministic terminator, not an operating point. The
 safety ceiling never fired.
 
-### Why the ceiling is pinned at the floor
+### Why the ceiling was pinned at the floor (until 2026-09-29)
 
 With the ceiling at 50,000 the rule raises `'8'` (3,405 inserted classes) to 27,240, the
 extractor prefers a different fusion of its quadratic solver, and `disc >= 0` at the
@@ -412,10 +414,11 @@ optimized arena differs from the raw one by ~0.5 (`kernel_glyph_optimize`). The
 production tiles (16 and 32 px) are clean (cross-form |Δ| ≤ 6.4e-6). This is the `'8'`
 defect that the raw-arm oracle found and that deleting the second optimizer removed
 (docs/plans/2026-09-08-macro-tier-is-arena-native.md), back by the route the oracle's own
-comment predicted. The knife edge belongs to the glyph kernel (`quad_tangency_winding.rs`)
-and the fix does too; until it lands, `CLASSICAL_CLASS_CEILING = CLASSICAL_CLASS_FLOOR`
-and the rule is inert. The enable is one constant (`CLASSICAL_CLASS_CEILING_CALIBRATED`),
-and the optimized-arm oracle is the gate that says whether it may be flipped.
+comment predicted. The knife edge belonged to the glyph kernel (`quad_tangency_winding.rs`)
+and so did the fix; until it landed, `CLASSICAL_CLASS_CEILING = CLASSICAL_CLASS_FLOOR`
+and the rule was inert. It never landed as a tangency fix: the kernel it belonged to was
+replaced, and a glyph's coverage is now its area written in closed form, with no
+discriminant to land on either side of (see "Unpinned" below).
 
 ### What it costs, and what it buys (measured with the ceiling at 50,000)
 
@@ -446,3 +449,102 @@ dearer at 50,000 than at 5,000. On chrome every raise past the floor is a loss (
 On the shaders +8%. Extraction cannot rank the larger space; that is the net's job, and
 the budget is not the lever past the input's own frontier — which is exactly where the
 new rule stops.
+
+## Unpinned (2026-09-29)
+
+`CLASSICAL_CLASS_CEILING` is 50,000, the value the sweep calibrated, and
+`CLASSICAL_CLASS_CEILING_CALIBRATED` is gone. JP: "unpin the cap". What blocked the raise
+was `'8'`'s discriminant. The glyph kernel that had it is deleted, and so are the
+integrals that came after it: a glyph's coverage is now its area written in closed form.
+
+### What the budgets become
+
+The tier is still keyed on the node count. The classical cap is
+`clamp(8 × inserted, 5,000, 50,000)`, with 40 applications per class of cap and 1.5 ms
+of safety ceiling per application.
+
+| input | inserted classes | tier | cap | applications | safety ceiling |
+|---|---:|---|---:|---:|---:|
+| the space glyph | 27 | rapid | 2,000 | 80,000 | 120 s |
+| every other printable ASCII glyph, 7/16/32 px (seven structures) | 154 | classical | 5,000 | 200,000 | 300 s |
+| cell grid, chrome, psychedelic, the 17 `shader_bench` kernels | 7–310 | all three | ≤ 5,000 | ≤ 200,000 | ≤ 300 s |
+| every `kernel!` expansion in the workspace (125, all targets) | ≤ 17 | blitz, rapid | ≤ 2,000 | ≤ 80,000 | ≤ 120 s |
+| `text`, 50 characters (`font_rendering`'s `text_sizes/50`) | 840 | classical | 6,720 | 268,800 | 403 s |
+| `text`, 94 characters | 1,456 | classical | 11,648 | 465,920 | 699 s |
+| §1.7's `glyph::<32>` (`kernel_copy`'s test) | 3,324 | classical | 26,592 | 1,063,680 | 1,596 s |
+| anything of 6,250 or more | | classical | 50,000 | 2,000,000 | 3,000 s |
+
+Every input of at most 625 inserted classes keeps the budget it had.
+
+### What moved
+
+Measured in release on AVX-512 and on AVX2 (`PIXELFLOW_ISA=avx2`), before = `40e2bb00`.
+Saturation records come from `saturation-telemetry`.
+
+**Production: nothing.** 316 kernels per tier are bit-identical in code and in pixels:
+
+- the 95 printable ASCII glyphs at 7, 16 and 32 px;
+- both 16 pt atlases (tiles 16 and 32);
+- the 2560×1584 cell grid;
+- chrome and psychedelic at 1920×1080;
+- the 17 `shader_bench` kernels;
+- `text` runs of 5, 10, 26 and 50 characters, and HELLO;
+- `font_rendering`'s four 32 px glyphs.
+
+Only `text_sizes/50` gets a raised cap (6,720). It still stops on the cap in round 1
+(1,764 → 1,780 classes) and extracts the same term.
+
+A glyph's optimize is seven saturations, because saturation is cached by structure. Each
+inserts 154 classes and stops on the cap in round 2 or 3, after 5,081–6,670
+applications, in 18–27 ms. Every record is unchanged.
+
+The full 16 px atlas bake (`GlyphAtlas::warm`, cold process, 9 alternated runs) takes the
+same time within noise, because it does the same work. Median (range):
+
+- AVX-512: 254 (190–306) ms before, 252 (226–318) ms after;
+- AVX2: 254 (210–306) ms before, 262 (222–302) ms after.
+
+**Where it moves.** It moves only on inputs no production path builds. Several are
+worse by some measure, and each is reported as found:
+
+| input | inserted | rounds / classes, before → after | latency-prior cost | bytes, AVX-512 | bytes, AVX2 | pixels | time |
+|---|---:|---|---:|---:|---:|---|---|
+| `text`, 94 chars | 1,456 | 1 / 3,428 → 1 / 4,118 | 2,706, same | same | same | same | same |
+| `text`, 213 chars | 3,122 | 1 / 4,831 → 1 / 8,365 | 5,443, same | same | same | same | same |
+| `text`, 500 chars | 7,140 | **0** / 7,140 → 1 / 17,349 | 12,086 → 12,044 | 1,505,616 → 1,647,672 (+9.4%) | 717,272 → 770,800 (+7.5%) | 4,241 and 4,927 of 120,000 texels move by ≤ 6.6e-7; 1 crosses an 8-bit step | compile 7.42 → 7.05 s and 3.74 → 3.76 s |
+| §1.7 `glyph::<32>`, six glyphs | 3,324 | 1 / 5,000 → 2 / 26,592 | 14,347 → 14,123 | | | against the fold: ≤ 4.2e-7 → ≤ 1.9e-6 (bound ≥ 1.6e-5) | optimize 106 → 821 ms, opt-level 0 |
+| §1.7 `glyph::<64>`, `'%'` | 6,620 | **0** / 6,620 → 2 / 50,000 | 28,651 → 28,203 | 87,696 → 101,100 (+15.3%) | 77,236 → 92,496 (+19.8%) | ≤ 1.2e-7 from the fold either way | bake 376 → 897 ms and 415 → 806 ms |
+| §1.7 `glyph::<192>`, `'%'` | 19,804 | **0** / 19,804 → 1 / 50,000 | 85,867 → 86,231 (+0.4%) | 263,056 → 261,932 | 230,324 → 257,872 (+12.0%) | identical | bake 5.22 → 5.71 s and 5.30 → 5.59 s |
+| a sum of 2,000 arguments (`pixelflow-core`'s unit test) | 3,999 | 1 / 5,000 → 2 / 31,992 | 7,996, same | | | | optimize 105 → 821 ms, opt-level 0 |
+
+A **0** is an input larger than the old cap. On those the rules never ran. The
+latency-prior cost moves by at most 1.6% either way. But on `'%'`'s family and on the
+500-character run the code grows by 7.5–19.8%. That is the sweep's own reading: more
+budget than the input's first round needs does not make extraction better. It is also
+the family shape Phase C of the language plan builds a glyph from, so it matters there.
+
+### The safety ceiling cannot trip on a production bake
+
+1. **Production budgets are unchanged.** Every kernel core-term, the scenes and the
+   shader ports build inserts at most 310 classes. Every `kernel!` expansion inserts at
+   most 17. So each resolves to the same budget as before, bit for bit, and its ceiling
+   is the same too. The unpin cannot change whether any of them trips.
+2. **Above 625 inserted classes, the ceiling grows with the cap**, at 60 ms per class
+   of cap (40 applications × 1.5 ms). The largest inputs measured reach the 50,000
+   ceiling:
+
+   | input | applications | classes | opt-level 0 | release |
+   |---|---:|---:|---:|---:|
+   | §1.7 `glyph::<64>` | 50,464 | 50,000 | 1.58 s | 0.41 s |
+   | §1.7 `glyph::<192>` | 26,588 | 50,000 | 1.28 s | 0.27 s |
+   | a sum of 1,000 bilinear terms, built to fill the cap (9,922 inserted) | 31,086 | 49,619 | 2.40 s | 0.43 s |
+
+   Each time is saturation plus one extraction. Against 3,000 s that is a margin of at
+   least 1,250×. Even if all 100 rounds each cost the heaviest round measured (2.4 s at
+   opt-level 0), the total would be 240 s: 12× under.
+3. **The slowest rate anywhere is still well above the floor.** The records cover the
+   tests of `pixelflow-search`, `-codegen`, `-core`, `-compiler`, `-graphics` and
+   `-runtime` (1,108 saturations), both tiers' probes and every macro expansion. Across
+   them the slowest rate is 5.9 applications/ms. That is a rapid-tier kernel in `pixelflow-compiler`'s tests at
+   opt-level 0, and this change does not touch it. The ceiling assumes 0.67/ms, so the
+   slowest rate is 8.8× the floor.

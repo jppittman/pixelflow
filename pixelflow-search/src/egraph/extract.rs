@@ -5,7 +5,6 @@
 //! [`pixelflow_ir::ExprArena`].
 
 use super::cost::{CostFunction, CostModel};
-use super::deps::var_variance;
 use super::graph::EGraph;
 use super::node::{EClassId, ENode};
 use alloc::collections::BinaryHeap;
@@ -133,14 +132,14 @@ impl<'g> Extraction<'g> {
     }
 
     /// Variance histogram (fraction const / frame-uniform / scanline-uniform
-    /// / pixel-varying) of the CHOSEN nodes, not the class-wide meet
-    /// [`super::DepsAnalysis`] would compute over the whole e-graph.
+    /// / pixel-varying) of the CHOSEN nodes, not the class-wide fact
+    /// (`EGraph::variance`, an intersection over every member).
     ///
     /// Materialises the choice function once via [`choices_to_arena`] and
     /// classifies that arena — P1(c) of
     /// docs/plans/2026-08-17-cost-model-domain.md: once a rewrite merges a
     /// pixel-varying node into a class alongside a constant one, the
-    /// class-wide meet reports CONST regardless of which node the
+    /// class-wide fact reports CONST regardless of which node the
     /// extraction actually chose, so only the materialised DAG describes
     /// what was picked.
     #[must_use]
@@ -925,7 +924,8 @@ pub fn extract<C: CostFunction>(
                     | ENode::Const(_)
                     | ENode::Buffer(_)
                     | ENode::Uniform(_)
-                    | ENode::Param(_) => costs.node_cost(node, None),
+                    | ENode::Param(_)
+                    | ENode::Ref { .. } => costs.node_cost(node, None),
                     // A fold is, for costing, a node with one child: its
                     // metadata is not an operand, so `children_slice` is the
                     // whole of what this arm needs to know about either.
@@ -938,11 +938,11 @@ pub fn extract<C: CostFunction>(
                             let op_cost = costs.node_cost(node, None);
                             // Saturating fold, not `.sum()`: a child's own
                             // `best_cost` can already sit at a prohibitive
-                            // sentinel (`Dwrt`'s `usize::MAX / 4` from
-                            // `CostModel::node_op_cost`, or this function's
-                            // own `CYCLE_COST`), so a node with several such
-                            // children overflows a plain `usize` sum. A real
-                            // `Dwrt`-bearing e-graph reaches that here.
+                            // sentinel (the `usize::MAX / 4`
+                            // `CostModel::node_op_cost` gives a fold whose
+                            // monoid has no combiner, or this function's own
+                            // `CYCLE_COST`), so a node with several such
+                            // children overflows a plain `usize` sum.
                             let per_child = fold_body_multiple(node);
                             let children_cost: usize = children
                                 .iter()
@@ -1369,6 +1369,16 @@ pub fn choices_to_arena(
                         }
                         result_stack.push(expr_id);
                     }
+                    ENode::Ref { key, .. } => {
+                        // A unit comes back as its name: its body is
+                        // optimized by itself and linked after extraction
+                        // (`pixelflow_ir::passes::link`).
+                        let expr_id = arena.embed(Shape::Ref(*key));
+                        if idx < id_map.len() {
+                            id_map[idx] = Some(expr_id);
+                        }
+                        result_stack.push(expr_id);
+                    }
                     ENode::Op { .. } | ENode::Reduce { .. } => {
                         let children = node.children_slice();
                         assert!(
@@ -1722,40 +1732,29 @@ impl ExtractedDAG {
 /// - Shared e-classes (for let-binding)
 /// - Topological order for emission
 /// The variance of one e-node, given the variance already chosen for the
-/// classes below it: the union of its children's, with leaves naming their
-/// own. A child whose form is not settled yet (a cycle under repair) counts
-/// as fully varying — the conservative direction, since it can only make a
-/// form look more expensive, never less.
+/// classes below it — [`ENode::variance`], the transfer function the
+/// e-graph's class fact is seeded by, fed the chosen forms instead. A fold's
+/// bound index drops out, which is what makes `Σ_i f(i)` frame-uniform when
+/// `f` reads nothing but the index, and therefore hoistable out of the pixel
+/// loop.
+///
+/// A node reading its own class (a cycle under repair) counts as fully
+/// varying — the conservative direction, since it can only make a form look
+/// more expensive, never less.
 fn node_variance(
     egraph: &EGraph,
     node: &ENode,
     best_var: &[Variance],
     canonical: EClassId,
 ) -> Variance {
-    match node {
-        ENode::Var(v) => var_variance(*v),
-        // A buffer's contents are fixed for the kernel's lifetime; a read of
-        // one varies with its index, which is the `Gather`'s other child.
-        ENode::Const(_) | ENode::Buffer(_) | ENode::Uniform(_) | ENode::Param(_) => Variance::CONST,
-        ENode::Op { children, .. } => children.iter().fold(Variance::CONST, |acc, &child| {
-            let c = egraph.find(child);
-            if c == canonical {
-                return Variance::ALL;
-            }
-            acc.union(best_var[c.0 as usize])
-        }),
-        // The one node that *shrinks* the set. Its index is bound, so it is
-        // not free in the result — which is what makes `Σ_i f(i)` frame-
-        // uniform when `f` reads nothing but the index, and therefore
-        // hoistable out of the pixel loop.
-        ENode::Reduce { fold, body } => {
-            let c = egraph.find(*body);
-            if c == canonical {
-                return Variance::ALL;
-            }
-            best_var[c.0 as usize].without(Variance::from_var(fold.binder().var()))
-        }
+    if node
+        .children_slice()
+        .iter()
+        .any(|&child| egraph.find(child) == canonical)
+    {
+        return Variance::ALL;
     }
+    node.variance(|child| best_var[egraph.find(child).index()])
 }
 
 /// The cost of one *settled* extraction, in both of the shapes that matter.
@@ -1791,10 +1790,11 @@ pub struct ChoiceCost {
 ///
 /// Weighting matches [`extract_dag_scoped`]: a node's op cost is multiplied
 /// by [`LatticeShape::evals`] of the variance of the *chosen* form below it,
-/// so a Z-only subexpression is priced once per frame and an X-dependent one
-/// once per sample. Leaves are free ([`CostModel::node_op_cost`]), so under
-/// [`LatticeShape::POINT`] `ChoiceCost::dag` equals the latency-prior cost of
-/// the arena `choices_to_arena` builds from the same map.
+/// so a subexpression that depends on nothing is priced once per call and an
+/// X-dependent one once per sample. Leaves are free
+/// ([`CostModel::node_op_cost`]), so under [`LatticeShape::POINT`]
+/// `ChoiceCost::dag` equals the latency-prior cost of the arena
+/// `choices_to_arena` builds from the same map.
 ///
 /// # Panics
 ///
@@ -1869,9 +1869,10 @@ pub fn cost_of_choices<C: CostFunction>(
         let node = chosen(canonical);
         let node_var = node_variance(egraph, node, &var, canonical);
         let weight = shape.evals(node_var);
-        // Saturating throughout: `Dwrt` is priced `usize::MAX / 4` and a tree
-        // cost is exponential in the sharing it refuses to price, so both
-        // sums reach the ceiling on real inputs.
+        // Saturating throughout: a tree cost is exponential in the sharing it
+        // refuses to price, so it reaches the ceiling on real inputs, and a
+        // fold whose monoid has no combiner is priced `usize::MAX / 4`
+        // (`CostModel::node_op_cost`).
         let own = usize::try_from((costs.node_cost(node, None) as u64).saturating_mul(weight))
             .unwrap_or(usize::MAX);
         // A fold evaluates its body once per index — see `fold_body_multiple`.
@@ -1905,16 +1906,19 @@ pub fn extract_dag<C: CostFunction>(egraph: &EGraph, root: EClassId, costs: &C) 
 ///
 /// The cost of a program is not the cost of its text but of its execution:
 /// a node's op cost is multiplied by [`LatticeShape::evals`] of the variance
-/// of the form chosen for it, so a subexpression that depends only on Z is
-/// priced once per frame while one that touches X is priced once per sample.
-/// Every extent is known at compile time, so this is the exact instruction
-/// count of the unrolled program rather than an ordinal preference.
+/// of the form chosen for it, so a subexpression that depends on nothing (a
+/// uniform's arithmetic) is priced once per call, one that depends only on Y
+/// once per row, and one that touches X once per sample. Every extent is
+/// known at compile time, so the weight is a count rather than an ordinal
+/// preference — except inside a surviving fold, where `evals` prices a node
+/// that reads the binder as per-sample and without the fold's trip count.
 ///
 /// That single change is what makes extraction the thing that *decides* the
-/// factorization: given `(X + Z) + Z` and its reassociation `X + (Z + Z)`,
-/// both two adds, the second leaves one of them outside the pixel loop and
-/// is therefore cheaper by a factor of the frame — which loop-invariant code
-/// motion after the fact can only discover, never choose between.
+/// factorization: given `(X + u) + u` for a uniform `u`, and its
+/// reassociation `X + (u + u)`, both two adds, the second leaves one of them
+/// outside the pixel loop and is therefore cheaper by a factor of the frame —
+/// which loop-invariant code motion after the fact can only discover, never
+/// choose between.
 ///
 /// [`LatticeShape::POINT`] weights everything by one, so `extract_dag`'s
 /// behavior is unchanged.
@@ -2192,15 +2196,17 @@ fn weighted_own<C: CostFunction>(costs: &C, node: &ENode, weight: u64) -> usize 
 /// **How many times `node`'s children are evaluated per evaluation of `node`.**
 ///
 /// One, for everything except a fold: `⊕_{[lo,hi)} f` evaluates `f` once per
-/// index, and **codegen has no iteration binder**, so `ExpandReduce` emits
-/// exactly that many copies of the body. Pricing the body once would tell the
-/// extractor a 34-piece fold costs what one piece costs, which is how an
-/// unpriced fold turns the loop unroller off — it would keep every fold,
-/// unconditionally, because folding would always look free.
+/// index, and codegen emits a surviving fold as a loop that runs its body
+/// exactly that many times (`pixelflow_ir::passes::legalize`). Pricing the
+/// body once would tell the extractor a 34-piece fold costs what one piece
+/// costs, which is how an unpriced fold turns the e-graph's unrolling
+/// (`PeelFold`, `HalveFold`) off — it would keep every fold, unconditionally,
+/// because folding would always look free.
 ///
 /// This is the multiplier the fold's own [`CostModel::node_op_cost`] arm
 /// deliberately leaves out: a node's cost cannot see its children's, and this
-/// is the one place that number is in hand.
+/// is the one place that number is in hand. The two halves sum to
+/// [`CostModel::fold_cost`], the one formula for a fold's price.
 ///
 /// The trip count is *local to the fold node*, which is what makes it exact.
 /// A per-binder-slot table would not work: `PeelFold` rewrites
@@ -2312,6 +2318,7 @@ fn canonical_key(egraph: &EGraph, node: &ENode) -> (u8, u128, usize, Vec<u32>) {
         // The fold *is* the discriminating part: two folds over one body
         // differ only in their metadata, so that is what orders them.
         ENode::Reduce { fold, .. } => (6, fold.to_bits(), children.len(), children),
+        ENode::Ref { key, .. } => (7, u128::from(key.bits()), 0, children),
     }
 }
 
@@ -2616,11 +2623,13 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for TreePricer<'_,
             | ENode::Const(_)
             | ENode::Buffer(_)
             | ENode::Uniform(_)
-            | ENode::Param(_) => own,
+            | ENode::Param(_)
+            | ENode::Ref { .. } => own,
             // Saturating fold, not `.sum()`: a child's own cost can already
-            // sit at a prohibitive sentinel (`Dwrt`'s `usize::MAX / 4` from
-            // `CostModel::node_op_cost`), so a node with several such
-            // children overflows a plain `usize` sum.
+            // sit at a prohibitive sentinel (the `usize::MAX / 4`
+            // `CostModel::node_op_cost` gives a fold whose monoid has no
+            // combiner), so a node with several such children overflows a
+            // plain `usize` sum.
             ENode::Op { .. } | ENode::Reduce { .. } => {
                 let per_child = fold_body_multiple(node);
                 own.saturating_add(
@@ -3269,7 +3278,8 @@ mod tests {
                     | ENode::Const(_)
                     | ENode::Buffer(_)
                     | ENode::Uniform(_)
-                    | ENode::Param(_) => own,
+                    | ENode::Param(_)
+                    | ENode::Ref { .. } => own,
                     ENode::Op { .. } | ENode::Reduce { .. } => {
                         let children = node.children_slice();
                         if children.iter().any(|&c| egraph.find(c) == canonical) {
@@ -3356,7 +3366,7 @@ mod tests {
             cur = match step % 8 {
                 0 => {
                     let inside = arena.push_binary(OpKind::Lt, cur, c);
-                    arena.push_ternary(OpKind::Select, inside, dx2, cur)
+                    arena.push_ternary(OpKind::If, inside, dx2, cur)
                 }
                 1 => arena.push_unary(OpKind::Sqrt, cur),
                 2 => arena.push_binary(OpKind::Mul, cur, dx),
@@ -4408,7 +4418,7 @@ mod tests {
         costs: &CostModel,
     ) -> usize {
         use pixelflow_ir::arena::ExprNode;
-        let mut seen = alloc::vec![false; arena.nodes_raw().len()];
+        let mut seen = alloc::vec![false; arena.len()];
         let mut stack = alloc::vec![root];
         let mut total = 0usize;
         while let Some(id) = stack.pop() {
@@ -4422,7 +4432,7 @@ mod tests {
                 | ExprNode::Uniform(_) => None,
                 ExprNode::Unary(k, _)
                 | ExprNode::Binary(k, _, _)
-                | ExprNode::Ternary(k, _, _, _) => Some(*k),
+                | ExprNode::Ternary(k, _, _, _) => Some(k),
                 other => panic!("unexpected extracted node {other:?}"),
             };
             if let Some(k) = kind {
@@ -4624,7 +4634,8 @@ mod tests {
                 | ENode::Const(_)
                 | ENode::Buffer(_)
                 | ENode::Uniform(_)
-                | ENode::Param(_) => 0,
+                | ENode::Param(_)
+                | ENode::Ref { .. } => 0,
             }
         }
     }

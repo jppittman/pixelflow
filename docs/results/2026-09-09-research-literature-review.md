@@ -146,6 +146,8 @@ REINFORCE, a transformer critic), both explicitly superseded. What replaced them
   improves Σ `dag_cost` −16.7% on 44 glyphs but costs a 95-glyph warm 6.6 s → 25.5 s, and puts ink on
   the `'8'` waist where FreeType has none. **Not shipped — pinned at the floor, so production is
   byte-identical.** The prerequisite is a tangency fix in the quadratic winding kernel.
+  (Shipped 2026-09-29, when that kernel was gone: a glyph's coverage became a closed form, and
+  every production kernel inserts few enough classes to keep the floor.)
 - **Why it gets worse, answered.** PR #1236 (extraction witnesses): of 334 classified frontier
   classes, **29% are CYCLE-PRICED — the DP never priced either candidate**, and 24 of 56 first
   divergences were not made by the DP at all (18 by `repair_choices_well_founded`, which has no cost

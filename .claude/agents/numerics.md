@@ -13,21 +13,19 @@ You advise on:
 
 ## Core Concepts You Must Know
 
-### The Field Abstraction
+### The vector is the JIT's
 
-`Field` is a transparent SIMD wrapper. Users write algebra; the compiler emits vectorized assembly.
+There is no vector type in the language or in `pixelflow-core`. Users write algebra; the
+compiler emits vectorized assembly at the tier the host's CPU reports at process startup
+(`pixelflow_codegen::isa::detect`):
 
-```rust
-// Backend selection (compile-time):
-// AVX-512: 16 lanes, x86_64 with avx512f
-// AVX2: 8 lanes, x86_64 with avx2
-// SSE2: 4 lanes, x86_64 baseline
-// NEON: 4 lanes, ARM/AArch64
-// Scalar: 1 lane, fallback
-pub struct Field(NativeSimd);
+```text
+AVX-512: 16 lanes, x86_64 with avx512f+avx512dq
+AVX2:     8 lanes, x86_64 with avx2+fma — the floor; nothing narrower is emitted
+NEON:     4 lanes, aarch64
 ```
 
-**Critical invariant**: `Field` is IR. Users compose manifolds, not fields.
+**Critical invariant**: lane width is never in the vocabulary. Users compose `Kernel`s.
 
 ### Automatic Differentiation
 

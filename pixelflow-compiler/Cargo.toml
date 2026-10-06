@@ -21,7 +21,6 @@ quote = "1"
 proc-macro2 = "1"
 pixelflow-ir = { path = "../pixelflow-ir" }
 pixelflow-search = { path = "../pixelflow-search" }
-pixelflow-codegen = { path = "../pixelflow-codegen" }
 
 [dev-dependencies]
 pixelflow-core = { path = "../pixelflow-core" }

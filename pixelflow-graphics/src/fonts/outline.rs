@@ -158,6 +158,31 @@ impl Contour {
         &self.segments
     }
 
+    /// The same closed curve traversed the other way. It winds −1 wherever
+    /// this contour winds +1.
+    ///
+    /// The segments are taken in reverse order and each is run backwards,
+    /// so every shared endpoint is still one shared value and the result
+    /// closes exactly as `self` did.
+    #[must_use]
+    pub(crate) fn reversed(&self) -> Self {
+        Self {
+            segments: self
+                .segments
+                .iter()
+                .rev()
+                .map(|&segment| match segment {
+                    Segment::Line { from, to } => Segment::Line { from: to, to: from },
+                    Segment::Quad { from, control, to } => Segment::Quad {
+                        from: to,
+                        control,
+                        to: from,
+                    },
+                })
+                .collect(),
+        }
+    }
+
     /// A contour from TrueType's point list — `(x, y, on_curve)` in order —
     /// with the format's implicit on-curve points made explicit: two
     /// consecutive off-curve points imply an on-curve point at their
@@ -272,6 +297,15 @@ impl Outline {
         self.contours.extend(other.contours);
     }
 
+    /// Every contour traversed the other way ([`Contour::reversed`]): the
+    /// same ink with its winding negated.
+    #[must_use]
+    pub(crate) fn reversed(&self) -> Self {
+        Self {
+            contours: self.contours.iter().map(Contour::reversed).collect(),
+        }
+    }
+
     /// The box `[x0, y0, x1, y1]` containing every control point, which
     /// contains every curve. `None` for an empty outline.
     #[must_use]
@@ -295,7 +329,11 @@ impl Outline {
 }
 
 /// The forward affine map `x' = a·x + b·y + tx, y' = c·x + d·y + ty`, stored
-/// as `[a, b, c, d, tx, ty]` — TrueType's component-transform layout.
+/// row-major as `[a, b, c, d, tx, ty]`.
+///
+/// Not TrueType's order: a component's 2×2 is stored `xscale, scale01,
+/// scale10, yscale`, and `scale01` multiplies `x` into `y'`, so it is this
+/// map's `c` and `scale10` its `b` (`Font::compound` swaps them as it reads).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Affine(pub [f32; 6]);
 
@@ -314,6 +352,15 @@ impl Affine {
     pub fn apply(self, [x, y]: Point) -> Point {
         let [a, b, c, d, tx, ty] = self.0;
         [a * x + b * y + tx, c * x + d * y + ty]
+    }
+
+    /// Whether the map reflects: its linear part has a negative
+    /// determinant. A reflection turns every contour it moves inside out,
+    /// so a curve that wound +1 around its ink winds −1.
+    #[must_use]
+    pub(crate) fn mirrors(self) -> bool {
+        let [a, b, c, d, ..] = self.0;
+        a * d - b * c < 0.0
     }
 
     /// The map that applies `self` first and then `outer`: `outer ∘ self`.
@@ -500,6 +547,46 @@ mod tests {
                 .collect(),
         );
         assert!(ring.is_ok());
+    }
+
+    /// Reversal runs every segment backwards in reverse order: it closes,
+    /// it undoes itself, and each segment of the result is one of the
+    /// original's with its ends swapped and its control kept.
+    #[test]
+    fn a_reversed_contour_is_the_same_curve_run_backwards() {
+        let c = Contour::from_truetype_points(&[
+            (0.0, 0.0, true),
+            (4.0, 0.0, true),
+            (4.0, 4.0, false),
+            (0.0, 4.0, true),
+        ])
+        .expect("four points make a contour");
+        let r = c.reversed();
+        assert_closed(&r);
+        assert_eq!(r.reversed(), c);
+        for (forward, backward) in c.segments().iter().zip(r.segments().iter().rev()) {
+            let expected = match *forward {
+                Segment::Line { from, to } => Segment::Line { from: to, to: from },
+                Segment::Quad { from, control, to } => Segment::Quad {
+                    from: to,
+                    control,
+                    to: from,
+                },
+            };
+            assert_eq!(*backward, expected);
+        }
+    }
+
+    #[test]
+    fn only_a_reflection_mirrors() {
+        assert!(!Affine::IDENTITY.mirrors());
+        assert!(!Affine::translation(5.0, -3.0).mirrors());
+        // A half-turn reverses both axes and so neither orientation.
+        assert!(!Affine([-1.0, 0.0, 0.0, -1.0, 0.0, 0.0]).mirrors());
+        assert!(Affine([-1.0, 0.0, 0.0, 1.0, 520.0, 0.0]).mirrors());
+        assert!(Affine([1.0, 0.0, 0.0, -0.5, 0.0, 0.0]).mirrors());
+        // Swapping the axes is a reflection across the diagonal.
+        assert!(Affine([0.0, 1.0, 1.0, 0.0, 0.0, 0.0]).mirrors());
     }
 
     #[test]

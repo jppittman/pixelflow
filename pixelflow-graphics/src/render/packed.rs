@@ -9,11 +9,11 @@
 //! (per call, per row) active.
 //!
 //! A colour is an [`Rgba`] tree rather than an array, so a *choice* between
-//! colours reaches here as one node and leaves as one `Select` on the packed
+//! colours reaches here as one node and leaves as one `If` on the packed
 //! words ([`pixelflow_ir::Bits::select`] — the blend the hardware already
 //! does). That is the difference between a scene the emitter can short-circuit
-//! and one it cannot: with four selects sharing a mask, everything either arm
-//! computes is shared from each select's point of view, and none of it can be
+//! and one it cannot: with four `If`s sharing a mask, everything either arm
+//! computes is shared from each `If`'s point of view, and none of it can be
 //! skipped.
 //!
 //! The layer below ([`pixelflow_core::Manifold`]) is the same object with
@@ -31,7 +31,7 @@ use crate::scene3d::Rgba;
 /// A colour packed to one `u32` pixel: each leaf's four channels packed to a
 /// byte exactly as `Pixel::from_rgba` does — `(x·255).clamp(0, 255)` then
 /// truncate toward zero — shifted to its byte lane and OR-folded, and each
-/// choice between colours blended as one `Select` on those words.
+/// choice between colours blended as one `If` on those words.
 ///
 /// `shifts[c]` is the bit position of channel `c` in `(r, g, b, a)` order.
 /// Both pixel orders are little-endian byte arrays wrapping a `u32`, so byte
@@ -42,7 +42,7 @@ use crate::scene3d::Rgba;
 /// the scalar pack's `as u8`, and `cvttps2dq`/`fcvtzs` both truncate toward
 /// zero — no per-target tie divergence to inherit.
 ///
-/// Selecting words and selecting channels give the same bits, since `Select`
+/// Selecting words and selecting channels give the same bits, since `If`
 /// is a lanewise bitwise blend and the pack is lanewise: whatever the
 /// not-taken arm packed is masked away whole. That equality is why this
 /// changes no pixel and why the goldens do not move
@@ -257,32 +257,16 @@ impl PackedFrame {
     ///
     /// The kernel's root is int-domain: each lane already holds a packed
     /// pixel's bit pattern, and the collapse store is a raw vector store, so
-    /// what reaches memory is exactly what the OR-fold built.
+    /// what reaches memory is exactly what the OR-fold built. Exactly
+    /// `region.width` words per row are written: a program that answers for
+    /// part of a frame leaves the border's columns to whatever paints them.
     ///
     /// # Panics
     ///
-    /// Panics if the region's width is zero, `stride` is less than it, or
-    /// `out` cannot hold the band.
+    /// Panics if the region's width or row count is zero, `stride` is less
+    /// than the width, or `out` cannot hold the band.
     pub fn collapse_rows(&self, region: PlaneRegion, out: &mut [u32], stride: usize) {
         self.frame.collapse_int_rows(region, out, stride);
-    }
-
-    /// [`Self::collapse_rows`] for a program that answers for only part of a
-    /// row: **exactly** `region.width` words per row, leaving the rest of the
-    /// stride as it was.
-    ///
-    /// `collapse_rows` lets a row's final partial batch overhang into the
-    /// stride's spare columns, because for a whole-frame scene those columns
-    /// are padding nobody reads. For a scene that covers part of the frame
-    /// they are the *border's* columns, filled by something else, so an
-    /// overhang there is wrong pixels rather than scratch.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the region's width is zero, `stride` is less than it, or
-    /// `out` cannot hold the sub-rectangle.
-    pub(crate) fn collapse_subrect(&self, region: PlaneRegion, out: &mut [u32], stride: usize) {
-        self.frame.collapse_int_subrect(region, out, stride);
     }
 }
 
@@ -313,10 +297,10 @@ mod tests {
     }
 
     /// **The equality S3b rests on.** Choosing between two packed words is
-    /// choosing between each of their channels: `Select` is a lanewise
+    /// choosing between each of their channels: `If` is a lanewise
     /// bitwise blend and the pack is lanewise, so the not-taken arm's bytes
     /// are masked away whole. Bit-exact, under both byte orders — which is
-    /// why one select over a whole colour draws the same picture as four, and
+    /// why one `If` over a whole colour draws the same picture as four, and
     /// why no golden moves when the colour becomes a tree.
     #[test]
     fn selecting_packed_words_is_selecting_the_channels() {
@@ -335,11 +319,11 @@ mod tests {
             mask.select(&ca[2], &cb[2]),
             mask.select(&ca[3], &cb[3]),
         );
-        let one_select = a.select(&mask, &b);
+        let one_if = a.select(&mask, &b);
 
         for shifts in [RGBA, BGRA] {
             assert_eq!(
-                words(&packed_kernel(&one_select, shifts), 8),
+                words(&packed_kernel(&one_if, shifts), 8),
                 words(&packed_kernel(&per_channel, shifts), 8),
                 "one select on the words disagrees with four on the channels, \
                  shifts {shifts:?}"
@@ -385,6 +369,97 @@ mod tests {
         assert_eq!(
             words(&packed_kernel(&red, BGRA), 1)[0],
             0xff00_0000 | 0xff_0000
+        );
+    }
+
+    // -- What a scene's compile branches over -----------------------------
+    //
+    // A guarded `If` and a blended one produce the same picture, so no
+    // golden sees a scene lose its branches; it only gets slower. These pins
+    // read `EmitTraffic::branches`, the tables the emitter branches on.
+
+    /// The frame the branch pins compile at: the size the throughput numbers
+    /// are quoted for.
+    const FRAME: [u32; 2] = [1920, 1080];
+
+    fn ray() -> crate::scene3d::Ray {
+        crate::scene3d::Ray::through_screen(FRAME[0] as f32, FRAME[1] as f32)
+    }
+
+    fn sphere_hit(ray: &crate::scene3d::Ray) -> crate::scene3d::Hit {
+        let k = Kernel::constant;
+        crate::scene3d::Sphere::new([k(0.0), k(0.0), k(4.0)], k(1.0)).hit(ray)
+    }
+
+    /// The floor checker under the sky: what one ray sees of the world.
+    fn world(ray: &crate::scene3d::Ray) -> Rgba {
+        use crate::scene3d::{checker, sky, Plane};
+        let floor = Plane::at_height(Kernel::constant(-1.0)).hit(ray);
+        floor.select(
+            &checker(&floor.point()[0], &floor.point()[2], &floor.footprint()),
+            &sky(ray),
+        )
+    }
+
+    /// A chrome sphere over a checker floor, reflecting the floor and sky:
+    /// the sphere's `If`, and a world's `If`s on each side of it.
+    fn chrome() -> Rgba {
+        let ray = ray();
+        let sphere = sphere_hit(&ray);
+        let mirrored = ray.reflected(sphere.normal());
+        sphere.select(&world(&mirrored), &world(&ray))
+    }
+
+    /// The sphere's silhouette over the sky, and nothing else: one `If`
+    /// whose arms are cheaper than a mispredicted branch.
+    fn silhouette() -> Rgba {
+        let ray = ray();
+        sphere_hit(&ray).select(&Rgba::opaque_gray(0.5), &crate::scene3d::sky(&ray))
+    }
+
+    /// The branches of `color` as compiled for a frame — through
+    /// `jit_cache::compile`, the one entry a [`PackedManifold`] compiles by.
+    fn branches_of(color: &Rgba) -> (u64, u64, u64) {
+        let linked = pixelflow_codegen::jit_cache::compile(
+            &packed_kernel(color, RGBA),
+            pixelflow_ir::LatticeShape::new(FRAME),
+        )
+        .expect("compile");
+        let b = linked.kernel.branches();
+        (b.guards, b.arms_branched, b.arm_entries)
+    }
+
+    /// The chrome sphere keeps the branches it earns: three of its `If`s
+    /// guard both their arms. Pinned on guards and arms, not on entries — an
+    /// entry count moves with every rewrite rule, an arm lost does not.
+    ///
+    /// Without the clustering search that used to make arms contiguous, the
+    /// same scene still read three guards but only four arms, and runs 3.5x slower on AVX-512 and 2.6x on AVX2
+    /// with the same pixels, which is why the arms are counted.
+    #[test]
+    fn the_chrome_sphere_keeps_its_branches() {
+        let (guards, arms, entries) = branches_of(&chrome());
+        assert_eq!(
+            (guards, arms),
+            (3, 6),
+            "chrome's branches moved ({entries} entries)"
+        );
+    }
+
+    /// The silhouette over the sky: one `If`, and one arm worth a branch.
+    ///
+    /// The arm is over the mispredict bound and was refused, before the layout
+    /// chose the order, because its values were not one run; the layout gives it
+    /// its branch. A spatially coherent mask earns one: the sphere's silhouette
+    /// is uniform in most batches. Pinned on guards and arms (entries are
+    /// recorded in `docs/results`).
+    #[test]
+    fn the_sphere_silhouette_branches_over_its_one_costly_arm() {
+        let (guards, arms, entries) = branches_of(&silhouette());
+        assert_eq!(
+            (guards, arms),
+            (1, 1),
+            "the silhouette's branches moved ({entries} entries)"
         );
     }
 }

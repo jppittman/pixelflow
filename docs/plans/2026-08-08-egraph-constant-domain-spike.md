@@ -48,7 +48,7 @@ estimate ("~71 in ~17 files") was close but not exact; here is the reconciliatio
 |---|---|---|
 | Raw matches | 76 | `rg` count, all 4 patterns, 17 files |
 | − dead code | −2 | `pixelflow-search/src/egraph/algebra.rs` is **not declared as a module** anywhere (`egraph/mod.rs` has no `mod algebra;`/`pub mod algebra;`) — it does not compile into the crate. It duplicates `InverseAnnihilation<T>` byte-for-byte from `math/algebra.rs`. See §3. |
-| − false positives | −2 | `nnue/factored.rs` (`v.is_const()`) and `egraph/deps.rs` (`child_v.is_const()`) both call **`Variance::is_const()`** (`pixelflow-ir/src/variance.rs`), an unrelated method on an unrelated type. Not `ENode` at all. |
+| − false positives | −2 | `nnue/factored.rs` (`v.is_const()`) and `egraph/deps.rs` (`child_v.is_const()`; deleted 2026-09-23) both call **`Variance::is_const()`** (`pixelflow-ir/src/variance.rs`), an unrelated method on an unrelated type. Not `ENode` at all. |
 | **Live, real total** | **72** | across **16 compiled files** |
 
 `pixelflow-pipeline` was checked and has **zero** references to `ENode` — it operates one
@@ -62,7 +62,7 @@ touch. Out of scope, confirmed by grep, not asserted.
 | `pixelflow-search/src/egraph/node.rs` | 6 | 1 (ctor def) | 3 (`as_f32`, `is_const`, + PartialEq/Hash below) | 1 | **Defines the type + hash-consing.** See §2.1. |
 | `pixelflow-search/src/egraph/graph.rs` | 25 | 21 (incl. `add_arena` widen, derivative helpers, tests) | 2 (`as_f32` in `add()`'s `const_fact` hook, `is_const` in `any_const_eq`) | 2 | Also owns the **union refusal valve** and new `const_fact` table — see §2.2. |
 | `pixelflow-search/src/egraph/extract.rs` | 8 | 1 (test) | 1 (`choices_to_arena` narrowing — **the** extraction funnel) | 6 (incl. new `pin_shift_counts`, see §2.4) | |
-| `pixelflow-search/src/egraph/deps.rs` | 8 (7 real) | 5 (tests) | 0 | 2 | Variance classification only; never reads the value. |
+| `pixelflow-search/src/egraph/deps.rs` | 8 (7 real) | 5 (tests) | 0 | 2 | Variance classification only; never reads the value. Deleted 2026-09-23 — the class variance fact replaced it. |
 | `pixelflow-search/src/math/algebra.rs` | 7 | 5 (incl. `ConstantFold` result) | 2 (`ConstantFold` arg-gather, 1 test) | 0 | **`ConstantFold::apply` — the crux.** See §2.3. |
 | `pixelflow-compiler/src/optimize.rs` | 4 | 3 | 1 (egraph→AST codegen) | 0 | Cross-crate: `ENode` is `pub`, matched from outside `pixelflow-search`. |
 | `pixelflow-search/src/nnue/factored.rs` | 3 (2 real) | 0 | 0 | 2 | Shape/`OpKind` classification only — **no numeric value ever reaches NNUE features.** Reassuring finding, see §3. |
@@ -427,7 +427,7 @@ implementation effort.
    payload — this is the hash-consing fix, the actual point).
 3. **Fix every compile error** `rustc` now reports — this mechanically finds the 15 shape-only
    sites plus `canonical_op`/`node_op_cost`/`node_deps`/etc. Expect ~15-20 one-line arm additions
-   across `graph.rs`, `extract.rs`, `cost.rs`, `deps.rs`, `factored.rs`.
+   across `graph.rs`, `extract.rs`, `cost.rs`, `deps.rs` (since deleted), `factored.rs`.
 4. **Fix the 6 bound-pattern read sites by hand** (§2.1's list) — each needs a real per-variant
    decision (usually: `Num(d) => ... d.to_f32() ...`, `Bits(b) => ... f32::from_bits(b) ...`,
    matching what `as_f32()` now does internally, but some sites — e.g. `codegen.rs::format_const`

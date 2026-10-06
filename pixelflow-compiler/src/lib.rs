@@ -23,6 +23,12 @@
 //! Rust TokenStream that rebuilds a `Kernel` at load time
 //! ```
 //!
+//! An entry that takes a kernel-typed parameter leaves the diagram at
+//! lowering: its argument exists only when its host function is called, so
+//! lowering's steps are emitted as the statements that take them, and run
+//! then (`emit::Staged`, Phase D-a of
+//! docs/plans/2026-09-25-the-language-is-kernel.md).
+//!
 //! Two representations, the surface AST and the IR. It used to be five: the
 //! optimizer ran
 //! on the *AST*, so `kernel!` went AST → e-graph → extracted DAG → back to an
@@ -62,30 +68,133 @@ use pixelflow_ir::optimize::{Identity, Optimize, Rewritten};
 use pixelflow_search::Saturate;
 use proc_macro::TokenStream;
 
-/// The `kernel!` macro: closure syntax for a [`Kernel`](pixelflow_core::Kernel),
+/// The plan that owns the constructs the front end refuses by phase: a
+/// refusal of one names the phase that brings it.
+pub(crate) const PLAN: &str = "docs/plans/2026-09-25-the-language-is-kernel.md";
+
+/// The `kernel!` macro: the language, as a block of items or as a closure,
 /// optimized by the e-graph at macro-expansion time.
 ///
-/// - Zero params → a `Kernel` value.
-/// - N params → a builder closure `move |p0: f32, ...| -> Kernel` that
-///   constant-folds its arguments into the fragment.
+/// # The items form
 ///
-/// Kernels compose as values — `Kernel::at`/`sum`/`select`/arithmetic — so
-/// there is no manifold-typed parameter. Derivatives (`DX`/`DY`) become
-/// symbolic `Dwrt` nodes, resolved by the e-graph here when it can and by
-/// codegen otherwise.
+/// A block of records, `const` items and `fn` items
+/// (docs/plans/2026-09-25-the-language-is-kernel.md §1.2):
 ///
-/// # Syntax
-///
-/// ```ignore
-/// kernel!(|param1: f32, param2: f32, ...| expression)
-/// ```
-///
-/// # Example
+/// - A `pub fn name(params) -> f32 { body }` is an **entry**: the macro
+///   emits a host `pub fn name(params) -> Kernel`, taking its parameters by
+///   their declared types — a kernel-typed one as a `&Kernel` — and, when
+///   it has uniform parameters and no kernel-typed one, its `Args` record
+///   (see *Binding times* below).
+/// - A private `fn` is a **helper**: type-checked once, inlined at each call.
+///   Helpers may call helpers; a cycle is refused, because the language is a
+///   DAG. `X` and `Y` appear only in entries — a helper takes its
+///   coordinates as arguments, so that applying it to a shifted coordinate
+///   warps it.
+/// - A `struct R { a: f32, b: f32 }` is a **record** (§1.3): named `f32`
+///   fields, emitted as a host `#[repr(C)]` struct of the same name and
+///   visibility, its attributes kept. A record is the type of an entry's or
+///   a helper's parameter; a body reads a field, `p.a`, aliases a record,
+///   `let q = p;`, and passes one on by name. Building, returning, choosing
+///   between or computing with whole records is Phase D (D7), and refused.
+/// - A `const NAME: f32 = expr;` is evaluated at expansion, per operation in
+///   `f32`, from literals, other consts, `+ - * /`, unary `-` and
+///   parentheses. A `const NAME: usize = expr;` is a count, evaluated from
+///   integers, other `usize` consts and `+ - * /`, each operation checked. A
+///   `pub const` is also emitted as a host `pub const`. A constant of a
+///   program is spelled this way, and no other.
 ///
 /// ```ignore
 /// use pixelflow_compiler::kernel;
 /// use pixelflow_core::{Kernel, Lattice};
 ///
+/// kernel! {
+///     pub const UNIT: f32 = 1.0;
+///     const RINGS: usize = 4;
+///
+///     /// The distance from `(cx, cy)`; a function of its arguments.
+///     fn dist(x: f32, y: f32, cx: f32, cy: f32) -> f32 {
+///         let dx = x - cx;
+///         let dy = y - cy;
+///         (dx * dx + dy * dy).sqrt()
+///     }
+///
+///     /// The signed distance to the circle: the entry reads `X` and `Y`.
+///     pub fn circle(cx: f32, cy: f32, r: f32) -> f32 {
+///         dist(X, Y, cx, cy) - r
+///     }
+///
+///     /// One inside the unit disc, zero outside; a choice is spelled `if`.
+///     pub fn disc(cx: f32, cy: f32) -> f32 {
+///         if dist(X, Y, cx, cy) < UNIT { UNIT } else { 0.0 }
+///     }
+///
+///     /// How many of the discs about the origin of radii 1 to `RINGS`
+///     /// contain the sample: a fold, Σ over `i ∈ [0, RINGS)`.
+///     pub fn rings() -> f32 {
+///         (0..RINGS)
+///             .map(|i| if dist(X, Y, 0.0, 0.0) < (i as f32) + UNIT { UNIT } else { 0.0 })
+///             .sum()
+///     }
+/// }
+///
+/// let unit_circle: Kernel = circle(0.0, 0.0, UNIT);
+/// let plane = Lattice::frame(64, 64).bake(&unit_circle);
+/// ```
+///
+/// # Types
+///
+/// Every expression is an `f32` or a `bool`. A comparison (`<`, `<=`, `>`,
+/// `>=`, `==`, `!=`) gives a `bool`; `&` and `|` combine two `bool`s; an
+/// `if c { a } else { b }` chooses by one, and both arms have the same type.
+/// A `bool` where an `f32` is expected, or the reverse, is a type error at
+/// expansion: `X.select(Y, 7.0)` used to blend a number as a mask. The IR
+/// keeps one lane for both; the type lives in the front end.
+///
+/// # Folds
+///
+/// `(a..b).map(|i| e).sum()` is Σ of `e` over `i ∈ [a, b)`; `.product()`,
+/// `.fold(f32::INFINITY, f32::min)` and `.fold(f32::NEG_INFINITY, f32::max)`
+/// are Π, min and max, and `(a..b).any(|i| m)` and `.all(|i| m)` are ∃ and ∀
+/// of `bool`s. An empty range gives the monoid's identity. The bounds are
+/// constant — integers, `usize` consts and an entry's structural parameters
+/// — and the index `i` is a `usize`, which a body reads only as `i as f32`:
+/// there is no arithmetic on an index and nothing to index. A fold lowers to
+/// one `Reduce`, the node `Kernel::over` builds; unrolling it is the
+/// e-graph's choice, at bake time. A closure is the body of a fold and
+/// appears nowhere else.
+///
+/// `if` is the choice. `.select(a, b)` still lowers to the same node this
+/// phase, and Phase B of the plan removes it.
+///
+/// A `let` binds a name, or takes a tuple apart where it is written:
+/// `let (x, y) = (X + 0.5, Y + 0.5);` binds each name to its expression, every
+/// expression read before any name binds, as Rust's does. A tuple anywhere
+/// else is a value, which is Phase D (D7).
+///
+/// # No collection types
+///
+/// The language has none (§1.3, §1.6): no array, slice, list or table — as
+/// a parameter, a value, or a thing to index or iterate. Several values are
+/// several parameters, a record is its named fields, and the one iteration
+/// is a fold, over a range. Each spelling of a collection — `[R; N]`,
+/// `&[R]`, `[a, b]`, `v[k]`, `.into_iter()`, `.iter()`, `.map` over anything
+/// but a range — is refused where it is written.
+///
+/// # The closure form
+///
+/// ```ignore
+/// kernel!(|param1: f32, param2: f32, ...| expression)
+/// ```
+///
+/// Sugar for a block with one entry, whose type is inferred, and the
+/// expansion is an expression rather than an item:
+///
+/// - Zero params → a `Kernel` value.
+/// - N params → a closure `move |p0: f32, ...| -> Kernel`, every parameter a
+///   uniform, as an entry's are. It has no `Args` record: a program compiled
+///   from it is rebound by position, `block.set_declared([p0, ...])`.
+///
+/// ```ignore
 /// let circle = kernel!(|cx: f32, cy: f32, r: f32| {
 ///     let dx = X - cx;
 ///     let dy = Y - cy;
@@ -96,33 +205,122 @@ use proc_macro::TokenStream;
 /// let plane = Lattice::frame(64, 64).bake(&unit_circle);
 /// ```
 ///
-/// # Parameters
+/// Derivatives (`DX`/`DY`) become symbolic `Dwrt` nodes, resolved by the
+/// e-graph here when it can and by codegen otherwise. The closure form takes
+/// no kernel-typed parameter: rustc refuses `impl Trait` in a closure's
+/// parameters (E0562).
 ///
-/// A builder's arguments are anything `Into<Scalar>`, and the type at the
-/// call site decides what the parameter is. An `f32` is folded into the
-/// fragment as a constant, so `circle(0.0, 0.0, 1.0)` is the same kernel it
-/// always was. A [`Uniform`](pixelflow_core::Uniform) handle makes the
-/// parameter an *argument* of the compiled kernel instead — invariant across
-/// the lattice, bound per call from a `UniformBlock`, never folded — so a
-/// scene transform or a cursor position moves without a recompile:
+/// # Kernel-typed parameters
+///
+/// An entry's parameter typed `impl Fn(f32, f32) -> f32` is a **kernel**
+/// the host passes when it calls the entry (§1.3, §1.4, Phase D-a), and the
+/// host function takes a `&Kernel` for it. A body applies one, `k(x, y)` —
+/// the argument at `(x, y)`, which is `k.at(x, y)`: application is
+/// contramap — or passes it by name to a helper's kernel-typed parameter,
+/// and does nothing else with it: arithmetic on one, a `let` of one, a
+/// return of one are refused. As rustc moves an `impl Fn` it passes, a body
+/// passes one on at most once on each path through it — an `if`'s arms are
+/// two — then uses it no more on that path, and never inside a fold's body.
+///
+/// Such an entry is a composition, whose program exists only once the host
+/// passes its argument, so its host function runs lowering's steps when it
+/// is called: the IR calls this macro makes at expansion for any other
+/// entry, then. No optimizer runs on it at expansion; the composed program
+/// is optimized when it is baked. A fold around an application closes after
+/// the argument is in, so the argument keeps its binders and the fold takes
+/// another (D4). An argument is closed and reads no table, or the call
+/// panics.
 ///
 /// ```ignore
-/// let cx = Uniform::new(0.0);
-/// let moving = circle(cx, 0.0, 1.0);   // cx is an argument; cy and r are folded
+/// kernel! {
+///     pub fn sum2(a: impl Fn(f32, f32) -> f32, b: impl Fn(f32, f32) -> f32) -> f32 {
+///         a(X, Y) + b(X, Y)
+///     }
+///
+///     /// Three copies of `k`, a column apart.
+///     pub fn columns(k: impl Fn(f32, f32) -> f32) -> f32 {
+///         (0..3).map(|i| k(X + (i as f32), Y)).sum()
+///     }
+/// }
+///
+/// let disc = kernel!(|r: f32| (X * X + Y * Y).sqrt() - r)(4.0);
+/// let both = sum2(&disc, &columns(&disc));
 /// ```
 ///
-/// Each `let` binding of a builder is one signature: the same binding cannot
-/// be called with an `f32` and a `Uniform` in the same position.
+/// # Binding times
+///
+/// Every value a program reads is bound at one of three times (§1.4):
+///
+/// - **Structural**: an entry's `const N: usize` generics. The host function
+///   is generic over them, and each value is its own program — a count in a
+///   fold's range, or `N as f32`. A helper takes none; it reads its entry's
+///   through an argument.
+/// - **Uniform**: every parameter. An `f32` is one uniform and a record is
+///   one per field; the kernel an entry returns declares them in that order,
+///   each with the call's value as its default, and baking it draws the
+///   call. The value is an argument of the program, never folded into it, so
+///   every call of an entry is one program: compiled once, and rebound per
+///   call from the entry's `Args` record — `<Entry in UpperCamelCase>Args`,
+///   its parameters as fields, written into a block the program made with
+///   `write_into`, which allocates nothing once the block is the caller's
+///   alone. A kernel the entry's is composed into still rebinds from it, its
+///   declarations the entry's in order beside argument-free kernels; beside
+///   other arguments the count differs, and `write_into` refuses. A
+///   constant is a `const` item.
+/// - **Kernel-typed**: an argument the host passes when it calls the entry.
+///   The composed program declares the entry's own uniforms first, in
+///   declaration order, then each argument's, in parameter order and that
+///   argument's own order, read or not — an instance passed twice declared
+///   once, where it first appears. Its key is the composed term's. It has
+///   no `Args` record: binding a composed program is O3 of the plan.
+///
+/// ```ignore
+/// use pixelflow_compiler::kernel;
+/// use pixelflow_core::{Lattice, Manifold};
+///
+/// kernel! {
+///     /// An axis-aligned box: a record.
+///     pub struct Bounds { pub x0: f32, pub y0: f32, pub x1: f32, pub y1: f32 }
+///
+///     /// `N` rings about the box's corner, `fg` on `bg`.
+///     pub fn rings<const N: usize>(b: Bounds, fg: f32, bg: f32) -> f32 {
+///         let dx = X - b.x0;
+///         let dy = Y - b.y0;
+///         let r = (dx * dx + dy * dy).sqrt();
+///         let within = (X <= b.x1) & (Y <= b.y1);
+///         let n: f32 = (0..N).map(|i| if r < (i as f32) + 1.0 { 1.0 } else { 0.0 }).sum();
+///         if within { fg * n / (N as f32) } else { bg }
+///     }
+/// }
+///
+/// let lattice = Lattice::frame(64, 64);
+/// let b = Bounds { x0: 8.0, y0: 8.0, x1: 40.0, y1: 40.0 };
+/// let once = lattice.bake(&rings::<4>(b, 1.0, 0.0));            // one call, baked
+///
+/// let program = Manifold::compile(&rings::<4>(b, 1.0, 0.0), lattice.extent);
+/// let mut block = program.block();
+/// RingsArgs::<4> { b, fg: 0.5, bg: 0.25 }.write_into(&mut block)?;
+/// let again = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
+/// ```
 ///
 /// # Pipeline
 ///
-/// 1. **Parser**: closure syntax → AST
-/// 2. **Semantic analysis**: symbol resolution, method validation
-/// 3. **Arena lowering**: the AST becomes an `ExprArena`
+/// 1. **Parser**: items or closure syntax → AST
+/// 2. **Semantic analysis**: symbol resolution, types, `const` evaluation,
+///    the call graph
+/// 3. **Arena lowering**: each entry's body becomes an `ExprArena`, helpers
+///    inlined, its parameters declared as uniforms
 /// 4. **Optimization**: e-graph saturation + latency-prior extraction, on
 ///    the arena. A kernel carrying a `Dwrt` declines here and is optimized
-///    at bake time instead, so composition still gets the chain rule.
-/// 5. **Emission**: the arena becomes code that rebuilds it at load time
+///    at bake time instead, so composition still gets the chain rule; so is
+///    an entry with structural parameters, a template until it is
+///    instantiated.
+/// 5. **Emission**: the arena becomes code that rebuilds it at load time,
+///    the call's values as its uniforms' defaults
+///
+/// An entry that takes a kernel skips 3 to 5 at expansion: its host
+/// function is lowering's steps, emitted as the statements that take them,
+/// and builds its arena when it is called (Phase D-a).
 #[proc_macro]
 pub fn kernel(input: TokenStream) -> TokenStream {
     expand(input, &mut macro_tier())
@@ -186,9 +384,8 @@ struct DwrtFree<P>(P);
 impl<P: Optimize> Optimize for DwrtFree<P> {
     fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
         let carries_dwrt = arena
-            .nodes_raw()
-            .iter()
-            .any(|n| matches!(n, ExprNode::Binary(OpKind::Dwrt, _, _)));
+            .nodes()
+            .any(|(_, n)| matches!(n, ExprNode::Binary(OpKind::Dwrt, _, _)));
         if carries_dwrt {
             return Rewritten::Declined;
         }
@@ -235,6 +432,7 @@ fn expand(input: TokenStream, optimizer: &mut dyn Optimize) -> TokenStream {
 #[cfg(test)]
 mod every_advertised_method_compiles {
     use crate::lower::LIBRARY_METHODS;
+    use crate::sema::{MethodTyping, method_typing};
     use crate::{Identity, Optimize, emit, macro_tier, parser, sema};
     use pixelflow_ir::{OpKind, known_method_names};
     use proc_macro2::Span;
@@ -251,13 +449,27 @@ mod every_advertised_method_compiles {
         KernelRaw,
     }
 
-    /// Expand `X.<method>(X, ..)` through `which` macro's own pipeline —
-    /// the same calls [`kernel`] and [`kernel_raw`] make — and report
-    /// whether it yields code.
+    /// Expand a well-typed call of `method` through `which` macro's own
+    /// pipeline — the same calls [`kernel`] and [`kernel_raw`] make — and
+    /// report whether it yields code.
+    ///
+    /// Well-typed by `sema`'s own typing of the op: an `f32` operand is `X`,
+    /// a `bool` one is `X.lt(X)`. The sweep asks the stage under test what
+    /// it takes, which is fine for what this checks — that every stage has
+    /// a path for every advertised name — and the typing itself is pinned
+    /// by `sema`'s tests.
     fn expand(which: Macro, method: &str, arg_count: usize) -> Result<(), String> {
         let name = Ident::new(method, Span::call_site());
-        let args = (0..arg_count).map(|_| quote!(X));
-        let body = quote! { || X.#name(#(#args),*) };
+        let number = quote!(X);
+        let mask = quote!(X.lt(X));
+        let (receiver, args): (proc_macro2::TokenStream, Vec<proc_macro2::TokenStream>) =
+            match OpKind::from_method_call(method, arg_count).map(method_typing) {
+                Some(MethodTyping::Choice) => (mask, vec![number.clone(), number]),
+                Some(MethodTyping::Comparison) | Some(MethodTyping::Arithmetic) | None => {
+                    (number.clone(), vec![number; arg_count])
+                }
+            };
+        let body = quote! { || #receiver.#name(#(#args),*) };
 
         let def = parser::parse(body).map_err(|e| e.to_string())?;
         let analyzed = sema::analyze(def).map_err(|e| e.to_string())?;

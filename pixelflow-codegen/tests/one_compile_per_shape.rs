@@ -108,3 +108,69 @@ fn a_thousand_circles_is_one_compile() {
         "999 more circles, differing only in their uniform instances, must not add a cache entry"
     );
 }
+
+/// `(x·s − 6.125)·y` over a fresh scale `s`: a unit's body, of a structure
+/// no other test here builds.
+fn unit_body() -> Kernel {
+    let mut a = ExprArena::new();
+    let s = a.declare_uniform(UniformDecl {
+        id: UniformIdentity::mint(),
+        default: 2.0,
+    });
+    let x = a.push_var(0);
+    let y = a.push_var(1);
+    let us = a.push_uniform(s);
+    let c = a.push_const(6.125);
+    let xs = a.push_binary(OpKind::Mul, x, us);
+    let shifted = a.push_binary(OpKind::Sub, xs, c);
+    let root = a.push_binary(OpKind::Mul, shifted, y);
+    Kernel::from_parts(a, root)
+}
+
+/// **A unit shared by two programs saturates once.** A named kernel is
+/// optimized by itself, through the same structure-keyed cache as any term
+/// (docs/plans/2026-09-25-the-language-is-kernel.md §4, O1), so a glyph that
+/// recurs — in another program, or over another font's uniforms — pays only
+/// for the term around it.
+///
+/// - The first program saturates its unit and the choice around it: 2.
+/// - A second program around the *same* unit saturates only its own term: 1.
+/// - A third around a unit of the same structure over fresh uniforms
+///   saturates its own term again — the term around a unit keys it by value,
+///   which is its identity — and not the unit: 1.
+#[test]
+fn a_unit_shared_by_two_programs_saturates_once() {
+    use pixelflow_search::runtime::saturation_count;
+
+    const SHAPE: LatticeShape = LatticeShape::new([16, 16]);
+    let _serial = SERIAL.lock().expect("serial");
+    let unit = unit_body().by_ref();
+    let x = Kernel::x();
+
+    let before = saturation_count();
+    let chosen = Kernel::y()
+        .lt(&Kernel::constant(3.0))
+        .select(&unit, &Kernel::constant(0.0));
+    let _ = compile(&chosen, SHAPE).expect("compile");
+    assert_eq!(
+        saturation_count() - before,
+        2,
+        "the unit and the term around it"
+    );
+
+    let before = saturation_count();
+    let _ = compile(&unit.mul(&x), SHAPE).expect("compile");
+    assert_eq!(
+        saturation_count() - before,
+        1,
+        "the unit is saturated already; only the new term around it is not"
+    );
+
+    let before = saturation_count();
+    let _ = compile(&unit_body().by_ref().mul(&x), SHAPE).expect("compile");
+    assert_eq!(
+        saturation_count() - before,
+        1,
+        "the term around a fresh unit saturates; the unit, a structure already saturated, does not"
+    );
+}

@@ -10,7 +10,6 @@ use alloc::vec::Vec;
 use crate::arena::{BufferDecl, BufferId, RETIRED_COORD_AXES, UniformDecl, UniformId};
 use crate::dag::{Builder, Dag, Id, Node, SideTable};
 use crate::fold::Fold;
-use crate::kernel::Scalar;
 use crate::key::KernelKey;
 use crate::kind::OpKind;
 
@@ -38,8 +37,8 @@ pub enum ExprData {
     /// Operator node. Arity (unary, binary, ternary, nary) is a property of the
     /// DAG edge count (`node.child_count()`).
     Op(OpKind),
-    /// A bounded fold. Its one child is the body; everything else about it —
-    /// monoid, binder, range — is [`Fold`], and lives here rather than in
+    /// A fold. Its one child is the body; everything else about it —
+    /// monoid, binder, domain — is [`Fold`], and lives here rather than in
     /// `Const` children.
     ///
     /// The alternative encoding is `Op(OpKind::Reduce)` over
@@ -60,21 +59,6 @@ pub enum ExprData {
     /// contain. What it names is a *kernel*, which is what makes it the one
     /// of the three that can be resolved back into graph.
     Ref(KernelKey),
-    /// The hard lowering of [`OpKind::Select`](crate::kind::OpKind::Select):
-    /// a branch, where only the taken arm's body runs, denoting the same
-    /// function as the soft (blend) form
-    /// (docs/plans/2026-09-12-emit-should-just-emit.md §1). Mirrors
-    /// [`crate::arena::ExprNode::Guard`], whose doc has the full reasoning
-    /// for why the arms are names and not children.
-    ///
-    /// One field short of its arena twin: `on`/`off` are carried here, same
-    /// as there, but the mask is not — a `Dag` node's one child is already
-    /// the edge the builder passed at construction (see [`Reduce`](Self::Reduce),
-    /// whose body is the same kind of implicit edge), so repeating it as a
-    /// field here would be two names for one thing rather than the deliberate
-    /// two names [`ExprNode::Guard`](crate::arena::ExprNode::Guard) gives the
-    /// arms.
-    Guard { on: KernelKey, off: KernelKey },
 }
 
 impl ExprData {
@@ -129,7 +113,6 @@ pub(crate) trait ExprBuilderExt {
     fn push_nary(&mut self, op: OpKind, children: &[Id]) -> Id;
     fn push_reduce(&mut self, fold: Fold, body: Id) -> Id;
     fn push_ref(&mut self, key: KernelKey) -> Id;
-    fn push_guard(&mut self, mask: Id, on: KernelKey, off: KernelKey) -> Id;
 }
 
 impl ExprBuilderExt for Builder<ExprData> {
@@ -186,11 +169,6 @@ impl ExprBuilderExt for Builder<ExprData> {
     #[inline]
     fn push_ref(&mut self, key: KernelKey) -> Id {
         self.push_unique(ExprData::Ref(key), &[])
-    }
-
-    #[inline]
-    fn push_guard(&mut self, mask: Id, on: KernelKey, off: KernelKey) -> Id {
-        self.push_unique(ExprData::Guard { on, off }, &[mask])
     }
 }
 
@@ -273,61 +251,6 @@ pub(crate) fn substitute_vars(
     table[root].expect("root must have been copied")
 }
 
-/// Copy subgraph, replacing macro parameters with values.
-///
-/// Not yet called: `Kernel`'s parameter substitution still goes through the
-/// legacy `ExprArena` path (`pixelflow-compiler/src/emit.rs`); this is the
-/// `Dag`-native replacement staged for that, per
-/// `docs/plans/2026-09-09-exprarena-on-dag.md`'s Stage C. `pub(crate)`
-/// rather than `pub` made the gap visible (a `pub` fn is dead-code-exempt on
-/// the assumption an external crate might call it, which none ever did) —
-/// `#[allow(dead_code)]` because deleting or wiring this in isn't this
-/// change's call to make.
-#[allow(dead_code)]
-pub(crate) fn substitute_params(
-    builder: &mut Builder<ExprData>,
-    root: Node<'_, ExprData>,
-    params: &[Scalar],
-    uniform_slots: &[UniformId],
-) -> Id {
-    let mut table = root.dag().side_table(None);
-    let mut stack = alloc::vec![(root, false)];
-    while let Some((node, expanded)) = stack.pop() {
-        if table[node].is_some() {
-            continue;
-        }
-        if expanded {
-            let id = if let ExprData::Param(idx) = *node {
-                match params.get(idx as usize) {
-                    Some(Scalar::Const(v)) => builder.push_const(*v),
-                    Some(Scalar::Uniform(_)) => {
-                        let u_id = uniform_slots[idx as usize];
-                        builder.push_uniform(u_id)
-                    }
-                    None => panic!("missing parameter substitution for slot {idx}"),
-                }
-            } else {
-                let child_ids: Vec<Id> = node
-                    .children()
-                    .map(|c| table[c].expect("child must have been copied"))
-                    .collect();
-                builder.push_unique(*node, &child_ids)
-            };
-            table[node] = Some(id);
-        } else {
-            stack.push((node, true));
-            if !matches!(*node, ExprData::Param(_)) {
-                for child in node.children() {
-                    if table[child].is_none() {
-                        stack.push((child, false));
-                    }
-                }
-            }
-        }
-    }
-    table[root].expect("root must have been copied")
-}
-
 // ────────────────────────────────────────── Legacy Arena Bridge ───────────────
 
 /// Convert an `ExprArena` and root `ExprId` into a `(Rooted<ExprData>, Environment)`.
@@ -378,7 +301,7 @@ pub fn from_arena_roots(
                     .children(id)
                     .map(|c| map[c.0 as usize].expect("child must be emitted before parent"))
                     .collect();
-                let new_id = match *arena.node(id) {
+                let new_id = match arena.node(id) {
                     ExprNode::Var(i) => b.push_var(i),
                     ExprNode::Const(v) => b.push_const(v),
                     ExprNode::Param(i) => b.push_param(i),
@@ -386,7 +309,6 @@ pub fn from_arena_roots(
                     ExprNode::Uniform(uni) => b.push_uniform(uni),
                     ExprNode::Ref(key) => b.push_ref(key),
                     ExprNode::Reduce { fold, .. } => b.push_reduce(fold, child_ids[0]),
-                    ExprNode::Guard { on, off, .. } => b.push_guard(child_ids[0], on, off),
                     // Post-legalize only: no `Kernel` holds a store, and a
                     // term language a `Kernel` is made of has no word for one.
                     ExprNode::Write { .. } => panic!(
@@ -396,7 +318,7 @@ pub fn from_arena_roots(
                     ExprNode::Unary(op, _)
                     | ExprNode::Binary(op, _, _)
                     | ExprNode::Ternary(op, _, _, _)
-                    | ExprNode::Nary(op, _, _) => b.push_nary(op, &child_ids),
+                    | ExprNode::Nary(op, _) => b.push_nary(op, &child_ids),
                 };
                 map[id.0 as usize] = Some(new_id);
             }
@@ -453,7 +375,6 @@ pub fn to_arena_roots(
             ExprData::Uniform(u) => arena.push_uniform(u),
             ExprData::Ref(key) => arena.push_ref(key),
             ExprData::Reduce(fold) => arena.push_reduce(fold, child_ids[0]),
-            ExprData::Guard { on, off } => arena.push_guard(child_ids[0], on, off),
             ExprData::Op(op) => match child_ids.len() {
                 1 => arena.push_unary(op, child_ids[0]),
                 2 => arena.push_binary(op, child_ids[0], child_ids[1]),
@@ -510,10 +431,10 @@ impl Environment {
                     self.uniforms[i], decl,
                     "two declarations share a UniformIdentity but disagree on default"
                 );
-                UniformId(i as u16)
+                UniformId(i as u64)
             }
             None => {
-                let id = UniformId(self.uniforms.len() as u16);
+                let id = UniformId(self.uniforms.len() as u64);
                 self.uniforms.push(decl);
                 id
             }
@@ -523,6 +444,17 @@ impl Environment {
 
 /// Splicing: copy donor subgraph into `builder`, remapping buffer and uniform
 /// slots into `env` by identity.
+///
+/// Every uniform the donor *declares* joins `env`, in the donor's
+/// declaration order, before any node is copied — read or not, and whatever
+/// order the walk would first reach them in. A kernel's declaration order is
+/// the positional binding of its arguments (`UniformBlock::set_declared`, a
+/// `kernel!` entry's `Args`), so a composition must keep it: the
+/// receiver's declarations, then each operand's, each in its own order. Had
+/// the walk declared them, `c + entry(..)` would hold the entry's arguments
+/// permuted and its unread ones dropped — the same count, bound to the
+/// wrong places. Buffers bind by identity, never by position, so they are
+/// declared as the walk reaches them.
 pub(crate) fn splice(
     builder: &mut Builder<ExprData>,
     env: &mut Environment,
@@ -531,7 +463,11 @@ pub(crate) fn splice(
 ) -> Id {
     let mut table = root.dag().side_table(None);
     let mut buf_map: Vec<Option<BufferId>> = alloc::vec![None; donor_env.buffers.len()];
-    let mut uni_map: Vec<Option<UniformId>> = alloc::vec![None; donor_env.uniforms.len()];
+    let uni_map: Vec<UniformId> = donor_env
+        .uniforms
+        .iter()
+        .map(|decl| env.slot_for_uniform(*decl))
+        .collect();
 
     let mut stack = alloc::vec![(root, false)];
     while let Some((node, expanded)) = stack.pop() {
@@ -551,17 +487,7 @@ pub(crate) fn splice(
                     };
                     ExprData::Buffer(slot)
                 }
-                ExprData::Uniform(u) => {
-                    let slot = match uni_map[u.0 as usize] {
-                        Some(s) => s,
-                        None => {
-                            let s = env.slot_for_uniform(donor_env.uniforms[u.0 as usize]);
-                            uni_map[u.0 as usize] = Some(s);
-                            s
-                        }
-                    };
-                    ExprData::Uniform(slot)
-                }
+                ExprData::Uniform(u) => ExprData::Uniform(uni_map[u.0 as usize]),
                 other => other,
             };
             let child_ids: Vec<Id> = node
@@ -771,6 +697,33 @@ mod tests {
         assert_eq!(target_env.uniforms[0], u_decl);
         let r = target_rooted.entry();
         assert_eq!(r.op(), Some(OpKind::Add));
+    }
+
+    /// A spliced operand's uniforms follow the receiver's in the operand's
+    /// own declaration order — not the order the walk reaches them in, and
+    /// not only the ones it reads — because that order is how arguments
+    /// are bound by position.
+    #[test]
+    fn splice_keeps_the_donors_declaration_order() {
+        let [r, a, b, c] = [1.0, 2.0, 3.0, 4.0].map(|v| crate::Uniform::new(v).decl());
+        let mut donor_b = Builder::new();
+        let mut donor_env = Environment::new();
+        let [sa, _sb, sc] = [a, b, c].map(|decl| donor_env.slot_for_uniform(decl));
+        // `c` is reached first, `a` second, and `b` never.
+        let (uc, ua) = (donor_b.push_uniform(sc), donor_b.push_uniform(sa));
+        let donor_root = donor_b.push_binary(OpKind::Sub, uc, ua);
+        let donor_rooted = donor_b.finish(&[donor_root]);
+
+        let mut target_b = Builder::new();
+        let mut target_env = Environment::new();
+        target_env.slot_for_uniform(r);
+        splice(
+            &mut target_b,
+            &mut target_env,
+            donor_rooted.entry(),
+            &donor_env,
+        );
+        assert_eq!(target_env.uniforms, [r, a, b, c]);
     }
 
     #[test]

@@ -5,6 +5,17 @@
 and one composition site converted and measured (§2.1, §7). §5's first cost
 has its gate; the inlining rule (L4) waits on a kernel that composes
 identical referents, because §7 found the glyph is not one.
+
+**Amended 2026-10-01: a reference is an optimization unit**
+([the-language-is-kernel](2026-09-25-the-language-is-kernel.md) §4, O1,
+answered yes by JP). The runtime tier saturates and extracts a referent by
+itself, holds it in the referring term as an opaque leaf carrying its
+variance, and links the optimized body back in after extraction
+(`passes::link`, `pixelflow_search::runtime`). The title still holds — the
+linker only inlines; what it inlines is now each body as optimized — and
+L4 is not built: under O1 no rule opens a unit, so inline-or-call is not a
+choice the e-graph makes. Whether a unit is emitted inline or called is
+C1's measurement there, which is §5.2's question.
 **Author:** JP (the framing and both design decisions), Claude (draft)
 **Supersedes the framing of:**
 [2026-09-09-the-graph-differentiates.md](2026-09-09-the-graph-differentiates.md)
@@ -53,9 +64,11 @@ are the same kind of thing.
 ## 2. Identity is the compile cache's key, and they are not two things
 
 **Decision (JP, 2026-09-09).** A referent is named the way `jit_cache` names
-one: `canonical(arena, root)` walks the reachable subgraph in ascending id
-order, remaps children densely, and encodes each node — a structural content
-hash. Two kernels with that key are the same kernel.
+one: `canonical(arena, root)` (`pixelflow-ir/src/key.rs`) walks the
+reachable subgraph in post-order from the root, hash-consing structurally
+equal subterms, and encodes each node — a structural content hash that does
+not depend on the order the arena was built in. Two kernels with that key are
+the same kernel.
 
 So one content-addressed store serves three purposes that are currently
 three mechanisms:
@@ -337,6 +350,11 @@ construction:
 
 The same pattern as `Select`/`Guard` and `Reduce`/loop: equivalent forms in
 the graph, priced by extraction.
+
+> **2026-10-05:** the `Guard { mask, on, off }` node this section cites as
+> precedent was retired (nothing produced it, and its emitter equalled `If`
+> only for a batch-uniform mask; commits "retire the guard-arm scope", "retire ExprNode::Guard"). The `Apply` design does not
+> depend on it: `KernelKey` stays, as `Ref` still names a kernel by it.
 
 ### What this reorders
 

@@ -2,9 +2,6 @@
 //!
 //! The shared Intermediate Representation (IR).
 //!
-//! - **Traits**: `Op` trait defines behavior, `EmitStyle` for codegen.
-//! - **Ops**: Unit structs (`Add`, `Mul`) implement `Op`.
-//!
 //! A SIMD backend abstraction (`Backend`/`SimdOps`) lived here, then moved to
 //! `pixelflow-core` on 2026-08-02 (it was not IR and not codegen — it lived
 //! beside `Field`, which it backed). It backed a per-batch "combinator"
@@ -32,16 +29,17 @@ extern crate alloc;
 pub mod dyadic;
 
 /// What a bounded reduction *is*: the algebra it folds under, the index it
-/// binds, and the range that index runs over. See the module docs for why
+/// binds, and the domain that index runs over. See the module docs for why
 /// those are a type rather than three `Const` children.
 pub mod fold;
-pub use fold::{Binder, Fold, Monoid};
+pub use fold::{Binder, Fold, Monoid, Placeholder};
 
 pub mod kind;
-pub mod traits;
+pub mod library;
+
 pub mod variance;
 
-pub use variance::{LatticeShape, Variance, compute_dag_variance};
+pub use variance::{LatticeShape, Variance};
 
 pub mod arena;
 
@@ -115,15 +113,11 @@ pub use term::{Children, Ir, Shape};
 pub mod optimize;
 pub use optimize::{Identity, Optimize, Rewritten, Then};
 
-pub mod binding;
-pub use binding::{BindError, BindingTable};
-
 pub mod kernel;
-pub use kernel::{Bits, Kernel, Scalar, Uniform};
+pub use kernel::{Bits, Kernel, Uniform};
 
 pub use kind::OpKind;
 pub use kind::known_method_names;
-pub use traits::EmitStyle;
 
 /// Fixture builders for this crate's own `benches/`/`tests/` binaries and
 /// one `pixelflow-search` unit test — the only callers still allowed to

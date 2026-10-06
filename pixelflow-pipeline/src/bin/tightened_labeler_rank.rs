@@ -445,7 +445,7 @@ fn main() {
 
         rows.push(ExprRow {
             name: name.clone(),
-            node_count: arena.nodes_raw().len(),
+            node_count: arena.len(),
             total_applications,
             loose_lb: loose.load_bearing.len() as u64,
             tight_lb: tight.load_bearing.len() as u64,

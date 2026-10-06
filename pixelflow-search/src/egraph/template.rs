@@ -73,11 +73,7 @@ fn match_root(
         | ExprData::Buffer(_)
         | ExprData::Uniform(_)
         | ExprData::Ref(_)
-        | ExprData::Reduce(_)
-        // No rule this harness generates ever writes a `Guard` into a
-        // pattern — the e-graph declines one on `insert` (G1), so nothing
-        // could ever have matched here in the first place.
-        | ExprData::Guard { .. } => false,
+        | ExprData::Reduce(_) => false,
         ExprData::Op(_) => match_op(egraph, pat, node, bindings),
     }
 }
@@ -96,8 +92,7 @@ fn match_class(
         | ExprData::Buffer(_)
         | ExprData::Uniform(_)
         | ExprData::Ref(_)
-        | ExprData::Reduce(_)
-        | ExprData::Guard { .. } => false,
+        | ExprData::Reduce(_) => false,
         ExprData::Op(_) => {
             for node in egraph.nodes(class) {
                 let mut trial = bindings.clone();
@@ -152,7 +147,7 @@ fn collect_metavars(node: Node<'_, ExprData>, out: &mut std::collections::BTreeS
         | ExprData::Buffer(_)
         | ExprData::Uniform(_)
         | ExprData::Ref(_) => {}
-        ExprData::Reduce(_) | ExprData::Op(_) | ExprData::Guard { .. } => {
+        ExprData::Reduce(_) | ExprData::Op(_) => {
             for c in node.children() {
                 collect_metavars(c, out);
             }
@@ -163,7 +158,7 @@ fn collect_metavars(node: Node<'_, ExprData>, out: &mut std::collections::BTreeS
 fn collect_metavars_arena(arena: &ExprArena, id: ExprId, out: &mut std::collections::BTreeSet<u8>) {
     match arena.node(id) {
         pixelflow_ir::arena::ExprNode::Var(mv) => {
-            out.insert(*mv);
+            out.insert(mv);
         }
         pixelflow_ir::arena::ExprNode::Const(_)
         | pixelflow_ir::arena::ExprNode::Param(_)
@@ -384,9 +379,9 @@ fn occurs(arena: &ExprArena, mv: u8, id: ExprId, subst: &BTreeMap<u8, ExprId>, d
     }
     match arena.node(id) {
         ExprNode::Var(v) => {
-            *v == mv
+            v == mv
                 || subst
-                    .get(v)
+                    .get(&v)
                     .is_some_and(|&t| occurs(arena, mv, t, subst, depth + 1))
         }
         ExprNode::Const(_) | ExprNode::Param(_) | ExprNode::Buffer(_) | ExprNode::Uniform(_) => {
@@ -401,7 +396,7 @@ fn occurs(arena: &ExprArena, mv: u8, id: ExprId, subst: &BTreeMap<u8, ExprId>, d
 fn resolve(arena: &ExprArena, id: ExprId, subst: &BTreeMap<u8, ExprId>) -> ExprId {
     let mut cur = id;
     while let ExprNode::Var(v) = arena.node(cur) {
-        match subst.get(v) {
+        match subst.get(&v) {
             Some(&t) => cur = t,
             None => break,
         }
@@ -418,7 +413,6 @@ fn unify(arena: &ExprArena, x: ExprId, y: ExprId, subst: &mut BTreeMap<u8, ExprI
     match (arena.node(x), arena.node(y)) {
         (ExprNode::Var(a), ExprNode::Var(b)) if a == b => true,
         (ExprNode::Var(a), _) => {
-            let a = *a;
             if occurs(arena, a, y, subst, 0) {
                 return false;
             }
@@ -426,7 +420,6 @@ fn unify(arena: &ExprArena, x: ExprId, y: ExprId, subst: &mut BTreeMap<u8, ExprI
             true
         }
         (_, ExprNode::Var(b)) => {
-            let b = *b;
             if occurs(arena, b, x, subst, 0) {
                 return false;
             }

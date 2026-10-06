@@ -39,7 +39,7 @@ pub struct CollapseKernel {
     ///
     /// This is not cosmetic: collapse cost is *not* independent of a
     /// buffer's values. `emit_skip_if_all_false`/`emit_skip_if_all_true`
-    /// (`pixelflow-codegen/src/emit/mod.rs`) branch on a `Select` guard's
+    /// (`pixelflow-codegen/src/emit/mod.rs`) branch on an `If` guard's
     /// mask at runtime, and a zero-filled piece table makes a glyph's every
     /// crossing-span mask uniformly false — the guard skips an arm
     /// production always takes. Replaying zeros here measures that skipped
@@ -102,7 +102,7 @@ impl Trips {
 // v3 carried a buffer's *shape* only; replay bound every declared buffer to
 // zeros (`dummy_context`) on the premise that "collapse cost depends on the
 // arena's shape, not the buffer's values." That premise was false: a
-// `Select` guard's runtime skip (`emit_skip_if_all_false`/`_all_true` in
+// `If` guard's runtime skip (`emit_skip_if_all_false`/`_all_true` in
 // `pixelflow-codegen/src/emit/mod.rs`) branches on whether any lane's mask
 // is set, which is a fact about the *data*, not the shape. A zero-filled
 // piece table makes every one of a glyph's crossing-span masks uniformly
@@ -176,7 +176,7 @@ pub fn encode(kernel: &CollapseKernel) -> String {
     use std::fmt::Write as _;
 
     let (arena, root) = (&kernel.arena, kernel.root);
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut reachable = vec![false; len];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -220,7 +220,7 @@ pub fn encode(kernel: &CollapseKernel) -> String {
             // The Z axis used to serve that role; it was the same thing
             // wearing a coordinate's name.
             ExprNode::Uniform(u) => {
-                writeln!(out, "A {}", arena.uniform_decl(*u).default.to_bits())
+                writeln!(out, "A {}", arena.uniform_decl(u).default.to_bits())
             }
             ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
             // A declared buffer slot. `id.0` is the *arena's* slot index, not
@@ -232,34 +232,33 @@ pub fn encode(kernel: &CollapseKernel) -> String {
             // shape (`ExprArena::buffers().len()`, and with it every
             // `Uniform`'s context slot).
             ExprNode::Buffer(id) => {
-                let decl = arena.buffer_decl(*id);
+                let decl = arena.buffer_decl(id);
                 writeln!(out, "B {} {} {}", id.0, decl.width, decl.height).expect("fmt");
                 // Only the first occurrence of this slot writes its data —
                 // see `buffer_data_emitted` above.
                 if buffer_data_emitted.insert(id.0) {
-                    write_buffer_data(&mut out, kernel, *id);
+                    write_buffer_data(&mut out, kernel, id);
                 }
                 Ok(())
             }
-            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, *a)),
+            ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, a)),
             ExprNode::Binary(k, a, b) => {
-                writeln!(out, "Bi {k:?} {} {}", d(&dense, *a), d(&dense, *b))
+                writeln!(out, "Bi {k:?} {} {}", d(&dense, a), d(&dense, b))
             }
             ExprNode::Ternary(k, a, b, c) => writeln!(
                 out,
                 "T {k:?} {} {} {}",
-                d(&dense, *a),
-                d(&dense, *b),
-                d(&dense, *c)
+                d(&dense, a),
+                d(&dense, b),
+                d(&dense, c)
             ),
             // An n-ary node — in practice `Reduce`, the winding fold's
             // binder: `[Const(combiner), Const(reduce_var), Const(extent),
             // body]`. The three `Const` children round trip through the `C`
             // arm above like any other constant; this arm only has to spell
             // the child list itself, whatever its length.
-            ExprNode::Nary(k, start, count) => {
-                let children = arena.nary_children_slice(*start, *count);
-                let ids: Vec<u32> = children.iter().map(|c| d(&dense, *c)).collect();
+            ExprNode::Nary(k, ..) => {
+                let ids: Vec<u32> = arena.children(id).map(|c| d(&dense, c)).collect();
                 write!(out, "N {k:?}").expect("fmt");
                 for id in ids {
                     write!(out, " {id}").expect("fmt");
@@ -269,7 +268,7 @@ pub fn encode(kernel: &CollapseKernel) -> String {
             // The fold as opaque bits — it is metadata, not children, so it
             // travels as one field rather than as three serialized nodes.
             ExprNode::Reduce { fold, body } => {
-                writeln!(out, "R {} {}", fold.to_bits(), d(&dense, *body))
+                writeln!(out, "R {} {}", fold.to_bits(), d(&dense, body))
             }
             ExprNode::Param(i) => panic!(
                 "{}: corpus kernels must be bakeable, but this one holds Param({i}) — a \
@@ -281,15 +280,6 @@ pub fn encode(kernel: &CollapseKernel) -> String {
             ExprNode::Ref(k) => panic!(
                 "{}: corpus kernels must be self-contained, but this one holds Ref({k:?}) — \
                  a name for a kernel interned in this process only",
-                kernel.name
-            ),
-            // Same reasoning as `Ref`: `on`/`off` name kernels in this
-            // process's `KernelStore` too, and nothing produces a `Guard`
-            // for a corpus kernel to hold yet (G1: never chosen).
-            ExprNode::Guard { mask: _, on, off } => panic!(
-                "{}: corpus kernels must be self-contained, but this one holds \
-                 Guard(on={on:?}, off={off:?}) — names for kernels interned in this \
-                 process only",
                 kernel.name
             ),
             // A corpus kernel is pre-legalize by construction; a store is
@@ -840,7 +830,7 @@ mod tests {
 
         // The buffer's actual contents, not just its shape, survive the
         // round trip exactly — bit for bit, since these values decide the
-        // guard masks a `Select` skips or takes at runtime.
+        // guard masks an `If` skips or takes at runtime.
         let decoded_data = decoded.buffer_data[0]
             .as_ref()
             .expect("captured buffer contents must survive the round trip, not decode to None");

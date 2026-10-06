@@ -18,7 +18,6 @@
 //! - [`graph`]: The EGraph itself
 //! - `growth` (feature `saturation-telemetry`): per-application growth
 //!   telemetry — how many e-nodes/e-classes a rewrite actually added
-//! - [`deps`]: Dependency analysis for uniform hoisting
 //!
 //! Mathematical rewrite rules are now in the [`crate::math`] module.
 //!
@@ -30,7 +29,6 @@
 pub mod anytime;
 pub mod candidate;
 pub(crate) mod cost;
-pub mod deps;
 pub mod derivative;
 pub(crate) mod extract;
 pub mod fold_rules;
@@ -73,7 +71,6 @@ pub use candidate::{
     REGISTERED_PRIMARY_BUDGET_APPLICATIONS,
 };
 pub use cost::{CostFunction, CostModel};
-pub use deps::{Deps, DepsAnalysis};
 pub use derivative::{ChainRule, derivative_rules};
 pub use extract::{
     ChoiceCost, ClaimAudit, CostScale, ExtractedDAG, Extraction, ExtractionObjective,
@@ -81,7 +78,7 @@ pub use extract::{
     build_extracted_dag_from_choices, choices_to_arena, compute_ref_counts, cost_of_choices,
     extract, extract_dag,
 };
-pub use fold_rules::{EmptyFold, HalveFold, PeelFold, fold_rules};
+pub use fold_rules::{EmptyFold, FactorFold, HalveFold, PeelFold, fold_rules};
 pub use graph::{
     ApplicationMask, ApplyResult, EGraph, EGraphBatch, HARD_CLASS_LIMIT, MaskScope, RewriteTarget,
     SaturationStats, SaturationStop, ScanStop,
@@ -104,10 +101,10 @@ pub use provenance::{
 pub use rewrite::{Rewrite, RewriteAction, TemplateArena, TemplatePattern};
 pub use rules::{Fingerprint, RuleId, RuleSet, rule_label};
 pub use saturate::{
-    APPLICATIONS_PER_CLASS, CLASSICAL_CLASS_CEILING, CLASSICAL_CLASS_CEILING_CALIBRATED,
-    CLASSICAL_CLASS_FLOOR, CLASSICAL_CLASSES_PER_INSERTED_CLASS, InputSize, SaturationConfig,
-    SaturationResult, achievable_cost_within_budget, config_for_input, config_for_node_count,
-    saturate_with_budget, saturate_with_full_budget,
+    APPLICATIONS_PER_CLASS, CLASSICAL_CLASS_CEILING, CLASSICAL_CLASS_FLOOR,
+    CLASSICAL_CLASSES_PER_INSERTED_CLASS, InputSize, SaturationConfig, SaturationResult,
+    achievable_cost_within_budget, config_for_input, config_for_node_count, saturate_with_budget,
+    saturate_with_full_budget,
 };
 pub use template::TemplateRewrite;
 
@@ -139,12 +136,10 @@ pub use crate::math::{
     // Rule collections
     all_math_rules,
     basic_algebra_rules,
-    core_rules,
     exp_rules,
     fusion_rules,
     inverse_pair_rules,
     parity_rules,
-    transcendental_rules,
     trig_rules,
 };
 

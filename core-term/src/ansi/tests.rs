@@ -6,15 +6,45 @@
 // Corrected imports using commands submodule path
 use super::{
     commands::{AnsiCommand, Attribute, C0Control, CsiCommand, EscCommand},
-    AnsiParser, AnsiProcessor,
+    AnsiParser, AnsiProcessor, AnsiSink,
 };
 use crate::color::{Color, NamedColor};
 use test_log::test; // Ensure test_log is a dev-dependency for log capturing in tests
 
+/// One element of what a batch delivers: a character of its text, or a
+/// command. Text arrives in runs; recording it per character keeps the
+/// expectations independent of where runs are split.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum Parsed {
+    Char(char),
+    Command(AnsiCommand),
+}
+
+pub(super) use Parsed::{Char, Command};
+
+/// Reads a batch the way the emulator does — through `AnsiSink`.
+struct Record(Vec<Parsed>);
+
+impl AnsiSink for Record {
+    fn text(&mut self, run: &str) {
+        self.0.extend(run.chars().map(Char));
+    }
+
+    fn command(&mut self, command: AnsiCommand) {
+        self.0.push(Command(command));
+    }
+}
+
+/// Feeds `bytes` to `processor` and returns what the emulator would receive.
+pub(super) fn parse(processor: &mut AnsiProcessor, bytes: &[u8]) -> Vec<Parsed> {
+    let mut sink = Record(Vec::new());
+    processor.process_bytes(bytes).drain_into(&mut sink);
+    sink.0
+}
+
 // Helper function to process bytes and get commands
-fn process_bytes(bytes: &[u8]) -> Vec<AnsiCommand> {
-    let mut processor = AnsiProcessor::new();
-    processor.process_bytes(bytes)
+fn process_bytes(bytes: &[u8]) -> Vec<Parsed> {
+    parse(&mut AnsiProcessor::new(), bytes)
 }
 
 #[test]
@@ -24,19 +54,19 @@ fn it_should_process_a_simple_printable_string() {
     assert_eq!(
         commands,
         vec![
-            AnsiCommand::Print('H'),
-            AnsiCommand::Print('e'),
-            AnsiCommand::Print('l'),
-            AnsiCommand::Print('l'),
-            AnsiCommand::Print('o'),
-            AnsiCommand::Print(','),
-            AnsiCommand::Print(' '),
-            AnsiCommand::Print('w'),
-            AnsiCommand::Print('o'),
-            AnsiCommand::Print('r'),
-            AnsiCommand::Print('l'),
-            AnsiCommand::Print('d'),
-            AnsiCommand::Print('!'),
+            Char('H'),
+            Char('e'),
+            Char('l'),
+            Char('l'),
+            Char('o'),
+            Char(','),
+            Char(' '),
+            Char('w'),
+            Char('o'),
+            Char('r'),
+            Char('l'),
+            Char('d'),
+            Char('!'),
         ]
     );
 }
@@ -45,7 +75,10 @@ fn it_should_process_a_simple_printable_string() {
 fn it_should_process_c0_bel() {
     let bytes = b"\x07"; // BEL
     let commands = process_bytes(bytes);
-    assert_eq!(commands, vec![AnsiCommand::C0Control(C0Control::BEL)]);
+    assert_eq!(
+        commands,
+        vec![Command(AnsiCommand::C0Control(C0Control::BEL))]
+    );
 }
 
 #[test]
@@ -125,7 +158,7 @@ fn it_should_process_csi_h_as_cup_1_1() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Csi(CsiCommand::CursorPosition(1, 1))]
+        vec![Command(AnsiCommand::Csi(CsiCommand::CursorPosition(1, 1)))]
     );
 }
 
@@ -135,9 +168,9 @@ fn it_should_process_csi_sgr_reset() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-            Attribute::Reset
-        ]))]
+        vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+            vec![Attribute::Reset]
+        )))]
     );
 }
 
@@ -147,9 +180,9 @@ fn it_should_process_csi_sgr_set_foreground() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-            Attribute::Foreground(Color::Named(NamedColor::Blue))
-        ]))]
+        vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+            vec![Attribute::Foreground(Color::Named(NamedColor::Blue))]
+        )))]
     );
 }
 
@@ -159,7 +192,7 @@ fn it_should_process_dec_private_mode_reset_12_att610_cursor_blink() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Csi(CsiCommand::ResetModePrivate(12))],
+        vec![Command(AnsiCommand::Csi(CsiCommand::ResetModePrivate(12)))],
         "Expected ResetModePrivate(12) for CSI ?12l"
     );
 }
@@ -170,7 +203,7 @@ fn it_should_process_dec_private_mode_set_25_text_cursor_enable() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Csi(CsiCommand::SetModePrivate(25))],
+        vec![Command(AnsiCommand::Csi(CsiCommand::SetModePrivate(25)))],
         "Expected SetModePrivate(25) for CSI ?25h"
     );
 }
@@ -181,7 +214,7 @@ fn it_should_process_dec_private_mode_reset_25_text_cursor_enable() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Csi(CsiCommand::ResetModePrivate(25))],
+        vec![Command(AnsiCommand::Csi(CsiCommand::ResetModePrivate(25)))],
         "Expected ResetModePrivate(25) for CSI ?25l"
     );
 }
@@ -209,7 +242,9 @@ fn it_should_process_various_dec_private_mouse_modes() {
         let set_commands = process_bytes(set_seq);
         assert_eq!(
             set_commands,
-            vec![AnsiCommand::Csi(CsiCommand::SetModePrivate(mode_num))],
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetModePrivate(
+                mode_num
+            )))],
             "Expected SetModePrivate({}) for {:?}",
             mode_num,
             String::from_utf8_lossy(set_seq)
@@ -217,7 +252,9 @@ fn it_should_process_various_dec_private_mouse_modes() {
         let reset_commands = process_bytes(reset_seq);
         assert_eq!(
             reset_commands,
-            vec![AnsiCommand::Csi(CsiCommand::ResetModePrivate(mode_num))],
+            vec![Command(AnsiCommand::Csi(CsiCommand::ResetModePrivate(
+                mode_num
+            )))],
             "Expected ResetModePrivate({}) for {:?}",
             mode_num,
             String::from_utf8_lossy(reset_seq)
@@ -231,7 +268,7 @@ fn it_should_process_dec_private_mode_bracketed_paste_2004() {
     let commands_set = process_bytes(bytes_set);
     assert_eq!(
         commands_set,
-        vec![AnsiCommand::Csi(CsiCommand::SetModePrivate(2004))],
+        vec![Command(AnsiCommand::Csi(CsiCommand::SetModePrivate(2004)))],
         "Expected SetModePrivate(2004) for CSI ?2004h"
     );
 
@@ -239,7 +276,9 @@ fn it_should_process_dec_private_mode_bracketed_paste_2004() {
     let commands_reset = process_bytes(bytes_reset);
     assert_eq!(
         commands_reset,
-        vec![AnsiCommand::Csi(CsiCommand::ResetModePrivate(2004))],
+        vec![Command(AnsiCommand::Csi(CsiCommand::ResetModePrivate(
+            2004
+        )))],
         "Expected ResetModePrivate(2004) for CSI ?2004l"
     );
 }
@@ -250,7 +289,7 @@ fn it_should_process_dec_private_mode_focus_event_1004() {
     let commands_set = process_bytes(bytes_set);
     assert_eq!(
         commands_set,
-        vec![AnsiCommand::Csi(CsiCommand::SetModePrivate(1004))],
+        vec![Command(AnsiCommand::Csi(CsiCommand::SetModePrivate(1004)))],
         "Expected SetModePrivate(1004) for CSI ?1004h"
     );
 
@@ -258,7 +297,9 @@ fn it_should_process_dec_private_mode_focus_event_1004() {
     let commands_reset = process_bytes(bytes_reset);
     assert_eq!(
         commands_reset,
-        vec![AnsiCommand::Csi(CsiCommand::ResetModePrivate(1004))],
+        vec![Command(AnsiCommand::Csi(CsiCommand::ResetModePrivate(
+            1004
+        )))],
         "Expected ResetModePrivate(1004) for CSI ?1004l"
     );
 }
@@ -269,7 +310,9 @@ fn it_should_process_dec_private_mode_uncommon_7727() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Csi(CsiCommand::ResetModePrivate(7727))],
+        vec![Command(AnsiCommand::Csi(CsiCommand::ResetModePrivate(
+            7727
+        )))],
         "Expected ResetModePrivate(7727) for CSI ?7727l"
     );
 }
@@ -280,7 +323,9 @@ fn it_should_process_csi_set_cursor_style_decscusr() {
     let commands_steady_block = process_bytes(bytes_steady_block);
     assert_eq!(
         commands_steady_block,
-        vec![AnsiCommand::Csi(CsiCommand::SetCursorStyle { shape: 2 })],
+        vec![Command(AnsiCommand::Csi(CsiCommand::SetCursorStyle {
+            shape: 2
+        }))],
         "Expected SetCursorStyle for CSI 2 SP q"
     );
 
@@ -288,7 +333,9 @@ fn it_should_process_csi_set_cursor_style_decscusr() {
     let commands_default_cursor = process_bytes(bytes_default_cursor);
     assert_eq!(
         commands_default_cursor,
-        vec![AnsiCommand::Csi(CsiCommand::SetCursorStyle { shape: 0 })],
+        vec![Command(AnsiCommand::Csi(CsiCommand::SetCursorStyle {
+            shape: 0
+        }))],
         "Expected SetCursorStyle for CSI 0 SP q"
     );
 
@@ -296,7 +343,9 @@ fn it_should_process_csi_set_cursor_style_decscusr() {
     let commands_blink_underline = process_bytes(bytes_blink_underline);
     assert_eq!(
         commands_blink_underline,
-        vec![AnsiCommand::Csi(CsiCommand::SetCursorStyle { shape: 3 })],
+        vec![Command(AnsiCommand::Csi(CsiCommand::SetCursorStyle {
+            shape: 3
+        }))],
         "Expected SetCursorStyle for CSI 3 SP q"
     );
 }
@@ -307,11 +356,11 @@ fn it_should_process_csi_window_manipulation_t() {
     let commands_23_0_0_t = process_bytes(bytes_23_0_0_t);
     assert_eq!(
         commands_23_0_0_t,
-        vec![AnsiCommand::Csi(CsiCommand::WindowManipulation {
+        vec![Command(AnsiCommand::Csi(CsiCommand::WindowManipulation {
             ps1: 23,
             ps2: Some(0),
             ps3: Some(0)
-        })],
+        }))],
         "Expected WindowManipulation for CSI 23;0;0t"
     );
 
@@ -319,11 +368,11 @@ fn it_should_process_csi_window_manipulation_t() {
     let commands_18_t = process_bytes(bytes_18_t);
     assert_eq!(
         commands_18_t,
-        vec![AnsiCommand::Csi(CsiCommand::WindowManipulation {
+        vec![Command(AnsiCommand::Csi(CsiCommand::WindowManipulation {
             ps1: 18,
             ps2: None,
             ps3: None
-        })],
+        }))],
         "Expected WindowManipulation for CSI 18t"
     );
 
@@ -331,11 +380,11 @@ fn it_should_process_csi_window_manipulation_t() {
     let commands_14_t = process_bytes(bytes_14_t);
     assert_eq!(
         commands_14_t,
-        vec![AnsiCommand::Csi(CsiCommand::WindowManipulation {
+        vec![Command(AnsiCommand::Csi(CsiCommand::WindowManipulation {
             ps1: 14,
             ps2: None,
             ps3: None
-        })],
+        }))],
         "Expected WindowManipulation for CSI 14t"
     );
 }
@@ -349,7 +398,7 @@ fn it_should_not_treat_a_t_with_other_intermediates_as_window_manipulation() {
     let commands = process_bytes(b"\x1b[1$t");
     assert_eq!(
         commands,
-        vec![AnsiCommand::Error(b't')],
+        vec![Command(AnsiCommand::Error(b't'))],
         "CSI 1 $ t should not be parsed as WindowManipulation"
     );
 }
@@ -359,11 +408,11 @@ fn it_should_process_csi_set_and_reset_mode() {
     // CSI 4 h -> SetMode(IRM), CSI 4 l -> ResetMode(IRM)
     assert_eq!(
         process_bytes(b"\x1b[4h"),
-        vec![AnsiCommand::Csi(CsiCommand::SetMode(4))]
+        vec![Command(AnsiCommand::Csi(CsiCommand::SetMode(4)))]
     );
     assert_eq!(
         process_bytes(b"\x1b[4l"),
-        vec![AnsiCommand::Csi(CsiCommand::ResetMode(4))]
+        vec![Command(AnsiCommand::Csi(CsiCommand::ResetMode(4)))]
     );
 }
 
@@ -373,19 +422,19 @@ fn it_should_process_csi_clear_tab_stops_via_g() {
     let commands = process_bytes(b"\x1b[3g");
     assert_eq!(
         commands,
-        vec![AnsiCommand::Csi(CsiCommand::ClearTabStops(3))]
+        vec![Command(AnsiCommand::Csi(CsiCommand::ClearTabStops(3)))]
     );
 }
 
 #[test]
 fn it_should_process_csi_sequence_fragmented_across_param_bytes() {
     let mut processor = AnsiProcessor::new();
-    let commands_frag1 = processor.process_bytes(b"\x1B[1");
+    let commands_frag1 = parse(&mut processor, b"\x1B[1");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC [ 1)");
-    let commands_frag2 = processor.process_bytes(b";2H");
+    let commands_frag2 = parse(&mut processor, b";2H");
     assert_eq!(
         commands_frag2,
-        vec![AnsiCommand::Csi(CsiCommand::CursorPosition(1, 2))],
+        vec![Command(AnsiCommand::Csi(CsiCommand::CursorPosition(1, 2)))],
         "After fragment 2 (;2H)"
     );
 }
@@ -393,12 +442,12 @@ fn it_should_process_csi_sequence_fragmented_across_param_bytes() {
 #[test]
 fn it_should_process_csi_sequence_fragmented_across_intermediate_bytes() {
     let mut processor = AnsiProcessor::new();
-    let commands_frag1 = processor.process_bytes(b"\x1B[?");
+    let commands_frag1 = parse(&mut processor, b"\x1B[?");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC [ ?)");
-    let commands_frag2 = processor.process_bytes(b"25h");
+    let commands_frag2 = parse(&mut processor, b"25h");
     assert_eq!(
         commands_frag2,
-        vec![AnsiCommand::Csi(CsiCommand::SetModePrivate(25))],
+        vec![Command(AnsiCommand::Csi(CsiCommand::SetModePrivate(25)))],
         "After fragment 2 (25h)"
     );
 }
@@ -406,12 +455,12 @@ fn it_should_process_csi_sequence_fragmented_across_intermediate_bytes() {
 #[test]
 fn it_should_process_csi_sequence_fragmented_after_esc() {
     let mut processor = AnsiProcessor::new();
-    let commands_frag1 = processor.process_bytes(b"\x1B");
+    let commands_frag1 = parse(&mut processor, b"\x1B");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC)");
-    let commands_frag2 = processor.process_bytes(b"[1A");
+    let commands_frag2 = parse(&mut processor, b"[1A");
     assert_eq!(
         commands_frag2,
-        vec![AnsiCommand::Csi(CsiCommand::CursorUp(1))],
+        vec![Command(AnsiCommand::Csi(CsiCommand::CursorUp(1)))],
         "After fragment 2 ([1A)"
     );
 }
@@ -419,34 +468,34 @@ fn it_should_process_csi_sequence_fragmented_after_esc() {
 #[test]
 fn it_should_process_string_interspersed_with_fragmented_csi() {
     let mut processor = AnsiProcessor::new();
-    let commands_frag1 = processor.process_bytes(b"Hello ");
+    let commands_frag1 = parse(&mut processor, b"Hello ");
     assert_eq!(
         commands_frag1,
         vec![
-            AnsiCommand::Print('H'),
-            AnsiCommand::Print('e'),
-            AnsiCommand::Print('l'),
-            AnsiCommand::Print('l'),
-            AnsiCommand::Print('o'),
-            AnsiCommand::Print(' '),
+            Char('H'),
+            Char('e'),
+            Char('l'),
+            Char('l'),
+            Char('o'),
+            Char(' '),
         ],
         "After fragment 1 (Hello )"
     );
-    let commands_frag2 = processor.process_bytes(b"\x1B[31");
+    let commands_frag2 = parse(&mut processor, b"\x1B[31");
     assert_eq!(commands_frag2, vec![], "After fragment 2 (ESC [ 31)");
-    let commands_frag3 = processor.process_bytes(b"m World");
+    let commands_frag3 = parse(&mut processor, b"m World");
     assert_eq!(
         commands_frag3,
         vec![
-            AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
+            Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
                 Attribute::Foreground(Color::Named(NamedColor::Red))
-            ])),
-            AnsiCommand::Print(' '),
-            AnsiCommand::Print('W'),
-            AnsiCommand::Print('o'),
-            AnsiCommand::Print('r'),
-            AnsiCommand::Print('l'),
-            AnsiCommand::Print('d'),
+            ]))),
+            Char(' '),
+            Char('W'),
+            Char('o'),
+            Char('r'),
+            Char('l'),
+            Char('d'),
         ],
         "After fragment 3 (m World)"
     );
@@ -458,39 +507,39 @@ fn it_should_handle_fragmented_utf8_input_with_intermediate_finalization() {
     // within its process_bytes) handles UTF-8 fragments delivered in separate calls.
     let mut processor_refined = AnsiProcessor::new();
     assert_eq!(
-        processor_refined.process_bytes(b"A"),
-        vec![AnsiCommand::Print('A')],
+        parse(&mut processor_refined, b"A"),
+        vec![Char('A')],
         "Refined Frag 0: Print 'A'"
     );
     // \xE4 is start of '你'. Since it's an incomplete sequence when process_bytes finishes, finalize() converts it.
     assert_eq!(
-        processor_refined.process_bytes(b"\xE4"),
-        vec![AnsiCommand::Print(char::REPLACEMENT_CHARACTER)],
+        parse(&mut processor_refined, b"\xE4"),
+        vec![Char(char::REPLACEMENT_CHARACTER)],
         "Refined Frag 1: Incomplete UTF-8 (E4) yields replacement char"
     );
     // \xBD is now treated as a new byte. It's an invalid UTF-8 start. finalize() converts it.
     assert_eq!(
-        processor_refined.process_bytes(b"\xBD"),
-        vec![AnsiCommand::Print(char::REPLACEMENT_CHARACTER)],
+        parse(&mut processor_refined, b"\xBD"),
+        vec![Char(char::REPLACEMENT_CHARACTER)],
         "Refined Frag 2: Invalid UTF-8 start (BD) yields replacement char"
     );
     // \xA0 is also an invalid UTF-8 start. finalize() converts it.
     assert_eq!(
-        processor_refined.process_bytes(b"\xA0"),
-        vec![AnsiCommand::Print(char::REPLACEMENT_CHARACTER)],
+        parse(&mut processor_refined, b"\xA0"),
+        vec![Char(char::REPLACEMENT_CHARACTER)],
         "Refined Frag 3: Invalid UTF-8 start (A0) yields replacement char"
     );
     assert_eq!(
-        processor_refined.process_bytes(b"B"),
-        vec![AnsiCommand::Print('B')],
+        parse(&mut processor_refined, b"B"),
+        vec![Char('B')],
         "Refined Frag 4: Print 'B'"
     );
 
     // For contrast, show how a complete multi-byte char is processed in one call
     let mut processor_complete = AnsiProcessor::new();
     assert_eq!(
-        processor_complete.process_bytes(b"\xE4\xBD\xA0"),
-        vec![AnsiCommand::Print('你')],
+        parse(&mut processor_complete, b"\xE4\xBD\xA0"),
+        vec![Char('你')],
         "Complete '你' in one call"
     );
 }
@@ -498,18 +547,18 @@ fn it_should_handle_fragmented_utf8_input_with_intermediate_finalization() {
 #[test]
 fn it_should_complete_csi_if_final_byte_arrives_after_params() {
     let mut processor = AnsiProcessor::new();
-    let commands_frag1 = processor.process_bytes(b"\x1B[31");
+    let commands_frag1 = parse(&mut processor, b"\x1B[31");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC [ 31)");
-    let commands_frag2 = processor.process_bytes(b"A");
+    let commands_frag2 = parse(&mut processor, b"A");
     assert_eq!(
         commands_frag2,
-        vec![AnsiCommand::Csi(CsiCommand::CursorUp(31))],
+        vec![Command(AnsiCommand::Csi(CsiCommand::CursorUp(31)))],
         "After fragment 2 (A)"
     );
-    let commands_frag3 = processor.process_bytes(b"BC");
+    let commands_frag3 = parse(&mut processor, b"BC");
     assert_eq!(
         commands_frag3,
-        vec![AnsiCommand::Print('B'), AnsiCommand::Print('C')],
+        vec![Char('B'), Char('C')],
         "After fragment 3 (BC)"
     );
 }
@@ -517,12 +566,12 @@ fn it_should_complete_csi_if_final_byte_arrives_after_params() {
 #[test]
 fn it_should_complete_osc_if_terminator_arrives_after_string_fragment() {
     let mut processor = AnsiProcessor::new();
-    let commands_frag1 = processor.process_bytes(b"\x1B]0;Ti");
+    let commands_frag1 = parse(&mut processor, b"\x1B]0;Ti");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC ] 0 ; Ti)");
-    let commands_frag2 = processor.process_bytes(b"tle\x07");
+    let commands_frag2 = parse(&mut processor, b"tle\x07");
     assert_eq!(
         commands_frag2,
-        vec![AnsiCommand::Osc(b"0;Title".to_vec())],
+        vec![Command(AnsiCommand::Osc(b"0;Title".to_vec()))],
         "After fragment 2 (tle BEL)"
     );
 }
@@ -530,12 +579,12 @@ fn it_should_complete_osc_if_terminator_arrives_after_string_fragment() {
 #[test]
 fn it_should_complete_dcs_if_terminator_arrives_after_string_fragment() {
     let mut processor = AnsiProcessor::new();
-    let commands_frag1 = processor.process_bytes(b"\x1BPSt");
+    let commands_frag1 = parse(&mut processor, b"\x1BPSt");
     assert_eq!(commands_frag1, vec![], "After fragment 1 (ESC P St)");
-    let commands_frag2 = processor.process_bytes(b"uff\x1B\\");
+    let commands_frag2 = parse(&mut processor, b"uff\x1B\\");
     assert_eq!(
         commands_frag2,
-        vec![AnsiCommand::Dcs(b"Stuff".to_vec())],
+        vec![Command(AnsiCommand::Dcs(b"Stuff".to_vec()))],
         "After fragment 2 (uff ESC \\)"
     );
 }
@@ -546,7 +595,10 @@ fn it_should_complete_dcs_if_terminator_arrives_after_string_fragment() {
 fn it_should_process_osc_string_terminated_by_bel() {
     let bytes = b"\x1B]0;Set Title\x07";
     let commands = process_bytes(bytes);
-    assert_eq!(commands, vec![AnsiCommand::Osc(b"0;Set Title".to_vec())]);
+    assert_eq!(
+        commands,
+        vec![Command(AnsiCommand::Osc(b"0;Set Title".to_vec()))]
+    );
 }
 
 #[test]
@@ -555,7 +607,7 @@ fn it_should_process_osc_string_terminated_by_st() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Osc(b"2;Another Title".to_vec())]
+        vec![Command(AnsiCommand::Osc(b"2;Another Title".to_vec()))]
     );
 }
 
@@ -563,14 +615,20 @@ fn it_should_process_osc_string_terminated_by_st() {
 fn it_should_process_dcs_string_terminated_by_st() {
     let bytes = b"\x1BP1;1$rText\x1B\\";
     let commands = process_bytes(bytes);
-    assert_eq!(commands, vec![AnsiCommand::Dcs(b"1;1$rText".to_vec())]);
+    assert_eq!(
+        commands,
+        vec![Command(AnsiCommand::Dcs(b"1;1$rText".to_vec()))]
+    );
 }
 
 #[test]
 fn it_should_process_pm_string_terminated_by_st() {
     let bytes = b"\x1B^Privacy Message\x1B\\";
     let commands = process_bytes(bytes);
-    assert_eq!(commands, vec![AnsiCommand::Pm(b"Privacy Message".to_vec())]);
+    assert_eq!(
+        commands,
+        vec![Command(AnsiCommand::Pm(b"Privacy Message".to_vec()))]
+    );
 }
 
 #[test]
@@ -579,7 +637,7 @@ fn it_should_process_apc_string_terminated_by_st() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Apc(b"Application Command".to_vec())]
+        vec![Command(AnsiCommand::Apc(b"Application Command".to_vec()))]
     );
 }
 
@@ -609,7 +667,7 @@ fn it_should_buffer_incomplete_csi_sequence() {
 fn it_should_process_csi_with_invalid_final_byte_as_error() {
     let bytes = b"\x1B[31a"; // 'a' is not a valid CSI final byte
     let commands = process_bytes(bytes);
-    assert_eq!(commands, vec![AnsiCommand::Error(b'a')]);
+    assert_eq!(commands, vec![Command(AnsiCommand::Error(b'a'))]);
 }
 
 #[test]
@@ -639,10 +697,10 @@ fn it_should_terminate_osc_on_bel_and_process_subsequent_chars() {
     assert_eq!(
         commands,
         vec![
-            AnsiCommand::Osc(b"0;String\x08with".to_vec()),
-            AnsiCommand::Print('B'),
-            AnsiCommand::Print('E'),
-            AnsiCommand::Print('L'),
+            Command(AnsiCommand::Osc(b"0;String\x08with".to_vec())),
+            Char('B'),
+            Char('E'),
+            Char('L'),
         ]
     );
 }
@@ -654,11 +712,11 @@ fn it_should_abort_osc_on_esc_and_process_subsequent_commands() {
     assert_eq!(
         commands,
         vec![
-            AnsiCommand::C0Control(C0Control::ESC),
-            AnsiCommand::C0Control(C0Control::BEL),
-            AnsiCommand::Print('B'),
-            AnsiCommand::Print('E'),
-            AnsiCommand::Print('L'),
+            Command(AnsiCommand::C0Control(C0Control::ESC)),
+            Command(AnsiCommand::C0Control(C0Control::BEL)),
+            Char('B'),
+            Char('E'),
+            Char('L'),
         ]
     );
 }
@@ -669,7 +727,7 @@ fn it_should_include_c0_controls_within_dcs_data() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Dcs(b"String\x08with\x0BC0".to_vec())]
+        vec![Command(AnsiCommand::Dcs(b"String\x08with\x0BC0".to_vec()))]
     );
 }
 
@@ -680,8 +738,8 @@ fn it_should_abort_dcs_on_esc_and_process_subsequent_st() {
     assert_eq!(
         commands,
         vec![
-            AnsiCommand::C0Control(C0Control::ESC),
-            AnsiCommand::StringTerminator,
+            Command(AnsiCommand::C0Control(C0Control::ESC)),
+            Command(AnsiCommand::StringTerminator),
         ]
     );
 }
@@ -690,13 +748,16 @@ fn it_should_abort_dcs_on_esc_and_process_subsequent_st() {
 fn it_should_not_process_st_in_ground_state() {
     let bytes_esc_st = b"\x1B\\"; // ST (ESC \)
     let commands_esc_st = process_bytes(bytes_esc_st);
-    assert_eq!(commands_esc_st, vec![AnsiCommand::StringTerminator]);
+    assert_eq!(
+        commands_esc_st,
+        vec![Command(AnsiCommand::StringTerminator)]
+    );
 
     let bytes_c1_st = b"\x9C"; // ST (C1 version)
     let commands_c1_st = process_bytes(bytes_c1_st);
     assert_eq!(
         commands_c1_st,
-        vec![AnsiCommand::Print(std::char::REPLACEMENT_CHARACTER)],
+        vec![Char(std::char::REPLACEMENT_CHARACTER)],
         "standalone C1 ST (0x9C) should print replacment"
     );
 }
@@ -707,9 +768,9 @@ fn it_should_abort_csi_on_esc_and_process_subsequent_csi() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-            Attribute::Italic
-        ]))]
+        vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+            vec![Attribute::Italic]
+        )))]
     );
 }
 
@@ -720,9 +781,9 @@ fn it_should_abort_csi_entry_on_esc_and_process_subsequent_csi() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-            Attribute::Italic
-        ]))]
+        vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+            vec![Attribute::Italic]
+        )))]
     );
 }
 
@@ -733,9 +794,9 @@ fn it_should_abort_csi_intermediate_on_esc_and_process_subsequent_csi() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-            Attribute::Italic
-        ]))]
+        vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+            vec![Attribute::Italic]
+        )))]
     );
 }
 
@@ -748,10 +809,7 @@ fn it_should_dispatch_non_esc_c0_control_received_in_csi_entry() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![
-            AnsiCommand::C0Control(C0Control::BEL),
-            AnsiCommand::Print('A')
-        ]
+        vec![Command(AnsiCommand::C0Control(C0Control::BEL)), Char('A')]
     );
 }
 
@@ -761,10 +819,7 @@ fn it_should_dispatch_non_esc_c0_control_received_in_csi_param() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![
-            AnsiCommand::C0Control(C0Control::BEL),
-            AnsiCommand::Print('A')
-        ]
+        vec![Command(AnsiCommand::C0Control(C0Control::BEL)), Char('A')]
     );
 }
 
@@ -774,10 +829,7 @@ fn it_should_dispatch_non_esc_c0_control_received_in_csi_intermediate() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![
-            AnsiCommand::C0Control(C0Control::BEL),
-            AnsiCommand::Print('A')
-        ]
+        vec![Command(AnsiCommand::C0Control(C0Control::BEL)), Char('A')]
     );
 }
 
@@ -787,7 +839,7 @@ fn it_should_report_error_for_unexpected_char_in_csi_entry() {
     // so it hits the CsiEntry fallback and is reported as an Error.
     let bytes = b"\x1B[:";
     let commands = process_bytes(bytes);
-    assert_eq!(commands, vec![AnsiCommand::Error(b':')]);
+    assert_eq!(commands, vec![Command(AnsiCommand::Error(b':'))]);
 }
 
 #[test]
@@ -802,11 +854,7 @@ fn it_should_discard_rest_of_malformed_csi_instead_of_printing_it() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![
-            AnsiCommand::Error(b':'),
-            AnsiCommand::Print('X'),
-            AnsiCommand::Print('Y')
-        ],
+        vec![Command(AnsiCommand::Error(b':')), Char('X'), Char('Y')],
         "the malformed sequence's tail must be discarded, not printed"
     );
 }
@@ -820,10 +868,10 @@ fn it_should_recover_to_ground_and_parse_the_next_csi_after_a_malformed_one() {
     assert_eq!(
         commands,
         vec![
-            AnsiCommand::Error(b':'),
-            AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
+            Command(AnsiCommand::Error(b':')),
+            Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
                 Attribute::Foreground(Color::Named(NamedColor::Red))
-            ])),
+            ]))),
         ]
     );
 }
@@ -837,8 +885,27 @@ fn it_should_abort_csi_ignore_on_esc_and_process_subsequent_csi() {
     assert_eq!(
         commands,
         vec![
-            AnsiCommand::Error(b':'),
-            AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![Attribute::Italic])),
+            Command(AnsiCommand::Error(b':')),
+            Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
+                Attribute::Italic
+            ]))),
+        ]
+    );
+}
+
+#[test]
+fn it_should_dispatch_non_esc_c0_control_received_while_discarding_a_malformed_csi() {
+    // A C0 control other than ESC, received while discarding a malformed
+    // CSI's tail, is dispatched as its own command (like the other CSI
+    // sub-states) rather than being swallowed as more garbage.
+    let bytes = b"\x1B[38:2\x07A";
+    let commands = process_bytes(bytes);
+    assert_eq!(
+        commands,
+        vec![
+            Command(AnsiCommand::Error(b':')),
+            Command(AnsiCommand::C0Control(C0Control::BEL)),
+            Char('A'),
         ]
     );
 }
@@ -851,7 +918,7 @@ fn it_should_stay_in_escape_state_on_repeated_esc() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Esc(EscCommand::ResetToInitialState)]
+        vec![Command(AnsiCommand::Esc(EscCommand::ResetToInitialState))]
     );
 }
 
@@ -864,7 +931,10 @@ fn it_should_ignore_invalid_esc_intermediate_charset_designator() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Ignore(b'('), AnsiCommand::Ignore(b' ')]
+        vec![
+            Command(AnsiCommand::Ignore(b'(')),
+            Command(AnsiCommand::Ignore(b' '))
+        ]
     );
 }
 
@@ -874,12 +944,16 @@ fn it_should_dispatch_non_esc_c0_control_received_in_escape_state() {
     // the pending escape sequence and is dispatched as its own command.
     let bytes = b"\x1B\x07"; // ESC BEL
     let commands = process_bytes(bytes);
-    assert_eq!(commands, vec![AnsiCommand::C0Control(C0Control::BEL)]);
+    assert_eq!(
+        commands,
+        vec![Command(AnsiCommand::C0Control(C0Control::BEL))]
+    );
 }
 
 #[cfg(test)]
 mod unicode_wide_tests {
-    use crate::ansi::{AnsiCommand, AnsiParser as AnsiParserTrait, AnsiProcessor}; // Use AnsiParser trait if needed, AnsiProcessor for instantiation
+    use super::{parse, Char, Command, Parsed};
+    use crate::ansi::{AnsiCommand, AnsiProcessor};
     use std::char; // For char::REPLACEMENT_CHARACTER
 
     // Import C0Control and EscCommand if they are used in expected AnsiCommand variants
@@ -900,9 +974,9 @@ mod unicode_wide_tests {
     const CHAR_C_BYTE: u8 = 0x63; // 'c' (used in RIS)
 
     // Helper function, assuming AnsiProcessor is the public API to test
-    fn process_bytes_unicode(bytes: &[u8]) -> Vec<AnsiCommand> {
+    fn process_bytes_unicode(bytes: &[u8]) -> Vec<Parsed> {
         let mut processor = AnsiProcessor::new();
-        processor.process_bytes(bytes)
+        parse(&mut processor, bytes)
     }
 
     #[test]
@@ -912,8 +986,8 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER),
-                AnsiCommand::Esc(EscCommand::ResetToInitialState), // Assuming from_esc maps 'c' to this
+                Char(char::REPLACEMENT_CHARACTER),
+                Command(AnsiCommand::Esc(EscCommand::ResetToInitialState)), // Assuming from_esc maps 'c' to this
             ],
             "ESC c (RIS) should be processed after UTF-8 interruption"
         );
@@ -926,9 +1000,9 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER),
-                AnsiCommand::C0Control(C0Control::BEL),
-                AnsiCommand::Print('A'),
+                Char(char::REPLACEMENT_CHARACTER),
+                Command(AnsiCommand::C0Control(C0Control::BEL)),
+                Char('A'),
             ],
             "BEL and char should be processed after UTF-8 interruption"
         );
@@ -940,7 +1014,7 @@ mod unicode_wide_tests {
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
             commands,
-            vec![AnsiCommand::Print('₄'), AnsiCommand::Print('B'),],
+            vec![Char('₄'), Char('B'),],
             "0xE2 0x82 0x84 should decode to '₄', not be interrupted by 0x84 as C1 IND"
         );
     }
@@ -962,19 +1036,18 @@ mod unicode_wide_tests {
         let commands = process_bytes_unicode(bytes);
 
         let mut expected_commands = vec![
-            AnsiCommand::Print(char::REPLACEMENT_CHARACTER), // For interrupted 0xE2
+            Char(char::REPLACEMENT_CHARACTER), // For interrupted 0xE2
         ];
         // Check how ESC 'A' is handled (assuming it's not a defined sequence, might print 'A')
-        if AnsiCommand::from_esc('A').is_none() {
-            expected_commands.push(AnsiCommand::Print('A'));
-        } else {
-            expected_commands.push(AnsiCommand::from_esc('A').unwrap());
+        match AnsiCommand::from_esc('A') {
+            None => expected_commands.push(Char('A')),
+            Some(command) => expected_commands.push(Command(command)),
         }
         expected_commands.extend(vec![
-            AnsiCommand::Print(char::REPLACEMENT_CHARACTER), // For interrupted 0xF0, 0x9F
-            AnsiCommand::C0Control(C0Control::BEL),
-            AnsiCommand::Print('¢'),
-            AnsiCommand::Esc(EscCommand::ResetToInitialState),
+            Char(char::REPLACEMENT_CHARACTER), // For interrupted 0xF0, 0x9F
+            Command(AnsiCommand::C0Control(C0Control::BEL)),
+            Char('¢'),
+            Command(AnsiCommand::Esc(EscCommand::ResetToInitialState)),
         ]);
         assert_eq!(commands, expected_commands);
     }
@@ -983,7 +1056,10 @@ mod unicode_wide_tests {
     fn it_should_process_bel_correctly() {
         let bytes = &[BEL_BYTE];
         let commands = process_bytes_unicode(bytes);
-        assert_eq!(commands, vec![AnsiCommand::C0Control(C0Control::BEL)]);
+        assert_eq!(
+            commands,
+            vec![Command(AnsiCommand::C0Control(C0Control::BEL))]
+        );
     }
 
     #[test]
@@ -992,7 +1068,7 @@ mod unicode_wide_tests {
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
             commands,
-            vec![AnsiCommand::Esc(EscCommand::ResetToInitialState)]
+            vec![Command(AnsiCommand::Esc(EscCommand::ResetToInitialState))]
         );
     }
 
@@ -1003,9 +1079,9 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER),
-                AnsiCommand::C0Control(C0Control::NUL),
-                AnsiCommand::Print('A'),
+                Char(char::REPLACEMENT_CHARACTER),
+                Command(AnsiCommand::C0Control(C0Control::NUL)),
+                Char('A'),
             ]
         );
     }
@@ -1017,9 +1093,9 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER),
-                AnsiCommand::C0Control(C0Control::ETX),
-                AnsiCommand::Esc(EscCommand::Index), // Assuming from_esc maps 'D' to Index
+                Char(char::REPLACEMENT_CHARACTER),
+                Command(AnsiCommand::C0Control(C0Control::ETX)),
+                Command(AnsiCommand::Esc(EscCommand::Index)), // Assuming from_esc maps 'D' to Index
             ]
         );
     }
@@ -1031,8 +1107,8 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print('\u{0080}'), // Valid UTF-8 for C1 PAD
-                AnsiCommand::Print('A'),
+                Char('\u{0080}'), // Valid UTF-8 for C1 PAD
+                Char('A'),
             ]
         );
     }
@@ -1044,10 +1120,10 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER),
+                Char(char::REPLACEMENT_CHARACTER),
                 // 0x9C (ST_C1_BYTE) is now ignored by process_byte_as_new_token
                 // after the UTF-8 sequence F0 9F 9C fails and 9C is reprocessed.
-                AnsiCommand::Print('A'),
+                Char('A'),
             ],
             "C1 ST (0x9C) after failed UTF-8 should be ignored, then 'A' printed"
         );
@@ -1060,8 +1136,8 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER),
-                AnsiCommand::Esc(EscCommand::ResetToInitialState),
+                Char(char::REPLACEMENT_CHARACTER),
+                Command(AnsiCommand::Esc(EscCommand::ResetToInitialState)),
             ]
         );
     }
@@ -1073,8 +1149,8 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER),
-                AnsiCommand::Esc(EscCommand::ResetToInitialState),
+                Char(char::REPLACEMENT_CHARACTER),
+                Command(AnsiCommand::Esc(EscCommand::ResetToInitialState)),
             ]
         );
     }
@@ -1086,8 +1162,8 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER),
-                AnsiCommand::Esc(EscCommand::ResetToInitialState),
+                Char(char::REPLACEMENT_CHARACTER),
+                Command(AnsiCommand::Esc(EscCommand::ResetToInitialState)),
             ]
         );
     }
@@ -1099,10 +1175,10 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER),
-                AnsiCommand::Esc(EscCommand::ReverseIndex), // Assuming from_esc maps 'M' to RI
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER),
-                AnsiCommand::C0Control(C0Control::BEL),
+                Char(char::REPLACEMENT_CHARACTER),
+                Command(AnsiCommand::Esc(EscCommand::ReverseIndex)), // Assuming from_esc maps 'M' to RI
+                Char(char::REPLACEMENT_CHARACTER),
+                Command(AnsiCommand::C0Control(C0Control::BEL)),
             ]
         );
     }
@@ -1114,9 +1190,9 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER), // For 0xE2 + 0x41 attempt
-                AnsiCommand::Print('A'),
-                AnsiCommand::Print('B'),
+                Char(char::REPLACEMENT_CHARACTER), // For 0xE2 + 0x41 attempt
+                Char('A'),
+                Char('B'),
             ]
         );
     }
@@ -1128,8 +1204,8 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER),
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER),
+                Char(char::REPLACEMENT_CHARACTER),
+                Char(char::REPLACEMENT_CHARACTER),
             ]
         );
     }
@@ -1138,10 +1214,7 @@ mod unicode_wide_tests {
     fn it_should_replace_incomplete_3_of_4_byte_utf8_at_stream_end() {
         let bytes = &[0xF0, 0x9F, 0x98]; // Incomplete '😀'
         let commands = process_bytes_unicode(bytes);
-        assert_eq!(
-            commands,
-            vec![AnsiCommand::Print(char::REPLACEMENT_CHARACTER),]
-        );
+        assert_eq!(commands, vec![Char(char::REPLACEMENT_CHARACTER),]);
     }
 
     #[test]
@@ -1151,9 +1224,9 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER),
-                AnsiCommand::C0Control(C0Control::DEL),
-                AnsiCommand::Print('A'),
+                Char(char::REPLACEMENT_CHARACTER),
+                Command(AnsiCommand::C0Control(C0Control::DEL)),
+                Char('A'),
             ]
         );
     }
@@ -1164,11 +1237,7 @@ mod unicode_wide_tests {
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
             commands,
-            vec![
-                AnsiCommand::Print('A'),
-                AnsiCommand::Print(std::char::REPLACEMENT_CHARACTER),
-                AnsiCommand::Print('B'),
-            ],
+            vec![Char('A'), Char(std::char::REPLACEMENT_CHARACTER), Char('B'),],
             "C1 NEL (0x84) should be ignored between A and B"
         );
     }
@@ -1180,9 +1249,9 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER), // For the invalid E2 84 41 sequence
+                Char(char::REPLACEMENT_CHARACTER), // For the invalid E2 84 41 sequence
 
-                AnsiCommand::Print('A'),
+                Char('A'),
             ],
             "0x84, when consumed by Utf8Decoder as part of an invalid sequence, should lead to REPLACEMENT_CHARACTER for the sequence, then 'A'"
         );
@@ -1195,8 +1264,8 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print(char::REPLACEMENT_CHARACTER), // For the invalid F0 9F 84 41 sequence
-                AnsiCommand::Print('A'),
+                Char(char::REPLACEMENT_CHARACTER), // For the invalid F0 9F 84 41 sequence
+                Char('A'),
             ],
             "0x84, when consumed by Utf8Decoder as part of an invalid 4-byte sequence, should lead to REPLACEMENT_CHARACTER, then 'A'"
         );
@@ -1208,7 +1277,7 @@ mod unicode_wide_tests {
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
             commands,
-            vec![AnsiCommand::Print('€'), AnsiCommand::Print('A'),],
+            vec![Char('€'), Char('A'),],
             "Euro sign (E2 82 AC) should decode correctly, followed by A"
         );
     }
@@ -1219,11 +1288,7 @@ mod unicode_wide_tests {
         let commands = process_bytes_unicode(bytes);
         assert_eq!(
             commands,
-            vec![
-                AnsiCommand::Print('€'),
-                AnsiCommand::Print(std::char::REPLACEMENT_CHARACTER),
-                AnsiCommand::Print('A'),
-            ],
+            vec![Char('€'), Char(std::char::REPLACEMENT_CHARACTER), Char('A'),],
             "C1 IND (0x85) should be ignored after €"
         );
     }
@@ -1235,10 +1300,10 @@ mod unicode_wide_tests {
         assert_eq!(
             commands,
             vec![
-                AnsiCommand::Print('A'),
-                AnsiCommand::Print(std::char::REPLACEMENT_CHARACTER),
-                AnsiCommand::Print(std::char::REPLACEMENT_CHARACTER),
-                AnsiCommand::Print('B'),
+                Char('A'),
+                Char(std::char::REPLACEMENT_CHARACTER),
+                Char(std::char::REPLACEMENT_CHARACTER),
+                Char('B'),
             ],
             "Sequence of C1 controls (0x84, 0x85) should be ignored"
         );
@@ -1251,7 +1316,7 @@ fn it_should_handle_esc_k_screen_title_sequence() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Apc(b"ls".to_vec())],
+        vec![Command(AnsiCommand::Apc(b"ls".to_vec()))],
         "ESC k (screen title sequence) should consume title text and not print it"
     );
 }
@@ -1262,7 +1327,7 @@ fn it_should_handle_esc_k_with_empty_title() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Apc(b"".to_vec())],
+        vec![Command(AnsiCommand::Apc(b"".to_vec()))],
         "ESC k with empty title should produce empty Apc command"
     );
 }
@@ -1273,7 +1338,7 @@ fn it_should_handle_esc_k_with_longer_title() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Apc(b"vim ~/.bashrc".to_vec())],
+        vec![Command(AnsiCommand::Apc(b"vim ~/.bashrc".to_vec()))],
         "ESC k with longer title should consume all text until ST"
     );
 }
@@ -1285,18 +1350,18 @@ fn it_should_handle_text_before_and_after_esc_k_sequence() {
     assert_eq!(
         commands,
         vec![
-            AnsiCommand::Print('B'),
-            AnsiCommand::Print('e'),
-            AnsiCommand::Print('f'),
-            AnsiCommand::Print('o'),
-            AnsiCommand::Print('r'),
-            AnsiCommand::Print('e'),
-            AnsiCommand::Apc(b"ls".to_vec()),
-            AnsiCommand::Print('A'),
-            AnsiCommand::Print('f'),
-            AnsiCommand::Print('t'),
-            AnsiCommand::Print('e'),
-            AnsiCommand::Print('r'),
+            Char('B'),
+            Char('e'),
+            Char('f'),
+            Char('o'),
+            Char('r'),
+            Char('e'),
+            Command(AnsiCommand::Apc(b"ls".to_vec())),
+            Char('A'),
+            Char('f'),
+            Char('t'),
+            Char('e'),
+            Char('r'),
         ],
         "Text before and after ESC k sequence should print correctly, title should be consumed"
     );
@@ -1311,7 +1376,9 @@ fn it_should_process_esc_open_paren_b_usascii_charset() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Esc(EscCommand::SelectCharacterSet('(', 'B'))],
+        vec![Command(AnsiCommand::Esc(EscCommand::SelectCharacterSet(
+            '(', 'B'
+        )))],
         "ESC ( B should select US ASCII charset"
     );
 }
@@ -1323,7 +1390,9 @@ fn it_should_process_esc_open_paren_0_dec_graphics_charset() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Esc(EscCommand::SelectCharacterSet('(', '0'))],
+        vec![Command(AnsiCommand::Esc(EscCommand::SelectCharacterSet(
+            '(', '0'
+        )))],
         "ESC ( 0 should select DEC Special Graphics charset"
     );
 }
@@ -1335,7 +1404,9 @@ fn it_should_process_esc_close_paren_a_uk_charset() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Esc(EscCommand::SelectCharacterSet(')', 'A'))],
+        vec![Command(AnsiCommand::Esc(EscCommand::SelectCharacterSet(
+            ')', 'A'
+        )))],
         "ESC ) A should select UK charset as G1"
     );
 }
@@ -1347,7 +1418,9 @@ fn it_should_process_esc_star_with_dec_supplemental() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Esc(EscCommand::SelectCharacterSet('*', '<'))],
+        vec![Command(AnsiCommand::Esc(EscCommand::SelectCharacterSet(
+            '*', '<'
+        )))],
         "ESC * < should select DEC Supplemental charset as G2"
     );
 }
@@ -1359,7 +1432,9 @@ fn it_should_process_esc_plus_with_dec_technical() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Esc(EscCommand::SelectCharacterSet('+', '>'))],
+        vec![Command(AnsiCommand::Esc(EscCommand::SelectCharacterSet(
+            '+', '>'
+        )))],
         "ESC + > should select DEC Technical charset as G3"
     );
 }
@@ -1371,7 +1446,9 @@ fn it_should_process_charset_designator_boundary_low() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Esc(EscCommand::SelectCharacterSet('(', '0'))],
+        vec![Command(AnsiCommand::Esc(EscCommand::SelectCharacterSet(
+            '(', '0'
+        )))],
         "ESC ( 0 (0x30) should be valid - lowest boundary"
     );
 }
@@ -1383,7 +1460,9 @@ fn it_should_process_charset_designator_boundary_high() {
     let commands = process_bytes(bytes);
     assert_eq!(
         commands,
-        vec![AnsiCommand::Esc(EscCommand::SelectCharacterSet('(', '~'))],
+        vec![Command(AnsiCommand::Esc(EscCommand::SelectCharacterSet(
+            '(', '~'
+        )))],
         "ESC ( ~ (0x7E) should be valid - highest boundary"
     );
 }
@@ -1412,9 +1491,9 @@ fn it_should_process_charset_special_designators() {
         let commands = process_bytes(bytes.as_bytes());
         assert_eq!(
             commands,
-            vec![AnsiCommand::Esc(EscCommand::SelectCharacterSet(
+            vec![Command(AnsiCommand::Esc(EscCommand::SelectCharacterSet(
                 '(', designator
-            ))],
+            )))],
             "ESC ( {} ({}) should be a valid charset designator",
             designator,
             name
@@ -1429,9 +1508,10 @@ fn it_should_reject_charset_designator_below_valid_range() {
     let commands = process_bytes(bytes);
     // Invalid charset designator should not produce a SelectCharacterSet command
     assert!(
-        !commands
-            .iter()
-            .any(|c| matches!(c, AnsiCommand::Esc(EscCommand::SelectCharacterSet(_, _)))),
+        !commands.iter().any(|c| matches!(
+            c,
+            Command(AnsiCommand::Esc(EscCommand::SelectCharacterSet(_, _)))
+        )),
         "ESC ( / (0x2F) should be rejected - below valid range"
     );
 }
@@ -1443,9 +1523,10 @@ fn it_should_reject_charset_designator_above_valid_range() {
     let commands = process_bytes(bytes);
     // Invalid charset designator should not produce a SelectCharacterSet command
     assert!(
-        !commands
-            .iter()
-            .any(|c| matches!(c, AnsiCommand::Esc(EscCommand::SelectCharacterSet(_, _)))),
+        !commands.iter().any(|c| matches!(
+            c,
+            Command(AnsiCommand::Esc(EscCommand::SelectCharacterSet(_, _)))
+        )),
         "ESC ( DEL (0x7F) should be rejected - above valid range"
     );
 }
@@ -1456,9 +1537,10 @@ fn it_should_reject_space_as_charset_designator() {
     let bytes = b"\x1B( ";
     let commands = process_bytes(bytes);
     assert!(
-        !commands
-            .iter()
-            .any(|c| matches!(c, AnsiCommand::Esc(EscCommand::SelectCharacterSet(_, _)))),
+        !commands.iter().any(|c| matches!(
+            c,
+            Command(AnsiCommand::Esc(EscCommand::SelectCharacterSet(_, _)))
+        )),
         "ESC ( SP (0x20) should be rejected - not a valid charset designator"
     );
 }
@@ -1473,7 +1555,7 @@ fn it_should_reject_space_as_charset_designator() {
 mod mutation_tests {
     use super::{
         super::commands::{AnsiCommand, Attribute, CsiCommand, EscCommand},
-        process_bytes,
+        process_bytes, Char, Command,
     };
     use crate::color::{Color, NamedColor};
     use test_log::test;
@@ -1488,9 +1570,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[1m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Bold
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Bold]
+            )))]
         );
     }
 
@@ -1499,9 +1581,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[2m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Faint
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Faint]
+            )))]
         );
     }
 
@@ -1510,9 +1592,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[3m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Italic
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Italic]
+            )))]
         );
     }
 
@@ -1521,9 +1603,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[4m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Underline
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Underline]
+            )))]
         );
     }
 
@@ -1532,9 +1614,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[5m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::BlinkSlow
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::BlinkSlow]
+            )))]
         );
     }
 
@@ -1543,9 +1625,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[6m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::BlinkRapid
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::BlinkRapid]
+            )))]
         );
     }
 
@@ -1554,9 +1636,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[7m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Reverse
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Reverse]
+            )))]
         );
     }
 
@@ -1565,9 +1647,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[8m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Conceal
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Conceal]
+            )))]
         );
     }
 
@@ -1576,9 +1658,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[9m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Strikethrough
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Strikethrough]
+            )))]
         );
     }
 
@@ -1587,9 +1669,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[21m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::UnderlineDouble
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::UnderlineDouble]
+            )))]
         );
     }
 
@@ -1598,9 +1680,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[22m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::NoBold
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::NoBold]
+            )))]
         );
     }
 
@@ -1609,9 +1691,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[23m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::NoItalic
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::NoItalic]
+            )))]
         );
     }
 
@@ -1620,9 +1702,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[24m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::NoUnderline
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::NoUnderline]
+            )))]
         );
     }
 
@@ -1631,9 +1713,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[25m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::NoBlink
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::NoBlink]
+            )))]
         );
     }
 
@@ -1642,9 +1724,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[27m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::NoReverse
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::NoReverse]
+            )))]
         );
     }
 
@@ -1653,9 +1735,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[28m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::NoConceal
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::NoConceal]
+            )))]
         );
     }
 
@@ -1664,9 +1746,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[29m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::NoStrikethrough
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::NoStrikethrough]
+            )))]
         );
     }
 
@@ -1675,9 +1757,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[53m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Overlined
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Overlined]
+            )))]
         );
     }
 
@@ -1686,9 +1768,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[55m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::NoOverlined
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::NoOverlined]
+            )))]
         );
     }
 
@@ -1698,18 +1780,18 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[58;5;42m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::UnderlineColor(Color::Indexed(42))
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::UnderlineColor(Color::Indexed(42))]
+            )))]
         );
 
         // 58;2;10;20;30 -> UnderlineColor(Rgb(10, 20, 30))
         let cmds = process_bytes(b"\x1b[58;2;10;20;30m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::UnderlineColor(Color::Rgb(10, 20, 30))
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::UnderlineColor(Color::Rgb(10, 20, 30))]
+            )))]
         );
     }
 
@@ -1718,9 +1800,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[59m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::UnderlineColor(Color::Default)
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::UnderlineColor(Color::Default)]
+            )))]
         );
     }
 
@@ -1748,9 +1830,9 @@ mod mutation_tests {
             let cmds = process_bytes(input.as_bytes());
             assert_eq!(
                 cmds,
-                vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                    Attribute::Foreground(Color::Named(expected_color))
-                ]))],
+                vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                    vec![Attribute::Foreground(Color::Named(expected_color))]
+                )))],
                 "SGR {} should produce Foreground({:?})",
                 code,
                 expected_color
@@ -1764,9 +1846,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[39m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Foreground(Color::Default)
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Foreground(Color::Default)]
+            )))]
         );
     }
 
@@ -1792,9 +1874,9 @@ mod mutation_tests {
             let cmds = process_bytes(input.as_bytes());
             assert_eq!(
                 cmds,
-                vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                    Attribute::Background(Color::Named(expected_color))
-                ]))],
+                vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                    vec![Attribute::Background(Color::Named(expected_color))]
+                )))],
                 "SGR {} should produce Background({:?})",
                 code,
                 expected_color
@@ -1807,9 +1889,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[49m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Background(Color::Default)
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Background(Color::Default)]
+            )))]
         );
     }
 
@@ -1835,9 +1917,9 @@ mod mutation_tests {
             let cmds = process_bytes(input.as_bytes());
             assert_eq!(
                 cmds,
-                vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                    Attribute::Foreground(Color::Named(expected_color))
-                ]))],
+                vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                    vec![Attribute::Foreground(Color::Named(expected_color))]
+                )))],
                 "SGR {} should produce Foreground({:?})",
                 code,
                 expected_color
@@ -1866,9 +1948,9 @@ mod mutation_tests {
             let cmds = process_bytes(input.as_bytes());
             assert_eq!(
                 cmds,
-                vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                    Attribute::Background(Color::Named(expected_color))
-                ]))],
+                vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                    vec![Attribute::Background(Color::Named(expected_color))]
+                )))],
                 "SGR {} should produce Background({:?})",
                 code,
                 expected_color
@@ -1887,9 +1969,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[38;5;0m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Foreground(Color::Indexed(0))
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Foreground(Color::Indexed(0))]
+            )))]
         );
     }
 
@@ -1899,9 +1981,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[38;5;255m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Foreground(Color::Indexed(255))
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Foreground(Color::Indexed(255))]
+            )))]
         );
     }
 
@@ -1912,9 +1994,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[48;5;100m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Background(Color::Indexed(100))
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Background(Color::Indexed(100))]
+            )))]
         );
     }
 
@@ -1924,9 +2006,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[38;2;255;128;0m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Foreground(Color::Rgb(255, 128, 0))
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Foreground(Color::Rgb(255, 128, 0))]
+            )))]
         );
     }
 
@@ -1936,9 +2018,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[48;2;10;20;30m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Background(Color::Rgb(10, 20, 30))
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Background(Color::Rgb(10, 20, 30))]
+            )))]
         );
     }
 
@@ -1949,9 +2031,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[38;2;1;2;3m");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(vec![
-                Attribute::Foreground(Color::Rgb(1, 2, 3))
-            ]))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(
+                vec![Attribute::Foreground(Color::Rgb(1, 2, 3))]
+            )))]
         );
     }
 
@@ -1963,50 +2045,74 @@ mod mutation_tests {
     #[test]
     fn csi_cursor_up_no_param_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[A");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorUp(1))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::CursorUp(1)))]
+        );
     }
 
     #[test]
     fn csi_cursor_up_param_zero_is_coerced_to_1() {
         // param_or_1 applies max(1), so 0 -> 1
         let cmds = process_bytes(b"\x1b[0A");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorUp(1))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::CursorUp(1)))]
+        );
     }
 
     #[test]
     fn csi_cursor_up_explicit_5() {
         let cmds = process_bytes(b"\x1b[5A");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorUp(5))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::CursorUp(5)))]
+        );
     }
 
     #[test]
     fn csi_cursor_down_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[B");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorDown(1))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::CursorDown(1)))]
+        );
     }
 
     #[test]
     fn csi_cursor_forward_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[C");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorForward(1))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::CursorForward(1)))]
+        );
     }
 
     #[test]
     fn csi_cursor_backward_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[D");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorBackward(1))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::CursorBackward(1)))]
+        );
     }
 
     #[test]
     fn csi_cursor_next_line_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[E");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorNextLine(1))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::CursorNextLine(1)))]
+        );
     }
 
     #[test]
     fn csi_cursor_prev_line_defaults_to_1() {
         let cmds = process_bytes(b"\x1b[F");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::CursorPrevLine(1))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::CursorPrevLine(1)))]
+        );
     }
 
     #[test]
@@ -2014,7 +2120,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[G");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::CursorCharacterAbsolute(1))]
+            vec![Command(AnsiCommand::Csi(
+                CsiCommand::CursorCharacterAbsolute(1)
+            ))]
         );
     }
 
@@ -2027,7 +2135,7 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[5;10H");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::CursorPosition(5, 10))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::CursorPosition(5, 10)))]
         );
     }
 
@@ -2036,7 +2144,7 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[3H");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::CursorPosition(3, 1))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::CursorPosition(3, 1)))]
         );
     }
 
@@ -2046,7 +2154,7 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[H");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::CursorPosition(1, 1))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::CursorPosition(1, 1)))]
         );
     }
 
@@ -2058,25 +2166,37 @@ mod mutation_tests {
     #[test]
     fn csi_erase_in_display_no_param_defaults_to_0() {
         let cmds = process_bytes(b"\x1b[J");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseInDisplay(0))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::EraseInDisplay(0)))]
+        );
     }
 
     #[test]
     fn csi_erase_in_display_explicit_2() {
         let cmds = process_bytes(b"\x1b[2J");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseInDisplay(2))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::EraseInDisplay(2)))]
+        );
     }
 
     #[test]
     fn csi_erase_in_line_no_param_defaults_to_0() {
         let cmds = process_bytes(b"\x1b[K");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseInLine(0))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::EraseInLine(0)))]
+        );
     }
 
     #[test]
     fn csi_erase_in_line_explicit_1() {
         let cmds = process_bytes(b"\x1b[1K");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseInLine(1))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::EraseInLine(1)))]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2087,37 +2207,49 @@ mod mutation_tests {
     #[test]
     fn esc_d_is_index() {
         let cmds = process_bytes(b"\x1bD");
-        assert_eq!(cmds, vec![AnsiCommand::Esc(EscCommand::Index)]);
+        assert_eq!(cmds, vec![Command(AnsiCommand::Esc(EscCommand::Index))]);
     }
 
     #[test]
     fn esc_e_is_next_line() {
         let cmds = process_bytes(b"\x1bE");
-        assert_eq!(cmds, vec![AnsiCommand::Esc(EscCommand::NextLine)]);
+        assert_eq!(cmds, vec![Command(AnsiCommand::Esc(EscCommand::NextLine))]);
     }
 
     #[test]
     fn esc_h_is_set_tab_stop() {
         let cmds = process_bytes(b"\x1bH");
-        assert_eq!(cmds, vec![AnsiCommand::Esc(EscCommand::SetTabStop)]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Esc(EscCommand::SetTabStop))]
+        );
     }
 
     #[test]
     fn esc_m_is_reverse_index() {
         let cmds = process_bytes(b"\x1bM");
-        assert_eq!(cmds, vec![AnsiCommand::Esc(EscCommand::ReverseIndex)]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Esc(EscCommand::ReverseIndex))]
+        );
     }
 
     #[test]
     fn esc_7_is_save_cursor() {
         let cmds = process_bytes(b"\x1b7");
-        assert_eq!(cmds, vec![AnsiCommand::Esc(EscCommand::SaveCursor)]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Esc(EscCommand::SaveCursor))]
+        );
     }
 
     #[test]
     fn esc_8_is_restore_cursor() {
         let cmds = process_bytes(b"\x1b8");
-        assert_eq!(cmds, vec![AnsiCommand::Esc(EscCommand::RestoreCursor)]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Esc(EscCommand::RestoreCursor))]
+        );
     }
 
     #[test]
@@ -2125,20 +2257,26 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1bc");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Esc(EscCommand::ResetToInitialState)]
+            vec![Command(AnsiCommand::Esc(EscCommand::ResetToInitialState))]
         );
     }
 
     #[test]
     fn esc_n_is_single_shift_2() {
         let cmds = process_bytes(b"\x1bN");
-        assert_eq!(cmds, vec![AnsiCommand::Esc(EscCommand::SingleShift2)]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Esc(EscCommand::SingleShift2))]
+        );
     }
 
     #[test]
     fn esc_o_is_single_shift_3() {
         let cmds = process_bytes(b"\x1bO");
-        assert_eq!(cmds, vec![AnsiCommand::Esc(EscCommand::SingleShift3)]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Esc(EscCommand::SingleShift3))]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2152,7 +2290,8 @@ mod mutation_tests {
         // SGR with 16 parameters: 1;2;0;0;... (14 zeros)
         // All 16 must be collected and processed.
         let cmds = process_bytes(b"\x1b[1;2;0;0;0;0;0;0;0;0;0;0;0;0;0;0m");
-        let Some(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs))) = cmds.first() else {
+        let Some(Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs)))) = cmds.first()
+        else {
             panic!("expected SetGraphicsRendition, got {:?}", cmds);
         };
         // Checking len kills mutations that reduce MAX_PARAMS below 16.
@@ -2175,7 +2314,8 @@ mod mutation_tests {
         // We send: ESC [ 0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;7m
         //          that's 16 zeros + 1 extra -> the 7 (Reverse) is the 17th and dropped.
         let cmds = process_bytes(b"\x1b[0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;0;7m");
-        let Some(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs))) = cmds.first() else {
+        let Some(Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs)))) = cmds.first()
+        else {
             panic!("expected SetGraphicsRendition, got {:?}", cmds);
         };
         // Every kept attribute should be Reset (0); Reverse (7) must NOT appear.
@@ -2198,8 +2338,7 @@ mod mutation_tests {
         let cmds = process_bytes(&[0xC1, 0x80]);
         // Both bytes should produce replacement characters, not a valid char
         assert!(
-            cmds.iter()
-                .all(|c| c == &AnsiCommand::Print(char::REPLACEMENT_CHARACTER)),
+            cmds.iter().all(|c| c == &Char(char::REPLACEMENT_CHARACTER)),
             "0xC1 must be an invalid start; got {:?}",
             cmds
         );
@@ -2211,7 +2350,7 @@ mod mutation_tests {
         let cmds = process_bytes(&[0xC2, 0x80]);
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Print('\u{0080}')],
+            vec![Char('\u{0080}')],
             "0xC2 0x80 must decode to U+0080"
         );
     }
@@ -2222,7 +2361,7 @@ mod mutation_tests {
         let cmds = process_bytes(&[0xF4, 0x8F, 0xBF, 0xBF]);
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Print('\u{10FFFF}')],
+            vec![Char('\u{10FFFF}')],
             "0xF4 0x8F 0xBF 0xBF must decode to U+10FFFF"
         );
     }
@@ -2232,8 +2371,7 @@ mod mutation_tests {
         // 0xF5 is just above the valid 4-byte start range (0xF4)
         let cmds = process_bytes(&[0xF5, 0x80, 0x80, 0x80]);
         assert!(
-            cmds.iter()
-                .any(|c| c == &AnsiCommand::Print(char::REPLACEMENT_CHARACTER)),
+            cmds.iter().any(|c| c == &Char(char::REPLACEMENT_CHARACTER)),
             "0xF5 must be invalid; got {:?}",
             cmds
         );
@@ -2245,8 +2383,7 @@ mod mutation_tests {
         // Should abort the UTF-8 sequence and emit replacement + DEL control
         let cmds = process_bytes(&[0xE2, 0x7F]);
         assert!(
-            cmds.iter()
-                .any(|c| c == &AnsiCommand::Print(char::REPLACEMENT_CHARACTER)),
+            cmds.iter().any(|c| c == &Char(char::REPLACEMENT_CHARACTER)),
             "0x7F after 3-byte start must not be a valid continuation; got {:?}",
             cmds
         );
@@ -2258,8 +2395,7 @@ mod mutation_tests {
         // Should abort the UTF-8 sequence
         let cmds = process_bytes(&[0xE2, 0xC0]);
         assert!(
-            cmds.iter()
-                .any(|c| c == &AnsiCommand::Print(char::REPLACEMENT_CHARACTER)),
+            cmds.iter().any(|c| c == &Char(char::REPLACEMENT_CHARACTER)),
             "0xC0 after 3-byte start must not be a valid continuation; got {:?}",
             cmds
         );
@@ -2271,7 +2407,7 @@ mod mutation_tests {
         let cmds = process_bytes(&[0xDF, 0xBF]);
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Print('\u{07FF}')],
+            vec![Char('\u{07FF}')],
             "0xDF 0xBF must decode to U+07FF"
         );
     }
@@ -2287,12 +2423,14 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b]0;title\x18rest");
         // No Osc command should appear; "rest" prints normally
         assert!(
-            !cmds.iter().any(|c| matches!(c, AnsiCommand::Osc(_))),
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Command(AnsiCommand::Osc(_)))),
             "CAN must cancel OSC; got {:?}",
             cmds
         );
         assert!(
-            cmds.iter().any(|c| c == &AnsiCommand::Print('r')),
+            cmds.iter().any(|c| c == &Char('r')),
             "text after CAN must print; got {:?}",
             cmds
         );
@@ -2303,7 +2441,9 @@ mod mutation_tests {
         // SUB (0x1A) inside an OSC should also discard it
         let cmds = process_bytes(b"\x1b]0;title\x1Arest");
         assert!(
-            !cmds.iter().any(|c| matches!(c, AnsiCommand::Osc(_))),
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Command(AnsiCommand::Osc(_)))),
             "SUB must cancel OSC; got {:?}",
             cmds
         );
@@ -2313,7 +2453,9 @@ mod mutation_tests {
     fn dcs_cancelled_by_can() {
         let cmds = process_bytes(b"\x1bPdata\x18rest");
         assert!(
-            !cmds.iter().any(|c| matches!(c, AnsiCommand::Dcs(_))),
+            !cmds
+                .iter()
+                .any(|c| matches!(c, Command(AnsiCommand::Dcs(_)))),
             "CAN must cancel DCS; got {:?}",
             cmds
         );
@@ -2331,7 +2473,7 @@ mod mutation_tests {
         input.push(0x07); // BEL terminates the string
 
         let cmds = process_bytes(&input);
-        let Some(AnsiCommand::Osc(data)) = cmds.first() else {
+        let Some(Command(AnsiCommand::Osc(data))) = cmds.first() else {
             panic!("an over-long OSC must still yield an Osc command; got {cmds:?}");
         };
         assert_eq!(
@@ -2348,7 +2490,7 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b]0;oldjunk\x18\x1b]1;newdata\x07");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Osc(b"1;newdata".to_vec())],
+            vec![Command(AnsiCommand::Osc(b"1;newdata".to_vec()))],
             "the cancelled sequence's bytes must not appear in the next OSC's payload"
         );
     }
@@ -2364,7 +2506,7 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[99999A");
         // Should produce CursorUp with some value (saturated), not panic
         assert_eq!(cmds.len(), 1, "should produce exactly one command");
-        let AnsiCommand::Csi(CsiCommand::CursorUp(n)) = cmds[0] else {
+        let Command(AnsiCommand::Csi(CsiCommand::CursorUp(n))) = cmds[0] else {
             panic!("should still produce CursorUp; got {:?}", cmds);
         };
         assert_eq!(n, u16::MAX, "overflow must saturate to u16::MAX, got {}", n);
@@ -2379,19 +2521,28 @@ mod mutation_tests {
     #[test]
     fn csi_ctc_0_is_set_tab_stop() {
         let cmds = process_bytes(b"\x1b[0W");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::SetTabStop)]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetTabStop))]
+        );
     }
 
     #[test]
     fn csi_ctc_2_clears_current_tab_stop() {
         let cmds = process_bytes(b"\x1b[2W");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::ClearTabStops(0))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::ClearTabStops(0)))]
+        );
     }
 
     #[test]
     fn csi_ctc_5_clears_all_tab_stops() {
         let cmds = process_bytes(b"\x1b[5W");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::ClearTabStops(3))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::ClearTabStops(3)))]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2402,13 +2553,19 @@ mod mutation_tests {
     #[test]
     fn csi_s_uppercase_is_scroll_up() {
         let cmds = process_bytes(b"\x1b[3S");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::ScrollUp(3))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::ScrollUp(3)))]
+        );
     }
 
     #[test]
     fn csi_t_uppercase_is_scroll_down() {
         let cmds = process_bytes(b"\x1b[3T");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::ScrollDown(3))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::ScrollDown(3)))]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2419,19 +2576,28 @@ mod mutation_tests {
     #[test]
     fn csi_at_is_insert_character() {
         let cmds = process_bytes(b"\x1b[2@");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::InsertCharacter(2))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::InsertCharacter(2)))]
+        );
     }
 
     #[test]
     fn csi_p_uppercase_is_delete_character() {
         let cmds = process_bytes(b"\x1b[2P");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::DeleteCharacter(2))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::DeleteCharacter(2)))]
+        );
     }
 
     #[test]
     fn csi_x_uppercase_is_erase_character() {
         let cmds = process_bytes(b"\x1b[2X");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::EraseCharacter(2))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::EraseCharacter(2)))]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2441,13 +2607,19 @@ mod mutation_tests {
     #[test]
     fn csi_l_uppercase_is_insert_line() {
         let cmds = process_bytes(b"\x1b[4L");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::InsertLine(4))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::InsertLine(4)))]
+        );
     }
 
     #[test]
     fn csi_m_uppercase_is_delete_line() {
         let cmds = process_bytes(b"\x1b[4M");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::DeleteLine(4))]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::DeleteLine(4)))]
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2460,10 +2632,10 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[5;24r");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetScrollingRegion {
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetScrollingRegion {
                 top: 5,
                 bottom: 24
-            })]
+            }))]
         );
     }
 
@@ -2473,10 +2645,10 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[r");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::SetScrollingRegion {
+            vec![Command(AnsiCommand::Csi(CsiCommand::SetScrollingRegion {
                 top: 1,
                 bottom: 0
-            })]
+            }))]
         );
     }
 
@@ -2492,7 +2664,7 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[5;10f");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::CursorPosition(5, 10))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::CursorPosition(5, 10)))]
         );
     }
 
@@ -2506,7 +2678,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[7d");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::LinePositionAbsolute(7))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::LinePositionAbsolute(
+                7
+            )))]
         );
     }
 
@@ -2516,7 +2690,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[d");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::LinePositionAbsolute(1))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::LinePositionAbsolute(
+                1
+            )))]
         );
     }
 
@@ -2527,7 +2703,9 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[c");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::PrimaryDeviceAttributes)]
+            vec![Command(AnsiCommand::Csi(
+                CsiCommand::PrimaryDeviceAttributes
+            ))]
         );
     }
 
@@ -2538,7 +2716,7 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[6n");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::DeviceStatusReport(6))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::DeviceStatusReport(6)))]
         );
     }
 
@@ -2548,7 +2726,7 @@ mod mutation_tests {
         let cmds = process_bytes(b"\x1b[n");
         assert_eq!(
             cmds,
-            vec![AnsiCommand::Csi(CsiCommand::DeviceStatusReport(0))]
+            vec![Command(AnsiCommand::Csi(CsiCommand::DeviceStatusReport(0)))]
         );
     }
 
@@ -2556,13 +2734,19 @@ mod mutation_tests {
     fn csi_s_is_save_cursor() {
         // 's' = save cursor (ANSI). Mutation: confusing 's' with 'S' (ScrollUp).
         let cmds = process_bytes(b"\x1b[s");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::SaveCursor)]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::SaveCursor))]
+        );
     }
 
     #[test]
     fn csi_u_is_restore_cursor() {
         // 'u' = restore cursor (ANSI). Mutation: confusing 'u' with 'U'.
         let cmds = process_bytes(b"\x1b[u");
-        assert_eq!(cmds, vec![AnsiCommand::Csi(CsiCommand::RestoreCursor)]);
+        assert_eq!(
+            cmds,
+            vec![Command(AnsiCommand::Csi(CsiCommand::RestoreCursor))]
+        );
     }
 }

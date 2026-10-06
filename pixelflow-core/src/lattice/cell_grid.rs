@@ -12,7 +12,7 @@
 //! blend — over two bound buffers (the per-cell data and the atlas). The
 //! per-frame update rewrites the cell buffer. This replaces the only
 //! alternative the combinator layer offered — a per-frame tree of boxed
-//! `Select`s sized by the runtime grid — with a program whose size is
+//! `If`s sized by the runtime grid — with a program whose size is
 //! independent of the grid's.
 //!
 //! ## What recompiles, and what does not
@@ -593,8 +593,7 @@ impl CellGridProgram {
     ///
     /// # Panics
     ///
-    /// Panics on a degenerate shape (zero cells, empty atlas), when this
-    /// build's `Field` width does not match the JIT's emitted width, or if
+    /// Panics on a degenerate shape (zero cells, empty atlas), or if
     /// compilation fails.
     #[must_use]
     pub fn compile(shape: CellGridShape, default_bg: [f32; 4]) -> Self {
@@ -720,7 +719,7 @@ impl CellGridFrame {
         );
         let claim = self.grid_range().intersect(&band);
         if !claim.is_empty() {
-            self.channels[channel].collapse_subrect(
+            self.channels[channel].collapse_rows(
                 PlaneRegion::rows(claim.width(), claim.y0(), claim.rows()),
                 out,
                 stride,
@@ -792,13 +791,19 @@ mod tests {
     /// a channel program (four cell fields — `bg` twice — plus the atlas)
     /// occupy exactly two slots: one per distinct buffer.
     ///
-    /// Nodes are a different story, and this pins the gap: every *use* of a
-    /// Kernel value re-splices its whole fragment, and the display contramap
-    /// makes each use of a coordinate two nodes rather than one. Identity
-    /// fixed the slots; it cannot fix this. Node sharing is an inlining
-    /// decision, and it belongs to the e-graph — which cannot see this arena
-    /// at all while `Gather` is unrepresentable there. This number falling is
-    /// the sign that landed.
+    /// Nodes used to be a different story, and this pinned the gap: every
+    /// *use* of a Kernel value re-splices its whole fragment, and the display
+    /// contramap made each use of a coordinate two nodes rather than one.
+    /// Identity fixed the slots; it could not fix this — node sharing was an
+    /// inlining decision, and it belonged to the e-graph, which could not see
+    /// this arena at all while `Gather` is unrepresentable there.
+    ///
+    /// `ExprArena` now hash-conses (docs/plans/2026-09-09-exprarena-on-dag.md,
+    /// Stage C): `push_*` interns structurally, so the *within-one-splice*
+    /// repetition this comment used to describe collapses for free, without
+    /// the e-graph. 157 -> 69 (56%) on this fixture the day consing landed —
+    /// still not the e-graph's sharing (a `Gather` is still opaque to it),
+    /// but the gap this test pins is smaller than it was.
     #[test]
     fn reads_of_one_buffer_share_a_slot_but_not_nodes() {
         let shape = CellGridShape {
@@ -831,11 +836,14 @@ mod tests {
     }
 
     /// Reachable nodes in one channel kernel. Pinned rather than derived:
-    /// see `reads_of_one_buffer_share_a_slot_but_not_nodes`.
-    pub(crate) const CHANNEL_NODES: usize = 157;
+    /// see `reads_of_one_buffer_share_a_slot_but_not_nodes`. Was 157 before
+    /// `ExprArena` hash-consed (Stage C of
+    /// docs/plans/2026-09-09-exprarena-on-dag.md); consing collapsed the
+    /// repeated coordinate-contramap fragments the old doc comment described.
+    pub(crate) const CHANNEL_NODES: usize = 69;
 
     fn reachable_nodes(arena: &ExprArena, root: pixelflow_ir::ExprId) -> usize {
-        let mut seen = vec![false; arena.nodes_raw().len()];
+        let mut seen = vec![false; arena.len()];
         let mut stack = vec![root];
         let mut count = 0;
         while let Some(id) = stack.pop() {
@@ -1424,7 +1432,7 @@ mod tests {
     /// | case | grid extent | what it pins |
     /// |---|---|---|
     /// | integral | 12 x 8 | the ordinary case; a border on both axes |
-    /// | fractional | 17 x 12 | **the `− ½`**: the grid spans `[0, 17.5)`, so pixel 17 (centre 17.5) is outside, and a range computed as `ceil(g)` would claim it. Also a claim width that is no multiple of any SIMD batch, so `RowTail::Exact`'s scratch path is live. |
+    /// | fractional | 17 x 12 | **the `− ½`**: the grid spans `[0, 17.5)`, so pixel 17 (centre 17.5) is outside, and a range computed as `ceil(g)` would claim it. Also a claim width that is no multiple of any SIMD batch, so a row's final partial batch is stored lane-wise. |
     /// | fractional through the scale | 22 x 11 | the same, with the display contramap carrying it: `3 · 5 · 1.5 = 22.5` is fractional though every cell extent on X is integral, and `3 · 2.5 · 1.5 = 11.25` is fractional in both. **Both axes discriminate** — `ceil(g)` gives 23 x 12. At `scale = 2.0`, which this case had first, both products came out integral and it pinned nothing about the half-pixel however fractional its cell extents looked. |
     /// | grid past the frame | 15 x 11 | the clip to the frame, with no border at all |
     ///
@@ -1518,7 +1526,7 @@ mod tests {
             let ranged = program.frame(&params, cells.clone(), atlas.clone());
 
             // The value encoding: the same channel kernels under the mask the
-            // select used to carry, evaluated over the whole frame.
+            // `If` used to carry, evaluated over the whole frame.
             let CellGridKernels {
                 channels,
                 buffers,

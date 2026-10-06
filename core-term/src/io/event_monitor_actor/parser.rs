@@ -3,7 +3,7 @@
 //! PTY parser actor.
 //!
 //! Receives raw byte batches from the reader on its data lane, parses them
-//! into `AnsiCommand`s (the CPU-heavy step), forwards the commands to the app,
+//! into an `AnsiBatch` (the CPU-heavy step), forwards the batch to the app,
 //! and recycles the drained buffer back to the reader's data lane. Purely
 //! message-driven — no OS blocking, so no waker.
 //!
@@ -47,21 +47,21 @@ impl TroupeActor<Directory> for PtyParser {
 }
 
 impl Actor<FilledBuf, ParserControl, ParserManagement> for PtyParser {
-    fn handle_data(&mut self, batch: FilledBuf) -> HandlerResult {
-        let commands = self.parser.process_bytes(batch.bytes());
+    fn handle_data(&mut self, filled: FilledBuf) -> HandlerResult {
+        let parsed = self.parser.process_bytes(filled.bytes());
 
         // Recycle the buffer; if the reader is gone the buffer just drops.
-        if let Err(e) = self.reader_tx.send(Message::Data(batch.data)) {
+        if let Err(e) = self.reader_tx.send(Message::Data(filled.data)) {
             debug!("PTY parser: reader gone, dropping recycled buffer: {}", e);
         }
 
-        if commands.is_empty() {
+        if parsed.is_empty() {
             return Ok(());
         }
         match &self.app_tx {
             // Bind (Management) always drains before Data, so this is set.
             Some(app_tx) => {
-                if let Err(e) = app_tx.send(commands) {
+                if let Err(e) = app_tx.send(parsed) {
                     warn!("PTY parser: failed to send commands to app: {}", e);
                 }
             }

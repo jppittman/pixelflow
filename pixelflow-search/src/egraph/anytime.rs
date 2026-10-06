@@ -139,9 +139,9 @@ pub struct AnytimeCurveOutput {
 ///
 /// Not `ExprArena::node_count_subtree`, which is documented to count a shared
 /// subtree once per reference (tree size, not DAG size) and so would not
-/// equal `nodes_raw().len()` for any expression with sharing.
+/// equal `ExprArena::len()` for any expression with sharing.
 fn reachable_node_count(arena: &ExprArena, root: ExprId) -> usize {
-    let mut seen = alloc::vec![false; arena.nodes_raw().len()];
+    let mut seen = alloc::vec![false; arena.len()];
     let mut stack = alloc::vec![root];
     let mut count = 0usize;
     while let Some(id) = stack.pop() {

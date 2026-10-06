@@ -1,47 +1,39 @@
 //! IR-to-IR transforms: legalization.
 //!
-//! [`legalize`] runs four passes today, each `(arena, root) -> (arena, root)`,
-//! each turning nodes no backend can emit into nodes every backend can:
+//! [`legalize`] runs six passes, each `(arena, root) -> (arena, root)`, each
+//! turning nodes no backend can emit into nodes every backend can:
 //!
 //! | pass | consumes | produces |
 //! |---|---|---|
 //! | [`expand_refs`] | `Ref` | the referent, spliced in |
 //! | [`lower_dwrt`] | `Dwrt` | arithmetic, and *re-introduces* transcendentals |
+//! | [`lattice::collapse`] | a kernel over `X`/`Y` | the same kernel wrapped in the lattice's row/col/lane folds around one `Write` |
+//! | [`lattice::pack`] | `collapse`'s degenerate `[0,1)` lane fold | the same folds strip-mined to the target's lane width |
 //! | [`expand_gather`] | `Gather` | index arithmetic + `RawGather` |
 //! | [`expand_transcendentals`] | `Sin`..`Pow` | arithmetic + bit-manip atoms |
 //!
 //! The order in that table is the order they must run: differentiating a `sin`
 //! produces a `cos`, so `lower_dwrt` has to go before the pass that expands
-//! them, and you cannot differentiate a *name*, so `expand_refs` goes before
-//! everything. Every pass is idempotent and has an identity fast-path, so
-//! running one that has nothing to do is free.
-//!
-//! Two more exist, in [`lattice`], and are **not** in that list or in
-//! [`legalize`]'s pipeline:
-//!
-//! | pass | consumes | produces |
-//! |---|---|---|
-//! | [`lattice::collapse`] | a kernel over `X`/`Y` | the same kernel wrapped in the lattice's row/col/lane folds around one `Write` |
-//! | [`lattice::pack`] | `collapse`'s degenerate `[0,1)` lane fold | the same folds strip-mined to the target's lane width |
-//!
-//! Their place in the full order is `expand_refs -> lower_dwrt -> collapse ->
-//! pack -> expand_gather -> expand_transcendentals`
-//! (docs/plans/2026-09-16-collapse-is-a-fold.md §2.3), but
-//! **[`legalize`] does not call either one yet.** The emitter refuses a
-//! `Write` until step 5 of that plan lands, so wiring them into every
-//! production compile now would hand the emitter a node it cannot execute,
-//! breaking every collapse in the tree. Until then they are arena-level
-//! transforms a caller runs directly.
+//! them; you cannot differentiate a *name*, so `expand_refs` goes before
+//! everything; a derivative is taken with respect to `X` before `collapse`
+//! substitutes `X` away, and a read's address arithmetic is built
+//! over the lattice's binders after it, so the two lattice passes sit between
+//! (docs/plans/2026-09-16-collapse-is-a-fold.md §2.3). Every pass is
+//! idempotent and has an identity fast-path, so running one that has nothing
+//! to do is free — except the two lattice passes, which always wrap: after
+//! them no coordinate `Var` exists and the root is a `Reduce` over the unit
+//! monoid whose body is a `Write`. That is the shape every backend emits, and
+//! the only shape.
 //!
 //! **`Reduce` is legal in the arena and [`legalize`] leaves every one
 //! standing**, nested or not: codegen emits a surviving fold as a loop, and a
-//! fold inside a fold's body as a loop inside a loop. [`expand_reduce`] is
-//! still here for a caller that wants a fold unrolled — a test comparing the
-//! two shapes — and is on no production path.
+//! fold inside a fold's body as a loop inside a loop. There is no pass that
+//! unrolls one: a fold a caller wants gone is halved away by the e-graph's
+//! `HalveFold` (`pixelflow-search`), not by a lowering.
 //!
 //! **Nothing here knows what it is lowering *for*.** There is no `cfg` in this
-//! module beyond `#[cfg(test)]`, and no import outside `crate::{arena, kind,
-//! variance}`. The legal set happens to be uniform across the backends today;
+//! module beyond `#[cfg(test)]`, and no import outside `crate::{arena, fold,
+//! kind, variance}`. The legal set happens to be uniform across the backends today;
 //! if it stops being uniform, that belongs in a target description these passes
 //! consult, not in a `cfg` here.
 //!
@@ -50,31 +42,32 @@
 //! a backend's business. Expanding them here means no emitter ever contains
 //! transcendental assembly, the polynomial has one home, and precision is a
 //! property of this code rather than of whichever backend you landed on.
-//! The expansions deliberately avoid `MulAdd` and `Select`, staying inside the
+//! The expansions deliberately avoid `MulAdd` and `If`, staying inside the
 //! differentiable primitive set so `lower_dwrt` can still get through them.
 //!
-//! They may use `Select`. [`legalize`] runs `lower_dwrt` *before*
+//! They may use `If`. [`legalize`] runs `lower_dwrt` *before*
 //! `expand_transcendentals` — the chain rule manufactures `Sin`/`Cos` nodes
 //! that the transcendental pass must still lower — so an expansion is only ever
 //! evaluated, never differentiated, and derivatives are taken against the
-//! symbolic rules in `diff_node` instead. (`lower_dwrt` carries a `Select` rule
+//! symbolic rules in `diff_node` instead. (`lower_dwrt` carries an `If` rule
 //! regardless: it blends the branch derivatives on the primal mask.)
 //!
 //! Nothing re-fuses `mul`+`add` into `MulAdd` afterwards — see `horner_step`.
 
 use crate::arena::{ExprArena, ExprId, ExprNode};
-use crate::fold::Fold;
 use crate::kind::OpKind;
 use crate::variance::Variance;
+use alloc::borrow::Cow;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 /// The lattice's own two folds — `collapse(extent)`, `pack(lanes)` — as
-/// legalize passes. See the module doc above for their place in the order
-/// and why [`legalize`] does not call them yet.
+/// legalize passes. See the module doc above for their place in the order.
 pub mod lattice;
 
-/// Run every legalization pass, in the one order they compose in.
+/// Run every legalization pass, in the one order they compose in, for the
+/// collapse `collapse` describes: the kernel comes back wrapped in the
+/// lattice's folds, strip-mined to the target's lane width.
 ///
 /// This is the whole pipeline. It was previously four calls copied into each
 /// compile entry, which is how two since-deleted entries came to run none of
@@ -83,24 +76,30 @@ pub mod lattice;
 /// refuses a surviving `Dwrt`. An order that has to be retyped is an order
 /// that can be forgotten.
 ///
-/// Every pass has an identity fast-path, so calling this on an arena that
-/// needs nothing lowered costs four comparisons and no allocation. There is
-/// no reason for a caller to want a subset.
-///
 /// # Errors
 ///
 /// Propagates [`lower_dwrt_owned`]'s error for expressions with no derivative
 /// rule — bound-memory reads, integer/bit ops, reductions.
-pub fn legalize(arena: &ExprArena, root: ExprId) -> Result<(ExprArena, ExprId), &'static str> {
+pub fn legalize(
+    arena: &ExprArena,
+    root: ExprId,
+    collapse: &lattice::Collapse,
+) -> Result<(ExprArena, ExprId), &'static str> {
     // `expand_refs` before anything else: every pass below reads structure,
     // and a reference has none to read — you cannot differentiate a name.
     let (arena, root) = expand_refs_owned(arena, root);
     // `lower_dwrt` next: differentiating a `sin` manufactures a `cos`, so it
     // has to precede the pass that expands them.
-    let (arena, root) = lower_dwrt_owned(&arena, root)?;
+    let (mut arena, root) = lower_dwrt_owned(&arena, root)?;
+    // The lattice, as folds: after `collapse` no coordinate `Var` exists,
+    // and `pack` strip-mines its column fold to the width the caller's
+    // target executes by lanes. Before `expand_gather`, so a read's address
+    // arithmetic is built over the binders and its variance read off them.
+    let root = lattice::collapse(&mut arena, root, collapse.domain);
+    let root = lattice::pack(&mut arena, root, collapse.lanes);
     // No reduce pass. A `Reduce` is legal for codegen (stage 2c —
     // `pixelflow-codegen` emits a surviving fold as a loop), and since
-    // `extract_folds` carves a fold inside a fold's body as a loop inside a
+    // `extract_folds` (`program/scopes.rs`) carves a fold inside a fold's body as a loop inside a
     // loop, so is the shape `Kernel::by_ref` produces whenever two folds are
     // composed by name and `expand_refs` splices one into the other. That
     // shape was the last thing unrolled here (`expand_nested_reduce`, now
@@ -146,8 +145,8 @@ fn is_transcendental_binary(op: OpKind) -> bool {
 /// already-lowered child — or `None` to keep it as a plain structural copy.
 /// Shared subexpressions are rebuilt once (`id_map` dedups), so a DAG stays a
 /// DAG. This is the single skeleton behind [`expand_transcendentals`],
-/// [`expand_gather`], and [`expand_reduce`]; each supplies only its `lower`
-/// hook. Mirrors [`ExprArena::substitute_params`].
+/// [`expand_gather`], and [`expand_refs`]; each supplies only its `lower`
+/// hook. Mirrors [`ExprArena::substitute_vars_with`].
 fn rebuild_arena<F>(arena: &mut ExprArena, root: ExprId, mut lower: F) -> ExprId
 where
     F: FnMut(&mut ExprArena, &ExprNode, &dyn Fn(ExprId) -> ExprId) -> Option<ExprId>,
@@ -167,7 +166,7 @@ fn try_rebuild_arena<E, F>(arena: &mut ExprArena, root: ExprId, mut lower: F) ->
 where
     F: FnMut(&mut ExprArena, &ExprNode, &dyn Fn(ExprId) -> ExprId) -> Result<Option<ExprId>, E>,
 {
-    let old_len = arena.nodes_raw().len();
+    let old_len = arena.len();
     let mut id_map: Vec<Option<ExprId>> = alloc::vec![None; old_len];
 
     enum Task {
@@ -193,11 +192,11 @@ where
                 if id_map[id.0 as usize].is_some() {
                     continue;
                 }
-                let node = arena.node(id).clone();
+                let node = arena.node(id);
                 let m = |old: ExprId| id_map[old.0 as usize].expect("child lowered before parent");
                 let new_id = match lower(arena, &node, &m)? {
                     Some(new) => new,
-                    None => copy_node(arena, &node, &m),
+                    None => copy_node(arena, id, &node, &m),
                 };
                 id_map[id.0 as usize] = Some(new_id);
             }
@@ -209,7 +208,16 @@ where
 
 /// Structural copy of `node` into `arena` with its children remapped by `m`.
 /// The default action for any node a lowering hook does not replace.
-fn copy_node(arena: &mut ExprArena, node: &ExprNode, m: &dyn Fn(ExprId) -> ExprId) -> ExprId {
+///
+/// `source` is `node`'s own id — needed only for the `Nary` arm, to read its
+/// children through [`ExprArena::children`] rather than the n-ary slab's raw
+/// offsets (docs/plans/2026-09-09-exprarena-on-dag.md, Stage A).
+fn copy_node(
+    arena: &mut ExprArena,
+    source: ExprId,
+    node: &ExprNode,
+    m: &dyn Fn(ExprId) -> ExprId,
+) -> ExprId {
     match node {
         ExprNode::Var(i) => arena.push_var(*i),
         ExprNode::Const(v) => arena.push_const(*v),
@@ -221,22 +229,12 @@ fn copy_node(arena: &mut ExprArena, node: &ExprNode, m: &dyn Fn(ExprId) -> ExprI
         ExprNode::Unary(op, a) => arena.push_unary(*op, m(*a)),
         ExprNode::Binary(op, a, b) => arena.push_binary(*op, m(*a), m(*b)),
         ExprNode::Ternary(op, a, b, c) => arena.push_ternary(*op, m(*a), m(*b), m(*c)),
-        ExprNode::Nary(op, start, len) => {
-            let (s, l) = (*start as usize, *len as usize);
-            let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
+        ExprNode::Nary(op, ..) => {
+            let children: Vec<ExprId> = arena.children(source).collect();
             let mapped: Vec<ExprId> = children.into_iter().map(&m).collect();
             arena.push_nary(*op, &mapped)
         }
         ExprNode::Reduce { fold, body } => arena.push_reduce(*fold, m(*body)),
-        // `on`/`off` are names, copied unchanged exactly as `Ref`'s key is
-        // just above — this is the fallback every pass in this module falls
-        // through to when it has no rule for a node, and for a `Guard` that
-        // must mean "leave the arms alone": `expand_refs` in particular
-        // relies on reaching here for `Guard` (it has no rule for one
-        // either), which is what keeps a `Ref` inside an arm unexpanded by
-        // this pass while the mask — a real child, rebuilt through `m` like
-        // any other child — is legalized like the rest of the graph.
-        ExprNode::Guard { mask, on, off } => arena.push_guard(m(*mask), *on, *off),
         // The binders are metadata, copied as a fold's are; the value is
         // the one child.
         ExprNode::Write {
@@ -253,13 +251,15 @@ fn copy_node(arena: &mut ExprArena, node: &ExprNode, m: &dyn Fn(ExprId) -> ExprI
 /// Replace every [`ExprNode::Ref`] reachable from `root` with its referent,
 /// spliced in, returning the (possibly new) root in the same arena.
 ///
-/// This is the linker, and in this stage it only inlines
-/// (docs/plans/2026-09-09-composition-is-linking.md §3): a reference is
-/// resolved through the [`KernelStore`](crate::store::KernelStore) and its
-/// body copied in at the reference's position, reading the same coordinates
-/// the reference did. The splice merges the referent's buffer and uniform
-/// declarations into this arena by identity, exactly as composition does, so
-/// a referent over bound memory keeps naming the same memory.
+/// This is [`link`] with every body the [`KernelStore`](crate::store::KernelStore)'s,
+/// as written: a reference is resolved there and its body copied in at the
+/// reference's position, reading the same coordinates the reference did. The
+/// splice merges the referent's buffer and uniform declarations into this
+/// arena by identity, exactly as composition does, so a referent over bound
+/// memory keeps naming the same memory. The runtime tier links each body as
+/// *optimized* instead, through [`link`] itself: the store is where a unit's
+/// body is found, not the only thing a name may be linked to
+/// (docs/plans/2026-09-25-the-language-is-kernel.md §4, O1).
 ///
 /// Recursive: a referent may itself hold references, and each is expanded
 /// before its body is spliced. That terminates because references form a DAG
@@ -270,10 +270,11 @@ fn copy_node(arena: &mut ExprArena, node: &ExprNode, m: &dyn Fn(ExprId) -> ExprI
 /// referent is spliced once per key, and every later `Ref` to that key
 /// points at the same subgraph. A kernel referenced `m` times therefore
 /// costs one copy of its body rather than `m` — and a reduction inside it
-/// is unrolled once by [`expand_reduce`], not `m` times. Splicing per use
-/// would give back exactly what composition by value costs (measured on a
-/// glyph whose winding sum is read once per boundary piece: 16k, 37k, 58k
-/// legalized nodes *per piece* at 40, 73, 132 pieces — quadratic).
+/// is one fold, not `m`. Splicing per use would give back exactly what
+/// composition by value costs (measured, when legalization still unrolled
+/// every fold, on a glyph whose winding sum is read once per boundary piece:
+/// 16k, 37k, 58k legalized nodes *per piece* at 40, 73, 132 pieces —
+/// quadratic).
 ///
 /// # Panics
 ///
@@ -281,20 +282,64 @@ fn copy_node(arena: &mut ExprArena, node: &ExprNode, m: &dyn Fn(ExprId) -> ExprI
 /// `Kernel::by_ref`, which interns before it names, so an unresolvable key is
 /// a corrupt graph rather than a condition to recover from.
 pub fn expand_refs(arena: &mut ExprArena, root: ExprId) -> ExprId {
-    let mut spliced: BTreeMap<crate::key::KernelKey, ExprId> = BTreeMap::new();
+    link_with(arena, root, |key| {
+        let (body, body_root) = expanded_referent(key);
+        Some((Cow::Owned(body), body_root))
+    })
+}
+
+/// Replace every [`ExprNode::Ref`] reachable from `root` whose key `bodies`
+/// holds with that body, spliced in, returning the (possibly new) root in
+/// the same arena. A key `bodies` does not hold stays a reference.
+///
+/// The one linker walk, with the bodies given rather than looked up.
+/// [`expand_refs`] is it over the store's bodies as written; the runtime
+/// tier is it over each unit's body as *optimized* — a unit is saturated
+/// and extracted by itself, its own references held as opaque leaves, and
+/// linked here after extraction and before legalization, so the emitter
+/// sees one program (docs/plans/2026-09-25-the-language-is-kernel.md §4,
+/// O1). A body may hold references of its own, and each is linked through
+/// `bodies` before the body is spliced. A name is spliced once per key, as
+/// in [`expand_refs`].
+///
+/// Sound for any `bodies` whose entries denote what their keys name: the
+/// splice reads the reference's own coordinates, so `⟦Ref k⟧ = ⟦body k⟧`
+/// and the term's denotation is unchanged.
+pub fn link(
+    arena: &mut ExprArena,
+    root: ExprId,
+    bodies: &BTreeMap<crate::key::KernelKey, (ExprArena, ExprId)>,
+) -> ExprId {
+    link_with(arena, root, |key| {
+        let (body, body_root) = bodies.get(&key)?;
+        if !body.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))) {
+            return Some((Cow::Borrowed(body), *body_root));
+        }
+        let mut linked = body.clone();
+        let linked_root = link(&mut linked, *body_root, bodies);
+        Some((Cow::Owned(linked), linked_root))
+    })
+}
+
+/// The walk [`expand_refs`] and [`link`] share: each reachable `Ref` whose
+/// key `referent` answers is replaced by that body, spliced once per key.
+fn link_with<'b>(
+    arena: &mut ExprArena,
+    root: ExprId,
+    mut referent: impl FnMut(crate::key::KernelKey) -> Option<(Cow<'b, ExprArena>, ExprId)>,
+) -> ExprId {
+    let mut spliced: BTreeMap<crate::key::KernelKey, Option<ExprId>> = BTreeMap::new();
     rebuild_arena(arena, root, |arena, node, _m| match node {
-        ExprNode::Ref(key) => Some(
-            *spliced
-                .entry(*key)
-                .or_insert_with(|| splice_referent(arena, *key)),
-        ),
+        ExprNode::Ref(key) => *spliced.entry(*key).or_insert_with(|| {
+            referent(*key).map(|(body, body_root)| arena.splice(&body, body_root))
+        }),
         _ => None,
     })
 }
 
-/// Resolve one reference and splice its (itself ref-free) body into `arena`.
+/// Resolve one reference to its body, itself expanded.
 #[cfg(feature = "std")]
-fn splice_referent(arena: &mut ExprArena, key: crate::key::KernelKey) -> ExprId {
+fn expanded_referent(key: crate::key::KernelKey) -> (ExprArena, ExprId) {
     let referent = crate::store::KernelStore::resolve(key).unwrap_or_else(|| {
         panic!(
             "expand_refs: {key:?} names no interned kernel — every Ref is \
@@ -302,8 +347,7 @@ fn splice_referent(arena: &mut ExprArena, key: crate::key::KernelKey) -> ExprId 
         )
     });
     let (ref_arena, ref_root) = referent.parts();
-    let (expanded, expanded_root) = expand_refs_owned(ref_arena, ref_root);
-    arena.splice(&expanded, expanded_root)
+    expand_refs_owned(ref_arena, ref_root)
 }
 
 /// The same, where there is no store to resolve against.
@@ -314,7 +358,7 @@ fn splice_referent(arena: &mut ExprArena, key: crate::key::KernelKey) -> ExprId 
 /// here means one was minted by hand through `ExprArena::push_ref`, which
 /// names nothing.
 #[cfg(not(feature = "std"))]
-fn splice_referent(_arena: &mut ExprArena, key: crate::key::KernelKey) -> ExprId {
+fn expanded_referent(key: crate::key::KernelKey) -> (ExprArena, ExprId) {
     panic!(
         "expand_refs: {key:?} cannot be resolved — the KernelStore is the \
          `std` feature, and so is Kernel::by_ref, so nothing here can have \
@@ -326,11 +370,7 @@ fn splice_referent(_arena: &mut ExprArena, key: crate::key::KernelKey) -> ExprId
 /// fast-path when the arena holds no `Ref`, otherwise clone-and-expand.
 #[must_use]
 pub fn expand_refs_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    if !arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Ref(_)))
-    {
+    if !arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))) {
         return (arena.clone(), root);
     }
     let mut owned = arena.clone();
@@ -368,9 +408,9 @@ pub(crate) fn expand_transcendentals_owned(arena: &ExprArena, root: ExprId) -> (
     // re-order / re-dedup nodes), which would perturb register allocation for
     // transcendental-free kernels; skipping it keeps lowering a true no-op for
     // them.
-    if !arena.nodes_raw().iter().any(|n| match n {
-        ExprNode::Unary(op, _) => is_transcendental_unary(*op),
-        ExprNode::Binary(op, _, _) => is_transcendental_binary(*op),
+    if !arena.nodes().any(|(_, n)| match n {
+        ExprNode::Unary(op, _) => is_transcendental_unary(op),
+        ExprNode::Binary(op, _, _) => is_transcendental_binary(op),
         _ => false,
     }) {
         return (arena.clone(), root);
@@ -405,9 +445,8 @@ pub fn expand_gather(arena: &mut ExprArena, root: ExprId) -> ExprId {
 #[must_use]
 pub(crate) fn expand_gather_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
     if !arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Ternary(OpKind::Gather, _, _, _)))
+        .nodes()
+        .any(|(_, n)| matches!(n, ExprNode::Ternary(OpKind::Gather, _, _, _)))
     {
         return (arena.clone(), root);
     }
@@ -423,7 +462,7 @@ pub(crate) fn expand_gather_owned(arena: &ExprArena, root: ExprId) -> (ExprArena
 /// matching `DiscreteManifold::eval`.
 fn lower_gather(arena: &mut ExprArena, buf: ExprId, x: ExprId, y: ExprId) -> ExprId {
     let decl = match arena.node(buf) {
-        ExprNode::Buffer(id) => *arena.buffer_decl(*id),
+        ExprNode::Buffer(id) => *arena.buffer_decl(id),
         other => panic!("lower_gather: first child must be a Buffer leaf, got {other:?}"),
     };
 
@@ -449,233 +488,6 @@ fn lower_gather(arena: &mut ExprArena, buf: ExprId, x: ExprId, y: ExprId) -> Exp
     arena.push_binary(OpKind::RawGather, buf, idx)
 }
 
-// ─────────────────────────────── Reduce lowering ──────────────────────────────
-
-/// Unroll every `Reduce` reachable from `root` into an explicit accumulation
-/// tree, returning the (possibly new) root in the same arena.
-///
-/// N inlined copies of `body`, one per index the fold's range visits, the
-/// reduction index substituted as a `Const` in each — [`unroll_reduce`] has
-/// the exact combining shape. Because the range is static (bound memory),
-/// each copy's gather indices become constant, so the emitter folds their
-/// addresses to immediates: the fold compiles to a flat, call-free, unrolled
-/// kernel. This is the reduction analogue of [`expand_gather`].
-pub fn expand_reduce(arena: &mut ExprArena, root: ExprId) -> ExprId {
-    rebuild_arena(arena, root, |arena, node, m| match node {
-        // The body is already lowered; unroll the fold over it.
-        ExprNode::Reduce { fold, body } => Some(unroll_reduce(arena, *fold, m(*body))),
-        _ => None,
-    })
-}
-
-/// Owned wrapper mirroring [`expand_transcendentals_owned`]: identity fast-path
-/// when the arena has no `Reduce`, otherwise clone-and-lower.
-#[must_use]
-pub fn expand_reduce_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    if !arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Reduce { .. }))
-    {
-        return (arena.clone(), root);
-    }
-    let mut owned = arena.clone();
-    let new_root = expand_reduce(&mut owned, root);
-    (owned, new_root)
-}
-
-/// Build the unrolled accumulation for one fold whose body is already lowered.
-///
-/// This is [`Fold::halve`] run to exhaustion, falling back to
-/// [`Fold::peel_back`] for the odd remainder at whatever level it arises —
-/// the same preference `egraph::fold_rules::HalveFold` gives the saturator.
-/// Sharing the two methods (rather than each restating "even → pair up, odd
-/// → strip one from the back") is what keeps a fold that survives extraction
-/// unrolling into the *identical* shape one saturation resolved itself: one
-/// definition of "fully unrolled," not two that happen to agree today.
-fn unroll_reduce(arena: &mut ExprArena, fold: Fold, body: ExprId) -> ExprId {
-    // Empty domain folds to the monoid identity.
-    if fold.is_empty() {
-        return arena.push_const(fold.monoid().identity());
-    }
-    let combiner_op = fold.monoid().op();
-    let var_idx = fold.binder().var();
-
-    // Which of the body's nodes actually vary with the index. Everything else
-    // is shared across all N terms rather than copied into each of them: the
-    // rewrite `⊕_i (f(i) · c) = c · ⊕_i f(i)` obtained by not duplicating `c`
-    // in the first place. Computed once here, before the substitutions start
-    // appending; every node reachable from `body` predates that point, so the
-    // table covers each id the substitution asks about.
-    let variance = crate::variance::compute_arena_variance(arena);
-
-    // Ascending order (`peel`, not `peel_back`): `combine_halved` pairs
-    // front-to-back, so the terms must already run left to right.
-    let mut terms = Vec::with_capacity(fold.len() as usize);
-    let mut rest = fold;
-    while let Some((k, shorter)) = rest.peel() {
-        terms.push(Substitution::new(body, var_idx, k as f32, &variance).apply(arena, body));
-        rest = shorter;
-    }
-
-    combine_halved(arena, fold, &terms, combiner_op)
-}
-
-/// Combine `terms` — `fold`'s own terms, already substituted, left to
-/// right — the way repeated [`Fold::halve`] does: pair adjacent terms,
-/// recursing on the doubled-stride fold, until [`Fold::halve`] declines
-/// (an odd count, or the single-term base case), at which point
-/// [`Fold::peel_back`] strips the last term and this recurses on the even
-/// remainder. Threading `fold` through rather than re-deriving "even vs
-/// odd" from `terms.len()` keeps this one definition: the decomposition
-/// [`Fold::halve`]/[`Fold::peel_back`] already are, not a second copy of
-/// their logic that could drift from it.
-fn combine_halved(arena: &mut ExprArena, fold: Fold, terms: &[ExprId], op: OpKind) -> ExprId {
-    debug_assert_eq!(
-        fold.len() as usize,
-        terms.len(),
-        "a fold and its substituted terms stay in lockstep"
-    );
-    if let Some(halved) = fold.halve() {
-        let paired: Vec<ExprId> = terms
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&[a, b]| arena.push_binary(op, a, b))
-            .collect();
-        return combine_halved(arena, halved, &paired, op);
-    }
-    let (rest, _last_index) = fold
-        .peel_back()
-        .expect("combine_halved is never called on an empty fold");
-    let last = *terms
-        .last()
-        .expect("fold.len() == terms.len(), both non-empty");
-    if rest.is_empty() {
-        // `fold.len() == 1`: nothing left to combine `last` with.
-        return last;
-    }
-    let rest_val = combine_halved(arena, rest, &terms[..terms.len() - 1], op);
-    arena.push_binary(op, rest_val, last)
-}
-
-/// One unrolled term of a fold: the body with the bound index replaced by a
-/// literal step.
-///
-/// The variance table is what makes this cheap. A subtree that does not depend
-/// on the index would be rebuilt unchanged, so it is not rebuilt at all — the
-/// original node is returned and all N terms share it. That is the rewrite
-/// `⊕_i (f(i) · c) = c · ⊕_i f(i)` obtained by declining to duplicate `c`.
-struct Substitution<'a> {
-    /// The index being replaced, and the step to replace it with.
-    var: u8,
-    value: f32,
-    /// Variance for every node the body can reach, indexed by `ExprId`.
-    variance: &'a [Variance],
-    /// Rebuilt nodes, so a shared subtree is rebuilt once and stays shared.
-    ///
-    /// Sized to the body, not the arena: children are pushed before their
-    /// parent, so nothing the body reaches has an id above the body's own.
-    /// One table per term is unavoidable (each term substitutes a different
-    /// value), but an arena-sized one is written in full on allocation —
-    /// `None` here is not the zero pattern — and the arena grows with every
-    /// term appended, so the unroll wrote O(terms × arena) bytes to produce
-    /// O(terms × body) nodes.
-    memo: Vec<Option<ExprId>>,
-}
-
-impl<'a> Substitution<'a> {
-    fn new(body: ExprId, var: u8, value: f32, variance: &'a [Variance]) -> Self {
-        Self {
-            var,
-            value,
-            variance,
-            memo: alloc::vec![None; body.0 as usize + 1],
-        }
-    }
-
-    fn apply(&mut self, arena: &mut ExprArena, id: ExprId) -> ExprId {
-        let idx = id.0 as usize;
-        if let Some(Some(m)) = self.memo.get(idx) {
-            return *m;
-        }
-        if self
-            .variance
-            .get(idx)
-            .is_some_and(|v| v.is_invariant_in(self.var))
-        {
-            return id;
-        }
-        let new = match arena.node(id).clone() {
-            ExprNode::Var(i) if i == self.var => arena.push_const(self.value),
-            ExprNode::Var(i) => arena.push_var(i),
-            ExprNode::Const(v) => arena.push_const(v),
-            ExprNode::Param(i) => arena.push_param(i),
-            ExprNode::Buffer(b) => arena.push_buffer(b),
-            ExprNode::Uniform(u) => arena.push_uniform(u),
-            // A leaf, and a closed one: a referent binds its own reduction
-            // indices, so no substitution of this fold's index can reach
-            // inside it.
-            ExprNode::Ref(k) => arena.push_ref(k),
-            ExprNode::Unary(op, a) => {
-                let a = self.apply(arena, a);
-                arena.push_unary(op, a)
-            }
-            ExprNode::Binary(op, a, b) => {
-                let a = self.apply(arena, a);
-                let b = self.apply(arena, b);
-                arena.push_binary(op, a, b)
-            }
-            ExprNode::Ternary(op, a, b, c) => {
-                let a = self.apply(arena, a);
-                let b = self.apply(arena, b);
-                let c = self.apply(arena, c);
-                arena.push_ternary(op, a, b, c)
-            }
-            ExprNode::Nary(op, start, len) => {
-                let (s, l) = (start as usize, len as usize);
-                let children: Vec<ExprId> = arena.nary_children_raw()[s..s + l].to_vec();
-                let mapped: Vec<ExprId> = children
-                    .into_iter()
-                    .map(|ch| self.apply(arena, ch))
-                    .collect();
-                arena.push_nary(op, &mapped)
-            }
-            // A nested fold binds a slot of its own — `lowest_free_binder`
-            // never reissues a live one — so this index cannot be captured
-            // and the substitution simply passes through the body.
-            ExprNode::Reduce { fold, body } => {
-                let body = self.apply(arena, body);
-                arena.push_reduce(fold, body)
-            }
-            // Same reasoning as `Ref` just above: an arm names a closed
-            // kernel binding its own indices, so this fold's substitution
-            // cannot reach inside it. Only the mask, a real child of this
-            // arena, can hold the index and is recursed into.
-            ExprNode::Guard { mask, on, off } => {
-                let mask = self.apply(arena, mask);
-                arena.push_guard(mask, on, off)
-            }
-            // The value may read the index; the binders name folds that
-            // are never unrolled — a lattice fold survives to codegen as a
-            // loop — so they pass through untouched.
-            ExprNode::Write {
-                row,
-                col,
-                lane,
-                value,
-            } => {
-                let value = self.apply(arena, value);
-                arena.push_write(row, col, lane, value)
-            }
-        };
-        if let Some(slot) = self.memo.get_mut(idx) {
-            *slot = Some(new);
-        }
-        new
-    }
-}
-
 // ─────────────────────────────── Dwrt lowering ───────────────────────────────
 
 /// Rewrite every `Dwrt(expr, var)` reachable from `root` into the analytic
@@ -684,7 +496,7 @@ impl<'a> Substitution<'a> {
 ///
 /// This is the runtime peer of the e-graph `ChainRule` (pixelflow-search):
 /// same algebra, applied directly to the arena with no e-graph dependency.
-/// Derivatives of piecewise ops (`Min`/`Max`/`Select`/`Clamp`/`Abs`) mirror
+/// Derivatives of piecewise ops (`Min`/`Max`/`If`/`Clamp`/`Abs`) mirror
 /// the `Jet2` forward-mode semantics in pixelflow-core — a mask on the primal
 /// values selecting between branch derivatives — so a kernel differentiated
 /// here matches the combinator-over-`Jet2` path within numeric tolerance.
@@ -701,14 +513,14 @@ pub fn lower_dwrt(arena: &mut ExprArena, root: ExprId) -> Result<ExprId, &'stati
     try_rebuild_arena(arena, root, |arena, node, m| match node {
         ExprNode::Binary(OpKind::Dwrt, expr, var) => {
             let var_idx = match arena.node(m(*var)) {
-                ExprNode::Const(v) => *v as u8,
+                ExprNode::Const(v) => v as u8,
                 _ => return Err("lower_dwrt: Dwrt's variable operand must be a Const"),
             };
             differentiate(arena, m(*expr), var_idx).map(Some)
         }
         ExprNode::Unary(OpKind::Dwrt, _)
         | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-        | ExprNode::Nary(OpKind::Dwrt, _, _) => {
+        | ExprNode::Nary(OpKind::Dwrt, _) => {
             Err("lower_dwrt: malformed Dwrt node (must be Binary(expr, var))")
         }
         _ => Ok(None),
@@ -721,20 +533,26 @@ pub fn lower_dwrt_owned(
     arena: &ExprArena,
     root: ExprId,
 ) -> Result<(ExprArena, ExprId), &'static str> {
-    if !arena.nodes_raw().iter().any(|n| {
-        matches!(
-            n,
-            ExprNode::Unary(OpKind::Dwrt, _)
-                | ExprNode::Binary(OpKind::Dwrt, _, _)
-                | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-                | ExprNode::Nary(OpKind::Dwrt, _, _)
-        )
-    }) {
+    if !holds_dwrt(arena) {
         return Ok((arena.clone(), root));
     }
     let mut owned = arena.clone();
     let new_root = lower_dwrt(&mut owned, root)?;
     Ok((owned, new_root))
+}
+
+/// Whether a `Dwrt` of any arity is anywhere in `arena` — the test every
+/// `Dwrt` fast path here makes.
+fn holds_dwrt(arena: &ExprArena) -> bool {
+    arena.nodes().any(|(_, n)| {
+        matches!(
+            n,
+            ExprNode::Unary(OpKind::Dwrt, _)
+                | ExprNode::Binary(OpKind::Dwrt, _, _)
+                | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
+                | ExprNode::Nary(OpKind::Dwrt, _)
+        )
+    })
 }
 
 /// Build `∂(expr)/∂(Var(var))` as new nodes in `arena`, sharing the primal
@@ -744,7 +562,7 @@ pub fn lower_dwrt_owned(
 ///
 /// Fully iterative — no recursion over expression depth, so arbitrarily deep
 /// kernels cannot overflow the stack. Two passes: (1) mark the nodes whose
-/// derivative a rule actually consumes (lazy per op: `Select` masks and
+/// derivative a rule actually consumes (lazy per op: `If` masks and
 /// comparison operands are never differentiated), walking an explicit stack;
 /// (2) compute marked derivatives in ascending id order — the arena is
 /// append-only, so children always precede parents.
@@ -762,7 +580,7 @@ fn differentiate(arena: &mut ExprArena, expr: ExprId, var: u8) -> Result<ExprId,
         if !marked.insert(id) {
             continue;
         }
-        push_deriv_children(arena.node(id), &mut stack);
+        push_deriv_children(&arena.node(id), &mut stack);
     }
 
     // A tabulation is the one rule that asks about *dependence* rather than
@@ -876,23 +694,15 @@ fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
                 stack.push(c);
             }
             // The mask is never differentiated.
-            OpKind::Select => {
+            OpKind::If => {
                 stack.push(b);
                 stack.push(c);
             }
             _ => {}
         },
-        ExprNode::Nary(_, _, _) => {}
+        ExprNode::Nary(_, _) => {}
         // No rule: `diff_node` raises the error for the fold itself.
         ExprNode::Reduce { .. } => {}
-        // No rule: differentiating a branch is not a question this design
-        // answers (a `Guard`'s two arms are two different functions, and
-        // `Select`'s own rule below blends their derivatives on the primal
-        // mask — whether a `Guard` should do the same, or refuse, is a
-        // decision for whichever stage first composes `Guard` with the
-        // calculus, not G1). `diff_node` raises the error for the node
-        // itself, so nothing here needs its mask's derivative.
-        ExprNode::Guard { .. } => {}
         // An effect has no derivative; `diff_node` refuses it.
         ExprNode::Write { .. } => {}
     }
@@ -1055,13 +865,13 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
                 let da = dchild(memo, a);
                 let db = dchild(memo, b);
                 let mask = arena.push_binary(OpKind::Lt, a, b);
-                Ok(arena.push_ternary(OpKind::Select, mask, da, db))
+                Ok(arena.push_ternary(OpKind::If, mask, da, db))
             }
             OpKind::Max => {
                 let da = dchild(memo, a);
                 let db = dchild(memo, b);
                 let mask = arena.push_binary(OpKind::Gt, a, b);
-                Ok(arena.push_ternary(OpKind::Select, mask, da, db))
+                Ok(arena.push_ternary(OpKind::If, mask, da, db))
             }
             // Masks are step functions: zero derivative almost everywhere.
             OpKind::Lt | OpKind::Le | OpKind::Gt | OpKind::Ge | OpKind::Eq | OpKind::Ne => {
@@ -1116,29 +926,23 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
                 let prod = d_add(arena, t1, t2);
                 Ok(d_add(arena, prod, dc))
             }
-            // Blend the branch derivatives on the primal mask (Jet2 select).
-            OpKind::Select => {
+            // Blend the branch derivatives on the primal mask (Jet2 `If`).
+            OpKind::If => {
                 let db = dchild(memo, b);
                 let dc = dchild(memo, c);
-                Ok(arena.push_ternary(OpKind::Select, a, db, dc))
+                Ok(arena.push_ternary(OpKind::If, a, db, dc))
             }
             OpKind::Gather => rules.tabulation(arena, &[b, c]),
             _ => Err("lower_dwrt: no derivative rule for this ternary op"),
         },
 
-        ExprNode::Nary(_, _, _) => Err("lower_dwrt: cannot differentiate an Nary op (Tuple)"),
+        ExprNode::Nary(_, _) => Err("lower_dwrt: cannot differentiate an Nary op (Tuple)"),
         // Linearity — `d(⊕_k f) = ⊕_k d(f)` — holds for `Σ` and for nothing
         // else in the monoid set: `Π` needs the product rule, and `min`/`max`
         // are selections, not sums. The rule is not written here because
         // this lowering is a *fallback*; the place for it is the rule set,
         // where the e-graph can also decline it.
         ExprNode::Reduce { .. } => Err("lower_dwrt: no derivative rule for a bounded fold"),
-        // `Select`'s rule blends the branch derivatives on the primal mask;
-        // whether a `Guard` should do the same or refuse outright is a
-        // question for whichever stage first composes `Guard` with the
-        // calculus. G1 only makes the node constructible, so this declines
-        // rather than guess.
-        ExprNode::Guard { .. } => Err("lower_dwrt: no derivative rule for a Guard"),
         // A store is an effect, not a function of the coordinates; and
         // `lower_dwrt` runs before the passes that build one.
         ExprNode::Write { .. } => Err("lower_dwrt: no derivative of a store"),
@@ -1163,11 +967,11 @@ fn sqrt_one_minus_sq(arena: &mut ExprArena, u: ExprId) -> ExprId {
 }
 
 fn is_const_zero(arena: &ExprArena, id: ExprId) -> bool {
-    matches!(arena.node(id), ExprNode::Const(v) if *v == 0.0)
+    matches!(arena.node(id), ExprNode::Const(v) if v == 0.0)
 }
 
 fn is_const_one(arena: &ExprArena, id: ExprId) -> bool {
-    matches!(arena.node(id), ExprNode::Const(v) if *v == 1.0)
+    matches!(arena.node(id), ExprNode::Const(v) if v == 1.0)
 }
 
 // Peephole constructors for derivative arithmetic. Most leaf derivatives are
@@ -1310,8 +1114,8 @@ pub const ATAN_MINIMAX: [f32; 4] = [0.999_268_04, -0.321_431_33, 0.146_614_41, -
 ///
 /// Reduces to a ratio in [-1,1] (swapping y/x when |y|>|x|), a degree-7 odd
 /// polynomial for atan on that interval, then
-/// quadrant fix-ups via `Select` on comparison masks. Uses `Select`/`Lt`/`Gt`/
-/// `Ge`/`Recip` — all primitives the value path emits. (Like other Select-using
+/// quadrant fix-ups via `If` on comparison masks. Uses `If`/`Lt`/`Gt`/
+/// `Ge`/`Recip` — all primitives the value path emits. (Like other If-using
 /// expansions this is value-path only; the jet path has no Ternary rule.)
 fn expand_atan2(arena: &mut ExprArena, y: ExprId, x: ExprId) -> ExprId {
     let pi = arena.push_const(core::f32::consts::PI);
@@ -1327,7 +1131,7 @@ fn expand_atan2(arena: &mut ExprArena, y: ExprId, x: ExprId) -> ExprId {
     let recip_x = arena.push_unary(OpKind::Recip, x);
     let x_over_y = arena.push_binary(OpKind::Mul, x, recip_y);
     let y_over_x = arena.push_binary(OpKind::Mul, y, recip_x);
-    let ratio = arena.push_ternary(OpKind::Select, swap, x_over_y, y_over_x);
+    let ratio = arena.push_ternary(OpKind::If, swap, x_over_y, y_over_x);
 
     // atan(ratio) on [-1,1]: ratio · Horner(c7,c5,c3,c1)(ratio²).
     let r2 = arena.push_binary(OpKind::Mul, ratio, ratio);
@@ -1341,17 +1145,17 @@ fn expand_atan2(arena: &mut ExprArena, y: ExprId, x: ExprId) -> ExprId {
     // If swapped, result is ±π/2 − atan_small (sign from ratio).
     let ratio_nonneg = arena.push_binary(OpKind::Ge, ratio, zero);
     let neg_half_pi = arena.push_unary(OpKind::Neg, half_pi);
-    let signed_half = arena.push_ternary(OpKind::Select, ratio_nonneg, half_pi, neg_half_pi);
+    let signed_half = arena.push_ternary(OpKind::If, ratio_nonneg, half_pi, neg_half_pi);
     let swapped_val = arena.push_binary(OpKind::Sub, signed_half, atan_small);
-    let atan_val = arena.push_ternary(OpKind::Select, swap, swapped_val, atan_small);
+    let atan_val = arena.push_ternary(OpKind::If, swap, swapped_val, atan_small);
 
     // Quadrant fix-up: if x < 0, add ±π (sign from y).
     let x_neg = arena.push_binary(OpKind::Lt, x, zero);
     let y_neg = arena.push_binary(OpKind::Lt, y, zero);
     let neg_pi = arena.push_unary(OpKind::Neg, pi);
-    let adjust = arena.push_ternary(OpKind::Select, y_neg, neg_pi, pi);
+    let adjust = arena.push_ternary(OpKind::If, y_neg, neg_pi, pi);
     let adjusted = arena.push_binary(OpKind::Add, atan_val, adjust);
-    arena.push_ternary(OpKind::Select, x_neg, adjusted, atan_val)
+    arena.push_ternary(OpKind::If, x_neg, adjusted, atan_val)
 }
 
 /// `2^x` as a primitive subgraph.
@@ -1393,7 +1197,7 @@ fn expand_exp2(arena: &mut ExprArena, arg_x: ExprId) -> ExprId {
     // Outside domain (NaN input), return NaN. Check original arg_x, not clamped x.
     let is_not_nan = arena.push_binary(OpKind::Eq, arg_x, arg_x);
     let nan = arena.push_const(f32::NAN);
-    arena.push_ternary(OpKind::Select, is_not_nan, val, nan)
+    arena.push_ternary(OpKind::If, is_not_nan, val, nan)
 }
 
 /// `log2(x)` as a primitive subgraph (documented domain x > 0).
@@ -1408,7 +1212,7 @@ fn expand_exp2(arena: &mut ExprArena, arg_x: ExprId) -> ExprId {
 /// via the split constant `log2 e = 1 + LOG2EA` to avoid the rounding from one
 /// full-width multiply. Accurate to ~1 ulp over the reduced range.
 ///
-/// Uses `Select` on a `Ge` mask for the range reduction, so (like the other
+/// Uses `If` on a `Ge` mask for the range reduction, so (like the other
 /// bit-manipulating expansions) this is value-path only.
 fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     // Reinterpret x's bits as int (free) and extract exponent: e = (bits >> 23) - 127.
@@ -1430,10 +1234,10 @@ fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     let reduce = arena.push_binary(OpKind::Ge, m, sqrt2);
     let half = arena.push_const(0.5);
     let m_halved = arena.push_binary(OpKind::Mul, m, half);
-    let m = arena.push_ternary(OpKind::Select, reduce, m_halved, m);
+    let m = arena.push_ternary(OpKind::If, reduce, m_halved, m);
     let one = arena.push_const(1.0);
     let e_bumped = arena.push_binary(OpKind::Add, e, one);
-    let e = arena.push_ternary(OpKind::Select, reduce, e_bumped, e);
+    let e = arena.push_ternary(OpKind::If, reduce, e_bumped, e);
 
     let t = arena.push_binary(OpKind::Sub, m, one);
 
@@ -1468,7 +1272,7 @@ fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     let zero = arena.push_const(0.0);
     let in_domain = arena.push_binary(OpKind::Lt, zero, x);
     let nan = arena.push_const(f32::NAN);
-    arena.push_ternary(OpKind::Select, in_domain, val, nan)
+    arena.push_ternary(OpKind::If, in_domain, val, nan)
 }
 
 /// Largest `|x|` for which `sin`/`cos`/`tan` return a value. Beyond it they
@@ -1664,7 +1468,7 @@ fn expand_sin_phase(arena: &mut ExprArena, x: ExprId, phase: f32) -> ExprId {
     let abs_x = arena.push_unary(OpKind::Abs, x);
     let in_domain = arena.push_binary(OpKind::Lt, abs_x, limit);
     let nan = arena.push_const(f32::NAN);
-    arena.push_ternary(OpKind::Select, in_domain, s, nan)
+    arena.push_ternary(OpKind::If, in_domain, s, nan)
 }
 
 /// `acc·x + add` as one `MulAdd` node.
@@ -1687,17 +1491,18 @@ fn expand_sin_phase(arena: &mut ExprArena, x: ExprId, phase: f32) -> ExprId {
 /// This is the tier divergence the previous form existed to avoid, so it is
 /// stated rather than discovered. Unfused mul+add rounds twice everywhere, so
 /// the `eval_scalar` oracle and every backend agreed bit-for-bit. `MulAdd`
-/// rounds **once** where an FMA instruction exists (x86 with `+fma`, aarch64
-/// `FMLA`) and **twice** where it does not (SSE2 baseline: `mulps` + `addps`)
-/// — CLAUDE.md, "Floating point at the edges". So the SSE2 tier now differs
-/// from the FMA tiers by up to a rounding per Horner step.
+/// rounds **once** where an FMA instruction exists (every selectable tier:
+/// `vfmadd231ps`, `FMLA`) and **twice** where the emitter decomposes it
+/// under register pressure (`ResolvedOp::DecomposedMulAdd`) — CLAUDE.md,
+/// "Floating point at the edges". So a decomposed step differs from a fused
+/// one by up to a rounding per Horner step.
 ///
 /// That is a *precision* difference, which the codebase's own rule puts on the
 /// table; it is not a range difference, which is not. One rounding is never
 /// less accurate than two, so the FMA tiers move toward the true value, not
 /// away from it, and the polynomial's range guarantees (`|sin| ≤ 1`, the
 /// `TRIG_DOMAIN` NaN edge) are unaffected — they come from the reduction and
-/// the `Select`, neither of which is a Horner step.
+/// the `If`, neither of which is a Horner step.
 fn horner_step(arena: &mut ExprArena, acc: ExprId, x: ExprId, add: ExprId) -> ExprId {
     arena.push_ternary(OpKind::MulAdd, acc, x, add)
 }
@@ -1705,7 +1510,7 @@ fn horner_step(arena: &mut ExprArena, acc: ExprId, x: ExprId, add: ExprId) -> Ex
 #[cfg(test)]
 mod dwrt_tests {
     use super::*;
-    use crate::fold::{Binder, Monoid};
+    use crate::fold::{Binder, Fold, Monoid};
 
     /// The first reduction binder — `Var(4)`, which these folds bind.
     fn binder() -> Binder {
@@ -1719,7 +1524,7 @@ mod dwrt_tests {
         let y = a.push_var(1);
         let e = a.push_binary(OpKind::Add, x, y);
         let (out, root) = lower_dwrt_owned(&a, e).expect("lower_dwrt");
-        assert_eq!(out.nodes_raw().len(), a.nodes_raw().len());
+        assert_eq!(out.len(), a.len());
         assert_eq!(root, e);
     }
 
@@ -1741,8 +1546,8 @@ mod dwrt_tests {
         let v0 = a.push_const(0.0);
         let root = a.push_binary(OpKind::Dwrt, e, v0);
         let (out, out_root) = lower_dwrt_owned(&a, root).expect("lower_dwrt");
-        assert!(out.nodes_raw().len() > a.nodes_raw().len());
-        assert!((out_root.0 as usize) < out.nodes_raw().len());
+        assert!(out.len() > a.len());
+        assert!((out_root.0 as usize) < out.len());
     }
 
     #[test]
@@ -1754,29 +1559,6 @@ mod dwrt_tests {
         let v0 = a.push_const(0.0);
         let root = a.push_binary(OpKind::Dwrt, red, v0);
         assert!(lower_dwrt_owned(&a, root).is_err());
-    }
-
-    /// Same refusal, for the same reason, on a `Guard`: differentiating a
-    /// branch is a decision for whichever stage first composes `Guard` with
-    /// the calculus, not G1 (which only makes the node constructible).
-    #[test]
-    fn differentiating_a_guard_errors_loudly() {
-        let mut a = ExprArena::new();
-        let mask = a.push_var(0);
-        let guard = a.push_guard(
-            mask,
-            crate::key::KernelKey::from_bits(1),
-            crate::key::KernelKey::from_bits(2),
-        );
-        let v0 = a.push_const(0.0);
-        let root = a.push_binary(OpKind::Dwrt, guard, v0);
-        match lower_dwrt_owned(&a, root) {
-            Err(msg) => assert!(
-                msg.contains("no derivative rule for a Guard"),
-                "unexpected message: {msg}"
-            ),
-            Ok(_) => panic!("lower_dwrt must refuse a Guard"),
-        }
     }
 
     /// A uniform is a value, never an extent — and that used to need a test,
@@ -1791,8 +1573,8 @@ mod dwrt_tests {
         let mut a = ExprArena::new();
         let body = a.push_var(4);
         let red = a.push_reduce(Fold::new(Monoid::SUM, binder(), 0..4), body);
-        let ExprNode::Reduce { fold, .. } = *a.node(red) else {
-            panic!("expected a fold");
+        let ExprNode::Reduce { fold, .. } = a.node(red) else {
+            panic!("expected a range fold");
         };
         assert_eq!(fold.len(), 4);
         // The trip count is not reachable from the node's children, so no
@@ -1950,7 +1732,7 @@ mod dwrt_tests {
         let (lowered, lroot) =
             lower_dwrt_owned(&a, root).expect("a binder-indexed read is a constant");
         assert!(
-            matches!(lowered.node(lroot), ExprNode::Const(v) if *v == 0.0),
+            matches!(lowered.node(lroot), ExprNode::Const(v) if v == 0.0),
             "expected Const(0.0), got {:?}",
             lowered.node(lroot)
         );
@@ -1964,7 +1746,7 @@ mod dwrt_tests {
         let (lowered, lroot) =
             lower_dwrt_owned(&a, root).expect("a binder-indexed read is a constant");
         assert!(
-            matches!(lowered.node(lroot), ExprNode::Const(v) if *v == 0.0),
+            matches!(lowered.node(lroot), ExprNode::Const(v) if v == 0.0),
             "expected Const(0.0), got {:?}",
             lowered.node(lroot)
         );
@@ -1986,7 +1768,7 @@ mod dwrt_tests {
         let (lowered, lroot) =
             lower_dwrt_owned(&a, root).expect("an X-indexed read is constant in Y");
         assert!(
-            matches!(lowered.node(lroot), ExprNode::Const(v) if *v == 0.0),
+            matches!(lowered.node(lroot), ExprNode::Const(v) if v == 0.0),
             "expected Const(0.0), got {:?}",
             lowered.node(lroot)
         );
@@ -1994,9 +1776,9 @@ mod dwrt_tests {
 
     #[test]
     fn rebuild_copies_nary_children_slice_correctly() {
-        // `copy_node`'s Nary arm reads `nodes_raw()[start..start+len]` — a
-        // second Nary node makes `start` nonzero, which is what distinguishes
-        // `start+len` from `start*len` (they coincide when start is 0).
+        // `copy_node`'s Nary arm reads `arena.children(source)` — a second
+        // Nary node makes the first's internal slab offset nonzero, which is
+        // what would expose an off-by-one in that slice if one existed.
         let mut a = ExprArena::new();
         let p = a.push_var(0);
         let _throwaway = a.push_nary(OpKind::Tuple, &[p]); // start=0, len=1
@@ -2010,14 +1792,16 @@ mod dwrt_tests {
         // its non-matching arms; `expand_transcendentals` is the simplest
         // public one and this arena has nothing for it to actually lower.
         let new_root = expand_transcendentals(&mut a, root);
-        let ExprNode::Nary(OpKind::Tuple, start, len) = a.node(new_root) else {
-            panic!("expected a rebuilt Tuple, got {:?}", a.node(new_root));
-        };
-        let children = a.nary_children_slice(*start, *len);
+        assert!(
+            matches!(a.node(new_root), ExprNode::Nary(OpKind::Tuple, ..)),
+            "expected a rebuilt Tuple, got {:?}",
+            a.node(new_root)
+        );
+        let children: Vec<ExprId> = a.children(new_root).collect();
         assert_eq!(children.len(), 3, "wrong slice length");
         for (child, expected_var) in children.iter().zip([0u8, 1, 4]) {
             assert!(
-                matches!(a.node(*child), ExprNode::Var(v) if *v == expected_var),
+                matches!(a.node(*child), ExprNode::Var(v) if v == expected_var),
                 "child {child:?} should be Var({expected_var})"
             );
         }
@@ -2086,11 +1870,7 @@ pub struct ExpandRefs;
 
 impl Optimize for ExpandRefs {
     fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if !arena
-            .nodes_raw()
-            .iter()
-            .any(|n| matches!(n, ExprNode::Ref(_)))
-        {
+        if !arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))) {
             return Rewritten::Unchanged;
         }
         let mut owned = arena.clone();
@@ -2117,15 +1897,7 @@ pub struct LowerDwrt;
 
 impl Optimize for LowerDwrt {
     fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if !arena.nodes_raw().iter().any(|n| {
-            matches!(
-                n,
-                ExprNode::Unary(OpKind::Dwrt, _)
-                    | ExprNode::Binary(OpKind::Dwrt, _, _)
-                    | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-                    | ExprNode::Nary(OpKind::Dwrt, _, _)
-            )
-        }) {
+        if !holds_dwrt(arena) {
             return Rewritten::Unchanged;
         }
         let mut owned = arena.clone();
@@ -2133,30 +1905,6 @@ impl Optimize for LowerDwrt {
             Ok(new_root) => Rewritten::Changed(owned, new_root),
             Err(_) => Rewritten::Declined,
         }
-    }
-}
-
-/// Unroll every `Reduce` into its terms.
-///
-/// The extents are static, so the binder disappears into N terms sharing their
-/// index-invariant subtrees, and what saturation then sees is binder-free
-/// arithmetic it can CSE and fold across those terms — rather than rewriting
-/// under a binder.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ExpandReduce;
-
-impl Optimize for ExpandReduce {
-    fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if !arena
-            .nodes_raw()
-            .iter()
-            .any(|n| matches!(n, ExprNode::Reduce { .. }))
-        {
-            return Rewritten::Unchanged;
-        }
-        let mut owned = arena.clone();
-        let new_root = expand_reduce(&mut owned, root);
-        Rewritten::Changed(owned, new_root)
     }
 }
 
@@ -2183,15 +1931,18 @@ mod nested_reduce_tests {
     }
 
     /// A `Reduce` whose body reads another `Reduce`'s result reaches the
-    /// backend as written: two folds, one inside the other. This used to be
-    /// the one shape `legalize` still unrolled (`expand_nested_reduce`,
-    /// deleted), because codegen carved fold bodies out one level at a time;
-    /// it carves a fold inside a fold now, and the pass went with the
-    /// restriction it existed for.
+    /// backend as written: two folds, one inside the other, both inside the
+    /// lattice's three. This used to be the one shape `legalize` still
+    /// unrolled (`expand_nested_reduce`, deleted), because codegen carved
+    /// fold bodies out one level at a time; it carves a fold inside a fold
+    /// now, and the pass went with the restriction it existed for.
     ///
     /// `inner = sum_{i<3}(X+i)`; `outer = sum_{j<2}(inner+j)`.
     #[test]
-    fn legalize_leaves_a_nested_reduce_standing() {
+    fn legalize_leaves_a_nested_reduce_standing_inside_the_lattices_folds() {
+        use crate::arena::{UniformDecl, UniformIdentity};
+        use crate::variance::LatticeShape;
+
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let inner_binder = Binder::from_slot(0).expect("slot 0 exists");
@@ -2204,21 +1955,41 @@ mod nested_reduce_tests {
         let outer_body = a.push_binary(OpKind::Add, inner, j);
         let root = a.push_reduce(Fold::new(Monoid::SUM, outer_binder, 0..2), outer_body);
 
-        let (legalized, new_root) = legalize(&a, root).expect("legalize");
+        let origin = |default| UniformDecl {
+            id: UniformIdentity::mint(),
+            default,
+        };
+        let collapse = lattice::Collapse {
+            domain: lattice::Domain {
+                shape: LatticeShape::new([4, 1]),
+                origin: [origin(0.0), origin(0.0)],
+            },
+            lanes: 4,
+        };
+        let (legalized, new_root) = legalize(&a, root, &collapse).expect("legalize");
+        // The lattice's row, column and lane folds around the kernel's two.
         assert_eq!(
             reachable_reduces(&legalized, new_root),
-            2,
-            "both folds must survive legalization"
+            5,
+            "both folds must survive legalization, inside the lattice's three"
         );
-        let ExprNode::Reduce { fold, body } = legalized.node(new_root) else {
-            panic!("root must still be the outer Reduce");
+        let ExprNode::Reduce { fold, .. } = legalized.node(new_root) else {
+            panic!("root must be the lattice's row fold");
         };
-        assert_eq!(fold.range(), 0..2);
-        let ExprNode::Binary(OpKind::Add, lhs, _) = legalized.node(*body) else {
+        assert_eq!(fold.monoid(), Monoid::SEQ);
+        assert_eq!(fold.range(), 0..1);
+        let outer = (0..legalized.len())
+            .map(|k| ExprId(k as u32))
+            .find(|id| matches!(legalized.node(*id), ExprNode::Reduce { fold, .. } if fold.range() == (0..2)))
+            .expect("the outer kernel fold survives");
+        let ExprNode::Reduce { body, .. } = legalized.node(outer) else {
+            unreachable!()
+        };
+        let ExprNode::Binary(OpKind::Add, lhs, _) = legalized.node(body) else {
             panic!("the outer body must still be `inner + j`");
         };
         assert!(
-            matches!(legalized.node(*lhs), ExprNode::Reduce { fold, .. } if fold.range() == (0..3)),
+            matches!(legalized.node(lhs), ExprNode::Reduce { fold, .. } if fold.range() == (0..3)),
             "the inner Reduce must be the outer body's own operand, not unrolled into it"
         );
     }
@@ -2253,16 +2024,54 @@ mod ref_expansion_tests {
         let (arena, root) = k.parts();
         let (out, out_root) = expand_refs_owned(arena, root);
         assert_eq!(out_root, root, "the root cannot move");
-        assert_eq!(
-            out.nodes_raw().len(),
-            arena.nodes_raw().len(),
-            "no node may be added or dropped"
-        );
+        assert_eq!(out.len(), arena.len(), "no node may be added or dropped");
         assert_eq!(canonical(&out, out_root).key, canonical(arena, root).key);
         assert!(matches!(
             ExpandRefs.optimize(arena, root),
             Rewritten::Unchanged
         ));
+    }
+
+    /// `link` splices the bodies it is given — here not the store's — once
+    /// per key, links a body's own references through the same map first,
+    /// and leaves a key it was not given a reference.
+    #[test]
+    fn link_splices_the_bodies_it_is_given_and_leaves_the_rest() {
+        let key_of = |k: &Kernel| match k.parts().0.node(k.parts().1) {
+            ExprNode::Ref(key) => key,
+            other => panic!("expected a reference, got {other:?}"),
+        };
+        let inner = Kernel::y().by_ref();
+        let outer_body = Kernel::x().add(&inner);
+        let outer = outer_body.by_ref();
+        let unlinked = Kernel::constant(2.0).by_ref();
+        let program = outer.mul(&outer).add(&unlinked);
+
+        // `inner` is linked to 7, which is not what the store holds for it.
+        let mut seven = ExprArena::new();
+        let seven_root = seven.push_const(7.0);
+        let (outer_arena, outer_root) = outer_body.parts();
+        let bodies = BTreeMap::from([
+            (key_of(&inner), (seven, seven_root)),
+            (key_of(&outer), (outer_arena.clone(), outer_root)),
+        ]);
+        let (arena, root) = program.parts();
+        let mut linked = arena.clone();
+        let root = link(&mut linked, root, &bodies);
+
+        let ExprNode::Binary(OpKind::Add, product, rest) = linked.node(root) else {
+            panic!("expected a sum, got {}", linked.display(root));
+        };
+        assert_eq!(linked.node(rest), ExprNode::Ref(key_of(&unlinked)));
+        let ExprNode::Binary(OpKind::Mul, a, b) = linked.node(product) else {
+            panic!("expected a product, got {}", linked.display(product));
+        };
+        assert_eq!(a, b, "one name is one node, however often it is read");
+        let ExprNode::Binary(OpKind::Add, x, c) = linked.node(a) else {
+            panic!("expected X + 7, got {}", linked.display(a));
+        };
+        assert_eq!(linked.node(x), ExprNode::Var(0));
+        assert_eq!(linked.node(c), ExprNode::Const(7.0));
     }
 
     /// `lower_dwrt` on its own refuses a reference rather than inventing a
@@ -2304,57 +2113,5 @@ mod ref_expansion_tests {
     #[should_panic(expected = "an open term has no identity")]
     fn naming_an_open_term_is_refused() {
         let _refused = Kernel::sum_over(3, |i| i.by_ref());
-    }
-
-    /// **The load-bearing property of G1.** `expand_refs` rewrites
-    /// `ExprNode::Ref` and nothing else, so a `Guard`'s two names — fields,
-    /// not children — are simply not a shape this pass can reach: they
-    /// survive expansion exactly as written. The mask, a real child in this
-    /// arena, has no such protection and is expanded like any other node —
-    /// this is what tells the test apart from a pass that does nothing at
-    /// all.
-    #[test]
-    fn expand_refs_leaves_a_guards_arms_intact() {
-        let on_key = Kernel::x().sqrt().by_ref();
-        let off_key = Kernel::y().neg().by_ref();
-        let on_key = match on_key.parts().0.node(on_key.parts().1) {
-            ExprNode::Ref(k) => *k,
-            other => panic!("Kernel::by_ref must produce a Ref, got {other:?}"),
-        };
-        let off_key = match off_key.parts().0.node(off_key.parts().1) {
-            ExprNode::Ref(k) => *k,
-            other => panic!("Kernel::by_ref must produce a Ref, got {other:?}"),
-        };
-
-        // The mask itself is a `Ref` — real expansion work to do, so a
-        // no-op pass could not accidentally pass this test.
-        let named_x = Kernel::x().by_ref();
-        let (mask_arena, mask_root) = named_x.parts();
-        assert!(
-            matches!(mask_arena.node(mask_root), ExprNode::Ref(_)),
-            "test setup: the mask must actually be a Ref"
-        );
-
-        let mut arena = mask_arena.clone();
-        let guard = arena.push_guard(mask_root, on_key, off_key);
-
-        let (expanded, expanded_root) = expand_refs_owned(&arena, guard);
-
-        match expanded.node(expanded_root) {
-            ExprNode::Guard { mask, on, off } => {
-                assert_eq!(*on, on_key, "on must survive expand_refs untouched");
-                assert_eq!(*off, off_key, "off must survive expand_refs untouched");
-                assert!(
-                    !matches!(expanded.node(*mask), ExprNode::Ref(_)),
-                    "the mask, a real child, must still be expanded — got {:?}",
-                    expanded.node(*mask)
-                );
-                assert!(
-                    matches!(expanded.node(*mask), ExprNode::Var(0)),
-                    "the mask named X, so its expansion must read X directly"
-                );
-            }
-            other => panic!("expand_refs must not splice a Guard's arms away, got {other:?}"),
-        }
     }
 }

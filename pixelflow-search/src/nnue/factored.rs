@@ -826,6 +826,12 @@ impl ChoicesCostDag<'_> {
             ENode::Param(_) => OpKind::Param,
             ENode::Op { op, .. } => op.kind(),
             ENode::Reduce { .. } => OpKind::Reduce,
+            // No op names a whole kernel, and a unit is the one leaf this
+            // walk cannot meet: only the runtime tier admits one.
+            ENode::Ref { key, .. } => panic!(
+                "ChoicesCostDag: {key:?} is a unit — a leaf only the runtime tier's \
+                 unit walk admits, and it has no OpKind"
+            ),
         }
     }
 

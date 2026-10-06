@@ -132,15 +132,19 @@ jobs:
           path: flake-results/
           if-no-files-found: ignore
 
-  # Single-run build+lint+test pass per x86-64 ISA level (SSE2/AVX2/AVX-512).
-  # Presubmit (rust.yaml) already built+linted every level with
-  # `--build-only`; this is the actual execution pass, deferred here because
-  # it's the slow part (four full test runs, one per ISA_LEVELS entry) and a
-  # bad result now means reverting the already-merged commit, not blocking a
-  # PR. No flake-retry loop like the `test` job above: a failure here is a
-  # genuine ISA-level break, and a flaky failure is exactly as real a break as
-  # a consistent one -- it fails this job outright, which fails the workflow
+  # One build+lint, then the whole workspace's tests once per x86-64 ISA tier
+  # the runner's CPU can execute (AVX2, AVX-512), each under
+  # `PIXELFLOW_ISA=<tier>`. Presubmit (rust.yaml) ran only the smoke subset
+  # per tier; this is the full execution pass, deferred here because it's the
+  # slow part (one full test run per ISA_LEVELS entry) and a bad result now
+  # means reverting the already-merged commit, not blocking a PR. No
+  # flake-retry loop like the `test` job above: a failure here is a genuine
+  # tier-level break, and a flaky failure is exactly as real a break as a
+  # consistent one -- it fails this job outright, which fails the workflow
   # and triggers the automatic revert.
+  #
+  # The name still says SSE2 to match the presubmit check's name; the SSE2
+  # tier itself is gone (docs/plans/2026-09-22-the-isa-is-decided-at-startup.md).
   isa-matrix:
     name: ISA matrix (SSE2/AVX2/AVX-512) -- build+lint+test
     runs-on: ubuntu-latest
@@ -181,7 +185,7 @@ jobs:
           restore-keys: |
             cargo-registry-
 
-      - name: Run ISA matrix (test + clippy per supported level)
+      - name: Run ISA matrix (build + clippy once, workspace tests per tier)
         shell: bash
         run: cargo run -p xtask -- isa-matrix --clippy
 

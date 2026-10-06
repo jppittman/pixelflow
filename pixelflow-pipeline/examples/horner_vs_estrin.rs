@@ -31,20 +31,21 @@
 //! which nothing in the render path currently holds.
 //!
 //! Run: `cargo run --release -p pixelflow-pipeline --example horner_vs_estrin`
-//! At other ISA levels (whether `MulAdd` is one instruction or two is most of
-//! the question): `RUSTFLAGS="-C llvm-args=-fp-contract=fast -C
-//! target-feature=+avx2,+fma" cargo run --release ...`
+//! At another ISA tier the host can execute: `PIXELFLOW_ISA=avx2 cargo run
+//! --release ...` (the tier is decided at startup, not by build flags).
 
 use pixelflow_codegen::emit::compile;
-use pixelflow_codegen::{JIT_VECTOR_BYTES, Point4, TileSlice};
 use pixelflow_core::FastMathGuard;
 use pixelflow_ir::passes::{ATAN_MINIMAX, EXP2_POLY, LOG2_POLY, SIN_CHEB};
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{ExprArena, ExprId, LatticeShape, OpKind};
 use pixelflow_pipeline::jit_bench::{BenchMode, BenchSession};
 use pixelflow_pipeline::poly::{PolyForm, build, critical_path};
 use pixelflow_search::egraph::CostModel;
 
-const LANES: usize = JIT_VECTOR_BYTES / 4;
+/// Lanes in one batch at the tier the JIT selected for this host.
+fn lanes() -> usize {
+    pixelflow_codegen::jit_vector_bytes() / 4
+}
 
 /// Degrees swept. Starts below the production polynomials (`ATAN_MINIMAX` is
 /// 4 coefficients) and runs well past them, so a crossover is bracketed rather
@@ -214,22 +215,18 @@ struct Emitted {
 /// Run a compiled kernel over `n` consecutive integer X values — the JIT's own
 /// arithmetic, FMA rounding included, which no scalar reference reproduces and
 /// which is why the error check runs here rather than through `eval_scalar`.
+///
+/// One collapse call over an `[n, 1]` plane: `x = 0 + col` for `col in 0..n`,
+/// whether or not `n` is a multiple of a batch — the compiled kernel handles
+/// its own remainder, so there is no group count or truncation any more.
 fn evaluate(arena: &ExprArena, root: ExprId, n: usize) -> Emitted {
-    let result = compile(arena, root).expect("compile");
-    let groups = n.div_ceil(LANES);
-    let mut out = vec![0.0f32; groups * LANES];
-    let mut x0 = [0.0f32; LANES];
-    for (i, lane) in x0.iter_mut().enumerate() {
-        *lane = i as f32;
-    }
+    let result = compile(arena, root, LatticeShape::new([n as u32, 1])).expect("compile");
+    let mut out = vec![0.0f32; n];
+    let origin = [0.0f32, 0.0f32];
+    let ctx: [*const f32; 2] = [core::ptr::null(), origin.as_ptr()];
     unsafe {
-        result.code.call_collapse(
-            core::ptr::null(),
-            TileSlice::contiguous(out.as_mut_ptr(), groups, 1),
-            Point4::new(x0, [0.0; LANES], [0.0; LANES], [0.0; LANES]),
-        );
+        result.code.call(ctx.as_ptr(), out.as_mut_ptr(), n);
     }
-    out.truncate(n);
     Emitted {
         outputs: out,
         spills: result.spill_count,
@@ -315,7 +312,7 @@ fn bench_one(
         // Spills and code size describe the kernel that was TIMED; the
         // accuracy kernel below is a different (unclamped) argument generator
         // and would report a different frame.
-        let timed = evaluate(&arena, root, LANES);
+        let timed = evaluate(&arena, root, lanes());
         row.spills[f] = timed.spills;
         row.bytes[f] = timed.bytes;
         for (m, &mode) in MODES.iter().enumerate() {
@@ -380,13 +377,14 @@ fn print_row(row: &Row) {
 /// this cancels overhead AND the shared prelude exactly, which is the protocol
 /// `measure_latency_prior` uses and the only one that survives a mode whose
 /// fixed cost rivals the kernel. `BenchMode::Latency`'s chaining apparatus —
-/// a 4×`LANES`-wide `Point4` stored to the stack, a call, and a store→load
-/// round trip, all of it serial — costs ~30ns per call at AVX-512, which pins
-/// every degree below ~16 to the same reading and makes an absolute ratio
-/// there a measurement of the harness. The slope does not care.
+/// the previous call's output fed back into both origin coordinates, a call,
+/// and a store→load round trip, all of it serial — costs some tens of ns per
+/// call at AVX-512, which pins every degree below ~16 to the same reading and
+/// makes an absolute ratio there a measurement of the harness. The slope does
+/// not care.
 ///
 /// Reported per CALL, not per lane: the quantity being compared is one more
-/// instruction in the kernel, and a kernel instruction serves all `LANES`.
+/// instruction in the kernel, and a kernel instruction serves all `lanes()`.
 fn slope_ns_per_degree(
     session: &mut BenchSession,
     form: PolyForm,
@@ -399,7 +397,7 @@ fn slope_ns_per_degree(
         measure(session, &arena, root, mode).0
     };
     let (ns_lo, ns_hi) = (at(lo), at(hi));
-    (ns_hi - ns_lo) * LANES as f64 / (hi - lo) as f64
+    (ns_hi - ns_lo) * lanes() as f64 / (hi - lo) as f64
 }
 
 /// Degrees the slope is differenced across. `SLOPE_LO` is above the point
@@ -420,10 +418,10 @@ fn production_polys() -> [(&'static str, &'static [f32]); 4] {
 
 fn main() {
     println!(
-        "# horner vs estrin — JIT_VECTOR_BYTES={JIT_VECTOR_BYTES} (LANES={LANES}), \
-         arch={}, host fma={}",
+        "# horner vs estrin — tier={} (LANES={}), arch={}",
+        pixelflow_codegen::isa::detect().name(),
+        lanes(),
         std::env::consts::ARCH,
-        cfg!(target_feature = "fma"),
     );
 
     let model = CostModel::latency_prior();

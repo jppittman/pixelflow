@@ -1,4 +1,4 @@
-use crate::input::{KeySymbol, Modifiers, MouseButton};
+use crate::input::{KeySymbol, Modifiers, MouseButton, Selection};
 // use pixelflow_render::Frame;
 
 /// Window ID wrapper for identifying windows.
@@ -224,18 +224,17 @@ pub enum EngineEventManagement {
     /// **Application**: May pause animations, suspend input processing, etc.
     FocusLost,
 
-    /// Text pasted from clipboard.
+    /// The content of a selection, answering `AppManagement::RequestPaste`.
     ///
     /// # Contract
     ///
-    /// **Engine**: User pasted; text comes from the system clipboard.
+    /// **Engine**: Sends exactly one per `RequestPaste`, naming the selection
+    /// that was read. The text is empty when the selection is empty or
+    /// unavailable. Answers for the same selection arrive in request order;
+    /// answers for different selections may not.
     ///
-    /// **Application**: Should insert the pasted text at the cursor position.
-    ///
-    /// # Arguments
-    ///
-    /// - UTF-8 text from the clipboard
-    Paste(String),
+    /// **Application**: Decides what the text is for — typically a paste.
+    Paste { selection: Selection, text: String },
 }
 
 /// Data events from the Engine (frame synchronization).
@@ -393,8 +392,17 @@ pub enum AppManagement {
     CreateWindow(WindowDescriptor),
     SetTitle(String),
     ResizeRequest(u32, u32),
-    CopyToClipboard(String),
-    RequestPaste,
+    /// Put text in a selection, for other applications to paste.
+    Copy {
+        selection: Selection,
+        text: String,
+    },
+    /// Read a selection; the text arrives as `EngineEventManagement::Paste`.
+    RequestPaste(Selection),
+    /// Ring the bell: the platform's alert sound or equivalent.
+    Bell,
+    /// Enter full screen, or leave it.
+    ToggleFullscreen,
     SetCursorIcon(CursorIcon),
     Quit,
 }
@@ -411,8 +419,16 @@ impl std::fmt::Debug for AppManagement {
             AppManagement::ResizeRequest(w, h) => {
                 f.debug_tuple("ResizeRequest").field(&(w, h)).finish()
             }
-            AppManagement::CopyToClipboard(s) => f.debug_tuple("CopyToClipboard").field(s).finish(),
-            AppManagement::RequestPaste => f.write_str("RequestPaste"),
+            AppManagement::Copy { selection, text } => f
+                .debug_struct("Copy")
+                .field("selection", selection)
+                .field("text", text)
+                .finish(),
+            AppManagement::RequestPaste(selection) => {
+                f.debug_tuple("RequestPaste").field(selection).finish()
+            }
+            AppManagement::Bell => f.write_str("Bell"),
+            AppManagement::ToggleFullscreen => f.write_str("ToggleFullscreen"),
             AppManagement::SetCursorIcon(icon) => {
                 f.debug_tuple("SetCursorIcon").field(icon).finish()
             }

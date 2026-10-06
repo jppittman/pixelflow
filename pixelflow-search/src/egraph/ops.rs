@@ -3,7 +3,7 @@
 //! Each operation is a unit struct implementing the `Op` trait.
 //! Properties are delegated to `OpKind` - the single source of truth.
 
-use pixelflow_ir::{EmitStyle, OpKind};
+use pixelflow_ir::OpKind;
 
 /// Trait for operations in the e-graph.
 ///
@@ -16,12 +16,6 @@ pub trait Op: 'static + Send + Sync {
     #[inline]
     fn name(&self) -> &'static str {
         self.kind().name()
-    }
-
-    /// How to emit this operation in generated code.
-    #[inline]
-    fn emit_style(&self) -> EmitStyle {
-        self.kind().emit_style()
     }
 
     /// Default cost estimate (delegates to `OpKind::default_cost`).
@@ -131,7 +125,7 @@ define_op!(Eq);
 define_op!(Ne);
 
 // === Control Flow ===
-define_op!(Select);
+define_op!(If);
 
 // === Aggregates ===
 define_op!(Tuple);
@@ -202,7 +196,7 @@ pub fn op_from_kind(kind: OpKind) -> Option<&'static dyn Op> {
         OpKind::Ge => Some(&Ge),
         OpKind::Eq => Some(&Eq),
         OpKind::Ne => Some(&Ne),
-        OpKind::Select => Some(&Select),
+        OpKind::If => Some(&If),
         OpKind::Tuple => Some(&Tuple),
         // Autodiff operator: lives in the e-graph, rewritten by the chain rule.
         OpKind::Dwrt => Some(&Dwrt),
@@ -307,7 +301,7 @@ pub(crate) fn mask_or() -> &'static dyn Op {
 // `Shl`/`Shr` do keep `Const` shift operands, because extraction emits `Const`
 // leaves verbatim — so the emitter's immediate-only contract holds. The count's
 // RANGE is a separate matter, enforced where the `Const` narrows to an
-// immediate (`emit::shift_immediate`) rather than assumed here.
+// immediate (`shift_immediate` in `program/lower.rs`) rather than assumed here.
 struct IntTrunc;
 impl Op for IntTrunc {
     fn kind(&self) -> OpKind {

@@ -10,9 +10,10 @@
 //! pairwise coverage exercises every 2-way interaction with a handful of cases.
 
 use super::pict::pairwise;
+use super::tests::{Command, Parsed};
 use super::{
     commands::{AnsiCommand, Attribute, CsiCommand},
-    AnsiParser, AnsiProcessor,
+    AnsiProcessor,
 };
 use crate::color::{Color, NamedColor};
 use test_log::test;
@@ -94,8 +95,8 @@ fn sgr_factors() -> Vec<Vec<Level>> {
     ]
 }
 
-fn process(bytes: &[u8]) -> Vec<AnsiCommand> {
-    AnsiProcessor::new().process_bytes(bytes)
+fn process(bytes: &[u8]) -> Vec<Parsed> {
+    super::tests::parse(&mut AnsiProcessor::new(), bytes)
 }
 
 /// Build the `ESC[...m` byte sequence for a chosen row, and its oracle output.
@@ -131,7 +132,7 @@ fn build_case(factors: &[Vec<Level>], row: &[usize]) -> (Vec<u8>, Vec<Attribute>
 fn parsed_attrs(seq: &[u8]) -> Option<Vec<Attribute>> {
     let commands = process(seq);
     match commands.as_slice() {
-        [AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs))] => Some(attrs.clone()),
+        [Command(AnsiCommand::Csi(CsiCommand::SetGraphicsRendition(attrs)))] => Some(attrs.clone()),
         _ => None,
     }
 }

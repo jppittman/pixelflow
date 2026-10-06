@@ -10,7 +10,9 @@ use super::provenance::{ApplicationRecord, Origin, UnionEvent};
 use super::provenance::{ENodeId, Provenance};
 use super::rewrite::{Rewrite, RewriteAction};
 use super::rules::RuleId;
+use alloc::collections::BTreeMap;
 use pixelflow_ir::kind::OpKind;
+use pixelflow_ir::{KernelKey, Variance};
 
 /// A potential rewrite target: (rule, e-class, node within class).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -106,6 +108,41 @@ pub struct EGraph {
     /// the moment congruence closure does its work. The fact must outlive the
     /// nodes.
     const_fact: Vec<Option<u32>>,
+    /// Which binders each class may depend on, indexed by class id — the
+    /// per-class variance fact (docs/plans/2026-09-23-an-integral-is-a-fold.md
+    /// §1, §3), kept beside `const_fact` and out of `EClass::nodes` for the
+    /// same reason: a guard read mid-`rebuild` must not see a drained class.
+    ///
+    /// **Law:** `var_fact[C] ⊇ var(⟦C⟧)` — the fact over-approximates the
+    /// variance of the one function every member of `C` denotes, so a bit
+    /// absent from the fact is a binder the class is provably constant along.
+    ///
+    /// - **Seeded** in [`EGraph::add`] by [`ENode::variance`], the node's
+    ///   transfer function, over its children's facts *as they stand then*.
+    ///   Each child's fact over-approximates the child, and the transfer is
+    ///   monotone, so the seed over-approximates the node.
+    /// - **Merged** in [`EGraph::union`] by *intersection*. Both classes
+    ///   denote the same function and both facts over-approximate it, so a
+    ///   bit either one lacks is a bit the function lacks. A fact only ever
+    ///   shrinks from its seed and never grows up from `∅` — the greatest
+    ///   fixpoint, not the least — which is why a cycle cannot certify an
+    ///   invariance: a class holding `x` and `x + 0` got each member's fact
+    ///   from facts that already existed, never from an assumption about
+    ///   itself.
+    /// - **Never repaired upward.** A union that shrinks a child's fact does
+    ///   not revisit the parents seeded from the larger one. A stale parent
+    ///   fact is still a superset, so a rule reading it may miss an
+    ///   opportunity but can never fire wrongly; soundness needs no repair.
+    var_fact: Vec<Variance>,
+    /// The units this graph may hold as leaves, with the variance each
+    /// carries — told to it by the runtime tier's unit walk
+    /// ([`EGraph::admit_unit`]) before the term is inserted. A unit's body is
+    /// not in this graph, so its variance cannot be computed here; and a
+    /// reference the graph was not told about is one [`insert`](super::insert)
+    /// declines, which is what keeps every other path — the macro tier,
+    /// research tools — exactly as it was (docs/plans/2026-09-25-the-language-is-kernel.md
+    /// §4, O1).
+    units: BTreeMap<KernelKey, Variance>,
     /// Unions REFUSED because they would assert two numerically unequal
     /// constants equal — a proved falsehood the graph declines to absorb.
     /// Distinct (bits, bits) pairs, kept for reporting and tests; see
@@ -193,7 +230,10 @@ pub struct EGraph {
 /// its own node list, or its direct children's, changing at all, and a
 /// 1-hop scheme would silently never re-check it — under-saturation that no
 /// correctness test can see, only a comparison against the un-skipped
-/// extraction cost can.
+/// extraction cost can. The runtime tier's `FactorFold` (outside
+/// `all_rules`, in `fold_rules`) is depth 2 as well: it reads a fold's body
+/// class and then its operands' variance facts, and a fact changes only when
+/// its own class is unioned, which bumps that class's `last_changed`.
 ///
 /// This is a single, uniform, crate-wide constant rather than a per-rule
 /// depth precisely so a future rule cannot silently exceed it the way a
@@ -325,6 +365,8 @@ impl Clone for EGraph {
             #[cfg(feature = "provenance-journal")]
             active_application: self.active_application,
             const_fact: self.const_fact.clone(),
+            var_fact: self.var_fact.clone(),
+            units: self.units.clone(),
             refused_const_unions: self.refused_const_unions.clone(),
             applications: self.applications,
             #[cfg(feature = "provenance-journal")]
@@ -441,8 +483,10 @@ pub struct SaturationStats {
 /// leaves every class the graph does hold correct, which is what
 /// truncation has always meant here.
 ///
-/// Two orders of magnitude above the production caps (500/2000/5000, see
-/// `SaturationConfig`), so no shipping configuration meets it.
+/// Twice the classical cap's ceiling (`CLASSICAL_CLASS_CEILING`, 50,000),
+/// and two orders of magnitude above the floors every shipped kernel keeps
+/// (500/2,000/5,000, see `SaturationConfig`), so no shipping configuration
+/// meets it.
 ///
 /// It bounds the graph *approximately*: a sweep estimates the classes a
 /// pending action will mint (`RewriteAction::Union` 0, `Create` 1, every
@@ -476,6 +520,8 @@ impl EGraph {
             #[cfg(feature = "provenance-journal")]
             active_application: None,
             const_fact: Vec::new(),
+            var_fact: Vec::new(),
+            units: BTreeMap::new(),
             refused_const_unions: Vec::new(),
             applications: 0,
             #[cfg(feature = "provenance-journal")]
@@ -513,6 +559,8 @@ impl EGraph {
             #[cfg(feature = "provenance-journal")]
             active_application: None,
             const_fact: Vec::new(),
+            var_fact: Vec::new(),
+            units: BTreeMap::new(),
             refused_const_unions: Vec::new(),
             applications: 0,
             #[cfg(feature = "provenance-journal")]
@@ -652,6 +700,37 @@ impl EGraph {
         }
     }
 
+    /// Tell this graph that `key` names a **unit** varying as `variance` says,
+    /// so a reference to it inserts as an opaque leaf
+    /// ([`ENode::Ref`]) rather than being declined.
+    ///
+    /// The runtime tier's unit walk calls this once per unit a term reads,
+    /// before inserting the term: it is the walk that holds each unit's body,
+    /// and so the only place its variance can be computed
+    /// (docs/plans/2026-09-25-the-language-is-kernel.md §4, O1).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `variance` names a binder or a retired axis — a unit is a
+    /// closed term over the coordinates and uniforms, and nothing else can be
+    /// optimized out of its context, because no rewrite outside it can reach
+    /// a binder inside it.
+    pub(crate) fn admit_unit(&mut self, key: KernelKey, variance: Variance) {
+        assert!(
+            variance.without(Variance::COORDS).is_const(),
+            "EGraph::admit_unit: {key:?} varies as {variance:?} — a unit must be \
+             closed over the coordinates, and this one reads a binder no \
+             rewrite outside it could substitute"
+        );
+        self.units.insert(key, variance);
+    }
+
+    /// The variance a unit admitted by [`Self::admit_unit`] carries, or
+    /// `None` if `key` was never admitted.
+    pub(crate) fn unit_variance(&self, key: KernelKey) -> Option<Variance> {
+        self.units.get(&key).copied()
+    }
+
     /// Insert `node`, returning the e-class that contains it.
     ///
     /// **Total, and the law depends on it.** The returned class always
@@ -686,6 +765,9 @@ impl EGraph {
             self.provenance.record_origin(enode_id, origin);
         }
         self.const_fact.push(node.as_f32().map(f32::to_bits));
+        // `node` is canonical, so every child indexes its class's live fact.
+        let variance = node.variance(|child| self.var_fact[child.index()]);
+        self.var_fact.push(variance);
         self.classes.push(EClass {
             nodes: vec![node.clone()],
             tags: vec![enode_id],
@@ -704,6 +786,29 @@ impl EGraph {
     #[must_use]
     pub fn refused_const_unions(&self) -> &[(u32, u32)] {
         &self.refused_const_unions
+    }
+
+    /// The binders `class` may depend on: a superset of what the function it
+    /// denotes varies with, so `!variance(c).depends_on(b)` proves `c` is
+    /// constant along `b` (see the `var_fact` field for the law and why it
+    /// holds without repair).
+    ///
+    /// The side condition every loop-transformation rule over a fold asks —
+    /// `⊕_i (c ⊗ f) = c ⊗ ⊕_i f` iff `i ∉ var(c)` — asked of the class
+    /// rather than of one representative.
+    #[must_use]
+    pub(crate) fn variance(&self, class: EClassId) -> Variance {
+        self.var_fact[self.find(class).index()]
+    }
+
+    /// The literal `class` is known to equal, if it is one — the class's
+    /// constant fact, which outlives a mid-`rebuild` drain of its nodes (see
+    /// the `const_fact` field). A comparison mask reads here as the NaN its
+    /// all-ones pattern is, so a caller that wants a *number* asks for one
+    /// it can recognize (`1.0`, a finite nonzero slope).
+    #[must_use]
+    pub(crate) fn constant(&self, class: EClassId) -> Option<f32> {
+        self.const_fact[self.find(class).index()].map(f32::from_bits)
     }
 
     pub fn union(&mut self, a: EClassId, b: EClassId) -> EClassId {
@@ -776,6 +881,9 @@ impl EGraph {
         if self.const_fact[parent.index()].is_none() {
             self.const_fact[parent.index()] = self.const_fact[child.index()];
         }
+        // Intersection, not a choice: see `var_fact`'s law.
+        self.var_fact[parent.index()] =
+            self.var_fact[parent.index()].intersection(self.var_fact[child.index()]);
         // `parent`'s own node list just changed (gained `child`'s nodes) —
         // see `class_is_dirty`/`DIRTY_TRACKING_MAX_DEPTH`.
         self.mutation_counter += 1;
@@ -1117,6 +1225,12 @@ impl EGraph {
             ENode::Param(_) => pixelflow_ir::OpKind::Param,
             ENode::Op { op, .. } => op.kind(),
             ENode::Reduce { .. } => pixelflow_ir::OpKind::Reduce,
+            // No op names a whole kernel, and a unit is the one leaf a
+            // research walk cannot meet: only the runtime tier admits one.
+            ENode::Ref { key, .. } => panic!(
+                "canonical_op: {key:?} is a unit — a leaf only the runtime tier's \
+                 unit walk admits, and it has no OpKind"
+            ),
         }
     }
 
@@ -1181,8 +1295,8 @@ impl EGraph {
     /// returning `false`: `false` already means "the rule did not fire",
     /// and a budget exhaustion that is indistinguishable from a non-match
     /// is the silent failure this ceiling exists to prevent. No production
-    /// path calls this, and the production caps are two orders of
-    /// magnitude below the limit.
+    /// path calls this, and the production caps stay below the limit (the
+    /// classical ceiling is half of it).
     pub fn apply_single_rule(&mut self, rule_idx: usize, class_id: EClassId, tag: ENodeId) -> bool {
         assert!(
             self.classes.len() < HARD_CLASS_LIMIT,
@@ -2082,21 +2196,8 @@ impl EGraph {
             RewriteAction::Differentiate { inner, var } => self.predict(|s| {
                 derivative_shape(s, inner, *var);
             }),
-            RewriteAction::PeelFold {
-                head,
-                head_root,
-                rest,
-                body,
-            } => self.predict(|s| {
-                peel_fold_shape(s, head, *head_root, *rest, *body);
-            }),
-            RewriteAction::HalveFold {
-                shift,
-                shift_root,
-                halved,
-                body,
-            } => self.predict(|s| {
-                halve_fold_shape(s, shift, *shift_root, *halved, *body);
+            RewriteAction::Plan(plan) => self.predict(|s| {
+                plan_shape(s, plan);
             }),
         }
     }
@@ -2237,23 +2338,9 @@ impl EGraph {
                 let deriv_id = derivative_shape(self, &inner, var);
                 self.union_counted(class_id, deriv_id)
             }
-            RewriteAction::PeelFold {
-                head,
-                head_root,
-                rest,
-                body,
-            } => {
-                let peeled = peel_fold_shape(self, &head, head_root, rest, body);
-                self.union_counted(class_id, peeled)
-            }
-            RewriteAction::HalveFold {
-                shift,
-                shift_root,
-                halved,
-                body,
-            } => {
-                let doubled = halve_fold_shape(self, &shift, shift_root, halved, body);
-                self.union_counted(class_id, doubled)
+            RewriteAction::Plan(plan) => {
+                let built = plan_shape(self, &plan);
+                self.union_counted(class_id, built)
             }
         }
     }
@@ -2876,38 +2963,24 @@ fn instantiate_template<S: NodeSink>(
                 children,
             })
         }
-        // No rule rewrites *into* a `Guard` yet — extraction cannot choose
-        // one over the `Select` it equals (G3), so no RHS template has a
-        // reason to build one, and the e-graph has no `ENode::Guard` for
-        // `sink.make` to produce even if one tried.
-        ExprData::Guard { on, off, .. } => {
-            panic!("instantiate_template: Guard(on={on:?}, off={off:?}) in a rewrite RHS template")
-        }
     }
 }
 
-/// Build `head ⊕ ⊕_{rest} body` — one peeled term combined with the fold over
-/// what is left.
+/// Build a [`Plan`](super::fold_rules::Plan) — every fold and integration
+/// rule's right-hand side — and return the class of its root.
 ///
-/// The head arrives as a template because computing it needs to *read* the
-/// graph (walking the body's classes to substitute the binder), which a
-/// [`NodeSink`] cannot do; the rule does that half and this replays it. The
-/// tail names `body` directly: peeling moves the range, never the body, which
-/// is what makes the rule affordable at all.
-fn peel_fold_shape<S: NodeSink>(
-    sink: &mut S,
-    head: &[super::fold_rules::HeadNode],
-    head_root: super::fold_rules::HeadRef,
-    rest: pixelflow_ir::Fold,
-    body: EClassId,
-) -> EClassId {
+/// The plan arrives already computed because computing it needs to *read*
+/// the graph (walking a body's classes to substitute a binder, recognizing an
+/// integrand), which a [`NodeSink`] cannot do; the rule does that half and
+/// this replays it, node by node in build order.
+fn plan_shape<S: NodeSink>(sink: &mut S, plan: &super::fold_rules::Plan) -> EClassId {
     use super::fold_rules::{HeadNode, HeadRef};
-    let mut planned: Vec<EClassId> = Vec::with_capacity(head.len());
+    let mut planned: Vec<EClassId> = Vec::with_capacity(plan.nodes.len());
     let resolve = |r: HeadRef, planned: &[EClassId]| match r {
         HeadRef::Plan(i) => planned[i as usize],
         HeadRef::Class(c) => c,
     };
-    for entry in head {
+    for entry in &plan.nodes {
         let id = match entry {
             HeadNode::Const(bits) => sink.make(ENode::Const(*bits)),
             HeadNode::Op { op, children } => sink.make(ENode::Op {
@@ -2921,65 +2994,7 @@ fn peel_fold_shape<S: NodeSink>(
         };
         planned.push(id);
     }
-    let head = resolve(head_root, &planned);
-    let rest_class = sink.make(ENode::Reduce { fold: rest, body });
-    let op = super::fold_rules::combiner_op(rest.monoid())
-        .expect("PeelFold checked the combiner before emitting this action");
-    // `rest` first: the peel takes the *last* index, so the accumulator is on
-    // the left and the chain leans the way `expand_reduce` builds it.
-    sink.make(ENode::Op {
-        op,
-        children: vec![rest_class, head],
-    })
-}
-
-/// Build `Reduce { fold: halved, body: body ⊕ shift }` — a fold's body
-/// doubled and its trip count halved.
-///
-/// `shift` arrives as a template for the reason `peel_fold_shape`'s `head`
-/// does: computing it needs to *read* the graph, which a [`NodeSink`]
-/// cannot do. `body` names the unshifted half directly — nothing about it
-/// changes, so nothing about it is rebuilt.
-fn halve_fold_shape<S: NodeSink>(
-    sink: &mut S,
-    shift: &[super::fold_rules::HeadNode],
-    shift_root: super::fold_rules::HeadRef,
-    halved: pixelflow_ir::Fold,
-    body: EClassId,
-) -> EClassId {
-    use super::fold_rules::{HeadNode, HeadRef};
-    let mut planned: Vec<EClassId> = Vec::with_capacity(shift.len());
-    let resolve = |r: HeadRef, planned: &[EClassId]| match r {
-        HeadRef::Plan(i) => planned[i as usize],
-        HeadRef::Class(c) => c,
-    };
-    for entry in shift {
-        let id = match entry {
-            HeadNode::Const(bits) => sink.make(ENode::Const(*bits)),
-            HeadNode::Op { op, children } => sink.make(ENode::Op {
-                op: *op,
-                children: children.iter().map(|c| resolve(*c, &planned)).collect(),
-            }),
-            HeadNode::Reduce { fold, body } => sink.make(ENode::Reduce {
-                fold: *fold,
-                body: resolve(*body, &planned),
-            }),
-        };
-        planned.push(id);
-    }
-    let shifted = resolve(shift_root, &planned);
-    let op = super::fold_rules::combiner_op(halved.monoid())
-        .expect("HalveFold checked the combiner before emitting this action");
-    // `body` first: `b ⊕ b[binder := binder+s]`, the unshifted (original
-    // left-to-right order) half on the left.
-    let doubled_body = sink.make(ENode::Op {
-        op,
-        children: vec![body, shifted],
-    });
-    sink.make(ENode::Reduce {
-        fold: halved,
-        body: doubled_body,
-    })
+    resolve(plan.root, &planned)
 }
 
 /// Build the e-class of the derivative of `inner` with respect to variable
@@ -3007,6 +3022,25 @@ fn derivative_shape<S: NodeSink>(sink: &mut S, inner: &ENode, var: u8) -> EClass
         // Likewise ∂p/∂x = 0: a builder's scalar is one number for the
         // whole lattice, whichever number it turns out to be.
         ENode::Param(_) => return sink.make(ENode::constant(0.0)),
+        // A unit that does not vary along the axis has derivative zero, as
+        // a uniform does. One that does keeps its `Dwrt`: a name has no
+        // structure to differentiate. The unit walk links every reference
+        // a written `Dwrt` reaches before insertion, so the chain rule runs
+        // here on every derivative the program wrote; a `Dwrt` over a unit
+        // can only come of rewriting a class it shares, and one extraction
+        // keeps is lowered by `lower_dwrt` on the linked body, after the
+        // link, like any other `Dwrt` the rules did not reach.
+        ENode::Ref { variance, .. } => {
+            if !variance.depends_on(var) {
+                return sink.make(ENode::constant(0.0));
+            }
+            let var_const = sink.make(ENode::constant(var as f32));
+            let inner = sink.make(inner.clone());
+            return sink.make(ENode::Op {
+                op: &ops::Dwrt,
+                children: vec![inner, var_const],
+            });
+        }
         ENode::Op { op, children } => (*op, children.clone()),
         // `d(⊕_k f) = ⊕_k d(f)` is linearity, which holds for `Σ` and for
         // nothing else in the monoid set — `Π` wants the product rule, and
@@ -3132,7 +3166,7 @@ fn derivative_shape<S: NodeSink>(sink: &mut S, inner: &ENode, var: u8) -> EClass
             let db = dwrt(sink, b);
             let mask = op2(sink, &ops::Lt, a, b);
             sink.make(ENode::Op {
-                op: &ops::Select,
+                op: &ops::If,
                 children: vec![mask, da, db],
             })
         }
@@ -3142,18 +3176,18 @@ fn derivative_shape<S: NodeSink>(sink: &mut S, inner: &ENode, var: u8) -> EClass
             let db = dwrt(sink, b);
             let mask = op2(sink, &ops::Gt, a, b);
             sink.make(ENode::Op {
-                op: &ops::Select,
+                op: &ops::If,
                 children: vec![mask, da, db],
             })
         }
         // Blend the branch derivatives on the primal mask; the mask itself
         // is not differentiated.
-        OpKind::Select => {
+        OpKind::If => {
             let (m, t, f) = (children[0], children[1], children[2]);
             let dt = dwrt(sink, t);
             let df = dwrt(sink, f);
             sink.make(ENode::Op {
-                op: &ops::Select,
+                op: &ops::If,
                 children: vec![m, dt, df],
             })
         }
@@ -4632,5 +4666,131 @@ mod mask_tests {
             "withholding a candidate and every re-derivation of it must change what the \
              run built — otherwise Δ is measuring nothing"
         );
+    }
+}
+
+/// The per-class variance fact (`var_fact`): seeded by the transfer function,
+/// merged by intersection, and a superset of the truth whatever the graph did
+/// to reach it.
+#[cfg(test)]
+mod variance_fact_tests {
+    use super::*;
+    use pixelflow_ir::{Binder, Fold, Monoid};
+
+    fn op2(op: &'static dyn Op, a: EClassId, b: EClassId) -> ENode {
+        ENode::Op {
+            op,
+            children: vec![a, b],
+        }
+    }
+
+    /// **Free of what any member is free of.** `X − X` is seeded `{X}` from
+    /// its children; the graph then learns it equals `0`, and the class is
+    /// `{X} ∩ ∅ = ∅`. A parent seeded before the union keeps its larger fact
+    /// — no upward repair — which is still a superset of the truth, so a rule
+    /// reading it can miss the invariance but never invent one.
+    #[test]
+    fn a_class_is_free_of_what_any_member_is_free_of() {
+        let mut eg = EGraph::new();
+        let x = eg.add(ENode::Var(0));
+        let y = eg.add(ENode::Var(1));
+        let x_minus_x = eg.add(op2(&ops::Sub, x, x));
+        let parent = eg.add(op2(&ops::Mul, x_minus_x, y));
+        assert_eq!(eg.variance(x_minus_x), Variance::X, "seeded from X and X");
+        assert_eq!(eg.variance(parent), Variance::COORDS);
+
+        let zero = eg.add(ENode::constant(0.0));
+        eg.union(x_minus_x, zero);
+        eg.rebuild();
+
+        assert_eq!(
+            eg.variance(x_minus_x),
+            Variance::CONST,
+            "one member proves the class constant, so the class is"
+        );
+        assert!(
+            eg.variance(parent).depends_on_x(),
+            "the parent's seed is stale and says so: still a superset of the \
+             truth ({{Y}}), which is all soundness needs"
+        );
+    }
+
+    /// **The meet is an intersection, not a pick.** A class proved equal to
+    /// both a Y-only and an X-only term varies with neither — a popcount
+    /// minimum would have kept one of the two.
+    #[test]
+    fn two_disjoint_members_leave_nothing() {
+        let mut eg = EGraph::new();
+        let x = eg.add(ENode::Var(0));
+        let y = eg.add(ENode::Var(1));
+        let sin_x = eg.add(ENode::Op {
+            op: &ops::Sin,
+            children: vec![x],
+        });
+        let sin_y = eg.add(ENode::Op {
+            op: &ops::Sin,
+            children: vec![y],
+        });
+        eg.union(sin_x, sin_y);
+        eg.rebuild();
+        assert_eq!(eg.variance(sin_x), Variance::CONST);
+    }
+
+    /// **A fold frees its binder**, and only its binder: `Σ_i (i · X)` varies
+    /// with `X`, its body with both.
+    #[test]
+    fn a_fold_removes_its_binder() {
+        let mut eg = EGraph::new();
+        let binder = Binder::from_slot(0).expect("a live binder");
+        let i = eg.add(ENode::Var(binder.var()));
+        let x = eg.add(ENode::Var(0));
+        let body = eg.add(op2(&ops::Mul, i, x));
+        let fold = eg.add(ENode::Reduce {
+            fold: Fold::new(Monoid::SUM, binder, 0..8),
+            body,
+        });
+        assert_eq!(
+            eg.variance(body),
+            Variance::X.union(Variance::from_var(binder.var()))
+        );
+        assert_eq!(eg.variance(fold), Variance::X);
+    }
+
+    /// **A cycle does not certify invariance.** Once `X + 0` is merged with
+    /// `X`, the class holds a member whose child is the class itself. Every
+    /// fact in it was seeded from facts that already existed — `X`'s own bit
+    /// — and never from an assumption about the class, so the cycle leaves
+    /// `{X}` standing. A least fixpoint started from `∅` closes at `∅`
+    /// instead: `var(C) = {X} ∩ var(C + 0)` and `var(C + 0) = var(C)`, so
+    /// `∅` is a fixpoint, and it is false.
+    #[test]
+    fn a_cycle_does_not_certify_invariance() {
+        let mut eg = EGraph::new();
+        let x = eg.add(ENode::Var(0));
+        let zero = eg.add(ENode::constant(0.0));
+        let x_plus_0 = eg.add(op2(&ops::Add, x, zero));
+        eg.union(x_plus_0, x);
+        eg.rebuild();
+
+        let class = eg.find(x);
+        assert!(
+            eg.nodes(class)
+                .iter()
+                .any(|n| n.children_slice().iter().any(|&c| eg.find(c) == class)),
+            "precondition: the class reaches itself"
+        );
+        assert_eq!(eg.variance(class), Variance::X);
+    }
+
+    /// The fact survives a clone — a search branch reads the same facts its
+    /// parent had.
+    #[test]
+    fn a_clone_keeps_the_facts() {
+        let mut eg = EGraph::new();
+        let x = eg.add(ENode::Var(0));
+        let y = eg.add(ENode::Var(1));
+        let sum = eg.add(op2(&ops::Add, x, y));
+        let copy = eg.clone();
+        assert_eq!(copy.variance(sum), Variance::COORDS);
     }
 }

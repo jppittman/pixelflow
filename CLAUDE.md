@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **NO TERMINAL LOGIC GOES IN PIXELFLOW.** PixelFlow is a general-purpose graphics library being extracted to its own crate/repo. Keep it terminal-agnostic.
 - Exporting direct manipulation of fields from pixelflow-core is strictly forbidden. Construct compute kernels at load time and render them.
 - **NO RAW LANE ARITHMETIC.** Do not perform raw operations on SIMD values without explicit direction. ALWAYS build the arena — `Kernel` values and the `kernel!` macro — and let the compiler emit the instructions.
-- **SIMD is an implementation detail.** `Field` — one SIMD batch, the collapse ABI's vector — is `pub(crate)` in pixelflow-core, and nothing outside that crate can name it, a lane, or a width. Do not change that. pixelflow-core is an algebra; writing it should look like Halide, not assembly.
+- **SIMD is an implementation detail.** pixelflow-core holds no vector type and no width. The one width in the workspace is the JIT's (`pixelflow_codegen::jit_vector_bytes()`), and which tier that is — AVX2+FMA as the floor and AVX-512 where the host has it on x86-64; NEON on aarch64 — is decided once, at process startup, by CPUID (`pixelflow_codegen::isa::detect`), never by build flags (docs/plans/2026-09-22-the-isa-is-decided-at-startup.md). Nothing outside `pixelflow-codegen`'s emitters names a lane. Do not change that. pixelflow-core is an algebra; writing it should look like Halide, not assembly. Nothing crosses the compiled kernel's ABI as a vector: a collapse is `fn(ctx, out, pitch)`, and the lattice's rows, batches and lanes are folds the kernel is wrapped in before it is scheduled (docs/plans/2026-09-16-collapse-is-a-fold.md).
 - **Minimal public API** - Do NOT change visibility of internal APIs without explicit permission. Keep `pub(crate)` and private items encapsulated. Compose `Kernel` values instead of exposing internals.
 - **Subtract before you add.** The good version of a primitive is reached by removing machinery, not stacking it. If a type's signature already refuses the wrong shape, you don't need a macro, a lint, or a doc to forbid it — the opinion lives in the types. Reach for a new dependency or a new abstraction only after subtraction has failed.
 
@@ -57,10 +57,10 @@ Behavior every target agrees on, pinned by
 | `exp`, `exp2` | saturate past ±126 exponents rather than overflowing to `inf` |
 
 A mask is a bit pattern, not a number, and that is a load-bearing distinction:
-`Select`'s **mixed-lane path** is a bitwise blend on every backend
+`If`'s **mixed-lane path** is a bitwise blend on every backend
 (`andps`/`andnps`/`orps`, `vpternlogd 0xCA`, `BSL`) and `BitAnd`/`BitOr` are
 literal bitwise ops. (The blend is the path a *lane-varying* mask takes, not
-what `Select` is — see "Select contains an if" below.) Spell a
+what `If` is — see "`If` contains an if" below.) Spell a
 true mask `1.0` and `mask & 1.0` is `0x3f800000`, which blends `7.0` against
 `9.0` into `4.5` — a value neither branch held. `OpKind::mask(bool)` is the only
 constructor, `OpKind::is_bitwise_domain()` marks the ops whose results are
@@ -78,7 +78,7 @@ Behavior that differs by target, because the instructions do:
 | `Round` (exact tie) | nearest-**even** (imm 0x00) → `round(2.5) == 2` | `FRINTA` ties-**away** → `3` |
 | `Round` (`-0.5 ≤ x ≤ -0.0`) | `-0.0` (sign preserved) | `-0.0` |
 | `Recip`, `Rsqrt` | `rcpps` ~12 bits; `vrcp14ps` ~14 | `FRECPE` + one `FRECPS` step |
-| `MulAdd` | **one** rounding with `+fma`, **two** without (`mulps`+`addps`) | one (`FMLA`) |
+| `MulAdd` | **one** rounding (`vfmadd231ps`; every selectable tier has FMA3), **two** only where the emitter decomposes it under register pressure | one (`FMLA`) |
 | `TruncToInt` (NaN, or `x >= 2^31`) | `cvttps2dq` → **`i32::MIN`** (integer indefinite) | `FCVTZS` **saturates**; NaN → 0 |
 | `Shl`, `Shr` (count outside `0..32`) | count > 31 zeroes the **whole** destination | immediate carries into `immh` → decodes as **`.2D`**, crossing lanes |
 
@@ -86,16 +86,16 @@ Behavior that differs by target, because the instructions do:
 SIMD batch at a time. That tier is retired — see
 `docs/plans/2026-09-06-kernel-with-a-lattice.md` — so there is one answer per target.)
 
-The `Recip` and `MulAdd` rows are the reminder that "target" is finer than
-"architecture": they differ between *ISA levels of the same machine*, which is
-what `cargo xtask isa-matrix` exists to keep honest. `Recip`/`Rsqrt` are
+The `Recip` row is the reminder that "target" is finer than "architecture": it
+differs between *ISA tiers of the same machine*, which is what
+`cargo xtask isa-matrix` exists to keep honest. `Recip`/`Rsqrt` are
 estimates — only ever guaranteed close, never equal — so no argument to them is
-ever foldable. `MulAdd` is the opposite case and is *not* fold-refused: FMA is
-available on every target, some just spell it as a multiply then an add, and
+ever foldable. `MulAdd` is the opposite case and is *not* fold-refused: an FMA
+instruction is on every selectable tier (the x86-64 floor requires FMA3), and
 one rounding versus two is a last-bit precision difference inside the contract
-(the emitter itself decomposes a `MulAdd` under register pressure on an FMA
-target). The folder and the oracle round once (`libm::fmaf`); a differential
-check bounds the product's rounding as tolerance rather than skipping the point.
+(the emitter itself decomposes a `MulAdd` under register pressure). The folder
+and the oracle round once (`libm::fmaf`); a differential check bounds the
+product's rounding as tolerance rather than skipping the point.
 
 Unifying any row costs instructions — x86 has no ties-away rounding mode, and
 NaN or signed-zero blending is a compare plus a select — so none of them are
@@ -183,10 +183,10 @@ Cargo workspace with 13 member crates:
 
 | Crate | Purpose |
 |-------|---------|
-| `pixelflow-core` | Lattices, the compiled `Manifold`, `collapse`, and the cell grid. Backends: x86-64 (SSE2 baseline, AVX2/AVX-512 opt-in via `target-feature`) and aarch64 (NEON) only — no portable/scalar fallback for other architectures. Edition 2024. |
+| `pixelflow-core` | Lattices, the compiled `Manifold`, `collapse`, and the cell grid. Targets x86-64 and aarch64 only — no portable/scalar fallback — and holds no vector code of its own: the ISA tier is the JIT's, decided at startup. Edition 2024. |
 | `pixelflow-compiler` | Proc-macro front end: `kernel!` and `kernel_raw!`, parser, sema, arena lowering, then optimization as an `Optimize` value over the arena. Edition 2024. |
 | `pixelflow-ir` | Shared IR. `ExprArena` (sole IR), OpKind enum, the `Kernel` value/AST. |
-| `pixelflow-codegen` | Expression graphs to machine code: per-ISA emitters (x86-64, aarch64), register allocation, executable memory, the JIT compile cache (`jit_cache`, `CompiledKernel`). Runs the optimizer itself, so a compiled kernel is never obtained unoptimized. |
+| `pixelflow-codegen` | Expression graphs to machine code: per-ISA emitters (x86-64 AVX2 and AVX-512, aarch64 NEON), the startup ISA decision (`isa`), register allocation, executable memory, the JIT compile cache (`jit_cache`, `CompiledKernel`). Runs the optimizer itself, so a compiled kernel is never obtained unoptimized. |
 | `pixelflow-graphics` | Font loading (TTF, SDF), colors (`Rgba8`, `Color`), the packed frame program, analytic 3-D scenes. |
 | `pixelflow-ml` | Graphics ML experiments (harmonic attention, SH feature maps). Not part of the compiler cost model. |
 | `pixelflow-search` | E-graph optimization. Rewrite rules, saturation, static latency-prior extraction, rule provenance + hindsight labeling, the saturation Guide. |
@@ -321,10 +321,11 @@ checkout step was skipped.
 Shift left where it is cheap, and *measure* the cheapness rather than assuming
 it. A check that costs an hour presubmit belongs in postsubmit — but a fast
 fraction of it usually belongs presubmit, and finding that fraction is the
-work. `xtask isa-matrix --smoke` is the worked example: per ISA level, running
-only the crates whose output *is* per-level machine code costs ~50s against
-~344s for the whole workspace, because the build those tests need has already
-happened for the lint.
+work. `xtask isa-matrix --smoke` is the worked example: per ISA tier
+(`PIXELFLOW_ISA=avx2|avx512`, one build for both), running only the crates
+whose output *is* per-tier machine code costs about a minute against several
+for the whole workspace, because the build those tests need happened once, for
+the lint.
 
 ### Build Commands
 
@@ -363,12 +364,21 @@ All errors must be explicitly handled. No silent failures.
 ### Toolchain
 
 - **Rust stable** (configured in `rust-toolchain.toml`)
-- SIMD backend auto-detected at compile time via `build.rs` and target features
+- The JIT's ISA tier is detected at process startup by CPUID, not by build flags — no `-C target-feature`, no `build.rs` probe
 - Platform features automatically selected based on OS
 
 ### SIMD Backend Selection
 
-Priority: AVX-512 > SSE2 (x86-64), NEON (aarch64) — no scalar fallback for other architectures. Detection via `build.rs` CPU feature probing + `target_feature` flags. See `pixelflow-core/src/backend/`.
+Decided once per process, at the first compile, by `pixelflow_codegen::isa::detect()`
+(`pixelflow-codegen/src/isa/`): on x86-64 the widest of AVX-512 (needs `avx512f`
+and `avx512dq`) and AVX2 (needs `avx2` and `fma` — the floor; a host below it is
+refused with the missing feature named), on aarch64 NEON. There is no SSE2 tier
+and no scalar fallback. `PIXELFLOW_ISA=avx2|avx512|neon` picks a narrower tier
+the host can also run (diagnosis, and how `xtask isa-matrix` runs both x86
+backends on one machine); naming one the host cannot run is refused, never
+downgraded. The width follows the tier (`pixelflow_codegen::jit_vector_bytes()`)
+and nothing else in the workspace holds one. See
+docs/plans/2026-09-22-the-isa-is-decided-at-startup.md.
 
 ## Code Style
 
@@ -406,44 +416,44 @@ Priority: AVX-512 > SSE2 (x86-64), NEON (aarch64) — no scalar fallback for oth
   **Branchless is the limit**: no case survives to runtime at all, because one
   expression is correct for every input. It is what this codebase is made of —
   a comparison yields a mask rather than a `bool`, and the language is a DAG
-  with no binder — so take it wherever the hardware offers it. `Select` is
-  **not** an example of it, however much it looks like one; see "Select
+  with no binder — so take it wherever the hardware offers it. `If` is
+  **not** an example of it, however much it looks like one; see "`If`
   contains an if" below. What it does not license is hand-rolling a
   *worse* branchless form than the instruction already there: the retired
   `Round` expansion (`(x + 0.5).floor()`, two instructions where `roundps` is
   one, and not any IEEE rounding mode) is the worked counter-example, and
   "Floating point at the edges" above is the long version.
 
-  **Select contains an if.** `Select(m, a, b)` *means* `if m then a else b`,
+  **`If` contains an if.** `If(m, a, b)` *means* `if m then a else b`,
   and that is two cases, not one. Both arms stay live and everything
-  downstream carries both. By this section's own taxonomy `Select` is
+  downstream carries both. By this section's own taxonomy `If` is
   **dispatch**, not a fold — it collapses no case and must not be read as if
   it did.
 
   So the jump is not an optimization codegen may buy; **the jump is what
-  `Select` is.** A batch whose mask is uniform takes an arm — that is the
+  `If` is.** A batch whose mask is uniform takes an arm — that is the
   conditional, executed. A batch whose mask varies *by lane* is the case a
   jump cannot serve, because different lanes want different arms, and the
   bitwise blend is the fallback for exactly that case. Blend is the
   lane-varying path, not the definition.
 
   Getting that default backwards is what produced `emit/guards.rs`: with
-  blend as the definition, a branch has to be *bought* per select
+  blend as the definition, a branch has to be *bought* per `If`
   (`MISPREDICT_PENALTY_CYCLES`) and, worse, an arm is only eligible when the
   values it owns happen to be one contiguous run of a flat schedule — so
-  `cluster_select_arms` permutes the schedule looking for that, in rounds,
+  `cluster_if_arms` permutes the schedule looking for that, in rounds,
   and it measured **73% of a glyph bake** while finding a constant 282 bytes
   (docs/BACKLOG.md, X1). Emit the arms as blocks and there is nothing to
   search for: contiguity is a consequence of building the structure rather
   than a property to be recovered after destroying it.
 
   The distinction is load-bearing, and getting it backwards has already cost.
-  If a select's meaning carries one case, then "which values does this arm
+  If an `If`'s meaning carries one case, then "which values does this arm
   serve" is an artifact of codegen, and the place to compute it is next to the
-  emitter, per select. That is where it was built, and it did not survive
+  emitter, per `If`. That is where it was built, and it did not survive
   contact. If the meaning carries two, an arm's condition is a fact about the
   DAG, the region a value is observed over is a property to be *read* rather
-  than reconstructed, and `Union`'s explicit ranges and a select's implicit
+  than reconstructed, and `Union`'s explicit ranges and an `If`'s implicit
   mask are the same thing at different levels of static knowledge. See
   docs/plans/2026-09-07-demand-is-a-dag-property.md.
 - **Platform `cfg` is encapsulation, not sprinkle** - a platform-predicate
@@ -541,20 +551,21 @@ handle.send(Message::Data(MyDataMsg))?;           // Lowest (backpressure)
 
 ## Debugging Pitfalls
 
-- **SIMD mismatch between machines**: Check `build.rs` output, verify target features. `RUSTFLAGS="-C target-cpu=native"` to match CPU.
-- **Unexpectedly slow**: May be building against a lower ISA level than the CPU supports (e.g. SSE2 baseline on an AVX2/AVX-512-capable host). Check build output and `RUSTFLAGS`/`target-cpu`; there is no separate portable-scalar tier to "fall back" to — see `xtask isa-matrix`.
+- **Different kernels on two machines**: the tier is the CPU's, so an AVX-512 host and an AVX2 host emit different code by design. `PIXELFLOW_ISA=avx2` on the wider host reproduces the narrower one; the `pixelflow-pipeline` journal's fingerprint records the tier a measurement ran on.
+- **Unexpectedly slow**: the tier is not a build setting, so `RUSTFLAGS`/`target-cpu` change nothing about the emitted kernels. Check `PIXELFLOW_ISA` is not set to a narrower tier than the host has; `core-term` logs the tier it selected at startup. There is no scalar tier to "fall back" to — see `xtask isa-matrix`.
+- **"this CPU lacks `avx2`" at startup**: the floor. The JIT emits AVX2+FMA or AVX-512 on x86-64 and nothing narrower; the refusal names the feature, and there is no override that lowers it.
 - **Cocoa main thread panic**: Ensure `pixelflow_runtime::run()` called from `fn main()`, not a spawned thread.
-- **"cannot find `Field`"**: intended. `Field` is `pub(crate)` in pixelflow-core. Compose `Kernel` values and collapse them; there is no per-batch value to hold.
+- **Looking for `Field`**: there is none. pixelflow-core holds no vector; the width is the JIT's (`pixelflow_codegen::jit_vector_bytes()`). Compose `Kernel` values and collapse them; there is no per-batch value to hold.
 - **Why did the e-graph pick that?**: Build with `--features saturation-telemetry` (e.g. `cargo run -p core-term --features saturation-telemetry`) and every production saturation run — macro-tier `kernel!` expansions and runtime-tier `Lattice::bake`/glyph bakes alike — appends a JSONL record (budget, stop reason, cost, wall clock) to `$PIXELFLOW_SATURATION_TELEMETRY` if set, else stderr; see `pixelflow-search/src/telemetry.rs`.
-- **A kernel built differently on two machines?** It cannot, by construction, and if it ever does that is the bug: production saturation budgets are denominated in **rule applications** (`SaturationConfig::max_applications`, 20,000/80,000/200,000 blitz/rapid/classical), plus the e-class and iteration caps — all three deterministic functions of the input. Wall clock is **not** a budget dimension; it is `SaturationConfig::safety_ceiling` (30s/120s/300s), a fail-loud assertion that **panics the build** rather than silently truncating saturation and emitting a worse kernel. A panic there means the budget is wrong for that input or the host is pathologically slow — investigate it, don't raise it. `PIXELFLOW_SATURATION_CEILING_MS` (ms; `0`/`off` disables) overrides the ceiling *for diagnosis only*: it can change whether the build panics, never which kernel is emitted. See `docs/plans/2026-09-01-production-budget-determinism.md`.
+- **A kernel built differently on two machines?** It cannot, by construction, and if it ever does that is the bug: production saturation budgets are denominated in **rule applications** (`SaturationConfig::max_applications`: 20,000/80,000 blitz/rapid; classical 200,000, rising to 2,000,000 with the input's inserted classes past 625), plus the e-class and iteration caps — all three deterministic functions of the input. Wall clock is **not** a budget dimension; it is `SaturationConfig::safety_ceiling` (30s/120s, classical 300s–3,000s), a fail-loud assertion that **panics the build** rather than silently truncating saturation and emitting a worse kernel. A panic there means the budget is wrong for that input or the host is pathologically slow — investigate it, don't raise it. `PIXELFLOW_SATURATION_CEILING_MS` (ms; `0`/`off` disables) overrides the ceiling *for diagnosis only*: it can change whether the build panics, never which kernel is emitted. See `docs/plans/2026-09-01-production-budget-determinism.md`.
 - **Need rule provenance (origins, union journal, derivation ancestry, the hindsight labeler)?**: build `pixelflow-search` with `--features provenance-journal` (default OFF; `pixelflow-pipeline` and `pixelflow-search`'s own tests enable it already) — without it, `Provenance::origins`/`applications`/`unions` and friends don't exist as types, they don't just return empty; `EGraph::application_count()` (the saturation budget's denominator) stays available either way.
 
 ## Execution Notes
 
 - **Hot paths:** the loop nest is inside the emitted code — one collapse call per stripe, not one per row or per SIMD batch
 - **Glyph caching:** a glyph bakes once and reads back as a gather over its bound buffer (`fonts/cache.rs`)
-- **Glyph coverage:** a winding number about a reference point, per-pixel and discriminant-free (`fonts/loop_blinn.rs`, docs/plans/2026-09-08-loop-blinn-glyph.md). Its bound is a domain-side extent because `u² − v` outside its control triangle is *wrong*, not merely slow — so the glyph is where a `Union` of index ranges earns its keep
-- **Antialiasing:** symbolic derivatives — `Kernel::dx()`/`dy()`, resolved before emission. A glyph's *winding* is exact (hard masks selecting signed constants); only the distance feeding the ramp is soft, so a comparison landing on the wrong side costs a rounding rather than half a unit of coverage
+- **Glyph coverage:** the exact area of the pixel under ink, `min(|Σ_p σ_p·A_p|, 1)` — one fold over a table of monotone quadratic arcs, each piece's area `A_p` written in closed form (`fonts/loop_blinn.rs`, `RisingArc::pixel_area`; `fonts/monotone.rs`). Nothing integrates: the IR, the e-graph and `kernel!` have no integral (deleted 2026-09-29 — a closed form is a formula to write down, not a derivation to rediscover under a saturation budget). The closed form bakes the ±½ pixel in the kernel's frame, so a glyph kernel is correct under translation only — a scaling `at` covers a pixel of the wrong size
+- **Antialiasing:** is the area — no ramp, no distance. `Kernel::dx()`/`dy()` remain the symbolic derivatives, resolved before emission, for a kernel that does ramp on a distance
 - **One kernel per scene:** four channel kernels compile together, so shared geometry is emitted once
 
 ## Cost Model and the Guide (offline, supervised)

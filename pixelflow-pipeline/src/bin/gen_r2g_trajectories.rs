@@ -573,7 +573,7 @@ fn run_trajectory(
         pixelflow_search::egraph::Vocabulary::Templates,
     )
     .expect("insert into e-graph");
-    let node_count = arena.nodes_raw().len();
+    let node_count = arena.len();
     let mut checkpoints = Vec::with_capacity(budgets.len());
     let mut last_stop = SaturationStop::ApplicationBudget;
     let mut last_ext = None;
@@ -685,7 +685,7 @@ fn mint_expression(
     budgets: &[usize],
     out: &mut impl Write,
 ) -> ExprMintOutcome {
-    let expr_node_count = arena.nodes_raw().len();
+    let expr_node_count = arena.len();
     let raw: Vec<RawTrajectory> = policies
         .iter()
         .map(|p| run_trajectory(p, cache, arena, root, max_classes, costs, budgets))
@@ -1057,7 +1057,7 @@ fn mint_split(
 
     let n = entries.len();
     for (i, (name, arena, root)) in entries.iter().enumerate() {
-        let node_count = arena.nodes_raw().len();
+        let node_count = arena.len();
         // `max_expr_nodes == 0` LIFTS the filter — see the flag's own doc.
         if max_expr_nodes != 0 && node_count > max_expr_nodes {
             outcome.skipped_oversized += 1;

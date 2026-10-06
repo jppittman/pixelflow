@@ -15,12 +15,13 @@
 //! Keys are the [`LatticeShape`] the kernel is compiled for — its extents,
 //! so a lattice of a different size is a different kernel and a window
 //! resize recompiles, by decision — plus the **canonical form of the
-//! reachable subgraph**: nodes in ascending id order with ids remapped
-//! dense. Construction garbage (dead
-//! nodes left behind by `substitute_params` / splicing rebuilds) does not
-//! perturb the key, so logically identical kernels hit regardless of build
-//! history. Keys are compared by full equality — a hash collision can cause
-//! a wasted probe, never wrong code.
+//! reachable subgraph**: a post-order walk from the root with structurally
+//! equal subterms hash-consed, so neither construction garbage (dead nodes
+//! left behind by `substitute_vars_with` / splicing rebuilds) nor the order a
+//! builder pushed the live nodes in perturbs the key, and logically
+//! identical kernels hit regardless of build history. Keys are compared by
+//! full equality — a hash collision can cause a wasted probe, never wrong
+//! code.
 //!
 //! ## The link step
 //!
@@ -53,7 +54,7 @@ use crate::CompiledKernel;
 use crate::emit;
 use crate::error::CompileError;
 use pixelflow_ir::LatticeShape;
-use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, ExprNode, UniformDecl};
+use pixelflow_ir::arena::{BufferDecl, ExprNode, UniformDecl};
 use pixelflow_ir::key::{Canonical, canonical};
 
 static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Arc<CompiledKernel>>>> = OnceLock::new();
@@ -97,32 +98,27 @@ pub struct Linked {
 /// Compile a [`Kernel`](pixelflow_ir::Kernel) for a lattice of the given `shape`.
 pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Linked, CompileError> {
     let (arena, root) = kernel.parts();
-    // References first, before the key or the link is read off anything. A
-    // `Ref` is a leaf whose body — and whose buffer and uniform declarations
-    // — are not in this arena, so a key taken here would name a kernel other
-    // than the one that gets emitted, and the link handed back would be
-    // missing every slot the referent reads. Expanding *is* the linker
-    // (docs/plans/2026-09-09-composition-is-linking.md §3), and it makes
-    // "a reference is a kernel" true at this boundary rather than only in the
-    // algebra: `Manifold::compile` needs to know nothing about it.
+    // The link tables, and the key, are read off the kernel with every
+    // reference expanded. A `Ref` is a leaf whose body — and whose buffer and
+    // uniform declarations — are not in this arena, so a key taken off the
+    // arena alone would name a kernel other than the one that gets emitted,
+    // and the link handed back would be missing every slot the referent
+    // reads. Slot order is ABI, and a unit's uniforms are slots.
     //
     // Guarded rather than called unconditionally: the pass's own identity
     // path still clones the arena, and this runs on every compile including
     // the cache hits.
-    let expanded = arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Ref(_)))
-        .then(|| pixelflow_ir::passes::expand_refs_owned(arena, root));
-    let (arena, root) = match &expanded {
+    let holds_a_ref = arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_)));
+    let expanded = holds_a_ref.then(|| pixelflow_ir::passes::expand_refs_owned(arena, root));
+    let (linked_arena, linked_root) = match &expanded {
         Some((linked, linked_root)) => (linked, *linked_root),
         None => (arena, root),
     };
     let Canonical {
-        mut key,
+        key: expanded_key,
         buffers,
         uniforms,
-    } = canonical(arena, root);
+    } = canonical(linked_arena, linked_root);
 
     // Optimize, link, then emit. This is not a step callers get to sequence:
     // an arena reaching a backend unoptimized is never what anyone wanted,
@@ -131,31 +127,45 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // with no CSE and no FMA fusion. It is inside the compile entry because
     // that is the only place it cannot be forgotten.
     //
-    // It bails to the arena as given for constructs the e-graph does not
-    // model (a `Tuple` root; `Reduce` is unrolled ahead of saturation and
-    // does optimize); those still compile, just without the extra fusion.
+    // The optimizer is handed the arena *as written*, references and all: a
+    // reference is a unit, optimized by itself and linked back in after
+    // extraction (`pixelflow_search::runtime`'s units;
+    // docs/plans/2026-09-25-the-language-is-kernel.md §4, O1).
+    //
+    // It bails for constructs the e-graph does not model
+    // (`egraph::insert`'s `Declined`: a `Param`, an op
+    // `Vocabulary::Runtime` does not resolve, such as a `RawGather`) in a
+    // term with no unit; those still compile — from the *expanded* arena, so
+    // a reference never reaches the emitter — just without the extra fusion,
+    // and saturation telemetry records the decline. A `Reduce` is modelled —
+    // it enters the e-graph as itself, and a fold extraction keeps is
+    // emitted as a loop.
     //
     // The relink after it renumbers the tables into the canonical order the
     // key was built from — extraction redeclares identities in its own
     // walk order — without touching a node, so the bytes of a kernel that
     // declares neither a buffer nor a uniform are exactly what they were.
-    let emit_fn = |arena: &ExprArena, root: ExprId| {
+    let emit_fn = || {
         let optimized = pixelflow_search::runtime::optimize_runtime_arena(arena, root, shape);
         let (arena, root) = optimized
             .as_deref()
             .map(|(a, r)| (a, *r))
-            .unwrap_or((arena, root));
+            .unwrap_or((linked_arena, linked_root));
         if buffers.is_empty() && uniforms.is_empty() {
-            return emit::compile(arena, root);
+            return emit::compile(arena, root, shape);
         }
         let (linked, root) = arena.relink(root, &buffers, &uniforms);
-        emit::compile(&linked, root)
+        emit::compile(&linked, root, shape)
     };
 
     // Keyed on the arena *as handed in*, before optimization, plus the shape.
     // Optimization is a deterministic function of those two, so equal inputs
     // yield equal output and a hit skips the saturation as well as the codegen.
-    key.extend_from_slice(&shape.key_bytes());
+    let key = cache_key(
+        expanded_key,
+        shape,
+        holds_a_ref.then(|| canonical(arena, root).key),
+    );
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(hit) = cache.lock().expect("jit_cache: lock poisoned").get(&key) {
         return Ok(Linked {
@@ -168,8 +178,12 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // Compile outside the lock so concurrent distinct-kernel constructions
     // don't serialize. A racing duplicate compile wastes work; the first
     // insertion wins so all callers share one region.
-    let result = emit_fn(arena, root)?;
-    let compiled = Arc::new(CompiledKernel::new(result.code, shape));
+    let result = emit_fn()?;
+    let compiled = Arc::new(CompiledKernel::new(
+        result.code,
+        result.traffic.branches,
+        shape,
+    ));
     let mut guard = cache.lock().expect("jit_cache: lock poisoned");
     let kernel = guard.entry(key).or_insert(compiled).clone();
     Ok(Linked {
@@ -177,6 +191,45 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
         buffers,
         uniforms,
     })
+}
+
+/// The first byte of a key whose kernel names units. No node encoding
+/// starts with it (`pixelflow_ir::key`'s tags are small), so such a key never
+/// equals the key of a kernel without one.
+const UNIT_PROGRAM_TAG: u8 = 0xff;
+
+/// The compile cache's key: what the code is a function of.
+///
+/// Without units that is the expanded kernel's structure and the shape —
+/// unchanged from before units existed. **With units it is also where they
+/// are.** The expanded structure cannot say: `body` and `body.by_ref()`
+/// expand alike and are different programs, since a unit is optimized by
+/// itself, so on that key whichever compiled first would answer for both and
+/// the bytes would depend on compile order. `as_written` — the kernel's own
+/// canonical bytes, in which a `Ref` is its referent's identity — says it.
+/// Laid out tag, the expanded key's length, the expanded key, the shape (a
+/// fixed width), then `as_written`, so two unit keys are equal only when all
+/// three are.
+///
+/// The cost of keying on identity, recorded in
+/// docs/plans/2026-09-25-the-language-is-kernel.md §4 O1: a unit's identity
+/// digests the uniforms it was minted with, so a font rebuilt over fresh
+/// uniforms is a new entry here, where the same structure without units
+/// would hit. A structural key that walks through the units is the caching
+/// JP has deferred.
+fn cache_key(expanded: Vec<u8>, shape: LatticeShape, as_written: Option<Vec<u8>>) -> Vec<u8> {
+    let Some(as_written) = as_written else {
+        let mut key = expanded;
+        key.extend_from_slice(&shape.key_bytes());
+        return key;
+    };
+    let mut key = Vec::new();
+    key.push(UNIT_PROGRAM_TAG);
+    key.extend_from_slice(&(expanded.len() as u64).to_le_bytes());
+    key.extend_from_slice(&expanded);
+    key.extend_from_slice(&shape.key_bytes());
+    key.extend_from_slice(&as_written);
+    key
 }
 
 /// Number of distinct kernels interned so far (test/telemetry hook).
@@ -192,7 +245,7 @@ pub fn entry_count() -> usize {
 mod tests {
     use super::*;
     use pixelflow_ir::Kernel;
-    use pixelflow_ir::arena::{BufferIdentity, UniformIdentity};
+    use pixelflow_ir::arena::{BufferIdentity, ExprArena, UniformIdentity};
     use pixelflow_ir::fold::{Binder, Fold, Monoid};
     use pixelflow_ir::kind::OpKind;
 
@@ -344,6 +397,109 @@ mod tests {
         );
     }
 
+    /// `X + Y` with its leaves pushed in either order is one program, so it
+    /// is one compiled region: the key is a function of what the root
+    /// denotes, not of where a builder happened to push the leaves.
+    #[test]
+    fn x_plus_y_pushed_in_either_order_is_one_entry() {
+        // A constant no other kernel in this binary reads, so neither order
+        // can hit an entry some other test made.
+        const ONLY_HERE: f32 = 0.6180339;
+        let x_first = {
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let y = a.push_var(1);
+            let k = a.push_const(ONLY_HERE);
+            let sum = a.push_binary(OpKind::Add, x, y);
+            let root = a.push_binary(OpKind::Mul, sum, k);
+            Kernel::from_parts(a, root)
+        };
+        let y_first = {
+            let mut a = ExprArena::new();
+            let k = a.push_const(ONLY_HERE);
+            let y = a.push_var(1);
+            let x = a.push_var(0);
+            let sum = a.push_binary(OpKind::Add, x, y);
+            let root = a.push_binary(OpKind::Mul, sum, k);
+            Kernel::from_parts(a, root)
+        };
+        assert!(
+            Arc::ptr_eq(&kernel_of(&x_first), &kernel_of(&y_first)),
+            "one program pushed in two orders must share one compiled region"
+        );
+    }
+
+    /// A subterm written twice and the same subterm shared are one program,
+    /// so they are one compiled region — and one argument: the link folds
+    /// the two slots naming one instance back to one, which is the only
+    /// duplicate an interning arena can carry.
+    #[test]
+    fn a_duplicated_subterm_and_a_shared_one_are_one_entry() {
+        let decl = UniformDecl {
+            id: UniformIdentity::mint(),
+            default: 0.25,
+        };
+        let shared = {
+            let mut a = ExprArena::new();
+            let u = a.declare_uniform(decl);
+            let x = a.push_var(0);
+            let leaf = a.push_uniform(u);
+            let xu = a.push_binary(OpKind::Mul, x, leaf);
+            let root = a.push_binary(OpKind::Add, xu, xu);
+            Kernel::from_parts(a, root)
+        };
+        let duplicated = {
+            let mut a = ExprArena::new();
+            let u1 = a.declare_uniform(decl);
+            let u2 = a.declare_uniform(decl);
+            let x = a.push_var(0);
+            let leaf1 = a.push_uniform(u1);
+            let leaf2 = a.push_uniform(u2);
+            let xu1 = a.push_binary(OpKind::Mul, x, leaf1);
+            let xu2 = a.push_binary(OpKind::Mul, x, leaf2);
+            let root = a.push_binary(OpKind::Add, xu1, xu2);
+            Kernel::from_parts(a, root)
+        };
+        let l_shared = compile(&shared, TEST_SHAPE).expect("compile");
+        let l_duplicated = compile(&duplicated, TEST_SHAPE).expect("compile");
+        assert!(
+            Arc::ptr_eq(&l_shared.kernel, &l_duplicated.kernel),
+            "a duplicated subterm and a shared one must share one compiled region"
+        );
+        assert_eq!(l_shared.uniforms, [decl]);
+        assert_eq!(l_duplicated.uniforms, [decl], "two slots, one argument");
+    }
+
+    /// One argument read twice and two arguments read once each are two
+    /// programs: the same shape bytes but for the slot numbers, which is
+    /// enough.
+    #[test]
+    fn one_argument_read_twice_and_two_arguments_are_two_entries() {
+        let decl = |default| UniformDecl {
+            id: UniformIdentity::mint(),
+            default,
+        };
+        let one_argument = {
+            let mut a = ExprArena::new();
+            let u = a.declare_uniform(decl(0.0));
+            let leaf = a.push_uniform(u);
+            let root = a.push_binary(OpKind::Add, leaf, leaf);
+            Kernel::from_parts(a, root)
+        };
+        let two_arguments = {
+            let mut a = ExprArena::new();
+            let u = a.declare_uniform(decl(0.0));
+            let v = a.declare_uniform(decl(0.0));
+            let (lu, lv) = (a.push_uniform(u), a.push_uniform(v));
+            let root = a.push_binary(OpKind::Add, lu, lv);
+            Kernel::from_parts(a, root)
+        };
+        assert!(
+            !Arc::ptr_eq(&kernel_of(&one_argument), &kernel_of(&two_arguments)),
+            "u + u and u + v must not share a cache entry"
+        );
+    }
+
     #[test]
     fn same_kernel_at_two_extents_is_two_entries() {
         let k = circle_arena(false);
@@ -484,8 +640,8 @@ mod tests {
         let (linked, lroot) = a.relink(root, &[], &uniforms);
         assert_eq!(linked.uniforms(), &[cx, r, cy]);
         assert_eq!(
-            linked.nodes_raw().len(),
-            a.nodes_raw().len(),
+            linked.len(),
+            a.len(),
             "every node here is reachable, so relinking keeps them all"
         );
         let k_linked = Kernel::from_parts(linked, lroot);
@@ -513,6 +669,14 @@ mod tests {
     /// dense little-endian indices) rather than as an opaque byte literal,
     /// because `OpCode`'s numbering is explicitly not stable across releases
     /// and pinning *that* would be a gate on the wrong thing.
+    ///
+    /// Re-derived once since: a uniform's slot is encoded at `UniformId`'s
+    /// width, and that width went from 16 to 64 bits when the cap it put on
+    /// a program's argument count was removed
+    /// (docs/plans/2026-09-25-the-language-is-kernel.md, A4). A buffer's slot
+    /// stays at `BufferId`'s 16, as buffers are on their way out. The key is
+    /// never persisted, so the encoding moving is a fact to pin, not a
+    /// migration.
     #[test]
     fn the_compile_key_is_the_canonical_bytes_plus_the_shape() {
         let buffer = BufferDecl {
@@ -524,42 +688,46 @@ mod tests {
             id: UniformIdentity::mint(),
             default: 0.5,
         };
+        // Pushed in one order, keyed in another: the walk is post-order from
+        // the root, children first to last, so the `Buffer` leaf the gather
+        // names first comes out first and the uniform the root names last
+        // comes out just before the root — whatever order they were pushed.
         let mut a = ExprArena::new();
         let buf_slot = a.declare_buffer(buffer);
         let uni_slot = a.declare_uniform(uniform);
-        let x = a.push_var(0); // dense 0
-        let c = a.push_const(2.5); // dense 1
-        let scaled = a.push_binary(OpKind::Mul, x, c); // dense 2
-        let u = a.push_uniform(uni_slot); // dense 3
-        let y = a.push_var(1); // dense 4
-        // Pushes the `Buffer` leaf (dense 5) then the `Gather` (dense 6).
+        let x = a.push_var(0); // canonical 1
+        let c = a.push_const(2.5); // canonical 2
+        let scaled = a.push_binary(OpKind::Mul, x, c); // canonical 3
+        let u = a.push_uniform(uni_slot); // canonical 6
+        let y = a.push_var(1); // canonical 4
+        // Pushes the `Buffer` leaf (canonical 0) then the `Gather` (5).
         let g = a.push_gather(buf_slot, scaled, y);
-        let root = a.push_binary(OpKind::Add, g, u); // dense 7
+        let root = a.push_binary(OpKind::Add, g, u); // canonical 7
 
         let mut want: Vec<u8> = Vec::new();
+        want.push(7); // Buffer, by dense slot, then extents
+        want.extend_from_slice(&0u16.to_le_bytes());
+        want.extend_from_slice(&4u32.to_le_bytes());
+        want.extend_from_slice(&2u32.to_le_bytes());
         want.extend_from_slice(&[0, 0]); // Var(0)
         want.push(1); // Const
         want.extend_from_slice(&2.5f32.to_bits().to_le_bytes());
         want.push(4); // Binary
         want.extend_from_slice(&OpKind::Mul.marshal().to_bytes());
-        want.extend_from_slice(&0u32.to_le_bytes());
         want.extend_from_slice(&1u32.to_le_bytes());
-        want.push(8); // Uniform, by dense offset
-        want.extend_from_slice(&0u16.to_le_bytes());
-        want.extend_from_slice(&[0, 1]); // Var(1)
-        want.push(7); // Buffer, by dense slot, then extents
-        want.extend_from_slice(&0u16.to_le_bytes());
-        want.extend_from_slice(&4u32.to_le_bytes());
         want.extend_from_slice(&2u32.to_le_bytes());
+        want.extend_from_slice(&[0, 1]); // Var(1)
         want.push(5); // Ternary
         want.extend_from_slice(&OpKind::Gather.marshal().to_bytes());
-        want.extend_from_slice(&5u32.to_le_bytes());
-        want.extend_from_slice(&2u32.to_le_bytes());
+        want.extend_from_slice(&0u32.to_le_bytes());
+        want.extend_from_slice(&3u32.to_le_bytes());
         want.extend_from_slice(&4u32.to_le_bytes());
+        want.push(8); // Uniform, by dense offset, at `UniformId`'s width
+        want.extend_from_slice(&0u64.to_le_bytes());
         want.push(4); // Binary
         want.extend_from_slice(&OpKind::Add.marshal().to_bytes());
+        want.extend_from_slice(&5u32.to_le_bytes());
         want.extend_from_slice(&6u32.to_le_bytes());
-        want.extend_from_slice(&3u32.to_le_bytes());
 
         let got = canonical(&a, root);
         assert_eq!(got.key, want, "the canonical encoding moved");

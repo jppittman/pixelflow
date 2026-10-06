@@ -1,7 +1,31 @@
 # Emit should just emit
 
 **JP, 2026-09-12.** Lift the guard decision out of the emitter, give the graph
-a hard and a soft `Select`, and let extraction choose between them.
+a hard and a soft `If`, and let extraction choose between them.
+
+> **Status (2026-10-05): G2 retired, G3 withdrawn, G4 moot.** G1 and G2 landed
+> (#1287) and were deleted in commits "retire the guard-arm scope" and "retire ExprNode::Guard", because nothing produced a
+> `Guard` and it did not mean what this plan says. The G2 emitter branched to
+> the off arm only when *every* lane's mask was false and otherwise ran the
+> on arm for all lanes, with no blend, so it equalled `If` only for a
+> batch-uniform mask. Sections 1 and 7 ("`Guard` and `If` denote the same
+> function") are **false** for a lane-varying mask; do not revive this plan
+> from this document alone. G3 (PR #1288, extending `collapse` to accept a
+> `Guard`) would have miscompiled on that gap and is **withdrawn**.
+> The goal was delivered for `If` itself: arms as blocks, no search over a flat
+> schedule, by #1309–#1313 (`program/ownership.rs`, `program/layout.rs`), where
+> the guard-versus-blend choice is a bound-gated pass over the finished DAG, not
+> an extraction choice — so §§4–5 are **superseded** by that decision. The
+> measurement that follows and §6's stage table stay as written history.
+>
+> **The emitter now names nothing upstream of it.** Lowering and scoping live in
+> `program/lower.rs` and `program/scopes.rs`, the driver in
+> `pixelflow-codegen/src/pipeline.rs`, and `emit/` is handed a finished
+> `ScopedSchedule`; `scripts/check-emit-boundary.sh` (CI job `emit-boundary`)
+> fails a change that makes `emit/` name the optimizer, the passes, the
+> `program/` stages or the driver, or `program/` name the allocator or a
+> register. (The one exemption is the `pub use` in `emit/mod.rs` that keeps
+> the public paths `emit::compile` and `emit::origin`.)
 
 ## The measurement that forces this
 
@@ -28,8 +52,8 @@ is carrying a passenger.
 And the passenger exists for a reason the backlog states as its opening
 pattern: *a structure the language has is destroyed early by an unconditional
 pass, then a later stage spends real work partially reconstructing it.* A
-`Select` **is** an if (CLAUDE.md, "Select contains an if"). The schedule is
-flattened, the branch structure is thrown away, and `cluster_select_arms`
+`If` **is** an if (CLAUDE.md, "`If` contains an if"). The schedule is
+flattened, the branch structure is thrown away, and `cluster_if_arms`
 spends 60% of a compile searching for contiguous skippable runs to get it back.
 
 A compiler whose front end hands the backend real control flow never does this.
@@ -38,13 +62,13 @@ Ours has to, because it discards its own.
 ## 1. Two nodes, one value
 
 ```
-Select(m, a, b)   soft — a blend. Both arms evaluated, bitwise select.
+If(m, a, b)       soft — a blend. Both arms evaluated, bitwise select.
 Guard (m, a, b)   hard — a branch. Only the taken arm's body runs.
 ```
 
 **They denote the same function.** That is the whole point: being equal, they
 belong in one e-class, and choosing between them is extraction's job rather
-than codegen's. `Select`'s value semantics do not change — the demand plan's
+than codegen's. `If`'s value semantics do not change — the demand plan's
 constraint stands, *"demand only decides what is computed, never what is
 selected."*
 
@@ -103,7 +127,7 @@ sentence. This plan removes the third; L4 and 2c remove the others.
 
 **The emitter** reads the node and emits:
 
-- `Select` → the blend it already emits.
+- `If` → the blend it already emits.
 - `Guard` → a mask test, a branch to a label, the arm's body, the join. R0
   already gave it labels, so there is no new mechanism.
 
@@ -112,7 +136,7 @@ No partition, no closure, no cone, no demand. Most of `guards.rs` deletes.
 **The allocator** still may not let a live range span a branch that might not
 have run a definition — that constraint is real and does not go away. But it
 **reads** the regions off the structure (`Guard`'s arms are its scopes) instead
-of calling `analyze_select_guards`. 2b already made the nest a tree with
+of calling `analyze_if_guards`. 2b already made the nest a tree with
 `Scope::Fold`; a guarded arm is the same shape of scope with a different
 binder.
 
@@ -176,8 +200,8 @@ the first that can pay.
 
 ## 7. Constraints
 
-- **`Select` stays a blend.** Its value semantics do not change.
-- **`Guard` and `Select` are equal**, and must be provably so — the e-graph may
+- **`If` stays a blend.** Its value semantics do not change.
+- **`Guard` and `If` are equal**, and must be provably so — the e-graph may
   rewrite either into the other without a cost argument.
 - **`MISPREDICT_PENALTY_CYCLES` stays the one bound.** A learned term may
   rerank; it may not replace the analytic floor.

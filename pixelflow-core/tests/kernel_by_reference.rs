@@ -3,10 +3,13 @@
 //!
 //! L2 of docs/plans/2026-09-09-composition-is-linking.md. `Kernel::by_ref`
 //! replaces a whole arena with one `Ref` leaf naming it in the
-//! `KernelStore`; `passes::expand_refs` puts the body back before anything
-//! reads structure. The property that has to hold for either to be usable is
-//! that a consumer cannot tell the difference — same pixels, from the same
-//! composition surface, with no caller gathering anything by hand.
+//! `KernelStore`. The compile reads the link tables off the kernel with every
+//! body put back (`passes::expand_refs`), and the optimizer treats each name
+//! as a unit — its body optimized by itself and linked in after extraction
+//! (docs/plans/2026-09-25-the-language-is-kernel.md §4, O1). The property
+//! that has to hold for either to be usable is that a consumer cannot tell
+//! the difference — same pixels, from the same composition surface, with no
+//! caller gathering anything by hand.
 //!
 //! This lives in `pixelflow-core` for the reason
 //! `reduce_binder_reads_bound_buffer.rs` does: the claim spans
@@ -130,12 +133,14 @@ fn nested_references_over_one_tabulation_bind_one_slot() {
     assert_eq!(render(&outer), render(&direct));
 }
 
-/// Pure arithmetic, no memory: a reference is the same kernel, so the JIT
-/// cache hands back the *same compiled region*. That is the property the
-/// whole design rests on — identity is content, and a name changes only how
-/// a kernel is built, never which kernel it is.
+/// Pure arithmetic, no memory: a reference is the same kernel, so it renders
+/// the same frame. That is the property the whole design rests on — identity
+/// is content, and a name changes how a kernel is built and where the
+/// optimizer's boundaries fall, never which function it is. (Not the same
+/// compiled *region*: a name is a unit, optimized by itself, so the compile
+/// cache keys a named kernel apart from its body — `jit_cache::cache_key`.)
 #[test]
-fn a_named_kernel_compiles_to_the_same_code_as_the_kernel() {
+fn a_named_kernel_renders_what_the_kernel_renders() {
     let body = Kernel::x()
         .mul(&Kernel::x())
         .add(&Kernel::y().mul(&Kernel::constant(3.5)))
@@ -153,4 +158,49 @@ fn a_named_kernel_compiles_to_the_same_code_as_the_kernel() {
             .buffer()
             .to_vec()
     );
+}
+
+/// A derivative of a named kernel. A name has no structure to
+/// differentiate, so a reference a `Dwrt` reaches is not a unit: it is linked
+/// as written before saturation, and the chain rule runs over its body in
+/// the graph as it does for any kernel. `∂(x²)/∂x` is `2x` at every sample.
+#[test]
+fn a_derivative_reaches_through_a_name() {
+    let square = Kernel::x().mul(&Kernel::x());
+    let named = render(&square.by_ref().dx());
+    assert_eq!(named, render(&square.dx()));
+    for (i, v) in named.iter().enumerate() {
+        let x = (i % FRAME) as f32;
+        assert_eq!(*v, 2.0 * x, "sample {i}");
+    }
+}
+
+/// A fold around a unit that folds over the same slot. `Kernel::over` picks
+/// its binder without seeing through a name, so the sum chooses the slot the
+/// named max already binds; after the link the max rebinds it inside the
+/// sum. That shadowing is what every pass must respect for a unit to be
+/// optimized out of its context (`pixelflow_search::runtime`, Law U), and
+/// it renders what the composition by value renders: `Σ_{j<3} (4x + j)`.
+#[test]
+fn a_fold_around_a_unit_that_rebinds_its_slot() {
+    let inner = Kernel::max_over(5, |i| i.mul(&Kernel::x()));
+    let named_sum = Kernel::sum_over(3, |j| inner.by_ref().add(j));
+    let binder = |k: &Kernel| {
+        let (arena, root) = k.parts();
+        match arena.node(root) {
+            pixelflow_ir::ExprNode::Reduce { fold, .. } => fold.binder(),
+            other => panic!("expected a fold at the root, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        binder(&named_sum),
+        binder(&inner),
+        "the fixture must make the sum and the named max share a slot"
+    );
+    let by_name = render(&named_sum);
+    assert_eq!(by_name, render(&Kernel::sum_over(3, |j| inner.add(j))));
+    for (i, v) in by_name.iter().enumerate() {
+        let x = (i % FRAME) as f32;
+        assert_eq!(*v, 12.0 * x + 3.0, "sample {i}");
+    }
 }

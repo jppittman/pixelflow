@@ -19,7 +19,7 @@
 //! policy rather than a test-only one. The point is the *pipeline*, end to end.
 
 use pixelflow_codegen::emit::compile;
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{ExprArena, ExprId, LatticeShape, OpKind};
 use pixelflow_search::egraph::{Budget, Optimizer};
 
 /// Build `sin(sqrt(x*x + y*y) * freq) * amp + bias` as an arena.
@@ -79,13 +79,25 @@ fn optimize(arena: &ExprArena, root: ExprId, tag: &str) -> (ExprArena, ExprId) {
 }
 
 // ---------------------------------------------------------------------------
-// Executing JIT code: broadcast one coordinate to all lanes, read lane 0.
+// Executing JIT code: one single-point lattice call per coordinate.
 // ---------------------------------------------------------------------------
 
-use pixelflow_codegen::JIT_VECTOR_BYTES;
-use pixelflow_codegen::emit::executable::{Point4, TileSlice};
+use pixelflow_codegen::emit::executable::ExecutableCode;
 
-const LANES: usize = JIT_VECTOR_BYTES / core::mem::size_of::<f32>();
+/// One point of a kernel compiled at [`LatticeShape::POINT`]: the sample at
+/// `(x, y)`, read back through the origin block.
+fn eval_at(code: &ExecutableCode, x: f32, y: f32) -> f32 {
+    let mut out = [0.0f32; 1];
+    let origin = [x, y];
+    // SAFETY: this arena declares no buffers and no uniform, so `ctx[0]` —
+    // the uniform-block slot — is unread; `ctx[1]` is the origin block, and
+    // `out` holds the one sample a single-point lattice writes.
+    let ctx: [*const f32; 2] = [core::ptr::null(), origin.as_ptr()];
+    unsafe {
+        code.call(ctx.as_ptr(), out.as_mut_ptr(), 1);
+    }
+    out[0]
+}
 
 #[test]
 fn prod_swirl_kernel_through_egraph_and_jit() {
@@ -96,8 +108,8 @@ fn prod_swirl_kernel_through_egraph_and_jit() {
 
     // JIT both the original and the e-graph-optimized DAG. Both paths run the
     // shared transcendental-lowering + regalloc + codegen pipeline.
-    let orig_jit = compile(&orig, orig_root).expect("JIT original");
-    let opt_jit = compile(&opt, opt_root).expect("JIT optimized");
+    let orig_jit = compile(&orig, orig_root, LatticeShape::POINT).expect("JIT original");
+    let opt_jit = compile(&opt, opt_root, LatticeShape::POINT).expect("JIT optimized");
     eprintln!(
         "[swirl] spills: original = {}, optimized = {}",
         orig_jit.spill_count, opt_jit.spill_count
@@ -121,51 +133,28 @@ fn prod_swirl_kernel_through_egraph_and_jit() {
     // certifies that e-graph extraction preserved semantics.
     let mut max_ref_err = 0.0_f32;
     let mut max_cross_err = 0.0_f32;
-    for chunk in coords.chunks(LANES) {
-        let mut xs = [0.0f32; LANES];
-        let mut ys = [0.0f32; LANES];
-        for (i, &(x, y)) in chunk.iter().enumerate() {
-            xs[i] = x;
-            ys[i] = y;
-        }
-        let p = Point4::new(xs, ys, [0.0; LANES], [0.0; LANES]);
-        let mut out_orig = [0.0f32; LANES];
-        let mut out_opt = [0.0f32; LANES];
-        unsafe {
-            orig_jit.code.call_collapse(
-                core::ptr::null(),
-                TileSlice::single(out_orig.as_mut_ptr()),
-                p,
-            );
-            opt_jit.code.call_collapse(
-                core::ptr::null(),
-                TileSlice::single(out_opt.as_mut_ptr()),
-                p,
-            );
-        }
-        for (i, &(x, y)) in chunk.iter().enumerate() {
-            let want = reference(x, y, freq, amp, bias);
-            let got_orig = out_orig[i];
-            let got_opt = out_opt[i];
+    for &(x, y) in &coords {
+        let got_orig = eval_at(&orig_jit.code, x, y);
+        let got_opt = eval_at(&opt_jit.code, x, y);
+        let want = reference(x, y, freq, amp, bias);
 
-            max_ref_err = max_ref_err.max((got_orig - want).abs());
-            max_ref_err = max_ref_err.max((got_opt - want).abs());
-            max_cross_err = max_cross_err.max((got_orig - got_opt).abs());
+        max_ref_err = max_ref_err.max((got_orig - want).abs());
+        max_ref_err = max_ref_err.max((got_opt - want).abs());
+        max_cross_err = max_cross_err.max((got_orig - got_opt).abs());
 
-            assert!(
-                (got_orig - want).abs() <= 6e-2,
-                "original JIT at ({x},{y}): got {got_orig}, want {want}"
-            );
-            assert!(
-                (got_opt - want).abs() <= 6e-2,
-                "optimized JIT at ({x},{y}): got {got_opt}, want {want}"
-            );
-            assert!(
-                (got_orig - got_opt).abs() <= 1e-1,
-                "e-graph extraction changed semantics at ({x},{y}): \
-                 original {got_orig} vs optimized {got_opt}"
-            );
-        }
+        assert!(
+            (got_orig - want).abs() <= 6e-2,
+            "original JIT at ({x},{y}): got {got_orig}, want {want}"
+        );
+        assert!(
+            (got_opt - want).abs() <= 6e-2,
+            "optimized JIT at ({x},{y}): got {got_opt}, want {want}"
+        );
+        assert!(
+            (got_orig - got_opt).abs() <= 1e-1,
+            "e-graph extraction changed semantics at ({x},{y}): \
+             original {got_orig} vs optimized {got_opt}"
+        );
     }
     eprintln!(
         "[swirl] max error vs analytic f32 = {max_ref_err:.4}, \

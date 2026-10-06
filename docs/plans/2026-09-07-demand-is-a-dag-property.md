@@ -243,6 +243,10 @@ rule is the inverse of `SelectHoistUnary`, applied when
 masks merge; and extraction *chooses* a guarded form rather than codegen
 recovering one from whatever form was extracted.
 
+> **2026-10-05:** the two-`KernelKey` `Guard` node, the one-armed idea's first
+> form in the arena, was retired (commits "retire the guard-arm scope", "retire ExprNode::Guard"): nothing produced it, and it
+> equalled `If` only for a batch-uniform mask. C2b remains unbuilt.
+
 ## 5. Guards and index ranges are one thing
 
 A Y-only mask `y_lo ≤ Y < y_hi` *is* an index range. L3 put that range
@@ -299,6 +303,30 @@ decides between them; no golden moves.
 into a loop over that range, and the per-row call overhead L3 measured
 on narrow summands (1.46× at 15-px cells) closes. Depends on L3's union
 being the loop-nest primitive.
+
+**2026-09-20 update.** The pass this section describes — the DNF algebra
+(§1) and the one backward pass computing it — now lives in
+`pixelflow-ir` (`pixelflow-ir/src/passes/demand.rs`), generic over its key
+type, per `docs/plans/2026-09-09-exprarena-on-dag.md`'s "Demand moves to
+the IR". `pixelflow-codegen`'s `emit::guards` instantiates the same
+generic function for its own `ValueId`-keyed schedule rather than holding
+a second copy; that telemetry-only use is unchanged in shape and behavior
+— it still answers `demand_exclusive` beside `exclusive`, exactly as §
+"Why now" describes. What C2a still needs, unbuilt: a version of
+`demand_of_arena` (or the schedule-keyed instantiation) that a
+runtime-tier extraction pass can call *during* costing, not only after —
+today's callers run it as a diagnostic over an already-built schedule,
+while C2a wants demand available to the cost model while it is still
+choosing a term, which is a different call site and not yet wired to one.
+
+**2026-10-03 update.** That telemetry-only use is gone. `passes/demand.rs`,
+`emit::guards`' schedule-keyed instantiation, and the
+`PIXELFLOW_GUARD_TELEMETRY` line with its `demand_exclusive` column were
+deleted: nothing in production decided from them, `demand_of_arena` had only
+its own tests, and a diagnostic that nothing reads is machinery the next
+change must carry. The DNF algebra and the backward pass are in VCS history
+(last present at `0459d2b3`); C2a, when built, starts from this section's
+algebra rather than from a resident implementation.
 
 ## 7. Constraints
 

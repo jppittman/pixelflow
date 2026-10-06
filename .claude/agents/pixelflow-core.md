@@ -33,10 +33,10 @@ Kernel ──Manifold::compile(extent)──▶ Manifold ──bind(&[(id, buf)]
   blend.
 - `CellGridProgram` — the terminal's scene geometry as channel kernels over a cell buffer
   and a coverage atlas.
-- `backend/` — the SIMD abstraction (AVX-512, AVX2, SSE2, NEON) the emitted code's ABI is
-  denominated in, plus `FastMathGuard`.
-- `Field` — one SIMD batch of `f32`, **`pub(crate)`**. It is the collapse ABI's vector and
-  nothing more: `Field::from(f32)`, `Field::sequential(f32)`, `size_of::<Field>()`.
+- `fastmath.rs` — `FastMathGuard`, the scoped FTZ/DAZ switch the render path holds.
+- No vector, no width. The batch a collapse executes by is the JIT's, decided at process
+  startup by the CPU (`pixelflow_codegen::isa`; AVX2+FMA or AVX-512 on x86-64, NEON on
+  aarch64); a test that needs the lane count reads `pixelflow_codegen::jit_vector_bytes()`.
 
 `Kernel`, `Bits` and `Monoid` are re-exported from `pixelflow-ir`; the language itself lives
 there.
@@ -107,7 +107,7 @@ Rust-side sampler.
 ## Anti-Patterns to Avoid
 
 - **Don't add a per-batch `eval`** — that is the tier this crate spent four stages deleting.
-- **Don't expose `Field`, a lane count, or a vector type** — `PARALLELISM` is the one number
-  that escapes, and only because a caller sizing a scratch buffer needs it.
+- **Don't add a lane count or a vector type** — this crate has none; the width is the
+  JIT's (`pixelflow_codegen::jit_vector_bytes()`), read at runtime by whoever needs it.
 - **Don't allocate per frame** — a band collapse allocates nothing; keep it that way.
 - **Don't add platform-specific code** — this crate is the evaluation boundary, not a driver.

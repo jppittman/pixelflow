@@ -37,8 +37,8 @@ hiccup can never masquerade as a postsubmit failure and trigger a revert.
 
 ### `isa-matrix`: single run, no flaky path
 
-Builds, lints, and runs `cargo test --workspace` once per x86-64 ISA level
-(SSE2/AVX2/AVX-512) this host's CPU supports — deliberately no retry, no
+Builds and lints once, then runs `cargo test --workspace` once per x86-64 ISA
+tier (AVX2, AVX-512) this host's CPU supports — deliberately no retry, no
 5-iteration classification. A test that only fails at one ISA level is
 exactly as real a break as one that fails everywhere; retrying it would hide
 the nondeterminism or ISA-specific bug it's surfacing, not resolve it. Any

@@ -22,7 +22,7 @@ use pixelflow_pipeline::alloc_probe::{self, CountingAlloc};
 static GLOBAL: CountingAlloc = CountingAlloc;
 
 /// Same shape as `bench_jit_compile_cost::build_kernel_arena`: an SDF-style
-/// core plus a repeating 8-op mix (select, sqrt, mul, add, mul_add, max,
+/// core plus a repeating 8-op mix (`If`, sqrt, mul, add, mul_add, max,
 /// sub, square) until `target_nodes` is reached. `salt` keeps two calls
 /// canonically distinct so `optimize_runtime_arena`'s cache never hits.
 fn build_kernel_arena(target_nodes: usize, salt: f32) -> (ExprArena, ExprId) {
@@ -42,7 +42,7 @@ fn build_kernel_arena(target_nodes: usize, salt: f32) -> (ExprArena, ExprId) {
         cur = match step % 8 {
             0 if remaining >= 2 => {
                 let inside = arena.push_binary(OpKind::Lt, cur, c);
-                arena.push_ternary(OpKind::Select, inside, dx2, cur)
+                arena.push_ternary(OpKind::If, inside, dx2, cur)
             }
             1 => arena.push_unary(OpKind::Sqrt, cur),
             2 => arena.push_binary(OpKind::Mul, cur, dx),

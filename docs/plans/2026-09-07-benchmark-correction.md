@@ -67,7 +67,7 @@ Every number carries its instrument in the row: ISA level, loop shape (scanline,
 - **`collapse_cost bench`** at real shapes — a valid e-graph instrument: `compile_as_baked` calls `optimize_runtime_arena` before `emit::compile`. This is D of production-scale §7: the oracle, not the product.
 - **`corpus_gaps`** (PR #1212) — the 90 structural columns per kernel; the acceptance instrument for §C.
 - **`egraph_off_on`** (PR #1210) — the off / cse-only / on / with-rule arms through the production path's three calls, asserted byte-identical to `Manifold::compile`.
-- **`PIXELFLOW_GUARD_TELEMETRY`** per scope, **`--features saturation-telemetry`** per compile (applications, iterations, classes, typed stop), **`glyph_compile_report`** (compile ms, byte hashes per glyph).
+- **`PIXELFLOW_GUARD_TELEMETRY`** per scope (removed 2026-10-03 as a diagnostic nothing decided from; VCS history holds it), **`--features saturation-telemetry`** per compile (applications, iterations, classes, typed stop), **`glyph_compile_report`** (compile ms, byte hashes per glyph).
 - **Oracles**: the FreeType comparison test from #1187; `eval_scalar` same-form with the NaN count reported, never a clamp; the rendered-frame byte comparison for the packed kernels.
 
 ### B.5 The gate

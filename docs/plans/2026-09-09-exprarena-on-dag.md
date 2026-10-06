@@ -1,6 +1,8 @@
 # `ExprArena` on `Dag`: staging the port
 
-**Status:** Proposed
+**Status:** Stages A–C done. A (`55005739`), B (`9fdb6b37`), the demand-move
+follow-on (`a77e526a`), C — hash-consing (2026-09-20, this revision). D not
+started.
 **Date:** 2026-09-09
 **Follows** the `dag` module (`pixelflow-ir/src/dag.rs`), which shipped
 deliberately unused by `ExprArena`.
@@ -294,11 +296,70 @@ gate — this wants the full workspace suite, `xtask isa-matrix`, and a
 `push_unique` escape hatch for whatever genuinely needs distinct nodes
 (`Builder` already ships one, for exactly this reason).
 
+### 5.3 Measured, 2026-09-20: the real thing, on Stage C
+
+The gate above, cleared. `ExprArena::intern` is `Builder::intern` — a real
+`Eq + Hash` key (`NodeData` + children, §6 below), not the prototype's
+`Debug`-string `BTreeMap` — so every number in §5.2 was a lower bound, and
+this is what it was a bound *on*. `Builder::push_unique` is the escape hatch
+the gate asked for; nothing in this tree turned out to need it; every `push_*`
+call site that used to assume a fresh id was audited and fixed instead (the
+module doc on `arena.rs` names the shape). Full workspace suite green,
+`xtask isa-matrix --clippy --smoke` green on all three x86-64 levels
+(sse2/avx2+fma/avx512f+dq).
+
+**§5.2's own comparison cannot be rerun as it was measured.** Between that
+prototype and Stage C landing, `docs/plans/2026-09-16-collapse-is-a-fold.md`
+(H6, BACKLOG.md) shipped and rewrote exactly the thing §5.2's "legalized"
+column was pricing: a glyph's winding/distance computation is a `Reduce` over
+buffer-bound piece data now, not N pieces unrolled into the arena once each.
+So "legalized `A` (11 pieces)" vs "legalized `O` (28 pieces)" is no longer a
+question the arena's node count can answer — extraction is 155 nodes for
+every glyph, every size, on *both* sides of Stage C (measured below). H6 and
+Stage C attack the same growth from two different ends and H6 got there
+first on this particular path; that does not make consing redundant, it
+changes where its win shows up.
+
+Where it shows up: the *raw built* arena, before saturation touches it —
+`Font::glyph_kernel_scaled(ch, size).kernel().parts()`,
+`pixelflow-graphics/examples/glyph_saturation_cost.rs`, DejaVu Sans Mono,
+this host, `A`/`O`/`S`/`8`/`g` at 16px and 32px (all ten rows identical,
+per H6 above):
+
+| | splice (base `a77e526a`) | consed (Stage C) | ratio |
+|---|---|---|---|
+| built arena | 2,721 | **165** | 16.5× |
+| extracted (`optimize_runtime_arena`) | 155 | 155 | unchanged |
+
+The extracted count matching confirms Stage C is semantics-preserving at the
+IR level — saturation already normalizes away the input arena's redundancy
+by the time extraction runs, so consing's arena-size win is entirely in
+construction and pre-saturation walk cost, not in what gets kept.
+
+**The compiled machine code is not always byte-identical, and that is real,
+not a regression.**
+`pixelflow-graphics/examples/demand_move_byte_check.rs` — written for an
+earlier stage's "nothing may change" guard, run here as a general fixture —
+splits in two on Stage C: `guarded_select` (no glyph, no buffer reads) is
+untouched, 428 bytes, identical FNV-1a hash, both sides. `glyph_8_at_32px`
+(the production path, `jit_cache::compile`) is not: 19,566 → 10,005 bytes,
+different hash — the code nearly halves. `8` has two contours, and before
+Stage C the emitter compiled each contour's now-generic (post-H6) fold body
+as its own instruction sequence even though the two are structurally
+identical work over different buffer offsets; consing lets the IR see that
+identity before codegen ever runs, so the emitter shares it instead of
+re-emitting it. This is not the same claim as "the extracted kernel does not
+change" above — extraction's *node count* is unchanged (the table above),
+but which of those nodes are shared subexpressions is exactly what consing
+adds, and codegen is where a shared subexpression turns into fewer bytes.
+Verified, not asserted: the full `pixelflow-graphics` suite — golden pixel
+tests included — is green on both sides of this diff.
+
 ---
 
 ## 6. Stages
 
-### Stage A — route the bypassers through `Ir` *(no representation change)*
+### Stage A — route the bypassers through `Ir` *(no representation change)* — **Done** (`55005739`)
 
 Convert the §3 offset-consumers to op+children access. Independently landable,
 no behavior change, and it deletes most of the 40 offset-binding sites:
@@ -318,27 +379,40 @@ no behavior change, and it deletes most of the 40 offset-binding sites:
   `CorpusFormat::SCHEMA` (`:101`) in the same commit** and confirm
   `corpus_identity()` changes, so stale files are rejected loudly.
 
-### Stage B — make the offsets private
+### Stage B — make the offsets private — **Done** (`9fdb6b37`)
 
 With Stage A landed, few consumers remain. Replace `Nary`'s `(u32, u16)` with
 an opaque `Copy` range newtype (private fields, still 16-byte-clean), or drop
 `nodes_raw()`/`nary_children_raw()` from the public API outright. This is the
 commit after which the representation is swappable.
 
-### Stage C — swap the storage
+### Stage C — swap the storage — **Done** (2026-09-20)
 
-`ExprArena { dag: Dag<ExprData>, buffers, uniforms }`, with `ExprId` kept as
-the public handle and translated at the boundary, and `ExprNode` reconstructed
-on demand by `node()`. Two consequences to decide explicitly:
+`ExprArena { builder: Builder<NodeData>, nary_children, nary_ranges, buffers,
+uniforms }`, with `ExprId` kept as the public handle and translated at the
+boundary (`to_dag_id`/`from_dag_id`, `arena.rs`), and `ExprNode`
+reconstructed on demand by `node()`. `NodeData` is `ExprData`'s name in this
+file — kept distinct from `crate::expr::ExprData` (`Kernel`'s own payload)
+because `ExprArena` genuinely needs `Nary`'s arity as a discriminant where
+`Kernel` doesn't; the type's own doc says why. Two consequences, decided:
 
-- **`ExprData::Const` must key on bit pattern** (`u32`), not `f32` — `f32` is
+- **`NodeData::Const` keys on bit pattern** (`u32`), not `f32` — `f32` is
   neither `Eq` nor `Ord`, so `Builder`'s `Key` bound refuses it. This matches
-  what the codebase already wants (`subtree_eq` compares constants bit-exactly,
+  what the codebase already wanted (`subtree_eq` compares constants bit-exactly,
   `arena.rs:1386`) and what both the cache key and the corpus format already
   do.
-- **Use `push_unique` here; do not let this stage decide consing.** The
-  representation swap should be semantics-preserving, and consing is a
-  separate question the codebase has already thought about — see §5.1.
+- **The representation swap does decide consing — deliberately, overriding
+  the `push_unique` instruction this section used to give.** §5.1's
+  deferral is about a *shared* store across `Kernel`s changing `Kernel`'s
+  representation; §5.2 already showed the *other* consing (private to one
+  `ExprArena`, no API change) was worth 17–30× on real glyphs, with the
+  extracted kernel unchanged, and §5.3 confirms it on the real
+  `Builder::intern` key rather than the prototype's placeholder one. Every
+  `push_*` call routes through one `intern` (`arena.rs`); nothing in this
+  tree needed `push_unique`, which stays available on `Builder` as the
+  escape hatch for whatever eventually does. See §5.3 for the numbers this
+  decision is made on, and §5.1 for why it does not smuggle in the deferred
+  *shared*-store consing.
 
 ### Stage D — the fork (optional)
 
@@ -360,7 +434,10 @@ Per stage, not at the end:
 - **C**: `pixelflow-ir` unit + integration tests; `cargo test --workspace`;
   `cargo bench -p pixelflow-ir --bench dag_vs_arena` to confirm no
   construction-path regression against the numbers recorded there;
-  `xtask isa-matrix --smoke`.
+  `xtask isa-matrix --smoke`. **Done, 2026-09-20**: `cargo test --workspace`
+  green; `xtask isa-matrix --clippy --smoke` PASS on all three x86-64 levels
+  (sse2/avx2+fma/avx512f+dq — clippy and the smoke test set on each); §5.3
+  has the node-count and byte-identity numbers.
 - **D**: workspace tests; the three §3.2 structs are the acceptance criterion —
   if they express cleanly as `Rooted`, the model held.
 

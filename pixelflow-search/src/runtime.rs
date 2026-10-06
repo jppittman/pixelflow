@@ -22,27 +22,100 @@
 //! `pixelflow-core`'s `Lattice::bake` — call this function before handing the
 //! arena to `jit_cache`.
 //!
+//! # Units: a name is an optimization boundary
+//!
+//! A kernel named by content (`Kernel::by_ref`, an `ExprNode::Ref`) is a
+//! **unit**: it is saturated and extracted by itself, held in the term that
+//! reads it as an opaque leaf, and linked back in after extraction. That is
+//! how a program too big for one e-graph — a font, about 160k classes
+//! inserted before any rule fires, over [`HARD_CLASS_LIMIT`] — is optimized
+//! a glyph at a time (docs/plans/2026-09-25-the-language-is-kernel.md §1.8,
+//! §4 O1).
+//!
+//! [`HARD_CLASS_LIMIT`]: crate::egraph::HARD_CLASS_LIMIT
+//!
+//! ```text
+//! P(k, s, t) = emit_t ∘ legalize_t ∘ lower_dwrt ∘ L_s (k)
+//! L_s(t)     = link( Ô_s(t),  r ↦ L_s(body r) )        once per key
+//! Ô_s(t)     = extract_s ∘ saturate ∘ insert°(t)        insert° holds each unit as a leaf
+//! ```
+//!
+//! **Law U.** `⟦L_s(k)⟧ = ⟦expand_refs(k)⟧`. By induction over the units,
+//! which form a DAG (a key names content that existed when it was minted):
+//!
+//! 1. `Ô_s` is sound for a leaf no rule can open. A unit leaf has no
+//!    children and no constant fact, so the one thing a rule reads off it is
+//!    its variance — `FactorFold`'s side condition, and the binder
+//!    substitution `PeelFold`/`HalveFold` skip a binder-free class by — and
+//!    the leaf carries its referent's ([`ENode::Ref`]). Every conditioned
+//!    rewrite is the one it would be with the body inlined.
+//! 2. The context cannot change what a unit reads. A unit is **closed**: its
+//!    variance names the coordinates and nothing else, which the unit walk
+//!    asserts, so no binder of the context reaches into it. Nothing before
+//!    the link substitutes a coordinate — `Kernel::at` expands a reference at
+//!    construction, saturation substitutes binders only, and the lattice's
+//!    folds are built by legalization, after the link. A fold around a unit
+//!    picks its binder slot without seeing inside, so after the link an outer
+//!    fold and one inside the unit may share a slot; the inner one rebinds
+//!    it, and every pass respects that shadowing — it is the shape
+//!    `expand_refs` has always produced (pinned for the fold rules by
+//!    `a_peel_stops_at_a_fold_that_rebinds_its_slot`; codegen resolves a
+//!    binder to its innermost loop). So `⟦C[Ref r]⟧` is `⟦C⟧` applied to
+//!    `⟦r⟧` at the same point, and optimizing `r` out of its context is
+//!    optimizing `⟦r⟧`.
+//! 3. [`link`](pixelflow_ir::passes::link) substitutes equals for equals —
+//!    the inductive hypothesis.
+//!
+//! The equality is of denotations, under the precision contract: bytes differ
+//! from inlining wherever the extractions do. **With no reference the
+//! sequence of calls is exactly what it was before units existed**, so the
+//! bytes are too.
+//!
+//! What a boundary loses is rewriting across it: constants, algebra and CSE
+//! of equal-but-not-identical terms between a unit and its context. A unit
+//! is priced 0 in its context, like a uniform (`CostModel::node_op_cost`
+//! says what that does not see). Identical subterms still share: the link
+//! splices into a hash-consed arena.
+//!
+//! A reference a `Dwrt` reaches is not a unit: it is linked as written before
+//! insertion, so the chain rule runs in the graph as it always has. You
+//! cannot differentiate a name, and differentiating a unit's *optimized* body
+//! after the link would put a derivative where nothing saturates it.
+//!
+//! **One saturation per structure.** A unit is saturated through the same
+//! structure-keyed cache as any term, so a glyph that recurs — across fonts
+//! over fresh uniforms, across zoom levels, across programs — saturates once.
+//! **Units run in parallel**, on scoped workers pulling from one index, and
+//! the result does not depend on how many there are: each unit's output is a
+//! function of its structure, the optimizer's fingerprint and the shape (the
+//! cache already relies on that, and the budget counts applications, never
+//! time — docs/plans/2026-09-01-production-budget-determinism.md), results
+//! land by index, and the link walks in the term's own order.
+//!
 //! # Saturation telemetry
 //!
 //! Build with `--features saturation-telemetry` to have every *saturation*
 //! here emit one JSONL record (budget, stop reason, cost, wall clock — see
 //! [`crate::telemetry`]); a call that extracts from a structure already
-//! saturated records nothing. Point it at a file with
+//! saturated records nothing. A unit's saturation is a record of its own, so
+//! a program's units can be read off one record each. A term the e-graph
+//! declines records why, once per term that declines. Point it at a file
+//! with
 //! `PIXELFLOW_SATURATION_TELEMETRY=/path/to/log.jsonl cargo run --features saturation-telemetry`,
 //! or leave it unset to see records on stderr.
 
 use crate::egraph::{
-    EClassId, EGraph, ENode, Optimizer, OptimizerStats, RuleSet, Vocabulary, insert,
+    Declined, EClassId, EGraph, Optimizer, OptimizerStats, RuleSet, Vocabulary, insert,
     reachable_count,
 };
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{BufferDecl, ExprArena, ExprId, ExprNode, UniformDecl};
 use pixelflow_ir::key::{Canonical, canonical};
-use pixelflow_ir::optimize::{Identity, Optimize};
-use pixelflow_ir::passes::{ExpandRefs, LowerDwrt};
-use pixelflow_ir::pipeline;
-use std::collections::HashMap;
+use pixelflow_ir::{KernelKey, KernelStore, Variance};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -57,8 +130,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// them. Extraction redeclares each distinct `BufferIdentity` once in the
 /// output arena.
 ///
-/// Returns `None`, unchanged, when the subgraph reachable from `root`
-/// contains a construct the e-graph doesn't model:
+/// A **reference** is a unit (see the module docs): its body is optimized by
+/// itself and linked in after extraction, so the arena handed back holds no
+/// `Ref`. A unit, or the term around it, that the e-graph declines is linked
+/// as written while the rest still optimize — a decline narrows to the term
+/// that declined.
+///
+/// Returns `None`, unchanged, when the term holds no reference and the
+/// subgraph reachable from `root` contains a construct the e-graph doesn't
+/// model:
 ///
 /// - `RawGather` — produced by lowering, after the e-graph's place in the
 ///   pipeline; reaching one here means the arena is already lowered.
@@ -107,6 +187,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// kernel that binds a table — a glyph, the cell grid — was no optimizer
 /// cache at all.
 ///
+/// A unit leaf is the one leaf the key holds by value
+/// (`pixelflow_ir::key`'s `Ref` encoding digests its referent's whole
+/// identity), so a term *around* units shares a saturation only with a term
+/// around the same units. The units themselves are keyed like any term.
+///
 /// [`saturation_count`] counts the saturations this process has run, for a
 /// test that wants to assert the second shape did not pay one.
 ///
@@ -120,14 +205,9 @@ pub fn optimize_runtime_arena(
     root: ExprId,
     shape: LatticeShape,
 ) -> Option<Arc<(ExprArena, ExprId)>> {
-    if saturation_switch() == SaturationSwitch::Off {
-        return without_saturation(arena, root).map(Arc::new);
-    }
-    let mut expanded = None;
-    let (arena, root) = with_refs_expanded(arena, root, &mut expanded);
-    let canon = canonical(arena, root);
-    let saturated = saturated_for(&canon, arena, root, shape)?;
-    extract_for(&saturated, &canon, arena, root, shape).map(Arc::new)
+    Program::of(arena, root)
+        .optimize(Run::new(shape, saturated_for))
+        .map(Arc::new)
 }
 
 /// [`optimize_runtime_arena`] with the cache bypassed: a fresh saturation
@@ -138,78 +218,7 @@ fn optimize_runtime_arena_uncached(
     root: ExprId,
     shape: LatticeShape,
 ) -> Option<(ExprArena, ExprId)> {
-    if saturation_switch() == SaturationSwitch::Off {
-        return without_saturation(arena, root);
-    }
-    let mut expanded = None;
-    let (arena, root) = with_refs_expanded(arena, root, &mut expanded);
-    let canon = canonical(arena, root);
-    let saturated = saturate(&canon, arena, root, shape)?;
-    extract_for(&saturated, &canon, arena, root, shape)
-}
-
-/// The `Identity` path: the same legalizing tail, no saturation. What
-/// `Lattice::bake` would emit if the e-graph did not exist — the "F" column
-/// of docs/plans/2026-09-06-egraph-at-production-scale.md §7, measured by
-/// docs/results/2026-09-07-egraph-off-vs-on-real-shaders.md.
-fn without_saturation(arena: &ExprArena, root: ExprId) -> Option<(ExprArena, ExprId)> {
-    pipeline![ExpandRefs, Identity, LowerDwrt]
-        .optimize(arena, root)
-        .into_changed()
-}
-
-/// References first: every step of optimization reads structure, and a name
-/// has none to read — its referent is not in this arena. Guarded rather than
-/// called unconditionally, since the pass's own identity path still clones
-/// the arena; `expanded` is where the clone lives when there is one.
-fn with_refs_expanded<'a>(
-    arena: &'a ExprArena,
-    root: ExprId,
-    expanded: &'a mut Option<(ExprArena, ExprId)>,
-) -> (&'a ExprArena, ExprId) {
-    if !arena
-        .nodes_raw()
-        .iter()
-        .any(|n| matches!(n, ExprNode::Ref(_)))
-    {
-        return (arena, root);
-    }
-    let (owned, owned_root) = expanded.insert(pixelflow_ir::passes::expand_refs_owned(arena, root));
-    (owned, *owned_root)
-}
-
-/// Extract `saturated` for `shape` and hand the term back in `arena`'s own
-/// names and slot order, lowered.
-fn extract_for(
-    saturated: &Saturated,
-    canon: &Canonical,
-    arena: &ExprArena,
-    root: ExprId,
-    shape: LatticeShape,
-) -> Option<(ExprArena, ExprId)> {
-    let optimizer = runtime_optimizer(shape);
-    let optimized = optimizer.extract(&saturated.egraph, saturated.root, saturated.stats.clone());
-    let (extracted, extracted_root) = optimized.to_arena(&saturated.egraph, saturated.root);
-
-    // Names. The graph's are the saturating composition's, in extraction
-    // order; this caller's go in their slots, in this caller's own order.
-    let (in_canonical_order, extracted_root) =
-        extracted.relink(extracted_root, &saturated.buffers, &saturated.uniforms);
-    let (in_callers_order, extracted_root) = in_canonical_order
-        .with_tables(canon.buffers.clone(), canon.uniforms.clone())
-        .relink(extracted_root, arena.buffers(), arena.uniforms());
-    let _ = root;
-
-    // `LowerDwrt` last, and that is the whole point: legalization is the
-    // *fallback*, taking whatever illegal shape survived saturation — a
-    // `Dwrt` the chain rule did not reach — and making it emittable. It owns
-    // nothing the graph does not also know, so running it first only takes
-    // choices away. A `Reduce` is not illegal, nested or not: codegen emits
-    // a surviving fold as a loop, and a fold inside a fold as a loop inside
-    // a loop, so every fold stays folded all the way to the assembler.
-    // Mirrors `pixelflow-ir::passes::legalize`, which says the same thing at
-    // the other compile entry.
-    pixelflow_ir::passes::lower_dwrt_owned(&in_callers_order, extracted_root).ok()
+    Program::of(arena, root).optimize(Run::new(shape, saturate_fresh))
 }
 
 /// How many terms this process has saturated.
@@ -222,6 +231,323 @@ pub fn saturation_count() -> usize {
 }
 
 static SATURATIONS: AtomicUsize = AtomicUsize::new(0);
+
+// ──────────────────────────────── the unit walk ──────────────────────────────
+
+/// A term and every unit it reads: the input to `L_s` (module docs).
+///
+/// Built by one walk over the store, which is the only place a unit's body
+/// and so its variance can be found; everything after it — saturation,
+/// extraction, the link — reads this and never the store.
+struct Program<'a> {
+    /// The term around the units, with every reference a `Dwrt` reaches
+    /// already linked as written. Borrowed when there was nothing to link.
+    outer: Cow<'a, ExprArena>,
+    root: ExprId,
+    /// Every unit reachable from the term, through units too, by key.
+    units: BTreeMap<KernelKey, Unit>,
+}
+
+/// One unit: its body, itself with the references a `Dwrt` reaches linked,
+/// and the variance its leaf carries.
+struct Unit {
+    body: ExprArena,
+    root: ExprId,
+    variance: Variance,
+}
+
+impl<'a> Program<'a> {
+    /// The units of the term at `root`, resolved through the store.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a key names no interned kernel (a corrupt graph, as
+    /// `passes::expand_refs` says), or if a unit is not closed — its
+    /// variance names a binder or a retired axis, which no rewrite outside
+    /// it could substitute (Law U, step 2). `Kernel::by_ref` refuses the
+    /// open term it can see; `KernelStore::intern` and `ExprArena::push_ref`
+    /// can name anything, so the law is checked here, where it is used.
+    fn of(arena: &'a ExprArena, root: ExprId) -> Self {
+        let mut units = BTreeMap::new();
+        if !holds_a_ref(arena) {
+            return Self {
+                outer: Cow::Borrowed(arena),
+                root,
+                units,
+            };
+        }
+        let (outer, root) = with_differentiated_refs_linked(arena, root);
+        let mut pending = refs_reachable(&outer, root);
+        while let Some(key) = pending.pop() {
+            if units.contains_key(&key) {
+                continue;
+            }
+            let referent = KernelStore::resolve(key).unwrap_or_else(|| {
+                panic!(
+                    "optimize_runtime_arena: {key:?} names no interned kernel — every \
+                     Ref is minted by Kernel::by_ref, which interns first"
+                )
+            });
+            let (body, body_root) = referent.parts();
+            let (body, body_root) = with_differentiated_refs_linked(body, body_root);
+            let variance =
+                pixelflow_ir::variance::compute_arena_variance(&body)[body_root.0 as usize];
+            assert!(
+                variance.without(Variance::COORDS).is_const(),
+                "optimize_runtime_arena: the unit {key:?} varies as {variance:?}. A unit \
+                 is optimized out of its context, which is sound only for a term closed \
+                 over the coordinates: no rewrite outside it can substitute a binder \
+                 inside it"
+            );
+            pending.extend(refs_reachable(&body, body_root));
+            units.insert(
+                key,
+                Unit {
+                    body: body.into_owned(),
+                    root: body_root,
+                    variance,
+                },
+            );
+        }
+        Self { outer, root, units }
+    }
+
+    /// `L_s`: every unit and the term around them optimized by itself, then
+    /// linked into one program, then `lower_dwrt` once over all of it.
+    ///
+    /// With no unit this is the sequence of calls the runtime tier has always
+    /// made, so a term without a reference is optimized exactly as before:
+    /// `None` when the e-graph declines it, for the caller to compile as
+    /// given.
+    fn optimize(&self, run: Run) -> Option<(ExprArena, ExprId)> {
+        let leaves: BTreeMap<KernelKey, Variance> =
+            self.units.iter().map(|(k, u)| (*k, u.variance)).collect();
+        let outer = Job {
+            arena: &self.outer,
+            root: self.root,
+            leaves: &leaves,
+        };
+        if self.units.is_empty() {
+            let (optimized, optimized_root) = outer.optimize(run)?;
+            return pixelflow_ir::passes::lower_dwrt_owned(&optimized, optimized_root).ok();
+        }
+
+        // The term around the units first, then each unit, in key order: the
+        // order results land in, whatever order the workers finish in.
+        let jobs: Vec<Job<'_>> = core::iter::once(outer)
+            .chain(self.units.values().map(|u| Job {
+                arena: &u.body,
+                root: u.root,
+                leaves: &leaves,
+            }))
+            .collect();
+        let mut optimized = run
+            .each(&jobs)
+            .into_iter()
+            .zip(&jobs)
+            .map(|(done, job)| done.unwrap_or_else(|| (job.arena.clone(), job.root)));
+        let (mut program, program_root) = optimized
+            .next()
+            .expect("the term around the units is the first job");
+        let bodies: BTreeMap<KernelKey, (ExprArena, ExprId)> =
+            self.units.keys().copied().zip(optimized).collect();
+
+        let linked_root = pixelflow_ir::passes::link(&mut program, program_root, &bodies);
+        // `lower_dwrt` last, over the linked program, and that is the whole
+        // point: legalization is the *fallback*, taking whatever illegal
+        // shape survived saturation — a `Dwrt` the chain rule did not reach
+        // — and making it emittable. It owns nothing the graph does not also
+        // know, so running it first only takes choices away.
+        pixelflow_ir::passes::lower_dwrt_owned(&program, linked_root).ok()
+    }
+}
+
+/// Whether `arena` holds a reference anywhere — the guard that keeps a term
+/// without one on exactly the path it always took, uncloned.
+fn holds_a_ref(arena: &ExprArena) -> bool {
+    arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_)))
+}
+
+/// The keys of the references reachable from `root`, in walk order, each
+/// once.
+fn refs_reachable(arena: &ExprArena, root: ExprId) -> Vec<KernelKey> {
+    let mut seen = vec![false; arena.len()];
+    let mut stack = vec![root];
+    let mut keys = Vec::new();
+    while let Some(id) = stack.pop() {
+        if core::mem::replace(&mut seen[id.0 as usize], true) {
+            continue;
+        }
+        if let ExprNode::Ref(key) = arena.node(id) {
+            keys.push(key);
+        }
+        stack.extend(arena.children(id));
+    }
+    keys
+}
+
+/// `arena` with every reference a `Dwrt` reaches linked as written, from the
+/// store: a reference under a derivative is not a unit (module docs).
+fn with_differentiated_refs_linked(
+    arena: &ExprArena,
+    root: ExprId,
+) -> (Cow<'_, ExprArena>, ExprId) {
+    let differentiated = differentiated_refs(arena, root);
+    if differentiated.is_empty() {
+        return (Cow::Borrowed(arena), root);
+    }
+    let bodies: BTreeMap<KernelKey, (ExprArena, ExprId)> = differentiated
+        .into_iter()
+        .map(|key| {
+            let referent = KernelStore::resolve(key).unwrap_or_else(|| {
+                panic!("optimize_runtime_arena: {key:?} names no interned kernel")
+            });
+            (key, referent.linked_parts())
+        })
+        .collect();
+    let mut linked = arena.clone();
+    let linked_root = pixelflow_ir::passes::link(&mut linked, root, &bodies);
+    (Cow::Owned(linked), linked_root)
+}
+
+/// The keys of the references reachable from the operand of a `Dwrt`
+/// reachable from `root`. A node is visited at most twice — once outside
+/// every derivative and once inside one.
+fn differentiated_refs(arena: &ExprArena, root: ExprId) -> BTreeSet<KernelKey> {
+    let mut seen: BTreeSet<(ExprId, bool)> = BTreeSet::new();
+    let mut stack = vec![(root, false)];
+    let mut keys = BTreeSet::new();
+    while let Some((id, under)) = stack.pop() {
+        if !seen.insert((id, under)) {
+            continue;
+        }
+        match arena.node(id) {
+            ExprNode::Ref(key) if under => {
+                keys.insert(key);
+            }
+            ExprNode::Binary(OpKind::Dwrt, operand, axis) => {
+                stack.push((operand, true));
+                stack.push((axis, under));
+            }
+            _ => stack.extend(arena.children(id).map(|c| (c, under))),
+        }
+    }
+    keys
+}
+
+// ─────────────────────────────── one term, one run ───────────────────────────
+
+/// One term the runtime tier saturates and extracts by itself: the term
+/// around the units, or one unit's body. `leaves` is every unit of the
+/// program with its variance; the graph admits them all, and the term holds
+/// the ones it reads.
+struct Job<'a> {
+    arena: &'a ExprArena,
+    root: ExprId,
+    leaves: &'a BTreeMap<KernelKey, Variance>,
+}
+
+impl Job<'_> {
+    /// `Ô_s`: saturate (or find saturated) and extract, in this term's own
+    /// names and slot order. `None` when the e-graph declines the term, which
+    /// telemetry records.
+    fn optimize(&self, run: Run) -> Option<(ExprArena, ExprId)> {
+        let canon = canonical(self.arena, self.root);
+        let saturated = match (run.saturate)(self, &canon, run.shape) {
+            Ok(saturated) => saturated,
+            Err(declined) => {
+                #[cfg(feature = "saturation-telemetry")]
+                crate::telemetry::record_decline(crate::tier::Tier::Runtime, declined);
+                #[cfg(not(feature = "saturation-telemetry"))]
+                let _ = declined;
+                return None;
+            }
+        };
+        Some(extract_for(&saturated, &canon, self.arena, run.shape))
+    }
+}
+
+/// How one optimization runs: the lattice it extracts for, where saturations
+/// come from (the cache, or fresh — a function value, not a flag), and how
+/// many workers share the units.
+#[derive(Clone, Copy)]
+struct Run {
+    shape: LatticeShape,
+    saturate: Saturate,
+    workers: NonZeroUsize,
+}
+
+/// Where a run gets a term's saturated graph.
+type Saturate = fn(&Job<'_>, &Canonical, LatticeShape) -> Result<Arc<Saturated>, Declined>;
+
+impl Run {
+    /// A run with as many workers as the host has threads — one where the
+    /// host cannot say, which costs time and nothing else, since the worker
+    /// count cannot reach the result ([`Run::each`]).
+    fn new(shape: LatticeShape, saturate: Saturate) -> Self {
+        let workers = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
+        Self {
+            shape,
+            saturate,
+            workers,
+        }
+    }
+
+    /// Every job optimized, the result for `jobs[i]` at `i`: workers pull
+    /// the next index until there is none, so which worker ran which job, and
+    /// in what order, cannot reach the result.
+    fn each(self, jobs: &[Job<'_>]) -> Vec<Option<(ExprArena, ExprId)>> {
+        let results: Vec<OnceLock<Option<(ExprArena, ExprId)>>> =
+            jobs.iter().map(|_| OnceLock::new()).collect();
+        let next = AtomicUsize::new(0);
+        let work = || {
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(job) = jobs.get(i) else {
+                    return;
+                };
+                let done = results[i].set(job.optimize(self)).is_ok();
+                assert!(done, "Run::each: job {i} was claimed twice");
+            }
+        };
+        let workers = self.workers.get().min(jobs.len());
+        std::thread::scope(|scope| {
+            for _ in 1..workers {
+                scope.spawn(work);
+            }
+            work();
+        });
+        results
+            .into_iter()
+            .map(|r| {
+                r.into_inner()
+                    .expect("Run::each: every job is claimed once")
+            })
+            .collect()
+    }
+}
+
+/// Extract `saturated` for `shape` and hand the term back in `arena`'s own
+/// names and slot order — unlowered: a unit is linked before `lower_dwrt`
+/// runs, once, over the whole program.
+fn extract_for(
+    saturated: &Saturated,
+    canon: &Canonical,
+    arena: &ExprArena,
+    shape: LatticeShape,
+) -> (ExprArena, ExprId) {
+    let optimizer = runtime_optimizer(shape);
+    let optimized = optimizer.extract(&saturated.egraph, saturated.root, saturated.stats.clone());
+    let (extracted, extracted_root) = optimized.to_arena(&saturated.egraph, saturated.root);
+
+    // Names. The graph's are the saturating composition's, in extraction
+    // order; this caller's go in their slots, in this caller's own order.
+    let (in_canonical_order, extracted_root) =
+        extracted.relink(extracted_root, &saturated.buffers, &saturated.uniforms);
+    in_canonical_order
+        .with_tables(canon.buffers.clone(), canon.uniforms.clone())
+        .relink(extracted_root, arena.buffers(), arena.uniforms())
+}
 
 /// A term saturated once, for every lattice it is later extracted at.
 struct Saturated {
@@ -243,16 +569,24 @@ fn runtime_optimizer(shape: LatticeShape) -> Optimizer {
         .for_lattice(shape)
 }
 
-/// The saturated graph for `canon`'s structure, saturating `arena` if this
-/// process has not seen the structure before. `None`, memoized, for a term
-/// the e-graph declines.
+/// One structure's saturation, or its decline, shared by every caller that
+/// asks for it.
+type Slot = Arc<OnceLock<Result<Arc<Saturated>, Declined>>>;
+
+/// The saturated graph for `canon`'s structure, saturating `job`'s term if
+/// this process has not seen the structure before. The decline is memoized
+/// like a result.
+///
+/// **Once per structure, however many ask at once.** Each key holds one slot,
+/// and the first caller to reach it saturates while the rest wait on it —
+/// so the units of one program, or two programs compiling at once, never
+/// saturate one structure twice.
 fn saturated_for(
+    job: &Job<'_>,
     canon: &Canonical,
-    arena: &ExprArena,
-    root: ExprId,
     shape: LatticeShape,
-) -> Option<Arc<Saturated>> {
-    static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Option<Arc<Saturated>>>>> = OnceLock::new();
+) -> Result<Arc<Saturated>, Declined> {
+    static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Slot>>> = OnceLock::new();
 
     let mut key = canon.key.clone();
     // Saturation is a deterministic function of the structure and the
@@ -264,41 +598,43 @@ fn saturated_for(
     // keying on it is what keeps that from being load-bearing.
     key.extend_from_slice(&runtime_optimizer(shape).fingerprint().to_bytes());
 
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(hit) = cache
-        .lock()
-        .expect("saturated_for: lock poisoned")
-        .get(&key)
-    {
-        return hit.clone();
-    }
-    // Saturate outside the lock so concurrent distinct structures don't
-    // serialize. A racing duplicate saturation wastes work; the first
-    // insertion wins so all callers share one graph.
-    let fresh = saturate(canon, arena, root, shape).map(Arc::new);
-    cache
-        .lock()
-        .expect("saturated_for: lock poisoned")
-        .entry(key)
-        .or_insert(fresh)
+    let slot: Slot = Arc::clone(
+        CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("saturated_for: lock poisoned")
+            .entry(key)
+            .or_default(),
+    );
+    // Outside the map's lock, so distinct structures saturate concurrently;
+    // inside the slot's, so one structure saturates once.
+    slot.get_or_init(|| saturate(job, canon, shape).map(Arc::new))
         .clone()
 }
 
-/// Insert `arena` and saturate it under the runtime tier's configuration.
+/// [`saturate`], uncached: the [`Saturate`] a measurement runs.
+fn saturate_fresh(
+    job: &Job<'_>,
+    canon: &Canonical,
+    shape: LatticeShape,
+) -> Result<Arc<Saturated>, Declined> {
+    saturate(job, canon, shape).map(Arc::new)
+}
+
+/// Insert `job`'s term and saturate it under the runtime tier's
+/// configuration, its units admitted as leaves.
 ///
 /// `shape` is not what saturation depends on; it prices the one extraction
 /// the telemetry record carries, the extraction this saturation was asked
 /// for.
-fn saturate(
-    canon: &Canonical,
-    arena: &ExprArena,
-    root: ExprId,
-    shape: LatticeShape,
-) -> Option<Saturated> {
+fn saturate(job: &Job<'_>, canon: &Canonical, shape: LatticeShape) -> Result<Saturated, Declined> {
     let mut optimizer = runtime_optimizer(shape);
     let mut egraph = optimizer.egraph();
-    let root_class = insert(arena, root, &mut egraph, Vocabulary::Runtime).ok()?;
-    let node_count = reachable_count(arena, root);
+    for (&key, &variance) in job.leaves {
+        egraph.admit_unit(key, variance);
+    }
+    let root_class = insert(job.arena, job.root, &mut egraph, Vocabulary::Runtime)?;
+    let node_count = reachable_count(job.arena, job.root);
     #[cfg(feature = "saturation-telemetry")]
     let inserted_classes = egraph.num_classes();
     #[cfg(feature = "saturation-telemetry")]
@@ -326,53 +662,12 @@ fn saturate(
     #[cfg(not(feature = "saturation-telemetry"))]
     let _ = node_count;
 
-    Some(Saturated {
+    Ok(Saturated {
         egraph,
         root: root_class,
         stats,
         buffers: canon.buffers.clone(),
         uniforms: canon.uniforms.clone(),
-    })
-}
-
-/// Whether the runtime tier saturates at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-enum SaturationSwitch {
-    Off = 0,
-    On = 1,
-}
-
-/// The one place `PIXELFLOW_SATURATION` is read.
-///
-/// `off` selects the `Identity` path above; `on` or unset selects
-/// saturation; any other value is a hard error. The variable is honoured
-/// only under the `saturation-switch` cargo feature (a measurement build:
-/// `pixelflow-pipeline`'s `egraph_off_on` harness). A build without the
-/// feature panics if the variable is set at all, so an `export
-/// PIXELFLOW_SATURATION=off` left behind in a shell can never quietly ship
-/// unoptimized kernels — the switch is not leavable-on by accident.
-fn saturation_switch() -> SaturationSwitch {
-    static SWITCH: OnceLock<SaturationSwitch> = OnceLock::new();
-    *SWITCH.get_or_init(|| {
-        let var = std::env::var("PIXELFLOW_SATURATION");
-        #[cfg(not(feature = "saturation-switch"))]
-        {
-            assert!(
-                matches!(var, Err(std::env::VarError::NotPresent)),
-                "PIXELFLOW_SATURATION is set ({var:?}) but this build has no \
-                 `saturation-switch` feature (pixelflow-search); the variable is a \
-                 measurement switch and a production build refuses to guess what \
-                 it means. Unset it."
-            );
-            SaturationSwitch::On
-        }
-        #[cfg(feature = "saturation-switch")]
-        match var.as_deref() {
-            Err(std::env::VarError::NotPresent) | Ok("on") => SaturationSwitch::On,
-            Ok("off") => SaturationSwitch::Off,
-            other => panic!("PIXELFLOW_SATURATION must be `on` or `off` (or unset), got {other:?}"),
-        }
     })
 }
 
@@ -390,24 +685,7 @@ mod tests {
     use super::*;
     use pixelflow_ir::OpKind;
     use pixelflow_ir::arena::BufferDecl;
-    use pixelflow_ir::binding::BindingTable;
     use pixelflow_ir::fold::{Binder, Fold, Monoid};
-
-    #[test]
-    fn saturation_switch_follows_the_variable() {
-        use super::SaturationSwitch;
-        // Without the feature a set variable is a panic (loud, in the call
-        // below); with it, the mapping is the contract.
-        #[cfg(not(feature = "saturation-switch"))]
-        let expected = SaturationSwitch::On;
-        #[cfg(feature = "saturation-switch")]
-        let expected = match std::env::var("PIXELFLOW_SATURATION").as_deref() {
-            Err(_) | Ok("on") => SaturationSwitch::On,
-            Ok("off") => SaturationSwitch::Off,
-            Ok(other) => panic!("unexpected PIXELFLOW_SATURATION={other:?} in a test process"),
-        };
-        assert_eq!(super::saturation_switch(), expected);
-    }
 
     #[test]
     fn repeated_bake_of_the_same_kernel_hits_the_cache() {
@@ -457,8 +735,8 @@ mod tests {
         let warm = warm_start.elapsed();
 
         assert_eq!(
-            opt1.nodes_raw().len(),
-            opt2.nodes_raw().len(),
+            opt1.len(),
+            opt2.len(),
             "cached and fresh optimization must agree on the result shape"
         );
         assert!(
@@ -470,7 +748,7 @@ mod tests {
 
     /// Ids of every node reachable from `root`, discovery order.
     fn reachable_ids(arena: &ExprArena, root: ExprId) -> Vec<ExprId> {
-        let mut seen = vec![false; arena.nodes_raw().len()];
+        let mut seen = vec![false; arena.len()];
         let mut stack = vec![root];
         let mut out = Vec::new();
         while let Some(id) = stack.pop() {
@@ -498,31 +776,10 @@ mod tests {
         reachable_ids(arena, root)
             .iter()
             .filter_map(|&id| match arena.node(id) {
-                &ExprNode::Buffer(b) => Some(arena.buffer_decl(b).id),
+                ExprNode::Buffer(b) => Some(arena.buffer_decl(b).id),
                 _ => None,
             })
             .collect()
-    }
-
-    /// Bind slices to an arena by buffer *identity*, not slot order: the
-    /// optimizer redeclares buffers in extraction-traversal order, so the
-    /// optimized arena's slot numbering can differ from the input's.
-    fn bind_by_identity<'a>(
-        arena: &ExprArena,
-        by_id: &[(pixelflow_ir::arena::BufferIdentity, &'a [f32])],
-    ) -> BindingTable<'a> {
-        let slices: Vec<&[f32]> = arena
-            .buffers()
-            .iter()
-            .map(|d| {
-                by_id
-                    .iter()
-                    .find(|(id, _)| *id == d.id)
-                    .unwrap_or_else(|| panic!("no slice for buffer identity {:?}", d.id))
-                    .1
-            })
-            .collect();
-        BindingTable::bind(arena, &slices).expect("bind_by_identity")
     }
 
     /// Slot order is the binding ABI: the JIT loads slot i's base pointer
@@ -642,11 +899,210 @@ mod tests {
     }
 
     /// Whether any `Nary` (the `Reduce` binder) is reachable from `root`.
+    // ───────────────────────────────── units ─────────────────────────────────
+    use pixelflow_ir::{Kernel, Uniform};
+
+    /// `Σ (x·cₖ + y·cₖ)` over a few constants, with a uniform in it: a body
+    /// with real rewriting to do (factoring, fusion), so an extraction has
+    /// choices to make.
+    fn busy_body(scale: f32) -> Kernel {
+        let tint = Uniform::new(scale).kernel();
+        (0..6)
+            .fold(Kernel::constant(0.0), |acc, k| {
+                let c = Kernel::constant(1.0 + k as f32 * 0.37);
+                acc.add(&Kernel::x().mul(&c).add(&Kernel::y().mul(&c)))
+            })
+            .mul(&tint)
+    }
+
+    /// The optimized term's canonical form: its structure and the names in
+    /// its slots.
+    fn canonical_of(optimized: &(ExprArena, ExprId)) -> Canonical {
+        canonical(&optimized.0, optimized.1)
+    }
+
+    /// **Law U at a lone unit, to the bit.** A kernel named and nothing
+    /// around it: the term around the unit is the leaf, so the link puts back
+    /// exactly the body's own optimization, and the two are one term — where
+    /// extraction cannot differ, units change nothing.
+    #[test]
+    fn a_lone_named_body_optimizes_to_the_body_s_own_term() {
+        let body = busy_body(0.5);
+        let shape = LatticeShape::new([16, 16]);
+        let (arena, root) = body.parts();
+        let direct = optimize_runtime_arena(arena, root, shape).expect("the body optimizes");
+        let named = body.by_ref();
+        let (arena, root) = named.parts();
+        let linked = optimize_runtime_arena(arena, root, shape).expect("the named body optimizes");
+        assert!(
+            !holds_a_ref(&linked.0) || refs_reachable(&linked.0, linked.1).is_empty(),
+            "the link leaves no reference reachable"
+        );
+        assert_eq!(canonical_of(&direct), canonical_of(&linked));
+    }
+
+    /// A program of several units of distinct structures, under a choice
+    /// over one uniform: each unit's body differs, so each saturates.
+    fn several_units() -> Kernel {
+        let id = Uniform::new(1.0).kernel();
+        let units: Vec<Kernel> = (0..5)
+            .map(|i| {
+                busy_body(0.25 + i as f32)
+                    .add(&Kernel::constant(i as f32 * 3.5))
+                    .by_ref()
+            })
+            .collect();
+        units[1..]
+            .iter()
+            .enumerate()
+            .fold(units[0].clone(), |acc, (i, u)| {
+                id.lt(&Kernel::constant(1.0 + i as f32)).select(&acc, u)
+            })
+    }
+
+    /// **The worker count cannot reach the program.** The same units on one
+    /// worker and on four, each run saturating afresh: results land by index
+    /// and the link walks the term in its own order, so the two programs are
+    /// one arena, node for node and slot for slot — not merely one canonical
+    /// form, which is blind to the order a link pushed nodes in.
+    #[test]
+    fn the_worker_count_does_not_reach_the_program() {
+        let program = several_units();
+        let (arena, root) = program.parts();
+        let shape = LatticeShape::new([16, 16]);
+        let run = |workers: usize| {
+            Program::of(arena, root)
+                .optimize(Run {
+                    shape,
+                    saturate: saturate_fresh,
+                    workers: NonZeroUsize::new(workers).expect("a worker"),
+                })
+                .expect("the program optimizes")
+        };
+        let (one, one_root) = run(1);
+        let (four, four_root) = run(4);
+        assert_eq!(one_root, four_root);
+        assert_eq!(
+            one.nodes().collect::<Vec<_>>(),
+            four.nodes().collect::<Vec<_>>()
+        );
+        assert_eq!(one.uniforms(), four.uniforms());
+        assert_eq!(one.buffers(), four.buffers());
+    }
+
+    /// A reference a derivative reaches is no unit: it is linked as written
+    /// before insertion, so the chain rule runs in the graph over its body. A
+    /// second reference beside it, which no `Dwrt` reaches, stays a unit.
+    #[test]
+    fn a_differentiated_reference_is_linked_before_insertion() {
+        let differentiated = Kernel::x().mul(&Kernel::x()).add(&Kernel::constant(0.125));
+        let beside = Kernel::y().mul(&Kernel::constant(2.75));
+        let program = differentiated.by_ref().dx().add(&beside.by_ref());
+        let (arena, root) = program.parts();
+        let walked = Program::of(arena, root);
+        assert_eq!(
+            walked.units.keys().copied().collect::<Vec<_>>(),
+            vec![KernelStore::intern(&beside)],
+            "only the reference no Dwrt reaches is a unit"
+        );
+        assert_eq!(
+            refs_reachable(&walked.outer, walked.root),
+            vec![KernelStore::intern(&beside)],
+            "the differentiated one is linked into the term itself"
+        );
+    }
+
+    /// Whether some fold reachable from `root` has a body that reaches
+    /// `Var(var)`.
+    fn a_fold_reads(arena: &ExprArena, root: ExprId, var: u8) -> bool {
+        let reaches = |from: ExprId| {
+            let mut seen = vec![false; arena.len()];
+            let mut stack = vec![from];
+            while let Some(id) = stack.pop() {
+                if core::mem::replace(&mut seen[id.0 as usize], true) {
+                    continue;
+                }
+                if arena.node(id) == ExprNode::Var(var) {
+                    return true;
+                }
+                stack.extend(arena.children(id));
+            }
+            false
+        };
+        reachable_ids(arena, root)
+            .into_iter()
+            .any(|id| match arena.node(id) {
+                ExprNode::Reduce { body, .. } => reaches(body),
+                _ => false,
+            })
+    }
+
+    /// **A unit is hoisted out of a fold it does not read**, because its
+    /// leaf carries its referent's variance: `Σ_{i<8} u·i`, with `u` a named
+    /// kernel of `X`, factors to `u·Σ i` and the fold no longer reads `X`.
+    /// The leaf is priced 0 (`CostModel::node_op_cost`), so the hoist is
+    /// chosen for the multiplications it saves, not for the unit's own
+    /// cost — the trade that price states.
+    #[test]
+    fn a_unit_is_hoisted_out_of_a_fold_it_does_not_read() {
+        let unit = Kernel::x()
+            .mul(&Kernel::x())
+            .add(&Kernel::constant(1.5))
+            .sqrt();
+        let program = Kernel::sum_over(8, |i| unit.by_ref().mul(i));
+        let (arena, root) = program.parts();
+        let (out, out_root) = &*optimize_runtime_arena(arena, root, LatticeShape::new([16, 16]))
+            .expect("the program optimizes");
+        assert!(
+            !a_fold_reads(out, *out_root, 0),
+            "the unit stayed inside the fold: {}",
+            out.display(*out_root)
+        );
+    }
+
+    /// **A decline narrows.** A unit the e-graph cannot hold — here, one
+    /// holding a `Seq`, an op no vocabulary resolves — is linked as written,
+    /// while the unit beside it is still optimized: one declining unit no
+    /// longer costs the program every other unit's optimization.
+    #[test]
+    fn a_declining_unit_does_not_cost_the_others_their_optimization() {
+        let mut sequenced = ExprArena::new();
+        let x = sequenced.push_var(0);
+        let y = sequenced.push_var(1);
+        let seq = sequenced.push_binary(OpKind::Seq, x, y);
+        let declines = Kernel::from_parts(sequenced, seq);
+        // X·0 + Y: folds to Y, which only an optimized unit can say.
+        let folds = Kernel::x().mul(&Kernel::constant(0.0)).add(&Kernel::y());
+        let program = declines.by_ref().add(&folds.by_ref());
+        let (arena, root) = program.parts();
+        let (out, out_root) = &*optimize_runtime_arena(arena, root, LatticeShape::POINT)
+            .expect("a program of units links even when one declines");
+        let ExprNode::Binary(OpKind::Add, a, b) = out.node(*out_root) else {
+            panic!(
+                "expected the sum of the two units, got {}",
+                out.display(*out_root)
+            );
+        };
+        let kinds = [out.node(a), out.node(b)];
+        assert!(
+            kinds
+                .iter()
+                .any(|n| matches!(n, ExprNode::Binary(OpKind::Seq, ..))),
+            "the declining unit is linked as written: {}",
+            out.display(*out_root)
+        );
+        assert!(
+            kinds.iter().any(|n| matches!(n, ExprNode::Var(1))),
+            "the other unit is optimized to Y: {}",
+            out.display(*out_root)
+        );
+    }
+
     /// Whether a binder survives to the optimized arena. Named for what it
     /// asks rather than for the node shape it used to look for: a fold is
     /// `ExprNode::Reduce` now, not an `Nary`.
     fn reaches_a_binder(arena: &ExprArena, root: ExprId) -> bool {
-        let mut seen = vec![false; arena.nodes_raw().len()];
+        let mut seen = vec![false; arena.len()];
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
             if core::mem::replace(&mut seen[id.0 as usize], true) {
@@ -677,7 +1133,7 @@ mod congruence_gap_probe {
     use super::*;
     use crate::arena_corpus::{category_of, load_arena_dump, median, percentile};
     use crate::egraph::rule_order::{RuleOrder, build_rule_set};
-    use crate::egraph::{CostModel, RuleSet, SaturationStop, choices_to_arena};
+    use crate::egraph::{CostModel, ENode, RuleSet, SaturationStop, choices_to_arena};
     use crate::nnue::{BwdGenConfig, BwdGenerator};
     use std::path::{Path, PathBuf};
 
@@ -771,7 +1227,7 @@ mod congruence_gap_probe {
     /// quantity this computes; the arena walk is kept as the independent
     /// check that they agree.
     fn arena_static_cost(model: &CostModel, arena: &ExprArena, root: ExprId) -> usize {
-        let len = arena.nodes_raw().len();
+        let len = arena.len();
         let mut seen = vec![false; len];
         let mut stack = vec![root];
         let mut total = 0usize;
@@ -782,7 +1238,7 @@ mod congruence_gap_probe {
             let kind = match arena.node(id) {
                 ExprNode::Unary(k, _)
                 | ExprNode::Binary(k, _, _)
-                | ExprNode::Ternary(k, _, _, _) => Some(*k),
+                | ExprNode::Ternary(k, _, _, _) => Some(k),
                 _ => None,
             };
             if let Some(k) = kind {
@@ -867,8 +1323,11 @@ mod congruence_gap_probe {
         arena: &ExprArena,
         root: ExprId,
     ) -> ProductionRun {
-        // What `optimize_runtime_arena_uncached` hands the e-graph:
-        // `ExpandRefs` and nothing else. `LowerDwrt` runs after saturation —
+        // What `optimize_runtime_arena_uncached` hands the e-graph for a
+        // term with no reference: the arena as written (`expand_refs` is the
+        // identity on it; a corpus arena holds none, and one that did is
+        // measured here whole rather than unit by unit, as production would
+        // optimize it). `LowerDwrt` runs after saturation —
         // a `Dwrt` is a thing the rule set knows, and legalization is the
         // fallback for what it declined — so lowering here would measure a
         // pipeline that no longer exists. `Reduce` needs no such fallback any
@@ -1777,7 +2236,7 @@ pub(crate) mod production_telemetry {
     /// (#1111) is this same number read off the choices instead of the
     /// materialized arena; this walk stays as the independent check.
     fn arena_cost(arena: &ExprArena, root: ExprId, costs: &CostModel) -> usize {
-        let len = arena.nodes_raw().len();
+        let len = arena.len();
         let mut seen = vec![false; len];
         let mut stack = vec![root];
         let mut total = 0usize;
@@ -1792,14 +2251,13 @@ pub(crate) mod production_telemetry {
                 | ExprNode::Uniform(_) => None,
                 ExprNode::Unary(k, _)
                 | ExprNode::Binary(k, _, _)
-                | ExprNode::Ternary(k, _, _, _) => Some(*k),
+                | ExprNode::Ternary(k, _, _, _) => Some(k),
                 // A fold survives extraction now; the legalizer unrolls it
                 // afterwards, and this walk prices the node it is.
                 ExprNode::Reduce { .. } => Some(OpKind::Reduce),
                 other @ (ExprNode::Param(_)
                 | ExprNode::Nary(..)
                 | ExprNode::Ref(_)
-                | ExprNode::Guard { .. }
                 | ExprNode::Write { .. }) => {
                     panic!("extracted arena contains {other:?}")
                 }
@@ -2318,7 +2776,7 @@ mod production_equivalence {
     /// reason: it has to be reproducible by a different build.
     fn digest(arena: &ExprArena, root: ExprId) -> String {
         let mut text = String::new();
-        let len = arena.nodes_raw().len();
+        let len = arena.len();
         let mut reachable = vec![false; len];
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {

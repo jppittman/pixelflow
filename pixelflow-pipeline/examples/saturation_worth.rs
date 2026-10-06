@@ -7,8 +7,7 @@
 //!   before `Optimize` did: every JIT entry point saturated unconditionally,
 //!   so "the JIT is slower than LLVM" could not be split into "the JIT emits
 //!   worse code" and "the e-graph does less for the JIT's input".
-//! - `saturated` — the production runtime pipeline, `LowerDwrt` then
-//!   `ExpandReduce` then `Saturate`.
+//! - `saturated` — `LowerDwrt` then `Saturate`, the runtime tier's optimizer.
 //!
 //! ```text
 //! cargo run --release -p pixelflow-pipeline --example saturation_worth
@@ -20,7 +19,7 @@
 
 use pixelflow_ir::arena::{ExprArena, ExprId};
 use pixelflow_ir::optimize::{Identity, Optimize};
-use pixelflow_ir::passes::{ExpandReduce, LowerDwrt};
+use pixelflow_ir::passes::LowerDwrt;
 use pixelflow_ir::{LatticeShape, pipeline};
 use pixelflow_pipeline::jit_bench::{BenchMode, BenchSession};
 use pixelflow_pipeline::shader_bench::{SHADERTOY_KERNEL_NAMES, named_shadertoy_kernel};
@@ -53,11 +52,7 @@ fn main() {
 
         let (raw_arena, raw_root) = arm(Identity, &arena, root);
         let (opt_arena, opt_root) = arm(
-            pipeline![
-                LowerDwrt,
-                ExpandReduce,
-                Saturate::runtime(LatticeShape::POINT)
-            ],
+            pipeline![LowerDwrt, Saturate::runtime(LatticeShape::POINT)],
             &arena,
             root,
         );

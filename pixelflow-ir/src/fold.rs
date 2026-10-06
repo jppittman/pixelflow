@@ -1,4 +1,4 @@
-//! What a bounded reduction *is*: an algebra, an index, and a range.
+//! What a bounded reduction *is*: an algebra, an index, and a domain.
 //!
 //! A `Reduce` node used to carry these three as `Const(f32)` children — an
 //! `OpKind` reinterpreted through its discriminant, a binder slot, and a trip
@@ -25,7 +25,7 @@
 use core::ops::Range;
 
 use crate::arena::{REDUCE_BINDER_BASE, REDUCE_BINDERS};
-use crate::kind::OpKind;
+use crate::kind::{OpCode, OpKind};
 
 /// The algebra a reduction folds under: an associative combining operation
 /// together with the identity an empty domain folds to.
@@ -91,6 +91,74 @@ impl Monoid {
             .monoid_identity()
             .expect("a Monoid's operator has an identity")
     }
+
+    /// Encode for transmission: its combining operation's [`OpCode`]. As
+    /// for [`OpKind::marshal`], the round trip is what is promised, not the
+    /// bytes. A range fold's bits hold their monoid as this code
+    /// ([`Fold::to_bits`]); crate-private, so it hands no consumer an opcode
+    /// to reason with.
+    #[must_use]
+    pub(crate) fn marshal(self) -> OpCode {
+        self.op().marshal()
+    }
+
+    /// Decode. `None` if the code names no op, or an op that generates no
+    /// algebra.
+    #[must_use]
+    pub(crate) fn unmarshal(code: OpCode) -> Option<Self> {
+        OpKind::unmarshal(code).and_then(Self::of)
+    }
+}
+
+/// `⊕` of distinct terms under a [`Monoid`], built as the terms arrive:
+/// `((t₀ ⊕ t₁) ⊕ t₂) ⊕ …`, left to right — the first term alone, no identity
+/// in front of it — and the monoid's identity when no term arrives.
+///
+/// The one shape a fold of *distinct* terms has. Not [`Kernel::over`]'s,
+/// which folds one body over an index, and not a halved fold's, which
+/// pairs its terms (`Fold::halve`): those are one body `N`
+/// times. [`Kernel::fold`] builds through it.
+///
+/// Generic over how a node is named, and handed each node to build as a
+/// callback, so the builder builds its terms between steps. A callback is
+/// handed the monoid's own operation to build with; no caller names one.
+///
+/// [`Kernel::over`]: crate::Kernel::over
+/// [`Kernel::fold`]: crate::Kernel::fold
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Chain<R> {
+    monoid: Monoid,
+    /// The terms so far, combined; `None` before the first.
+    folded: Option<R>,
+}
+
+impl<R> Chain<R> {
+    /// No terms yet, under `monoid`.
+    #[must_use]
+    pub(crate) fn new(monoid: Monoid) -> Self {
+        Self {
+            monoid,
+            folded: None,
+        }
+    }
+
+    /// Fold in `term`. The first term is the fold so far; after it,
+    /// `combine` builds `folded ⊕ term` from the monoid's operation and the
+    /// two operands, in that order.
+    pub(crate) fn push(&mut self, term: R, combine: impl FnOnce(OpKind, R, R) -> R) {
+        self.folded = Some(match self.folded.take() {
+            None => term,
+            Some(folded) => combine(self.monoid.op(), folded, term),
+        });
+    }
+
+    /// The fold of every term pushed, or — when none was — what `identity`
+    /// builds from the monoid's identity.
+    #[must_use]
+    pub(crate) fn finish(self, identity: impl FnOnce(f32) -> R) -> R {
+        let monoid = self.monoid;
+        self.folded.unwrap_or_else(|| identity(monoid.identity()))
+    }
 }
 
 /// Which of the reserved index slots a fold binds.
@@ -147,6 +215,62 @@ impl Binder {
     }
 }
 
+/// The first `Var` index a [`Placeholder`] takes: past the whole index space
+/// a [`Binder`] can name ([`Variance::VARIABLES`]), so renaming a placeholder
+/// can never reach a binder an inner fold has already chosen.
+///
+/// [`Variance::VARIABLES`]: crate::Variance::VARIABLES
+pub(crate) const PLACEHOLDER_BASE: u8 = crate::variance::Variance::VARIABLES;
+
+/// A fold's index while its body is built, before its [`Binder`] is chosen.
+///
+/// The binder is chosen after the body exists — the lowest slot no fold in
+/// the body binds — so the body is built against a placeholder `Var` and
+/// the placeholder renamed once the slot is known
+/// ([`ExprArena::close_over`], the one place that is done). A placeholder
+/// must be unique among the binders being built *at once*: a nested fold
+/// renames every occurrence of its own, so if it shared one with the fold
+/// enclosing it, it would capture the outer index — `Σ_i Σ_j f(i, j)` would
+/// become `Σ_i Σ_j f(j, j)`. How one is kept unique is the builder's: a
+/// `Kernel` claims one from a set shared across threads, `kernel!`'s
+/// lowering takes one per fold it has open.
+///
+/// A type rather than a `Var` index so that closing over anything else — an
+/// `X`, which would bind the coordinate — is unrepresentable.
+///
+/// [`ExprArena::close_over`]: crate::ExprArena::close_over
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Placeholder(u8);
+
+impl Placeholder {
+    /// How many binders may be under construction at once, across every
+    /// builder: the placeholders past the binders' index space a `u64` set can
+    /// track, which is more than the [`Binder::COUNT`] a program can nest.
+    pub const COUNT: usize = u64::BITS as usize;
+
+    /// The `n`th placeholder, or `None` past [`Placeholder::COUNT`].
+    #[must_use]
+    pub fn nth(n: usize) -> Option<Self> {
+        if n >= Self::COUNT {
+            return None;
+        }
+        PLACEHOLDER_BASE
+            .checked_add(u8::try_from(n).ok()?)
+            .map(Self)
+    }
+
+    /// The `Var` index a body reads this placeholder through.
+    #[must_use]
+    pub fn var(self) -> u8 {
+        self.0
+    }
+}
+
+// A program nests at most `Binder::COUNT` folds, so a builder that takes one
+// placeholder per fold it has open never runs out before the index space
+// does.
+const _: () = assert!(Placeholder::COUNT >= Binder::COUNT);
+
 /// The fold a [`Reduce`] performs: a monoid, the index it binds, and the
 /// arithmetic progression that index runs over.
 ///
@@ -167,8 +291,8 @@ pub struct Fold {
     binder: Binder,
     /// Half-open `[lo, hi)`, `lo <= hi` by construction.
     ///
-    /// `u32`, the width [`Fold::range`] speaks. These were `u16`, first "so
-    /// the two fit the node in the 16 bytes `ExprNode` is capped at" — a
+    /// `u32`, the width [`Fold::range`] speaks. These were `u16`, first
+    /// "so the two fit the node in the 16 bytes `ExprNode` is capped at" — a
     /// width nothing depended on, made into a cap on how many terms a
     /// reduction may have — and then because an unrolled fold could not
     /// afford more copies of its body. A surviving `Reduce` is a loop now
@@ -177,26 +301,57 @@ pub struct Fold {
     /// describing a program is not narrowed without a measurement asking.
     lo: u32,
     hi: u32,
-    /// The step between visited indices. `1` for every [`Fold::new`], or
-    /// whatever [`Fold::strided`] was constructed with. After that, only
+    /// The step between visited indices. `1` for every [`Fold::new`],
+    /// or whatever [`Fold::strided`] was constructed with. After that, only
     /// [`Fold::halve`] ever doubles it, and only when `hi - lo` stays an
     /// exact multiple of it — an invariant [`Fold::strided`] checks directly
     /// (it refuses a stride that does not divide the span), [`Fold::new`]
     /// gets for free by going through it with a stride of 1 (which divides
-    /// anything), and [`Fold::halve`] preserves (it only fires on an even
-    /// trip count, so the new stride still divides `hi - lo` exactly). That
-    /// invariant is what makes [`Fold::len`] integer division rather than an
-    /// approximation.
+    /// anything), and [`Fold::halve`] preserves (it only fires on an
+    /// even trip count, so the new stride still divides `hi - lo` exactly).
+    /// That invariant is what makes [`Fold::len`] integer division
+    /// rather than an approximation.
     stride: u32,
 }
 
 impl Fold {
+    /// The largest end a range may have: 2²⁴, the last integer to which an
+    /// `f32` names every integer.
+    ///
+    /// A fold's index is an `f32` lane — the binder's `Var`, and the counter
+    /// the JIT steps by adding `1.0` and compares against the end, both
+    /// loaded as `f32` — so past 2²⁴ neighbouring indices round together
+    /// and the fold is not the one written. Measured through `kernel!`
+    /// before `kernel!` refused such a bound:
+    /// `(16777100..16777300).map(|i| ((i as f32) - 16777000.0) * X).sum()`
+    /// gave 39890 at `X = 1`, where rustc gives 39900; below 2²⁴ the two
+    /// agree. It is refused here, beside the reversed range, so that every
+    /// constructor — `Kernel::over` as much as `kernel!`'s lowering — is
+    /// refused alike.
+    ///
+    /// The ends stay `u32`, the width [`Fold::range`] speaks: the lane
+    /// is the narrower of the two, and widening the ends (A5 of
+    /// docs/plans/2026-09-25-the-language-is-kernel.md) would not lift it.
+    pub const EXACT_BOUND: u32 = 1 << f32::MANTISSA_DIGITS;
+
+    /// Whether `range` is a domain a fold may range over: forwards, and
+    /// ending at or before [`Fold::EXACT_BOUND`], so that every index
+    /// it names, and its end, is an exact `f32`.
+    ///
+    /// The one statement of the contract: the constructors panic where it
+    /// fails, [`Fold::from_bits`] refuses where it fails, and a front end
+    /// asks it to refuse a range with its own words before building one.
+    #[must_use]
+    pub fn admits(range: &Range<u32>) -> bool {
+        range.start <= range.end && range.end <= Self::EXACT_BOUND
+    }
+
     /// The fold of `monoid` over `range`, binding `binder`, visiting every
     /// index in it — [`Fold::strided`] with a stride of `1`.
     ///
     /// # Panics
     ///
-    /// Panics if `range` is reversed.
+    /// Panics unless [`Fold::admits`] `range`.
     #[must_use]
     pub fn new(monoid: Monoid, binder: Binder, range: Range<u32>) -> Self {
         Self::strided(monoid, binder, range, 1)
@@ -209,14 +364,20 @@ impl Fold {
     ///
     /// # Panics
     ///
-    /// Panics if `range` is reversed, `stride` is `0`, or `stride` does not
-    /// divide `range.end - range.start` exactly — the invariant [`Fold::len`]
-    /// and [`Fold::from_bits`] both rely on.
+    /// Panics unless [`Fold::admits`] `range`, or if `stride` is `0` or
+    /// does not divide `range.end - range.start` exactly — the invariant
+    /// [`Fold::len`] and [`Fold::from_bits`] both rely on.
     #[must_use]
     pub fn strided(monoid: Monoid, binder: Binder, range: Range<u32>, stride: u32) -> Self {
         assert!(
             range.start <= range.end,
             "a fold's range runs forwards: {range:?}"
+        );
+        assert!(
+            Self::admits(&range),
+            "a fold's range ends at most at {} (2^24): {range:?} — its index is an `f32` \
+             lane, which names every integer only that far",
+            Self::EXACT_BOUND
         );
         assert!(stride != 0, "a fold's stride must be nonzero");
         assert!(
@@ -263,28 +424,29 @@ impl Fold {
 
     /// The half-open range every visited index lies within.
     ///
-    /// The *bound*, not the visited set: once [`Fold::halve`] has run, the
-    /// indices in `[lo, hi)` that are actually visited are `lo`,
+    /// The *bound*, not the visited set: once [`Fold::halve`] has run,
+    /// the indices in `[lo, hi)` that are actually visited are `lo`,
     /// `lo + stride`, `lo + 2·stride`, … — [`Fold::stride`] apart, not
-    /// consecutive. [`Fold::len`] is the count that stays exact either way.
+    /// consecutive. [`Fold::len`] is the count that stays exact either
+    /// way.
     #[must_use]
     pub fn range(self) -> Range<u32> {
         self.lo..self.hi
     }
 
     /// The step between one visited index and the next. `1` from
-    /// [`Fold::new`], or [`Fold::strided`]'s own argument; [`Fold::halve`] is
-    /// the only thing that doubles it afterward.
+    /// [`Fold::new`], or [`Fold::strided`]'s own argument;
+    /// [`Fold::halve`] is the only thing that doubles it afterward.
     #[must_use]
     pub fn stride(self) -> u32 {
         self.stride
     }
 
     /// How many terms the fold combines — the *trip count*, which
-    /// [`Fold::halve`] halves without touching [`Fold::range`]. Distinct from
-    /// the index span `hi - lo`: they coincide only at `stride == 1`, and
-    /// every caller here wants the trip count (how many times the body is
-    /// evaluated), never the span.
+    /// [`Fold::halve`] halves without touching [`Fold::range`].
+    /// Distinct from the index span `hi - lo`: they coincide only at
+    /// `stride == 1`, and every caller here wants the trip count (how many
+    /// times the body is evaluated), never the span.
     #[must_use]
     pub fn len(self) -> u32 {
         (self.hi - self.lo) / self.stride
@@ -350,48 +512,6 @@ impl Fold {
         })
     }
 
-    /// This fold as opaque bits, and [`Fold::from_bits`] back.
-    ///
-    /// Three callers need exactly this and nothing else: the runtime tier's
-    /// JIT-cache key, [`canonical`](crate::key::canonical)'s content digest,
-    /// and the `kernel!` macro, which emits an arena as tokens that rebuild
-    /// it at load time. Each of them is *serializing* a fold rather than
-    /// reasoning about one, so this is what they get — not an accessor for
-    /// the combining opcode, which stays crate-private because the op set is
-    /// an IR concept and a consumer names algebras.
-    #[must_use]
-    pub fn to_bits(self) -> u128 {
-        u128::from(self.stride) << 80
-            | u128::from(self.monoid.op().index() as u8) << 72
-            | u128::from(self.binder.slot()) << 64
-            | u128::from(self.lo) << 32
-            | u128::from(self.hi)
-    }
-
-    /// The fold [`Fold::to_bits`] wrote, or `None` if the bits do not name
-    /// one — an op that generates no algebra, an index outside the binder
-    /// space, a reversed range, a zero stride, or a stride that does not
-    /// divide `hi - lo` exactly (the invariant every constructor here
-    /// maintains, and which [`Fold::len`] relies on).
-    ///
-    /// Total, so a corrupt cache key or a hand-written token stream is a
-    /// `None` at the boundary rather than a fold that means something else.
-    #[must_use]
-    pub fn from_bits(bits: u128) -> Option<Self> {
-        let stride = ((bits >> 80) & 0xffff_ffff) as u32;
-        let monoid = Monoid::of(OpKind::from_index(((bits >> 72) & 0xff) as usize)?)?;
-        let binder = Binder::from_slot(((bits >> 64) & 0xff) as u8)?;
-        let lo = ((bits >> 32) & 0xffff_ffff) as u32;
-        let hi = (bits & 0xffff_ffff) as u32;
-        (lo <= hi && stride != 0 && (hi - lo).is_multiple_of(stride)).then_some(Self {
-            monoid,
-            binder,
-            lo,
-            hi,
-            stride,
-        })
-    }
-
     /// The fold over everything *before* the last index, and that index — or
     /// `None` when the domain is empty.
     ///
@@ -414,6 +534,96 @@ impl Fold {
             };
             (rest, rest.hi)
         })
+    }
+
+    /// The monoid's byte in [`Fold::to_bits`]: its code
+    /// (`Monoid::marshal`), the one encoding of a monoid.
+    fn monoid_byte(self) -> u8 {
+        let [byte] = self.monoid.marshal().to_bytes();
+        byte
+    }
+
+    /// This fold as opaque bits, and [`Fold::from_bits`] back.
+    ///
+    /// Three callers need exactly this and nothing else: the runtime tier's
+    /// JIT-cache key, [`canonical`](crate::key::canonical)'s content digest,
+    /// and the `kernel!` macro, which emits an arena as tokens that rebuild
+    /// it at load time. Each of them is *serializing* a fold rather than
+    /// reasoning about one, so this is what they get — not an accessor for
+    /// the combining opcode: the op set is an IR concept, a consumer names
+    /// algebras, and `Monoid::op` is crate-private. The opcode itself is
+    /// reachable — these bits decode, the monoid's code in them round-trips
+    /// through `OpKind::unmarshal`, and a backend emitting a surviving loop
+    /// reads it through [`Fold::combine_op`] — so what is withheld is
+    /// an accessor offered to anything that reasons about a fold.
+    ///
+    /// The layout is `stride << 80 | op << 72 | binder << 64 | lo << 32 |
+    /// hi`, and nothing is written at or above bit `UNUSED_BITS` (112).
+    #[must_use]
+    pub fn to_bits(self) -> u128 {
+        u128::from(self.stride) << 80
+            | u128::from(self.monoid_byte()) << 72
+            | u128::from(self.binder.slot()) << 64
+            | u128::from(self.lo) << 32
+            | u128::from(self.hi)
+    }
+
+    /// The fold [`Fold::to_bits`] wrote, or `None` if the bits do not name
+    /// one: anything at or above bit `UNUSED_BITS` (112), an op that
+    /// generates no algebra, an index outside the binder space, a range
+    /// [`Fold::admits`] does not — reversed, or ending past
+    /// [`Fold::EXACT_BOUND`] — a zero stride, or a stride that does not
+    /// divide `hi - lo` exactly.
+    ///
+    /// Total, and the exact inverse of [`Fold::to_bits`]: a corrupt cache
+    /// key or a hand-written token stream is a `None` at the boundary rather
+    /// than a fold that means something else.
+    #[must_use]
+    pub fn from_bits(bits: u128) -> Option<Self> {
+        if bits >> UNUSED_BITS != 0 {
+            return None;
+        }
+        let stride = ((bits >> 80) & 0xffff_ffff) as u32;
+        let monoid = Monoid::unmarshal(OpCode::from_bytes([((bits >> 72) & 0xff) as u8]))?;
+        let binder = Binder::from_slot(((bits >> 64) & 0xff) as u8)?;
+        let lo = ((bits >> 32) & 0xffff_ffff) as u32;
+        let hi = (bits & 0xffff_ffff) as u32;
+        (Self::admits(&(lo..hi)) && stride != 0 && (hi - lo).is_multiple_of(stride)).then_some(
+            Self {
+                monoid,
+                binder,
+                lo,
+                hi,
+                stride,
+            },
+        )
+    }
+}
+
+/// Where [`Fold::to_bits`]'s layout ends: every bit from here up is zero,
+/// and [`Fold::from_bits`] refuses bits that say otherwise.
+const UNUSED_BITS: u32 = 112;
+
+/// One fold printed the way every reader of an arena spells it: its
+/// combining op, binder and bounds (`add_4[0..8)`, with ` step 2` once the
+/// stride is not 1).
+impl core::fmt::Display for Fold {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{}_{}[{}..{})",
+            self.combine_op().name(),
+            self.binder().var(),
+            self.lo,
+            self.hi
+        )?;
+        // The step is worth stating once it is not 1 — the shape
+        // `Fold::halve` leaves behind — since the bounds alone would then
+        // read as "every index" and aren't.
+        if self.stride != 1 {
+            write!(f, " step {}", self.stride)?;
+        }
+        Ok(())
     }
 }
 
@@ -446,6 +656,45 @@ mod tests {
         assert_eq!(fold.len(), 0);
     }
 
+    /// A monoid round-trips through its code, every one of them, and a code
+    /// naming an op that generates no algebra decodes to none.
+    #[test]
+    fn a_monoid_round_trips_through_its_code() {
+        for monoid in [
+            Monoid::SUM,
+            Monoid::PRODUCT,
+            Monoid::MAX,
+            Monoid::MIN,
+            Monoid::ANY,
+            Monoid::ALL,
+            Monoid::SEQ,
+        ] {
+            assert_eq!(Monoid::unmarshal(monoid.marshal()), Some(monoid));
+        }
+        assert_eq!(Monoid::unmarshal(OpKind::Sub.marshal()), None);
+    }
+
+    /// A chain of distinct terms is left-nested, the first term alone and
+    /// the monoid's own operation between each pair — `((a ⊕ b) ⊕ c)`, no
+    /// identity in front — and a chain of none is the monoid's identity.
+    #[test]
+    fn a_chain_folds_its_terms_left_to_right_and_none_to_the_identity() {
+        let spelled = |monoid: Monoid, terms: &[&str]| {
+            let mut chain = Chain::new(monoid);
+            for term in terms {
+                chain.push(alloc::string::String::from(*term), |op, folded, term| {
+                    alloc::format!("({folded} {op:?} {term})")
+                });
+            }
+            chain.finish(|identity| alloc::format!("{identity}"))
+        };
+        assert_eq!(spelled(Monoid::SUM, &["a", "b", "c"]), "((a Add b) Add c)");
+        assert_eq!(spelled(Monoid::MIN, &["a", "b"]), "(a Min b)");
+        assert_eq!(spelled(Monoid::PRODUCT, &["a"]), "a");
+        assert_eq!(spelled(Monoid::PRODUCT, &[]), "1");
+        assert_eq!(spelled(Monoid::MAX, &[]), "-inf");
+    }
+
     #[test]
     fn an_empty_fold_is_its_identity() {
         let b = Binder::from_slot(0).expect("slot 0 exists");
@@ -465,6 +714,63 @@ mod tests {
         // range, and the point here is the *constructor's* refusal.
         let (lo, hi) = (7u32, 3u32);
         assert!(Fold::new(Monoid::SUM, b, lo..hi).is_empty());
+    }
+
+    /// A range ends at most at 2²⁴, where an `f32` index stops naming every
+    /// integer: `16777216` is the last end admitted, forwards only, and an
+    /// empty range past it is refused too — its end is loaded as an `f32`
+    /// like any other's.
+    #[test]
+    fn a_range_ends_at_most_at_the_exact_bound() {
+        let bound = Fold::EXACT_BOUND;
+        assert_eq!(bound, 16_777_216);
+        assert_eq!(bound as f32 as u32, bound, "the bound itself is exact");
+        assert_ne!((bound + 1) as f32 as u32, bound + 1, "and one past is not");
+        for admitted in [0..0, 0..bound, bound - 1..bound, bound..bound] {
+            assert!(Fold::admits(&admitted), "{admitted:?}");
+        }
+        let (lo, hi) = (7u32, 3u32);
+        for refused in [0..bound + 1, bound + 1..bound + 1, 0..u32::MAX, lo..hi] {
+            assert!(!Fold::admits(&refused), "{refused:?}");
+        }
+    }
+
+    /// `Kernel::over`'s constructor refuses a range past the bound, as
+    /// `kernel!` refuses one: the builder is covered by the same contract.
+    #[test]
+    #[should_panic(expected = "ends at most at 16777216 (2^24)")]
+    fn a_range_past_the_exact_bound_is_refused() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        let past = Fold::EXACT_BOUND + 1;
+        assert!(!Fold::new(Monoid::SUM, b, 16_777_100..past).is_empty());
+    }
+
+    /// Bits naming a range past the bound name no fold: a corrupt key is a
+    /// `None` at the boundary, not a fold whose index rounds.
+    #[test]
+    fn from_bits_refuses_a_range_past_the_exact_bound() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        let bits = Fold::new(Monoid::SUM, b, 0..4).to_bits();
+        let past = (bits & !0xffff_ffffu128) | u128::from(Fold::EXACT_BOUND + 1);
+        assert_eq!(Fold::from_bits(past), None);
+        let at = (bits & !0xffff_ffffu128) | u128::from(Fold::EXACT_BOUND);
+        assert!(Fold::from_bits(at).is_some());
+    }
+
+    /// Every placeholder is past every binder — a rename of one never
+    /// reaches a slot an inner fold chose — and there are as many as a
+    /// `u64` set tracks.
+    #[test]
+    fn a_placeholder_is_past_every_binder() {
+        let first = Placeholder::nth(0).expect("a placeholder");
+        assert_eq!(first.var(), crate::Variance::VARIABLES);
+        assert!(Binder::all().all(|binder| binder.var() < first.var()));
+        let last = Placeholder::nth(Placeholder::COUNT - 1).expect("the last placeholder");
+        assert_eq!(
+            usize::from(last.var() - first.var()),
+            Placeholder::COUNT - 1
+        );
+        assert_eq!(Placeholder::nth(Placeholder::COUNT), None);
     }
 
     /// A trip count past what a `u16` held. A surviving fold is a loop, so
@@ -575,11 +881,11 @@ mod tests {
 
     /// **The load-bearing property.** Halving to exhaustion (falling back to
     /// [`Fold::peel_back`] for the odd remainder, the preference
-    /// `passes::expand_reduce` and `egraph::fold_rules::HalveFold` both give
-    /// it) must visit the same terms, in the same left-to-right order, as
-    /// [`Fold::peel`] does one at a time — for an even trip count (pure
-    /// halving, no remainder ever arises) and an odd one (forces the
-    /// peel-back epilogue at more than one level of the recursion).
+    /// `egraph::fold_rules::HalveFold` gives it) must visit the same terms,
+    /// in the same left-to-right order, as [`Fold::peel`] does one at a time
+    /// — for an even trip count (pure halving, no remainder ever arises) and
+    /// an odd one (forces the peel-back epilogue at more than one level of
+    /// the recursion).
     ///
     /// "Same order" here means the same *sequence* of leaves read
     /// left-to-right, not the same bracketing: halving `[lo,hi)` re-groups
@@ -592,7 +898,7 @@ mod tests {
     /// module doc of `egraph::fold_rules`) would sum to the identical value.
     /// So this checks the sequence directly — with "term" specialized to its
     /// own raw index and "combine" to list concatenation, `combine` below is
-    /// the shape `passes::expand_reduce::combine_halved` uses for real, just
+    /// the shape `egraph::fold_rules::HalveFold` builds for real, just
     /// instantiated to make the order legible without an arena or a JIT.
     #[test]
     fn halving_to_exhaustion_visits_the_same_terms_in_the_same_order_as_peeling() {
@@ -666,21 +972,52 @@ mod tests {
     fn from_bits_refuses_a_stride_that_does_not_divide_the_range() {
         let b = Binder::from_slot(0).expect("slot 0 exists");
         let mut bits = Fold::new(Monoid::SUM, b, 0..5).to_bits();
-        // Corrupt the stride field (bits 48..64) to 2, which does not divide
+        // Corrupt the stride field (bits 80..112) to 2, which does not divide
         // `5 - 0`: a fold that claims this would silently drop or duplicate
         // an index, so `from_bits` must refuse it rather than build one.
         bits = (bits & !(0xffff_ffffu128 << 80)) | (2u128 << 80);
         assert_eq!(Fold::from_bits(bits), None);
     }
 
+    /// Corpus compatibility, against a literal assembled by hand from the
+    /// layout — nothing above bit 112, stride 1 at bit 80, `Add` (index 2)
+    /// at 72, slot 1 at 64, `lo = 3` at 32, `hi = 11` at 0 — rather than
+    /// against `to_bits`, which would only check the encoder agrees with
+    /// itself. The same literal a range has written since before the
+    /// interval domain came and went, so a corpus serialized by any of them
+    /// decodes unchanged; a bit set above the layout names no fold.
+    #[test]
+    fn a_range_decodes_from_its_layout_assembled_by_hand() {
+        let literal: u128 = 0x0000_0000_0001_0201_0000_0003_0000_000b;
+        let b = Binder::from_slot(1).expect("slot 1 exists");
+        let want = Fold::new(Monoid::SUM, b, 3..11);
+        assert_eq!(Fold::from_bits(literal), Some(want));
+        assert_eq!(want.to_bits(), literal, "and a range still writes it");
+        for bit in [112, 127] {
+            assert_eq!(Fold::from_bits(literal | 1u128 << bit), None, "bit {bit}");
+        }
+    }
+
+    #[test]
+    fn a_fold_prints_its_domain() {
+        let b = Binder::from_slot(0).expect("slot 0 exists");
+        assert_eq!(
+            alloc::format!("{}", Fold::new(Monoid::SUM, b, 0..8)),
+            "add_4[0..8)"
+        );
+        assert_eq!(
+            alloc::format!("{}", Fold::strided(Monoid::MAX, b, 0..8, 2)),
+            "max_4[0..8) step 2"
+        );
+    }
+
     /// `ExprNode`'s crate-wide budget (see the static assertion in
     /// `arena.rs`) is a ceiling every variant shares, not a per-variant
-    /// promise — it grew from 16 to 24 when `Guard` arrived with two
-    /// `KernelKey`s, and a `Fold` with `u32` ends fits a `Reduce` node in
-    /// that same 24. Pinned here as a byte count rather than left to the
-    /// crate-wide assertion alone, so a future field that also fits the
-    /// crate-wide check but pushes `Fold` itself past what a `Reduce` node
-    /// ought to need fails here with a number, not just "too big".
+    /// promise — a `Reduce` node, a `Fold` plus one `ExprId`, is what holds
+    /// the node at 24 bytes. Pinned here as a byte count rather than left to the crate-wide
+    /// assertion alone, so a future field that also fits the crate-wide
+    /// check but pushes `Fold` itself past what a `Reduce` node ought to
+    /// need fails here with a number, not just "too big".
     #[test]
     fn fold_and_expr_node_stay_within_the_node_budget() {
         assert_eq!(
@@ -690,9 +1027,8 @@ mod tests {
         );
         assert!(
             core::mem::size_of::<Fold>() + core::mem::size_of::<crate::arena::ExprId>() <= 24,
-            "a Reduce node is a Fold plus one ExprId, and fits the width a \
-             Guard already needs — a fact about Reduce, not a budget Fold's \
-             fields were chosen to meet"
+            "a Reduce node is a Fold plus one ExprId, and fits in 24 bytes — a \
+             fact about Reduce, not a budget Fold's fields were chosen to meet"
         );
         assert!(
             core::mem::size_of::<crate::arena::ExprNode>() <= 32,

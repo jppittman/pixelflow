@@ -253,6 +253,26 @@ impl MacWindow {
         }
     }
 
+    /// Enters full screen as its own space, or leaves it.
+    pub fn toggle_fullscreen(&mut self) {
+        /// `NSWindowCollectionBehaviorFullScreenPrimary`: the window may be
+        /// the one a full-screen space is made for.
+        const FULL_SCREEN_PRIMARY: usize = 1 << 7;
+        unsafe {
+            let behavior: usize = sys::send(self.window.0, sys::sel(b"collectionBehavior\0"));
+            sys::send_1::<(), usize>(
+                self.window.0,
+                sys::sel(b"setCollectionBehavior:\0"),
+                behavior | FULL_SCREEN_PRIMARY,
+            );
+            sys::send_1::<(), Id>(
+                self.window.0,
+                sys::sel(b"toggleFullScreen:\0"),
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
     pub fn request_redraw(&mut self) {
         unsafe {
             sys::send_1::<(), BOOL>(self.view.0, sys::sel(b"setNeedsDisplay:\0"), YES);

@@ -195,7 +195,7 @@ fn assert_screen_state(
 #[test]
 fn it_should_print_a_single_ascii_character() {
     let mut term = create_test_emulator(10, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["A         "], Some((0, 1)));
 }
@@ -203,11 +203,11 @@ fn it_should_print_a_single_ascii_character() {
 #[test]
 fn it_should_print_multiple_ascii_characters_on_one_line() {
     let mut term = create_test_emulator(10, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('H')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('e')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('l')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('l')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('o')));
+    term.print_text("H");
+    term.print_text("e");
+    term.print_text("l");
+    term.print_text("l");
+    term.print_text("o");
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["Hello     "], Some((0, 5)));
 }
@@ -217,13 +217,13 @@ fn it_should_wrap_character_to_next_line_when_end_of_line_is_reached() {
     let mut term = create_test_emulator(5, 2);
     for char_code in '1'..='5' {
         // Prints "12345"
-        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(char_code)));
+        term.print_text(char_code.encode_utf8(&mut [0; 4]));
     }
     let snapshot_before_wrap = term.get_render_snapshot().expect("Snapshot was None");
     // After filling a line, cursor is at rightmost position (0, 4)
     assert_screen_state(&snapshot_before_wrap, &["12345", "     "], Some((0, 4)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('W'))); // This character should wrap
+    term.print_text("W"); // This character should wrap
     let snapshot_after_wrap = term.get_render_snapshot().expect("Snapshot was None");
     // Character wraps to next line
     assert_screen_state(&snapshot_after_wrap, &["12345", "W    "], Some((1, 1)));
@@ -232,13 +232,13 @@ fn it_should_wrap_character_to_next_line_when_end_of_line_is_reached() {
 #[test]
 fn it_should_overwrite_existing_characters() {
     let mut term = create_test_emulator(10, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('Y')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('Z')));
+    term.print_text("X");
+    term.print_text("Y");
+    term.print_text("Z");
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 2),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["XAZ       "], Some((0, 2)));
 }
@@ -246,7 +246,7 @@ fn it_should_overwrite_existing_characters() {
 #[test]
 fn it_should_print_a_single_multibyte_unicode_character() {
     let mut term = create_test_emulator(10, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
+    term.print_text("世");
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["世        "], Some((0, 2)));
     let glyph_1_wrapper = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
@@ -269,8 +269,8 @@ fn it_should_print_a_single_multibyte_unicode_character() {
 #[test]
 fn it_should_print_multiple_multibyte_unicode_characters() {
     let mut term = create_test_emulator(10, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('你')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('好')));
+    term.print_text("你");
+    term.print_text("好");
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["你好      "], Some((0, 4)));
 
@@ -300,9 +300,9 @@ fn it_should_print_multiple_multibyte_unicode_characters() {
 #[test]
 fn it_should_handle_mixed_ascii_and_multibyte_unicode_characters() {
     let mut term = create_test_emulator(10, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
+    term.print_text("A");
+    term.print_text("世");
+    term.print_text("B");
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["A世B      "], Some((0, 4)));
 
@@ -333,13 +333,13 @@ fn it_should_handle_mixed_ascii_and_multibyte_unicode_characters() {
 #[test]
 fn it_should_wrap_wide_character_correctly() {
     let mut term = create_test_emulator(3, 2);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
+    term.print_text("A");
+    term.print_text("世");
     let snapshot_before_wrap = term.get_render_snapshot().expect("Snapshot was None");
     // After 'A' and wide char '世', line is full, cursor at (0, 2)
     assert_screen_state(&snapshot_before_wrap, &["A世", "   "], Some((0, 2)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('C')));
+    term.print_text("C");
     let snapshot_after_wrap = term.get_render_snapshot().expect("Snapshot was None");
     // 'C' wraps to next line
     assert_screen_state(&snapshot_after_wrap, &["A世", "C  "], Some((1, 1)));
@@ -348,8 +348,8 @@ fn it_should_wrap_wide_character_correctly() {
 #[test]
 fn it_should_not_print_second_half_of_wide_char_if_at_edge_and_no_wrap_mode_or_similar_logic() {
     let mut term = create_test_emulator(2, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
+    term.print_text("A");
+    term.print_text("世");
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     // After 'A', '世' wraps. Space is written at (0,1). "A " scrolls to scrollback.
     // Screen is "世". Cursor logical (0,2), physical (0,1).
@@ -372,11 +372,11 @@ fn it_should_not_print_second_half_of_wide_char_if_at_edge_and_no_wrap_mode_or_s
 #[test]
 fn it_should_overwrite_first_half_of_wide_char_with_ascii() {
     let mut term = create_test_emulator(5, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
+    term.print_text("世");
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 1),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
+    term.print_text("X");
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["X    "], Some((0, 1))); // assert_screen_state handles this
 
@@ -404,11 +404,11 @@ fn it_should_overwrite_first_half_of_wide_char_with_ascii() {
 #[test]
 fn it_should_overwrite_second_half_of_wide_char_with_ascii() {
     let mut term = create_test_emulator(5, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
+    term.print_text("世");
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(1, 2),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('Y'))); // Prints "Y", overwrites placeholder
+    term.print_text("Y"); // Prints "Y", overwrites placeholder
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
 
@@ -457,8 +457,8 @@ fn it_should_overwrite_second_half_of_wide_char_with_ascii() {
 #[test]
 fn it_should_print_ascii_over_wide_char_that_straddles_line_end_after_wrap() {
     let mut term = create_test_emulator(2, 2);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('世')));
+    term.print_text("A");
+    term.print_text("世");
     let s1 = term.get_render_snapshot().expect("Snapshot was None");
     // Emulator logic: 'A' at (0,0). '世' attempts to print at (0,1) on 2-wide terminal.
     // Wrap occurs: space is printed at (0,1). Screen line 0 is "A ".
@@ -466,7 +466,7 @@ fn it_should_print_ascii_over_wide_char_that_straddles_line_end_after_wrap() {
     // No scroll for s1. Screen: ["A ", "世"]. Cursor logical (1,2), physical (1,1).
     assert_screen_state(&s1, &["A ", "世"], Some((1, 1)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
+    term.print_text("X");
     let s2 = term.get_render_snapshot().expect("Snapshot was None");
     // After wrap, next character causes scroll.
     // Line "A " goes to scrollback. Line "世" becomes new line 0. New blank line 1.
@@ -481,7 +481,7 @@ fn it_should_print_ascii_over_wide_char_that_straddles_line_end_after_wrap() {
     let s3 = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&s3, &["世", "X "], Some((0, 1))); // Cursor is now (0,1)
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('Z'))); // Prints 'Z' at (0,1)
+    term.print_text("Z"); // Prints 'Z' at (0,1)
     let s4 = term.get_render_snapshot().expect("Snapshot was None");
     // Screen: ["世Z", "X "]. Cursor (0,2) (row 0, col 2)
     // Check s4 screen content directly
@@ -536,11 +536,11 @@ fn it_should_move_cursor_down_keeping_column_on_line_feed_if_lnm_is_off() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::ResetMode(20),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A'))); // Char 'A' at (0,0). Cursor at (0,1).
+    term.print_text("A"); // Char 'A' at (0,0). Cursor at (0,1).
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorForward(3),
     ))); // Cursor moves from (0,1) to (0,4).
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B'))); // Char 'B' at (0,4). Cursor at (0,5). Screen "A   B" on line 0.
+    term.print_text("B"); // Char 'B' at (0,4). Cursor at (0,5). Screen "A   B" on line 0.
 
     let snapshot_before_lf = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(
@@ -558,7 +558,7 @@ fn it_should_move_cursor_down_keeping_column_on_line_feed_if_lnm_is_off() {
         Some((1, 5)),
     );
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('C'))); // Char 'C' at (1,5). Cursor at (1,6).
+    term.print_text("C"); // Char 'C' at (1,5). Cursor at (1,6).
     let snapshot_final = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(
         &snapshot_final,
@@ -574,15 +574,15 @@ fn it_should_scroll_up_and_move_cursor_down_keeping_column_on_line_feed_at_botto
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::ResetMode(20),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('2')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('3'))); // Line 0: "123", cursor (0,3)
+    term.print_text("1");
+    term.print_text("2");
+    term.print_text("3"); // Line 0: "123", cursor (0,3)
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR))); // Cursor (0,0)
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF))); // LNM off: Cursor moves from (0,0) to (1,0)
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A'))); // Line 1: "A", cursor (1,1)
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B'))); // Line 1: "AB", cursor (1,2)
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('C'))); // Line 1: "ABC", cursor (1,3)
+    term.print_text("A"); // Line 1: "A", cursor (1,1)
+    term.print_text("B"); // Line 1: "AB", cursor (1,2)
+    term.print_text("C"); // Line 1: "ABC", cursor (1,3)
 
     let snapshot_before_scroll = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot_before_scroll, &["123  ", "ABC  "], Some((1, 3)));
@@ -591,7 +591,7 @@ fn it_should_scroll_up_and_move_cursor_down_keeping_column_on_line_feed_at_botto
     let snapshot_after_scroll = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot_after_scroll, &["ABC  ", "     "], Some((1, 3)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
+    term.print_text("X");
     let snapshot_final = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot_final, &["ABC  ", "   X "], Some((1, 4)));
 }
@@ -604,11 +604,11 @@ fn it_should_move_cursor_down_and_to_col_0_on_line_feed_if_lnm_is_on() {
         20,
     ))));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorForward(3),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
+    term.print_text("B");
 
     let snapshot_before_lf = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(
@@ -625,7 +625,7 @@ fn it_should_move_cursor_down_and_to_col_0_on_line_feed_if_lnm_is_on() {
         Some((1, 0)),
     );
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('C')));
+    term.print_text("C");
     let snapshot_final = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(
         &snapshot_final,
@@ -642,15 +642,15 @@ fn it_should_scroll_and_move_to_col_0_on_line_feed_at_bottom_if_lnm_is_on() {
         20,
     ))));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('2')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('3')));
+    term.print_text("1");
+    term.print_text("2");
+    term.print_text("3");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('C')));
+    term.print_text("A");
+    term.print_text("B");
+    term.print_text("C");
 
     let snapshot_before_scroll = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot_before_scroll, &["123  ", "ABC  "], Some((1, 3)));
@@ -659,7 +659,7 @@ fn it_should_scroll_and_move_to_col_0_on_line_feed_at_bottom_if_lnm_is_on() {
     let snapshot_after_scroll = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot_after_scroll, &["ABC  ", "     "], Some((1, 0)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
+    term.print_text("X");
     let snapshot_final = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot_final, &["ABC  ", "X    "], Some((1, 1)));
 }
@@ -668,15 +668,15 @@ fn it_should_scroll_and_move_to_col_0_on_line_feed_at_bottom_if_lnm_is_on() {
 #[test]
 fn it_should_move_cursor_to_col_0_on_carriage_return() {
     let mut term = create_test_emulator(10, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('C')));
+    term.print_text("A");
+    term.print_text("B");
+    term.print_text("C");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["ABC       "], Some((0, 0)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
+    term.print_text("X");
     let snapshot2 = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot2, &["XBC       "], Some((0, 1)));
 }
@@ -685,14 +685,14 @@ fn it_should_move_cursor_to_col_0_on_carriage_return() {
 #[test]
 fn it_should_move_cursor_left_on_backspace() {
     let mut term = create_test_emulator(10, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
+    term.print_text("A");
+    term.print_text("B");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::BS)));
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["AB        "], Some((0, 1)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
+    term.print_text("X");
     let snapshot2 = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot2, &["AX        "], Some((0, 2)));
 }
@@ -704,13 +704,13 @@ fn it_should_not_wrap_cursor_on_backspace_at_start_of_line() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::ResetMode(20),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('L')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
+    term.print_text("L");
+    term.print_text("1");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('L')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('2')));
+    term.print_text("L");
+    term.print_text("2");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
 
@@ -727,13 +727,13 @@ fn it_should_not_wrap_cursor_on_backspace_at_start_of_line() {
 #[test]
 fn it_should_move_cursor_to_next_tab_stop_on_horizontal_tab() {
     let mut term = create_test_emulator(20, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::HT)));
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["A                   "], Some((0, 8)));
 
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
+    term.print_text("B");
     let snapshot2 = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot2, &["A       B           "], Some((0, 9)));
 
@@ -746,9 +746,7 @@ fn it_should_move_cursor_to_next_tab_stop_on_horizontal_tab() {
 fn it_should_move_cursor_to_last_column_on_horizontal_tab_if_no_more_tab_stops() {
     let mut term = create_test_emulator(10, 1);
     for i in 0..9 {
-        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(
-            std::char::from_u32('0' as u32 + i as u32).unwrap_or('X'),
-        )));
+        term.print_text(&i.to_string());
     }
     let snapshot_before = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot_before, &["012345678 "], Some((0, 9)));
@@ -762,7 +760,7 @@ fn it_should_move_cursor_to_last_column_on_horizontal_tab_if_no_more_tab_stops()
 #[test]
 fn it_should_do_nothing_visible_on_escape_character() {
     let mut term = create_test_emulator(10, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
     let snapshot_before = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot_before, &["A         "], Some((0, 1)));
 
@@ -1336,7 +1334,7 @@ fn setup_ed_el_screen(term: &mut TerminalEmulator, width: usize, height: usize) 
         for c in 0..width {
             let char_val =
                 std::char::from_u32(('A' as u32) + (r % 26) as u32 + (c % 3) as u32).unwrap_or('?');
-            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(char_val)));
+            term.print_text(char_val.encode_utf8(&mut [0; 4]));
         }
         if r < height - 1 {
             term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
@@ -1925,15 +1923,15 @@ fn it_should_clamp_cursor_to_new_bottom_right_if_cursor_was_beyond_after_shrink(
 fn it_should_handle_resize_with_content_and_cursor_at_edges() {
     let mut term = create_test_emulator(3, 2);
     // Fill screen and place cursor at bottom right (1,2)
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('2')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('3'))); // L0: "123"
+    term.print_text("1");
+    term.print_text("2");
+    term.print_text("3"); // L0: "123"
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF))); // to L1, (1,0)
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('4')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('5')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('6'))); // L1: "456", cursor (1,3) (just off screen edge)
-                                                                        // Let's put cursor exactly at (1,2)
+    term.print_text("4");
+    term.print_text("5");
+    term.print_text("6"); // L1: "456", cursor (1,3) (just off screen edge)
+                          // Let's put cursor exactly at (1,2)
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(2, 3),
     ))); // Cursor to (1,2)
@@ -2037,8 +2035,8 @@ fn it_should_switch_to_alternate_screen_buffer_and_back_on_csi_1049() {
     assert_screen_state(&snapshot_asb, &["     ", "     "], Some((0, 0))); // Cursor usually resets to (0,0) on ASB
 
     // Print something on ASB
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('Y')));
+    term.print_text("X");
+    term.print_text("Y");
     let snapshot_asb_content = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot_asb_content, &["XY   ", "     "], Some((0, 2)));
 
@@ -2065,11 +2063,11 @@ fn it_should_enable_and_disable_autowrap_mode_on_decawm() {
 
     // DECAWM is on by default in emulator
     // Autowrap is ON by default - verify wrapping behavior
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('1')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('2')));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('3'))); // Fills line 0: "123"
-                                                                        // After filling line, next char will wrap
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('4'))); // Wraps to line 1
+    term.print_text("1");
+    term.print_text("2");
+    term.print_text("3"); // Fills line 0: "123"
+                          // After filling line, next char will wrap
+    term.print_text("4"); // Wraps to line 1
     assert_screen_state(
         &term.get_render_snapshot().expect("Snapshot was None"),
         &["123", "4  "],
@@ -2085,11 +2083,11 @@ fn it_should_enable_and_disable_autowrap_mode_on_decawm() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(2, 3),
     ))); // Cursor to (1,2) on line "4  "
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('5'))); // Prints '5' at (1,2). Line "4 5". Cursor (1,3).
-                                                                        // With autowrap off, cursor stays at right edge (verified below via the overwrite behavior)
+    term.print_text("5"); // Prints '5' at (1,2). Line "4 5". Cursor (1,3).
+                          // With autowrap off, cursor stays at right edge (verified below via the overwrite behavior)
 
     // Try to print past end of line with autowrap off
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('6')));
+    term.print_text("6");
     // Character '6' should overwrite '5' at the last column (1,2). Cursor stays at (1,3) (or clamps to last char).
     // Current `char_processor.rs` `print_char` logic: if `cursor.x >= screen_width` and `!autowrap` and `!wrap_next`, it sets `cursor.x = screen_width -1`.
     // So '6' is printed at (1,2) over '5'. Cursor logical (3,1). Physical (2,1) for snapshot.
@@ -2107,9 +2105,9 @@ fn it_should_enable_and_disable_autowrap_mode_on_decawm() {
     // Autowrap is ON again - verify wrapping behavior restored
     // Cursor is at (1,3) on line "4 6". Line is full.
     // Line is full with autowrap on, next char will wrap
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('7'))); // Should wrap to next line (scroll if needed)
-                                                                        // We have 2 lines. (0,1). This will scroll.
-                                                                        // L0 "123" scrolls off. L1 "4 6" becomes L0. L2 "7  " becomes L1.
+    term.print_text("7"); // Should wrap to next line (scroll if needed)
+                          // We have 2 lines. (0,1). This will scroll.
+                          // L0 "123" scrolls off. L1 "4 6" becomes L0. L2 "7  " becomes L1.
     assert_screen_state(
         &term.get_render_snapshot().expect("Snapshot was None"),
         &["4 6", "7  "],
@@ -2247,13 +2245,13 @@ fn it_should_reset_all_attributes_on_sgr_0() {
             Attribute::Bold,
         ]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A'))); // Print with attributes
+    term.print_text("A"); // Print with attributes
 
     // Reset
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Reset]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B'))); // Print after reset
+    term.print_text("B"); // Print after reset
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     let glyph_a_wrapper = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
@@ -2288,13 +2286,13 @@ fn it_should_set_bold_on_sgr_1_and_reset_on_sgr_22() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Bold]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
 
     // SGR 22 maps to NoBold (which also implies NoFaint for this test's purpose)
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::NoBold]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
+    term.print_text("B");
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
@@ -2327,13 +2325,13 @@ fn it_should_set_faint_on_sgr_2_and_reset_on_sgr_22() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Faint]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
 
     // SGR 22 maps to NoBold (which also implies NoFaint)
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::NoBold]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
+    term.print_text("B");
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
@@ -2366,12 +2364,12 @@ fn it_should_set_italic_on_sgr_3_and_reset_on_sgr_23() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Italic]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::NoItalic]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
+    term.print_text("B");
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
@@ -2400,12 +2398,12 @@ fn it_should_set_underline_on_sgr_4_and_reset_on_sgr_24() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Underline]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::NoUnderline]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B')));
+    term.print_text("B");
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
@@ -2445,9 +2443,7 @@ fn it_should_set_basic_ansi_foreground_colors_sgr_30_37() {
         term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
             CsiCommand::SetGraphicsRendition(vec![Attribute::Foreground(Color::Named(color_name))]),
         )));
-        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(
-            (b'A' + i as u8) as char,
-        )));
+        term.print_text(((b'A' + i as u8) as char).encode_utf8(&mut [0; 4]));
     }
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     for (i, &color_name) in colors.iter().enumerate() {
@@ -2486,9 +2482,7 @@ fn it_should_set_bright_ansi_foreground_colors_sgr_90_97() {
                 Attribute::Foreground(Color::Named(color_name)), // Parser maps 90-97 to these NamedColor variants
             ]),
         )));
-        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(
-            (b'A' + i as u8) as char,
-        )));
+        term.print_text(((b'A' + i as u8) as char).encode_utf8(&mut [0; 4]));
     }
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     for (i, &color_name) in bright_colors.iter().enumerate() {
@@ -2514,7 +2508,7 @@ fn it_should_set_indexed_foreground_color_sgr_38_5_n() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Foreground(Color::Indexed(123))]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
     let attr = match get_glyph_from_snapshot(
         &term.get_render_snapshot().expect("Snapshot was None"),
         0,
@@ -2534,7 +2528,7 @@ fn it_should_set_rgb_foreground_color_sgr_38_2_r_g_b() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Foreground(Color::Rgb(10, 20, 30))]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
     let attr = match get_glyph_from_snapshot(
         &term.get_render_snapshot().expect("Snapshot was None"),
         0,
@@ -2556,12 +2550,12 @@ fn it_should_reset_foreground_color_on_sgr_39() {
             NamedColor::Red,
         ))]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A'))); // Red 'A'
+    term.print_text("A"); // Red 'A'
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Foreground(Color::Default)]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B'))); // Default fg 'B'
+    term.print_text("B"); // Default fg 'B'
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
@@ -2595,9 +2589,7 @@ fn it_should_set_basic_ansi_background_colors_sgr_40_47() {
         term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
             CsiCommand::SetGraphicsRendition(vec![Attribute::Background(Color::Named(color_name))]),
         )));
-        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(
-            (b'A' + i as u8) as char,
-        )));
+        term.print_text(((b'A' + i as u8) as char).encode_utf8(&mut [0; 4]));
     }
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     for (i, &color_name) in colors.iter().enumerate() {
@@ -2636,9 +2628,7 @@ fn it_should_set_bright_ansi_background_colors_sgr_100_107() {
                 Attribute::Background(Color::Named(color_name)), // Parser maps 100-107 to these
             ]),
         )));
-        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(
-            (b'A' + i as u8) as char,
-        )));
+        term.print_text(((b'A' + i as u8) as char).encode_utf8(&mut [0; 4]));
     }
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     for (i, &color_name) in bright_colors.iter().enumerate() {
@@ -2664,7 +2654,7 @@ fn it_should_set_indexed_background_color_sgr_48_5_n() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Background(Color::Indexed(201))]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
     let attr = match get_glyph_from_snapshot(
         &term.get_render_snapshot().expect("Snapshot was None"),
         0,
@@ -2684,7 +2674,7 @@ fn it_should_set_rgb_background_color_sgr_48_2_r_g_b() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Background(Color::Rgb(40, 50, 60))]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A')));
+    term.print_text("A");
     let attr = match get_glyph_from_snapshot(
         &term.get_render_snapshot().expect("Snapshot was None"),
         0,
@@ -2706,12 +2696,12 @@ fn it_should_reset_background_color_on_sgr_49() {
             NamedColor::Blue,
         ))]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A'))); // Blue bg 'A'
+    term.print_text("A"); // Blue bg 'A'
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Background(Color::Default)]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B'))); // Default bg 'B'
+    term.print_text("B"); // Default bg 'B'
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
@@ -2742,12 +2732,12 @@ fn it_should_set_inverse_on_sgr_7_and_reset_on_sgr_27() {
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::Reverse]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('A'))); // Inverse A: fg=Blue, bg=Red
+    term.print_text("A"); // Inverse A: fg=Blue, bg=Red
 
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::SetGraphicsRendition(vec![Attribute::NoReverse]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('B'))); // Not inverse B: fg=Red, bg=Blue
+    term.print_text("B"); // Not inverse B: fg=Red, bg=Blue
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     let attr_a = match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
@@ -2789,7 +2779,7 @@ fn it_should_set_multiple_attributes_in_one_sgr_sequence() {
             Attribute::Underline,
         ]),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
+    term.print_text("X");
 
     let attr_x = match get_glyph_from_snapshot(
         &term.get_render_snapshot().expect("Snapshot was None"),
@@ -2912,7 +2902,7 @@ fn it_should_handle_csi_cup_with_origin_mode_decom() {
 
 fn print_str(term: &mut TerminalEmulator, s: &str) {
     for ch in s.chars() {
-        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print(ch)));
+        term.print_text(ch.encode_utf8(&mut [0; 4]));
     }
 }
 
@@ -3073,10 +3063,10 @@ fn it_should_map_characters_through_g1_when_shifted_out_and_back_to_g0_ascii_whe
     )));
     // Shift Out: make G1 (line drawing) the active set. 'q' maps to '─'.
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::SO)));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('q')));
+    term.print_text("q");
     // Shift In: make G0 (still default ASCII) active again. 'q' prints literally.
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::SI)));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('q')));
+    term.print_text("q");
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["─q   "], Some((0, 2)));
@@ -3085,9 +3075,9 @@ fn it_should_map_characters_through_g1_when_shifted_out_and_back_to_g0_ascii_whe
 #[test]
 fn it_should_attach_a_zero_width_combining_character_to_the_previously_printed_cell() {
     let mut term = create_test_emulator(5, 1);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('e')));
+    term.print_text("e");
     // U+0301 COMBINING ACUTE ACCENT: zero-width, must not advance the cursor.
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('\u{0301}')));
+    term.print_text("\u{0301}");
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     let glyph = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
@@ -3155,7 +3145,7 @@ fn it_should_clear_the_screen_and_reset_cursor_and_attributes_on_esc_c() {
     assert_screen_state(&snapshot, &["     ", "     "], Some((0, 0)));
 
     // Attributes should also be back to default: a freshly printed char is not bold.
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('X')));
+    term.print_text("X");
     let snapshot2 = term.get_render_snapshot().expect("Snapshot was None");
     match get_glyph_from_snapshot(&snapshot2, 0, 0).unwrap() {
         Glyph::Single(cell) => assert!(
@@ -3278,7 +3268,7 @@ fn it_should_attach_a_combining_character_to_the_last_cell_of_the_previous_row_a
     term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
         CsiCommand::CursorPosition(2, 1),
     )));
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('\u{0301}')));
+    term.print_text("\u{0301}");
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     match get_glyph_from_snapshot(&snapshot, 0, 2).unwrap() {
@@ -3294,7 +3284,7 @@ fn it_should_attach_a_combining_character_to_the_last_cell_of_the_previous_row_a
 fn it_should_attach_a_combining_character_to_the_wide_primary_cell_when_following_a_wide_char() {
     let mut term = create_test_emulator(5, 1);
     print_str(&mut term, "世");
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('\u{0301}')));
+    term.print_text("\u{0301}");
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     match get_glyph_from_snapshot(&snapshot, 0, 0).unwrap() {
@@ -3313,7 +3303,7 @@ fn it_should_attach_a_combining_character_to_the_wide_primary_cell_when_followin
 #[test]
 fn it_should_discard_a_combining_character_printed_at_the_origin_with_no_previous_cell() {
     let mut term = create_test_emulator(3, 2);
-    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Print('\u{0301}')));
+    term.print_text("\u{0301}");
 
     let snapshot = term.get_render_snapshot().expect("Snapshot was None");
     assert_screen_state(&snapshot, &["   ", "   "], Some((0, 0)));

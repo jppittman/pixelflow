@@ -6,15 +6,9 @@
 //!
 //! Two layers of validation:
 //!   1. Byte tests (always run): emitted bytes match reference encodings.
-//!   2. Runtime test (only when built `+avx512f`): JIT a tiny zmm kernel and
-//!      execute it on the host, checking all 16 lanes — the ground truth.
-//!
-//! Run the runtime test with:
-//!   RUSTFLAGS="-C target-feature=+avx512f" cargo test -p pixelflow-ir \
-//!     --test avx512_evex_proof
-
-#[cfg(target_feature = "avx512f")]
-use pixelflow_codegen::emit::executable::ExecutableCode;
+//!   2. Runtime test (on an x86-64 host with AVX-512F; a note and an early
+//!      return otherwise): JIT a tiny zmm kernel and execute it on the host,
+//!      checking all 16 lanes — the ground truth.
 
 // ============================================================================
 // Minimal EVEX encoder (512-bit). Promoted to a real module once proven.
@@ -123,39 +117,67 @@ fn evex_fmadd_bytes() {
 
 // ============================================================================
 // Runtime proof — executes a JIT'd 512-bit kernel on the host.
-// Only built when the crate is compiled with AVX-512 enabled.
 // ============================================================================
 
-#[cfg(target_feature = "avx512f")]
-#[test]
-fn evex_runtime_16_lanes() {
+#[cfg(target_arch = "x86_64")]
+mod runtime {
+    use super::{vaddps, vfmadd213ps, vmulps};
     use core::arch::x86_64::*;
+    use pixelflow_codegen::emit::executable::ExecutableCode;
 
     // System V passes/returns __m512 in zmm0-7: X=zmm0, Y=zmm1, Z=zmm2.
     // Passing __m512 by value IS the emitted ABI (SysV: zmm0-7), so the
     // not-FFI-safe warning is a false positive here — same reason
-    // `backend::emit::executable`'s KernelFn aliases carry this allow.
+    // `emit::executable`'s KernelFn aliases carry this allow.
     #[allow(improper_ctypes_definitions)]
     type Kernel = unsafe extern "C" fn(__m512, __m512, __m512, __m512) -> __m512;
 
-    // Kernel A: (X + Y) * Z
-    //   vaddps zmm0, zmm0, zmm1 ; vmulps zmm0, zmm0, zmm2 ; ret
-    let mut a = Vec::new();
-    vaddps(&mut a, 0, 0, 1);
-    vmulps(&mut a, 0, 0, 2);
-    a.push(0xC3);
-    let code_a = unsafe { ExecutableCode::from_code(&a).expect("mmap A") };
+    /// Call `code` on `(xs, ys, zs, 0)` and hand its 16 lanes back.
+    ///
+    /// # Safety
+    ///
+    /// The host must execute AVX-512F: `code` is `zmm` code, and this
+    /// function is compiled with AVX-512F enabled to be allowed to pass
+    /// `zmm` values.
+    #[target_feature(enable = "avx512f")]
+    unsafe fn run(code: &ExecutableCode, xs: [f32; 16], ys: [f32; 16], zs: [f32; 16]) -> [f32; 16] {
+        unsafe {
+            let f: Kernel = code.as_fn();
+            let r = f(
+                _mm512_loadu_ps(xs.as_ptr()),
+                _mm512_loadu_ps(ys.as_ptr()),
+                _mm512_loadu_ps(zs.as_ptr()),
+                _mm512_setzero_ps(),
+            );
+            let mut out = [0.0f32; 16];
+            _mm512_storeu_ps(out.as_mut_ptr(), r);
+            out
+        }
+    }
 
-    // Kernel B: X*Y + Z via real FMA
-    //   vfmadd213ps zmm0, zmm1, zmm2  (zmm0 = zmm1*zmm0 + zmm2) ; ret
-    let mut b = Vec::new();
-    vfmadd213ps(&mut b, 0, 1, 2);
-    b.push(0xC3);
-    let code_b = unsafe { ExecutableCode::from_code(&b).expect("mmap B") };
+    #[test]
+    fn evex_runtime_16_lanes() {
+        // Only F instructions below, so F alone is the question — not the
+        // DQ the JIT's own AVX-512 tier additionally needs.
+        if !std::is_x86_feature_detected!("avx512f") {
+            eprintln!("skipped: this host cannot execute AVX-512F");
+            return;
+        }
 
-    unsafe {
-        let fa: Kernel = code_a.as_fn();
-        let fb: Kernel = code_b.as_fn();
+        // Kernel A: (X + Y) * Z
+        //   vaddps zmm0, zmm0, zmm1 ; vmulps zmm0, zmm0, zmm2 ; ret
+        let mut a = Vec::new();
+        vaddps(&mut a, 0, 0, 1);
+        vmulps(&mut a, 0, 0, 2);
+        a.push(0xC3);
+        let code_a = unsafe { ExecutableCode::from_code(&a).expect("mmap A") };
+
+        // Kernel B: X*Y + Z via real FMA
+        //   vfmadd213ps zmm0, zmm1, zmm2  (zmm0 = zmm1*zmm0 + zmm2) ; ret
+        let mut b = Vec::new();
+        vfmadd213ps(&mut b, 0, 1, 2);
+        b.push(0xC3);
+        let code_b = unsafe { ExecutableCode::from_code(&b).expect("mmap B") };
 
         // 16 distinct lanes so we'd catch a width/lane bug.
         let mut xs = [0.0f32; 16];
@@ -166,17 +188,9 @@ fn evex_runtime_16_lanes() {
             ys[i] = (2 * i) as f32 + 1.0;
             zs[i] = (i as f32) * 0.5 - 3.0;
         }
-        let x = _mm512_loadu_ps(xs.as_ptr());
-        let y = _mm512_loadu_ps(ys.as_ptr());
-        let z = _mm512_loadu_ps(zs.as_ptr());
-        let zero = _mm512_setzero_ps();
 
-        let ra = fa(x, y, z, zero);
-        let rb = fb(x, y, z, zero);
-        let mut oa = [0.0f32; 16];
-        let mut ob = [0.0f32; 16];
-        _mm512_storeu_ps(oa.as_mut_ptr(), ra);
-        _mm512_storeu_ps(ob.as_mut_ptr(), rb);
+        // SAFETY: the host runs AVX-512F, checked above.
+        let (oa, ob) = unsafe { (run(&code_a, xs, ys, zs), run(&code_b, xs, ys, zs)) };
 
         for i in 0..16 {
             let want_a = (xs[i] + ys[i]) * zs[i];

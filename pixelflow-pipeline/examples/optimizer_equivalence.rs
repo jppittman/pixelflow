@@ -18,21 +18,19 @@
 
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::key::KernelKey;
 use pixelflow_pipeline::shader_bench::{SHADERTOY_KERNEL_NAMES, named_shadertoy_kernel};
 use pixelflow_search::egraph::Optimizer;
 use pixelflow_search::runtime::optimize_runtime_arena;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+/// `KernelKey::of` is exactly this digest — a canonical, reachability-scoped
+/// fingerprint of the arena — so this example uses that shared definition
+/// instead of restating FNV-1a over `nodes_raw()`'s debug string
+/// (docs/plans/2026-09-09-exprarena-on-dag.md, Stage A).
 fn digest(arena: &ExprArena, root: ExprId) -> u64 {
-    let rendered = format!("{root:?}|{:?}", arena.nodes_raw());
-    let mut h = FNV_OFFSET;
-    for b in rendered.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
+    KernelKey::of(arena, root).bits()
 }
 
 fn main() {

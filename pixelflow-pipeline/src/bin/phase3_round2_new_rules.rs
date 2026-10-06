@@ -175,7 +175,7 @@ fn run_curves(
     let mut curves = Vec::with_capacity(sampled.len());
 
     for (i, (origin, name, arena, root)) in sampled.iter().enumerate() {
-        let node_count = arena.nodes_raw().len();
+        let node_count = arena.len();
         let class_cap = config_for_node_count(node_count).max_classes;
         // This arm's rule set names the arm: `Optimizer::rules` is the one
         // place a non-production vocabulary enters.
@@ -400,8 +400,8 @@ fn main() {
     // (phase3_unguided_baseline.rs), restated here so this binary depends on
     // no internals of that one.
     entries.sort_by(|a, b| {
-        let na = a.2.nodes_raw().len();
-        let nb = b.2.nodes_raw().len();
+        let na = a.2.len();
+        let nb = b.2.len();
         na.cmp(&nb).then_with(|| a.1.cmp(&b.1))
     });
     let stride = entries.len() as f64 / args.samples as f64;

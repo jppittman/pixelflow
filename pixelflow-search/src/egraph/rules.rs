@@ -177,12 +177,12 @@ impl RuleSet {
 
     /// [`RuleSet::production`] plus the bounded-fold decompositions.
     ///
-    /// The runtime tier's set, and only its: `kernel!` has no syntax that
-    /// builds a fold, so at the macro tier these rules can never fire.
-    /// Adding them to [`super::all_rules`] instead would leave them inert
-    /// there while perturbing the pinned rule-set grids that
-    /// `crate::math::inflate`'s inflation study measures against — a changed
-    /// baseline for no measurement's sake. Which rules a tier holds is
+    /// The runtime tier's set, and only its: the macro tier's set holds no
+    /// fold rule, so a `kernel!` fold reaches the runtime tier as the one
+    /// `Reduce` it lowered to, and is unrolled or factored there, at bake
+    /// time. Adding them to [`super::all_rules`] instead would perturb the
+    /// pinned rule-set grids that `crate::math::inflate`'s inflation study
+    /// measures against — a changed baseline for no measurement's sake. Which rules a tier holds is
     /// already a place the tiers differ (so is the vocabulary, and so is
     /// whether extraction is priced against a lattice).
     #[must_use]

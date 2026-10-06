@@ -18,14 +18,18 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::arena::{BufferDecl, BufferIdentity, ExprArena, ExprId, UniformDecl, UniformIdentity};
+use crate::arena::{
+    Axis, BufferDecl, BufferIdentity, ExprArena, ExprId, ExprNode, IndexSpaceFull, UniformDecl,
+    UniformIdentity,
+};
 use crate::dag::{Builder, Dag, Node, Rooted};
 use crate::expr::{
     Environment, ExprBuilderExt, ExprData, copy_subgraph, from_arena, splice, substitute_vars,
     to_arena,
 };
-use crate::fold::{Binder, Fold, Monoid};
+use crate::fold::{Binder, Chain, Fold, Monoid, Placeholder};
 use crate::kind::OpKind;
+use crate::library::{self, Terms};
 
 /// One bit per placeholder index, set while that index is claimed by a binder
 /// under construction. Claims are taken and released in any order, so this is a
@@ -35,89 +39,47 @@ use crate::kind::OpKind;
 /// 0 while B still holds 1, and the next claim hands out 1 again.
 static PLACEHOLDERS_IN_USE: AtomicU64 = AtomicU64::new(0);
 
-/// Placeholder indices sit above the retired coordinate space (`0..4`, of
-/// which only X and Y are live) and the whole reduction index space
-/// (`4..Variance::VARIABLES`) — past every index a real binder can take,
-/// which is what keeps a placeholder's rename from ever reaching a binder
-/// an inner fold has already chosen. A `Kernel` never contains the
-/// compiler's manifold-param slots (the value-producing macro path rejects
-/// manifold params outright), so everything from here up is free.
-const PLACEHOLDER_BASE: u32 = crate::variance::Variance::VARIABLES as u32;
-
-/// A reduction's bound index while its body is under construction, before a
-/// real slot is chosen.
+/// A [`Placeholder`] claimed for a binder under construction, released on
+/// drop.
 ///
-/// The placeholder must be unique among binders that are *simultaneously* being
-/// built: a nested fold renames every occurrence of its own placeholder to a
-/// real slot, so if it shared one with the fold enclosing it, it would capture
-/// the outer index — `Σ_i Σ_j f(i, j)` would silently become `Σ_i Σ_j f(j, j)`.
-/// The claim is released on drop, so the space is bounded by how many binders
-/// are open at this instant, not by how many kernels have ever been built.
-///
-/// [`lowest_free_binder`] caps nesting at [`Binder::COUNT`]; the 64
-/// placeholders here admit that many binders under construction at once,
-/// however they nest across threads, and exhaustion panics rather than
-/// aliasing an index.
-struct BinderScope(u32);
+/// The placeholder must be unique among binders that are *simultaneously*
+/// being built (see [`Placeholder`]), and kernels are built on many threads
+/// at once, so the claim is taken from a set every thread shares. It is
+/// released on drop, so the space is bounded by how many binders are open at
+/// this instant, not by how many kernels have ever been built: the
+/// [`Placeholder::COUNT`] placeholders admit that many binders under
+/// construction at once, however they nest across threads, and exhaustion
+/// panics rather than aliasing an index.
+struct BinderScope {
+    /// The bit of [`PLACEHOLDERS_IN_USE`] this claim holds.
+    bit: u32,
+    placeholder: Placeholder,
+}
 
 impl BinderScope {
     fn enter() -> Self {
         let mut in_use = PLACEHOLDERS_IN_USE.load(Ordering::Relaxed);
         loop {
             let bit = (!in_use).trailing_zeros();
-            assert!(
-                bit < u64::BITS,
-                "too many kernel binders under construction at once"
-            );
+            let placeholder = Placeholder::nth(bit as usize)
+                .unwrap_or_else(|| panic!("too many kernel binders under construction at once"));
             match PLACEHOLDERS_IN_USE.compare_exchange_weak(
                 in_use,
                 in_use | (1 << bit),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return Self(bit),
+                Ok(_) => return Self { bit, placeholder },
                 Err(observed) => in_use = observed,
             }
         }
-    }
-
-    fn placeholder(&self) -> u8 {
-        (PLACEHOLDER_BASE + self.0) as u8
     }
 }
 
 impl Drop for BinderScope {
     fn drop(&mut self) {
-        PLACEHOLDERS_IN_USE.fetch_and(!(1 << self.0), Ordering::Relaxed);
+        PLACEHOLDERS_IN_USE.fetch_and(!(1 << self.bit), Ordering::Relaxed);
     }
-}
-
-/// The lowest binder not already bound by a `Reduce` in `arena`.
-///
-/// Binders are built inside-out, so a fold sees every inner fold's slot and
-/// takes the next free one — distinct live binders never share an index.
-///
-/// # Panics
-///
-/// Panics when every slot is live, i.e. one fold deeper than the index space.
-fn lowest_free_binder(dag: &Dag<ExprData>) -> Binder {
-    let mut used = [false; Binder::COUNT];
-    for node in dag.iter() {
-        // `ExprData::Reduce(Fold)` is why this is two lines. Read off a
-        // `Const` child it was a float, tested against `floorf` and a magic
-        // range, and asked again by every pass that wanted a binder.
-        if let ExprData::Reduce(fold) = *node {
-            used[fold.binder().slot() as usize] = true;
-        }
-    }
-    Binder::all()
-        .find(|b| !used[b.slot() as usize])
-        .unwrap_or_else(|| {
-            panic!(
-                "more than {} live nested reductions: the index space is full",
-                Binder::COUNT
-            )
-        })
 }
 
 /// A named scalar argument of a kernel: the JIT tier's spelling of a
@@ -125,11 +87,11 @@ fn lowest_free_binder(dag: &Dag<ExprData>) -> Binder {
 ///
 /// Creating one mints an identity; the handle is the only way to set the
 /// value later, so a kernel's arguments are exactly the handles its author
-/// kept. It composes as a leaf ([`Uniform::kernel`]) or stands in for a
-/// builder's scalar parameter ([`Scalar`]); either way the value is invariant
+/// kept. It composes as a leaf ([`Uniform::kernel`]); the value is invariant
 /// across the lattice and unknown until the call, so the compiler hoists
 /// everything that depends only on it into the per-call prologue and never
-/// folds it.
+/// folds it. (A `kernel!` entry's parameters are uniforms too, declared by
+/// its expansion and bound by position rather than through a handle.)
 ///
 /// Two handles from two `new` calls are two arguments, even with equal
 /// defaults; one handle read from twenty places is one argument.
@@ -179,31 +141,6 @@ impl Uniform {
     }
 }
 
-/// What a builder accepts for a scalar parameter. The *type* decides whether
-/// the value is folded into the fragment as a constant or declared as a
-/// uniform slot: an `f32` folds, so every call site that passes one keeps its
-/// meaning, and a [`Uniform`] handle makes the parameter an argument of the
-/// compiled kernel instead.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Scalar {
-    /// Folded in: part of the kernel.
-    Const(f32),
-    /// Bound per call: an argument of the kernel.
-    Uniform(Uniform),
-}
-
-impl From<f32> for Scalar {
-    fn from(v: f32) -> Self {
-        Self::Const(v)
-    }
-}
-
-impl From<Uniform> for Scalar {
-    fn from(u: Uniform) -> Self {
-        Self::Uniform(u)
-    }
-}
-
 /// A composed expression fragment: the front-end value.
 #[derive(Clone)]
 pub struct Kernel {
@@ -246,6 +183,30 @@ fn merge_buffer_data(
                 base.insert(*id, Arc::clone(data));
             }
         }
+    }
+}
+
+/// Kernel values as a place to build [`library`] terms: a node is a
+/// `Kernel`, built as every combinator builds one — the receiver copied,
+/// the operand spliced in, one node on top — so a composite built through
+/// the one definition lays out its arena as the combinators always did.
+struct Values;
+
+impl library::sealed::Sealed for Values {}
+
+impl Terms for Values {
+    type Term = Kernel;
+
+    fn constant(&mut self, value: f32) -> Kernel {
+        Kernel::constant(value)
+    }
+
+    fn unary(&mut self, op: OpKind, operand: Kernel) -> Kernel {
+        operand.map(op)
+    }
+
+    fn binary(&mut self, op: OpKind, [a, b]: [Kernel; 2]) -> Kernel {
+        a.combine(&b, op)
     }
 }
 
@@ -313,7 +274,11 @@ impl Kernel {
         &self.inner.env.buffers
     }
 
-    /// Uniform declarations.
+    /// Uniform declarations, in declaration order — the order a positional
+    /// binding supplies them in. A composition declares its receiver's, then
+    /// each operand's in turn, each in that operand's own order and read or
+    /// not; one instance composed twice is declared once, where it first
+    /// appears.
     #[must_use]
     pub fn uniforms(&self) -> &[UniformDecl] {
         &self.inner.env.uniforms
@@ -324,16 +289,16 @@ impl Kernel {
     /// The X coordinate.
     #[must_use]
     pub fn x() -> Self {
-        Self::coord(0)
+        Self::coord(Axis::X)
     }
     /// The Y coordinate.
     #[must_use]
     pub fn y() -> Self {
-        Self::coord(1)
+        Self::coord(Axis::Y)
     }
-    fn coord(i: u8) -> Self {
+    fn coord(axis: Axis) -> Self {
         let mut b = Builder::new();
-        let r = b.push_var(i);
+        let r = b.push_var(axis.var());
         Self::wrap(b.finish(&[r]), Environment::new(), BTreeMap::new())
     }
 
@@ -358,8 +323,8 @@ impl Kernel {
     /// thing that becomes machine code.
     #[must_use]
     pub fn from_parts(arena: ExprArena, root: ExprId) -> Self {
-        let (rooted, env) = from_arena(&arena, root);
-        let entry = rooted.entry();
+        let kernel = Self::adopt(arena, root, BTreeMap::new());
+        let entry = kernel.root();
         assert!(
             entry.retired_axis().is_none(),
             "Kernel::from_parts: the arena names Var({}), which was the {} \
@@ -373,12 +338,23 @@ impl Kernel {
             },
             crate::arena::COORD_AXES,
         );
+        kernel
+    }
+
+    /// The kernel `arena`'s `root` is, carrying `buffers`: the arena as it
+    /// stands is the one [`Kernel::parts`] hands out, node for node.
+    fn adopt(
+        arena: ExprArena,
+        root: ExprId,
+        buffers: BTreeMap<BufferIdentity, Arc<[f32]>>,
+    ) -> Self {
+        let (rooted, env) = from_arena(&arena, root);
         Self {
             inner: Arc::new(KernelData {
                 rooted,
                 env,
                 legacy: (arena, root),
-                buffers: BTreeMap::new(),
+                buffers,
             }),
         }
     }
@@ -506,10 +482,12 @@ impl Kernel {
     pub fn round(&self) -> Self {
         self.map(OpKind::Round)
     }
-    /// The fractional part, `self - ⌊self⌋`. Library, not a primitive.
+    /// The fractional part, `self - ⌊self⌋`. Library, not a primitive:
+    /// [`library::fract`], the one definition `kernel!`'s `.fract()` builds
+    /// too.
     #[must_use]
     pub fn fract(&self) -> Self {
-        self.sub(&self.floor())
+        library::fract(&mut Values, self.clone())
     }
 
     // ───────────────────── transcendentals ────────────────────────
@@ -578,9 +556,11 @@ impl Kernel {
     /// `√(self² + other²)` — the length of `(self, other)`. Library, not a
     /// primitive: no hardware computes it, so a `Hypot` node bought nothing
     /// but a decomposition each backend had to write for itself.
+    /// [`library::hypot`], the one definition `kernel!`'s `.hypot()` builds
+    /// too.
     #[must_use]
     pub fn hypot(&self, other: &Kernel) -> Self {
-        self.mul(self).add(&other.mul(other)).sqrt()
+        library::hypot(&mut Values, [self.clone(), other.clone()])
     }
 
     // ─────────────────────── comparisons / masks ──────────────────
@@ -635,21 +615,25 @@ impl Kernel {
     // ─────────────────────────── control ──────────────────────────
 
     /// `self ? if_true : if_false` — `self` is the mask.
+    ///
+    /// Lowers to [`OpKind::If`]. The method keeps its name until Phase B of
+    /// docs/plans/2026-09-25-the-language-is-kernel.md renames it `if`.
     #[must_use]
     pub fn select(&self, if_true: &Kernel, if_false: &Kernel) -> Self {
-        self.combine3(if_true, if_false, OpKind::Select)
+        self.combine3(if_true, if_false, OpKind::If)
     }
     /// `clamp(self, lo, hi)` = `min(max(self, lo), hi)`.
     ///
-    /// Library, not a primitive: this builds the composition it denotes, so
-    /// there is exactly one definition of clamping and every tier evaluates
-    /// the same nodes. (It used to be an IR node that three backends and the
-    /// e-graph's derivative rule each re-decomposed by hand, and they
-    /// disagreed on degenerate `lo > hi` bounds.) Passing `lo > hi` yields
-    /// `hi`, as the composition says.
+    /// Library, not a primitive: this builds the composition it denotes,
+    /// [`library::clamp`], so there is exactly one definition of clamping —
+    /// `kernel!`'s `.clamp()` builds it too — and every tier evaluates the
+    /// same nodes. (It used to be an IR node
+    /// that three backends and the e-graph's derivative rule each
+    /// re-decomposed by hand, and they disagreed on degenerate `lo > hi`
+    /// bounds.) Passing `lo > hi` yields `hi`, as the composition says.
     #[must_use]
     pub fn clamp(&self, lo: &Kernel, hi: &Kernel) -> Self {
-        self.max(lo).min(hi)
+        library::clamp(&mut Values, self.clone(), [lo.clone(), hi.clone()])
     }
 
     // ───────────────────────── composition ────────────────────────
@@ -686,115 +670,138 @@ impl Kernel {
     ///
     /// Note this is the **fixed-arity** fold over a slice of distinct terms,
     /// not [`Kernel::over`], which folds one body over a bounded index.
+    ///
+    /// Its shape is `Chain`'s, the one a fold of distinct terms has:
+    /// `((k₀ ⊕ k₁) ⊕ k₂) ⊕ …`.
     #[must_use]
     pub fn fold(monoid: Monoid, kernels: &[Kernel]) -> Self {
-        let op = monoid.op();
         let Some((head, tail)) = kernels.split_first() else {
             return Self::constant(monoid.identity());
         };
         let mut b = Builder::new();
         let mut env = head.inner.env.clone();
-        let mut root = copy_subgraph(&mut b, head.root());
         let mut buffers = head.inner.buffers.clone();
+        let mut chain = Chain::new(monoid);
+        // The first term's tables are the fold's, so its subgraph is copied
+        // as it stands; each later term is spliced against them.
+        let first = copy_subgraph(&mut b, head.root());
+        chain.push(first, |op, folded, term| b.push_binary(op, folded, term));
         for k in tail {
-            let rhs = splice(&mut b, &mut env, k.root(), &k.inner.env);
-            root = b.push_binary(op, root, rhs);
+            let term = splice(&mut b, &mut env, k.root(), &k.inner.env);
+            chain.push(term, |op, folded, term| b.push_binary(op, folded, term));
             merge_buffer_data(&mut buffers, &k.inner.buffers);
         }
+        let root = chain.finish(|identity| b.push_const(identity));
         Self::wrap(b.finish(&[root]), env, buffers)
     }
 
-    /// `⊕_{i ∈ 0..extent} body(i)` — **the** reduction binder: fold `body` over
+    /// `⊕_{i ∈ range} body(i)` — **the** reduction binder: fold `body` over
     /// a bounded discrete domain under `monoid`, eliminating that dimension.
     ///
     /// This is the primitive; [`Kernel::sum_over`] and friends are one-line
-    /// helpers over it, and a new [`Monoid`] extends the language without
-    /// touching this method.
+    /// helpers over it at `0..extent`, and a new [`Monoid`] extends the
+    /// language without touching this method.
     ///
     /// The closure receives the bound index as a `Kernel` of its own, so Rust's
     /// scoping *is* the binder's scoping — an index cannot escape the fold that
     /// binds it, and a repeated index in nested folds is a genuine contraction
-    /// rather than an accident. `extent` is a static count, which is what keeps
-    /// the language total and its cost closed-form (`|D| × cost(body)`); the
+    /// rather than an accident. `range` is static, which is what keeps the
+    /// language total and its cost closed-form (`|D| × cost(body)`); the
     /// backend unrolls, so the domain is bounded in practice as well as in
     /// principle.
+    ///
+    /// **Where the domain starts is the fold's, not the body's.** Two folds
+    /// whose bodies read `table[i]` over different rows of one table have
+    /// one body, and the e-graph reasons about it once; spelling the second
+    /// as `table[i + offset]` over `0..len` gives it a body of its own.
     ///
     /// Nesting is supported (up to [`Binder::COUNT`] live binders — the
     /// reserved index space): each fold takes the lowest index slot its body
     /// does not already bind.
     ///
+    /// The slot is chosen only after the body exists: the body is built
+    /// against a placeholder, and [`ExprArena::close_over`] — the one
+    /// definition of the choice and the rename, which `kernel!`'s lowering
+    /// closes its folds through too — picks the slot and renames it.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless [`Fold::admits`] `range`: if it runs backwards, or ends
+    /// past 2²⁴, where an `f32` index stops naming every integer. Panics too
+    /// when the body already binds every slot, i.e. one fold deeper than the
+    /// index space.
+    ///
     /// ```ignore
     /// // Σ_d q(d)·k(d) — a contraction over the shared index.
-    /// Kernel::over(Monoid::SUM, 64, |d| q.at_index(d).mul(&k.at_index(d)))
+    /// Kernel::over(Monoid::SUM, 0..64, |d| q.at_index(d).mul(&k.at_index(d)))
     /// ```
     #[must_use]
-    pub fn over(monoid: Monoid, extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        // Build the body against a placeholder index unique to this binder,
-        // then rename it to a real slot once we can see which slots the body
-        // already binds. Choosing the slot up-front is impossible: the body
-        // (and therefore its inner binders) does not exist yet.
+    pub fn over(
+        monoid: Monoid,
+        range: core::ops::Range<u32>,
+        body: impl FnOnce(&Kernel) -> Kernel,
+    ) -> Self {
         let scope = BinderScope::enter();
         let index = {
             let mut b = Builder::new();
-            let r = b.push_var(scope.placeholder());
+            let r = b.push_var(scope.placeholder.var());
             Self::wrap(b.finish(&[r]), Environment::new(), BTreeMap::new())
         };
         let body = body(&index);
-
-        let mut b = Builder::new();
-        let env = body.inner.env.clone();
-        let binder = lowest_free_binder(body.dag());
-        let renamed = b.push_var(binder.var());
-        let body_root = substitute_vars(&mut b, body.root(), &[(scope.placeholder(), renamed)]);
-        // One typed node. The encoding this replaced pushed three `Const`
-        // children — combiner index, binder slot, extent — and left every
-        // reader to recover them by position and by asking a float whether
-        // it was really a small integer.
-        let root = b.push_reduce(Fold::new(monoid, binder, 0..extent), body_root);
+        let (arena, root) = body.parts();
+        let closed = arena.close_over(root, scope.placeholder, |binder| {
+            Fold::new(monoid, binder, range)
+        });
+        let (arena, root) = closed.unwrap_or_else(|IndexSpaceFull| {
+            panic!(
+                "more than {} live nested reductions: the index space is full",
+                Binder::COUNT
+            )
+        });
         // Only `body`'s own graph is used above — no other kernel is spliced
         // in — so its buffer table carries forward unchanged.
-        Self::wrap(b.finish(&[root]), env, body.inner.buffers.clone())
+        Self::adopt(arena, root, body.inner.buffers.clone())
     }
 
     /// `Σ_{i ∈ 0..extent} body(i)` — contraction, projection, and every other
     /// sum over a bounded index.
     #[must_use]
     pub fn sum_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::SUM, extent, body)
+        Self::over(Monoid::SUM, 0..extent, body)
     }
 
     /// `Π_{i ∈ 0..extent} body(i)`.
     #[must_use]
     pub fn product_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::PRODUCT, extent, body)
+        Self::over(Monoid::PRODUCT, 0..extent, body)
     }
 
     /// `max_{i ∈ 0..extent} body(i)` — the stabilizer half of a softmax, and
     /// the shape of any "best over a bounded set" query.
     #[must_use]
     pub fn max_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::MAX, extent, body)
+        Self::over(Monoid::MAX, 0..extent, body)
     }
 
     /// `min_{i ∈ 0..extent} body(i)` — e.g. the nearest hit of a bounded set
     /// of SDFs.
     #[must_use]
     pub fn min_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::MIN, extent, body)
+        Self::over(Monoid::MIN, 0..extent, body)
     }
 
     /// `∃_{i ∈ 0..extent} body(i)` — a mask that is set where *any* index
     /// satisfies `body`.
     #[must_use]
     pub fn any_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::ANY, extent, body)
+        Self::over(Monoid::ANY, 0..extent, body)
     }
 
     /// `∀_{i ∈ 0..extent} body(i)` — a mask that is set where *every* index
     /// satisfies `body`.
     #[must_use]
     pub fn all_over(extent: u32, body: impl FnOnce(&Kernel) -> Kernel) -> Self {
-        Self::over(Monoid::ALL, extent, body)
+        Self::over(Monoid::ALL, 0..extent, body)
     }
 
     /// Sample `self` at warped coordinates — contramap / `.at()`. Each of
@@ -834,32 +841,32 @@ impl Kernel {
     /// Panics unless `var` names a coordinate axis.
     #[must_use]
     pub fn dwrt(&self, var: u8) -> Self {
-        assert!(
-            (var as usize) < crate::arena::COORD_AXES,
-            "Kernel::dwrt: no axis {var}; a lattice has {} \
-             (0 = X, 1 = Y)",
-            crate::arena::COORD_AXES
-        );
-        let mut b = Builder::new();
-        let r = copy_subgraph(&mut b, self.root());
-        let v = b.push_const(f32::from(var));
-        let root = b.push_binary(OpKind::Dwrt, r, v);
-        Self::wrap(
-            b.finish(&[root]),
-            self.inner.env.clone(),
-            self.inner.buffers.clone(),
-        )
+        let Some(&axis) = Axis::ALL.get(usize::from(var)) else {
+            panic!(
+                "Kernel::dwrt: no axis {var}; a lattice has {} \
+                 (0 = X, 1 = Y)",
+                crate::arena::COORD_AXES
+            );
+        };
+        self.derivative(axis)
     }
 
     /// `∂self/∂X`.
     #[must_use]
     pub fn dx(&self) -> Self {
-        self.dwrt(0)
+        self.derivative(Axis::X)
     }
     /// `∂self/∂Y`.
     #[must_use]
     pub fn dy(&self) -> Self {
-        self.dwrt(1)
+        self.derivative(Axis::Y)
+    }
+
+    /// `∂self/∂axis`: [`library::derivative`], the one definition of the
+    /// `Dwrt` encoding, which `kernel!`'s `DX`, `DY` and the Hessian family
+    /// build too.
+    fn derivative(&self, axis: Axis) -> Self {
+        library::derivative(&mut Values, self.clone(), axis)
     }
 
     // ───────────────────────── back end ───────────────────────────
@@ -902,10 +909,18 @@ impl Kernel {
     ///
     /// The tabulations `k` carries come along, so the data still travels with
     /// the value; the referent's arena, root and tables are reachable through
-    /// the key. Today every reference is inlined again by
-    /// [`expand_refs`](crate::passes::expand_refs) before anything else sees
-    /// it — the linker only inlines — so this changes what a kernel *costs to
-    /// build*, never what it means.
+    /// the key.
+    ///
+    /// **A name is an optimization unit.** The runtime tier
+    /// (`pixelflow_search::runtime::optimize_runtime_arena`) saturates and
+    /// extracts a referent by itself, holds it in the referring term as an
+    /// opaque leaf no rewrite reaches inside, and links the two after
+    /// extraction ([`link`](crate::passes::link)), so the emitter still sees
+    /// one program. That is how a font too big for one e-graph is optimized
+    /// a glyph at a time (docs/plans/2026-09-25-the-language-is-kernel.md §4,
+    /// O1). So this changes what a kernel *costs to build* and where the
+    /// optimizer's boundaries fall — which rewrites can cross the name —
+    /// never what it means.
     ///
     /// This is the only way a `Ref` node is produced — so it is also why a
     /// `no_std` build cannot hold one: the store a name is looked up in needs
@@ -915,22 +930,25 @@ impl Kernel {
     ///
     /// # Panics
     ///
-    /// Panics on a kernel that is still *open* — one holding a
-    /// [`BinderScope`] placeholder, i.e. the index a `Kernel::over` body is
-    /// being built against. A name for an open term means nothing: the
-    /// referent's value depends on a binding the store cannot carry, and the
-    /// binder's rename cannot reach through a name to substitute it, so what
-    /// expansion would put back is an index nothing binds.
+    /// Panics on a kernel that is *open* ([`ExprArena::free_index`]) — one
+    /// holding a [`BinderScope`] placeholder, i.e. the index a `Kernel::over`
+    /// body is being built against, or reading a binder no fold in it binds.
+    /// A name for an open term means nothing: the referent's value depends
+    /// on a binding the store cannot carry, the binder's rename cannot reach
+    /// through a name to substitute it, and a fold built around the name
+    /// chooses its binder without seeing through it — so what expansion
+    /// would put back is an index nothing binds, or the wrong fold's.
     #[cfg(feature = "std")]
     #[must_use]
     pub fn by_ref(&self) -> Self {
         let (arena, root) = self.parts();
-        let open = arena.free_var_at_or_above(root, PLACEHOLDER_BASE as u8);
+        let open = arena.free_index(root);
         assert!(
             open.is_none(),
-            "Kernel::by_ref: this kernel holds Var({}), a reduction binder's \
-             placeholder — it is the body of a `Kernel::over` still under \
-             construction, and an open term has no identity to name it by",
+            "Kernel::by_ref: this kernel reads Var({}), an index no fold in it \
+             binds — the body of a `Kernel::over` still under construction, or \
+             a fold's body cut from its fold — and an open term has no identity \
+             to name it by",
             open.unwrap_or_default(),
         );
         let key = crate::store::KernelStore::intern(self);
@@ -999,6 +1017,124 @@ impl Kernel {
     }
 }
 
+/// A kernel admitted as an argument of a program being built in an arena
+/// ([`ExprArena::admit`]): checked closed and reading no table, its uniforms
+/// declared there in its own order. It is what [`ExprArena::apply`] takes,
+/// so no argument is applied without those two checks; that the arena it is
+/// applied in declared its uniforms is `apply`'s own assertion, since a
+/// fold's body is built in a copy of the arena that admitted it
+/// ([`ExprArena::open_fold`]), which a borrow of that arena could not name.
+#[derive(Clone, Copy)]
+pub struct Argument<'k>(&'k Kernel);
+
+/// **Application is contramap, in an arena.** A `kernel!` entry that takes a
+/// kernel-typed parameter, `k: impl Fn(f32, f32) -> f32`, runs lowering's
+/// steps when it is called, and `k(u, v)` in its body is one of them
+/// (docs/plans/2026-09-25-the-language-is-kernel.md, Phase D-a).
+///
+/// What `k(u, v)` denotes. A kernel is a function of the coordinate map:
+/// `⟦k⟧ : (S → ℝ²) → (S → ℝ)`, with `X`, `Y` the map's two components and
+/// `DX`, `DY` derivatives in the sample `s ∈ S`. Applying it precomposes
+/// the map: `⟦k(u, v)⟧(φ) = ⟦k⟧(s ↦ (⟦u⟧(φ)(s), ⟦v⟧(φ)(s)))`. That is
+/// [`Kernel::at`], and the term is the same, `k[X := u, Y := v]` — the IR's
+/// own substitution, [`ExprArena::substitute_vars_with`], the arena-level
+/// sibling of the one `at` makes over a kernel's DAG — one canonical key
+/// with `at`'s, for an argument that names no other kernel. One that does,
+/// applied at `(X, Y)`, keeps the name ([`ExprArena::apply`]) where `at`
+/// expands it: the same program, under another key. A `Dwrt` in `k`
+/// survives the substitution, so a derivative in an argument is taken in
+/// the sample, by the chain rule, as it is under `at`
+/// (`derivative_under_warp.rs`): `DX` of `X·X` applied at `(2X, Y)` is
+/// `8X`, not the `4X` that `2x` evaluated at `2X` would be.
+///
+/// Binders. An application inside a fold's body happens while that fold is
+/// open: its index is a placeholder, and the folds around the hole choose
+/// their binders only when they close ([`ExprArena::close_fold`]), after
+/// the argument is in — the lowest slot no fold in the body binds, the
+/// argument's folds among them. So the argument keeps its own binders, the
+/// folds around it take others, and the hole's coordinates may read those
+/// folds' indices: nothing is captured, with no second binder rule beside
+/// [`ExprArena::close_over`]'s.
+impl ExprArena {
+    /// Admit `kernel` as an argument of the program this arena builds, and
+    /// declare its uniforms here, in its own declaration order, read or not
+    /// — after whatever this arena declared before (an entry's own
+    /// parameters), and once each: an instance admitted twice, or shared
+    /// with an earlier argument, is declared where it first appears. That is
+    /// the order `Kernel`'s combinators declare an operand's in, so a
+    /// positional binding of the composed program reads it off the
+    /// composition.
+    ///
+    /// # Panics
+    ///
+    /// If `kernel` reads a table — a buffer declared or carried: the
+    /// language has none (D3 of docs/plans/2026-09-25-the-language-is-kernel.md)
+    /// — or is open ([`ExprArena::free_index`]): an index no fold in it binds
+    /// would be bound by whichever fold this arena builds around its
+    /// application, as [`Kernel::by_ref`] refuses a name for one.
+    pub fn admit<'k>(&mut self, kernel: &'k Kernel) -> Argument<'k> {
+        assert!(
+            kernel.buffers().is_empty() && kernel.buffer_data().next().is_none(),
+            "a kernel-typed argument reads a table, and the language has none (D3 of \
+             docs/plans/2026-09-25-the-language-is-kernel.md): pass a kernel over \
+             uniforms",
+        );
+        let (arena, root) = kernel.parts();
+        let open = arena.free_index(root);
+        assert!(
+            open.is_none(),
+            "a kernel-typed argument reads Var({}), an index no fold in it binds, which \
+             a fold around its application would bind: an argument is closed (D4 of \
+             docs/plans/2026-09-25-the-language-is-kernel.md)",
+            open.unwrap_or_default(),
+        );
+        for decl in kernel.uniforms() {
+            self.uniform_slot_for(*decl);
+        }
+        Argument(kernel)
+    }
+
+    /// `argument` applied at `(u, v)`, nodes of this arena: its term
+    /// spliced in with `X := u` and `Y := v` — see this block's doc for what
+    /// that denotes.
+    ///
+    /// At `(X, Y)` the substitution is the identity, and there is nothing to
+    /// substitute: the term is spliced as it stands, a [`Ref`] in it left a
+    /// name. Under a real warp a name is expanded first, as [`Kernel::at`]
+    /// expands one, because a substitution cannot reach through it.
+    ///
+    /// # Panics
+    ///
+    /// If this arena does not declare `argument`'s uniforms — it, or the
+    /// arena it was copied from to build a fold's body, did not
+    /// [`admit`](Self::admit) it. Spliced here, they would be declared in
+    /// the order this application reads them, and only those it reads,
+    /// which is not the order a positional binding of the composed program
+    /// reads off its parameters (D-a and O3 of
+    /// docs/plans/2026-09-25-the-language-is-kernel.md).
+    ///
+    /// [`Ref`]: ExprNode::Ref
+    pub fn apply(&mut self, argument: &Argument<'_>, [u, v]: [ExprId; 2]) -> ExprId {
+        let Argument(kernel) = *argument;
+        let declared = |decl: &UniformDecl| self.uniforms().iter().any(|d| d.id == decl.id);
+        assert!(
+            kernel.uniforms().iter().all(declared),
+            "a kernel-typed argument applied in an arena that did not admit it: its \
+             uniforms would be declared in the order this application reads them, not \
+             its own (D-a of docs/plans/2026-09-25-the-language-is-kernel.md)",
+        );
+        let at_the_sample = self.node(u) == ExprNode::Var(Axis::X.var())
+            && self.node(v) == ExprNode::Var(Axis::Y.var());
+        if at_the_sample {
+            let (arena, root) = kernel.parts();
+            return self.splice(arena, root);
+        }
+        let (linked, root) = kernel.linked_parts();
+        let spliced = self.splice(&linked, root);
+        self.substitute_vars_with(spliced, &[(Axis::X.var(), u), (Axis::Y.var(), v)])
+    }
+}
+
 /// A kernel whose lanes are BIT PATTERNS rather than numbers — the discrete
 /// half of the language, entered by [`Kernel::trunc_to_int`].
 ///
@@ -1062,7 +1198,7 @@ impl Bits {
     /// `mask ? if_true : if_false` — a choice between two lane patterns.
     ///
     /// The same IR node as [`Kernel::select`], because there was never a
-    /// second one to write: `Select` is a bitwise blend on every backend
+    /// second one to write: `If`'s lane-varying path is a bitwise blend on every backend
     /// (`andps`/`andnps`/`orps`, `vpternlogd 0xCA`, `BSL`), so a choice
     /// between patterns is the instruction that already exists. What is new
     /// is the type, and it is the whole point — a colour packed into a word
@@ -1094,6 +1230,8 @@ impl Bits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arena::ExprNode;
+    use crate::fold::Fold;
 
     /// The count is still checked at runtime; the OPERAND no longer needs
     /// checking, because `Kernel::x().shl(32)` does not compile at all now —
@@ -1102,6 +1240,47 @@ mod tests {
     #[should_panic(expected = "32-bit lane")]
     fn shl_past_the_lane_is_refused() {
         let _refused = Kernel::x().trunc_to_int().shl(32);
+    }
+
+    /// The builder refuses a fold past 2²⁴ as `kernel!` does: both build
+    /// through `Fold`, which holds the one bound. Before, `kernel!`
+    /// refused and this summed the wrong terms without a word
+    /// (docs/BACKLOG.md, C8).
+    #[test]
+    #[should_panic(expected = "ends at most at 16777216 (2^24)")]
+    fn a_fold_past_the_exact_bound_is_refused_by_the_builder_too() {
+        let past = Fold::EXACT_BOUND + 1;
+        let _refused = Kernel::over(Monoid::SUM, 16_777_100..past, |i| i.clone());
+    }
+
+    /// A fold is laid out as the builder always laid one out — the binder's
+    /// index first, then the body copied from its root, last child first,
+    /// then the fold — now that it is closed by `ExprArena::close_over`, the
+    /// definition `kernel!`'s lowering closes through too. A layout, not a
+    /// meaning: pinned because a compile is not promised to be blind to it,
+    /// and B5 moved the construction without moving a node.
+    #[test]
+    fn a_fold_is_laid_out_as_the_builder_always_laid_it_out() {
+        let fold = Kernel::sum_over(4, |i| Kernel::x().mul(i).add(&Kernel::y()));
+        let (arena, root) = fold.parts();
+        let binder = Binder::from_slot(0).expect("slot 0");
+        let nodes: Vec<ExprNode> = arena.nodes().map(|(_, node)| node).collect();
+        assert_eq!(
+            nodes,
+            [
+                ExprNode::Var(binder.var()),
+                ExprNode::Var(Axis::Y.var()),
+                ExprNode::Var(Axis::X.var()),
+                ExprNode::Binary(OpKind::Mul, ExprId(2), ExprId(0)),
+                ExprNode::Binary(OpKind::Add, ExprId(3), ExprId(1)),
+                ExprNode::Reduce {
+                    fold: Fold::new(Monoid::SUM, binder, 0..4),
+                    body: ExprId(4),
+                },
+            ],
+            "{}",
+            arena.display(root)
+        );
     }
 
     /// A hand-built arena that names the retired Z axis is refused where it
@@ -1128,10 +1307,9 @@ mod tests {
     }
 
     #[test]
-    fn scalar_is_chosen_by_type() {
+    fn two_uniform_instances_are_two_arguments() {
         let u = Uniform::new(0.0);
-        assert!(matches!(Scalar::from(1.5), Scalar::Const(v) if v == 1.5));
-        assert!(matches!(Scalar::from(u), Scalar::Uniform(h) if h == u));
+        assert_eq!(u, u, "one instance is one argument");
         assert_ne!(
             Uniform::new(0.0),
             Uniform::new(0.0),
@@ -1227,5 +1405,205 @@ mod tests {
         let left = Kernel::x().with_buffer_data(id, Arc::from([1.0f32].as_slice()));
         let right = Kernel::y().with_buffer_data(id, Arc::from([1.0f32].as_slice()));
         let _refused = left.add(&right);
+    }
+
+    // ───────────────────────── admit / apply ─────────────────────────
+
+    /// `k` admitted into a fresh arena and applied at `(u, v)`, as the
+    /// kernel it builds — what an entry taking `k` does with `k(u, v)`.
+    fn applied(k: &Kernel, at: impl FnOnce(&mut ExprArena) -> [ExprId; 2]) -> Kernel {
+        let mut arena = ExprArena::new();
+        let argument = arena.admit(k);
+        let at = at(&mut arena);
+        let root = arena.apply(&argument, at);
+        let (arena, root) = arena.compact(root);
+        Kernel::from_parts(arena, root)
+    }
+
+    fn key(k: &Kernel) -> crate::key::Canonical {
+        let (arena, root) = k.parts();
+        crate::key::canonical(arena, root)
+    }
+
+    /// Applied under a warp, an argument is `Kernel::at`'s term: one
+    /// program, by canonical key, with its uniforms where `at` puts them.
+    #[test]
+    fn an_application_is_at() {
+        let r = Uniform::new(2.5);
+        let k = Kernel::x().mul(&Kernel::y()).sub(&r.kernel());
+        let warped = applied(&k, |a| {
+            let (x, y) = (a.push_var(Axis::X.var()), a.push_var(Axis::Y.var()));
+            let one = a.push_const(1.0);
+            [
+                a.push_binary(OpKind::Add, x, one),
+                a.push_binary(OpKind::Mul, y, y),
+            ]
+        });
+        let at = k.at(
+            &Kernel::x().add(&Kernel::constant(1.0)),
+            &Kernel::y().mul(&Kernel::y()),
+        );
+        assert_eq!(key(&warped), key(&at));
+    }
+
+    /// A derivative in the argument survives the application, to be taken
+    /// in the sample: `DX(X·X)` applied at `(2X, Y)` is `at`'s term, `8X`,
+    /// not `2x` read at `2X`.
+    #[test]
+    fn a_derivative_in_an_argument_is_at() {
+        let k = Kernel::x().mul(&Kernel::x()).dx();
+        let warped = applied(&k, |a| {
+            let (x, y) = (a.push_var(Axis::X.var()), a.push_var(Axis::Y.var()));
+            let two = a.push_const(2.0);
+            [a.push_binary(OpKind::Mul, x, two), y]
+        });
+        let at = k.at(&Kernel::x().mul(&Kernel::constant(2.0)), &Kernel::y());
+        assert_eq!(key(&warped), key(&at));
+        let (arena, root) = warped.parts();
+        assert!(
+            arena
+                .nodes()
+                .any(|(_, n)| matches!(n, ExprNode::Binary(OpKind::Dwrt, ..))),
+            "the derivative is still to be taken: {}",
+            arena.display(root)
+        );
+    }
+
+    /// An argument is applied only in an arena that admitted it, or in a
+    /// fold body's copy of one: anywhere else its uniforms would be
+    /// declared in the order the application reads them.
+    #[test]
+    #[should_panic(expected = "an arena that did not admit it")]
+    fn an_argument_applied_where_it_was_not_admitted_is_refused() {
+        let k = Uniform::new(1.0).kernel().mul(&Kernel::x());
+        let mut admitting = ExprArena::new();
+        let argument = admitting.admit(&k);
+        let mut other = ExprArena::new();
+        let (x, y) = (other.push_var(Axis::X.var()), other.push_var(Axis::Y.var()));
+        let _refused = other.apply(&argument, [x, y]);
+    }
+
+    /// A fold's body is built in a copy of the arena ([`ExprArena::open_fold`]),
+    /// which declares what the arena did: an argument admitted before the
+    /// fold opened is applied inside it.
+    #[test]
+    fn an_argument_admitted_before_a_fold_is_applied_inside_it() {
+        let k = Uniform::new(1.0).kernel().mul(&Kernel::x());
+        let mut arena = ExprArena::new();
+        let argument = arena.admit(&k);
+        let open = arena.open_fold(0).expect("one fold open");
+        let index = open.index();
+        let y = arena.push_var(Axis::Y.var());
+        let body = arena.apply(&argument, [index, y]);
+        let fold = arena
+            .close_fold(open, body, |binder| Fold::new(Monoid::SUM, binder, 0..3))
+            .expect("a binder is free");
+        assert_eq!(arena.uniforms(), k.uniforms());
+        assert!(matches!(arena.node(fold), ExprNode::Reduce { .. }));
+    }
+
+    /// At the sample the term is spliced as it stands, so a name in it
+    /// stays a name — the reference a glyph's unit is held by (O1 of the
+    /// plan) survives being summed.
+    #[cfg(feature = "std")]
+    #[test]
+    fn at_the_sample_a_name_stays_a_name() {
+        let named = Kernel::x().mul(&Kernel::y()).by_ref();
+        let here = applied(&named, |a| {
+            [a.push_var(Axis::X.var()), a.push_var(Axis::Y.var())]
+        });
+        let (arena, root) = here.parts();
+        assert!(
+            matches!(arena.node(root), ExprNode::Ref(_)),
+            "{}",
+            arena.display(root)
+        );
+        let moved = applied(&named, |a| {
+            let x = a.push_var(Axis::X.var());
+            [x, x]
+        });
+        let (arena, root) = moved.parts();
+        assert!(
+            !arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))),
+            "under a warp the name is expanded: {}",
+            arena.display(root)
+        );
+    }
+
+    /// The arena's own declarations first, then each argument's in its
+    /// order, read or not; an instance admitted twice is declared once.
+    #[test]
+    fn an_argument_declares_its_uniforms_in_its_order_once() {
+        let [a0, a1, b0] = [Uniform::new(1.0), Uniform::new(2.0), Uniform::new(3.0)];
+        // `a1` is declared before `a0`, and nothing reads it.
+        let a = {
+            let mut arena = ExprArena::new();
+            let _unread = arena.declare_uniform(a1.decl());
+            let read = arena.declare_uniform(a0.decl());
+            let root = arena.push_uniform(read);
+            Kernel::from_parts(arena, root)
+        };
+        assert_eq!(a.uniforms(), [a1.decl(), a0.decl()]);
+        let b = b0.kernel();
+        let own = UniformDecl {
+            id: UniformIdentity::mint(),
+            default: 0.5,
+        };
+        let mut arena = ExprArena::new();
+        arena.declare_uniform(own);
+        let _a = arena.admit(&a);
+        let _b = arena.admit(&b);
+        let _a_again = arena.admit(&a);
+        let declared: Vec<UniformDecl> = arena.uniforms().to_vec();
+        let mut want = alloc::vec![own];
+        want.extend_from_slice(a.uniforms());
+        want.push(b0.decl());
+        assert_eq!(declared, want);
+    }
+
+    /// An argument reads no table: the language has none (D3).
+    #[test]
+    #[should_panic(expected = "reads a table")]
+    fn an_argument_reading_a_table_is_refused() {
+        let table =
+            Kernel::x().with_buffer_data(BufferIdentity::mint(), Arc::from([1.0f32].as_slice()));
+        let _refused = ExprArena::new().admit(&table);
+    }
+
+    /// A kernel reading only `index`, which nothing in it binds.
+    fn open_at(index: u8) -> Kernel {
+        let mut a = ExprArena::new();
+        let root = a.push_var(index);
+        Kernel::from_parts(a, root)
+    }
+
+    /// An argument is closed: the placeholder of a fold still being built —
+    /// a `Kernel::over` body passed on from inside its closure — would be
+    /// bound by the fold around its application.
+    #[test]
+    #[should_panic(expected = "an index no fold in it binds")]
+    fn an_argument_holding_a_placeholder_is_refused() {
+        let placeholder = crate::fold::Placeholder::nth(0).expect("a placeholder");
+        let _refused = ExprArena::new().admit(&open_at(placeholder.var()));
+    }
+
+    /// And so would a binder no fold in it binds — a fold's body cut from
+    /// its fold — which a scan for placeholders alone let through.
+    #[test]
+    #[should_panic(expected = "an index no fold in it binds")]
+    fn an_argument_reading_a_free_binder_is_refused() {
+        let binder = Binder::from_slot(0).expect("a binder");
+        let _refused = ExprArena::new().admit(&open_at(binder.var()));
+    }
+
+    /// A name asks the same question of what it names, with the same walk:
+    /// a free binder has no identity either (`naming_an_open_term_is_refused`
+    /// pins the placeholder).
+    #[cfg(feature = "std")]
+    #[test]
+    #[should_panic(expected = "an open term has no identity")]
+    fn naming_a_term_reading_a_free_binder_is_refused() {
+        let binder = Binder::from_slot(0).expect("a binder");
+        let _refused = open_at(binder.var()).by_ref();
     }
 }

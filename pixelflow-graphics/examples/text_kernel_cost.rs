@@ -9,7 +9,7 @@
 //!
 //! - `saturation_sees` is reference-linked and nothing else — exactly what
 //!   `pixelflow_search::runtime` hands the e-graph, since legalization
-//!   (`LowerDwrt`, `ExpandReduce`) runs *after* saturation as the fallback
+//!   (`LowerDwrt`) runs *after* saturation as the fallback
 //!   for shapes the rule set declined. It is the lever on optimization cost,
 //!   and holding it down is why the legalizer sits at the end.
 //! - `legalized` is the whole of `legalize` on the *unoptimized* arena, so
@@ -25,13 +25,21 @@ use std::time::Instant;
 use pixelflow_core::Kernel;
 use pixelflow_graphics::fonts::{text, Font};
 use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::passes::lattice::{Collapse, Domain};
 use pixelflow_ir::passes::legalize;
+use pixelflow_ir::LatticeShape;
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
-/// The piece table both folds read has this many columns per piece
+/// The piece table the fold reads has this many columns per piece
 /// (`loop_blinn::PIECE_ROW_COLS`, private to that module).
-const PIECE_ROW_COLS: usize = 22;
+const PIECE_ROW_COLS: usize = 10;
+
+/// The lattice `legalize` wraps the kernel for, held fixed across every
+/// string length: this file measures how node counts scale with the piece
+/// count, not with the canvas, so any shape would do as long as it is the
+/// same one for every row.
+const MEASURE_SHAPE: LatticeShape = LatticeShape::new([64, 64]);
 
 fn reachable(arena: &ExprArena, root: ExprId) -> usize {
     let mut seen = vec![false; arena.len()];
@@ -72,7 +80,14 @@ fn main() {
             / PIECE_ROW_COLS;
         let (linked, linked_root) = kernel.linked_parts();
         let t1 = Instant::now();
-        let (legal, legal_root) = legalize(arena, root).expect("legalize");
+        let collapse = Collapse {
+            domain: Domain {
+                shape: MEASURE_SHAPE,
+                origin: pixelflow_codegen::emit::origin(),
+            },
+            lanes: (pixelflow_codegen::jit_vector_bytes() / 4) as u32,
+        };
+        let (legal, legal_root) = legalize(arena, root, &collapse).expect("legalize");
         let legalize_t = t1.elapsed();
         println!(
             "{n:>5}  {:>12}  {:>9}  {:>9}  {pieces:>6}  {:>15}  {:>19}  {:>11}",

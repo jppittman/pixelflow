@@ -58,12 +58,3 @@ saturation-telemetry = []
 # `pixelflow-compiler`, `pixelflow-codegen`, `pixelflow-runtime`, or
 # `core-term` — pinned by `scripts/check-provenance-journal-scope.sh` in CI.
 provenance-journal = []
-# `PIXELFLOW_SATURATION=on|off`, read in exactly one place
-# (`runtime::saturation_switch`): `off` compiles runtime kernels through the
-# `Identity` path — the legalizing prefix (`LowerDwrt`, `ExpandReduce`) with
-# no saturation — so the raw-versus-optimized delta on a shipped kernel can be
-# measured through the real `Lattice::bake` path. Default OFF; without the
-# feature a *set* variable is a panic, never a silent no-op, so a stray export
-# cannot ship unoptimized kernels. Enabled only by `pixelflow-pipeline`'s
-# `egraph_off_on` harness build (`--features pixelflow-search/saturation-switch`).
-saturation-switch = []

@@ -10,14 +10,12 @@
 //! (tier, stop reason, classes, applications, per-rule firing histogram from
 //! the provenance journal) and what the emitter made of the result (bytes,
 //! spill slots, hoisted values, schedule entries per scope of the collapse
-//! nest, trip-weighted memory ops). The guard analysis is the emitter's own
-//! `PIXELFLOW_GUARD_TELEMETRY` line on stderr; this binary prints a marker
-//! before each compile so a reader can pair the two streams.
+//! nest, trip-weighted memory ops).
 //!
 //! Usage:
 //! ```bash
-//! PIXELFLOW_GUARD_TELEMETRY=1 cargo run --release -p pixelflow-pipeline --bin corpus_gaps -- \
-//!   --dumps <dir>[,<dir>...] --out rows.csv --synthetic-n 24 2> guards.log
+//! cargo run --release -p pixelflow-pipeline --bin corpus_gaps -- \
+//!   --dumps <dir>[,<dir>...] --out rows.csv --synthetic-n 24
 //! ```
 //!
 //! Rows are appended to `--out` as each kernel finishes, so a run that dies
@@ -35,7 +33,7 @@ use pixelflow_ir::arena::{
 };
 use pixelflow_ir::variance::LatticeShape;
 use pixelflow_ir::{ExprArena, ExprId, OpKind};
-use pixelflow_pipeline::collapse_bench::{self, LANES, corpus::Trips};
+use pixelflow_pipeline::collapse_bench::{self, lanes};
 use pixelflow_pipeline::shader_bench::{NAMED_KERNEL_NAMES, SHADERTOY_KERNEL_NAMES, named_kernel};
 use pixelflow_pipeline::training::{bezier_family, sh_family};
 use pixelflow_search::egraph::{
@@ -103,10 +101,6 @@ struct Kernel {
 
 fn main() {
     let args = Args::parse();
-    assert!(
-        std::env::var_os("PIXELFLOW_GUARD_TELEMETRY").is_some(),
-        "run with PIXELFLOW_GUARD_TELEMETRY=1 so the emitter's guard analysis lands on stderr"
-    );
     let mut out = open_out(&args.out);
     let done: HashSet<String> = existing_names(&args.out);
 
@@ -388,7 +382,7 @@ fn synthetic_kernels(n: usize, seed: u64) -> Vec<Kernel> {
     }
     // collapse_cost's synthetic allocation-pressure corpus, at its own extents.
     for k in collapse_bench::corpus::synthetic() {
-        if k.extent[0] < LANES as u32 {
+        if k.extent[0] < lanes() as u32 {
             continue;
         }
         out.push(synth(
@@ -442,7 +436,7 @@ fn existing_names(path: &Path) -> HashSet<String> {
 /// multiset the e-graph's own interning sees. Buffers and uniforms keep
 /// their declarations (identity-equal slots stay one node).
 fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut reachable = vec![false; len];
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -464,7 +458,7 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
         Const(u32),
         Param(u8),
         Buffer(u16),
-        Uniform(u16),
+        Uniform(u64),
         Op(OpKind, Vec<u32>),
         /// A fold's identity is its metadata plus its body — the bits are
         /// the metadata, and two folds sharing them fold the same way.
@@ -483,7 +477,7 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
             assert_ne!(d, u32::MAX, "hash_cons: child after parent");
             d
         };
-        let (key, build): (Key, Build) = match *arena.node(id) {
+        let (key, build): (Key, Build) = match arena.node(id) {
             ExprNode::Var(i) => (Key::Var(i), Box::new(move |a| a.push_var(i))),
             ExprNode::Const(v) => (Key::Const(v.to_bits()), Box::new(move |a| a.push_const(v))),
             ExprNode::Param(i) => (Key::Param(i), Box::new(move |a| a.push_param(i))),
@@ -492,13 +486,6 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
             ExprNode::Ref(k) => panic!(
                 "hash_cons: Ref({k:?}) names a kernel interned in this process; \
                  corpus arenas are self-contained, so expand_refs first"
-            ),
-            // Same reasoning as `Ref`: `on`/`off` name kernels in this
-            // process's `KernelStore` too, and no corpus arena holds a
-            // `Guard` yet (G1: never chosen).
-            ExprNode::Guard { on, off, .. } => panic!(
-                "hash_cons: Guard(on={on:?}, off={off:?}) names kernels interned in this \
-                 process; corpus arenas are self-contained"
             ),
             ExprNode::Write { .. } => {
                 panic!("hash_cons: a Write in a corpus arena — corpus arenas are pre-legalize")
@@ -528,12 +515,8 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
                     Box::new(move |a| a.push_ternary(k, x, y, z)),
                 )
             }
-            ExprNode::Nary(k, start, n) => {
-                let kids: Vec<ExprId> = arena
-                    .nary_children_slice(start, n)
-                    .iter()
-                    .map(|&c| ExprId(m(c, &map)))
-                    .collect();
+            ExprNode::Nary(k, ..) => {
+                let kids: Vec<ExprId> = arena.children(id).map(|c| ExprId(m(c, &map))).collect();
                 let raw: Vec<u32> = kids.iter().map(|c| c.0).collect();
                 (Key::Op(k, raw), Box::new(move |a| a.push_nary(k, &kids)))
             }
@@ -572,7 +555,7 @@ fn median_usize(v: &mut [usize]) -> f64 {
 /// Tree count with multiplicity (a spliced subterm counted once per use)
 /// and the latency-prior tree cost, both saturating.
 fn tree_figures(arena: &ExprArena, root: ExprId, costs: &CostModel) -> (u128, u128) {
-    let len = arena.nodes_raw().len();
+    let len = arena.len();
     let mut memo: Vec<Option<(u128, u128)>> = vec![None; len];
     let mut order = Vec::new();
     let mut stack = vec![root];
@@ -669,7 +652,7 @@ fn census(arena: &ExprArena, root: ExprId) -> Census {
         if k == OpKind::Gather || k == OpKind::RawGather {
             gathers += 1;
         }
-        if let &ExprNode::Ternary(OpKind::Select, m, a, b) = arena.node(id) {
+        if let ExprNode::Ternary(OpKind::If, m, a, b) = arena.node(id) {
             selects.push((m, a, b));
         }
     }
@@ -766,10 +749,9 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
     )
     .expect("fmt");
 
-    // ---- production saturation (runtime.rs: LowerDwrt, ExpandReduce, Saturate::runtime) ----
+    // ---- saturation: LowerDwrt, then Optimizer::production() (runtime.rs lowers after) ----
     let (lowered, lowered_root) = pixelflow_ir::passes::lower_dwrt_owned(&k.arena, k.root)
         .unwrap_or_else(|e| panic!("{}: lower_dwrt failed: {e}", k.name));
-    let (lowered, lowered_root) = pixelflow_ir::passes::expand_reduce_owned(&lowered, lowered_root);
     let node_count = reachable_count(&lowered, lowered_root);
     // Costs are priced on the LOWERED term — what the e-graph is handed —
     // so the input and extracted columns share units (`Dwrt` is expanded
@@ -865,7 +847,6 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
         let r = ordered.splice(&extracted, extracted_root);
         (ordered, r)
     };
-    eprintln!("corpus-gaps emit={}", k.name);
     // `emit::compile` refuses an arena naming the retired Z/W axes
     // (`Var(2)`/`Var(3)`): production has two coordinate axes and uniforms,
     // and a generator that draws from four "variables" builds kernels the
@@ -874,32 +855,37 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
     let emit_result = if emit_arena.retired_axis(emit_root).is_some() {
         Err(None)
     } else {
-        pixelflow_codegen::emit::compile(&emit_arena, emit_root).map_err(Some)
+        pixelflow_codegen::emit::compile(&emit_arena, emit_root, LatticeShape::new(k.extent))
+            .map_err(Some)
     };
     match emit_result {
         Ok(res) => {
-            let t = &res.traffic;
-            let trips = Trips::of(k.extent, LANES as u32);
-            let feats = collapse_bench::features_of(&res, trips);
-            let total =
-                f64::from(t.frame.instructions + t.row.instructions + t.body.instructions).max(1.0);
+            // `feats.frame`/`.row`/`.body` are `collapse_bench::features_of`'s
+            // three-tier scope split (once-per-call / lattice row loop /
+            // everything nested deeper), not raw fields of `res.traffic`
+            // any more — see that function's doc.
+            let feats = collapse_bench::features_of(&res);
+            let total = f64::from(
+                feats.frame.instructions + feats.row.instructions + feats.body.instructions,
+            )
+            .max(1.0);
             write!(
                 row,
                 ",ok,{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{},{},{},{},{},{}",
                 feats.bytes_total,
                 res.spill_count,
                 res.hoisted_values,
-                t.carried,
-                t.frame.instructions,
-                t.row.instructions,
-                t.body.instructions,
-                f64::from(t.frame.instructions) / total,
-                f64::from(t.row.instructions) / total,
-                f64::from(t.body.instructions) / total,
+                feats.carried,
+                feats.frame.instructions,
+                feats.row.instructions,
+                feats.body.instructions,
+                f64::from(feats.frame.instructions) / total,
+                f64::from(feats.row.instructions) / total,
+                f64::from(feats.body.instructions) / total,
                 feats.frame.memory_ops(),
                 feats.row.memory_ops(),
                 feats.body.memory_ops(),
-                t.body.remats,
+                feats.body.remats,
                 feats.dyn_memory_ops,
                 feats.dyn_instructions,
             )

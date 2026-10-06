@@ -909,7 +909,8 @@ fn greedy_trace(egraph: &EGraph, root: EClassId, costs: &CostModel) -> GreedyTra
                     | ENode::Const(_)
                     | ENode::Buffer(_)
                     | ENode::Uniform(_)
-                    | ENode::Param(_) => costs.node_op_cost(node),
+                    | ENode::Param(_)
+                    | ENode::Ref { .. } => costs.node_op_cost(node),
                     ENode::Op { .. } | ENode::Reduce { .. } => {
                         let children = node.children_slice();
                         if children.iter().any(|&c| egraph.find(c) == canonical) {
@@ -1043,11 +1044,14 @@ fn measure(
     time_limit: Duration,
     max_expansions: u64,
 ) -> Measured {
-    // What `optimize_runtime_arena_uncached` hands the e-graph: `ExpandRefs`
-    // and nothing else. Legalization (`LowerDwrt`, `ExpandReduce`) runs
-    // *after* saturation now — it is the fallback for shapes the graph
-    // declined — so lowering here would measure a pipeline that no longer
-    // exists, on an arena an order of magnitude larger than production's.
+    // What `optimize_runtime_arena_uncached` hands the e-graph for a term
+    // with no reference: the arena as written (`expand_refs` is the identity
+    // on it; one that held a reference is measured here whole rather than
+    // unit by unit, as production would optimize it). Legalization
+    // (`LowerDwrt`) runs *after* saturation now — it is the fallback for
+    // shapes the graph declined — so lowering here would measure a pipeline
+    // that no longer exists, on an arena an order of magnitude larger than
+    // production's.
     let (arena, root) = pixelflow_ir::passes::expand_refs_owned(arena, root);
     let node_count = reachable_count(&arena, root);
 

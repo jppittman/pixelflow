@@ -226,35 +226,27 @@ pub const CLASSICAL_CLASSES_PER_INSERTED_CLASS: usize = 8;
 /// more (the shaders, the cell grid, the scene kernels).
 pub const CLASSICAL_CLASS_FLOOR: usize = 5_000;
 
-/// The classical cap's ceiling — **pinned at the floor, which switches the
-/// input-sized cap off.**
+/// The classical cap's ceiling: where the input-sized cap stops growing, at
+/// 6,250 inserted classes. The application budget there is 2,000,000 and the
+/// safety ceiling 3,000 s.
 ///
-/// The rule is calibrated and measured (8 per inserted class, ceiling 50,000:
-/// `docs/results/2026-09-08-class-cap-sweep.md`, −16.7% Σ `dag_cost` on the
-/// 44 DEJaVu glyphs it raises, none dearer) and it is blocked by a rendering
-/// defect it exposes: raising `'8'` off the floor changes which fusion the
-/// extractor picks for its quadratic solver, `disc >= 0` at the waist's
-/// tangency lands on the other side of exact zero, and a half-covered smear
-/// appears along the waist at 13–21 px where FreeType has no ink
-/// (`pixelflow-graphics/tests/freetype_oracle.rs`, the optimized arm — the
-/// `'8'` defect the raw arm's oracle found in 2026-09, back by the route its
-/// own comment predicted). The knife edge is the glyph kernel's
-/// (`quad_tangency_winding.rs`), not the optimizer's, and it has to be fixed
-/// there first. When it is, this constant becomes 50,000 — a 50,000-class
-/// e-graph peaks near 25 MB of live heap on the sweep's glyphs and the
-/// extraction pass's reach sets stay under 2 MB there — and nothing else
-/// changes.
-pub const CLASSICAL_CLASS_CEILING: usize = CLASSICAL_CLASS_FLOOR;
-
-/// What [`CLASSICAL_CLASS_CEILING`] becomes when the `'8'` tangency is fixed:
-/// the ceiling the sweep calibrated the rule under.
-pub const CLASSICAL_CLASS_CEILING_CALIBRATED: usize = 50_000;
+/// The value is the one the rule was calibrated under
+/// (`docs/results/2026-09-08-class-cap-sweep.md`, whose proportional arms
+/// ran with this ceiling; the largest cap they reached was 31,952). From
+/// #1229 until 2026-09-29 it was pinned at the floor, which switched the
+/// rule off, because raising `'8'` flipped its discriminant at the waist's
+/// tangency. Neither that kernel nor the integrals that followed it exist
+/// now: a glyph's coverage is written in closed form and has no
+/// discriminant. Today a glyph inserts 154 classes and keeps the floor, as
+/// does every kernel core-term builds; what the rule raises is a `text` run
+/// of more than a few dozen characters, or a `kernel!` family of more than
+/// a few copies.
+pub const CLASSICAL_CLASS_CEILING: usize = 50_000;
 
 // The saturation loop clamps every cap to `HARD_CLASS_LIMIT`; a ceiling above
 // it would be a cap that silently never applies.
-const _: () = assert!(CLASSICAL_CLASS_CEILING_CALIBRATED <= super::graph::HARD_CLASS_LIMIT);
+const _: () = assert!(CLASSICAL_CLASS_CEILING <= super::graph::HARD_CLASS_LIMIT);
 const _: () = assert!(CLASSICAL_CLASS_FLOOR <= CLASSICAL_CLASS_CEILING);
-const _: () = assert!(CLASSICAL_CLASS_CEILING <= CLASSICAL_CLASS_CEILING_CALIBRATED);
 
 impl SaturationConfig {
     /// A tier from its two free dimensions: the application budget and the
@@ -285,7 +277,7 @@ impl SaturationConfig {
     /// Complex expressions (51+ nodes) at the classical **floor**: the flat
     /// 5,000-class cap. Production sizes classical from the input through
     /// [`Self::classical_for`]; this is what that resolves to for any input
-    /// of at most 500 inserted classes, and what every offline caller that
+    /// of at most 625 inserted classes, and what every offline caller that
     /// names "the classical budget" without an input gets.
     pub fn classical() -> Self {
         Self::tier(100, CLASSICAL_CLASS_FLOOR)
@@ -295,8 +287,7 @@ impl SaturationConfig {
     /// inserts to: [`CLASSICAL_CLASSES_PER_INSERTED_CLASS`] per inserted
     /// class, never below [`Self::classical`]'s floor nor above
     /// [`CLASSICAL_CLASS_CEILING`]. The application budget and the safety
-    /// ceiling scale with it. **Inert while the ceiling is pinned at the
-    /// floor** — see [`CLASSICAL_CLASS_CEILING`] for what blocks it.
+    /// ceiling scale with it.
     ///
     /// Why the inserted class count and not the node count the tier is
     /// keyed on: a `Kernel` built by composition re-expands its shared
@@ -392,7 +383,7 @@ pub fn config_for_input(input: InputSize) -> SaturationConfig {
 /// flat 5,000-class floor. Production goes through [`config_for_input`],
 /// which sizes classical from the inserted class count; this is what an
 /// offline caller that has only a node count gets, and what every tier
-/// resolves to for an input of at most 500 inserted classes.
+/// resolves to for an input of at most 625 inserted classes.
 pub fn config_for_node_count(node_count: usize) -> SaturationConfig {
     config_for_input(InputSize {
         nodes: node_count,
