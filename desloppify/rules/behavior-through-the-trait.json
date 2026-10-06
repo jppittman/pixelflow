@@ -16,5 +16,5 @@
   "skills": [
     "behavioral-contracts"
   ],
-  "prompt": "The lines named are public inherent methods. Flag each one that offers behavior outside the module's traits: a method a trait impl merely forwards to (a second door to the same behavior), or behavior no trait covers. Suggest the trait method it belongs on. Do not flag constructors (`new`, `with_*`, `from_*`, builders) or plain accessors of a data type with no behavior."
+  "prompt": "The lines named are public inherent methods. The module's contract is its traits \u2014 real ones, or for a type with a single implementation, a trait shape documented in the module root's docs (shown as context when this file is not the root). Flag each method that offers behavior outside that contract: a method a trait impl merely forwards to (a second door to the same behavior), behavior no trait or documented shape covers, or a method whose signature differs from the documented shape's. Suggest where it belongs. Do not flag constructors (`new`, `with_*`, `from_*`, builders) or plain accessors of a data type with no behavior."
 }

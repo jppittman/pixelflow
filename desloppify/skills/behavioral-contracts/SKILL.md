@@ -13,7 +13,8 @@ is which.
 The root file — `mod.rs`, or `lib.rs` for the crate — declares everything any
 other module may use, and little else:
 
-- **Traits** that state the module's behavior, each with rustdoc a test could
+- **Traits** that state the module's behavior — the API's *shape* — each with
+  rustdoc a test could
   be written from: what it denotes, its preconditions and postconditions, and
   its guarantees (order, determinism, completeness, memory bounds, what
   happens on bad input). "Handles input", "may", "for example" and "returns
@@ -26,10 +27,41 @@ other module may use, and little else:
   must know that a signature can't say.
 - `mod` declarations (private) and `pub use`. No algorithm bodies.
 
+## A trait is the shape, not necessarily a `trait`
+
+A real `trait` earns its keep when there is more than one implementation (a
+second backend, a scripted fake for tests). With exactly one, keep it simple:
+the concrete type implements its methods directly, and the module root
+documents the shape as a trait in its module docs, so the API still reads at
+a glance:
+
+```rust
+//! # Contract
+//!
+//! ```ignore
+//! /// Implemented by [`TerminalEmulator`].
+//! trait Emulator {
+//!     /// Applies `input`; returns what the caller must do, if anything.
+//!     fn interpret_input(&mut self, input: EmulatorInput) -> Option<EmulatorAction>;
+//!     /// The visible state, for the renderer.
+//!     fn snapshot(&self) -> TerminalSnapshot;
+//! }
+//! ```
+```
+
+The documented shape is the contract with the same standard as a real trait:
+every public method of the type appears in it with the same signature and a
+doc a test could be written from, and nothing public is missing from it.
+Because the compiler does not check it, it drifts unless something does —
+that is what the rules are for. When a second implementation appears, the
+documented trait becomes a real one and nothing else about the module moves.
+
 ## Implementation files expose nothing
 
 Every other file in the module is implementation. Its items are private or
-`pub(super)` — visible to the root, which decides what escapes. A file whose
+`pub(super)` — visible to the root, which decides what escapes — except the
+methods the root's contract declares: the documented shape's methods may be
+`pub` where they are implemented, because the root already lists them. A file whose
 parent is `lib.rs`/`main.rs` that has anything to offer the crate is a module
 with no contract yet: it becomes a directory with a `mod.rs`.
 
