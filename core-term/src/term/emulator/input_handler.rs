@@ -346,6 +346,49 @@ mod tests {
         }
     }
 
+    // Each arm below is the only thing that turns a paste or quit keybinding
+    // into the action the orchestrator acts on, and each returns an `Option`:
+    // weaken one to `None` and the request is dropped in silence -- no panic,
+    // no wrong action, just a key that stopped working. `keys.rs` covers only
+    // the keystroke -> `UserInputAction` half, and the arms are reached from
+    // nowhere else, so without these the whole second half is uncovered.
+
+    #[test]
+    fn it_should_ask_for_the_clipboard_when_it_receives_request_clipboard_paste() {
+        let mut emu = create_test_emu_for_input();
+
+        let result =
+            emu.interpret_input(EmulatorInput::User(UserInputAction::RequestClipboardPaste));
+
+        assert_eq!(
+            result,
+            Some(EmulatorAction::RequestClipboardContent(
+                Selection::Clipboard
+            ))
+        );
+    }
+
+    #[test]
+    fn it_should_ask_for_the_primary_selection_when_it_receives_request_primary_paste() {
+        let mut emu = create_test_emu_for_input();
+
+        let result = emu.interpret_input(EmulatorInput::User(UserInputAction::RequestPrimaryPaste));
+
+        assert_eq!(
+            result,
+            Some(EmulatorAction::RequestClipboardContent(Selection::Primary))
+        );
+    }
+
+    #[test]
+    fn it_should_return_quit_when_it_receives_request_quit() {
+        let mut emu = create_test_emu_for_input();
+
+        let result = emu.interpret_input(EmulatorInput::User(UserInputAction::RequestQuit));
+
+        assert_eq!(result, Some(EmulatorAction::Quit));
+    }
+
     fn enable_mode(emu: &mut TerminalEmulator, mode: crate::term::modes::DecModeConstant) {
         use crate::ansi::commands::CsiCommand;
         emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
