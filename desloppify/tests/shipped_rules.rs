@@ -5,6 +5,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use desloppify::language::Language;
+use desloppify::review::plan;
 use desloppify::rule::Rule;
 use desloppify::skills::Skills;
 use desloppify::snippet::snippets;
@@ -118,4 +119,40 @@ fn file_review_sends_the_whole_file_naming_matched_lines_and_skips_files_without
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn interface_rule_points_at_everything_wider_than_pub_super() {
+    let source = "pub fn a() {}\npub(super) fn b() {}\nfn c() {}\npub(crate) struct S;\n";
+    let found = snippets(&rule("interface-lives-in-mod-rs"), Language::Rust, source).unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(found[0].numbered.starts_with("Review lines 1, 4.\n"));
+}
+
+#[test]
+fn trait_rule_points_at_public_inherent_methods_but_not_trait_impls() {
+    let source = "impl S {\n    pub fn a() {}\n    pub(super) fn b() {}\n}\nimpl T for S {\n    fn c() {}\n}\n";
+    let found = snippets(&rule("behavior-through-the-trait"), Language::Rust, source).unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(found[0].numbered.starts_with("Review lines 2.\n"));
+}
+
+#[test]
+fn module_root_context_attaches_the_mod_rs_to_an_implementation_file() {
+    let dir = std::env::temp_dir().join(format!("desloppify-root-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("mod.rs"), "mod leaf;\n").unwrap();
+    let leaf = dir.join("leaf.rs");
+    std::fs::write(&leaf, "pub fn exposed() {}\n").unwrap();
+
+    let rules = shipped();
+    let calls = plan(&rules, &[leaf]).unwrap();
+    let call = calls
+        .iter()
+        .find(|c| rules[c.rule].id == "interface-lives-in-mod-rs")
+        .unwrap();
+    let root = call.root.as_ref().unwrap();
+    assert_eq!(root.path, dir.join("mod.rs"));
+    assert_eq!(root.text, "mod leaf;\n");
+    std::fs::remove_dir_all(&dir).unwrap();
 }

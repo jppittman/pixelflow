@@ -1,0 +1,20 @@
+{
+  "level": 2,
+  "scope": {
+    "language": "rust",
+    "query": "((impl_item !trait body: (declaration_list (function_item (visibility_modifier) @vis) @target)) (#not-eq? @vis \"pub(super)\"))"
+  },
+  "review": "file",
+  "exclude": [
+    "**/tests/**",
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests.rs",
+    "**/*_tests.rs"
+  ],
+  "context": "module_root",
+  "skills": [
+    "behavioral-contracts"
+  ],
+  "prompt": "The lines named are public inherent methods. Flag each one that offers behavior outside the module's traits: a method a trait impl merely forwards to (a second door to the same behavior), or behavior no trait covers. Suggest the trait method it belongs on. Do not flag constructors (`new`, `with_*`, `from_*`, builders) or plain accessors of a data type with no behavior."
+}

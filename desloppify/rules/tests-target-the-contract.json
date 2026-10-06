@@ -1,0 +1,16 @@
+{
+  "level": 2,
+  "scope": "file",
+  "paths": [
+    "**/tests/**",
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests.rs",
+    "**/*_tests.rs"
+  ],
+  "context": "module_root",
+  "skills": [
+    "behavioral-contracts"
+  ],
+  "prompt": "These are tests. Flag tests that test the implementation instead of the contract: reaching `pub(super)` fields or private helpers, constructing internal state directly instead of driving the trait's inputs, or asserting on intermediate internals rather than the returned effects. Where several tests repeat a check that every implementation of a trait should pass, suggest a generic contract test (`fn contract<T: Trait>(...)`). Do not flag tests of a pure data type's own methods."
+}

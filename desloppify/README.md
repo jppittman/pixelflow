@@ -26,6 +26,7 @@ or any snippet that could not be reviewed.
 | `level` | 1–4: how capable a model the question needs |
 | `scope` | the rule's input: `"file"`; a named part — `"functions"`, `"function_names"`, `"function_bodies"`, `"types"`, `"comments"` — in every language that has it; or `{"language": "rust", "query": "... @target"}` |
 | `review` | `"each"` (default): one call per captured part. `"together"`: all of a file's parts in one call, for questions about consistency across them. `"file"`: the whole file, naming the captured lines, if it has any — for a match that needs its surroundings |
+| `context` | `"module_root"`: each call also sees the root (`mod.rs`/`lib.rs`/`main.rs`) of the reviewed file's module — the contract an implementation file is judged against |
 | `paths`, `exclude` | optional globs over paths relative to where the review runs (`pixelflow-*/**`, `**/tests/**`); no `paths` means every file |
 | `skills` | optional skill names to put ahead of the prompt |
 | `prompt` | what to flag |
@@ -70,9 +71,17 @@ already a CI job or a lint, and stays there.
 | `invariant-in-comment` | 3 | file | CLAUDE.md: denote before you build |
 | `mask-is-not-a-number` | 3 | kernel crates | CLAUDE.md: floating point at the edges |
 | `hardware-instruction-first` | 3 | kernel crates | CLAUDE.md: take what the hardware gives |
+| `interface-lives-in-mod-rs` | 1 | impl files, at anything wider than `pub(super)` | behavioral contracts |
+| `behavior-through-the-trait` | 2 | public inherent methods | behavioral contracts |
+| `tests-target-the-contract` | 2 | test files | behavioral contracts |
+| `mod-rs-is-a-contract` | 3 | `mod.rs`, `lib.rs` | behavioral contracts |
+| `effects-are-returned` | 3 | traits and trait impls | behavioral contracts |
 
-Skills: `style-guide` (STYLE.md distilled) and `pixelflow-architecture`
-(CLAUDE.md's constraints).
+Skills: `style-guide` (STYLE.md distilled), `pixelflow-architecture`
+(CLAUDE.md's constraints) and `behavioral-contracts` (the module shape of
+`core-term`'s `ansi/`, `term/` and PTY troupe: a trait contract in the module
+root, a private implementation behind it, effects returned as data, tests
+against the trait).
 
 ## Rate limiting — `src/rate_limit/`
 

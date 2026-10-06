@@ -18,7 +18,8 @@
 //! anything else. A named part applies to every language that has it; a query
 //! to its own language. `paths` and `exclude` are globs over file paths
 //! relative to where the review runs (`pixelflow-*/**`, `**/tests/**`); a
-//! rule with no `paths` reads every file. `review` says whether each captured part is reviewed
+//! rule with no `paths` reads every file. `"context": "module_root"` also
+//! shows each call the root file of the reviewed file's module. `review` says whether each captured part is reviewed
 //! on its own (`"each"`, the default) or all of a file's are reviewed in one
 //! call (`"together"`) — the way to ask about consistency across them — or
 //! the whole file is reviewed, pointed at the captured lines, if it has any
@@ -94,8 +95,23 @@ struct RuleFile {
     #[serde(default)]
     exclude: Vec<String>,
     #[serde(default)]
+    context: Surroundings,
+    #[serde(default)]
     skills: Vec<String>,
     prompt: String,
+}
+
+/// What a call sees besides the code under review.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Surroundings {
+    /// Nothing else.
+    #[default]
+    None,
+    /// The root file of the module the reviewed file belongs to (its
+    /// `mod.rs`, `lib.rs` or `main.rs`): the contract an implementation file
+    /// is judged against.
+    ModuleRoot,
 }
 
 /// The files a rule reads, by path relative to where the review runs.
@@ -171,6 +187,7 @@ pub struct Rule {
     pub level: ModelLevel,
     pub files: Files,
     pub scope: Scope,
+    pub context: Surroundings,
     /// The skills' text followed by the rule's prompt.
     pub instructions: String,
 }
@@ -225,6 +242,7 @@ impl Rule {
             level: file.level,
             files: Files::new(&file.paths, &file.exclude)?,
             scope,
+            context: file.context,
             instructions,
         })
     }

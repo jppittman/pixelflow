@@ -1,0 +1,25 @@
+{
+  "level": 1,
+  "scope": {
+    "language": "rust",
+    "query": "((_ (visibility_modifier) @vis) @target (#not-eq? @vis \"pub(super)\"))"
+  },
+  "review": "file",
+  "exclude": [
+    "**/*_tests.rs",
+    "**/benches/**",
+    "**/build.rs",
+    "**/examples/**",
+    "**/lib.rs",
+    "**/main.rs",
+    "**/mod.rs",
+    "**/src/bin/**",
+    "**/tests.rs",
+    "**/tests/**"
+  ],
+  "context": "module_root",
+  "skills": [
+    "behavioral-contracts"
+  ],
+  "prompt": "This is an implementation file: the lines named carry a visibility wider than `pub(super)`. Flag each one that lets code outside this module reach past the module root: a `pub`/`pub(crate)` function or trait (it belongs in the module root, as or behind a trait), a `pub mod`, or a `pub` type the module root does not re-export with `pub use`. A `pub` type that the module root re-exports is fine, as are `pub` fields and methods of a `pub(super)` type. If the module root shown is `lib.rs` or `main.rs`, any public item here means this file is a module without a contract and should become a directory with a `mod.rs`; say so once."
+}

@@ -1,0 +1,19 @@
+{
+  "level": 3,
+  "scope": "file",
+  "paths": [
+    "**/mod.rs",
+    "**/lib.rs"
+  ],
+  "exclude": [
+    "**/tests/**",
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests.rs",
+    "**/*_tests.rs"
+  ],
+  "skills": [
+    "behavioral-contracts"
+  ],
+  "prompt": "This is a module root. It should read as the module's contract. Flag: algorithm bodies or logic beyond constructors and trivial delegation (they belong in implementation files); public behavior offered as free functions or inherent methods rather than a trait; traits whose rustdoc does not state what they denote, their preconditions, postconditions and guarantees precisely enough to write a test from (flag vague words: \"handles\", \"may\", \"for example\", \"etc.\", \"if something goes wrong\"); signatures looser than their contract (an `Option`/`Result` whose failure cases the doc doesn't enumerate, `bool` flags, `&mut self` on a query, several entry points where one closed input enum would make the contract total); and a missing module doc where the module has a lifecycle or topology a caller must know. For each, say what the tighter version is."
+}

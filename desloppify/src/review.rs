@@ -1,6 +1,6 @@
 //! A review: every rule over every file it applies to, one agent call per snippet.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -9,7 +9,7 @@ use tokio::task::JoinSet;
 
 use crate::agent::Agent;
 use crate::language::Language;
-use crate::rule::Rule;
+use crate::rule::{Rule, Surroundings};
 use crate::snippet::{Snippet, snippets};
 
 const REVIEWER: &str = "\
@@ -45,6 +45,43 @@ pub struct Call {
     pub rule: usize,
     pub path: PathBuf,
     pub snippet: Snippet,
+    /// The module root, when the rule asks for it and the file has one.
+    pub root: Option<Source>,
+}
+
+pub struct Source {
+    pub path: PathBuf,
+    pub text: String,
+}
+
+/// File names that make a file its directory's module root.
+const ROOT_FILES: [&str; 3] = ["mod.rs", "lib.rs", "main.rs"];
+
+/// The root file of the module `path` belongs to, unless `path` is one.
+fn module_root(path: &Path) -> Result<Option<Source>> {
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| ROOT_FILES.contains(&n))
+    {
+        return Ok(None);
+    }
+    let Some(dir) = path.parent() else {
+        return Ok(None);
+    };
+    // `foo/bar.rs` belongs to `foo/mod.rs`, or to `foo.rs` in the 2018 layout.
+    let candidates = ROOT_FILES
+        .iter()
+        .map(|name| dir.join(name))
+        .chain(std::iter::once(dir.with_extension("rs")));
+    for root in candidates {
+        if root.is_file() {
+            let text = std::fs::read_to_string(&root)
+                .with_context(|| format!("reading {}", root.display()))?;
+            return Ok(Some(Source { path: root, text }));
+        }
+    }
+    Ok(None)
 }
 
 /// Every call a review of `files` under `rules` makes, without making any.
@@ -63,10 +100,21 @@ pub fn plan(rules: &[Rule], files: &[PathBuf]) -> Result<Vec<Call>> {
         {
             let snippets = snippets(rule, language, &source)
                 .with_context(|| format!("parsing {}", path.display()))?;
+            if snippets.is_empty() {
+                continue;
+            }
+            let root = match rule.context {
+                Surroundings::None => None,
+                Surroundings::ModuleRoot => module_root(path)?,
+            };
             calls.extend(snippets.into_iter().map(|snippet| Call {
                 rule: index,
                 path: path.clone(),
                 snippet,
+                root: root.as_ref().map(|r| Source {
+                    path: r.path.clone(),
+                    text: r.text.clone(),
+                }),
             }));
         }
     }
@@ -79,12 +127,20 @@ pub async fn review(agent: Arc<Agent>, rules: Arc<Vec<Rule>>, plan: Vec<Call>) -
         rule: index,
         path,
         snippet,
+        root,
     } in plan
     {
         let (agent, rules) = (agent.clone(), rules.clone());
         calls.spawn(async move {
             let rule = &rules[index];
-            let prompt = format!("File: {}\n\n{}", path.display(), snippet.numbered);
+            let mut prompt = format!("File: {}\n\n{}", path.display(), snippet.numbered);
+            if let Some(root) = &root {
+                prompt.push_str(&format!(
+                    "\nFor context only, not under review — its module root, {}:\n\n{}",
+                    root.path.display(),
+                    root.text
+                ));
+            }
             let preamble = format!("{REVIEWER}\n\n{}", rule.instructions);
             let replies = async { parse(&agent.ask(rule.level, &preamble, &prompt).await?) }
                 .await
