@@ -1523,12 +1523,6 @@ impl<'a> Allocation<'a> {
         self.where_at(v, Point::HEAD.index)
     }
 
-    /// The register a root is carried in across the loops inside its region.
-    #[must_use]
-    pub fn carried(&self, root: ValueId) -> Option<Reg> {
-        self.nest.carried(root)
-    }
-
     /// Where `v` lives at every point of this scope.
     ///
     /// # Panics
@@ -4980,7 +4974,6 @@ mod tests {
             )
             .expect("a test nest fits the frame");
         let carry = alloc
-            .body()
             .carried(c)
             .expect("a register above the floor carries the constant");
         let inside = alloc.scope(Scope::Fold(0));
@@ -5718,7 +5711,7 @@ mod tests {
             let carried = body
                 .roots()
                 .iter()
-                .filter(|r| body.carried(**r).is_some())
+                .filter(|r| alloc.carried(**r).is_some())
                 .count();
             assert_eq!(
                 carried, roots_carried,
@@ -5791,11 +5784,11 @@ mod tests {
             )
             .expect("a test nest fits the frame");
         assert!(
-            alloc.body().carried(read).is_some(),
+            alloc.carried(read).is_some(),
             "fixture assumes NEST_FILE's budget carries a root the fold does read"
         );
         assert_eq!(
-            alloc.body().carried(unused),
+            alloc.carried(unused),
             None,
             "budget is available (the control above proves it), so only the \
              zero-use filter can be refusing this"
@@ -6274,7 +6267,7 @@ mod tests {
             )
             .expect("a test nest fits the frame");
         assert!(
-            alloc.body().carried(root).is_some(),
+            alloc.carried(root).is_some(),
             "fixture assumes NEST_FILE's budget carries the only root"
         );
         let inside = alloc.scope(Scope::Fold(0));

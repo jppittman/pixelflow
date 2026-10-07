@@ -7,10 +7,9 @@
 //!
 //! This module models these entities as first-class domain objects, providing
 //! capability traits for writing ([`StoreTarget`]) and reading ([`SourceOperand`])
-//! across registers and memory, along with a recycling [`StackFrame`] slot allocator.
+//! across registers and memory, along with the [`StackFrame`] slot allocator.
 
 use super::{PtrReg, Reg};
-use alloc::vec::Vec;
 
 /// An aligned slot in the stack frame.
 ///
@@ -212,26 +211,18 @@ impl SourceOperand for Storage {
     }
 }
 
-/// A recycling stack frame slot allocator.
+/// A stack frame slot allocator.
 ///
-/// Manages allocation and deallocation of vector stack slots at a fixed byte stride,
-/// reusing slots that have been released to minimize stack frame size.
+/// Manages allocation of vector stack slots at a fixed byte stride.
 #[derive(Clone, Debug)]
 pub struct StackFrame {
     vector_bytes: u32,
     allocated_bytes: u32,
-    free_pool: Vec<Slot>,
 }
 
 impl StackFrame {
-    /// Create a new stack frame manager for vector slots of `vector_bytes` stride.
-    #[inline]
-    #[must_use]
-    pub const fn new(vector_bytes: u32) -> Self {
-        Self::with_base(vector_bytes, 0)
-    }
-
-    /// The same, but handing out slots from `base` upward instead of from 0.
+    /// A frame for vector slots of `vector_bytes` stride, handing out slots
+    /// from `base` upward.
     ///
     /// A scope that runs to completion before the next one needs its slots can
     /// reuse the same offsets — that is why the two collapse prologues and the
@@ -246,31 +237,20 @@ impl StackFrame {
         Self {
             vector_bytes,
             allocated_bytes: base,
-            free_pool: Vec::new(),
         }
     }
 
-    /// Allocate a slot in the frame, reusing a previously freed slot if available.
+    /// Allocate a slot in the frame.
     pub fn alloc_slot(&mut self) -> Result<Slot, crate::error::CompileError> {
         const MAX_FRAME: u32 = 2 * 1024 * 1024;
-        if let Some(reused) = self.free_pool.pop() {
-            Ok(reused)
-        } else {
-            if self.allocated_bytes > MAX_FRAME - self.vector_bytes {
-                return Err(crate::error::CompileError::BudgetExceeded(
-                    "spill frame overflow: exceeds 2MB stack limit",
-                ));
-            }
-            let offset = self.allocated_bytes;
-            self.allocated_bytes += self.vector_bytes;
-            Ok(Slot::new(offset, self.vector_bytes))
+        if self.allocated_bytes > MAX_FRAME - self.vector_bytes {
+            return Err(crate::error::CompileError::BudgetExceeded(
+                "spill frame overflow: exceeds 2MB stack limit",
+            ));
         }
-    }
-
-    /// Release a slot back to the free pool so it can be reused by a later value.
-    pub fn free_slot(&mut self, slot: Slot) {
-        debug_assert_eq!(slot.bytes(), self.vector_bytes);
-        self.free_pool.push(slot);
+        let offset = self.allocated_bytes;
+        self.allocated_bytes += self.vector_bytes;
+        Ok(Slot::new(offset, self.vector_bytes))
     }
 
     /// Total stack frame size in bytes, aligned to 16 bytes per standard ABI.
@@ -278,13 +258,6 @@ impl StackFrame {
     #[must_use]
     pub const fn frame_size(&self) -> u32 {
         (self.allocated_bytes + 15) & !15
-    }
-
-    /// The vector stride in bytes.
-    #[inline]
-    #[must_use]
-    pub const fn vector_bytes(&self) -> u32 {
-        self.vector_bytes
     }
 }
 
@@ -349,17 +322,12 @@ mod tests {
     }
 
     #[test]
-    fn stack_frame_allocates_and_reuses_slots() {
-        let mut frame = StackFrame::new(16);
+    fn stack_frame_allocates_slots_at_the_stride() {
+        let mut frame = StackFrame::with_base(16, 0);
         let s0 = frame.alloc_slot().unwrap();
         let s1 = frame.alloc_slot().unwrap();
         assert_eq!(s0.offset(), 0);
         assert_eq!(s1.offset(), 16);
-        assert_eq!(frame.frame_size(), 32);
-
-        frame.free_slot(s0);
-        let s2 = frame.alloc_slot().unwrap();
-        assert_eq!(s2.offset(), 0);
         assert_eq!(frame.frame_size(), 32);
     }
 }
