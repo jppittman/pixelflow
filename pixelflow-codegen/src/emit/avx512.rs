@@ -698,10 +698,6 @@ pub fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
     assemble(code, [Evex::m0f38_66(0xB8).rrr(dst.0, a.0, b.0)]);
 }
 
-/// Bitwise helpers exposed for completeness / future mask emulation.
-pub fn emit_and(code: &mut Vec<u8>, dst: Reg, s1: Reg, s2: Reg) {
-    vandps(code, dst.0, s1.0, s2.0);
-}
 // =============================================================================
 // Bound-memory gather (RawGather lowering target)
 //
@@ -791,22 +787,6 @@ mod tests {
     //! real `zmm` kernels and execute them on the host (all 16 lanes), so a bad
     //! byte fails loudly. Runtime tests require `+avx512f`.
     #![allow(clippy::needless_range_loop)]
-    use super::*;
-
-    #[test]
-    fn emit_and_emits_the_same_bytes_as_vandps() {
-        // `emit_and` is `pub fn` (bitwise helpers exposed for completeness /
-        // future mask emulation, per its doc comment) but nothing in this
-        // file or the driver calls it — pin it directly against the private
-        // `vandps` it wraps, whose own correctness is already proven by
-        // `emit_unary_negates_and_takes_the_absolute_value_of_every_lane`'s
-        // Abs case.
-        let mut via_and = Vec::new();
-        emit_and(&mut via_and, Reg(3), Reg(1), Reg(2));
-        let mut via_vandps = Vec::new();
-        vandps(&mut via_vandps, 3, 1, 2);
-        assert_eq!(via_and, via_vandps);
-    }
 
     /// Executes the bytes on this host's CPU, so every test first asks
     /// whether it can (`skip_unless_host_runs!`); the encodings themselves
@@ -1319,10 +1299,8 @@ pub(crate) mod driver {
             for r in &plan.reloads {
                 self.reload(code, r);
             }
-            if let Some((dst, src)) = plan.setup_mov
-                && dst != src
-            {
-                AsmProgram::from([Evex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0)]).assemble(code);
+            if let Some((dst, src)) = plan.setup_mov {
+                super::emit_mov(code, dst, src);
             }
             match &plan.op {
                 ResolvedOp::Nop => {}
@@ -1368,13 +1346,9 @@ pub(crate) mod driver {
                     // `r9`-`r11`, so the SIB's no-base encoding is unreachable).
                     let idx_int = crate::emit::declared_temp(plan.scratch.temp(0));
                     let gather_dst = crate::emit::declared_temp(plan.scratch.temp(1));
-                    AsmProgram::from([
-                        Evex::m0f_f3(0x5B).rrr(idx_int.0, UNUSED_VVVV, idx.0),
-                        EncodedInst::from_slice(&[0xB8, 0xFF, 0xFF, 0x00, 0x00]),
-                        EncodedInst::from_slice(&[0xC5, 0xF8, 0x92, 0xC8]),
-                        super::gather(gather_dst, base.0, idx_int),
-                    ])
-                    .assemble(code);
+                    super::emit_cvttps2dq(code, idx_int, *idx);
+                    super::emit_set_gather_mask(code);
+                    super::emit_gather(code, gather_dst, base.0, idx_int);
                     if *dst != gather_dst {
                         AsmProgram::from([Evex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, gather_dst.0)])
                             .assemble(code);
@@ -1453,19 +1427,14 @@ pub(crate) mod driver {
                     if_false,
                 } => {
                     // setup_mov already placed the vector mask in dst; one vpternlogd.
-                    AsmProgram::from([Evex::m0f3a_66(0x25)
-                        .imm(0xCA)
-                        .rrr(dst.0, if_true.0, if_false.0)])
-                    .assemble(code);
+                    super::emit_if(code, *dst, *if_true, *if_false);
                 }
             }
             Ok(())
         }
 
         fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg) {
-            if dst != src {
-                AsmProgram::from([Evex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0)]).assemble(code);
-            }
+            super::emit_mov(code, dst, src);
         }
 
         fn emit_store(

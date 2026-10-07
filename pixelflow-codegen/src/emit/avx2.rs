@@ -25,8 +25,8 @@
 //! AVX-512 tier resets `k1`.
 
 use super::x86_64;
-use super::x86_64::{Disp, Imm32, Mem, NoDisp, frame_slot, ptr};
-use super::{AsmProgram, EncodedInst, Gpr, PtrReg, Reg, SourceOperand, assemble, unimplemented_op};
+use super::x86_64::{Disp, Mem, NoDisp, frame_slot};
+use super::{AsmProgram, EncodedInst, Gpr, PtrReg, Reg, assemble, unimplemented_op};
 use crate::error::CompileError;
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
@@ -201,39 +201,6 @@ impl Vex {
         x86_64::vsib4_operand_into(&mut inst, reg, base, index);
         inst
     }
-
-    /// `op dst, vvvv, [addr]` — 3-operand VEX.256 with memory operand.
-    #[allow(dead_code)]
-    fn rrm<D: Disp>(self, dst: u8, vvvv: u8, addr: Mem<D>) -> EncodedInst {
-        let mut inst = EncodedInst::new();
-        let rbit = if dst >= 8 { 0x00 } else { 0x80 };
-        let bbit = if addr.base.0 >= 8 { 0x00 } else { 0x20 };
-        inst.push(0xC4);
-        inst.push(rbit | 0x40 | bbit | self.map as u8);
-        inst.push(
-            ((self.w as u8) << 7) | ((!vvvv & 0xF) << 3) | ((self.l256 as u8) << 2) | self.pp as u8,
-        );
-        inst.push(self.opcode);
-        x86_64::mem_operand_into(&mut inst, dst, addr);
-        inst
-    }
-
-    /// Generic 3-operand form: `op dst, vvvv, rm` where `rm` can be a register or stack slot.
-    #[allow(dead_code)]
-    fn rro<S: SourceOperand>(self, dst: u8, vvvv: u8, rm: S) -> Option<EncodedInst> {
-        if let Some(r) = rm.source_reg() {
-            return Some(self.rrr(dst, vvvv, r.0));
-        }
-        let slot = rm.source_slot()?;
-        Some(self.rrm(
-            dst,
-            vvvv,
-            Mem {
-                base: ptr::RSP,
-                disp: Imm32(slot.offset() as i32),
-            },
-        ))
-    }
 }
 
 /// A [`Vex`] instruction carrying its imm8.
@@ -323,12 +290,6 @@ fn cmp_pred(op: OpKind) -> Option<u8> {
         OpKind::Ge => CMP_GE,
         _ => return None,
     })
-}
-
-/// Whether `op` is a comparison handled by [`emit_binary`].
-#[must_use]
-pub fn is_compare(op: OpKind) -> bool {
-    cmp_pred(op).is_some()
 }
 
 // --- rounding (0F3A, 66 prefix, W0; imm8) ---
@@ -693,33 +654,6 @@ mod tests {
     //! Hardware validation, mirroring `avx512.rs`'s runtime test tier: JIT real
     //! `ymm` kernels and execute them on the host.
     use super::*;
-
-    #[test]
-    fn is_compare_is_true_only_for_the_six_ordered_comparison_ops() {
-        for op in [
-            OpKind::Eq,
-            OpKind::Ne,
-            OpKind::Lt,
-            OpKind::Le,
-            OpKind::Gt,
-            OpKind::Ge,
-        ] {
-            assert!(is_compare(op), "{op:?} should be a compare");
-        }
-        for op in [
-            OpKind::Add,
-            OpKind::Sub,
-            OpKind::Mul,
-            OpKind::Div,
-            OpKind::Min,
-            OpKind::Max,
-            OpKind::BitAnd,
-            OpKind::BitOr,
-            OpKind::IAdd,
-        ] {
-            assert!(!is_compare(op), "{op:?} should not be a compare");
-        }
-    }
 
     /// Executes the bytes on this host's CPU, so every test first asks
     /// whether it can (`skip_unless_host_runs!`); the encodings themselves
@@ -1289,10 +1223,8 @@ pub(crate) mod driver {
             for r in &plan.reloads {
                 self.reload(code, r);
             }
-            if let Some((dst, src)) = plan.setup_mov
-                && dst != src
-            {
-                AsmProgram::from([Vex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0)]).assemble(code);
+            if let Some((dst, src)) = plan.setup_mov {
+                super::emit_mov(code, dst, src);
             }
             match &plan.op {
                 ResolvedOp::Nop => {}
@@ -1416,9 +1348,7 @@ pub(crate) mod driver {
         }
 
         fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg) {
-            if dst != src {
-                AsmProgram::from([Vex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0)]).assemble(code);
-            }
+            super::emit_mov(code, dst, src);
         }
 
         fn emit_store(
