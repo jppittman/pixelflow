@@ -949,14 +949,14 @@ pub struct CompileResult {
     /// The executable code.
     pub code: executable::ExecutableCode,
     /// Number of spills performed.
-    pub spill_count: u32,
+    pub spill_count: u64,
     /// Total stack space used for spills (bytes).
     pub spill_bytes: u32,
     /// Register budget that was used.
     pub max_regs: u8,
     /// Values one scope computes for the scopes inside it and parks in a
     /// slot of their own — the loop-invariant code motion, counted.
-    pub hoisted_values: u32,
+    pub hoisted_values: u64,
     /// What was emitted, per scope of the nest — the static half of a cost
     /// model's inputs. Counted, never optimized: see [`traffic`](self::traffic).
     pub traffic: EmitTraffic,
@@ -1071,7 +1071,7 @@ trait IsaBackend {
     /// Bracket one scope's emission, for a decorator that attributes what is
     /// emitted to the scope it runs in. Defaults do nothing.
     fn scope_begin(&mut self) {}
-    fn scope_end(&mut self, _scope: regalloc::Scope, _bytes: u32) {}
+    fn scope_end(&mut self, _scope: regalloc::Scope, _bytes: u64) {}
 
     // -------------------------------------------------------------------------
     // A surviving `Reduce`'s own loop: the seed, the trip test, the
@@ -1993,7 +1993,7 @@ fn emit_scope<B: IsaBackend>(
     };
 
     let code = asm.finish();
-    backend.scope_end(allocation.scope(), code.len() as u32);
+    backend.scope_end(allocation.scope(), code.len() as u64);
     Ok((code, result_reg))
 }
 
@@ -2398,9 +2398,9 @@ fn compile_via_backend<B: IsaBackend>(
     counting.emit_ret(&mut asm.code);
     let ret_end = asm.code.len();
     counting.finish(&mut asm);
-    let trailing = (asm.code.len() - ret_end) as u32;
+    let trailing = (asm.code.len() - ret_end) as u64;
     let code = asm.finish();
-    let scaffold = counting.take(code.len() as u32 - body.len() as u32 - trailing);
+    let scaffold = counting.take(code.len() as u64 - body.len() as u64 - trailing);
     let scopes = counting.scopes();
 
     // How many times one call runs each scope: the body once, a fold its
@@ -2432,14 +2432,14 @@ fn compile_via_backend<B: IsaBackend>(
     let carried = nest
         .parks()
         .filter(|root| nest.carried(*root).is_some())
-        .count() as u32;
+        .count() as u64;
     let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
     Ok(CompileResult {
         code: exec,
         spill_count: nest.body().spill_slots(),
         spill_bytes: nest.spill_bytes(),
         max_regs: file.scratch.len(),
-        hoisted_values: nest.parks().count() as u32,
+        hoisted_values: nest.parks().count() as u64,
         traffic: EmitTraffic {
             scopes: EmitTraffic::by_index(scopes, trips.len()),
             trips,
@@ -6877,7 +6877,7 @@ mod tests {
                 self.inner.scope_begin();
             }
 
-            fn scope_end(&mut self, scope: regalloc::Scope, bytes: u32) {
+            fn scope_end(&mut self, scope: regalloc::Scope, bytes: u64) {
                 let offsets = self.open.pop().expect("scope_end without a scope_begin");
                 self.closed.push((scope, offsets));
                 self.inner.scope_end(scope, bytes);

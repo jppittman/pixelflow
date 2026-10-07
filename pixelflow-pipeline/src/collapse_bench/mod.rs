@@ -307,15 +307,15 @@ pub fn features_of(result: &CompileResult) -> StaticFeatures {
     };
     let outer_loop = t.scopes.get(1).copied().unwrap_or_default();
     let inner_loop = sum_scope_traffic(t.scopes.get(2..).unwrap_or(&[]));
-    let dyn_weighted = |pick: fn(&pixelflow_codegen::emit::traffic::ScopeTraffic) -> u32| -> u64 {
+    let dyn_weighted = |pick: fn(&pixelflow_codegen::emit::traffic::ScopeTraffic) -> u64| -> u64 {
         t.scopes
             .iter()
             .zip(&t.trips)
-            .map(|(s, trips)| u64::from(pick(s)) * trips)
+            .map(|(s, trips)| pick(s) * trips)
             .sum()
     };
     StaticFeatures {
-        bytes_total: result.code.len() as u32,
+        bytes_total: result.code.len() as u64,
         frame: scope(&t.body()),
         row: scope(&outer_loop),
         body: scope(&inner_loop),
@@ -634,7 +634,7 @@ mod tests {
             "the body of a kernel that reads X cannot be empty"
         );
         assert!(
-            statics.dyn_memory_ops >= u64::from(statics.body.memory_ops()),
+            statics.dyn_memory_ops >= statics.body.memory_ops(),
             "one body iteration is a lower bound on the call's memory traffic"
         );
     }

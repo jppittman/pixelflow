@@ -1684,8 +1684,8 @@ impl<'a> Allocation<'a> {
     /// slots, plus the parks and fold slots it reads. For the body, which
     /// nothing encloses, exactly the values it spills.
     #[must_use]
-    pub(crate) fn spill_slots(&self) -> u32 {
-        self.code().slots.iter().flatten().count() as u32
+    pub(crate) fn spill_slots(&self) -> u64 {
+        self.code().slots.iter().flatten().count() as u64
     }
 
     /// The park of `v`, if this scope is the one that parks it (`v` is one
@@ -4733,7 +4733,7 @@ mod tests {
                     assert_eq!(body.slot_of(v), None, "{v:?} never leaves a register");
                 }
             }
-            assert_eq!(body.spill_slots(), spilled.len() as u32);
+            assert_eq!(body.spill_slots(), spilled.len() as u64);
             assert_eq!(a.spill_bytes(), spilled.len() as u32 * vector_bytes);
             assert_eq!(a.frame_bytes(), a.spill_bytes(), "no folds, no roots");
         }

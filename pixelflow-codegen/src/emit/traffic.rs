@@ -36,11 +36,11 @@ use alloc::vec::Vec;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScopeTraffic {
     /// Scheduled operations emitted (one per `InstructionPlan`).
-    pub instructions: u32,
+    pub instructions: u64,
     /// Stack loads emitted as part of one instruction's operand resolution:
     /// the value is fetched into a register that instruction reserved, used,
     /// and forgotten.
-    pub loads_transient: u32,
+    pub loads_transient: u64,
     /// Stack loads the driver emits *between* instructions — a range the
     /// allocator chose to bring back into a register the value then keeps, a
     /// scope head's reconciliation, a guard's mask, a fold's slot-held root.
@@ -52,27 +52,27 @@ pub struct ScopeTraffic {
     /// number no longer says what the load bought. The call site does, and it
     /// always did — an `InstructionPlan`'s reloads serve one instruction by
     /// definition.
-    pub loads_kept: u32,
+    pub loads_kept: u64,
     /// Constants brought into a register from the kernel's constant pool (or
     /// an immediate, where the ISA encodes one) rather than from the frame:
     /// a load, but not of a slot this kernel wrote, which is why it is
     /// counted apart from both the loads and the stores.
-    pub remats: u32,
+    pub remats: u64,
     /// Stack stores emitted: spills, parks, a fold's slot-held roots.
-    pub stores: u32,
+    pub stores: u64,
     /// The lattice's own stores — one per `Write`, whatever its width. Not a
     /// spill: the output plane is the kernel's result, not its scratch.
-    pub writes: u32,
+    pub writes: u64,
     /// Bytes of machine code the scope's own instructions occupy, excluding
     /// the scopes nested inside it, so every byte lands in exactly one scope.
-    pub bytes: u32,
+    pub bytes: u64,
 }
 
 impl ScopeTraffic {
     /// Loads plus stores — the quantity #1150's table reports, and the one
     /// the 2026-09-04 measurements found does not predict AVX-512 time.
     #[must_use]
-    pub const fn memory_ops(&self) -> u32 {
+    pub const fn memory_ops(&self) -> u64 {
         self.loads_transient + self.loads_kept + self.stores
     }
 }
@@ -148,14 +148,14 @@ pub struct EmitTraffic {
     /// so this is the one count that can differ between two allocations of a
     /// kernel with no instruction differing, by less than
     /// [`CONST_POOL_ALIGN`](super::CONST_POOL_ALIGN).
-    pub trailing: u32,
+    pub trailing: u64,
     /// Bytes one spilled register occupies: the backend's vector width.
     pub vector_bytes: u32,
     /// Registers the allocator had to hand out.
     pub pool: u8,
     /// Parked roots that hold a register across the scopes inside them
     /// rather than a slot.
-    pub carried: u32,
+    pub carried: u64,
     /// The `If` branches the nest was emitted with.
     pub branches: BranchTraffic,
 }
@@ -182,8 +182,8 @@ impl EmitTraffic {
     /// Every scope's bytes plus the function's own and what trails its return
     /// — the whole of what was emitted, by construction.
     #[must_use]
-    pub fn bytes(&self) -> u32 {
-        self.scopes.iter().map(|s| s.bytes).sum::<u32>() + self.scaffold.bytes + self.trailing
+    pub fn bytes(&self) -> u64 {
+        self.scopes.iter().map(|s| s.bytes).sum::<u64>() + self.scaffold.bytes + self.trailing
     }
 
     /// Memory operations one call executes: each scope's, weighted by how
@@ -197,7 +197,7 @@ impl EmitTraffic {
         self.scopes
             .iter()
             .zip(&self.trips)
-            .map(|(s, trips)| u64::from(s.memory_ops()) * trips)
+            .map(|(s, trips)| s.memory_ops() * trips)
             .sum()
     }
 }
@@ -215,7 +215,7 @@ fn scope_ix(scope: Scope) -> usize {
 #[derive(Default)]
 struct Open {
     traffic: ScopeTraffic,
-    nested_bytes: u32,
+    nested_bytes: u64,
 }
 
 /// An `IsaBackend` that counts what it forwards.
@@ -252,7 +252,7 @@ impl<'a, B: IsaBackend> Counting<'a, B> {
 
     /// The traffic emitted outside every scope since the last `take`, with
     /// those counters reset; `bytes` is the caller's measure of it.
-    pub(super) fn take(&mut self, bytes: u32) -> ScopeTraffic {
+    pub(super) fn take(&mut self, bytes: u64) -> ScopeTraffic {
         debug_assert!(self.open.is_empty(), "take while a scope is open");
         let mut taken = core::mem::take(&mut self.base);
         taken.bytes = bytes;
@@ -386,7 +386,7 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.scope_begin();
     }
 
-    fn scope_end(&mut self, scope: Scope, bytes: u32) {
+    fn scope_end(&mut self, scope: Scope, bytes: u64) {
         let Open {
             mut traffic,
             nested_bytes,
@@ -843,13 +843,13 @@ mod tests {
              the scenario has stopped testing its subject"
         );
         let t = &result.traffic;
-        let stores: u32 = t.scopes.iter().map(|s| s.stores).sum();
-        let loads: u32 = t
+        let stores: u64 = t.scopes.iter().map(|s| s.stores).sum();
+        let loads: u64 = t
             .scopes
             .iter()
             .map(|s| s.loads_transient + s.loads_kept)
             .sum();
-        let instructions: u32 = t.scopes.iter().map(|s| s.instructions).sum();
+        let instructions: u64 = t.scopes.iter().map(|s| s.instructions).sum();
         assert!(
             stores > 0,
             "values reached a frame slot with no store counted: {t:?}"
@@ -872,7 +872,7 @@ mod tests {
             .scopes
             .iter()
             .zip(&t.trips)
-            .map(|(s, trips)| u64::from(s.writes) * trips)
+            .map(|(s, trips)| s.writes * trips)
             .sum();
         let lanes = crate::isa::jit_vector_bytes() as u64 / 4;
         let [width, rows] = SHAPE.extent().map(u64::from);
@@ -926,7 +926,7 @@ mod tests {
                 "{name}: the scaffold changed with the register budget"
             );
             assert!(
-                t.trailing.abs_diff(l.trailing) < CONST_POOL_ALIGN as u32,
+                t.trailing.abs_diff(l.trailing) < CONST_POOL_ALIGN as u64,
                 "{name}: what trails the return changed with the register budget by more \
                  than the pool's alignment: {} vs {} bytes",
                 t.trailing,

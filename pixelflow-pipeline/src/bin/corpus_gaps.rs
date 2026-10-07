@@ -865,10 +865,10 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
             // everything nested deeper), not raw fields of `res.traffic`
             // any more — see that function's doc.
             let feats = collapse_bench::features_of(&res);
-            let total = f64::from(
-                feats.frame.instructions + feats.row.instructions + feats.body.instructions,
-            )
-            .max(1.0);
+            let total = ((feats.frame.instructions
+                + feats.row.instructions
+                + feats.body.instructions) as f64)
+                .max(1.0);
             write!(
                 row,
                 ",ok,{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{},{},{},{},{},{}",
@@ -879,9 +879,9 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
                 feats.frame.instructions,
                 feats.row.instructions,
                 feats.body.instructions,
-                f64::from(feats.frame.instructions) / total,
-                f64::from(feats.row.instructions) / total,
-                f64::from(feats.body.instructions) / total,
+                feats.frame.instructions as f64 / total,
+                feats.row.instructions as f64 / total,
+                feats.body.instructions as f64 / total,
                 feats.frame.memory_ops(),
                 feats.row.memory_ops(),
                 feats.body.memory_ops(),

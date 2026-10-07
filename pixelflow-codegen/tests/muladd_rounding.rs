@@ -242,7 +242,7 @@ fn a_spilled_muladd_rounds_twice_on_every_target() {
     let result = EmitCtx::with_max_regs(1)
         .compile(&a, root, pixelflow_ir::LatticeShape::POINT)
         .expect("compile spilled MulAdd");
-    let stores: u32 = result.traffic.scopes.iter().map(|s| s.stores).sum();
+    let stores: u64 = result.traffic.scopes.iter().map(|s| s.stores).sum();
     assert!(stores > 0, "scenario failed to create register pressure");
     let jit = CompiledKernel::new(
         result.code,
