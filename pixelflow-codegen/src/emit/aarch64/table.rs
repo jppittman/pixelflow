@@ -580,13 +580,6 @@ impl From<PtrReg> for StrReg {
     }
 }
 
-impl From<Gpr> for StrReg {
-    #[inline(always)]
-    fn from(g: Gpr) -> Self {
-        StrReg::X(PtrReg(g.0))
-    }
-}
-
 /// Store register: `STR src, [addr]`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Str {

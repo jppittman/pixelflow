@@ -3,7 +3,7 @@
 //! Each function emits raw machine code bytes for one instruction (or a small fixed sequence).
 //! These are the "atoms" that compound operations are built from.
 
-use super::{AsmInsn, AsmProgram, Gpr, Label, LabelRef, PtrReg, Reg, assemble, unimplemented_op};
+use super::{AsmInsn, AsmProgram, Gpr, Label, LabelRef, PtrReg, Reg, unimplemented_op};
 use crate::error::CompileError;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -351,12 +351,6 @@ impl crate::emit::AsmInsn for Inst {
 // =============================================================================
 // Load / Store
 // =============================================================================
-
-/// `dup v<dst>.4s, v<src>.s[0]` — broadcast lane 0 to every lane.
-#[inline]
-pub fn emit_dup_lane0(code: &mut Vec<u8>, dst: Reg, src: Reg) {
-    assemble(code, [DupLane0::new(dst, src)]);
-}
 
 /// `dst = splat(base[offset])`: `ldr s<dst>, [base, #offset*4]` reads the
 /// value and `dup` spreads it. `base` is the block's address, wherever the
@@ -948,8 +942,6 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
         return format!("mov x{}, x{}", rd, rm);
     }
 
-    let top11 = word >> 21;
-
     if word & 0xFFE0FC00 == 0x4EA01C00 {
         if rn == rm {
             return format!("mov v{}.16b, v{}.16b", rd, rn);
@@ -1196,7 +1188,6 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
         return format!("subs x{}, x{}, x{}", rd, rn, rm);
     }
 
-    let _ = top11; // suppress unused warning
     "unknown".into()
 }
 
@@ -1397,7 +1388,7 @@ mod tests {
     #[test]
     fn disassemble_ret() {
         let mut code = Vec::new();
-        ret(&mut code);
+        AsmProgram::from([Inst::Ret]).assemble(&mut code);
         let dis = disassemble_code(&code);
         assert!(
             dis.contains("ret"),
@@ -2493,24 +2484,6 @@ pub mod xr {
 
 pub use table::Imm12;
 
-/// `movz dst, #imm16` — also how `mov dst, xzr` is spelled, as `movz dst, #0`.
-#[inline(always)]
-pub fn movz(code: &mut Vec<u8>, dst: impl Into<Gpr>, imm: u16) {
-    let dst = dst.into();
-    emit32(code, 0xD280_0000 | ((imm as u32) << 5) | dst.0 as u32);
-}
-
-/// `cmp lhs, rhs` — `subs xzr, lhs, rhs`, setting the flags [`b_hs`] reads.
-#[inline(always)]
-pub fn cmp(code: &mut Vec<u8>, lhs: impl Into<Gpr>, rhs: impl Into<Gpr>) {
-    let lhs = lhs.into();
-    let rhs = rhs.into();
-    emit32(
-        code,
-        0xEB00_0000 | ((rhs.0 as u32) << 16) | ((lhs.0 as u32) << 5) | 31,
-    );
-}
-
 /// What an [`add`] can add: another register, a pointer register, or a 12-bit immediate.
 ///
 /// As on x86, the operand's *type* selects the encoding, so the mnemonic stays
@@ -2545,23 +2518,6 @@ impl AddOperand for Imm12 {
 #[inline(always)]
 pub fn add(code: &mut Vec<u8>, dst: impl Into<Gpr>, src: impl Into<Gpr>, operand: impl AddOperand) {
     operand.add_into(code, dst.into(), src.into());
-}
-
-/// `mvn w<dst>, w<src>` — bitwise NOT of a 32-bit general register.
-///
-/// `ORN Wd, WZR, Wm`; the guard path uses it to turn "all lanes set" into
-/// zero so the branch on W16 that follows ([`BranchIfW16Zero`]) tests it.
-#[inline(always)]
-pub fn mvn_w(code: &mut Vec<u8>, dst: impl Into<Gpr>, src: impl Into<Gpr>) {
-    let dst = dst.into();
-    let src = src.into();
-    emit32(code, 0x2A20_03E0 | ((src.0 as u32) << 16) | dst.0 as u32);
-}
-
-/// `ret`
-#[inline(always)]
-pub fn ret(code: &mut Vec<u8>) {
-    emit32(code, 0xD65F_03C0);
 }
 
 // =============================================================================
@@ -2698,97 +2654,7 @@ pub struct BCond {
 }
 
 impl BCond {
-    /// One constructor per mnemonic, so a call site reads like the assembly it
-    /// is: `BCond::hs(exit)` for `b.hs exit`.
-    ///
-    /// Sugar over the one encoder, not sixteen types: `B.cond` is a single
-    /// instruction whose low nibble is [`Cond`].
-    #[must_use]
-    #[inline(always)]
-    pub const fn eq(target: Label) -> Self {
-        Self::on(Cond::Eq, target)
-    }
-    /// `b.ne`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn ne(target: Label) -> Self {
-        Self::on(Cond::Ne, target)
-    }
-    /// `b.hs` / `b.cs` — unsigned `>=`, and after `FCMP` also "or unordered".
-    #[must_use]
-    #[inline(always)]
-    pub const fn hs(target: Label) -> Self {
-        Self::on(Cond::Hs, target)
-    }
-    /// `b.lo` / `b.cc` — unsigned `<`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn lo(target: Label) -> Self {
-        Self::on(Cond::Lo, target)
-    }
-    /// `b.hi` — unsigned `>`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn hi(target: Label) -> Self {
-        Self::on(Cond::Hi, target)
-    }
-    /// `b.ls` — unsigned `<=`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn ls(target: Label) -> Self {
-        Self::on(Cond::Ls, target)
-    }
-    /// `b.ge` — signed `>=`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn ge(target: Label) -> Self {
-        Self::on(Cond::Ge, target)
-    }
-    /// `b.lt` — signed `<`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn lt(target: Label) -> Self {
-        Self::on(Cond::Lt, target)
-    }
-    /// `b.gt` — signed `>`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn gt(target: Label) -> Self {
-        Self::on(Cond::Gt, target)
-    }
-    /// `b.le` — signed `<=`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn le(target: Label) -> Self {
-        Self::on(Cond::Le, target)
-    }
-    /// `b.mi` — negative.
-    #[must_use]
-    #[inline(always)]
-    pub const fn mi(target: Label) -> Self {
-        Self::on(Cond::Mi, target)
-    }
-    /// `b.pl` — non-negative.
-    #[must_use]
-    #[inline(always)]
-    pub const fn pl(target: Label) -> Self {
-        Self::on(Cond::Pl, target)
-    }
-    /// `b.vs` — overflow set.
-    #[must_use]
-    #[inline(always)]
-    pub const fn vs(target: Label) -> Self {
-        Self::on(Cond::Vs, target)
-    }
-    /// `b.vc` — overflow clear.
-    #[must_use]
-    #[inline(always)]
-    pub const fn vc(target: Label) -> Self {
-        Self::on(Cond::Vc, target)
-    }
-
-    /// The branch on a condition chosen at run time, where no single mnemonic
-    /// names it.
+    /// The branch on a condition chosen at run time.
     #[must_use]
     #[inline(always)]
     pub const fn on(condition: Cond, target: Label) -> Self {
@@ -2939,7 +2805,7 @@ mod label_tests {
     fn a_conditional_writes_imm19_and_keeps_its_condition() {
         let exit = Label::new("end");
         let code = assemble([
-            Item::Inst(BCond::hs(exit).into()),
+            Item::Inst(BCond::on(Cond::Hs, exit).into()),
             Item::Inst(NOP),
             Item::Label(exit),
         ]);
@@ -3140,11 +3006,23 @@ mod xr_tests {
     #[test]
     fn encodings_match_the_manual() {
         // MOVZ Xd, #imm16 — `mov xN, xzr` is `movz xN, #0`.
-        assert_eq!(word(|c| movz(c, X6, 0)), 0xD280_0006);
-        assert_eq!(word(|c| movz(c, X5, 0)), 0xD280_0005);
+        assert_eq!(
+            word(|c| AsmProgram::from([table::Movz::new(X6, 0)]).assemble(c)),
+            0xD280_0006
+        );
+        assert_eq!(
+            word(|c| AsmProgram::from([table::Movz::new(X5, 0)]).assemble(c)),
+            0xD280_0005
+        );
         // SUBS XZR, Xn, Xm
-        assert_eq!(word(|c| cmp(c, X6, X3)), 0xEB03_00DF);
-        assert_eq!(word(|c| cmp(c, X5, X2)), 0xEB02_00BF);
+        assert_eq!(
+            word(|c| AsmProgram::from([table::CmpI64::new(X6, X3)]).assemble(c)),
+            0xEB03_00DF
+        );
+        assert_eq!(
+            word(|c| AsmProgram::from([table::CmpI64::new(X5, X2)]).assemble(c)),
+            0xEB02_00BF
+        );
         // ADD Xd, Xn, #imm12
         assert_eq!(word(|c| add(c, X1, X1, Imm12(16))), 0x9100_4021);
         assert_eq!(word(|c| add(c, X5, X5, Imm12(1))), 0x9100_04A5);
@@ -3164,7 +3042,10 @@ mod xr_tests {
             0x3D80_0020
         );
         // RET
-        assert_eq!(word(ret), 0xD65F_03C0);
+        assert_eq!(
+            word(|c| AsmProgram::from([Inst::Ret]).assemble(c)),
+            0xD65F_03C0
+        );
     }
 
     /// The immediate and register forms of `add` are different instructions
