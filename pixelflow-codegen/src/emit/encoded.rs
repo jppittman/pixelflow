@@ -95,12 +95,6 @@ impl EncodedInst {
     pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
-
-    /// Append this instruction's bytes directly to a code buffer.
-    #[inline]
-    pub fn emit(&self, code: &mut Vec<u8>) {
-        code.extend_from_slice(self.as_bytes());
-    }
 }
 
 impl Deref for EncodedInst {
