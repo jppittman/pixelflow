@@ -508,16 +508,6 @@ impl Loc {
             Loc::Slot(s) => panic!("expected register, got stack slot {}", s.offset()),
         }
     }
-
-    /// Physical storage location.
-    #[must_use]
-    pub fn storage(self) -> Storage {
-        match self {
-            Loc::Reg(r) => Storage::Reg(r),
-            Loc::Ptr(p) => Storage::Ptr(p),
-            Loc::Slot(s) => Storage::Slot(s),
-        }
-    }
 }
 
 impl From<Reg> for Loc {
@@ -537,7 +527,11 @@ impl From<Slot> for Loc {
 impl StoreTarget for Loc {
     #[inline]
     fn target_storage(self) -> Storage {
-        self.storage()
+        match self {
+            Loc::Reg(r) => Storage::Reg(r),
+            Loc::Ptr(p) => Storage::Ptr(p),
+            Loc::Slot(s) => Storage::Slot(s),
+        }
     }
     #[inline]
     fn target_reg(self) -> Option<Reg> {
@@ -558,7 +552,7 @@ impl StoreTarget for Loc {
 impl SourceOperand for Loc {
     #[inline]
     fn source_storage(self) -> Option<Storage> {
-        Some(self.storage())
+        Some(self.target_storage())
     }
     #[inline]
     fn source_reg(self) -> Option<Reg> {
@@ -604,30 +598,6 @@ impl Binding {
             Binding::Remat(bits) => panic!("expected register, got rematerialized {bits:#x}"),
         }
     }
-
-    /// Physical storage location if not rematerialized.
-    #[must_use]
-    pub fn as_loc(self) -> Option<Loc> {
-        match self {
-            Binding::Loc(loc) => Some(loc),
-            Binding::Remat(_) => None,
-        }
-    }
-
-    /// Physical storage as the canonical enum, if not rematerialized.
-    #[must_use]
-    pub fn as_storage(self) -> Option<Storage> {
-        self.as_loc().map(|l| l.storage())
-    }
-
-    /// Stack slot if spilled to stack.
-    #[must_use]
-    pub fn as_slot(self) -> Option<Slot> {
-        match self {
-            Binding::Loc(Loc::Slot(s)) => Some(s),
-            _ => None,
-        }
-    }
 }
 
 impl From<Loc> for Binding {
@@ -654,7 +624,10 @@ impl From<Slot> for Binding {
 impl SourceOperand for Binding {
     #[inline]
     fn source_storage(self) -> Option<Storage> {
-        self.as_storage()
+        match self {
+            Binding::Loc(loc) => Some(loc.target_storage()),
+            Binding::Remat(_) => None,
+        }
     }
 
     #[inline]
@@ -1331,7 +1304,6 @@ fn emit_scope<B: IsaBackend>(
     allocation: regalloc::Allocation<'_>,
     backend: &mut B,
 ) -> Result<(Vec<u8>, Option<Reg>), CompileError> {
-    let file = backend.register_file();
     backend.scope_begin();
     // Allocation happened before this call — once per scope, over the whole
     // nest, its frame included. The allocator chooses the evaluation order,
@@ -1361,10 +1333,9 @@ fn emit_scope<B: IsaBackend>(
         let at_binder = match opened.fold_roots().binder {
             regalloc::Where::Reg(r) => Binding::from(r),
             regalloc::Where::Ptr(_) => unreachable!("a fold's binder is a vector"),
-            regalloc::Where::Spilled | regalloc::Where::Remat(_) => Binding::from(Slot::new(
-                allocation.binder_slot(def.value),
-                file.vector_bytes,
-            )),
+            regalloc::Where::Spilled | regalloc::Where::Remat(_) => {
+                Binding::from(Slot::new(allocation.binder_slot(def.value)))
+            }
         };
         if !enclosing.iter().any(|(b, _)| *b == binder) {
             enclosing.push((binder, at_binder));
@@ -2098,17 +2069,11 @@ pub fn resolve_operands(
     let mut reloads = Vec::new();
     let mut setup_mov = None;
 
-    let loc_of = |v: regalloc::ValueId| -> Binding {
-        locs.get(v.0 as usize)
-            .copied()
-            .flatten()
-            .unwrap_or_else(|| panic!("{v:?} has no binding"))
-    };
     // The address an instruction reads, in a pointer register: where the
     // allocator keeps it, or reloaded from its slot into the one pointer
     // register it reserved for this instruction. Never a constant.
     let base_of = |v: regalloc::ValueId, reloads: &mut Vec<Reload>| -> PtrReg {
-        match loc_of(v) {
+        match location_of(locs, v) {
             Binding::Loc(Loc::Ptr(p)) => p,
             Binding::Loc(Loc::Slot(slot)) => {
                 let target = scratch.ptr_reload.unwrap_or_else(|| {
@@ -2125,7 +2090,8 @@ pub fn resolve_operands(
     };
     // "Not in a register" — a rematerialized value needs a reload target just
     // as a spilled one does, so both answer false here.
-    let in_register = |v: &regalloc::ValueId| matches!(loc_of(*v), Binding::Loc(Loc::Reg(_)));
+    let in_register =
+        |v: &regalloc::ValueId| matches!(location_of(locs, *v), Binding::Loc(Loc::Reg(_)));
 
     // Where each operand comes from, and so which register each reload lands
     // in. The same call the allocator made when it decided how many to
@@ -2153,7 +2119,7 @@ pub fn resolve_operands(
     };
 
     let resolve = |v: regalloc::ValueId, target: Reg, reloads: &mut Vec<Reload>| -> Reg {
-        match loc_of(v) {
+        match location_of(locs, v) {
             Binding::Loc(Loc::Reg(reg)) => reg,
             Binding::Remat(bits) => {
                 reloads.push(Reload::Const {
@@ -2175,7 +2141,7 @@ pub fn resolve_operands(
     // [`operand_sources`] reserved for it.
     let operand = |k: usize, v: regalloc::ValueId, reloads: &mut Vec<Reload>| -> Reg {
         match sources[k] {
-            OperandSource::Resident => loc_of(v).reg(),
+            OperandSource::Resident => location_of(locs, v).reg(),
             OperandSource::Destination | OperandSource::Reload(_) => {
                 resolve(v, target_for(k), reloads)
             }
@@ -2268,7 +2234,7 @@ pub fn resolve_operands(
                         // depends on `b` having been consumed by then.
                         let a_reg = operand(0, *a, &mut reloads);
                         let b_reg = operand(1, *b, &mut reloads);
-                        let (c_reg, c_deferred) = match loc_of(*c) {
+                        let (c_reg, c_deferred) = match location_of(locs, *c) {
                             Binding::Loc(Loc::Reg(reg)) => (reg, None),
                             Binding::Remat(bits) => {
                                 (target_for(2), Some(DeferredReload::Const(bits)))
@@ -3564,7 +3530,7 @@ mod tests {
                 };
                 assert_eq!(
                     view.slot_of(def.value),
-                    Some(Slot::new(park, file.vector_bytes)),
+                    Some(Slot::new(park)),
                     "Fold({j}) addresses {:?} somewhere other than its park",
                     def.value
                 );
@@ -3656,7 +3622,7 @@ mod tests {
             locs[v as usize] = Some(Binding::Loc(Loc::Reg(Reg(r))));
         }
         for &(v, off) in spilled {
-            locs[v as usize] = Some(Binding::Loc(Loc::Slot(Slot::new(off, 16))));
+            locs[v as usize] = Some(Binding::Loc(Loc::Slot(Slot::new(off))));
         }
         locs
     }
@@ -3699,7 +3665,7 @@ mod tests {
             plan.reloads[0],
             Reload::FromStack {
                 target: Reg(6),
-                slot: Slot::new(0, 16),
+                slot: Slot::new(0),
             }
         );
         assert_eq!(
@@ -3727,14 +3693,14 @@ mod tests {
             plan.reloads[0],
             Reload::FromStack {
                 target: Reg(6),
-                slot: Slot::new(0, 16),
+                slot: Slot::new(0),
             }
         );
         assert_eq!(
             plan.reloads[1],
             Reload::FromStack {
                 target: RELOAD[0],
-                slot: Slot::new(16, 16),
+                slot: Slot::new(16),
             }
         );
         assert_eq!(
@@ -3763,7 +3729,7 @@ mod tests {
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
         drop(resolve_operands(
             &op,
-            Loc::Slot(Slot::new(32, 16)).into(),
+            Loc::Slot(Slot::new(32)).into(),
             locs.as_slice(),
             TEST_SCRATCH,
         ));
@@ -3835,14 +3801,14 @@ mod tests {
             plan.reloads[0],
             Reload::FromStack {
                 target: Reg(8),
-                slot: Slot::new(0, 16),
+                slot: Slot::new(0),
             }
         );
         assert_eq!(
             plan.reloads[1],
             Reload::FromStack {
                 target: RELOAD[0],
-                slot: Slot::new(16, 16),
+                slot: Slot::new(16),
             }
         );
         // c is in a register, no deferred reload needed
@@ -3882,10 +3848,7 @@ mod tests {
         match &plan.op {
             ResolvedOp::DecomposedMulAdd { c, c_deferred, .. } => {
                 assert_eq!(*c, RELOAD[1]); // its own reservation, deferred past the FMUL
-                assert_eq!(
-                    *c_deferred,
-                    Some(DeferredReload::FromStack(Slot::new(32, 16)))
-                );
+                assert_eq!(*c_deferred, Some(DeferredReload::FromStack(Slot::new(32))));
             }
             other => panic!("expected DecomposedMulAdd, got {:?}", other),
         }
@@ -4645,7 +4608,7 @@ mod tests {
                 .find(|d| matches!(d.op, ScheduledOp::Unary(OpKind::Abs, _)))
                 .map(|d| d.value)
                 .expect("|X·Y| is in the schedule");
-            let arm = guard.true_range();
+            let arm = guard.range(IfArm::True);
             SplitFixture {
                 arena: a,
                 root,
@@ -6202,7 +6165,7 @@ mod tests {
                 ("c in a register", None),
                 (
                     "c reloaded from the stack",
-                    Some(DeferredReload::FromStack(Slot::new(32, 16))),
+                    Some(DeferredReload::FromStack(Slot::new(32))),
                 ),
                 (
                     "c rematerialized",
@@ -6425,7 +6388,7 @@ mod tests {
                 // tail rather than by a per-backend length.
                 let (mul, add) = undeferred.split_at(undeferred.len() - tail_len(name));
                 for deferred in [
-                    DeferredReload::FromStack(Slot::new(32, 16)),
+                    DeferredReload::FromStack(Slot::new(32)),
                     DeferredReload::Const(1.0f32.to_bits()),
                 ] {
                     let got = encode(backend, decomposed(Some(deferred.clone())));

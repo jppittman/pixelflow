@@ -628,7 +628,7 @@ mod tests {
             reloads: vec![
                 Reload::FromStack {
                     target: Reg(0),
-                    slot: Slot::new(0, 16),
+                    slot: Slot::new(0),
                 },
                 Reload::Const {
                     target: Reg(1),
@@ -662,7 +662,7 @@ mod tests {
         let mut backend = RecordingBackend::new();
         let mut counting = Counting::new(&mut backend);
         let mut code = Vec::new();
-        let locs = [Some(Binding::Loc(Loc::Slot(Slot::new(0, 16))))];
+        let locs = [Some(Binding::Loc(Loc::Slot(Slot::new(0))))];
 
         counting.emit_resolve(&mut code, regalloc::ValueId(0), Reg(0), &locs);
         let traffic = counting.take(0);

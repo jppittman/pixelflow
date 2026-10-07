@@ -580,13 +580,6 @@ impl From<PtrReg> for StrReg {
     }
 }
 
-impl From<Gpr> for StrReg {
-    #[inline(always)]
-    fn from(g: Gpr) -> Self {
-        StrReg::X(PtrReg(g.0))
-    }
-}
-
 /// Store register: `STR src, [addr]`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Str {
@@ -599,15 +592,6 @@ impl Str {
     #[inline]
     pub const fn new_raw(src: StrReg, addr: Mem) -> Self {
         Self { src, addr }
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn new(src: impl Into<StrReg>, addr: Mem) -> Self {
-        Self {
-            src: src.into(),
-            addr,
-        }
     }
 
     #[must_use]

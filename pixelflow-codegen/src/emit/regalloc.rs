@@ -1272,7 +1272,7 @@ impl NestAllocation {
                 opened = parent;
             }
             for (v, offset) in pins {
-                tables[ix][v.0 as usize] = Some(Slot::new(offset, vector_bytes));
+                tables[ix][v.0 as usize] = Some(Slot::new(offset));
             }
         }
 
@@ -1521,12 +1521,6 @@ impl<'a> Allocation<'a> {
     #[must_use]
     pub fn at_head(&self, v: ValueId) -> Where {
         self.where_at(v, Point::HEAD.index)
-    }
-
-    /// The register a root is carried in across the loops inside its region.
-    #[must_use]
-    pub fn carried(&self, root: ValueId) -> Option<Reg> {
-        self.nest.carried(root)
     }
 
     /// Where `v` lives at every point of this scope.
@@ -3608,7 +3602,7 @@ fn operands_of(sop: &ScheduledOp, class: Class) -> impl Iterator<Item = ValueId>
 mod tests {
     use super::*;
     use crate::emit::{allocate_flat, flat_nest};
-    use crate::program::lay_out;
+    use crate::program::{IfArm, lay_out};
     use pixelflow_ir::kind::OpKind;
 
     /// `nest` with its guards tabulated the way a compile tabulates them.
@@ -4352,8 +4346,8 @@ mod tests {
         assert_eq!(guards.len(), 1, "the schedule has exactly one If");
         assert_eq!(guards[0].if_idx, 3);
         assert_eq!(guards[0].mask_vid, ValueId(0));
-        assert_eq!(guards[0].true_range(), (1, 3));
-        assert_eq!(guards[0].false_range(), (3, 3));
+        assert_eq!(guards[0].range(IfArm::True), (1, 3));
+        assert_eq!(guards[0].range(IfArm::False), (3, 3));
     }
 
     /// A spilled operand read inside a guarded arm is *not* worth promoting
@@ -4397,7 +4391,7 @@ mod tests {
             guards
                 .iter()
                 .find(|g| g.if_idx == if_index)
-                .map(IfGuard::true_range),
+                .map(|g| g.range(IfArm::True)),
             Some((rsqrt_index, if_index)),
             "fixture assumes the Rsqrt alone forms the true arm's exclusive range"
         );
@@ -4496,7 +4490,7 @@ mod tests {
             guards
                 .iter()
                 .find(|g| g.if_idx == if_index)
-                .map(IfGuard::true_range),
+                .map(|g| g.range(IfArm::True)),
             Some((1, if_index)),
             "fixture assumes the whole reduction, starting at Y's own \
              definition, is the true arm's exclusive range"
@@ -4730,7 +4724,7 @@ mod tests {
             for (n, v) in spilled.iter().enumerate() {
                 assert_eq!(
                     body.slot_of(*v),
-                    Some(Slot::new(n as u32 * vector_bytes, vector_bytes)),
+                    Some(Slot::new(n as u32 * vector_bytes)),
                     "vector_bytes={vector_bytes}: {v:?} is spilled value {n} in schedule order"
                 );
             }
@@ -4980,7 +4974,6 @@ mod tests {
             )
             .expect("a test nest fits the frame");
         let carry = alloc
-            .body()
             .carried(c)
             .expect("a register above the floor carries the constant");
         let inside = alloc.scope(Scope::Fold(0));
@@ -5626,11 +5619,11 @@ mod tests {
         }
         assert_eq!(
             body.slot_of(ValueId(1)),
-            Some(Slot::new(body.accumulator_slot(ValueId(1)), vb))
+            Some(Slot::new(body.accumulator_slot(ValueId(1))))
         );
         assert_eq!(
             a.scope(Scope::Fold(0)).slot_of(ValueId(11)),
-            Some(Slot::new(body.accumulator_slot(ValueId(11)), vb))
+            Some(Slot::new(body.accumulator_slot(ValueId(11))))
         );
         let parks_from = m + 2 * a.fold_count() as u32 * vb;
         assert_eq!(body.park(ValueId(5)), Some(parks_from));
@@ -5718,7 +5711,7 @@ mod tests {
             let carried = body
                 .roots()
                 .iter()
-                .filter(|r| body.carried(**r).is_some())
+                .filter(|r| alloc.carried(**r).is_some())
                 .count();
             assert_eq!(
                 carried, roots_carried,
@@ -5791,11 +5784,11 @@ mod tests {
             )
             .expect("a test nest fits the frame");
         assert!(
-            alloc.body().carried(read).is_some(),
+            alloc.carried(read).is_some(),
             "fixture assumes NEST_FILE's budget carries a root the fold does read"
         );
         assert_eq!(
-            alloc.body().carried(unused),
+            alloc.carried(unused),
             None,
             "budget is available (the control above proves it), so only the \
              zero-use filter can be refusing this"
@@ -6274,7 +6267,7 @@ mod tests {
             )
             .expect("a test nest fits the frame");
         assert!(
-            alloc.body().carried(root).is_some(),
+            alloc.carried(root).is_some(),
             "fixture assumes NEST_FILE's budget carries the only root"
         );
         let inside = alloc.scope(Scope::Fold(0));

@@ -302,8 +302,8 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::program::IfGuard;
     use crate::program::ScheduledOp;
+    use crate::program::{IfArm, IfGuard};
     use pixelflow_ir::kind::OpKind;
 
     impl Layout {
@@ -445,8 +445,8 @@ mod tests {
         assert!(layout.is_identity());
         assert_eq!(values, [0, 1, 2, 3]);
         assert_eq!(layout.guards.len(), 1);
-        assert_eq!(layout.guards[0].true_range(), (1, 3));
-        assert_eq!(layout.guards[0].false_range(), (3, 3));
+        assert_eq!(layout.guards[0].range(IfArm::True), (1, 3));
+        assert_eq!(layout.guards[0].range(IfArm::False), (3, 3));
     }
 
     /// A stranger between the arm's values: the arm's two values become one
@@ -523,7 +523,7 @@ mod tests {
         let (layout, values) = laid_out(&schedule);
         assert_eq!(*values.last().unwrap(), 6);
         let guard = &layout.guards[0];
-        let (t, f) = (guard.true_range(), guard.false_range());
+        let (t, f) = (guard.range(IfArm::True), guard.range(IfArm::False));
         assert!(t.0 != t.1 && f.0 != f.1, "both arms branch: {guard:?}");
         assert!(t.1 <= f.0 || f.1 <= t.0, "the two runs do not overlap");
     }
@@ -545,7 +545,7 @@ mod tests {
         let (inner, outer) = (&layout.guards[0], &layout.guards[1]);
         let inside = |a: (usize, usize), b: (usize, usize)| b.0 <= a.0 && a.1 <= b.1;
         assert!(
-            inside(inner.true_range(), outer.true_range()),
+            inside(inner.range(IfArm::True), outer.range(IfArm::True)),
             "the inner arm's run is inside the outer's: {inner:?} in {outer:?}"
         );
     }
@@ -679,7 +679,7 @@ mod tests {
 
         let (blind, _) = laid_out(&schedule);
         let (seen, values) = laid_out_with(&schedule, &[], &folds);
-        let len = |g: &IfGuard| g.true_range().1 - g.true_range().0;
+        let len = |g: &IfGuard| g.range(IfArm::True).1 - g.range(IfArm::True).0;
         assert_eq!(len(&blind.guards[0]), 3, "the arm owned `W` unseen");
         assert_eq!(len(&seen.guards[0]), 2, "`W` is not the arm's");
         assert!(
@@ -739,7 +739,7 @@ mod tests {
         ];
         let (layout, _) = laid_out(&schedule);
         assert_eq!(layout.guards.len(), 1);
-        assert_eq!(layout.guards[0].false_range(), (1, 2));
+        assert_eq!(layout.guards[0].range(IfArm::False), (1, 2));
     }
 
     /// The arm fold's trip count below: long enough that pricing the loop as
@@ -824,7 +824,7 @@ mod tests {
 
         let (layout, _) = laid_out_with(&schedule, &[], &folds);
         assert_eq!(
-            layout.guards[0].true_range(),
+            layout.guards[0].range(IfArm::True),
             (3, 4),
             "the loop is skipped whole"
         );
@@ -878,7 +878,7 @@ mod tests {
         );
         let (layout, _) = laid_out_with(&schedule, &roots, &folds);
         assert_eq!(
-            layout.guards[0].true_range(),
+            layout.guards[0].range(IfArm::True),
             (4, 5),
             "the loop, not its pointer"
         );

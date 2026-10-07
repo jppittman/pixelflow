@@ -277,7 +277,7 @@ mod label_tests {
         let end = Label::new("end");
         let code = assemble([
             Item::Inst(Inst::from(Jmp { target: end })),
-            Item::Inst(Inst::ret()),
+            Item::Inst(Inst::Ret),
             Item::Label(end),
         ]);
 
@@ -295,7 +295,7 @@ mod label_tests {
         let top = Label::new("end");
         let code = assemble([
             Item::Label(top),
-            Item::Inst(Inst::ret()),
+            Item::Inst(Inst::Ret),
             Item::Inst(Inst::from(Jmp { target: top })),
         ]);
 
@@ -451,24 +451,6 @@ pub enum Inst {
     Encoded(EncodedInst),
     Jmp(Jmp),
     Jcc(Jcc),
-}
-
-impl Inst {
-    #[must_use]
-    #[inline(always)]
-    pub const fn mov(dst: Gpr, src: Gpr) -> Self {
-        Self::Mov { dst, src }
-    }
-    #[must_use]
-    #[inline(always)]
-    pub const fn xor(dst: Gpr, src: Gpr) -> Self {
-        Self::Xor { dst, src }
-    }
-    #[must_use]
-    #[inline(always)]
-    pub const fn ret() -> Self {
-        Self::Ret
-    }
 }
 
 impl From<EncodedInst> for Inst {
@@ -743,95 +725,11 @@ impl Jcc {
     pub const fn je(target: Label) -> Self {
         Self::on(Cond::E, target)
     }
-    /// `jne` / `jnz`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn jne(target: Label) -> Self {
-        Self::on(Cond::Ne, target)
-    }
     /// `jb` / `jc` / `jnae` — unsigned `<`.
     #[must_use]
     #[inline(always)]
     pub const fn jb(target: Label) -> Self {
         Self::on(Cond::B, target)
-    }
-    /// `jae` / `jnb` / `jnc` — unsigned `>=`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn jae(target: Label) -> Self {
-        Self::on(Cond::Ae, target)
-    }
-    /// `jbe` / `jna` — unsigned `<=`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn jbe(target: Label) -> Self {
-        Self::on(Cond::Be, target)
-    }
-    /// `ja` / `jnbe` — unsigned `>`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn ja(target: Label) -> Self {
-        Self::on(Cond::A, target)
-    }
-    /// `jl` / `jnge` — signed `<`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn jl(target: Label) -> Self {
-        Self::on(Cond::L, target)
-    }
-    /// `jge` / `jnl` — signed `>=`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn jge(target: Label) -> Self {
-        Self::on(Cond::Ge, target)
-    }
-    /// `jle` / `jng` — signed `<=`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn jle(target: Label) -> Self {
-        Self::on(Cond::Le, target)
-    }
-    /// `jg` / `jnle` — signed `>`.
-    #[must_use]
-    #[inline(always)]
-    pub const fn jg(target: Label) -> Self {
-        Self::on(Cond::G, target)
-    }
-    /// `js` — sign set.
-    #[must_use]
-    #[inline(always)]
-    pub const fn js(target: Label) -> Self {
-        Self::on(Cond::S, target)
-    }
-    /// `jns` — sign clear.
-    #[must_use]
-    #[inline(always)]
-    pub const fn jns(target: Label) -> Self {
-        Self::on(Cond::Ns, target)
-    }
-    /// `jo` — overflow.
-    #[must_use]
-    #[inline(always)]
-    pub const fn jo(target: Label) -> Self {
-        Self::on(Cond::O, target)
-    }
-    /// `jno` — no overflow.
-    #[must_use]
-    #[inline(always)]
-    pub const fn jno(target: Label) -> Self {
-        Self::on(Cond::No, target)
-    }
-    /// `jp` / `jpe` — parity even; set by an unordered float compare.
-    #[must_use]
-    #[inline(always)]
-    pub const fn jp(target: Label) -> Self {
-        Self::on(Cond::P, target)
-    }
-    /// `jnp` / `jpo` — parity odd.
-    #[must_use]
-    #[inline(always)]
-    pub const fn jnp(target: Label) -> Self {
-        Self::on(Cond::Np, target)
     }
 
     /// The branch on a condition chosen at run time, where no single mnemonic
@@ -1022,8 +920,6 @@ pub(in crate::emit) fn write_address(
 pub trait Disp: Copy {
     /// The ModRM `mod` field this displacement implies.
     const MOD: u8;
-    /// Append the displacement bytes, if the mode has any.
-    fn emit(self, code: &mut Vec<u8>);
     /// Append the displacement bytes into an `EncodedInst`.
     fn emit_inst(self, inst: &mut EncodedInst);
 }
@@ -1040,17 +936,11 @@ pub struct NoDisp;
 impl Disp for NoDisp {
     const MOD: u8 = 0x00;
     #[inline(always)]
-    fn emit(self, _code: &mut Vec<u8>) {}
-    #[inline(always)]
     fn emit_inst(self, _inst: &mut EncodedInst) {}
 }
 
 impl Disp for Imm8 {
     const MOD: u8 = 0x40;
-    #[inline(always)]
-    fn emit(self, code: &mut Vec<u8>) {
-        code.push(self.0 as u8);
-    }
     #[inline(always)]
     fn emit_inst(self, inst: &mut EncodedInst) {
         inst.push(self.0 as u8);
@@ -1059,10 +949,6 @@ impl Disp for Imm8 {
 
 impl Disp for Imm32 {
     const MOD: u8 = 0x80;
-    #[inline(always)]
-    fn emit(self, code: &mut Vec<u8>) {
-        code.extend_from_slice(&self.0.to_le_bytes());
-    }
     #[inline(always)]
     fn emit_inst(self, inst: &mut EncodedInst) {
         inst.extend(&self.0.to_le_bytes());
@@ -1313,7 +1199,11 @@ mod gpr_tests {
 
         let top = Label::new("end");
         let mut c = Vec::new();
-        AsmProgram::new([Item::Label(top), Item::Inst(Inst::from(Jcc::jae(top)))]).assemble(&mut c);
+        AsmProgram::new([
+            Item::Label(top),
+            Item::Inst(Inst::from(Jcc::on(Cond::Ae, top))),
+        ])
+        .assemble(&mut c);
         assert_eq!(c[..2], [0x0F, 0x83]);
         assert_eq!(&c[2..6], &(-6i32).to_le_bytes(), "a back edge is negative");
     }

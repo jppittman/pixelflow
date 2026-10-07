@@ -7,27 +7,25 @@
 //!
 //! This module models these entities as first-class domain objects, providing
 //! capability traits for writing ([`StoreTarget`]) and reading ([`SourceOperand`])
-//! across registers and memory, along with a recycling [`StackFrame`] slot allocator.
+//! across registers and memory, along with the [`StackFrame`] slot allocator.
 
 use super::{PtrReg, Reg};
-use alloc::vec::Vec;
 
 /// An aligned slot in the stack frame.
 ///
 /// A `Slot` represents a concrete stack address: it knows its byte displacement
-/// relative to the stack/frame pointer and the vector width (in bytes).
+/// relative to the stack/frame pointer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Slot {
     offset: u32,
-    bytes: u32,
 }
 
 impl Slot {
-    /// Create a new stack slot with the given byte displacement and size.
+    /// Create a new stack slot with the given byte displacement.
     #[inline]
     #[must_use]
-    pub const fn new(offset: u32, bytes: u32) -> Self {
-        Self { offset, bytes }
+    pub const fn new(offset: u32) -> Self {
+        Self { offset }
     }
 
     /// Displacement in bytes from the stack/frame pointer (e.g. `[rsp + offset]`).
@@ -35,13 +33,6 @@ impl Slot {
     #[must_use]
     pub const fn offset(self) -> u32 {
         self.offset
-    }
-
-    /// Size of the vector slot in bytes (16 for NEON, 32 for AVX2, 64 for AVX-512).
-    #[inline]
-    #[must_use]
-    pub const fn bytes(self) -> u32 {
-        self.bytes
     }
 }
 
@@ -212,26 +203,18 @@ impl SourceOperand for Storage {
     }
 }
 
-/// A recycling stack frame slot allocator.
+/// A stack frame slot allocator.
 ///
-/// Manages allocation and deallocation of vector stack slots at a fixed byte stride,
-/// reusing slots that have been released to minimize stack frame size.
+/// Manages allocation of vector stack slots at a fixed byte stride.
 #[derive(Clone, Debug)]
 pub struct StackFrame {
     vector_bytes: u32,
     allocated_bytes: u32,
-    free_pool: Vec<Slot>,
 }
 
 impl StackFrame {
-    /// Create a new stack frame manager for vector slots of `vector_bytes` stride.
-    #[inline]
-    #[must_use]
-    pub const fn new(vector_bytes: u32) -> Self {
-        Self::with_base(vector_bytes, 0)
-    }
-
-    /// The same, but handing out slots from `base` upward instead of from 0.
+    /// A frame for vector slots of `vector_bytes` stride, handing out slots
+    /// from `base` upward.
     ///
     /// A scope that runs to completion before the next one needs its slots can
     /// reuse the same offsets — that is why the two collapse prologues and the
@@ -246,31 +229,20 @@ impl StackFrame {
         Self {
             vector_bytes,
             allocated_bytes: base,
-            free_pool: Vec::new(),
         }
     }
 
-    /// Allocate a slot in the frame, reusing a previously freed slot if available.
+    /// Allocate a slot in the frame.
     pub fn alloc_slot(&mut self) -> Result<Slot, crate::error::CompileError> {
         const MAX_FRAME: u32 = 2 * 1024 * 1024;
-        if let Some(reused) = self.free_pool.pop() {
-            Ok(reused)
-        } else {
-            if self.allocated_bytes > MAX_FRAME - self.vector_bytes {
-                return Err(crate::error::CompileError::BudgetExceeded(
-                    "spill frame overflow: exceeds 2MB stack limit",
-                ));
-            }
-            let offset = self.allocated_bytes;
-            self.allocated_bytes += self.vector_bytes;
-            Ok(Slot::new(offset, self.vector_bytes))
+        if self.allocated_bytes > MAX_FRAME - self.vector_bytes {
+            return Err(crate::error::CompileError::BudgetExceeded(
+                "spill frame overflow: exceeds 2MB stack limit",
+            ));
         }
-    }
-
-    /// Release a slot back to the free pool so it can be reused by a later value.
-    pub fn free_slot(&mut self, slot: Slot) {
-        debug_assert_eq!(slot.bytes(), self.vector_bytes);
-        self.free_pool.push(slot);
+        let offset = self.allocated_bytes;
+        self.allocated_bytes += self.vector_bytes;
+        Ok(Slot::new(offset))
     }
 
     /// Total stack frame size in bytes, aligned to 16 bytes per standard ABI.
@@ -278,13 +250,6 @@ impl StackFrame {
     #[must_use]
     pub const fn frame_size(&self) -> u32 {
         (self.allocated_bytes + 15) & !15
-    }
-
-    /// The vector stride in bytes.
-    #[inline]
-    #[must_use]
-    pub const fn vector_bytes(&self) -> u32 {
-        self.vector_bytes
     }
 }
 
@@ -296,7 +261,7 @@ mod tests {
     #[test]
     fn storage_capabilities_for_reg_and_slot() {
         let r = Reg(3);
-        let s = Slot::new(32, 16);
+        let s = Slot::new(32);
 
         // StoreTarget
         assert_eq!(r.target_reg(), Some(Reg(3)));
@@ -304,8 +269,8 @@ mod tests {
         assert_eq!(r.target_storage(), Storage::Reg(Reg(3)));
 
         assert_eq!(s.target_reg(), None);
-        assert_eq!(s.target_slot(), Some(Slot::new(32, 16)));
-        assert_eq!(s.target_storage(), Storage::Slot(Slot::new(32, 16)));
+        assert_eq!(s.target_slot(), Some(Slot::new(32)));
+        assert_eq!(s.target_storage(), Storage::Slot(Slot::new(32)));
 
         // SourceOperand
         assert_eq!(r.source_const(), None);
@@ -315,16 +280,16 @@ mod tests {
     #[test]
     fn storage_capabilities_for_loc() {
         let l_reg = Loc::Reg(Reg(4));
-        let l_slot = Loc::Slot(Slot::new(64, 32));
+        let l_slot = Loc::Slot(Slot::new(64));
 
         // StoreTarget is total for Loc: every Loc is a writable physical location.
         assert_eq!(l_reg.target_storage(), Storage::Reg(Reg(4)));
         assert_eq!(l_reg.target_reg(), Some(Reg(4)));
         assert_eq!(l_reg.target_slot(), None);
 
-        assert_eq!(l_slot.target_storage(), Storage::Slot(Slot::new(64, 32)));
+        assert_eq!(l_slot.target_storage(), Storage::Slot(Slot::new(64)));
         assert_eq!(l_slot.target_reg(), None);
-        assert_eq!(l_slot.target_slot(), Some(Slot::new(64, 32)));
+        assert_eq!(l_slot.target_slot(), Some(Slot::new(64)));
 
         // SourceOperand
         assert_eq!(l_reg.source_reg(), Some(Reg(4)));
@@ -332,7 +297,7 @@ mod tests {
         assert_eq!(l_reg.source_const(), None);
 
         assert_eq!(l_slot.source_reg(), None);
-        assert_eq!(l_slot.source_slot(), Some(Slot::new(64, 32)));
+        assert_eq!(l_slot.source_slot(), Some(Slot::new(64)));
         assert_eq!(l_slot.source_const(), None);
 
         // Binding SourceOperand capabilities (including Remat)
@@ -341,7 +306,7 @@ mod tests {
         let b_remat = Binding::Remat(0x3F80_0000);
 
         assert_eq!(b_reg.source_reg(), Some(Reg(4)));
-        assert_eq!(b_slot.source_slot(), Some(Slot::new(64, 32)));
+        assert_eq!(b_slot.source_slot(), Some(Slot::new(64)));
         assert_eq!(b_remat.source_reg(), None);
         assert_eq!(b_remat.source_slot(), None);
         assert_eq!(b_remat.source_const(), Some(0x3F80_0000));
@@ -349,17 +314,12 @@ mod tests {
     }
 
     #[test]
-    fn stack_frame_allocates_and_reuses_slots() {
-        let mut frame = StackFrame::new(16);
+    fn stack_frame_allocates_slots_at_the_stride() {
+        let mut frame = StackFrame::with_base(16, 0);
         let s0 = frame.alloc_slot().unwrap();
         let s1 = frame.alloc_slot().unwrap();
         assert_eq!(s0.offset(), 0);
         assert_eq!(s1.offset(), 16);
-        assert_eq!(frame.frame_size(), 32);
-
-        frame.free_slot(s0);
-        let s2 = frame.alloc_slot().unwrap();
-        assert_eq!(s2.offset(), 0);
         assert_eq!(frame.frame_size(), 32);
     }
 }
