@@ -4613,7 +4613,7 @@ mod tests {
                 .find(|d| matches!(d.op, ScheduledOp::Unary(OpKind::Abs, _)))
                 .map(|d| d.value)
                 .expect("|X·Y| is in the schedule");
-            let arm = guard.true_range();
+            let arm = guard.range(IfArm::True);
             SplitFixture {
                 arena: a,
                 root,

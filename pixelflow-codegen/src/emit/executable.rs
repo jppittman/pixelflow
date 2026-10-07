@@ -145,15 +145,10 @@ pub use linux::LinuxCodePage;
 #[cfg(target_os = "linux")]
 pub type NativeCodePage = linux::LinuxCodePage;
 
-pub mod mock;
-pub use mock::MockCodePage;
-
-/// Get the system page size for the native target.
-#[must_use]
-#[inline]
-pub fn page_size() -> usize {
-    NativeCodePage::page_size()
-}
+#[cfg(test)]
+mod mock;
+#[cfg(test)]
+use mock::MockCodePage;
 
 // =============================================================================
 // The one kernel ABI
@@ -216,7 +211,7 @@ mod page_tests {
     /// one.
     #[test]
     fn page_size_is_a_sane_power_of_two() {
-        let n = page_size();
+        let n = NativeCodePage::page_size();
         assert!(n >= 4096, "page size {n} below the smallest we run on");
         assert!(n <= 1 << 20, "page size {n} implausibly large");
         assert!(n.is_power_of_two(), "page size {n} is not a power of two");
@@ -245,7 +240,7 @@ mod page_tests {
     fn length_reported_is_the_code_not_the_mapping() {
         let mut code = host_ret();
         let ret_len = code.len();
-        code.resize(page_size() + ret_len, 0);
+        code.resize(NativeCodePage::page_size() + ret_len, 0);
         code.rotate_right(ret_len); // keep the `ret` first
         // SAFETY: entry point is a valid `ret`; the padding is never executed.
         let exec = unsafe { ExecutableCode::from_code(&code) }.expect("map + flip");
@@ -303,7 +298,7 @@ mod page_tests {
     /// case `is_empty` exists to report.
     #[test]
     fn is_empty_reports_a_zero_length_page() {
-        let exec = MockCodePage::map(page_size())
+        let exec = MockCodePage::map(NativeCodePage::page_size())
             .expect("map")
             .finish(0)
             .expect("finish");
@@ -320,7 +315,7 @@ mod page_tests {
     /// of it.
     #[test]
     fn capacity_rounds_up_to_the_page_size_without_overshooting_an_exact_multiple() {
-        let page = page_size();
+        let page = NativeCodePage::page_size();
 
         let exact = vec![0u8; page];
         let exec = NativeCodePage::from_code(&exact).expect("map");

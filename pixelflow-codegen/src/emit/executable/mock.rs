@@ -8,7 +8,6 @@ use alloc::vec::Vec;
 #[derive(Clone, Debug)]
 pub struct MockCodePage {
     pub bytes: Vec<u8>,
-    pub capacity: usize,
 }
 
 impl CodePage for MockCodePage {
@@ -19,7 +18,6 @@ impl CodePage for MockCodePage {
     fn map(capacity: usize) -> Result<Self, CompileError> {
         Ok(Self {
             bytes: Vec::with_capacity(capacity),
-            capacity,
         })
     }
 

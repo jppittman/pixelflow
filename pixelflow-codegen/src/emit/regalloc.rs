@@ -3602,7 +3602,7 @@ fn operands_of(sop: &ScheduledOp, class: Class) -> impl Iterator<Item = ValueId>
 mod tests {
     use super::*;
     use crate::emit::{allocate_flat, flat_nest};
-    use crate::program::lay_out;
+    use crate::program::{IfArm, lay_out};
     use pixelflow_ir::kind::OpKind;
 
     /// `nest` with its guards tabulated the way a compile tabulates them.
@@ -4346,8 +4346,8 @@ mod tests {
         assert_eq!(guards.len(), 1, "the schedule has exactly one If");
         assert_eq!(guards[0].if_idx, 3);
         assert_eq!(guards[0].mask_vid, ValueId(0));
-        assert_eq!(guards[0].true_range(), (1, 3));
-        assert_eq!(guards[0].false_range(), (3, 3));
+        assert_eq!(guards[0].range(IfArm::True), (1, 3));
+        assert_eq!(guards[0].range(IfArm::False), (3, 3));
     }
 
     /// A spilled operand read inside a guarded arm is *not* worth promoting
@@ -4391,7 +4391,7 @@ mod tests {
             guards
                 .iter()
                 .find(|g| g.if_idx == if_index)
-                .map(IfGuard::true_range),
+                .map(|g| g.range(IfArm::True)),
             Some((rsqrt_index, if_index)),
             "fixture assumes the Rsqrt alone forms the true arm's exclusive range"
         );
@@ -4490,7 +4490,7 @@ mod tests {
             guards
                 .iter()
                 .find(|g| g.if_idx == if_index)
-                .map(IfGuard::true_range),
+                .map(|g| g.range(IfArm::True)),
             Some((1, if_index)),
             "fixture assumes the whole reduction, starting at Y's own \
              definition, is the true arm's exclusive range"

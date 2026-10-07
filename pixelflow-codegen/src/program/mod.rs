@@ -268,43 +268,10 @@ impl<T> ArmPair<T> {
         }
     }
 
-    /// Access the value for `arm`.
-    #[inline]
-    pub const fn get(&self, arm: IfArm) -> &T {
-        match arm {
-            IfArm::True => &self.true_arm,
-            IfArm::False => &self.false_arm,
-        }
-    }
-
-    /// Mutably access the value for `arm`.
-    #[inline]
-    pub fn get_mut(&mut self, arm: IfArm) -> &mut T {
-        match arm {
-            IfArm::True => &mut self.true_arm,
-            IfArm::False => &mut self.false_arm,
-        }
-    }
-
     /// Iterate over references to both arm values.
     #[inline]
     pub fn values(&self) -> impl Iterator<Item = &T> {
         [&self.true_arm, &self.false_arm].into_iter()
-    }
-}
-
-impl<T> core::ops::Index<IfArm> for ArmPair<T> {
-    type Output = T;
-    #[inline]
-    fn index(&self, arm: IfArm) -> &Self::Output {
-        self.get(arm)
-    }
-}
-
-impl<T> core::ops::IndexMut<IfArm> for ArmPair<T> {
-    #[inline]
-    fn index_mut(&mut self, arm: IfArm) -> &mut Self::Output {
-        self.get_mut(arm)
     }
 }
 
@@ -335,22 +302,6 @@ impl IfGuard {
         }
     }
 
-    /// Schedule index range exclusive to the true arm: `[start, end)`.
-    #[must_use]
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) const fn true_range(&self) -> (usize, usize) {
-        self.ranges.true_arm
-    }
-
-    /// Schedule index range exclusive to the false arm: `[start, end)`.
-    #[must_use]
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) const fn false_range(&self) -> (usize, usize) {
-        self.ranges.false_arm
-    }
-
     /// Whether this arm is guarded (has a non-empty range).
     #[must_use]
     #[inline]
@@ -369,7 +320,6 @@ impl IfGuard {
     /// Total entries skipped across both arms.
     #[must_use]
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn total_guarded_entries(&self) -> usize {
         (self.ranges.true_arm.1 - self.ranges.true_arm.0)
             + (self.ranges.false_arm.1 - self.ranges.false_arm.0)
