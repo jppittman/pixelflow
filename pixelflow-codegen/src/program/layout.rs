@@ -355,14 +355,14 @@ mod tests {
         })
     }
 
-    fn def(value: u32, op: ScheduledOp) -> Def {
+    fn def(value: u64, op: ScheduledOp) -> Def {
         Def {
             value: ValueId(value),
             op,
         }
     }
 
-    fn if_of(value: u32, mask: u32, if_true: u32, if_false: u32) -> Def {
+    fn if_of(value: u64, mask: u64, if_true: u64, if_false: u64) -> Def {
         def(
             value,
             ScheduledOp::Ternary(
@@ -374,7 +374,7 @@ mod tests {
         )
     }
 
-    fn unary(value: u32, op: OpKind, of: u32) -> Def {
+    fn unary(value: u64, op: OpKind, of: u64) -> Def {
         def(value, ScheduledOp::Unary(op, ValueId(of)))
     }
 
@@ -383,11 +383,11 @@ mod tests {
     /// its value, and laying it out again moves nothing), and each arm it
     /// branches over is exactly the run of the values that arm owns — no
     /// stranger inside it, nothing the arm owns outside it.
-    fn laid_out(schedule: &[Def]) -> (Layout, Vec<u32>) {
+    fn laid_out(schedule: &[Def]) -> (Layout, Vec<u64>) {
         laid_out_with(schedule, &[], &FoldReads::default())
     }
 
-    fn laid_out_with(schedule: &[Def], roots: &[ValueId], folds: &FoldReads) -> (Layout, Vec<u32>) {
+    fn laid_out_with(schedule: &[Def], roots: &[ValueId], folds: &FoldReads) -> (Layout, Vec<u64>) {
         let layout = Layout::of(schedule, roots, folds);
         assert!(layout.is_sound(schedule, roots, folds));
         let own = Ownership::of(schedule, roots, folds);
@@ -466,7 +466,7 @@ mod tests {
         assert!(!layout.is_identity());
         // The arm is values 2 and 4 and must be adjacent; the stranger is
         // read after the `If` and stays out of the arm's way.
-        let at = |v: u32| values.iter().position(|&x| x == v).unwrap();
+        let at = |v: u64| values.iter().position(|&x| x == v).unwrap();
         assert_eq!(at(4), at(2) + 1, "the arm is one run: {values:?}");
         assert!(at(5) > at(4));
         assert_eq!(
@@ -565,7 +565,7 @@ mod tests {
             if_of(7, 0, 5, 6),
         ];
         let (_, values) = laid_out(&schedule);
-        let at = |v: u32| values.iter().position(|&x| x == v).unwrap();
+        let at = |v: u64| values.iter().position(|&x| x == v).unwrap();
         assert!(at(3) < at(4), "the input precedes its reader: {values:?}");
     }
 
@@ -593,8 +593,8 @@ mod tests {
         let mut schedule: Vec<Def> =
             alloc::vec![def(0, ScheduledOp::Var(0)), def(1, ScheduledOp::Var(1))];
         while schedule.len() < len {
-            let value = schedule.len() as u32;
-            let earlier = |rng: &mut Lcg| rng.below(value as usize) as u32;
+            let value = schedule.len() as u64;
+            let earlier = |rng: &mut Lcg| rng.below(value as usize) as u64;
             let op = match rng.below(10) {
                 0..=2 => ScheduledOp::Unary(OpKind::Rsqrt, ValueId(earlier(&mut rng))),
                 3..=4 => ScheduledOp::Unary(OpKind::Neg, ValueId(earlier(&mut rng))),
@@ -622,7 +622,7 @@ mod tests {
         for seed in 0..300 {
             let len = 20 + (seed as usize % 40);
             let schedule = random_schedule(seed, len);
-            let roots: Vec<ValueId> = alloc::vec![ValueId((len - 1) as u32)];
+            let roots: Vec<ValueId> = alloc::vec![ValueId((len - 1) as u64)];
             let folds = FoldReads::default();
             let layout = Layout::of(&schedule, &roots, &folds);
             assert!(
@@ -647,7 +647,7 @@ mod tests {
         ScheduledOp::Reduce(fold, ValueId(99))
     }
 
-    fn at(values: &[u32], v: u32) -> usize {
+    fn at(values: &[u64], v: u64) -> usize {
         values
             .iter()
             .position(|&x| x == v)
@@ -755,7 +755,7 @@ mod tests {
 
     /// `select(X < 20, F, 0) + Y`, with `F` the `Reduce` def `fold` opening at
     /// position 3 — the true arm's only entry of its own.
-    fn if_over_a_fold(fold: pixelflow_ir::fold::Fold, body_root: u32) -> Vec<Def> {
+    fn if_over_a_fold(fold: pixelflow_ir::fold::Fold, body_root: u64) -> Vec<Def> {
         alloc::vec![
             def(0, ScheduledOp::Var(0)),
             def(1, ScheduledOp::Const(20.0)),
@@ -771,7 +771,7 @@ mod tests {
     /// `|x − j|` per trip, `j` the binder of `fold` and `x` read from the
     /// enclosing scope as `ValueId(0)`; the ids from `first` up are the body's
     /// own.
-    fn distance_body(fold: pixelflow_ir::fold::Fold, first: u32) -> Vec<Def> {
+    fn distance_body(fold: pixelflow_ir::fold::Fold, first: u64) -> Vec<Def> {
         let (j, diff, abs) = (first, first + 1, first + 2);
         alloc::vec![
             def(0, ScheduledOp::Var(0)),

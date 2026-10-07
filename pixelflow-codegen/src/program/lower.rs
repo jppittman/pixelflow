@@ -125,9 +125,9 @@ pub(crate) fn arena_to_schedule(
         }
     };
 
-    // ExprId to ValueId mapping. u32::MAX = unmapped (unreachable, or a
+    // ExprId to ValueId mapping. u64::MAX = unmapped (unreachable, or a
     // `Write` node, whose defs are its lane folds').
-    let mut id_map = alloc::vec![ValueId(u32::MAX); len];
+    let mut id_map = alloc::vec![ValueId(u64::MAX); len];
     let mut schedule = Vec::new();
     let mut next_id = 0;
 
@@ -152,7 +152,7 @@ pub(crate) fn arena_to_schedule(
         let map_child = |child: ExprId| -> ValueId {
             let mapped = id_map[child.0 as usize];
             assert!(
-                mapped.0 != u32::MAX,
+                mapped.0 != u64::MAX,
                 "arena_to_schedule: child ExprId({}) not yet mapped -- \
                  arena is not in topological order or child is unreachable",
                 child.0
