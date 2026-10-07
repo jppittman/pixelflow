@@ -1,14 +1,14 @@
-//! The rules and skills in this crate load, and their queries find what they
-//! claim to. Catches a bad query or a dangling skill name before a review does.
+//! The rules and skills in this crate load, and each sees the unit it claims
+//! to. Catches a bad rule file or a dangling skill name before a review does.
 
 use std::path::Path;
 use std::path::PathBuf;
 
 use desloppify::language::Language;
 use desloppify::review::plan;
-use desloppify::rule::{self, Rule};
+use desloppify::rule::{self, Rule, Verdict};
 use desloppify::skills;
-use desloppify::snippet::snippets;
+use desloppify::snippet::{outline, snippets};
 
 fn shipped() -> Vec<Rule> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -26,40 +26,84 @@ fn every_shipped_rule_loads() {
 }
 
 #[test]
-fn boolean_argument_query_ignores_other_parameters() {
-    let source = "fn a(x: bool) {}\nfn b(x: u32) {}\n";
-    let found = snippets(&rule("boolean-argument"), Language::Rust, source).unwrap();
-    assert_eq!(found.len(), 1);
-    assert!(found[0].numbered.contains("fn a"));
+fn every_shipped_rule_lists_its_fine_outcomes_before_its_violations() {
+    for rule in shipped() {
+        let verdicts: Vec<_> = rule.decision.outcomes.iter().map(|o| o.verdict).collect();
+        let first_violation = verdicts
+            .iter()
+            .position(|v| *v == Verdict::Violation)
+            .unwrap();
+        assert!(first_violation > 0, "{} has no fine outcome", rule.id);
+        assert!(
+            verdicts[first_violation..]
+                .iter()
+                .all(|v| *v == Verdict::Violation),
+            "{}",
+            rule.id
+        );
+    }
 }
 
 #[test]
-fn function_shapes_sees_signatures_without_bodies() {
+fn signatures_are_shown_without_bodies_joined_in_one_snippet() {
     let source = "pub fn a(x: u8) -> u8 {\n    x\n}\nfn b() {}\n";
-    let found = snippets(&rule("function-shapes"), Language::Rust, source).unwrap();
-    assert_eq!(found.len(), 1);
+    let found = snippets(&rule("boolean-argument"), Language::Rust, source).unwrap();
     assert_eq!(
-        found[0].numbered,
-        "    1 | pub fn a(x: u8) -> u8\n  ...\n    4 | fn b()\n"
+        found,
+        [desloppify::snippet::Snippet {
+            first_line: 1,
+            numbered: "    1 | pub fn a(x: u8) -> u8\n  ...\n    4 | fn b()\n".into()
+        }]
     );
 }
 
 #[test]
-fn types_scope_reviews_each_type_alone() {
+fn types_are_reviewed_each_alone() {
     let source = "struct A { id: u32 }\nfn f() {}\nenum B { X }\n";
     let found = snippets(&rule("control-plane-64-bit"), Language::Rust, source).unwrap();
-    assert_eq!(found.len(), 2);
+    let lines: Vec<_> = found.iter().map(|s| s.first_line).collect();
+    assert_eq!(lines, [1, 3]);
 }
 
 #[test]
-fn test_names_rule_reviews_only_test_functions_together() {
-    let source =
-        "#[test]\nfn works() {}\n\nfn helper() {}\n\n#[test]\nfn rejects_empty_input() {}\n";
-    let found = snippets(&rule("test-names-it-should"), Language::Rust, source).unwrap();
-    assert_eq!(found.len(), 1);
+fn functions_are_reviewed_each_alone_whole() {
+    let source = "fn f() {\n    let a = x.unwrap();\n}\nfn g() {}\n";
+    let found = snippets(&rule("panicking-unwrap"), Language::Rust, source).unwrap();
+    assert_eq!(found.len(), 2);
     assert_eq!(
         found[0].numbered,
-        "    2 | works\n  ...\n    7 | rejects_empty_input\n"
+        "    1 | fn f() {\n    2 |     let a = x.unwrap();\n    3 | }\n"
+    );
+}
+
+#[test]
+fn functions_inside_a_cfg_test_module_are_not_reviewed() {
+    let source =
+        "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nmod inner {\n    fn b() {}\n}\n";
+    let found = snippets(&rule("guard-clauses"), Language::Rust, source).unwrap();
+    let lines: Vec<_> = found.iter().map(|s| s.first_line).collect();
+    assert_eq!(lines, [1, 7]);
+}
+
+#[test]
+fn an_outline_keeps_every_line_but_function_bodies_at_its_own_number() {
+    let source = "#[test]\nfn works() {\n    assert!(true);\n}\n\npub struct S;\nimpl S {\n    fn m(&self) {\n        inner();\n    }\n}\n";
+    let shown = outline(Language::Rust, source).unwrap();
+    assert_eq!(
+        shown.numbered,
+        "    1 | #[test]\n    2 | fn works() { … }\n    5 | \n    6 | pub struct S;\n    7 | impl S {\n    8 |     fn m(&self) { … }\n   11 | }\n"
+    );
+    let found = snippets(&rule("test-names-it-should"), Language::Rust, source).unwrap();
+    assert_eq!(found, [shown]);
+}
+
+#[test]
+fn a_function_nested_in_a_body_is_elided_with_it() {
+    let source = "fn outer() {\n    fn inner() {\n    }\n}\nfn after() {}\n";
+    let shown = outline(Language::Rust, source).unwrap();
+    assert_eq!(
+        shown.numbered,
+        "    1 | fn outer() { … }\n    5 | fn after() { … }\n"
     );
 }
 
@@ -89,6 +133,17 @@ fn excluded_paths_are_not_read() {
             .files
             .contains(&PathBuf::from("pixelflow-codegen/src/emit/x86.rs"))
     );
+    let registers = rule("registers-come-from-the-allocator");
+    assert!(
+        registers
+            .files
+            .contains(&PathBuf::from("pixelflow-codegen/src/emit/x86_64.rs"))
+    );
+    assert!(
+        !registers
+            .files
+            .contains(&PathBuf::from("pixelflow-codegen/src/emit/regalloc.rs"))
+    );
     let unwrap = rule("panicking-unwrap");
     assert!(
         !unwrap
@@ -97,67 +152,70 @@ fn excluded_paths_are_not_read() {
     );
 }
 
-#[test]
-fn function_review_sends_each_function_holding_a_match_naming_its_lines() {
-    let unwrap = rule("panicking-unwrap");
-    let source = "fn f() {\n    let a = x.unwrap();\n    let b = y.expect(\"y\");\n}\nfn g() {}\n";
-    let found = snippets(&unwrap, Language::Rust, source).unwrap();
-    assert_eq!(found.len(), 1);
-    assert_eq!(
-        found[0].numbered,
-        "Review lines 2, 3.\n\n    1 | fn f() {\n    2 |     let a = x.unwrap();\n    3 |     let b = y.expect(\"y\");\n    4 | }\n"
-    );
-    assert!(
-        snippets(&unwrap, Language::Rust, "fn g() {}\n")
-            .unwrap()
-            .is_empty()
-    );
+/// A scratch directory, removed on drop.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("desloppify-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn write(&self, name: &str, text: &str) -> PathBuf {
+        let path = self.0.join(name);
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("leaving {}: {error}", self.0.display());
+        }
+    }
 }
 
 #[test]
-fn interface_rule_shows_signatures_of_everything_wider_than_pub_super() {
-    let source = "pub fn a() {\n}\npub(super) fn b() {}\nfn c() {}\npub(crate) struct S;\n";
-    let found = snippets(&rule("interface-lives-in-mod-rs"), Language::Rust, source).unwrap();
-    assert_eq!(found.len(), 1);
-    assert_eq!(
-        found[0].numbered,
-        "    1 | pub fn a()\n  ...\n    5 | pub(crate) struct S;\n"
-    );
-}
-
-#[test]
-fn trait_rule_shows_public_inherent_method_signatures_but_not_trait_impls() {
-    let source = "impl S {\n    pub fn a() {}\n    pub(super) fn b() {}\n}\nimpl T for S {\n    pub fn c() {}\n}\n";
-    let found = snippets(&rule("behavior-through-the-trait"), Language::Rust, source).unwrap();
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].numbered, "    2 | pub fn a()\n");
-}
-
-#[test]
-fn module_root_context_attaches_the_mod_rs_to_an_implementation_file() {
-    let dir = std::env::temp_dir().join(format!("desloppify-root-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("mod.rs"), "mod leaf;\n").unwrap();
-    let leaf = dir.join("leaf.rs");
-    std::fs::write(&leaf, "pub fn exposed() {}\n").unwrap();
+fn module_root_context_attaches_the_mod_rs_outline_to_an_implementation_file() {
+    let dir = Scratch::new("root");
+    dir.write("mod.rs", "mod leaf;\npub fn made() -> u8 {\n    1\n}\n");
+    let leaf = dir.write("leaf.rs", "pub fn exposed() {}\n");
 
     let rules = shipped();
     let calls = plan(&rules, &[leaf]).unwrap();
     let call = calls
         .iter()
-        .find(|c| rules[c.rule].id == "interface-lives-in-mod-rs")
+        .find(|c| {
+            c.rules
+                .iter()
+                .any(|&r| rules[r].id == "interface-lives-in-mod-rs")
+        })
         .unwrap();
     let root = call.root.as_ref().unwrap();
-    assert_eq!(root.path, dir.join("mod.rs"));
-    assert_eq!(root.text, "mod leaf;\n");
-    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(root.path, dir.0.join("mod.rs"));
+    assert_eq!(
+        root.text,
+        "    1 | mod leaf;\n    2 | pub fn made() -> u8 { … }\n"
+    );
 }
 
 #[test]
-fn functions_inside_a_cfg_test_module_are_not_reviewed() {
-    let source =
-        "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nmod inner {\n    fn b() {}\n}\n";
-    let found = snippets(&rule("guard-clauses"), Language::Rust, source).unwrap();
-    let names: Vec<_> = found.iter().map(|s| s.first_line).collect();
-    assert_eq!(names, [1, 7]);
+fn rules_that_see_the_same_unit_share_its_calls() {
+    let dir = Scratch::new("shared");
+    let file = dir.write("a.rs", "fn a() {}\nfn b() {}\n");
+
+    let rules = shipped();
+    let calls = plan(&rules, &[file]).unwrap();
+    let by_function: Vec<_> = calls
+        .iter()
+        .filter(|c| c.rules.iter().any(|&r| rules[r].id == "guard-clauses"))
+        .collect();
+    assert_eq!(by_function.len(), 2, "one call per function");
+    for call in by_function {
+        let ids: Vec<_> = call.rules.iter().map(|&r| rules[r].id.as_str()).collect();
+        assert!(ids.contains(&"magic-numbers"), "{ids:?}");
+        assert!(ids.contains(&"silent-failure"), "{ids:?}");
+    }
 }

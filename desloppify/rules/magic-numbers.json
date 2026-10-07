@@ -1,10 +1,22 @@
 {
-  "level": 1,
-  "scope": "functions",
+  "unit": "functions",
+  "levels": {
+    "decide": 1,
+    "explain": 2
+  },
   "exclude": [
+    "**/*_tests.rs",
     "**/benches/**",
     "**/examples/**",
+    "**/tests.rs",
     "**/tests/**"
   ],
-  "prompt": "Flag numeric literals other than 0, 1 and 2 whose meaning is not obvious from the line they are on: thresholds, sizes, counts, bit masks, timeouts, protocol values. Suggest a constant name for each. Do not flag literals in tests, in `const`/`static` definitions, unit conversions that are obvious (`1000` ms per second), or the coefficients of a documented mathematical formula."
+  "question": "Does this function use a numeric literal other than 0, 1 or 2 whose meaning is not obvious from its line?",
+  "fine": {
+    "named_or_obvious": "Every such number is a named constant, an obvious unit conversion, or a coefficient of a documented formula — or there are none."
+  },
+  "violations": {
+    "magic_number": "A threshold, size, count, bit mask, timeout or protocol value appears as a bare literal."
+  },
+  "guidance": "Suggest a constant name for each."
 }

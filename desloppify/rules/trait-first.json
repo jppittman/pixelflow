@@ -1,8 +1,19 @@
 {
-  "level": 3,
-  "scope": "file",
+  "unit": "file",
+  "levels": {
+    "decide": 2,
+    "explain": 3
+  },
   "skills": [
     "style-guide"
   ],
-  "prompt": "Flag a second implementation of something this file already does one way that was not written as a second `impl` of a trait: a parallel free function (`foo` and `foo_fast`), a copy of a type or module with small changes, or a mode flag/enum parameter switching an existing implementation's behavior. Also flag a `Box<dyn Trait>` or `&dyn Trait` called on a hot path (per element, per pixel, per frame) where the set of implementations is fixed and a `match` over an enum or a generic would settle it once. Name the trait that should exist."
+  "question": "Does this file implement something a second way without a trait, or pay dynamic dispatch on a hot path where the implementations are fixed?",
+  "fine": {
+    "one_way_or_trait": "Each category is done one way, or its implementations are impls of one trait; dynamic dispatch, if any, is off the hot path or over an open set."
+  },
+  "violations": {
+    "second_way": "A second implementation as a parallel free function (`foo` and `foo_fast`), a copied type or module, or a mode flag switching an implementation's behavior.",
+    "hot_dyn": "`Box<dyn Trait>`/`&dyn Trait` called per element, pixel or frame where a `match` over an enum or a generic would settle it once."
+  },
+  "guidance": "Name the trait that should exist."
 }

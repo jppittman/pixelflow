@@ -1,8 +1,17 @@
 {
-  "level": 1,
-  "scope": "file",
+  "unit": "outline",
+  "levels": {
+    "decide": 1,
+    "explain": 2
+  },
   "paths": [
     "pixelflow-*/**"
   ],
-  "prompt": "This file is in a pixelflow crate, a general-purpose graphics library. Flag anything specific to a terminal emulator: PTYs, ANSI/VT escape sequences, terminal grids, cells, cursors or scrollback, shell or TTY handling, terminal key encoding. Generic text, glyph and font rendering is fine."
+  "question": "This file is in a general-purpose graphics library. Does it contain anything specific to a terminal emulator?",
+  "fine": {
+    "general_purpose": "Nothing terminal-specific; generic text, glyph and font rendering is fine."
+  },
+  "violations": {
+    "terminal_logic": "PTYs, ANSI/VT escape sequences, terminal grids, cells, cursors or scrollback, shell or TTY handling, or terminal key encoding."
+  }
 }

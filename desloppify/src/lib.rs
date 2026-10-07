@@ -6,6 +6,7 @@
 //! into its prompt. Each matched snippet is one rate-limited agent call.
 
 pub mod agent;
+pub mod decide;
 pub mod language;
 pub mod model;
 pub mod rate_limit;

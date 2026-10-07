@@ -1,10 +1,9 @@
 {
-  "level": 1,
-  "scope": {
-    "language": "rust",
-    "query": "((function_item (visibility_modifier) @vis body: (_) @cut) @target (#not-eq? @vis \"pub(super)\"))\n([(struct_item (visibility_modifier) @vis) (enum_item (visibility_modifier) @vis) (union_item (visibility_modifier) @vis) (trait_item (visibility_modifier) @vis) (type_item (visibility_modifier) @vis) (const_item (visibility_modifier) @vis) (static_item (visibility_modifier) @vis) (mod_item (visibility_modifier) @vis)] @target (#not-eq? @vis \"pub(super)\"))"
+  "unit": "outline",
+  "levels": {
+    "decide": 1,
+    "explain": 2
   },
-  "review": "together",
   "exclude": [
     "**/*_tests.rs",
     "**/benches/**",
@@ -21,5 +20,15 @@
   "skills": [
     "behavioral-contracts"
   ],
-  "prompt": "This is an implementation file. Shown are its items (functions as signatures only) that carry a visibility wider than `pub(super)`. Flag each one that lets code outside this module reach past the module root: a `pub`/`pub(crate)` function or trait (it belongs in the module root, as or behind a trait), a `pub mod`, or a `pub` type the module root does not re-export with `pub use`. A `pub` type that the module root re-exports is fine, as are `pub` fields and methods of a `pub(super)` type, and a `pub` method the module root's contract declares \u2014 as a real trait, or as the trait shape documented in its module docs \u2014 with the same signature. A `pub` method missing from that contract, or whose signature differs from it, is a finding either way. If the module root shown is `lib.rs` or `main.rs`, any public item here means this file is a module without a contract and should become a directory with a `mod.rs`; say so once."
+  "question": "This is an implementation file. Does it expose anything wider than `pub(super)` that its module root's contract does not declare?",
+  "fine": {
+    "private": "Everything is private or `pub(super)`, or the only wider items are `pub` types the module root re-exports with `pub use`, `pub` fields and methods of a `pub(super)` type, and `pub` methods the root's contract declares with the same signature."
+  },
+  "violations": {
+    "exposed_behavior": "A `pub` or `pub(crate)` function or trait that belongs in the module root, as or behind a trait.",
+    "unexported_type": "A `pub` type or `pub mod` the module root does not re-export.",
+    "contract_mismatch": "A `pub` method missing from the root's contract (its traits or documented trait shape), or with a different signature.",
+    "contractless_module": "The module root is `lib.rs` or `main.rs` and this file offers the crate public items: it is a module with no contract yet and should become a directory with a `mod.rs`."
+  },
+  "guidance": "Name each item and where it belongs."
 }

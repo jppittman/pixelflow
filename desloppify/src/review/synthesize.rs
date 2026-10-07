@@ -8,7 +8,7 @@ use anyhow::Result;
 use super::{Finding, Report};
 use crate::agent::{Answer, Ask, Question};
 use crate::model::ModelLevel;
-use crate::rule::Rule;
+use crate::rule::{Rule, Verdict};
 
 const LEAD: &str = "\
 You are the lead reviewer. Other reviewers each applied one rule, given below, \
@@ -54,16 +54,24 @@ fn brief(rules: &[Rule], report: &Report) -> String {
         .iter()
         .filter(|r| report.findings.iter().any(|f| f.rule == r.id))
     {
-        // The rule's own prompt is its last paragraph; skills ahead of it are
-        // context the reviewers needed, not something the lead must judge.
-        let prompt = rule.instructions.rsplit("\n\n").next().unwrap_or_default();
-        brief.push_str(&format!("- `{}`: {prompt}\n", rule.id));
+        brief.push_str(&format!("- `{}`: {}\n", rule.id, rule.decision.question));
+        for outcome in rule
+            .decision
+            .outcomes
+            .iter()
+            .filter(|o| o.verdict == Verdict::Violation)
+        {
+            brief.push_str(&format!("  - `{}`: {}\n", outcome.name, outcome.meaning));
+        }
     }
     brief.push_str("\n## Findings\n");
     for (path, findings) in by_file {
         brief.push_str(&format!("\n### {}\n\n", path.display()));
         for f in findings {
-            brief.push_str(&format!("- line {} [{}]: {}\n", f.line, f.rule, f.message));
+            brief.push_str(&format!(
+                "- line {} [{}/{}]: {}\n",
+                f.line, f.rule, f.outcome, f.message
+            ));
         }
     }
     if !report.failures.is_empty() {

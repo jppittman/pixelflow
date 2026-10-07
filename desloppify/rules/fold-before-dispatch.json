@@ -1,10 +1,23 @@
 {
-  "level": 2,
-  "scope": "functions",
+  "unit": "functions",
+  "levels": {
+    "decide": 1,
+    "explain": 2
+  },
   "exclude": [
+    "**/*_tests.rs",
     "**/benches/**",
     "**/examples/**",
+    "**/tests.rs",
     "**/tests/**"
   ],
-  "prompt": "Flag dispatch where a fold was available: an `if`/`else` whose two arms compute what one expression could (a value clamped, a sign normalized, an `Option` defaulted) so that both cases stay live downstream for no reason. Also flag `else if` chains testing an enum or a fixed set of conditions that should be a `match`, and `if`/`else` arms that send execution to genuinely different behaviors (those are dispatch and should say so with a `match` over an enum). Explain which cases could be collapsed and how. Do not flag guard clauses that return early."
+  "question": "Does this function keep cases alive that a fold would collapse, or dispatch with `if`/`else` where a `match` should say so?",
+  "fine": {
+    "folded": "Cases are collapsed wherever they can be and irreducible cases are a `match` over an enum — or the function has no branching beyond guard clauses that return early."
+  },
+  "violations": {
+    "unfolded": "An `if`/`else` computes in two arms what one expression could (a clamp, a sign normalization, an `Option` default), keeping both cases live downstream for nothing.",
+    "disguised_dispatch": "An `else if` chain over an enum or a fixed set of conditions, or `if`/`else` arms sending execution to genuinely different behaviors, that should be a `match`."
+  },
+  "guidance": "Say which cases collapse and how, or what the `match` is over. Guard clauses that return early are not findings."
 }

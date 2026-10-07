@@ -1,9 +1,22 @@
 {
-  "level": 1,
-  "scope": {
-    "language": "rust",
-    "query": "((attribute_item (attribute (identifier) @attr)) . (function_item name: (identifier) @target) (#eq? @attr \"test\"))"
+  "unit": "outline",
+  "levels": {
+    "decide": 1,
+    "explain": 1
   },
-  "review": "together",
-  "prompt": "These are the test function names in one file. Prefix each with \"it should\" and flag the ones that do not then read as a sentence telling you what broke if the test fails (`test1`, `min_max`, `handles_edge_case`, `basic`, `works`). Suggest a better name for each."
+  "paths": [
+    "**/tests/**",
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests.rs",
+    "**/*_tests.rs"
+  ],
+  "question": "Prefixed with \"it should\", does every test name here read as a sentence saying what broke when the test fails?",
+  "fine": {
+    "sentences": "Every `#[test]` name reads as a sentence after \"it should\", or there are no tests here."
+  },
+  "violations": {
+    "unreadable_name": "A test named like `test1`, `min_max`, `handles_edge_case`, `basic` or `works` says nothing about what broke."
+  },
+  "guidance": "Suggest a better name for each."
 }

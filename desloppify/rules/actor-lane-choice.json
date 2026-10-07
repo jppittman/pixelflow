@@ -1,6 +1,9 @@
 {
-  "level": 2,
-  "scope": "file",
+  "unit": "file",
+  "levels": {
+    "decide": 1,
+    "explain": 2
+  },
   "paths": [
     "core-term/**",
     "pixelflow-runtime/**",
@@ -9,5 +12,14 @@
   "skills": [
     "pixelflow-architecture"
   ],
-  "prompt": "Flag messages sent on the wrong priority lane: bulk or continuous data (PTY output, frames, render requests) sent as Control or Management, or latency-critical events (user input, resize, close, lifecycle) sent as Data where backpressure could delay them. Also flag a `let _ =` or ignored result on a send."
+  "question": "Does this code send any actor message on the wrong priority lane, or ignore a send's result?",
+  "fine": {
+    "no_sends": "The code sends no actor messages.",
+    "right_lanes": "Every message goes on its lane — bulk or continuous data (PTY output, frames, render requests) as Data; latency-critical events (input, resize, close, lifecycle, config) as Control or Management — and every send's result is handled."
+  },
+  "violations": {
+    "wrong_lane": "A bulk or continuous message is sent as Control or Management, or a latency-critical event as Data, where backpressure could delay it.",
+    "ignored_send": "A send's result is discarded (`let _ =`, `.ok()`) where a failure needed handling."
+  },
+  "guidance": "Name the message and the lane it belongs on."
 }

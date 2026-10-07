@@ -1,14 +1,22 @@
 {
-  "level": 1,
-  "scope": {
-    "language": "rust",
-    "query": "(call_expression function: (field_expression field: (field_identifier) @method (#match? @method \"^(unwrap|expect)$\"))) @target"
+  "unit": "functions",
+  "levels": {
+    "decide": 1,
+    "explain": 2
   },
-  "review": "function",
   "exclude": [
-    "**/tests/**",
+    "**/*_tests.rs",
     "**/benches/**",
-    "**/examples/**"
+    "**/examples/**",
+    "**/tests.rs",
+    "**/tests/**"
   ],
-  "prompt": "Flag this `unwrap`/`expect` if valid input to the program can make it panic. Do not flag it in tests, or where the line itself (or an invariant established immediately above) makes the failure impossible."
+  "question": "Can an `unwrap`, `expect` or `panic!` in this function fire on valid input to the program?",
+  "fine": {
+    "cannot_fire": "Every one is ruled out by its own line or an invariant established just above it — or there are none."
+  },
+  "violations": {
+    "panics_on_valid_input": "Some valid input makes one fire, where the failure should be returned or the invariant carried by a type."
+  },
+  "guidance": "Name the input that makes it fire."
 }

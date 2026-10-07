@@ -1,20 +1,28 @@
 {
-  "level": 2,
-  "scope": {
-    "language": "rust",
-    "query": "((impl_item !trait body: (declaration_list (function_item (visibility_modifier) @vis body: (_) @cut) @target)) (#not-eq? @vis \"pub(super)\"))"
+  "unit": "outline",
+  "levels": {
+    "decide": 1,
+    "explain": 2
   },
-  "review": "together",
   "exclude": [
-    "**/tests/**",
+    "**/*_tests.rs",
     "**/benches/**",
     "**/examples/**",
     "**/tests.rs",
-    "**/*_tests.rs"
+    "**/tests/**"
   ],
   "context": "module_root",
   "skills": [
     "behavioral-contracts"
   ],
-  "prompt": "Shown are this file's public inherent methods, as signatures. The module's contract is its traits \u2014 real ones, or for a type with a single implementation, a trait shape documented in the module root's docs (shown as context when this file is not the root). Flag each method that offers behavior outside that contract: a method a trait impl merely forwards to (a second door to the same behavior), behavior no trait or documented shape covers, or a method whose signature differs from the documented shape's. Suggest where it belongs. Do not flag constructors (`new`, `with_*`, `from_*`, builders) or plain accessors of a data type with no behavior."
+  "question": "Does this file give any public inherent method behavior that its module's contract — its traits, or the trait shape documented in the module root's docs — does not declare?",
+  "fine": {
+    "no_public_methods": "There are no public inherent methods beyond constructors (`new`, `with_*`, `from_*`, builders) and plain accessors of data types.",
+    "through_the_contract": "Every public inherent method is declared by the contract, with the same signature."
+  },
+  "violations": {
+    "second_door": "A public method duplicates behavior a trait impl forwards to, so callers can bypass the contract.",
+    "undeclared_behavior": "A public method offers behavior no trait or documented shape declares, or its signature differs from the documented one."
+  },
+  "guidance": "Name each method and the trait method it belongs on."
 }

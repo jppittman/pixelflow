@@ -33,6 +33,19 @@ impl TryFrom<u64> for ModelLevel {
     }
 }
 
+impl ModelLevel {
+    /// The next level up; `None` at the top.
+    #[must_use]
+    pub fn above(self) -> Option<Self> {
+        match self {
+            Self::Lite => Some(Self::Fast),
+            Self::Fast => Some(Self::Strong),
+            Self::Strong => Some(Self::Frontier),
+            Self::Frontier => None,
+        }
+    }
+}
+
 impl From<ModelLevel> for u64 {
     fn from(level: ModelLevel) -> Self {
         level as u64

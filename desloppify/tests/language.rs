@@ -4,25 +4,23 @@
 use desloppify::language::Language;
 use desloppify::rule::{Part, TARGET_CAPTURE};
 
-const PARTS: [Part; 5] = [
-    Part::Functions,
-    Part::FunctionNames,
-    Part::FunctionBodies,
-    Part::Types,
-    Part::Comments,
-];
+const PARTS: [Part; 3] = [Part::Functions, Part::FunctionSignatures, Part::Types];
+
+fn compiles_with_target(language: Language, source: &str) {
+    let query = tree_sitter::Query::new(&language.grammar(), source)
+        .unwrap_or_else(|e| panic!("{language:?} {source}: {e}"));
+    assert!(query.capture_index_for_name(TARGET_CAPTURE).is_some());
+}
 
 #[test]
 fn every_part_query_compiles_and_captures_target() {
     for language in Language::ALL {
         for part in PARTS {
-            let Some(source) = language.query(part) else {
-                continue;
-            };
-            let query = tree_sitter::Query::new(&language.grammar(), source)
-                .unwrap_or_else(|e| panic!("{language:?} {part:?}: {e}"));
-            assert!(query.capture_index_for_name(TARGET_CAPTURE).is_some());
+            if let Some(source) = language.query(part) {
+                compiles_with_target(language, source);
+            }
         }
+        compiles_with_target(language, language.bodies());
     }
 }
 

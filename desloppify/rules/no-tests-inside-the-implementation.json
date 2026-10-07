@@ -1,19 +1,25 @@
 {
-  "level": 1,
-  "scope": {
-    "language": "rust",
-    "query": "(mod_item name: (identifier) @name body: (_) @cut (#match? @name \"^tests?$|_tests?$\")) @target"
+  "unit": "outline",
+  "levels": {
+    "decide": 1,
+    "explain": 1
   },
-  "review": "together",
   "exclude": [
-    "**/tests/**",
+    "**/*_tests.rs",
     "**/benches/**",
     "**/examples/**",
     "**/tests.rs",
-    "**/*_tests.rs"
+    "**/tests/**"
   ],
   "skills": [
     "behavioral-contracts"
   ],
-  "prompt": "Shown are test modules declared inside the source tree, where they can see the module's private items. Tests belong in the crate's `tests/` directory, where only the exported interface is visible. Flag each one: its tests should move there and drive the exported API."
+  "question": "Does this file declare a test module inside the source tree, such as `#[cfg(test)] mod tests`?",
+  "fine": {
+    "no_test_module": "No test module is declared here."
+  },
+  "violations": {
+    "test_module": "A test module sits in the source tree, where its tests can see private items; tests belong in the crate's `tests/` directory, driving the exported interface."
+  },
+  "guidance": "Name the module and the exported entry point its tests should drive instead."
 }
