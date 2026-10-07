@@ -1,0 +1,10 @@
+{
+  "level": 1,
+  "scope": "functions",
+  "exclude": [
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests/**"
+  ],
+  "prompt": "Flag places where a failure is swallowed or replaced by a plausible value: `.ok()`, `.unwrap_or_default()`, `.unwrap_or(..)`, `if let Ok(..)`/`if let Some(..)` with no else on an operation whose failure the caller needed to know about; an error logged and then ignored; a fallback taken silently where the rule is to fail loud \u2014 panic or return the error, naming the cause \u2014 (a degenerate extent, an unbound slot, a width mismatch). Do not flag absence that is a normal outcome (a lookup that may miss, an optional config value) or tests."
+}

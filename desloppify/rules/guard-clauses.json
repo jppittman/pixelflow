@@ -1,0 +1,10 @@
+{
+  "level": 1,
+  "scope": "functions",
+  "exclude": [
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests/**"
+  ],
+  "prompt": "Read each function top to bottom and track the cases still open: inputs not yet handled, invariants not yet checked. That number should only go down as you read: the top is the hardest part, where everything is still possible, each guard discharges one case and exits, and at the bottom one case is left and what to do is obvious. Flag functions where it doesn't: the main path indented inside the happy branch of an `if`/`if let`/`match` whose other branch only bails out; an `else` after a branch that already returns, breaks or continues; `if let Some(x) = ... { ... } else { return }` that `let ... else` or `?` would flatten; a check made late that could be made first; and cases reopened after being handled (a value re-checked further down). Report the line where the case should have been discharged and how. Do not flag a single shallow `if`, or a `match` whose arms are all real work."
+}

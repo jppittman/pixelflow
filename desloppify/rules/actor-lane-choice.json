@@ -1,0 +1,13 @@
+{
+  "level": 2,
+  "scope": "file",
+  "paths": [
+    "core-term/**",
+    "pixelflow-runtime/**",
+    "actor-scheduler/**"
+  ],
+  "skills": [
+    "pixelflow-architecture"
+  ],
+  "prompt": "Flag messages sent on the wrong priority lane: bulk or continuous data (PTY output, frames, render requests) sent as Control or Management, or latency-critical events (user input, resize, close, lifecycle) sent as Data where backpressure could delay them. Also flag a `let _ =` or ignored result on a send."
+}

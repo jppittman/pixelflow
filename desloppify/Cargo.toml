@@ -1,0 +1,27 @@
+[package]
+name = "desloppify"
+version = "0.1.0"
+edition = "2024"
+description = "Rule-driven code review: tree-sitter finds the code, a tiered agent reviews it."
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+globset = "0.4"
+schemars = "1"
+rig-core = { version = "0.43", features = ["reqwest"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+streaming-iterator = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "time"] }
+tree-sitter = "0.27"
+tree-sitter-rust = "0.24"
+
+[dev-dependencies]
+http = "1"
+
+[lints]
+workspace = true

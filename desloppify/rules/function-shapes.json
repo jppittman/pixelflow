@@ -1,0 +1,15 @@
+{
+  "level": 3,
+  "scope": "function_signatures",
+  "review": "crate",
+  "exclude": [
+    "**/tests/**",
+    "**/benches/**",
+    "**/examples/**"
+  ],
+  "skills": [
+    "style-guide",
+    "behavioral-contracts"
+  ],
+  "prompt": "Shown are the signatures of every function in one crate, file by file. Read them all together and look for the patterns no single function shows:\n- Names that are namespaces: a name stacking concepts (`compile_arena_dag_jet`), or a family that grew suffixes (`foo`, `foo_with_ctx`, `foo_scanline`) \u2014 it wants to be a module, a type with methods, or a builder.\n- Argument lists that recur: the same three or four parameters travelling together through several functions, or any function with four or more \u2014 name the struct they form.\n- A missing denotation: functions that all take or return the same loose pieces (a `u32` and a `bool`, a pair of floats, a string that means one of a few things) where a named type would say what they are and refuse the wrong value.\n- Extraction: functions in different files that are the same operation spelled differently, or a group of functions that are one trait's methods without the trait.\n- Inconsistent vocabulary: one idea under several verbs (`get_`/`fetch_`/`load_`), or one verb meaning different things.\nReport each pattern once, at one representative function, naming the others it covers, and say what the extraction or type would be. Do not report single-function nits."
+}

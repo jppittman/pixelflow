@@ -1,0 +1,12 @@
+{
+  "level": 1,
+  "scope": "file",
+  "paths": [
+    "pixelflow-*/**"
+  ],
+  "exclude": [
+    "pixelflow-codegen/src/emit/**",
+    "pixelflow-codegen/src/isa/**"
+  ],
+  "prompt": "Flag code that makes SIMD visible outside pixelflow-codegen's emitters: a type, constant or parameter naming a lane count or vector width, `std::arch`/`core::arch` intrinsics, `__m256`-style types, `#[target_feature]`, per-lane loops or raw lane arithmetic, a choice of ISA by `cfg(target_feature)` or build flags, or a public item exposing a vector. The width belongs to the JIT (`jit_vector_bytes()`), decided at startup. Do not flag reading `jit_vector_bytes()` where a buffer must be sized to it."
+}

@@ -1,0 +1,16 @@
+{
+  "level": 1,
+  "scope": "functions",
+  "paths": [
+    "pixelflow-runtime/**",
+    "pixelflow-graphics/**",
+    "pixelflow-core/**",
+    "core-term/src/**"
+  ],
+  "exclude": [
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests/**"
+  ],
+  "prompt": "Flag heap allocation in code that runs every frame or every cell/glyph/pixel during rendering: `Vec::new`/`vec!`/`collect` into a new collection, `String`/`format!`, `Box::new`, `clone()` of a heap type, `HashMap` construction. Suggest the reused buffer or cache. Do not flag setup, construction, caching on a miss, or code that plainly runs once."
+}

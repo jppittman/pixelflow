@@ -1,0 +1,19 @@
+{
+  "level": 3,
+  "scope": {
+    "language": "rust",
+    "query": "[(trait_item) (impl_item trait: (_))] @target"
+  },
+  "review": "file",
+  "exclude": [
+    "**/tests/**",
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests.rs",
+    "**/*_tests.rs"
+  ],
+  "skills": [
+    "behavioral-contracts"
+  ],
+  "prompt": "The lines named are traits and trait impls. Flag contract methods that perform their effects instead of returning them: writing to a file descriptor, socket or PTY, sending on a channel or actor handle, spawning, sleeping, reading a clock or global state \u2014 where the method could instead return (or push into an output parameter) a value describing what should happen, as `EmulatorAction`, `AnsiBatch` and `DriverOut` do, leaving a thin adapter to perform it. Name the effect type that would replace it. Do not flag the adapter layer whose whole job is performing effects (an actor's `handle_*` that forwards a returned effect to a channel)."
+}

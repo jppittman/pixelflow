@@ -1,0 +1,19 @@
+{
+  "level": 1,
+  "scope": {
+    "language": "rust",
+    "query": "(mod_item name: (identifier) @name body: (_) @cut (#match? @name \"^tests?$|_tests?$\")) @target"
+  },
+  "review": "together",
+  "exclude": [
+    "**/tests/**",
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests.rs",
+    "**/*_tests.rs"
+  ],
+  "skills": [
+    "behavioral-contracts"
+  ],
+  "prompt": "Shown are test modules declared inside the source tree, where they can see the module's private items. Tests belong in the crate's `tests/` directory, where only the exported interface is visible. Flag each one: its tests should move there and drive the exported API."
+}

@@ -1,0 +1,14 @@
+{
+  "level": 1,
+  "scope": {
+    "language": "rust",
+    "query": "(call_expression function: (field_expression field: (field_identifier) @method (#match? @method \"^(unwrap|expect)$\"))) @target"
+  },
+  "review": "function",
+  "exclude": [
+    "**/tests/**",
+    "**/benches/**",
+    "**/examples/**"
+  ],
+  "prompt": "Flag this `unwrap`/`expect` if valid input to the program can make it panic. Do not flag it in tests, or where the line itself (or an invariant established immediately above) makes the failure impossible."
+}

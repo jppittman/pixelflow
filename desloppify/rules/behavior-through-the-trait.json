@@ -1,0 +1,20 @@
+{
+  "level": 2,
+  "scope": {
+    "language": "rust",
+    "query": "((impl_item !trait body: (declaration_list (function_item (visibility_modifier) @vis body: (_) @cut) @target)) (#not-eq? @vis \"pub(super)\"))"
+  },
+  "review": "together",
+  "exclude": [
+    "**/tests/**",
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests.rs",
+    "**/*_tests.rs"
+  ],
+  "context": "module_root",
+  "skills": [
+    "behavioral-contracts"
+  ],
+  "prompt": "Shown are this file's public inherent methods, as signatures. The module's contract is its traits \u2014 real ones, or for a type with a single implementation, a trait shape documented in the module root's docs (shown as context when this file is not the root). Flag each method that offers behavior outside that contract: a method a trait impl merely forwards to (a second door to the same behavior), behavior no trait or documented shape covers, or a method whose signature differs from the documented shape's. Suggest where it belongs. Do not flag constructors (`new`, `with_*`, `from_*`, builders) or plain accessors of a data type with no behavior."
+}

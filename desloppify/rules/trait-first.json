@@ -1,0 +1,8 @@
+{
+  "level": 3,
+  "scope": "file",
+  "skills": [
+    "style-guide"
+  ],
+  "prompt": "Flag a second implementation of something this file already does one way that was not written as a second `impl` of a trait: a parallel free function (`foo` and `foo_fast`), a copy of a type or module with small changes, or a mode flag/enum parameter switching an existing implementation's behavior. Also flag a `Box<dyn Trait>` or `&dyn Trait` called on a hot path (per element, per pixel, per frame) where the set of implementations is fixed and a `match` over an enum or a generic would settle it once. Name the trait that should exist."
+}

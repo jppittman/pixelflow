@@ -1,0 +1,9 @@
+{
+  "level": 1,
+  "scope": {
+    "language": "rust",
+    "query": "((attribute_item (attribute (identifier) @attr)) . (function_item name: (identifier) @target) (#eq? @attr \"test\"))"
+  },
+  "review": "together",
+  "prompt": "These are the test function names in one file. Prefix each with \"it should\" and flag the ones that do not then read as a sentence telling you what broke if the test fails (`test1`, `min_max`, `handles_edge_case`, `basic`, `works`). Suggest a better name for each."
+}

@@ -1,0 +1,16 @@
+{
+  "level": 2,
+  "scope": "file",
+  "paths": [
+    "**/tests/**",
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests.rs",
+    "**/*_tests.rs"
+  ],
+  "context": "module_root",
+  "skills": [
+    "behavioral-contracts"
+  ],
+  "prompt": "These are tests. Every test must be black-box: it may only drive the module's exported interface and observe what that interface returns, even when the behavior it checks is internal. Flag any test that reaches past it: touching `pub(super)` fields or private helpers, constructing internal state directly instead of reaching it through the interface's inputs, calling an implementation type's internal methods, or asserting on intermediates rather than the returned effects or observable state. For each, say how the same behavior is observed through the interface (which input to feed, which output to read), and if it cannot be, name the input or effect the interface is missing \u2014 an injected clock or seed, a returned effect \u2014 rather than suggesting a way in. Where several tests repeat a check every implementation of a trait should pass, suggest a generic contract test (`fn contract<T: Trait>(...)`)."
+}

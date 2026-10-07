@@ -1,0 +1,8 @@
+{
+  "level": 1,
+  "scope": "file",
+  "paths": [
+    "pixelflow-*/**"
+  ],
+  "prompt": "This file is in a pixelflow crate, a general-purpose graphics library. Flag anything specific to a terminal emulator: PTYs, ANSI/VT escape sequences, terminal grids, cells, cursors or scrollback, shell or TTY handling, terminal key encoding. Generic text, glyph and font rendering is fine."
+}
