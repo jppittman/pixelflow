@@ -28,11 +28,7 @@ fn eval_point(jit: &pixelflow_codegen::CompiledKernel, x: f32, y: f32) -> f32 {
     out[0]
 }
 
-fn eval_points_1d(jit: &pixelflow_codegen::CompiledKernel, inputs: &[f32]) -> Vec<f32> {
-    inputs.iter().map(|&x| eval_point(jit, x, 0.0)).collect()
-}
-
-fn eval_points_2d(jit: &pixelflow_codegen::CompiledKernel, inputs: &[(f32, f32)]) -> Vec<f32> {
+fn eval_points(jit: &pixelflow_codegen::CompiledKernel, inputs: &[(f32, f32)]) -> Vec<f32> {
     inputs.iter().map(|&(x, y)| eval_point(jit, x, y)).collect()
 }
 
@@ -40,8 +36,8 @@ fn check(name: &str, k: &Kernel, inputs: &[f32], reference: impl Fn(f32) -> f32)
     let jit = jit_cache::compile(k, pixelflow_ir::LatticeShape::POINT)
         .unwrap_or_else(|e| panic!("{name}: kernel failed to compile on this backend: {e}"))
         .kernel;
-    let results = eval_points_1d(&jit, inputs);
-    for (&x, got) in inputs.iter().zip(results) {
+    for &x in inputs {
+        let got = eval_point(&jit, x, 0.0);
         let want = reference(x);
         let rel = ((got - want) / want.abs().max(1e-6)).abs();
         assert!(
@@ -102,7 +98,7 @@ fn assert_tiers_agree_binary(name: &str, k: &Kernel, op: pixelflow_ir::OpKind) {
     .filter(|&(x, y)| !op.fold_is_platform_specific(&[x, y]))
     .collect();
 
-    let results = eval_points_2d(&jit, &inputs);
+    let results = eval_points(&jit, &inputs);
     for (&(x, y), got) in inputs.iter().zip(results) {
         let want = op.eval_binary(x, y).expect("oracle covers this op");
         // Bit-exact, not `==`: `-0.0 == 0.0` would hide a signed-zero
@@ -155,7 +151,7 @@ fn nan_comparisons_agree_between_tiers() {
         .filter(|&(x, y)| !op.fold_is_platform_specific(&[x, y]))
         .collect();
 
-        let results = eval_points_2d(&jit, &inputs);
+        let results = eval_points(&jit, &inputs);
         for (&(x, y), got) in inputs.iter().zip(results) {
             let want = op.eval_binary(x, y).expect("oracle covers this op");
             assert_eq!(
@@ -195,9 +191,16 @@ fn a_folded_mask_blends_like_a_computed_one() {
         .expect("mask kernel compiles")
         .kernel;
 
-    let res = eval_points_1d(&jit, &[1.0, -1.0]);
-    assert_eq!(res[0], 7.0, "mask true must select if_true exactly");
-    assert_eq!(res[1], 9.0, "mask false must select if_false exactly");
+    assert_eq!(
+        eval_point(&jit, 1.0, 0.0),
+        7.0,
+        "mask true must select if_true exactly"
+    );
+    assert_eq!(
+        eval_point(&jit, -1.0, 0.0),
+        9.0,
+        "mask false must select if_false exactly"
+    );
 }
 
 #[test]
@@ -211,9 +214,8 @@ fn round_agrees_between_tiers_away_from_ties() {
     // nearest-even, aarch64 FRINTA ties-away, combinator `(x+0.5).floor()`), so
     // there is no answer to assert — see `tie_result_is_platform_specific`.
     assert!(OpKind::Round.fold_is_platform_specific(&[2.5]));
-    let inputs = [2.4f32, 2.6, -2.4, -2.6, 0.2, 7.0, -7.0];
-    let results = eval_points_1d(&jit, &inputs);
-    for (&x, got) in inputs.iter().zip(results) {
+    for x in [2.4f32, 2.6, -2.4, -2.6, 0.2, 7.0, -7.0] {
+        let got = eval_point(&jit, x, 0.0);
         let want = OpKind::Round.eval_unary(x).expect("oracle covers Round");
         assert_eq!(got, want, "round({x}): JIT {got} vs oracle {want}");
     }
