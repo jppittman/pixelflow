@@ -131,11 +131,6 @@ impl Inst {
     }
     #[must_use]
     #[inline(always)]
-    pub fn str(src: impl Into<StrReg>, addr: Mem) -> Self {
-        Self::Str(Str::new(src, addr))
-    }
-    #[must_use]
-    #[inline(always)]
     pub fn str_q(src: Reg, addr: Mem) -> Self {
         Self::Str(Str::q(src, addr))
     }

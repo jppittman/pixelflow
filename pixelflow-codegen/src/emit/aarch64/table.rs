@@ -596,15 +596,6 @@ impl Str {
 
     #[must_use]
     #[inline]
-    pub fn new(src: impl Into<StrReg>, addr: Mem) -> Self {
-        Self {
-            src: src.into(),
-            addr,
-        }
-    }
-
-    #[must_use]
-    #[inline]
     pub const fn q(src: Reg, addr: Mem) -> Self {
         Self {
             src: StrReg::Q(src),

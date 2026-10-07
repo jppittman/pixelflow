@@ -789,8 +789,7 @@ mod tests {
     #![allow(clippy::needless_range_loop)]
 
     /// Executes the bytes on this host's CPU, so every test first asks
-    /// whether it can (`skip_unless_host_runs!`); the encodings themselves
-    /// are pinned bytewise on every host by the tests above. The `extern
+    /// whether it can (`skip_unless_host_runs!`). The `extern
     /// "C"` kernels take `zmm` values, which the ABI only lets a caller
     /// compiled with AVX-512 pass — hence `#[target_feature]` on the
     /// functions that call them, and nowhere else.
