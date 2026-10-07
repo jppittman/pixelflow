@@ -124,7 +124,6 @@ impl Layout {
         let count = blocks.tree.len();
         let block_at = |pos: usize| blocks.of_region[own.region_of(pos).0];
 
-        // Each block's own values, in the order they already had.
         let mut members: Vec<Vec<usize>> = alloc::vec![Vec::new(); count];
         for pos in 0..len {
             members[block_at(pos)].push(pos);
@@ -262,8 +261,6 @@ impl Layout {
             position[old] = new;
         }
 
-        // The branches, in the new order: one per `If` with an arm that earned
-        // a block, the arm that did not left empty at the `If`.
         let mut run_of_arm = alloc::vec![None; own.arms().len()];
         for block in 1..count {
             let arm = blocks.arm[block].expect("a block but the scope is an arm");

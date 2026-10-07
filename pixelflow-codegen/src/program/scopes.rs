@@ -136,7 +136,6 @@ impl ScopedSchedule {
 /// its parent's, so each scope's children are carried to the new order as the
 /// scope is laid out.
 pub(crate) fn lay_out(scoped: &mut ScopedSchedule) {
-    // One `FoldReads` per scope, the body's at 0 and `Fold(j)`'s at `j + 1`.
     let slot = |scope: Scope| match scope {
         Scope::Body => 0,
         Scope::Fold(j) => j + 1,
@@ -391,8 +390,6 @@ fn extract_folds_bound_by(
     // store — so that scope binds its binder, and a lane-varying value is
     // computed here, not somewhere deeper.
     let bound = bound.union(lane_binders(&schedule));
-    // A binder this scope is not inside: what a value carrying one is
-    // nested under, and what a fold read from outside does not carry.
     let deeper = Variance::BINDERS.bits() & !bound.bits();
     let hoisted =
         |v: ValueId| placeholder[v.0 as usize] || variance[v.0 as usize].bits() & deeper == 0;

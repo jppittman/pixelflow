@@ -338,10 +338,10 @@ fn vroundps(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
 
 // --- int/float convert (0F, W0) ---
 fn vcvttps2dq(c: &mut Vec<u8>, d: u8, s: u8) {
-    assemble(c, [Vex::m0f_f3(0x5B).rrr(d, UNUSED_VVVV, s)]); // F3 prefix
+    assemble(c, [Vex::m0f_f3(0x5B).rrr(d, UNUSED_VVVV, s)]);
 }
 fn vcvtdq2ps(c: &mut Vec<u8>, d: u8, s: u8) {
-    assemble(c, [Vex::m0f(0x5B).rrr(d, UNUSED_VVVV, s)]); // no prefix
+    assemble(c, [Vex::m0f(0x5B).rrr(d, UNUSED_VVVV, s)]);
 }
 
 // --- integer-domain (66 prefix, 0F, W0) ---
@@ -589,9 +589,9 @@ pub fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount
 pub fn emit_if(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg, tmp: Option<Reg>) {
     let tmp = super::declared_temp(tmp);
     debug_assert!(tmp.0 != dst.0 && tmp.0 != if_true.0 && tmp.0 != if_false.0);
-    vandps(code, tmp.0, dst.0, if_true.0); // tmp = mask & if_true
-    vandnps(code, dst.0, dst.0, if_false.0); // dst = ~mask & if_false
-    vorps(code, dst.0, tmp.0, dst.0); // dst = blended
+    vandps(code, tmp.0, dst.0, if_true.0);
+    vandnps(code, dst.0, dst.0, if_false.0);
+    vorps(code, dst.0, tmp.0, dst.0);
 }
 
 /// `vmovmskps eax, ymmSRC` — gather the 8 lane sign bits into eax[7:0].

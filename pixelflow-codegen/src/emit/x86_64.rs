@@ -502,9 +502,6 @@ impl From<MovLoadPtr> for Inst {
 impl AsmInsn for Inst {
     #[inline]
     fn label_ref(self) -> Option<LabelRef> {
-        // A branch is an ordinary instruction whose operand happens to be a
-        // name: it emits a placeholder displacement above, and this says which
-        // label the assembler should measure it against.
         match self {
             Inst::Jmp(j) => j.label_ref(),
             Inst::Jcc(j) => j.label_ref(),

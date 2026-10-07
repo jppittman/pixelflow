@@ -320,9 +320,6 @@ impl From<AdrpAdd> for Inst {
 impl crate::emit::AsmInsn for Inst {
     #[inline]
     fn label_ref(self) -> Option<LabelRef> {
-        // A branch is an ordinary instruction whose operand happens to be a
-        // name: `emit_into` writes its word with a zero displacement, and this
-        // says which label the assembler should measure it against.
         match self {
             Inst::B(b) => b.label_ref(),
             Inst::BCond(b) => b.label_ref(),
@@ -416,16 +413,13 @@ pub fn emit_fmov_imm(code: &mut Vec<u8>, dst: Reg, val: f32) {
     let bits = val.to_bits();
 
     if bits == 0 {
-        // MOVI Vd.4S, #0 - single instruction for zero
         emit32(code, 0x4F000400 | (dst.0 as u32));
         return;
     }
 
-    // Try FMOV Vd.4S, #imm8 for common float constants (1 instruction)
     if let Some(imm8) = try_encode_fmov_imm8(val) {
         let abc = ((imm8 as u32) >> 5) & 0x7;
         let defgh = (imm8 as u32) & 0x1F;
-        // FMOV Vd.4S, #imm8: 0x4F00F400 | abc<<16 | defgh<<5 | Rd
         emit32(
             code,
             0x4F00_F400 | (abc << 16) | (defgh << 5) | (dst.0 as u32),
@@ -439,13 +433,10 @@ pub fn emit_fmov_imm(code: &mut Vec<u8>, dst: Reg, val: f32) {
     let lo16 = bits & 0xFFFF;
     let hi16 = bits >> 16;
 
-    // MOVZ W16, #lo16
     emit32(code, 0x52800010 | (lo16 << 5));
 
-    // MOVK W16, #hi16, LSL #16
     emit32(code, 0x72A00010 | (hi16 << 5));
 
-    // DUP Vd.4S, W16
     emit32(code, 0x4E040C00 | (dst.0 as u32) | (16 << 5));
 }
 
@@ -483,7 +474,6 @@ pub fn try_encode_fmov_imm8(val: f32) -> Option<u8> {
         return None;
     }
 
-    // Extract imm8 = a:b:c:d:e:f:g:h
     let a = (bits >> 31) & 1;
     let c = (bits >> 24) & 1;
     let d = (bits >> 23) & 1;
@@ -700,8 +690,6 @@ pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: Broadca
 
 /// USHR Vd.4S, Vn.4S, #shift (unsigned shift right by immediate)
 fn emit_ushr(code: &mut Vec<u8>, dst: Reg, src: Reg, shift: u8) {
-    // Encoding: 0x6F200400 | ((32 - shift) << 16) as immh:immb
-    // For .4S: immh = 001x, so (32-shift) in bits [19:16]
     // A shift by zero is the identity, and USHR cannot encode it: `64 - 0` is
     // 64, which does not fit the 6-bit immediate field. Emit the move instead
     // of refusing a perfectly portable operation — `fold_is_platform_specific`
@@ -827,7 +815,6 @@ pub(crate) fn emit_unary(code: &mut Vec<u8>, unary: super::Unary) {
         OpKind::Ceil => AsmProgram::from([Inst::Frintp(dst, src)]).assemble(code),
         OpKind::Round => AsmProgram::from([Inst::Frinta(dst, src)]).assemble(code),
 
-        // Bit-manip primitives (integer-domain conversions).
         OpKind::TruncToInt => AsmProgram::from([Inst::Fcvtzs(dst, src)]).assemble(code),
         OpKind::IntToFloat => AsmProgram::from([Inst::Scvtf(dst, src)]).assemble(code),
 
@@ -858,18 +845,15 @@ pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Re
         OpKind::Min => AsmProgram::from([Inst::Fmin(dst, src1, src2)]).assemble(code),
         OpKind::Max => AsmProgram::from([Inst::Fmax(dst, src1, src2)]).assemble(code),
 
-        // Comparisons (result is mask in dst)
         OpKind::Gt => AsmProgram::from([Inst::Fcmgt(dst, src1, src2)]).assemble(code),
         OpKind::Ge => AsmProgram::from([Inst::Fcmge(dst, src1, src2)]).assemble(code),
-        OpKind::Lt => AsmProgram::from([Inst::Fcmgt(dst, src2, src1)]).assemble(code), // swap args
+        OpKind::Lt => AsmProgram::from([Inst::Fcmgt(dst, src2, src1)]).assemble(code),
         OpKind::Le => AsmProgram::from([Inst::Fcmge(dst, src2, src1)]).assemble(code),
         OpKind::Eq => AsmProgram::from([Inst::Fcmeq(dst, src1, src2)]).assemble(code),
         OpKind::Ne => {
-            // Ne = not Eq: FCMEQ then bitwise NOT
             AsmProgram::from([Inst::Fcmeq(dst, src1, src2), Inst::Not(dst, dst)]).assemble(code);
         }
 
-        // Bit-manip primitives (integer-domain).
         OpKind::IAdd => AsmProgram::from([Inst::AddI32(dst, src1, src2)]).assemble(code),
         OpKind::BitAnd => AsmProgram::from([Inst::And(dst, src1, src2)]).assemble(code),
         OpKind::BitOr => AsmProgram::from([Inst::Orr(dst, src1, src2)]).assemble(code),
@@ -921,32 +905,26 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
     let rn = (word >> 5) & 0x1F;
     let rm = (word >> 16) & 0x1F;
 
-    // RET
     if word == 0xD65F03C0 {
         return "ret".into();
     }
 
-    // MOVI Vd.4S, #0 (common zero-fill)
     if word & 0xFFFFFC00 == 0x4F000400 {
         return format!("movi v{}.4s, #0", rd);
     }
 
-    // FMOV Vd.4S, #imm8
     if word & 0xFFC0FC00 == 0x4F00F400 {
         return format!("fmov v{}.4s, #imm8", rd);
     }
 
-    // DUP Vd.4S, W16 (from GP)
     if word & 0xFFFFFC00 == 0x4E040C00 {
         return format!("dup v{}.4s, w{}", rd, rn);
     }
 
-    // DUP Vd.4S, Vn.S[0] (scalar dup)
     if word & 0xFFFFFC00 == 0x4E040400 {
         return format!("dup v{}.4s, v{}.s[0]", rd, rn);
     }
 
-    // MOVZ Wd, #imm16
     if word & 0xFFE0001F == 0x52800010 {
         let imm16 = (word >> 5) & 0xFFFF;
         return format!("movz w16, #0x{:x}", imm16);
@@ -955,13 +933,11 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
         let imm16 = (word >> 5) & 0xFFFF;
         return format!("movz w{}, #0x{:x}", rd, imm16);
     }
-    // MOVZ Xd, #imm16 (64-bit)
     if word & 0xFFE00000 == 0xD2800000 {
         let imm16 = (word >> 5) & 0xFFFF;
         return format!("movz x{}, #0x{:x}", rd, imm16);
     }
 
-    // MOVK Wd, #imm16, LSL #16
     if word & 0xFFE00000 == 0x72A00000 {
         let imm16 = (word >> 5) & 0xFFFF;
         return format!("movk w{}, #0x{:x}, lsl #16", rd, imm16);
@@ -972,11 +948,8 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
         return format!("mov x{}, x{}", rd, rm);
     }
 
-    // NEON 3-same (binary vector ops) — top bits determine the operation
-    // Extract opcode bits for classification
     let top11 = word >> 21;
 
-    // ORR Vd.16B, Vn.16B, Vm.16B (also MOV when Vn==Vm)
     if word & 0xFFE0FC00 == 0x4EA01C00 {
         if rn == rm {
             return format!("mov v{}.16b, v{}.16b", rd, rn);
@@ -984,158 +957,122 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
         return format!("orr v{}.16b, v{}.16b, v{}.16b", rd, rn, rm);
     }
 
-    // FADD Vd.4S, Vn.4S, Vm.4S
     if word & 0xFFE0FC00 == 0x4E20D400 {
         return format!("fadd v{}.4s, v{}.4s, v{}.4s", rd, rn, rm);
     }
-    // FSUB Vd.4S, Vn.4S, Vm.4S
     if word & 0xFFE0FC00 == 0x4EA0D400 {
         return format!("fsub v{}.4s, v{}.4s, v{}.4s", rd, rn, rm);
     }
-    // FMUL Vd.4S, Vn.4S, Vm.4S
     if word & 0xFFE0FC00 == 0x6E20DC00 {
         return format!("fmul v{}.4s, v{}.4s, v{}.4s", rd, rn, rm);
     }
-    // FDIV Vd.4S, Vn.4S, Vm.4S
     if word & 0xFFE0FC00 == 0x6E20FC00 {
         return format!("fdiv v{}.4s, v{}.4s, v{}.4s", rd, rn, rm);
     }
-    // FMLA Vd.4S, Vn.4S, Vm.4S (fused multiply-add)
     if word & 0xFFE0FC00 == 0x4E20CC00 {
         return format!("fmla v{}.4s, v{}.4s, v{}.4s", rd, rn, rm);
     }
-    // FMIN Vd.4S, Vn.4S, Vm.4S
     if word & 0xFFE0FC00 == 0x4EA0F400 {
         return format!("fmin v{}.4s, v{}.4s, v{}.4s", rd, rn, rm);
     }
-    // FMAX Vd.4S, Vn.4S, Vm.4S
     if word & 0xFFE0FC00 == 0x4E20F400 {
         return format!("fmax v{}.4s, v{}.4s, v{}.4s", rd, rn, rm);
     }
 
-    // FCMGT Vd.4S, Vn.4S, Vm.4S
     if word & 0xFFE0FC00 == 0x6EA0E400 {
         return format!("fcmgt v{}.4s, v{}.4s, v{}.4s", rd, rn, rm);
     }
-    // FCMGE Vd.4S, Vn.4S, Vm.4S
     if word & 0xFFE0FC00 == 0x6E20E400 {
         return format!("fcmge v{}.4s, v{}.4s, v{}.4s", rd, rn, rm);
     }
-    // FCMEQ Vd.4S, Vn.4S, Vm.4S
     if word & 0xFFE0FC00 == 0x4E20E400 {
         return format!("fcmeq v{}.4s, v{}.4s, v{}.4s", rd, rn, rm);
     }
 
-    // BSL Vd.16B, Vn.16B, Vm.16B
     if word & 0xFFE0FC00 == 0x6E601C00 {
         return format!("bsl v{}.16b, v{}.16b, v{}.16b", rd, rn, rm);
     }
 
-    // AND Vd.16B, Vn.16B, Vm.16B
     if word & 0xFFE0FC00 == 0x4E201C00 {
         return format!("and v{}.16b, v{}.16b, v{}.16b", rd, rn, rm);
     }
 
-    // ADD Vd.4S, Vn.4S, Vm.4S (integer)
     if word & 0xFFE0FC00 == 0x4EA08400 {
         return format!("add v{}.4s, v{}.4s, v{}.4s", rd, rn, rm);
     }
-    // SUB Vd.4S, Vn.4S, Vm.4S (integer)
     if word & 0xFFE0FC00 == 0x6EA08400 {
         return format!("sub v{}.4s, v{}.4s, v{}.4s", rd, rn, rm);
     }
 
-    // FRSQRTS Vd.4S, Vn.4S, Vm.4S
     if word & 0xFFE0FC00 == 0x4EA0FC00 {
         return format!("frsqrts v{}.4s, v{}.4s, v{}.4s", rd, rn, rm);
     }
-    // FRECPS Vd.4S, Vn.4S, Vm.4S
     if word & 0xFFE0FC00 == 0x4E20FC00 {
         return format!("frecps v{}.4s, v{}.4s, v{}.4s", rd, rn, rm);
     }
 
-    // 2-reg misc (unary vector ops)
-    // FSQRT Vd.4S, Vn.4S
     if word & 0xFFFFFC00 == 0x6EA1F800 {
         return format!("fsqrt v{}.4s, v{}.4s", rd, rn);
     }
-    // FABS Vd.4S, Vn.4S
     if word & 0xFFFFFC00 == 0x4EA0F800 {
         return format!("fabs v{}.4s, v{}.4s", rd, rn);
     }
-    // FNEG Vd.4S, Vn.4S
     if word & 0xFFFFFC00 == 0x6EA0F800 {
         return format!("fneg v{}.4s, v{}.4s", rd, rn);
     }
-    // NOT Vd.16B, Vn.16B
     if word & 0xFFFFFC00 == 0x2E205800 {
         return format!("not v{}.16b, v{}.16b", rd, rn);
     }
-    // FRINTM Vd.4S, Vn.4S (floor)
     if word & 0xFFFFFC00 == 0x4E219800 {
         return format!("frintm v{}.4s, v{}.4s", rd, rn);
     }
-    // FRINTP Vd.4S, Vn.4S (ceil)
     if word & 0xFFFFFC00 == 0x4EA18800 {
         return format!("frintp v{}.4s, v{}.4s", rd, rn);
     }
-    // FRINTA Vd.4S, Vn.4S (round)
     if word & 0xFFFFFC00 == 0x6E218800 {
         return format!("frinta v{}.4s, v{}.4s", rd, rn);
     }
-    // FRSQRTE Vd.4S, Vn.4S
     if word & 0xFFFFFC00 == 0x6EA1D800 {
         return format!("frsqrte v{}.4s, v{}.4s", rd, rn);
     }
-    // FRECPE Vd.4S, Vn.4S
     if word & 0xFFFFFC00 == 0x4EA1D800 {
         return format!("frecpe v{}.4s, v{}.4s", rd, rn);
     }
-    // FCVTZS Vd.4S, Vn.4S
     if word & 0xFFFFFC00 == 0x4EA1B800 {
         return format!("fcvtzs v{}.4s, v{}.4s", rd, rn);
     }
-    // SCVTF Vd.4S, Vn.4S
     if word & 0xFFFFFC00 == 0x4E21D800 {
         return format!("scvtf v{}.4s, v{}.4s", rd, rn);
     }
-    // UMINV Sd, Vn.4S
     if word & 0xFFFFFC00 == 0x6EB1A800 {
         return format!("uminv s{}, v{}.4s", rd, rn);
     }
-    // UMAXV Sd, Vn.4S
     if word & 0xFFFFFC00 == 0x6E30A800 {
         return format!("umaxv s{}, v{}.4s", rd, rn);
     }
 
-    // FMOV Wd, Sn (SIMD to GP)
     if word & 0xFFFFFC00 == 0x1E260000 {
         return format!("fmov w{}, s{}", rd, rn);
     }
 
-    // LDR Qt, [Xn, #imm] (128-bit unsigned offset)
     if word & 0xFFC00000 == 0x3DC00000 {
         let imm12 = (word >> 10) & 0xFFF;
         let byte_offset = imm12 * 16;
         return format!("ldr q{}, [x{}, #{}]", rd, rn, byte_offset);
     }
-    // STR Qt, [Xn, #imm] (128-bit unsigned offset)
     if word & 0xFFC00000 == 0x3D800000 {
         let imm12 = (word >> 10) & 0xFFF;
         let byte_offset = imm12 * 16;
         return format!("str q{}, [x{}, #{}]", rd, rn, byte_offset);
     }
 
-    // LDR Qt, [Xn], #16 (post-index)
     if word & 0xFFFFFC00 == 0x3CC10400 {
         return format!("ldr q{}, [x{}], #16", rd, rn);
     }
-    // STR Qt, [Xn], #16 (post-index)
     if word & 0xFFFFFC00 == 0x3C810400 {
         return format!("str q{}, [x{}], #16", rd, rn);
     }
 
-    // STP Xt1, Xt2, [Xn, #imm]! (pre-index GP pair)
     if word & 0xFFC00000 == 0xA9800000 | (0b11 << 23) {
         let rt2 = (word >> 10) & 0x1F;
         let imm7 = ((word >> 15) & 0x7F) as i32;
@@ -1143,7 +1080,6 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
         return format!("stp x{}, x{}, [x{}, #{}]!", rd, rt2, rn, offset);
     }
 
-    // STP Xt1, Xt2, [Xn, #imm] (signed offset GP pair, no writeback)
     if word & 0xFFC00000 == 0xA9000000 {
         let rt2 = (word >> 10) & 0x1F;
         let imm7 = ((word >> 15) & 0x7F) as i32;
@@ -1151,7 +1087,6 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
         return format!("stp x{}, x{}, [x{}, #{}]", rd, rt2, rn, offset);
     }
 
-    // LDP Xt1, Xt2, [Xn], #imm (post-index GP pair)
     if word & 0xFFC00000 == 0xA8C00000 {
         let rt2 = (word >> 10) & 0x1F;
         let imm7 = ((word >> 15) & 0x7F) as i32;
@@ -1159,7 +1094,6 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
         return format!("ldp x{}, x{}, [x{}], #{}", rd, rt2, rn, offset);
     }
 
-    // LDP Xt1, Xt2, [Xn, #imm] (signed offset GP pair)
     if word & 0xFFC00000 == 0xA9400000 {
         let rt2 = (word >> 10) & 0x1F;
         let imm7 = ((word >> 15) & 0x7F) as i32;
@@ -1167,7 +1101,6 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
         return format!("ldp x{}, x{}, [x{}, #{}]", rd, rt2, rn, offset);
     }
 
-    // STP Qt1, Qt2, [Xn, #imm] (NEON pair, signed offset)
     if word & 0xFFC00000 == 0xAD000000 {
         let rt2 = (word >> 10) & 0x1F;
         let imm7 = ((word >> 15) & 0x7F) as i32;
@@ -1175,7 +1108,6 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
         return format!("stp q{}, q{}, [x{}, #{}]", rd, rt2, rn, offset);
     }
 
-    // LDP Qt1, Qt2, [Xn, #imm] (NEON pair, signed offset)
     if word & 0xFFC00000 == 0xAD400000 {
         let rt2 = (word >> 10) & 0x1F;
         let imm7 = ((word >> 15) & 0x7F) as i32;
@@ -1183,13 +1115,11 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
         return format!("ldp q{}, q{}, [x{}, #{}]", rd, rt2, rn, offset);
     }
 
-    // ADD Xd, Xn, #imm12 (GP immediate)
     if word & 0xFF000000 == 0x91000000 {
         let imm12 = (word >> 10) & 0xFFF;
         return format!("add x{}, x{}, #{}", rd, rn, imm12);
     }
 
-    // SUB Xd, Xn, #imm12 (GP immediate) -- includes SUBS via 0xF1
     if word & 0xFF000000 == 0xD1000000 {
         let imm12 = (word >> 10) & 0xFFF;
         return format!("sub x{}, x{}, #{}", rd, rn, imm12);
@@ -1218,33 +1148,26 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
         return format!("shl v{}.4s, v{}.4s, #{}", rd, rn, shift);
     }
 
-    // ADR Xd, #imm
     if word & 0x9F000000 == 0x10000000 {
         return format!("adr x{}, <imm>", rd);
     }
-    // ADRP Xd, #imm
     if word & 0x9F000000 == 0x90000000 {
         return format!("adrp x{}, <imm>", rd);
     }
 
-    // CBZ Wt (32-bit)
     if word & 0xFF000000 == 0x34000000 {
         return format!("cbz w{}, <imm>", rd);
     }
-    // CBNZ Wt (32-bit)
     if word & 0xFF000000 == 0x35000000 {
         return format!("cbnz w{}, <imm>", rd);
     }
-    // CBZ Xt (64-bit)
     if word & 0xFF000000 == 0xB4000000 {
         return format!("cbz x{}, <imm>", rd);
     }
-    // CBNZ Xt (64-bit)
     if word & 0xFF000000 == 0xB5000000 {
         return format!("cbnz x{}, <imm>", rd);
     }
 
-    // B.cond
     if word & 0xFF000010 == 0x54000000 {
         let cond = word & 0xF;
         let cond_name = match cond {
@@ -1265,12 +1188,10 @@ fn decode_aarch64_mnemonic(word: u32) -> String {
         return format!("b.{} <imm>", cond_name);
     }
 
-    // B (unconditional)
     if word & 0xFC000000 == 0x14000000 {
         return "b <imm>".to_string();
     }
 
-    // SUBS Xd, Xn, Xm (register)
     if word & 0xFFE00000 == 0xEB000000 {
         return format!("subs x{}, x{}, x{}", rd, rn, rm);
     }
@@ -2334,7 +2255,6 @@ pub(crate) mod driver {
     ) -> Result<(), CompileError> {
         use super::*;
 
-        // 1. Emit reloads (from stack or rematerialized constants)
         for reload in &plan.reloads {
             match reload {
                 Reload::FromStack { target, slot } => {
@@ -2351,12 +2271,10 @@ pub(crate) mod driver {
             }
         }
 
-        // 2. Emit setup MOV (for FMLA accumulator or BSL mask)
         if let Some((dst, src)) = plan.setup_mov {
             AsmProgram::from([Inst::mov(dst, src)]).assemble(code);
         }
 
-        // 3. Emit main op
         match &plan.op {
             ResolvedOp::Nop => {}
             ResolvedOp::LoadConst { dst, val_bits } => {
@@ -2465,11 +2383,9 @@ pub(crate) mod driver {
                 c,
                 c_deferred,
             } => {
-                // FMUL(dst, a, b) — consumes a and b (loaded upfront).
                 AsmProgram::from([Inst::Fmul(*dst, *a, *b)]).assemble(code);
                 // Reload c after FMUL (c may reuse tmp_op which held b).
                 emit_deferred(code, *c, c_deferred.as_ref(), pool);
-                // FADD(dst, dst, c)
                 AsmProgram::from([Inst::Fadd(*dst, *dst, *c)]).assemble(code);
             }
             ResolvedOp::If {
