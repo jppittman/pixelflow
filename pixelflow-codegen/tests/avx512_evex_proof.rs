@@ -73,7 +73,7 @@ fn vfmadd213ps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
 // ============================================================================
 
 #[test]
-fn evex_addps_bytes() {
+fn evex_addps_encodes_the_hand_derived_bytes() {
     // vaddps zmm0, zmm0, zmm1  ->  62 F1 7C 48 58 C1
     let mut c = Vec::new();
     vaddps(&mut c, 0, 0, 1);
@@ -81,7 +81,7 @@ fn evex_addps_bytes() {
 }
 
 #[test]
-fn evex_mulps_bytes() {
+fn evex_mulps_encodes_the_hand_derived_bytes() {
     // vmulps zmm0, zmm0, zmm2  ->  62 F1 7C 48 59 C2
     let mut c = Vec::new();
     vmulps(&mut c, 0, 0, 2);
@@ -89,7 +89,7 @@ fn evex_mulps_bytes() {
 }
 
 #[test]
-fn evex_mulps_high_regs_bytes() {
+fn evex_mulps_with_high_registers_inverts_every_high_bit() {
     // vmulps zmm9, zmm20, zmm30 exercises every high-bit inversion path.
     //   reg=9  (bit3=1 -> R=0),   r/m=30 (bit3=1->B=0, bit4=1->X=0),
     //   vvvv=20 (low=4 -> ~=B; bit4=1 -> V'=0)
@@ -104,7 +104,7 @@ fn evex_mulps_high_regs_bytes() {
 }
 
 #[test]
-fn evex_fmadd_bytes() {
+fn evex_fmadd213ps_encodes_the_hand_derived_bytes() {
     // vfmadd213ps zmm0, zmm1, zmm2  ->  62 F2 75 48 A8 C2
     //   map=0F38 (mm=10) -> P0 = 1111_0010 = 0xF2
     //   vvvv=~1=1110; pp=66(01); P1 = 0 1110 1 01 = 0x75
@@ -156,7 +156,7 @@ mod runtime {
     }
 
     #[test]
-    fn evex_runtime_16_lanes() {
+    fn evex_code_computes_all_16_lanes_on_the_host() {
         // Only F instructions below, so F alone is the question — not the
         // DQ the JIT's own AVX-512 tier additionally needs.
         if !std::is_x86_feature_detected!("avx512f") {

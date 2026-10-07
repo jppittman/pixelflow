@@ -32,7 +32,7 @@ const PIECES: u32 = 5;
 /// Terms of the parked-roots kernel: each reads two values its fold's scope
 /// does not compute (a row-invariant product and the call-invariant constant
 /// it was built from), so this many terms is twice as many roots.
-pub const PARKED_TERMS: u32 = 2048;
+pub const PARKED_TERMS: u64 = 2048;
 
 /// The binder slot every user fold here takes. The lattice's own folds take
 /// the first slots no reachable fold or `Var` names, so these kernels' folds
@@ -135,7 +135,7 @@ pub fn two_sibling_folds() -> (ExprArena, ExprId) {
 /// nothing the optimizer factors can make them one.
 ///
 /// `Σ_{i<3} Σ_r min(y·c_r, x + i + c_r)`
-pub fn parked_roots(terms: u32) -> (ExprArena, ExprId) {
+pub fn parked_roots(terms: u64) -> (ExprArena, ExprId) {
     let mut a = ExprArena::new();
     let (x, y, i) = leaves(&mut a);
     let along = a.push_binary(OpKind::Add, x, i);

@@ -113,7 +113,6 @@ fn sum_kernel(n: u32) -> Kernel {
 /// time has always produced, built by literally peeling one term at a time
 /// in Rust rather than by asking anything under test to do it.
 fn hand_unrolled_sum(n: u32) -> (ExprArena, ExprId) {
-    assert!(n >= 1, "test kernels here are always non-empty");
     let mut arena = ExprArena::new();
     let mut acc = arena.push_const(0.0);
     for k in 1..n {

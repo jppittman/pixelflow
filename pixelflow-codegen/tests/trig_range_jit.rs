@@ -105,26 +105,6 @@ impl Rng {
     }
 }
 
-/// One f32 ULP toward `+inf` (`+0.0`/`-0.0` both step to the smallest
-/// positive subnormal). Not a general-purpose `nextafter` — it only needs to
-/// place an adversarial point next to a quadrant boundary, and NaN/`+inf`
-/// inputs never reach it here.
-fn next_up(x: f32) -> f32 {
-    if x == 0.0 {
-        return f32::from_bits(1);
-    }
-    let bits = x.to_bits();
-    if x > 0.0 {
-        f32::from_bits(bits + 1)
-    } else {
-        f32::from_bits(bits - 1)
-    }
-}
-
-fn next_down(x: f32) -> f32 {
-    -next_up(-x)
-}
-
 /// The domain contract itself: finite and strictly inside `TRIG_DOMAIN`.
 ///
 /// This mirrors the *predicate* `expand_sin_phase` guards on (`abs_x < limit`
@@ -178,8 +158,8 @@ fn build_samples() -> Vec<f32> {
     while k <= k_max {
         let center = (k as f64 * half_pi) as f32;
         xs.push(center);
-        xs.push(next_up(center));
-        xs.push(next_down(center));
+        xs.push(center.next_up());
+        xs.push(center.next_down());
         k += stride;
     }
     xs.push(0.0);
@@ -194,10 +174,10 @@ fn build_samples() -> Vec<f32> {
     }
     xs.push(TRIG_DOMAIN);
     xs.push(-TRIG_DOMAIN);
-    xs.push(next_down(TRIG_DOMAIN)); // just inside
-    xs.push(next_up(TRIG_DOMAIN)); // just outside
-    xs.push(next_up(-TRIG_DOMAIN)); // just inside (negative side)
-    xs.push(next_down(-TRIG_DOMAIN)); // just outside (negative side)
+    xs.push(TRIG_DOMAIN.next_down()); // just inside
+    xs.push(TRIG_DOMAIN.next_up()); // just outside
+    xs.push((-TRIG_DOMAIN).next_up()); // just inside (negative side)
+    xs.push((-TRIG_DOMAIN).next_down()); // just outside (negative side)
 
     // 5. Signed zero and explicit subnormals.
     xs.extend_from_slice(&[
@@ -287,7 +267,7 @@ fn check_domain_contract(name: &str, bound: Bound, samples: &[(f32, f32)]) {
 /// three are NaN outside it (or for non-finite/NaN input) — asserted with no
 /// tolerance, against ~100,000 points per function.
 #[test]
-fn sin_cos_tan_domain_contract_on_jit() {
+fn sin_cos_tan_stay_in_range_inside_the_domain_and_are_nan_outside_it() {
     let samples = build_samples();
     assert!(
         samples.len() >= 90_000,
