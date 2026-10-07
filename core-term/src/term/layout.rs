@@ -348,4 +348,46 @@ mod tests {
         assert_eq!(layout.cols, 100);
         assert_eq!(layout.rows, 30);
     }
+
+    #[test]
+    fn it_should_report_no_change_when_the_computed_zoom_size_already_matches_the_current_size() {
+        // base_cell_px (10, 16) at one zoom-in step rounds to (11, 18); start
+        // already there with zoom_steps still at 0, so the next zoom-in finds
+        // its target size equal to the current one despite being in range.
+        let mut layout = Layout {
+            cell_width_px: 11,
+            cell_height_px: 18,
+            ..Layout::new(80, 24)
+        };
+
+        assert!(
+            !layout.zoom(Zoom::In),
+            "a step whose target size matches the current size is not a change, in range or not"
+        );
+        assert_eq!((layout.cell_width_px, layout.cell_height_px), (11, 18));
+    }
+
+    #[test]
+    fn it_should_reset_to_the_base_cell_size_even_when_that_size_is_outside_the_zoom_clamp_range() {
+        // A configured base cell size can itself fall outside the zoom
+        // feature's own [MIN, MAX] clamp (e.g. an oversized accessibility
+        // font). Reset must still return to it rather than being blocked by
+        // the same out-of-range guard that stops In/Out at the clamp edge.
+        let mut layout = Layout {
+            base_cell_px: (10, MAX_ZOOMED_CELL_HEIGHT_PX + 50),
+            cell_width_px: 20,
+            cell_height_px: 200,
+            zoom_steps: 3,
+            ..Layout::new(80, 24)
+        };
+
+        assert!(
+            layout.zoom(Zoom::Reset),
+            "reset is never blocked by the out-of-range guard"
+        );
+        assert_eq!(
+            (layout.cell_width_px, layout.cell_height_px),
+            (10, MAX_ZOOMED_CELL_HEIGHT_PX + 50)
+        );
+    }
 }
