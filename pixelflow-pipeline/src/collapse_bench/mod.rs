@@ -143,7 +143,7 @@ struct Sentinel {
     code: ExecutableCode,
     buffer: Vec<f32>,
     extent: [u32; 2],
-    bytes: u32,
+    bytes: u64,
     /// Kept so [`Sentinel::measure`] can bind its context the same way
     /// [`CollapseSession::measure`] binds any other kernel's — empty for
     /// this arena today, but a special-cased hardcoded slot count would be
@@ -169,7 +169,7 @@ impl CollapseSession {
         let root = arena.push_unary(pixelflow_ir::OpKind::Sqrt, sum);
         let result = compile_as_baked(&arena, root, SENTINEL_EXTENT);
         let mut sentinel = Sentinel {
-            bytes: result.code.len() as u32,
+            bytes: result.code.len() as u64,
             code: result.code,
             buffer: output_buffer(SENTINEL_EXTENT),
             extent: SENTINEL_EXTENT,

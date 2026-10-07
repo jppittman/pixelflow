@@ -950,7 +950,10 @@ pub struct CompileResult {
     pub code: executable::ExecutableCode,
     /// Number of spills performed.
     pub spill_count: u64,
-    /// Total stack space used for spills (bytes).
+    /// Total stack space used for spills (bytes). A frame offset, not a
+    /// program count: `StackFrame` refuses a frame past 2 MiB and the
+    /// encoders address a slot through a disp32 / imm12, so the width is the
+    /// encoding's.
     pub spill_bytes: u32,
     /// Register budget that was used.
     pub max_regs: u8,

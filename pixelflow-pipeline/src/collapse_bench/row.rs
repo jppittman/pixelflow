@@ -47,7 +47,9 @@ pub struct StaticFeatures {
     /// Frame slots holding a value with an address: the body's
     /// `regalloc::Allocation::spill_slots`.
     pub spill_slots: u64,
-    /// Stack bytes the frame occupies.
+    /// Stack bytes the frame occupies: `CompileResult::spill_bytes`, a frame
+    /// offset bounded by `StackFrame`'s 2 MiB limit and the slot encodings,
+    /// not a program count.
     pub frame_bytes: u32,
     /// Values LICM lifted out of the body.
     pub hoisted: u64,
@@ -97,7 +99,7 @@ pub struct Measurement {
     /// Bytes of the sentinel's own emitted code. If this differs between two
     /// refs, the sentinel is not the same anchor on both and the calibration
     /// above cannot be compared.
-    pub sentinel_bytes: u32,
+    pub sentinel_bytes: u64,
     pub samples: u32,
     /// Calls the timer bracketed per sample, after the dispersion autoscale.
     pub calls_per_sample: u64,
