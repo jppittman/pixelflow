@@ -1304,7 +1304,6 @@ fn emit_scope<B: IsaBackend>(
     allocation: regalloc::Allocation<'_>,
     backend: &mut B,
 ) -> Result<(Vec<u8>, Option<Reg>), CompileError> {
-    let file = backend.register_file();
     backend.scope_begin();
     // Allocation happened before this call — once per scope, over the whole
     // nest, its frame included. The allocator chooses the evaluation order,
@@ -1334,10 +1333,9 @@ fn emit_scope<B: IsaBackend>(
         let at_binder = match opened.fold_roots().binder {
             regalloc::Where::Reg(r) => Binding::from(r),
             regalloc::Where::Ptr(_) => unreachable!("a fold's binder is a vector"),
-            regalloc::Where::Spilled | regalloc::Where::Remat(_) => Binding::from(Slot::new(
-                allocation.binder_slot(def.value),
-                file.vector_bytes,
-            )),
+            regalloc::Where::Spilled | regalloc::Where::Remat(_) => {
+                Binding::from(Slot::new(allocation.binder_slot(def.value)))
+            }
         };
         if !enclosing.iter().any(|(b, _)| *b == binder) {
             enclosing.push((binder, at_binder));
@@ -3532,7 +3530,7 @@ mod tests {
                 };
                 assert_eq!(
                     view.slot_of(def.value),
-                    Some(Slot::new(park, file.vector_bytes)),
+                    Some(Slot::new(park)),
                     "Fold({j}) addresses {:?} somewhere other than its park",
                     def.value
                 );
@@ -3624,7 +3622,7 @@ mod tests {
             locs[v as usize] = Some(Binding::Loc(Loc::Reg(Reg(r))));
         }
         for &(v, off) in spilled {
-            locs[v as usize] = Some(Binding::Loc(Loc::Slot(Slot::new(off, 16))));
+            locs[v as usize] = Some(Binding::Loc(Loc::Slot(Slot::new(off))));
         }
         locs
     }
@@ -3667,7 +3665,7 @@ mod tests {
             plan.reloads[0],
             Reload::FromStack {
                 target: Reg(6),
-                slot: Slot::new(0, 16),
+                slot: Slot::new(0),
             }
         );
         assert_eq!(
@@ -3695,14 +3693,14 @@ mod tests {
             plan.reloads[0],
             Reload::FromStack {
                 target: Reg(6),
-                slot: Slot::new(0, 16),
+                slot: Slot::new(0),
             }
         );
         assert_eq!(
             plan.reloads[1],
             Reload::FromStack {
                 target: RELOAD[0],
-                slot: Slot::new(16, 16),
+                slot: Slot::new(16),
             }
         );
         assert_eq!(
@@ -3731,7 +3729,7 @@ mod tests {
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
         drop(resolve_operands(
             &op,
-            Loc::Slot(Slot::new(32, 16)).into(),
+            Loc::Slot(Slot::new(32)).into(),
             locs.as_slice(),
             TEST_SCRATCH,
         ));
@@ -3803,14 +3801,14 @@ mod tests {
             plan.reloads[0],
             Reload::FromStack {
                 target: Reg(8),
-                slot: Slot::new(0, 16),
+                slot: Slot::new(0),
             }
         );
         assert_eq!(
             plan.reloads[1],
             Reload::FromStack {
                 target: RELOAD[0],
-                slot: Slot::new(16, 16),
+                slot: Slot::new(16),
             }
         );
         // c is in a register, no deferred reload needed
@@ -3850,10 +3848,7 @@ mod tests {
         match &plan.op {
             ResolvedOp::DecomposedMulAdd { c, c_deferred, .. } => {
                 assert_eq!(*c, RELOAD[1]); // its own reservation, deferred past the FMUL
-                assert_eq!(
-                    *c_deferred,
-                    Some(DeferredReload::FromStack(Slot::new(32, 16)))
-                );
+                assert_eq!(*c_deferred, Some(DeferredReload::FromStack(Slot::new(32))));
             }
             other => panic!("expected DecomposedMulAdd, got {:?}", other),
         }
@@ -6170,7 +6165,7 @@ mod tests {
                 ("c in a register", None),
                 (
                     "c reloaded from the stack",
-                    Some(DeferredReload::FromStack(Slot::new(32, 16))),
+                    Some(DeferredReload::FromStack(Slot::new(32))),
                 ),
                 (
                     "c rematerialized",
@@ -6393,7 +6388,7 @@ mod tests {
                 // tail rather than by a per-backend length.
                 let (mul, add) = undeferred.split_at(undeferred.len() - tail_len(name));
                 for deferred in [
-                    DeferredReload::FromStack(Slot::new(32, 16)),
+                    DeferredReload::FromStack(Slot::new(32)),
                     DeferredReload::Const(1.0f32.to_bits()),
                 ] {
                     let got = encode(backend, decomposed(Some(deferred.clone())));

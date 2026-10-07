@@ -1272,7 +1272,7 @@ impl NestAllocation {
                 opened = parent;
             }
             for (v, offset) in pins {
-                tables[ix][v.0 as usize] = Some(Slot::new(offset, vector_bytes));
+                tables[ix][v.0 as usize] = Some(Slot::new(offset));
             }
         }
 
@@ -4724,7 +4724,7 @@ mod tests {
             for (n, v) in spilled.iter().enumerate() {
                 assert_eq!(
                     body.slot_of(*v),
-                    Some(Slot::new(n as u32 * vector_bytes, vector_bytes)),
+                    Some(Slot::new(n as u32 * vector_bytes)),
                     "vector_bytes={vector_bytes}: {v:?} is spilled value {n} in schedule order"
                 );
             }
@@ -5619,11 +5619,11 @@ mod tests {
         }
         assert_eq!(
             body.slot_of(ValueId(1)),
-            Some(Slot::new(body.accumulator_slot(ValueId(1)), vb))
+            Some(Slot::new(body.accumulator_slot(ValueId(1))))
         );
         assert_eq!(
             a.scope(Scope::Fold(0)).slot_of(ValueId(11)),
-            Some(Slot::new(body.accumulator_slot(ValueId(11)), vb))
+            Some(Slot::new(body.accumulator_slot(ValueId(11))))
         );
         let parks_from = m + 2 * a.fold_count() as u32 * vb;
         assert_eq!(body.park(ValueId(5)), Some(parks_from));

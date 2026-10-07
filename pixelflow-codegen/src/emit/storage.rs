@@ -14,19 +14,18 @@ use super::{PtrReg, Reg};
 /// An aligned slot in the stack frame.
 ///
 /// A `Slot` represents a concrete stack address: it knows its byte displacement
-/// relative to the stack/frame pointer and the vector width (in bytes).
+/// relative to the stack/frame pointer.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Slot {
     offset: u32,
-    bytes: u32,
 }
 
 impl Slot {
-    /// Create a new stack slot with the given byte displacement and size.
+    /// Create a new stack slot with the given byte displacement.
     #[inline]
     #[must_use]
-    pub const fn new(offset: u32, bytes: u32) -> Self {
-        Self { offset, bytes }
+    pub const fn new(offset: u32) -> Self {
+        Self { offset }
     }
 
     /// Displacement in bytes from the stack/frame pointer (e.g. `[rsp + offset]`).
@@ -34,13 +33,6 @@ impl Slot {
     #[must_use]
     pub const fn offset(self) -> u32 {
         self.offset
-    }
-
-    /// Size of the vector slot in bytes (16 for NEON, 32 for AVX2, 64 for AVX-512).
-    #[inline]
-    #[must_use]
-    pub const fn bytes(self) -> u32 {
-        self.bytes
     }
 }
 
@@ -250,7 +242,7 @@ impl StackFrame {
         }
         let offset = self.allocated_bytes;
         self.allocated_bytes += self.vector_bytes;
-        Ok(Slot::new(offset, self.vector_bytes))
+        Ok(Slot::new(offset))
     }
 
     /// Total stack frame size in bytes, aligned to 16 bytes per standard ABI.
@@ -269,7 +261,7 @@ mod tests {
     #[test]
     fn storage_capabilities_for_reg_and_slot() {
         let r = Reg(3);
-        let s = Slot::new(32, 16);
+        let s = Slot::new(32);
 
         // StoreTarget
         assert_eq!(r.target_reg(), Some(Reg(3)));
@@ -277,8 +269,8 @@ mod tests {
         assert_eq!(r.target_storage(), Storage::Reg(Reg(3)));
 
         assert_eq!(s.target_reg(), None);
-        assert_eq!(s.target_slot(), Some(Slot::new(32, 16)));
-        assert_eq!(s.target_storage(), Storage::Slot(Slot::new(32, 16)));
+        assert_eq!(s.target_slot(), Some(Slot::new(32)));
+        assert_eq!(s.target_storage(), Storage::Slot(Slot::new(32)));
 
         // SourceOperand
         assert_eq!(r.source_const(), None);
@@ -288,16 +280,16 @@ mod tests {
     #[test]
     fn storage_capabilities_for_loc() {
         let l_reg = Loc::Reg(Reg(4));
-        let l_slot = Loc::Slot(Slot::new(64, 32));
+        let l_slot = Loc::Slot(Slot::new(64));
 
         // StoreTarget is total for Loc: every Loc is a writable physical location.
         assert_eq!(l_reg.target_storage(), Storage::Reg(Reg(4)));
         assert_eq!(l_reg.target_reg(), Some(Reg(4)));
         assert_eq!(l_reg.target_slot(), None);
 
-        assert_eq!(l_slot.target_storage(), Storage::Slot(Slot::new(64, 32)));
+        assert_eq!(l_slot.target_storage(), Storage::Slot(Slot::new(64)));
         assert_eq!(l_slot.target_reg(), None);
-        assert_eq!(l_slot.target_slot(), Some(Slot::new(64, 32)));
+        assert_eq!(l_slot.target_slot(), Some(Slot::new(64)));
 
         // SourceOperand
         assert_eq!(l_reg.source_reg(), Some(Reg(4)));
@@ -305,7 +297,7 @@ mod tests {
         assert_eq!(l_reg.source_const(), None);
 
         assert_eq!(l_slot.source_reg(), None);
-        assert_eq!(l_slot.source_slot(), Some(Slot::new(64, 32)));
+        assert_eq!(l_slot.source_slot(), Some(Slot::new(64)));
         assert_eq!(l_slot.source_const(), None);
 
         // Binding SourceOperand capabilities (including Remat)
@@ -314,7 +306,7 @@ mod tests {
         let b_remat = Binding::Remat(0x3F80_0000);
 
         assert_eq!(b_reg.source_reg(), Some(Reg(4)));
-        assert_eq!(b_slot.source_slot(), Some(Slot::new(64, 32)));
+        assert_eq!(b_slot.source_slot(), Some(Slot::new(64)));
         assert_eq!(b_remat.source_reg(), None);
         assert_eq!(b_remat.source_slot(), None);
         assert_eq!(b_remat.source_const(), Some(0x3F80_0000));
