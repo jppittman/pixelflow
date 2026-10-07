@@ -690,12 +690,11 @@ pub fn emit_unary(code: &mut Vec<u8>, unary: super::Unary, pool: &mut x86_64::Co
     }
 }
 
-/// Emit a fused multiply-add `dst = a*b + c` where `dst` already holds `c`.
-/// (213 form: `vfmadd213ps dst, a, b` == `dst = a*dst + b`; caller arranges
-/// operands so this computes the intended `a*b + c`.)
+/// Emit a fused multiply-add `dst = a*b + c` where `dst` already holds `c`:
+/// `vfmadd231ps dst, a, b` (EVEX.512.66.0F38.W0 B8 /r), which is
+/// `dst = a*b + dst`. The 231 form is the one whose accumulator is the
+/// destination, so `c` needs no move.
 pub fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
-    // dst currently = c. We want a*b + c. vfmadd231ps dst, a, b => dst = a*b + dst.
-    // 231: EVEX.512.66.0F38.W0 B8 /r.
     assemble(code, [Evex::m0f38_66(0xB8).rrr(dst.0, a.0, b.0)]);
 }
 

@@ -2384,7 +2384,8 @@ pub(crate) mod driver {
                 c_deferred,
             } => {
                 AsmProgram::from([Inst::Fmul(*dst, *a, *b)]).assemble(code);
-                // Reload c after FMUL (c may reuse tmp_op which held b).
+                // c is loaded only after the FMUL has consumed b: its register may
+                // be the one that held b.
                 emit_deferred(code, *c, c_deferred.as_ref(), pool);
                 AsmProgram::from([Inst::Fadd(*dst, *dst, *c)]).assemble(code);
             }
