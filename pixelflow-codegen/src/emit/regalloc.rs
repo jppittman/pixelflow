@@ -1962,8 +1962,6 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
         };
         meta
     };
-    // How many times per call fold `j`'s body runs: its own trip count times
-    // every enclosing fold's. The body runs once.
     let mut trips: Vec<usize> = Vec::with_capacity(folds);
     for j in 0..folds {
         let own = meta_of(j).len() as usize;
@@ -1976,8 +1974,6 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
         Scope::Body => 1,
         Scope::Fold(j) => trips[j],
     };
-    // The folds from `k` up to `j`, `k` first, if `j` encloses `k` (or is
-    // it); empty otherwise.
     let chain_up_to = |k: usize, j: usize| -> Vec<usize> {
         let mut chain = vec![k];
         let mut at = k;
@@ -1992,7 +1988,6 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
         }
         chain
     };
-    // Whether `outer` runs `inner`: `inner` is `outer`, or nested in it.
     let inside = |outer: Scope, inner: Scope| -> bool {
         match (outer, inner) {
             (Scope::Body, _) => true,
@@ -2001,9 +1996,6 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
         }
     };
     let scopes = || core::iter::once(Scope::Body).chain((0..folds).map(Scope::Fold));
-    // Every read of fold `j`'s binder inside it, weighted by how often the
-    // reading fold runs — across `j`'s own body and every fold within,
-    // except where a fold in between rebinds the same slot.
     let binder_reads = |j: usize| -> usize {
         let var = meta_of(j).binder().var();
         (0..folds)
@@ -2075,7 +2067,6 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
                 }
             }
         }
-        // A root's class, read off its def in the scope that computes it.
         let mut classes: Vec<Option<Class>> = vec![None; roots.len()];
         for d in schedule_of(scope) {
             if let Some(slot) = slots.of(d.value) {
@@ -3295,9 +3286,7 @@ impl LinearScan {
                 // read back from its bits — costs the same reload instruction
                 // here whether it is kept afterwards or not, so keeping it is
                 // free until something evicts it, and an eviction emits
-                // nothing. Constants used to be excluded here to stop them
-                // thrashing against an eviction rule that always chose them
-                // first; that rule is gone, and this exclusion went with it.
+                // nothing.
                 if pass.is_resident(operand) {
                     continue;
                 }

@@ -1644,7 +1644,6 @@ fn emit_scope<B: IsaBackend>(
         Ok(())
     };
 
-    // The unit-typed roots — an effect, not a value.
     let is_unit = |op: &ScheduledOp| match op {
         ScheduledOp::Write { .. } | ScheduledOp::Seq(..) => true,
         ScheduledOp::Reduce(fold, _) => fold.monoid() == Monoid::SEQ,
@@ -1702,7 +1701,6 @@ fn emit_scope<B: IsaBackend>(
         let guard_temp = scratch.guard_temp;
         let mask_guard_temp = scratch.mask_guard_temp;
 
-        // Guard branches that begin before this instruction.
         for pb in &branch_starts[sched_idx] {
             let (guard_idx, arm) = (pb.guard_idx, pb.arm);
             let guard = &if_guards[guard_idx];
@@ -1823,9 +1821,6 @@ fn emit_scope<B: IsaBackend>(
             // result — the slot it was given stays a dead vector of stack.
             let accumulates = fold.monoid() != Monoid::SEQ;
 
-            // Seed: the accumulator starts at the monoid's identity and the
-            // binder at `lo`, each where it lives — written through a temp
-            // when that is a slot.
             let mut seed = |backend: &mut B, at: Option<Reg>, value: f32, slot: u32| match at {
                 Some(r) => backend.load_const(&mut asm.code, r, value),
                 None => {
@@ -1869,7 +1864,6 @@ fn emit_scope<B: IsaBackend>(
                 exit,
             );
 
-            // The body, in its own scope.
             let (fold_code, body_result) = emit_scope(fold_alloc, backend)?;
             asm.code.extend_from_slice(&fold_code);
 
@@ -1922,7 +1916,6 @@ fn emit_scope<B: IsaBackend>(
         let dst_loc = location_of(&locs, *vid);
         let plan = resolve_operands(sched_op, dst_loc, &locs, scratch)?;
 
-        // If with a guard region: emit a uniform-mask short-circuit wrapper.
         if let ScheduledOp::Ternary(OpKind::If, mask_vid, true_vid, false_vid) = sched_op
             && let Some(guard) = guard_at[sched_idx].map(|gi| &if_guards[gi])
             && guard.has_guarded_arm()
@@ -2006,10 +1999,6 @@ fn emit_scope<B: IsaBackend>(
         // constant's definition included, which otherwise emits nothing.
         hand_off(backend, &mut asm.code, *vid, written)?;
     }
-
-    // No "did every branch get its landing point" assertion here any more:
-    // `Assembly::finish` panics on a name nobody wrote, which is the same
-    // check, stated once, for every branch rather than only these.
 
     // The scope's result, in a register for the fold around it to combine.
     // Usually the last instruction's own destination; not when the body's
@@ -2109,7 +2098,6 @@ pub fn resolve_operands(
     let mut reloads = Vec::new();
     let mut setup_mov = None;
 
-    // Resolve a value to its register, or plan a reload from stack/constant into `target`.
     let loc_of = |v: regalloc::ValueId| -> Binding {
         locs.get(v.0 as usize)
             .copied()
@@ -2272,7 +2260,6 @@ pub fn resolve_operands(
 
             match op_kind {
                 OpKind::MulAdd => {
-                    // MulAdd(a, b, c) = a*b + c.
                     if a_spilled && b_spilled {
                         // Decompose: FMUL(dst, a, b) then FADD(dst, dst, c).
                         // `a` lands in `dst`, which the multiply consumes it
@@ -2281,7 +2268,6 @@ pub fn resolve_operands(
                         // depends on `b` having been consumed by then.
                         let a_reg = operand(0, *a, &mut reloads);
                         let b_reg = operand(1, *b, &mut reloads);
-                        // c is deferred — don't add to upfront reloads.
                         let (c_reg, c_deferred) = match loc_of(*c) {
                             Binding::Loc(Loc::Reg(reg)) => (reg, None),
                             Binding::Remat(bits) => {

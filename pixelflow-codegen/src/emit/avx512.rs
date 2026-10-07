@@ -591,8 +591,7 @@ pub fn emit_compare(code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2], k:
         unimplemented_op("avx-512", op)
     };
     let [src1, src2] = srcs;
-    // vcmpps k, src1, src2, pred  (k-dest in ModRM.reg)
-    // vpmovm2d dst, k  (widen mask -> vector)
+    // The k destination is encoded in ModRM.reg — `rrr`'s first slot.
     assemble(
         code,
         [
@@ -634,9 +633,7 @@ pub fn emit_mask_flags(code: &mut Vec<u8>, mask: Reg, k: KReg) {
     assemble(
         code,
         [
-            // vptestmd k, mask, mask  (EVEX.512.66.0F38.W0 27 /r)
             Evex::m0f38_66(0x27).rrr(k.0, mask.0, mask.0),
-            // kortestw k1, k1  (VEX.L0.0F.W0 98 /r) -> C5 F8 98 C9
             EncodedInst::from_slice(&[0xC5, 0xF8, 0x98, 0xC9]),
         ],
     );
@@ -693,12 +690,11 @@ pub fn emit_unary(code: &mut Vec<u8>, unary: super::Unary, pool: &mut x86_64::Co
     }
 }
 
-/// Emit a fused multiply-add `dst = a*b + c` where `dst` already holds `c`.
-/// (213 form: `vfmadd213ps dst, a, b` == `dst = a*dst + b`; caller arranges
-/// operands so this computes the intended `a*b + c`.)
+/// Emit a fused multiply-add `dst = a*b + c` where `dst` already holds `c`:
+/// `vfmadd231ps dst, a, b` (EVEX.512.66.0F38.W0 B8 /r), which is
+/// `dst = a*b + dst`. The 231 form is the one whose accumulator is the
+/// destination, so `c` needs no move.
 pub fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
-    // dst currently = c. We want a*b + c. vfmadd231ps dst, a, b => dst = a*b + dst.
-    // 231: EVEX.512.66.0F38.W0 B8 /r.
     assemble(code, [Evex::m0f38_66(0xB8).rrr(dst.0, a.0, b.0)]);
 }
 
@@ -732,9 +728,7 @@ pub fn emit_set_gather_mask(code: &mut Vec<u8>) {
     assemble(
         code,
         [
-            // mov eax, 0x0000FFFF
             EncodedInst::from_slice(&[0xB8, 0xFF, 0xFF, 0x00, 0x00]),
-            // kmovw k1, eax  (VEX.L0.0F.W0 92 /r ; ModRM 11 001 000)
             EncodedInst::from_slice(&[0xC5, 0xF8, 0x92, 0xC8]),
         ],
     );
@@ -1440,7 +1434,6 @@ pub(crate) mod driver {
                     c,
                     c_deferred,
                 } => {
-                    // dst = a*b, reload c (after the multiply if deferred), dst += c.
                     super::emit_binary(code, OpKind::Mul, *dst, *a, *b);
                     match c_deferred {
                         Some(DeferredReload::FromStack(slot)) => {
