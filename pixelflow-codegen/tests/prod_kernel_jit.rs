@@ -14,13 +14,15 @@
 //!              ->  transcendental lowering + register allocation + codegen
 //!              ->  native machine code, executed on real coordinates.
 //!
-//! Extraction goes through `env_extraction_policy`, the same seam the
-//! `kernel!` macros and runtime kernels use, so this exercises the shipped
-//! policy rather than a test-only one. The point is the *pipeline*, end to end.
+//! Optimization is `pixelflow_search::runtime::optimize_runtime_arena`, the
+//! entry `jit_cache::compile` takes for every runtime kernel — its budget,
+//! its rule set and its extraction policy — so this exercises the shipped
+//! optimizer rather than one assembled for the test. The point is the
+//! *pipeline*, end to end.
 
 use pixelflow_codegen::emit::compile;
 use pixelflow_ir::{ExprArena, ExprId, LatticeShape, OpKind};
-use pixelflow_search::egraph::{Budget, Optimizer};
+use pixelflow_search::runtime::optimize_runtime_arena;
 
 /// Build `sin(sqrt(x*x + y*y) * freq) * amp + bias` as an arena.
 fn build_swirl(freq: f32, amp: f32, bias: f32) -> (ExprArena, ExprId) {
@@ -43,39 +45,6 @@ fn build_swirl(freq: f32, amp: f32, bias: f32) -> (ExprArena, ExprId) {
 
 fn reference(x: f32, y: f32, freq: f32, amp: f32, bias: f32) -> f32 {
     (((x * x + y * y).sqrt()) * freq).sin() * amp + bias
-}
-
-/// Optimize `(arena, root)` through the e-graph and the production
-/// extraction policy, returning the extracted DAG. Prints a few diagnostics
-/// so the run is visible.
-fn optimize(arena: &ExprArena, root: ExprId, tag: &str) -> (ExprArena, ExprId) {
-    // The production entry point, held to this test's own round budget.
-    let mut optimizer = Optimizer::production().budget(Budget::Explicit {
-        iterations: 40,
-        classes: 10_000,
-        applications: None,
-    });
-    let mut eg = optimizer.egraph();
-    let root_class = pixelflow_search::egraph::insert(
-        arena,
-        root,
-        &mut eg,
-        pixelflow_search::egraph::Vocabulary::Templates,
-    )
-    .expect("insert into e-graph");
-    let classes_before = eg.num_classes();
-
-    let optimized = optimizer.run(&mut eg, root_class, arena.len());
-    let classes_after = eg.num_classes();
-
-    let (out_arena, out_root) = optimized.to_arena(&eg, root_class);
-
-    eprintln!(
-        "[{tag}] egraph {classes_before} -> {classes_after} classes, \
-         extracted DAG = {} nodes",
-        out_arena.len(),
-    );
-    (out_arena, out_root)
 }
 
 // ---------------------------------------------------------------------------
@@ -104,16 +73,14 @@ fn egraph_extraction_preserves_the_swirl_kernels_values_on_the_jit() {
     let (freq, amp, bias) = (3.0_f32, 0.5, 0.5);
 
     let (orig, orig_root) = build_swirl(freq, amp, bias);
-    let (opt, opt_root) = optimize(&orig, orig_root, "swirl");
+    let optimized = optimize_runtime_arena(&orig, orig_root, LatticeShape::POINT)
+        .expect("the e-graph models every op in the swirl");
+    let (opt, opt_root) = &*optimized;
 
     // JIT both the original and the e-graph-optimized DAG. Both paths run the
     // shared transcendental-lowering + regalloc + codegen pipeline.
     let orig_jit = compile(&orig, orig_root, LatticeShape::POINT).expect("JIT original");
-    let opt_jit = compile(&opt, opt_root, LatticeShape::POINT).expect("JIT optimized");
-    eprintln!(
-        "[swirl] spills: original = {}, optimized = {}",
-        orig_jit.spill_count, opt_jit.spill_count
-    );
+    let opt_jit = compile(opt, *opt_root, LatticeShape::POINT).expect("JIT optimized");
 
     // A grid of coordinates spanning the unit-ish disc the shader samples.
     let coords = [
@@ -157,7 +124,7 @@ fn egraph_extraction_preserves_the_swirl_kernels_values_on_the_jit() {
         );
     }
     eprintln!(
-        "[swirl] max error vs analytic f32 = {max_ref_err:.4}, \
-         max original-vs-optimized = {max_cross_err:.4}"
+        "[swirl] max error vs analytic f32 = {max_ref_err:.3e}, \
+         max original-vs-optimized = {max_cross_err:.3e}"
     );
 }
