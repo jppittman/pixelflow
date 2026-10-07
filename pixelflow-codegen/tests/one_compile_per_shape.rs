@@ -14,7 +14,7 @@
 use std::sync::{Arc, Mutex};
 
 use pixelflow_codegen::jit_cache::{compile, entry_count};
-use pixelflow_ir::arena::{ExprArena, UniformDecl, UniformIdentity};
+use pixelflow_ir::arena::{ExprArena, UniformDecl, UniformId, UniformIdentity};
 use pixelflow_ir::kind::OpKind;
 use pixelflow_ir::{Kernel, LatticeShape};
 
@@ -22,26 +22,39 @@ use pixelflow_ir::{Kernel, LatticeShape};
 /// tests of this binary run one at a time.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// `(x − cx)·r + cy` over three fresh instances, declared in one of two
-/// orders so the link — not the declaration order — is what is shared.
-fn circle(declared_in_order: bool) -> Kernel {
+/// Three fresh instances — `cx`, `cy`, `r` — minted in that order whatever
+/// order they are then declared in.
+fn instances() -> [UniformDecl; 3] {
     let decl = |default| UniformDecl {
         id: UniformIdentity::mint(),
         default,
     };
-    let (cx, cy, r) = (decl(0.0), decl(0.0), decl(1.0));
+    [decl(0.0), decl(0.0), decl(1.0)]
+}
+
+/// `(x − cx)·r + cy` over three fresh instances declared as `cx`, `cy`, `r`.
+fn circle_declared_in_order() -> Kernel {
+    let [cx, cy, r] = instances();
     let mut a = ExprArena::new();
-    let (scx, scy, sr) = if declared_in_order {
-        (
-            a.declare_uniform(cx),
-            a.declare_uniform(cy),
-            a.declare_uniform(r),
-        )
-    } else {
-        let sr = a.declare_uniform(r);
-        let scy = a.declare_uniform(cy);
-        (a.declare_uniform(cx), scy, sr)
-    };
+    let scx = a.declare_uniform(cx);
+    let scy = a.declare_uniform(cy);
+    let sr = a.declare_uniform(r);
+    circle_over(a, [scx, scy, sr])
+}
+
+/// [`circle_declared_in_order`] with the instances declared as `r`, `cy`,
+/// `cx`, so the link — not the declaration order — is what is shared.
+fn circle_declared_reversed() -> Kernel {
+    let [cx, cy, r] = instances();
+    let mut a = ExprArena::new();
+    let sr = a.declare_uniform(r);
+    let scy = a.declare_uniform(cy);
+    let scx = a.declare_uniform(cx);
+    circle_over(a, [scx, scy, sr])
+}
+
+/// `(x − cx)·r + cy` over the three declared slots `[cx, cy, r]`.
+fn circle_over(mut a: ExprArena, [scx, scy, sr]: [UniformId; 3]) -> Kernel {
     let x = a.push_var(0);
     let ucx = a.push_uniform(scx);
     let ur = a.push_uniform(sr);
@@ -52,11 +65,10 @@ fn circle(declared_in_order: bool) -> Kernel {
     Kernel::from_parts(a, root)
 }
 
-/// `circle` with one more term, so the two tests in this binary never race
+/// `base` with one more term, so the two tests in this binary never race
 /// on one structure's first saturation.
-fn shifted_circle(declared_in_order: bool) -> Kernel {
-    let circle = circle(declared_in_order);
-    let (arena, root) = circle.parts();
+fn shifted(base: &Kernel) -> Kernel {
+    let (arena, root) = base.parts();
     let mut a = arena.clone();
     let one = a.push_const(1.0);
     let root = a.push_binary(OpKind::Add, root, one);
@@ -73,10 +85,18 @@ fn one_saturation_per_structure_across_shapes_and_compositions() {
 
     let _serial = SERIAL.lock().expect("serial");
     let before = saturation_count();
-    let _ = compile(&shifted_circle(true), LatticeShape::new([32, 32])).expect("compile");
+    let _ = compile(
+        &shifted(&circle_declared_in_order()),
+        LatticeShape::new([32, 32]),
+    )
+    .expect("compile");
     assert_eq!(saturation_count() - before, 1, "the first shape saturates");
     for shape in [[33, 32], [32, 33], [48, 8]] {
-        let _ = compile(&shifted_circle(false), LatticeShape::new(shape)).expect("compile");
+        let _ = compile(
+            &shifted(&circle_declared_reversed()),
+            LatticeShape::new(shape),
+        )
+        .expect("compile");
     }
     assert_eq!(
         saturation_count() - before,
@@ -90,12 +110,16 @@ fn a_thousand_circles_is_one_compile() {
     const SHAPE: LatticeShape = LatticeShape::new([64, 64]);
     let _serial = SERIAL.lock().expect("serial");
     let before = entry_count();
-    let k = circle(true);
+    let k = circle_declared_in_order();
     let first = compile(&k, SHAPE).expect("compile").kernel;
     let after_first = entry_count();
     assert_eq!(after_first - before, 1, "the first circle compiles once");
     for i in 1..1000 {
-        let k = circle(i % 2 == 0);
+        let k = if i % 2 == 0 {
+            circle_declared_in_order()
+        } else {
+            circle_declared_reversed()
+        };
         let linked = compile(&k, SHAPE).expect("compile");
         assert!(
             Arc::ptr_eq(&first, &linked.kernel),
