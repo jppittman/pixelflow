@@ -100,7 +100,7 @@ fn eval_at(code: &ExecutableCode, x: f32, y: f32) -> f32 {
 }
 
 #[test]
-fn prod_swirl_kernel_through_egraph_and_jit() {
+fn egraph_extraction_preserves_the_swirl_kernels_values_on_the_jit() {
     let (freq, amp, bias) = (3.0_f32, 0.5, 0.5);
 
     let (orig, orig_root) = build_swirl(freq, amp, bias);

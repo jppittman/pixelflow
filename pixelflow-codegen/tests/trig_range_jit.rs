@@ -267,7 +267,7 @@ fn check_domain_contract(name: &str, bound: Bound, samples: &[(f32, f32)]) {
 /// three are NaN outside it (or for non-finite/NaN input) — asserted with no
 /// tolerance, against ~100,000 points per function.
 #[test]
-fn sin_cos_tan_domain_contract_on_jit() {
+fn sin_cos_tan_stay_in_range_inside_the_domain_and_are_nan_outside_it() {
     let samples = build_samples();
     assert!(
         samples.len() >= 90_000,
