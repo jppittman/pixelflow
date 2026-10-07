@@ -228,14 +228,14 @@ impl Ownership {
 mod tests {
     use super::*;
 
-    fn def(value: u32, op: ScheduledOp) -> Def {
+    fn def(value: u64, op: ScheduledOp) -> Def {
         Def {
             value: ValueId(value),
             op,
         }
     }
 
-    fn if_of(value: u32, mask: u32, if_true: u32, if_false: u32) -> Def {
+    fn if_of(value: u64, mask: u64, if_true: u64, if_false: u64) -> Def {
         def(
             value,
             ScheduledOp::Ternary(
@@ -368,7 +368,7 @@ mod tests {
             own.arms()
                 .iter()
                 .map(|arm| {
-                    let mut values: Vec<u32> = (0..schedule.len())
+                    let mut values: Vec<u64> = (0..schedule.len())
                         .filter(|&pos| own.is_within(own.region_of(pos), arm.region))
                         .map(|pos| schedule[pos].value.0)
                         .collect();

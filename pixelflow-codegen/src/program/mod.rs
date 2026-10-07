@@ -23,7 +23,7 @@ use pixelflow_ir::kind::OpKind;
 
 /// A value in the program (SSA-style).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ValueId(pub u32);
+pub struct ValueId(pub u64);
 
 /// Which register file a value lives in: a vector of `f32` lanes, or an
 /// address.

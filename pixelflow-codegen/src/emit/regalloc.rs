@@ -1684,8 +1684,8 @@ impl<'a> Allocation<'a> {
     /// slots, plus the parks and fold slots it reads. For the body, which
     /// nothing encloses, exactly the values it spills.
     #[must_use]
-    pub(crate) fn spill_slots(&self) -> u32 {
-        self.code().slots.iter().flatten().count() as u32
+    pub(crate) fn spill_slots(&self) -> u64 {
+        self.code().slots.iter().flatten().count() as u64
     }
 
     /// The park of `v`, if this scope is the one that parks it (`v` is one
@@ -2449,7 +2449,7 @@ impl RegisterAllocator for LinearScan {
 fn record(scan: &Scan, parked: &BTreeMap<ValueId, Where>) -> Vec<Option<Placement>> {
     let mut placements: Vec<Option<Placement>> = alloc::vec![None; scan.ranges.len()];
     for (key, ranges) in scan.ranges.iter().enumerate() {
-        if parked.contains_key(&ValueId(key as u32)) {
+        if parked.contains_key(&ValueId(key as u64)) {
             continue;
         }
         for &(index, at) in ranges {
@@ -3803,7 +3803,7 @@ mod tests {
         Point { index }
     }
 
-    fn def(value: u32, op: ScheduledOp) -> Def {
+    fn def(value: u64, op: ScheduledOp) -> Def {
         Def {
             value: ValueId(value),
             op,
@@ -3819,7 +3819,7 @@ mod tests {
     /// a uniform reads its block's address, a pointer operand these schedules
     /// would each have to define first. The lane iota is the one leaf left
     /// that reads nothing and is built into a register.
-    fn leaf(value: u32) -> Def {
+    fn leaf(value: u64) -> Def {
         def(
             value,
             ScheduledOp::Lanes(pixelflow_ir::fold::Binder::from_slot(0).expect("slot 0")),
@@ -3928,7 +3928,7 @@ mod tests {
     #[test]
     fn guarded_arms_prefers_the_narrowest_covering_arm() {
         use crate::program::ArmPair;
-        let guard = |if_idx: usize, mask: u32, true_arm: (usize, usize)| IfGuard {
+        let guard = |if_idx: usize, mask: u64, true_arm: (usize, usize)| IfGuard {
             if_idx,
             mask_vid: ValueId(mask),
             ranges: ArmPair::new(true_arm, (0, 0)),
@@ -4267,7 +4267,7 @@ mod tests {
         // filler between them to push them out of a pool sized at the floor —
         // which is what makes this a test about reload targets rather than
         // about an `If` whose operands all happen to be resident.
-        let width = u32::from(RegisterFile::MIN_SCRATCH) + 1;
+        let width = u64::from(RegisterFile::MIN_SCRATCH) + 1;
         let mut schedule = vec![
             leaf(0),
             leaf(1),
@@ -4364,7 +4364,7 @@ mod tests {
     fn a_spilled_operand_read_again_only_at_the_arms_end_is_not_kept() {
         let x = ValueId(1);
         let mut schedule = vec![leaf(0), def(1, ScheduledOp::Unary(OpKind::Neg, ValueId(0)))];
-        let fillers: Vec<u32> = (10..16).collect(); // f1..f6.
+        let fillers: Vec<u64> = (10..16).collect(); // f1..f6.
         for &f in &fillers {
             schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
         }
@@ -4372,7 +4372,7 @@ mod tests {
         let eviction_index = schedule.len() - 1; // index 8.
         for (i, &f) in fillers.iter().enumerate() {
             schedule.push(def(
-                100 + i as u32,
+                100 + i as u64,
                 ScheduledOp::Unary(OpKind::Neg, ValueId(f)),
             )); // dist 1..6.
         }
@@ -4431,7 +4431,7 @@ mod tests {
     fn a_value_defined_at_the_arms_own_start_needs_no_revert_at_its_end() {
         let y = ValueId(1);
         let mut schedule = vec![leaf(0), def(1, ScheduledOp::Unary(OpKind::Neg, ValueId(0)))];
-        let leaves: Vec<u32> = (10..17).collect(); // 7 more leaves alongside Y: 8 live at once.
+        let leaves: Vec<u64> = (10..17).collect(); // 7 more leaves alongside Y: 8 live at once.
         for &l in &leaves {
             schedule.push(def(l, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
         }
@@ -4579,7 +4579,7 @@ mod tests {
     /// moment the floor moves.
     #[test]
     fn pressure_beyond_the_pool_spills() {
-        let width = u32::from(RegisterFile::MIN_SCRATCH) + 1;
+        let width = u64::from(RegisterFile::MIN_SCRATCH) + 1;
         let mut schedule = vec![leaf(0)];
         for i in 1..=width {
             schedule.push(def(i, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
@@ -4620,7 +4620,7 @@ mod tests {
     /// its bits, so there is nothing to store and no frame slot to give it.
     #[test]
     fn constants_are_rematerialized_rather_than_spilled() {
-        let width = u32::from(RegisterFile::MIN_SCRATCH) + 1;
+        let width = u64::from(RegisterFile::MIN_SCRATCH) + 1;
         let mut schedule = vec![leaf(0)];
         for i in 1..=width {
             schedule.push(def(i, ScheduledOp::Const(i as f32)));
@@ -4660,7 +4660,7 @@ mod tests {
 
     /// A leaf, `width` values of it that all stay live, and the chain of
     /// adds that consumes them: one more live value than the pool holds.
-    fn over_the_pool(width: u32, make: fn(u32) -> ScheduledOp) -> Vec<Def> {
+    fn over_the_pool(width: u64, make: fn(u64) -> ScheduledOp) -> Vec<Def> {
         let mut schedule = vec![leaf(0)];
         for i in 1..=width {
             schedule.push(def(i, make(i)));
@@ -4702,7 +4702,7 @@ mod tests {
     /// 16-byte units it has to scale back up.
     #[test]
     fn spill_slots_go_out_in_schedule_order_at_the_vector_stride() {
-        let width = u32::from(RegisterFile::MIN_SCRATCH) + 1;
+        let width = u64::from(RegisterFile::MIN_SCRATCH) + 1;
         for vector_bytes in [16u32, 32, 64] {
             let file = RegisterFile {
                 vector_bytes,
@@ -4733,7 +4733,7 @@ mod tests {
                     assert_eq!(body.slot_of(v), None, "{v:?} never leaves a register");
                 }
             }
-            assert_eq!(body.spill_slots(), spilled.len() as u32);
+            assert_eq!(body.spill_slots(), spilled.len() as u64);
             assert_eq!(a.spill_bytes(), spilled.len() as u32 * vector_bytes);
             assert_eq!(a.frame_bytes(), a.spill_bytes(), "no folds, no roots");
         }
@@ -4743,7 +4743,7 @@ mod tests {
     /// bits.
     #[test]
     fn rematerialized_values_take_no_frame_space() {
-        let width = u32::from(RegisterFile::MIN_SCRATCH) + 1;
+        let width = u64::from(RegisterFile::MIN_SCRATCH) + 1;
         let a = alloc(over_the_pool(width, |i| ScheduledOp::Const(i as f32)));
         assert!(
             (1..=width).any(|i| ever(&a, ValueId(i))
@@ -4767,8 +4767,8 @@ mod tests {
             ..TEST_FILE
         }
         .checked();
-        let limit = 2 * 1024 * 1024 / file.vector_bytes;
-        let width = limit + u32::from(RegisterFile::MIN_SCRATCH) + 1;
+        let limit = 2 * 1024 * 1024 / u64::from(file.vector_bytes);
+        let width = limit + u64::from(RegisterFile::MIN_SCRATCH) + 1;
         let result = LinearScan.allocate_nest(
             flat_nest(over_the_pool(width, |_| {
                 ScheduledOp::Unary(OpKind::Neg, ValueId(0))
@@ -4798,7 +4798,7 @@ mod tests {
         ];
         // The leaf and both constants hold three registers; enough fresh
         // values to fill the rest and force exactly one eviction.
-        let negs = u32::from(RegisterFile::MIN_SCRATCH) - 2;
+        let negs = u64::from(RegisterFile::MIN_SCRATCH) - 2;
         for i in 0..negs {
             schedule.push(def(10 + i, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
         }
@@ -4835,7 +4835,7 @@ mod tests {
         let mut schedule = vec![leaf(0), def(c.0, ScheduledOp::Const(1.5))];
         // Fill the pool past the leaf and the constant: one eviction, and
         // the constant is the only value whose slot is already valid.
-        let negs = u32::from(RegisterFile::MIN_SCRATCH) - 1;
+        let negs = u64::from(RegisterFile::MIN_SCRATCH) - 1;
         for i in 0..negs {
             schedule.push(def(10 + i, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
         }
@@ -4881,7 +4881,7 @@ mod tests {
         let mut body = vec![leaf(0)];
         // Fill the pool with fresh values that stay live to the end, so both
         // constants are defined against a full pool.
-        let negs = u32::from(RegisterFile::MIN_SCRATCH) - 1;
+        let negs = u64::from(RegisterFile::MIN_SCRATCH) - 1;
         for i in 0..negs {
             body.push(def(10 + i, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
         }
@@ -5008,9 +5008,9 @@ mod tests {
         // `MIN_SCRATCH` of them, back when the leaf was a coordinate sitting
         // in an input register outside the pool; the collapse ABI passes no
         // vectors, so there is no such register any more.
-        let pool = RegisterFile::MIN_SCRATCH as u32;
+        let pool = RegisterFile::MIN_SCRATCH as u64;
         let mut schedule = vec![leaf(0)];
-        let fillers: Vec<u32> = (10..10 + pool - 1).collect();
+        let fillers: Vec<u64> = (10..10 + pool - 1).collect();
         for &f in &fillers {
             schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
         }
@@ -5027,7 +5027,7 @@ mod tests {
         // none of them expire before the constant's contest runs.
         for (i, &f) in fillers.iter().enumerate() {
             schedule.push(def(
-                100 + i as u32,
+                100 + i as u64,
                 ScheduledOp::Unary(OpKind::Neg, ValueId(f)),
             ));
         }
@@ -5059,9 +5059,9 @@ mod tests {
         // `MIN_SCRATCH` of them, back when the leaf was a coordinate sitting
         // in an input register outside the pool; the collapse ABI passes no
         // vectors, so there is no such register any more.
-        let pool = RegisterFile::MIN_SCRATCH as u32;
+        let pool = RegisterFile::MIN_SCRATCH as u64;
         let mut schedule = vec![leaf(0)];
-        let fillers: Vec<u32> = (10..10 + pool - 1).collect();
+        let fillers: Vec<u64> = (10..10 + pool - 1).collect();
         for &f in &fillers {
             schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
         }
@@ -5083,7 +5083,7 @@ mod tests {
         // one demoted it.
         for (i, &f) in fillers.iter().enumerate() {
             schedule.push(def(
-                100 + i as u32,
+                100 + i as u64,
                 ScheduledOp::Unary(OpKind::Neg, ValueId(f)),
             ));
         }
@@ -5110,9 +5110,9 @@ mod tests {
         // `MIN_SCRATCH` of them, back when the leaf was a coordinate sitting
         // in an input register outside the pool; the collapse ABI passes no
         // vectors, so there is no such register any more.
-        let pool = RegisterFile::MIN_SCRATCH as u32;
+        let pool = RegisterFile::MIN_SCRATCH as u64;
         let mut schedule = vec![leaf(0)];
-        let fillers: Vec<u32> = (10..10 + pool - 1).collect();
+        let fillers: Vec<u64> = (10..10 + pool - 1).collect();
         for &f in &fillers {
             schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
         }
@@ -5162,9 +5162,9 @@ mod tests {
         // `MIN_SCRATCH` of them, back when the leaf was a coordinate sitting
         // in an input register outside the pool; the collapse ABI passes no
         // vectors, so there is no such register any more.
-        let pool = RegisterFile::MIN_SCRATCH as u32;
+        let pool = RegisterFile::MIN_SCRATCH as u64;
         let mut schedule = vec![leaf(0)];
-        let fillers: Vec<u32> = (10..10 + pool - 1).collect();
+        let fillers: Vec<u64> = (10..10 + pool - 1).collect();
         for &f in &fillers {
             schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
         }
@@ -5178,7 +5178,7 @@ mod tests {
         let (early, last) = fillers.split_at(fillers.len() - 1);
         for (i, &f) in early.iter().enumerate() {
             schedule.push(def(
-                100 + i as u32,
+                100 + i as u64,
                 ScheduledOp::Unary(OpKind::Neg, ValueId(f)),
             ));
         }
@@ -5212,7 +5212,7 @@ mod tests {
     #[test]
     fn a_demoted_last_instruction_queues_no_demotion_past_the_schedule() {
         let mut schedule = vec![leaf(0)];
-        for f in 10..17u32 {
+        for f in 10..17u64 {
             schedule.push(def(f, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
         }
         schedule.push(def(20, ScheduledOp::Unary(OpKind::Neg, ValueId(0)))); // 8th value: the last instruction.
@@ -5238,7 +5238,7 @@ mod tests {
     fn belady_evicts_the_value_used_farthest_out() {
         // One more independent value than the pool holds, so exactly one must
         // go to memory and the test is about *which*.
-        let live = u32::from(RegisterFile::MIN_SCRATCH) + 1;
+        let live = u64::from(RegisterFile::MIN_SCRATCH) + 1;
         let mut schedule = vec![leaf(0)];
         for i in 1..=live {
             schedule.push(def(i, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
@@ -5314,7 +5314,7 @@ mod tests {
     fn a_destination_never_lands_on_a_resident_operand() {
         // Wide enough to evict: `width` values all live at once over a pool of
         // `MIN_SCRATCH`, then folded pairwise so every fold reads two of them.
-        let width = u32::from(RegisterFile::MIN_SCRATCH) * 3;
+        let width = u64::from(RegisterFile::MIN_SCRATCH) * 3;
         let mut schedule = vec![leaf(0)];
         for i in 1..=width {
             schedule.push(def(i, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
@@ -5441,7 +5441,7 @@ mod tests {
     /// over a schedule wide enough to evict at every step.
     #[test]
     fn reservations_match_residency_under_pressure() {
-        let width = u32::from(RegisterFile::MIN_SCRATCH) * 3;
+        let width = u64::from(RegisterFile::MIN_SCRATCH) * 3;
         let mut schedule = vec![leaf(0), leaf(1)];
         for i in 2..=width {
             schedule.push(def(i, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
@@ -5477,7 +5477,7 @@ mod tests {
     /// A body of `roots` constants, all handed to one fold that reads each of
     /// them once: the shape where weighing a root by a scan of the fold is the
     /// product of the two sizes.
-    fn a_fold_reading_every_root(roots: u32) -> ScopedSchedule {
+    fn a_fold_reading_every_root(roots: u64) -> ScopedSchedule {
         let binder = def(roots + 1, ScheduledOp::Var(fold_meta().binder().var()));
         let reads = (0..roots).map(|i| {
             let read = ScheduledOp::Binary(OpKind::Add, binder.value, ValueId(i));
@@ -5515,7 +5515,7 @@ mod tests {
 
         assert!(plan.fold_binder[0], "the binder is read twice a trip");
         assert!(plan.fold_accumulator[0], "and the combine reloads the sum");
-        let carried: Vec<ValueId> = (0..BUDGET as u32 - 2).map(ValueId).collect();
+        let carried: Vec<ValueId> = (0..BUDGET as u64 - 2).map(ValueId).collect();
         assert_eq!(
             plan.scope_roots[0], carried,
             "what the fold's binder and accumulator leave of the budget goes \
@@ -5527,7 +5527,7 @@ mod tests {
     /// scopes inside to reload.
     #[test]
     fn an_unbounded_budget_carries_every_root() {
-        const ROOTS: u32 = 64;
+        const ROOTS: u64 = 64;
         let plan = plan_carries(&a_fold_reading_every_root(ROOTS), [usize::MAX, 0]);
         assert_eq!(
             plan.scope_roots[0].len(),
@@ -6116,7 +6116,7 @@ mod tests {
     /// The shape both carry tests below need: more roots than the pool has
     /// above the floor, so some are carried and some are parked.
     fn nest_with_a_read_loop() -> (Vec<ValueId>, NestAllocation) {
-        let width = 6u32;
+        let width = 6u64;
         let mut outer = vec![leaf(0)];
         for i in 1..=width {
             outer.push(def(i, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
@@ -6127,10 +6127,10 @@ mod tests {
         let mut acc = ValueId(100);
         for (i, root) in roots.iter().enumerate() {
             inner.push(def(
-                200 + i as u32,
+                200 + i as u64,
                 ScheduledOp::Binary(OpKind::Add, acc, *root),
             ));
-            acc = ValueId(200 + i as u32);
+            acc = ValueId(200 + i as u64);
         }
 
         let at = outer.len();
