@@ -12,6 +12,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::storage::MAX_FRAME;
 use super::{
     Gpr, KReg, OperandSource, PtrReg, Reg, ScheduledOp, Slot, StackFrame, operand_sources,
     reloads_wanted,
@@ -1149,10 +1150,10 @@ impl NestAllocation {
     /// where the placement says.
     ///
     /// # Errors
-    /// [`CompileError::BudgetExceeded`] when the frame outgrows
-    /// [`StackFrame::alloc_slot`]'s limit. The frame is this pass's output,
-    /// so a program too large for it is refused here, where the size is
-    /// known, and never by a panic.
+    /// [`CompileError::BudgetExceeded`] when the frame — spill slots, fold
+    /// roots and parks together — outgrows [`StackFrame::alloc_slot`]'s limit.
+    /// The frame is this pass's output, so a program too large for it is
+    /// refused here, where the size is known, and never by a panic.
     fn new(
         body: ScopeCode,
         folds: Vec<FoldScope>,
@@ -1226,6 +1227,17 @@ impl NestAllocation {
                 let slot = parks_from + parks.len() as u32 * vector_bytes;
                 parks.insert(root, slot);
             }
+        }
+        // The fold roots and parks sit above the spill half `alloc_slot`
+        // bounds, so the whole frame is checked here, once. Summed in `u64`:
+        // the `u32` offsets above could wrap before a compare in their own
+        // width saw it.
+        let frame_bytes = u64::from(spill_bytes)
+            + (2 * nest.folds.len() as u64 + parks.len() as u64) * u64::from(vector_bytes);
+        if frame_bytes > u64::from(MAX_FRAME) {
+            return Err(CompileError::BudgetExceeded(
+                "frame overflow: spill slots, fold roots and parks exceed the 2MB stack limit",
+            ));
         }
         nest.frame_bytes = parks_from + parks.len() as u32 * vector_bytes;
         nest.parks = parks;

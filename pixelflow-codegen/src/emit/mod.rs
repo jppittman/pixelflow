@@ -1022,13 +1022,18 @@ trait IsaBackend {
 
     /// Resolve a value to a register, reloading or rematerializing into
     /// `target` if it is not already in one.
+    ///
+    /// # Errors
+    ///
+    /// [`CompileError::BudgetExceeded`] when a rematerialized constant has no
+    /// addressable place in the backend's constant pool.
     fn emit_resolve(
         &mut self,
         code: &mut Vec<u8>,
         vid: regalloc::ValueId,
         target: Reg,
         locs: &[Option<Binding>],
-    ) -> Reg;
+    ) -> Result<Reg, CompileError>;
 
     /// Jump to `label` when **no lane selects `test.arm`**, so the arm can be
     /// skipped.
@@ -1090,10 +1095,26 @@ trait IsaBackend {
     // -------------------------------------------------------------------------
 
     /// `dst += scalar` across every lane, clobbering `scratch`.
-    fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32);
+    ///
+    /// # Errors
+    ///
+    /// [`CompileError::BudgetExceeded`] when the scalar has no addressable
+    /// place in the backend's constant pool.
+    fn add_scalar(
+        &mut self,
+        code: &mut Vec<u8>,
+        dst: Reg,
+        scratch: Reg,
+        scalar: f32,
+    ) -> Result<(), CompileError>;
 
     /// Load an `f32` constant, broadcast across every lane.
-    fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32);
+    ///
+    /// # Errors
+    ///
+    /// [`CompileError::BudgetExceeded`] when the constant has no addressable
+    /// place in the backend's constant pool.
+    fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) -> Result<(), CompileError>;
 
     /// `dst = op(srcs[0], srcs[1])`, an ordinary vector ALU op outside the
     /// schedule: the fold loop's accumulate (`op` is the fold's monoid).
@@ -1540,7 +1561,7 @@ fn emit_scope<B: IsaBackend>(
                             )
                         });
                     locs[vid.0 as usize] = Some(binding(allocation, vid, from_memory));
-                    let got = backend.emit_resolve(&mut asm.code, vid, r, &locs);
+                    let got = backend.emit_resolve(&mut asm.code, vid, r, &locs)?;
                     debug_assert_eq!(got, r, "a value out of a register reloads into the target");
                 }
                 Binding::Loc(Loc::Ptr(p)) => {
@@ -1646,7 +1667,7 @@ fn emit_scope<B: IsaBackend>(
         for (v, to) in core::mem::take(&mut moves[sched_idx]) {
             match to {
                 Binding::Loc(Loc::Reg(r)) => {
-                    let src = backend.emit_resolve(&mut asm.code, v, r, &locs);
+                    let src = backend.emit_resolve(&mut asm.code, v, r, &locs)?;
                     if src != r {
                         backend.emit_mov(&mut asm.code, r, src);
                     }
@@ -1676,7 +1697,7 @@ fn emit_scope<B: IsaBackend>(
             let guard = &if_guards[guard_idx];
             let mask_reg = match location_of(&locs, guard.mask_vid) {
                 Binding::Loc(Loc::Reg(r)) => r,
-                _ => backend.emit_resolve(&mut asm.code, guard.mask_vid, guard_mask(), &locs),
+                _ => backend.emit_resolve(&mut asm.code, guard.mask_vid, guard_mask(), &locs)?,
             };
             let past_arm = arm_join(guard, arm);
             let test = MaskTest {
@@ -1728,7 +1749,7 @@ fn emit_scope<B: IsaBackend>(
                     let target = scratch
                         .reload(0)
                         .expect("a Write's value is not resident and no reload was reserved");
-                    backend.emit_resolve(&mut asm.code, *value, target, &locs)
+                    backend.emit_resolve(&mut asm.code, *value, target, &locs)?
                 }
             };
             backend.emit_write(
@@ -1791,17 +1812,24 @@ fn emit_scope<B: IsaBackend>(
             // result — the slot it was given stays a dead vector of stack.
             let accumulates = fold.monoid() != Monoid::SEQ;
 
-            let mut seed = |backend: &mut B, at: Option<Reg>, value: f32, slot: u32| match at {
-                Some(r) => backend.load_const(&mut asm.code, r, value),
-                None => {
-                    backend.load_const(&mut asm.code, t0, value);
-                    backend.slot_store(&mut asm.code, t0, slot);
+            let mut seed = |backend: &mut B,
+                            at: Option<Reg>,
+                            value: f32,
+                            slot: u32|
+             -> Result<(), CompileError> {
+                match at {
+                    Some(r) => backend.load_const(&mut asm.code, r, value),
+                    None => {
+                        backend.load_const(&mut asm.code, t0, value)?;
+                        backend.slot_store(&mut asm.code, t0, slot);
+                        Ok(())
+                    }
                 }
             };
             if accumulates {
-                seed(backend, acc_reg, fold.monoid().identity(), acc_slot);
+                seed(backend, acc_reg, fold.monoid().identity(), acc_slot)?;
             }
-            seed(backend, binder_reg, fold.range().start as f32, binder_slot);
+            seed(backend, binder_reg, fold.range().start as f32, binder_slot)?;
 
             let top = Label::new(&alloc::format!("reduce{}_top", vid.0));
             let exit = Label::new(&alloc::format!("reduce{}_exit", vid.0));
@@ -1821,7 +1849,7 @@ fn emit_scope<B: IsaBackend>(
                     t0
                 }
             };
-            backend.load_const(&mut asm.code, t1, fold.range().end as f32);
+            backend.load_const(&mut asm.code, t1, fold.range().end as f32)?;
             backend.test_ge(&mut asm.code, t0, [binder_now, t1], scratch.mask_guard_temp);
             backend.branch_if_arm_is_dead(
                 &mut asm,
@@ -1860,10 +1888,10 @@ fn emit_scope<B: IsaBackend>(
             // the whole of "advance the loop".
             let stride = fold.stride() as f32;
             match binder_reg {
-                Some(b) => backend.add_scalar(&mut asm.code, b, t0, stride),
+                Some(b) => backend.add_scalar(&mut asm.code, b, t0, stride)?,
                 None => {
                     backend.slot_load(&mut asm.code, t0, binder_slot);
-                    backend.add_scalar(&mut asm.code, t0, t1, stride);
+                    backend.add_scalar(&mut asm.code, t0, t1, stride)?;
                     backend.slot_store(&mut asm.code, t0, binder_slot);
                 }
             }
@@ -1892,7 +1920,7 @@ fn emit_scope<B: IsaBackend>(
         {
             let mask_reg = match location_of(&locs, *mask_vid) {
                 Binding::Loc(Loc::Reg(r)) => r,
-                _ => backend.emit_resolve(&mut asm.code, *mask_vid, guard_mask(), &locs),
+                _ => backend.emit_resolve(&mut asm.code, *mask_vid, guard_mask(), &locs)?,
             };
             let dst = dst_loc.reg();
             let in_reg = |v: regalloc::ValueId| match location_of(&locs, v) {
@@ -1928,7 +1956,7 @@ fn emit_scope<B: IsaBackend>(
             if let Some(freg) = false_reg {
                 backend.emit_mov(&mut asm.code, dst, freg);
             } else {
-                backend.emit_resolve(&mut asm.code, *false_vid, dst, &locs);
+                backend.emit_resolve(&mut asm.code, *false_vid, dst, &locs)?;
             }
             backend.jump(&mut asm, join);
 
@@ -1936,7 +1964,7 @@ fn emit_scope<B: IsaBackend>(
             if let Some(treg) = true_reg {
                 backend.emit_mov(&mut asm.code, dst, treg);
             } else {
-                backend.emit_resolve(&mut asm.code, *true_vid, dst, &locs);
+                backend.emit_resolve(&mut asm.code, *true_vid, dst, &locs)?;
             }
 
             asm.bind(join);
@@ -1986,7 +2014,7 @@ fn emit_scope<B: IsaBackend>(
                 let target = allocation.scratch(sched_len - 1).result.expect(
                     "the allocator reserves a result target on every scope's last instruction",
                 );
-                backend.emit_resolve(&mut asm.code, root, target, &locs)
+                backend.emit_resolve(&mut asm.code, root, target, &locs)?
             }
         })
     };
@@ -6832,7 +6860,7 @@ mod tests {
                 vid: regalloc::ValueId,
                 target: Reg,
                 locs: &[Option<Binding>],
-            ) -> Reg {
+            ) -> Result<Reg, CompileError> {
                 self.note_binding(locs.get(vid.0 as usize).copied().flatten());
                 self.inner.emit_resolve(code, vid, target, locs)
             }
@@ -6878,12 +6906,23 @@ mod tests {
                 self.inner.scope_end(scope, bytes);
             }
 
-            fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
-                self.inner.add_scalar(code, dst, scratch, scalar);
+            fn add_scalar(
+                &mut self,
+                code: &mut Vec<u8>,
+                dst: Reg,
+                scratch: Reg,
+                scalar: f32,
+            ) -> Result<(), CompileError> {
+                self.inner.add_scalar(code, dst, scratch, scalar)
             }
 
-            fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
-                self.inner.load_const(code, dst, val);
+            fn load_const(
+                &mut self,
+                code: &mut Vec<u8>,
+                dst: Reg,
+                val: f32,
+            ) -> Result<(), CompileError> {
+                self.inner.load_const(code, dst, val)
             }
 
             fn alu(&mut self, code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2]) {

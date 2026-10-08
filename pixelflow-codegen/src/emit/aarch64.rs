@@ -1987,17 +1987,17 @@ pub(crate) mod driver {
             vid: regalloc::ValueId,
             target: Reg,
             locs: &[Option<Binding>],
-        ) -> Reg {
+        ) -> Result<Reg, CompileError> {
             match location_of(locs, vid) {
-                Binding::Loc(Loc::Reg(reg)) => reg,
+                Binding::Loc(Loc::Reg(reg)) => Ok(reg),
                 Binding::Remat(bits) => {
                     emit_const_load(code, target, bits, &self.consts);
-                    target
+                    Ok(target)
                 }
                 Binding::Loc(Loc::Slot(slot)) => {
                     AsmProgram::from([Inst::ldr_q(target, frame_slot(slot.offset()))])
                         .assemble(code);
-                    target
+                    Ok(target)
                 }
                 Binding::Loc(Loc::Ptr(p)) => {
                     unreachable!("{vid:?} is an address in {p:?}; the pointer class resolves it")
@@ -2117,13 +2117,26 @@ pub(crate) mod driver {
             AsmProgram::from([Inst::ldr_q(dst, frame_slot(offset))]).assemble(code);
         }
 
-        fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
+        fn add_scalar(
+            &mut self,
+            code: &mut Vec<u8>,
+            dst: Reg,
+            scratch: Reg,
+            scalar: f32,
+        ) -> Result<(), CompileError> {
             super::emit_fmov_imm(code, scratch, scalar);
             AsmProgram::from([Inst::Fadd(dst, dst, scratch)]).assemble(code);
+            Ok(())
         }
 
-        fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
+        fn load_const(
+            &mut self,
+            code: &mut Vec<u8>,
+            dst: Reg,
+            val: f32,
+        ) -> Result<(), CompileError> {
             super::emit_fmov_imm(code, dst, val);
+            Ok(())
         }
 
         fn alu(&mut self, code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2]) {

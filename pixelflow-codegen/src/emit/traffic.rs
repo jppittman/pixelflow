@@ -320,7 +320,7 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         vid: ValueId,
         target: Reg,
         locs: &[Option<Binding>],
-    ) -> Reg {
+    ) -> Result<Reg, CompileError> {
         match locs.get(vid.0 as usize).copied().flatten() {
             Some(Binding::Loc(Loc::Slot(_))) => self.current().loads_kept += 1,
             Some(Binding::Remat(_)) => self.current().remats += 1,
@@ -402,12 +402,18 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.scope_end(scope, bytes);
     }
 
-    fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
-        self.inner.add_scalar(code, dst, scratch, scalar);
+    fn add_scalar(
+        &mut self,
+        code: &mut Vec<u8>,
+        dst: Reg,
+        scratch: Reg,
+        scalar: f32,
+    ) -> Result<(), CompileError> {
+        self.inner.add_scalar(code, dst, scratch, scalar)
     }
 
-    fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
-        self.inner.load_const(code, dst, val);
+    fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) -> Result<(), CompileError> {
+        self.inner.load_const(code, dst, val)
     }
 
     fn alu(
@@ -516,8 +522,8 @@ mod tests {
             _vid: regalloc::ValueId,
             target: Reg,
             _locs: &[Option<Binding>],
-        ) -> Reg {
-            target
+        ) -> Result<Reg, CompileError> {
+            Ok(target)
         }
 
         fn ptr_store(&mut self, _code: &mut Vec<u8>, _src: PtrReg, _offset: u32) {}
@@ -544,9 +550,24 @@ mod tests {
 
         fn slot_load(&mut self, _code: &mut Vec<u8>, _dst: Reg, _offset: u32) {}
 
-        fn add_scalar(&mut self, _code: &mut Vec<u8>, _dst: Reg, _scratch: Reg, _scalar: f32) {}
+        fn add_scalar(
+            &mut self,
+            _code: &mut Vec<u8>,
+            _dst: Reg,
+            _scratch: Reg,
+            _scalar: f32,
+        ) -> Result<(), CompileError> {
+            Ok(())
+        }
 
-        fn load_const(&mut self, _code: &mut Vec<u8>, _dst: Reg, _val: f32) {}
+        fn load_const(
+            &mut self,
+            _code: &mut Vec<u8>,
+            _dst: Reg,
+            _val: f32,
+        ) -> Result<(), CompileError> {
+            Ok(())
+        }
 
         fn alu(&mut self, _code: &mut Vec<u8>, _op: OpKind, _dst: Reg, _srcs: [Reg; 2]) {}
 
@@ -667,7 +688,9 @@ mod tests {
         let mut code = Vec::new();
         let locs = [Some(Binding::Loc(Loc::Slot(Slot::new(0))))];
 
-        counting.emit_resolve(&mut code, regalloc::ValueId(0), Reg(0), &locs);
+        counting
+            .emit_resolve(&mut code, regalloc::ValueId(0), Reg(0), &locs)
+            .unwrap();
         let traffic = counting.take(0);
 
         assert_eq!(
@@ -686,7 +709,9 @@ mod tests {
         let mut code = Vec::new();
         let locs = [Some(Binding::Remat(0x3f80_0000))];
 
-        counting.emit_resolve(&mut code, regalloc::ValueId(0), Reg(0), &locs);
+        counting
+            .emit_resolve(&mut code, regalloc::ValueId(0), Reg(0), &locs)
+            .unwrap();
         let traffic = counting.take(0);
 
         assert_eq!(
@@ -705,7 +730,9 @@ mod tests {
         let mut code = Vec::new();
         let locs = [Some(Binding::Loc(Loc::Reg(Reg(3))))];
 
-        counting.emit_resolve(&mut code, regalloc::ValueId(0), Reg(0), &locs);
+        counting
+            .emit_resolve(&mut code, regalloc::ValueId(0), Reg(0), &locs)
+            .unwrap();
 
         assert_eq!(counting.take(0), ScopeTraffic::default());
     }

@@ -52,8 +52,8 @@ const POOL_BASE: PtrReg = PtrReg(8);
 pub(super) struct ConstPool {
     /// The entries, in pool order.
     entries: Vec<u32>,
-    /// Each entry's byte offset, by its bits.
-    index: BTreeMap<u32, u32>,
+    /// Each entry's position in `entries`, by its bits.
+    index: BTreeMap<u32, u64>,
 }
 
 impl ConstPool {
@@ -63,16 +63,20 @@ impl ConstPool {
     /// Always a `disp32`, never a `disp8`: EVEX scales a `disp8` by the
     /// operand's tuple size, VEX does not, and one form for both is worth
     /// three bytes per load.
-    pub(super) fn operand(&mut self, bits: u32) -> Mem<Imm32> {
-        let offset = *self.index.entry(bits).or_insert_with(|| {
-            let offset = (self.entries.len() * 4) as u32;
-            self.entries.push(bits);
-            offset
-        });
-        Mem {
-            base: POOL_BASE,
-            disp: Imm32(offset as i32),
+    ///
+    /// # Errors
+    ///
+    /// [`CompileError::BudgetExceeded`] when the entry lies past a `disp32`
+    /// ([`block_element`]): a pool that cannot be addressed never grows.
+    pub(super) fn operand(&mut self, bits: u32) -> Result<Mem<Imm32>, CompileError> {
+        if let Some(&position) = self.index.get(&bits) {
+            return block_element(POOL_BASE, position);
         }
+        let position = self.entries.len() as u64;
+        let element = block_element(POOL_BASE, position)?;
+        self.entries.push(bits);
+        self.index.insert(bits, position);
+        Ok(element)
     }
 
     /// Append the pool after the return and bind [`CONST_POOL`] where it
@@ -800,9 +804,9 @@ pub(in crate::emit) const fn frame_slot(offset: u32) -> Mem<Imm32> {
 const F32_BYTES: u64 = 4;
 
 /// The `offset`-th `f32` of the block at `base`, `[base + 4*offset]`, as a
-/// `disp32` operand — the one place a uniform's 64-bit slot meets the
-/// width x86 gives a displacement, shared by the VEX and EVEX tiers the way
-/// [`mem_operand_into`] is.
+/// `disp32` operand — the one place a uniform's or a pool entry's 64-bit
+/// position meets the width x86 gives a displacement, shared by the VEX and
+/// EVEX tiers the way [`mem_operand_into`] is.
 ///
 /// # Errors
 ///
@@ -817,7 +821,7 @@ pub(in crate::emit) fn block_element(
         .checked_mul(F32_BYTES)
         .and_then(|bytes| i32::try_from(bytes).ok())
         .ok_or(CompileError::BudgetExceeded(
-            "uniform offset past x86's disp32",
+            "block offset past x86's disp32",
         ))?;
     Ok(Mem {
         base,
@@ -1305,6 +1309,38 @@ mod gpr_tests {
         assert_eq!(
             one(movups_store(Reg(9), slot)),
             [0x44, 0x0F, 0x11, 0x8C, 0x24, 64, 0, 0, 0]
+        );
+    }
+
+    /// The pool's entry `k` is at byte `4k`, so entry 2^29 is the first a
+    /// signed `disp32` cannot hold. It is refused the way `block_element`
+    /// refuses a uniform, not wrapped into an address below the pool. A
+    /// kernel with 2^29 distinct constants is not buildable, so the pool is
+    /// handed that many entries directly; `vec![0; n]` is a zeroed
+    /// allocation whose pages are never touched.
+    #[test]
+    fn a_pool_past_the_disp32_is_refused_not_wrapped() {
+        const LAST_FITTING: usize = (1 << 29) - 1;
+        let mut pool = ConstPool {
+            entries: vec![0; LAST_FITTING],
+            index: BTreeMap::new(),
+        };
+        let last = pool.operand(1).expect("entry 2^29 - 1 is at byte 2^31 - 4");
+        assert_eq!(last.disp, Imm32(i32::MAX - 3));
+
+        assert!(
+            matches!(pool.operand(2), Err(CompileError::BudgetExceeded(_))),
+            "entry 2^29 is at byte 2^31, past a signed disp32"
+        );
+        assert_eq!(
+            pool.entries.len(),
+            LAST_FITTING + 1,
+            "a refused constant is not entered"
+        );
+        assert_eq!(
+            pool.operand(1)
+                .expect("an entered constant keeps its place"),
+            last
         );
     }
 
