@@ -7,7 +7,7 @@
 //! table"). The property did not change — an out-of-range `sin` still ships
 //! green with nothing to catch it — so this rebuilds the claim against the
 //! thing that actually ships: a JIT-compiled kernel, called through
-//! `pixelflow_codegen::CompiledKernel`, the same route
+//! `pixelflow_codegen::emit::CompiledKernel`, the same route
 //! `transcendental_jit.rs` uses.
 //!
 //! The property, exactly as CLAUDE.md states it: **range is a hard property,
@@ -63,7 +63,7 @@ use pixelflow_ir::passes::TRIG_DOMAIN;
 
 /// One point of a kernel compiled at [`pixelflow_ir::LatticeShape::POINT`],
 /// read back through the origin block.
-fn eval_point(jit: &pixelflow_codegen::CompiledKernel, x: f32) -> f32 {
+fn eval_point(jit: &pixelflow_codegen::emit::CompiledKernel, x: f32) -> f32 {
     let mut out = [0.0f32; 1];
     let origin = [x, 0.0f32];
     // SAFETY: every kernel this file compiles declares no buffer and no
@@ -77,7 +77,7 @@ fn eval_point(jit: &pixelflow_codegen::CompiledKernel, x: f32) -> f32 {
     out[0]
 }
 
-fn eval_points_1d(jit: &pixelflow_codegen::CompiledKernel, inputs: &[f32]) -> Vec<f32> {
+fn eval_points_1d(jit: &pixelflow_codegen::emit::CompiledKernel, inputs: &[f32]) -> Vec<f32> {
     inputs.iter().map(|&x| eval_point(jit, x)).collect()
 }
 

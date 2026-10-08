@@ -115,7 +115,7 @@ an unrecognized value panics quoting itself. Same family as
 | `JIT_VECTOR_BYTES` and its three `cfg` arms in `pixelflow-codegen/src/lib.rs` | ~50 | `jit_vector_bytes()` |
 | `emit::Native` and its four `cfg` arms | ~40 | `compile_native`'s `match` |
 | the `avx2,-fma` `compile_error!` in `emit/avx2.rs` | 15 | the probe refuses the host |
-| the SSE2-only `cfg` gates on `emit`'s tests, and the `+avx512f`/`+avx2` gates on the per-backend runtime test modules | — | tests run on the host's tier; per-backend runtime tests run wherever the host can execute them (`skip_unless_host_runs!`) |
+| the SSE2-only `cfg` gates on `emit`'s tests, and the `+avx512f`/`+avx2` gates on the per-backend runtime test modules | — | tests run on the host's tier; the AVX2 runtime tests run on every x86-64 host (the floor), and the AVX-512 ones on the process that selected AVX-512 (`skip_unless_avx512_is_selected!`), which `xtask isa-matrix`'s avx512 pass is |
 | `xtask`'s `run_with_rustflags`, `host_triple`, the per-level target directory | ~90 | one build |
 
 `pixelflow-core/src/backend/fastmath.rs` moved to `pixelflow-core/src/fastmath.rs`:

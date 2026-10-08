@@ -52,8 +52,7 @@
 //! definition of each row. The golden pins all three backends from any
 //! host; this prints the host's own, through the production path as well.
 
-use pixelflow_codegen::emit::traffic::{BranchTraffic, ScopeTraffic};
-use pixelflow_codegen::emit::{CompileResult, compile};
+use pixelflow_codegen::emit::{CompileResult, ScopeTraffic, compile};
 use pixelflow_codegen::jit_cache::{self, Linked};
 use pixelflow_codegen::{CompileError, fnv1a64};
 use pixelflow_ir::{ExprArena, ExprId, Kernel, LatticeShape, OpKind, Uniform};
@@ -215,7 +214,7 @@ fn through_the_jit(
 fn jit_columns(production: &Result<Linked, CompileError>) -> String {
     match production {
         Ok(linked) => {
-            let bytes = linked.kernel.code_bytes();
+            let bytes = linked.kernel.as_bytes();
             format!("jit_len={:<6} jit_fnv={:016x}", bytes.len(), fnv1a64(bytes))
         }
         Err(e) => format!("jit ERROR {e:?}"),
@@ -291,16 +290,11 @@ fn sibling_cases() -> Vec<SiblingRow> {
     ]
 }
 
-/// `guards/arms/entries`: what a compile branched over.
-fn branches(b: BranchTraffic) -> String {
-    format!("{}/{}/{}", b.guards, b.arms_branched, b.arm_entries)
-}
-
 /// One scope's counts, in a fixed order.
 fn counts(t: &ScopeTraffic) -> String {
     format!(
-        "instructions={} loads_transient={} loads_kept={} remats={} stores={} writes={} bytes={}",
-        t.instructions, t.loads_transient, t.loads_kept, t.remats, t.stores, t.writes, t.bytes
+        "instructions={} loads_transient={} loads_kept={} remats={} stores={} bytes={}",
+        t.instructions, t.loads_transient, t.loads_kept, t.remats, t.stores, t.bytes
     )
 }
 
@@ -312,14 +306,7 @@ fn print_sibling_row(row: &SiblingRow) {
         root,
         shape,
     } = row;
-    let jit = through_the_jit(arena, *root, *shape);
-    let mut production = jit_columns(&jit);
-    if let Ok(linked) = &jit {
-        production.push_str(&format!(
-            " jit_branches={}",
-            branches(linked.kernel.branches())
-        ));
-    }
+    let production = jit_columns(&through_the_jit(arena, *root, *shape));
     let compiled = compile(arena, *root, *shape);
     println!("{name:<24} {} {production}", emitter_columns(&compiled));
     let Ok(r) = compiled else {
@@ -327,15 +314,12 @@ fn print_sibling_row(row: &SiblingRow) {
     };
     let t = &r.traffic;
     println!(
-        "    compile: spill_count={} spill_bytes={} hoisted_values={} max_regs={} \
-         vector_bytes={} pool={}",
-        r.spill_count, r.spill_bytes, r.hoisted_values, r.max_regs, t.vector_bytes, t.pool
+        "    compile: spill_count={} spill_bytes={} hoisted_values={} vector_bytes={} pool={}",
+        r.spill_count, r.spill_bytes, r.hoisted_values, t.vector_bytes, t.pool
     );
     println!(
-        "    traffic: carried={} trailing={} branches={} scopes={}",
+        "    traffic: carried={} scopes={}",
         t.carried,
-        t.trailing,
-        branches(t.branches),
         t.scopes.len()
     );
     println!("    scaffold: {}", counts(&t.scaffold));

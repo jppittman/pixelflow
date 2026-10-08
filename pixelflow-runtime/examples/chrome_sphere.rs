@@ -37,7 +37,7 @@ fn world(ray: &Ray) -> Rgba {
 }
 
 /// A chrome sphere at (0, 0, 4) reflecting that world.
-fn scene() -> (Scene, usize, std::time::Duration) {
+fn scene() -> (Scene, std::time::Duration) {
     let ray = Ray::through_screen(W as f32, H as f32);
     let sphere = Sphere::new([k(0.0), k(0.0), k(4.0)], k(1.0)).hit(&ray);
     let mirrored = ray.reflected(sphere.normal());
@@ -46,8 +46,7 @@ fn scene() -> (Scene, usize, std::time::Duration) {
     let start = Instant::now();
     let program = compile_platform_packed(&color, [W as u32, H as u32]);
     let compile = start.elapsed();
-    let code = program.code_bytes().len();
-    (Scene::Packed(program.bind(&[])), code, compile)
+    (Scene::Packed(program.bind(&[])), compile)
 }
 
 fn save(name: &str, frame: &Frame<PlatformPixel>) {
@@ -69,8 +68,8 @@ fn main() {
         (W * H) as f64 / 1_000_000.0
     );
 
-    let (scene, code, compile) = scene();
-    println!("Compiled once in {compile:?} to {code} bytes of code\n");
+    let (scene, compile) = scene();
+    println!("Compiled once in {compile:?}\n");
 
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
     println!("Available CPU threads: {cores}\n");

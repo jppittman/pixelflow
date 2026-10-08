@@ -220,7 +220,7 @@ fn legalize_keeps_a_bare_reduce_and_its_size_does_not_track_the_extent() {
         let collapse = pixelflow_ir::passes::lattice::Collapse {
             domain: pixelflow_ir::passes::lattice::Domain {
                 shape: pixelflow_ir::LatticeShape::new([1, 1]),
-                origin: pixelflow_codegen::emit::origin(),
+                origin: [0.0, 0.0].map(|default| pixelflow_ir::Uniform::new(default).decl()),
             },
             lanes: 4,
         };

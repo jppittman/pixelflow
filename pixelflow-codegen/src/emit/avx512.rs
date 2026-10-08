@@ -278,7 +278,7 @@ const UNUSED_VVVV: u8 = 0;
 ///
 /// Only the `Neg`/`Abs` sign mask: EVEX is non-destructive and `vpternlogd`
 /// blends an `If` with no temporary.
-pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
+fn temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
         ScheduledOp::Unary(OpKind::Neg | OpKind::Abs, _) => 1,
@@ -294,7 +294,7 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
 }
 
 /// How many GPRs this backend's encoding of `op` needs beyond
-/// [`regalloc::RegisterFile::gpr_ctx`].
+/// [`regalloc::RegisterFile::gpr_ctx`](crate::emit::regalloc::RegisterFile::gpr_ctx).
 ///
 /// `Gather` and `Uniform` need none: the base each addresses is a pointer
 /// value the allocator carries, and `vgatherdps` takes its indices as a
@@ -303,7 +303,7 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
 /// each before combining them into the address, and the remainder's
 /// writemask rides in through the second once the address is done with it;
 /// the iota carries each eight bytes in through one.
-pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
+fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
         ScheduledOp::Write { .. } => 2,
@@ -318,7 +318,7 @@ pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
 /// work and now a `RegisterFile::mask_scratch` reservation — and a remainder
 /// store's writemask. Every other op either has no mask (arithmetic) or
 /// reads the mask as an ordinary vector (`If`).
-pub(crate) fn mask_temps_for(op: &super::ScheduledOp) -> u8 {
+fn mask_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
         ScheduledOp::Binary(op_kind, ..) if is_compare(*op_kind) => 1,
@@ -452,7 +452,7 @@ fn vpsrld_imm(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
 }
 
 /// vmovaps zmmDST, zmmSRC — register copy (EVEX.512.0F.W0 28 /r).
-pub fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
+fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     if dst.0 == src.0 {
         return;
     }
@@ -495,7 +495,7 @@ fn emit_const(
 ///
 /// [`CompileError::BudgetExceeded`] when the element lies past a `disp32`
 /// ([`x86_64::block_element`]).
-pub(super) fn emit_uniform_load(
+fn emit_uniform_load(
     code: &mut Vec<u8>,
     dst: Reg,
     base: PtrReg,
@@ -512,12 +512,7 @@ pub(super) fn emit_uniform_load(
 /// writemask, no `vgatherdps`. See [`x86_64::BroadcastGprs`] for the
 /// register contract; `dst` may alias `idx`, since the index is in a GPR
 /// before `dst` is written.
-pub(super) fn emit_broadcast_load(
-    code: &mut Vec<u8>,
-    dst: Reg,
-    idx: Reg,
-    gprs: x86_64::BroadcastGprs,
-) {
+fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64::BroadcastGprs) {
     AsmProgram::from([
         vcvttss2si_xmm(gprs.index, idx),
         Evex::m0f38_66(0x18).rm_scaled4(dst.0, gprs.base.as_gpr(), gprs.index),
@@ -623,7 +618,7 @@ fn emit_compare(code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2], k: KRe
 /// One `vpternlogd dst, if_true, if_false, 0xCA` (EVEX.512.66.0F3A.W0 25 /r ib):
 /// the truth table 0xCA computes `A?B:C` per bit with A=dst(mask), B=if_true,
 /// C=if_false, i.e. a per-lane select for an all-ones/all-zeros mask.
-pub fn emit_if(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg) {
+fn emit_if(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg) {
     assemble(
         code,
         [Evex::m0f3a_66(0x25)
@@ -738,7 +733,7 @@ fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
 /// (EVEX.512.F3.0F.W0 5B /r). The lowered gather index is an exact non-negative
 /// integer in float form, so truncation is lossless and matches the reference
 /// interpreter's `floorf(index) as usize`.
-pub fn emit_cvttps2dq(code: &mut Vec<u8>, dst: Reg, src: Reg) {
+fn emit_cvttps2dq(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     assemble(code, [Evex::m0f_f3(0x5B).rrr(dst.0, UNUSED_VVVV, src.0)]);
 }
 
@@ -746,7 +741,7 @@ pub fn emit_cvttps2dq(code: &mut Vec<u8>, dst: Reg, src: Reg) {
 ///
 /// A gather requires a non-zero writemask and *clears* the bits it completes, so
 /// this must run before each gather. Clobbers `eax` (caller-saved scratch).
-pub fn emit_set_gather_mask(code: &mut Vec<u8>) {
+fn emit_set_gather_mask(code: &mut Vec<u8>) {
     assemble(
         code,
         [
@@ -802,7 +797,7 @@ fn gather(dst: Reg, base_gpr: u8, index: Reg) -> EncodedInst {
     inst
 }
 
-pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, base_gpr: u8, index: Reg) {
+fn emit_gather(code: &mut Vec<u8>, dst: Reg, base_gpr: u8, index: Reg) {
     AsmProgram::from([gather(dst, base_gpr, index)]).assemble(code);
 }
 
@@ -813,18 +808,114 @@ mod tests {
     //! real `zmm` kernels and execute them on the host (all 16 lanes), so a bad
     //! byte fails loudly. Runtime tests require `+avx512f`.
     #![allow(clippy::needless_range_loop)]
+    use super::*;
+
+    /// Offset 3 shifted up by a full 16-bit range: where a 16-bit slot used
+    /// to wrap back to argument 3.
+    const PAST_U16: u64 = 3 + (u16::MAX as u64 + 1);
+
+    /// The uniform read for `dst = 5` through the block in `rax`: offset 3
+    /// is `vbroadcastss zmm5, [rax + 12]` (checked against `llvm-mc
+    /// --disassemble`, LLVM 18), and an offset past the old 16-bit width
+    /// carries its full `disp32` with the same prefix and ModRM. The block's
+    /// address is a pointer-class value the allocator placed, so no load of
+    /// it appears here: that is the `Context` def's, once per call.
+    #[test]
+    fn a_uniform_read_is_one_broadcast_load() {
+        let mut code = Vec::new();
+        emit_uniform_load(&mut code, Reg(5), PtrReg(0), 3).expect("fits");
+        assert_eq!(code, [0x62, 0xF2, 0x7D, 0x48, 0x18, 0xA8, 0x0C, 0, 0, 0]);
+
+        let mut code = Vec::new();
+        emit_uniform_load(&mut code, Reg(5), PtrReg(0), PAST_U16).expect("fits");
+        assert_eq!(
+            code,
+            [0x62, 0xF2, 0x7D, 0x48, 0x18, 0xA8, 0x0C, 0x00, 0x04, 0x00]
+        );
+    }
+
+    /// The width is the encoder's, and an offset past it is refused, never
+    /// wrapped: a wrapped displacement would be a load of some other argument,
+    /// with plausible pixels. `disp32` is signed, so the last element it
+    /// reaches is at `i32::MAX / 4` — and a refused offset emits nothing.
+    #[test]
+    fn an_offset_past_the_disp32_is_refused() {
+        const LAST_DISP32: u64 = i32::MAX as u64 / 4;
+        let mut code = Vec::new();
+        emit_uniform_load(&mut code, Reg(0), PtrReg(0), LAST_DISP32)
+            .expect("the last element a disp32 reaches");
+        for offset in [LAST_DISP32 + 1, u64::MAX] {
+            let mut code = Vec::new();
+            let refused = emit_uniform_load(&mut code, Reg(0), PtrReg(0), offset);
+            assert!(
+                matches!(refused, Err(CompileError::BudgetExceeded(_))),
+                "offset {offset}: expected a refusal, got {refused:?}"
+            );
+            assert!(code.is_empty(), "offset {offset}: a refusal emitted bytes");
+        }
+    }
+
+    /// The lane-uniform read for `dst = 5, idx = 6`: `vcvttss2si rcx, xmm6`
+    /// then `vbroadcastss zmm5, [rax + rcx*4]` (checked against `objdump
+    /// -M intel`); and with the base and index past the low eight, `[r9 +
+    /// r11*4]` sets `X` and `B` in the prefix (clear, inverted). The base's
+    /// own load is the `Context` def's, once per call, not this instruction's.
+    #[test]
+    fn a_lane_uniform_read_truncates_then_broadcasts() {
+        let low = x86_64::BroadcastGprs {
+            base: PtrReg(0),
+            index: x86_64::gpr::RCX,
+        };
+        let mut code = Vec::new();
+        emit_broadcast_load(&mut code, Reg(5), Reg(6), low);
+        assert_eq!(
+            code,
+            [
+                0x62, 0xF1, 0xFE, 0x48, 0x2C, 0xCE, 0x62, 0xF2, 0x7D, 0x48, 0x18, 0x2C, 0x88
+            ]
+        );
+
+        let high = x86_64::BroadcastGprs {
+            base: PtrReg(9),
+            index: Gpr(11),
+        };
+        let mut code = Vec::new();
+        emit_broadcast_load(&mut code, Reg(5), Reg(6), high);
+        assert_eq!(&code[6..], [0x62, 0x92, 0x7D, 0x48, 0x18, 0x2C, 0x99]);
+    }
 
     /// Executes the bytes on this host's CPU, so every test first asks
-    /// whether it can (`skip_unless_host_runs!`). The `extern
+    /// whether this process emits AVX-512 (`skip_unless_avx512_is_selected!`).
+    /// The `extern
     /// "C"` kernels take `zmm` values, which the ABI only lets a caller
     /// compiled with AVX-512 pass — hence `#[target_feature]` on the
     /// functions that call them, and nowhere else.
     #[cfg(target_arch = "x86_64")]
     mod runtime {
         use super::super::*;
-        use crate::emit::executable::ExecutableCode;
+
+        /// `ret` (`C3`): the end of a hand-assembled test kernel, which
+        /// returns its `__m256`/`__m512` in the vector register a
+        /// `vzeroupper` would clear.
+        const RET: u8 = 0xC3;
+        use crate::emit::executable::CompiledKernel;
         use crate::emit::{Gpr, PtrReg};
-        use crate::isa::{Isa, skip_unless_host_runs};
+
+        /// In a test: return early, with a note on stderr, unless this process
+        /// emits AVX-512 ([`crate::isa::detect`]) — so `xtask isa-matrix` runs
+        /// these on the pass that selects it. The harness has no skip, so an
+        /// early `return` with a note is what "not this tier" looks like:
+        /// never a silent pass, and never a failure for a fact about the
+        /// machine.
+        macro_rules! skip_unless_avx512_is_selected {
+            () => {
+                let selected = crate::isa::detect();
+                if selected != crate::isa::Isa::Avx512 {
+                    std::eprintln!("skipped: this process emits {selected:?}, not AVX-512");
+                    return;
+                }
+            };
+        }
         use core::arch::x86_64::*;
 
         // Passing __m512 by value IS the emitted ABI (SysV: zmm0-7), so
@@ -834,7 +925,7 @@ mod tests {
 
         fn run(body: &[u8], xs: [f32; 16], ys: [f32; 16], zs: [f32; 16]) -> [f32; 16] {
             let mut code = body.to_vec();
-            crate::emit::x86_64::ret(&mut code);
+            code.push(RET);
             // SAFETY: every caller is a test that checked the host runs AVX-512.
             unsafe { run_code(&code, xs, ys, zs) }
         }
@@ -852,7 +943,7 @@ mod tests {
             let mut asm = crate::emit::Assembly::default();
             x86_64::anchor(&mut asm);
             asm.code.extend_from_slice(body);
-            crate::emit::x86_64::ret(&mut asm.code);
+            asm.code.push(RET);
             pool.finish(&mut asm);
             // SAFETY: every caller is a test that checked the host runs AVX-512.
             unsafe { run_code(&asm.finish(), xs, ys, zs) }
@@ -865,9 +956,9 @@ mod tests {
         /// `zmm` values.
         #[target_feature(enable = "avx512f")]
         unsafe fn run_code(code: &[u8], xs: [f32; 16], ys: [f32; 16], zs: [f32; 16]) -> [f32; 16] {
-            let exec = unsafe { ExecutableCode::from_code(code).expect("mmap") };
+            let exec = unsafe { CompiledKernel::from_code(code).expect("mmap") };
             unsafe {
-                let f: K = exec.as_fn();
+                let f: K = core::mem::transmute(exec.as_bytes().as_ptr());
                 let r = f(
                     _mm512_loadu_ps(xs.as_ptr()),
                     _mm512_loadu_ps(ys.as_ptr()),
@@ -887,11 +978,11 @@ mod tests {
         ///
         /// The host must execute AVX-512 (every caller checked).
         #[target_feature(enable = "avx512f")]
-        unsafe fn gather(exec: &ExecutableCode, base: *const f32, idx: [f32; 16]) -> [f32; 16] {
+        unsafe fn gather(exec: &CompiledKernel, base: *const f32, idx: [f32; 16]) -> [f32; 16] {
             #[allow(improper_ctypes_definitions)]
             type G = unsafe extern "C" fn(*const f32, __m512) -> __m512;
             unsafe {
-                let f: G = exec.as_fn();
+                let f: G = core::mem::transmute(exec.as_bytes().as_ptr());
                 let r = f(base, _mm512_loadu_ps(idx.as_ptr()));
                 let mut out = [0.0f32; 16];
                 _mm512_storeu_ps(out.as_mut_ptr(), r);
@@ -935,7 +1026,7 @@ mod tests {
 
         #[test]
         fn emit_binary_matches_the_scalar_reference_for_every_arithmetic_op() {
-            skip_unless_host_runs!(Isa::Avx512);
+            skip_unless_avx512_is_selected!();
             let (xs, ys, zs) = lanes();
             let cases: &[BinaryCase] = &[
                 (OpKind::Add, |a, b| a + b),
@@ -954,7 +1045,7 @@ mod tests {
 
         #[test]
         fn emit_binary_writes_a_high_numbered_register() {
-            skip_unless_host_runs!(Isa::Avx512);
+            skip_unless_avx512_is_selected!();
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Mul, Reg(20), X, Y);
@@ -964,7 +1055,7 @@ mod tests {
 
         #[test]
         fn emit_load_and_emit_store_address_a_high_numbered_base_register_correctly() {
-            skip_unless_host_runs!(Isa::Avx512);
+            skip_unless_avx512_is_selected!();
             // Every production caller in this file addresses memory through
             // rsp or rax (both < r8), so `Evex::rm`'s B-bit inversion for a
             // >= r8 base has no other coverage. Move the incoming pointer
@@ -996,9 +1087,9 @@ mod tests {
             for (i, v) in buf.iter_mut().enumerate() {
                 *v = i as f32;
             }
-            let exec = unsafe { ExecutableCode::from_code(&c).expect("mmap") };
+            let exec = unsafe { CompiledKernel::from_code(&c).expect("mmap") };
             unsafe {
-                let f: F = exec.as_fn();
+                let f: F = core::mem::transmute(exec.as_bytes().as_ptr());
                 f(buf.as_mut_ptr());
             }
             for (i, &v) in buf.iter().enumerate() {
@@ -1017,7 +1108,7 @@ mod tests {
 
         #[test]
         fn emit_unary_computes_sqrt_of_a_positive_operand() {
-            skip_unless_host_runs!(Isa::Avx512);
+            skip_unless_avx512_is_selected!();
             let (xs, ys, zs) = lanes();
             let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
@@ -1027,7 +1118,7 @@ mod tests {
 
         #[test]
         fn emit_unary_negates_and_takes_the_absolute_value_of_every_lane() {
-            skip_unless_host_runs!(Isa::Avx512);
+            skip_unless_avx512_is_selected!();
             let (xs, ys, zs) = lanes();
             let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
@@ -1043,7 +1134,7 @@ mod tests {
         /// every read is one broadcast from it.
         #[test]
         fn emit_const_broadcasts_and_adds_to_every_lane() {
-            skip_unless_host_runs!(Isa::Avx512);
+            skip_unless_avx512_is_selected!();
             let (xs, ys, zs) = lanes();
             let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
@@ -1062,7 +1153,7 @@ mod tests {
 
         #[test]
         fn emit_fmadd_c_in_dst_computes_the_fused_multiply_add() {
-            skip_unless_host_runs!(Isa::Avx512);
+            skip_unless_avx512_is_selected!();
             let (xs, ys, zs) = lanes();
             // emit_fmadd_c_in_dst(dst, a, b): dst = a*b + dst.
             let mut c = Vec::new();
@@ -1082,7 +1173,7 @@ mod tests {
         /// forms genuinely disagree, and this asserts the bits.
         #[test]
         fn emit_fmadd_c_in_dst_rounds_once_not_twice() {
-            skip_unless_host_runs!(Isa::Avx512);
+            skip_unless_avx512_is_selected!();
             let xs = [1.000_000_1f32; 16];
             let ys = [4097.0f32; 16];
             let zs = [4097.0f32; 16];
@@ -1111,7 +1202,7 @@ mod tests {
 
         #[test]
         fn emit_gather_reads_the_value_at_each_lanes_index() {
-            skip_unless_host_runs!(Isa::Avx512);
+            skip_unless_avx512_is_selected!();
             // JIT a function: fn(*const f32 base [rdi], __m512 idx_float [zmm0]) -> __m512
             // that truncates the float indices, sets the mask, and gathers
             // base[idx] per lane. Validates the VSIB vgatherdps bytes on hardware.
@@ -1120,7 +1211,7 @@ mod tests {
             emit_set_gather_mask(&mut c); // k1 = 0xFFFF
             emit_gather(&mut c, Reg(14), 7, Reg(13)); // zmm14{k1} = [rdi + zmm13*4]
             emit_mov(&mut c, Reg(0), Reg(14)); // return in zmm0
-            crate::emit::x86_64::ret(&mut c);
+            c.push(RET);
 
             let buf: Vec<f32> = (0..64).map(|i| (i as f32) * 1.5 + 0.25).collect();
             // Distinct per-lane indices, including repeats and the ends.
@@ -1129,7 +1220,7 @@ mod tests {
                 41.0,
             ];
 
-            let exec = unsafe { ExecutableCode::from_code(&c).expect("mmap") };
+            let exec = unsafe { CompiledKernel::from_code(&c).expect("mmap") };
             // SAFETY: the host runs AVX-512, checked at the top of this test.
             let out = unsafe { gather(&exec, buf.as_ptr(), idx) };
 
@@ -1141,7 +1232,7 @@ mod tests {
 
         #[test]
         fn emit_gather_addresses_high_numbered_vector_registers_and_gpr_base() {
-            skip_unless_host_runs!(Isa::Avx512);
+            skip_unless_avx512_is_selected!();
             // The production driver always gathers through rax (base_gpr=0)
             // with dst/idx below zmm16 in every kernel this test suite
             // compiles, so `emit_gather_reads_the_value_at_each_lanes_index`
@@ -1155,7 +1246,7 @@ mod tests {
             emit_set_gather_mask(&mut c);
             emit_gather(&mut c, Reg(20), 9, Reg(21)); // zmm20{k1} = [r9 + zmm21*4]
             emit_mov(&mut c, Reg(0), Reg(20));
-            crate::emit::x86_64::ret(&mut c);
+            c.push(RET);
 
             let buf: Vec<f32> = (0..64).map(|i| (i as f32) * 1.5 + 0.25).collect();
             let idx: [f32; 16] = [
@@ -1163,7 +1254,7 @@ mod tests {
                 41.0,
             ];
 
-            let exec = unsafe { ExecutableCode::from_code(&c).expect("mmap") };
+            let exec = unsafe { CompiledKernel::from_code(&c).expect("mmap") };
             // SAFETY: the host runs AVX-512, checked at the top of this test.
             let out = unsafe { gather(&exec, buf.as_ptr(), idx) };
 
@@ -1175,7 +1266,7 @@ mod tests {
 
         #[test]
         fn emit_load_after_emit_store_recovers_the_spilled_value() {
-            skip_unless_host_runs!(Isa::Avx512);
+            skip_unless_avx512_is_selected!();
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             AsmProgram::from([crate::emit::x86_64::Inst::SubImm32 {
@@ -1208,13 +1299,13 @@ mod tests {
 /// compiles, typechecks and is swept for op coverage on every host, whatever
 /// CPU it has. Only `compile_native` in `emit` decides which backend a
 /// process instantiates — from the tier `crate::isa` read off the CPU — and
-/// only [`executable`](super::super::executable) needs the matching hardware.
+/// only [`executable`](crate::emit::executable) needs the matching hardware.
 ///
 /// The consequence worth stating: a change that does not touch an ISA file
 /// cannot introduce a platform-specific bug. That is the bargain `unsafe`
 /// makes — confine what cannot be checked, so the rest is checked by
 /// construction.
-pub(crate) mod driver {
+pub(super) mod driver {
     use super::super::*;
     use super::{
         AsmProgram, Evex, IOTA_BYTES, Mem, NoDisp, UNUSED_VVVV, frame_slot, kmovw_from_gpr,
@@ -1275,16 +1366,14 @@ pub(crate) mod driver {
     .checked();
 
     /// AVX-512 implementation of the shared driver's leaf operations.
-    pub(crate) struct Avx512Backend {
+    pub(in crate::emit) struct Avx512Backend {
         consts: x86::ConstPool,
-        file: regalloc::RegisterFile,
     }
 
     impl Avx512Backend {
-        pub(crate) fn new(ctx: EmitCtx) -> Self {
+        pub(in crate::emit) fn new() -> Self {
             Self {
                 consts: x86::ConstPool::default(),
-                file: AVX512_FILE.capped(ctx.max_regs),
             }
         }
 
@@ -1309,7 +1398,7 @@ pub(crate) mod driver {
         }
 
         fn register_file(&self) -> regalloc::RegisterFile {
-            self.file
+            AVX512_FILE
         }
 
         /// Nothing to seed: the pool fills as constants are emitted.
@@ -1395,8 +1484,7 @@ pub(crate) mod driver {
                     super::emit_uniform_load(code, *dst, *base, *offset)?;
                 }
                 ResolvedOp::Context { dst, slot } => {
-                    let ctx = self
-                        .file
+                    let ctx = AVX512_FILE
                         .gpr_ctx
                         .expect("x86's context read needs the GPR context input");
                     AsmProgram::from([x86::MovLoadPtr {
@@ -1619,7 +1707,7 @@ pub(crate) mod driver {
         fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan) {
             let addr = write_address(
                 code,
-                &self.file,
+                &AVX512_FILE,
                 write,
                 Convert {
                     from_xmm: |code, dst, src| {
@@ -1634,7 +1722,7 @@ pub(crate) mod driver {
                 base: PtrReg(addr.0),
                 disp: NoDisp,
             };
-            let lanes = self.file.vector_bytes / 4;
+            let lanes = AVX512_FILE.vector_bytes / 4;
             if write.lanes == lanes {
                 AsmProgram::from([Evex::m0f(0x11).rm(write.value.0, at)]).assemble(code);
                 return;

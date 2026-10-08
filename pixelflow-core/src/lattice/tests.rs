@@ -546,10 +546,14 @@ mod uniforms {
         let (k2, _) = circle();
         let extent = [16, 4];
         let p1 = Manifold::compile(&k1, extent);
-        let p2 = Manifold::compile(&k2, extent);
-        assert_eq!(
-            p1.code_bytes().as_ptr(),
-            p2.code_bytes().as_ptr(),
+        let shape = pixelflow_ir::LatticeShape::new(extent);
+        let compiled = |k: &Kernel| {
+            pixelflow_codegen::jit_cache::compile(k, shape)
+                .expect("compile")
+                .kernel
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&compiled(&k1), &compiled(&k2)),
             "two instances of one shape share one compiled region"
         );
         let lattice = Lattice::frame(16, 4);

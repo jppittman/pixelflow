@@ -45,7 +45,7 @@ fn guarded_if_kernel() -> Kernel {
 
 fn report(label: &str, kernel: &Kernel, shape: LatticeShape) {
     let linked = jit_cache::compile(kernel, shape).expect("compile");
-    let bytes = linked.kernel.code_bytes();
+    let bytes = linked.kernel.as_bytes();
     println!(
         "{label}: shape={:?} len={} fnv1a64={:016x}",
         shape,

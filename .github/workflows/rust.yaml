@@ -407,6 +407,14 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # Narrowing an item leaves any doc that links to it pointing at something
+      # private or gone, and nothing else in CI renders the docs. Private items
+      # too: most of pixelflow-codegen is private, and its links are its map.
+      - name: Check pixelflow-codegen's doc links resolve
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p pixelflow-codegen --no-deps --document-private-items
+
   cross-target-abi:
     name: Cross-target ABI (aarch64)
     needs: change-scope
@@ -671,7 +679,6 @@ jobs:
           tests=(
             color_chrome_sphere
             floor_only
-            four_channels_share_one_geometry
           )
           for test_name in "${tests[@]}"; do
             cargo nextest run -p pixelflow-graphics \
@@ -680,6 +687,12 @@ jobs:
               --profile ci \
               --no-tests fail
           done
+          # Reads the emitted code of the scene's packed kernel, which only
+          # render::packed can build, so it lives beside it.
+          cargo nextest run -p pixelflow-graphics --lib \
+            -E "test(=render::packed::tests::four_channels_share_one_geometry)" \
+            --profile ci \
+            --no-tests fail
 
       - name: Check ray/surface composition contracts
         shell: bash

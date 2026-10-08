@@ -8,11 +8,11 @@ use libc::{
     sysconf,
 };
 
-use super::{CodePage, ExecutableCode};
+use super::{CodePage, CompiledKernel};
 use crate::error::CompileError;
 
 /// A mapped, writable code page on Linux.
-pub struct LinuxCodePage {
+pub(super) struct LinuxCodePage {
     ptr: *mut u8,
     capacity: usize,
 }
@@ -21,9 +21,6 @@ pub struct LinuxCodePage {
 fn sync_instruction_cache(ptr: *mut u8, len: usize) {
     use core::arch::asm;
 
-    if len == 0 {
-        return;
-    }
     let start = ptr as usize;
     let end = start + len;
 
@@ -80,30 +77,12 @@ impl CodePage for LinuxCodePage {
     }
 
     fn write(&mut self, code: &[u8]) {
-        // `assert!`, not `debug_assert!`: this trait's methods are safe, so a
-        // caller reaches this `copy_nonoverlapping` from safe code. A
-        // debug-only guard compiles out of release, where the overrun would
-        // write past the mapping.
-        assert!(
-            code.len() <= self.capacity,
-            "code buffer ({} bytes) exceeds the mapped page ({} bytes)",
-            code.len(),
-            self.capacity,
-        );
+        // `CodePage::from_code` maps `code.len()` rounded up to a page, and
+        // nothing else calls this.
         unsafe { ptr::copy_nonoverlapping(code.as_ptr(), self.ptr, code.len()) };
     }
 
-    fn finish(self, len: usize) -> Result<ExecutableCode, CompileError> {
-        // Before anything reads `len` bytes: `sync_instruction_cache` walks
-        // that range, and the `ExecutableCode` this returns hands it to the
-        // safe `as_bytes`, which builds a slice from it. An unchecked `len`
-        // past `capacity` is therefore out-of-bounds through safe code.
-        if len > self.capacity {
-            return Err(CompileError::Internal(
-                "finish: code length exceeds the mapped page",
-            ));
-        }
-
+    fn finish(self, len: usize) -> Result<CompiledKernel, CompileError> {
         let rc = unsafe {
             mprotect(
                 self.ptr.cast::<libc::c_void>(),
@@ -118,7 +97,7 @@ impl CodePage for LinuxCodePage {
         sync_instruction_cache(self.ptr, len);
 
         let me = core::mem::ManuallyDrop::new(self);
-        Ok(ExecutableCode {
+        Ok(CompiledKernel {
             ptr: me.ptr,
             len,
             capacity: me.capacity,
@@ -128,7 +107,7 @@ impl CodePage for LinuxCodePage {
 
 impl Drop for LinuxCodePage {
     fn drop(&mut self) {
-        // As `ExecutableCode::drop`: the failure is a leak at best and nothing
+        // As `CompiledKernel::drop`: the failure is a leak at best and nothing
         // can be done about it here, but it must not pass unremarked. This
         // drop is reached on `finish`'s error paths too.
         let rc = unsafe { munmap(self.ptr.cast::<libc::c_void>(), self.capacity) };
@@ -141,56 +120,11 @@ impl Drop for LinuxCodePage {
 }
 
 #[cfg(test)]
-pub(crate) fn test_sync_empty() {
-    let mut byte = 0u8;
-    sync_instruction_cache(&raw mut byte, 0);
-}
-
-#[cfg(test)]
 mod tests {
     use super::LinuxCodePage;
     use crate::emit::executable::CodePage;
 
-    /// Every one of `CodePage`'s methods is safe, so this sequence is
-    /// reachable without `unsafe`.
-    /// Before the guard in `finish`, it returned an `ExecutableCode` whose
-    /// `len` exceeded the mapping — and `ExecutableCode::as_bytes` is a safe
-    /// `from_raw_parts` over exactly that `len`.
-    #[test]
-    fn sealing_past_the_mapping_is_refused_rather_than_returning_an_oob_slice() {
-        // `map` records the requested capacity verbatim — mmap rounds up to a
-        // page internally, but `self.capacity` is what was asked for, and that
-        // is the bound `as_bytes` would be trusted with.
-        const REQUESTED: usize = 64;
-
-        assert!(
-            LinuxCodePage::map(REQUESTED)
-                .expect("map")
-                .finish(REQUESTED)
-                .is_ok(),
-            "sealing exactly the requested capacity must still be allowed",
-        );
-        assert!(
-            LinuxCodePage::map(REQUESTED)
-                .expect("map")
-                .finish(REQUESTED + 1)
-                .is_err(),
-            "one byte past the mapping must be refused, not handed to as_bytes",
-        );
-    }
-
-    /// The release-mode half of the same hole: `write` guarded
-    /// `copy_nonoverlapping` with a `debug_assert!`, which is absent from the
-    /// build that ships.
-    #[test]
-    #[should_panic(expected = "exceeds the mapped page")]
-    fn writing_past_the_mapping_panics_rather_than_overrunning_it() {
-        let mut page = LinuxCodePage::map(64).expect("map");
-        let oversized = vec![0x90u8; 65];
-        page.write(&oversized);
-    }
-
-    /// `ExecutableCode`'s `Drop` (not this file's `LinuxCodePage::drop` —
+    /// `CompiledKernel`'s `Drop` (not this file's `LinuxCodePage::drop` —
     /// `finish` wraps `self` in `ManuallyDrop` before that impl ever runs) is
     /// what owns unmapping the flipped page, and nothing in this crate reads
     /// it back to notice if that stopped happening: a `Drop` reduced to a

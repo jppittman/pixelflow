@@ -23,8 +23,7 @@
 //! all four backends from any host by `emit::tests::muladd_encoding`.
 #![cfg(target_arch = "x86_64")]
 
-use pixelflow_codegen::CompiledKernel;
-use pixelflow_codegen::emit::{EmitCtx, compile};
+use pixelflow_codegen::emit::{CompiledKernel, compile};
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId};
 
@@ -72,11 +71,6 @@ fn fused(a: f32, b: f32, c: f32) -> f32 {
 fn decomposed(a: f32, b: f32, c: f32) -> f32 {
     core::hint::black_box(a * b) + c
 }
-
-/// `RegisterFile::MIN_SCRATCH`, the smallest pool `EmitCtx::with_max_regs`
-/// accepts. That constant is crate-private and this crate cannot name it, so a
-/// floor that rises is caught by `capped`'s assert, which names both numbers.
-const SMALLEST_POOL: u8 = 7;
 
 /// An input where the two forms differ, so an assertion against one of them
 /// genuinely rejects the other. `1.0000001 * 4097.0` needs more mantissa bits
@@ -153,12 +147,7 @@ fn an_unspilled_muladd_rounds_once() {
     // the backend live in registers rather than reloaded — is what the bit
     // check below proves: only the fused, single-rounding form produces
     // `fused(A, B, C)`.
-    let jit = CompiledKernel::new(
-        result.code,
-        result.traffic.branches,
-        pixelflow_ir::LatticeShape::POINT,
-    );
-    let got = eval_point(&jit, A, B, &[C]);
+    let got = eval_point(&result.code, A, B, &[C]);
     assert_bits("fused MulAdd", got, fused(A, B, C));
 }
 
@@ -169,10 +158,9 @@ fn an_unspilled_muladd_rounds_once() {
 ///
 /// This is the arm AVX-512 had no test for at all: `spill_pressure.rs`'s
 /// scenarios were sized for the six-register SSE2 pool and stopped spilling
-/// against AVX-512's nineteen. Shrinking the pool explicitly —
-/// `EmitCtx::with_max_regs`, which its own doc calls "how a caller forces
-/// spilling deliberately" — reaches it at every width instead of at
-/// whichever one the scenario happened to suit.
+/// against AVX-512's nineteen. The wall below is sized past every tier's
+/// whole pool instead, so the production compile reaches it at every width
+/// rather than at whichever one the scenario happened to suit.
 ///
 /// Three things the scenario has to get right, and each has been the reason
 /// an earlier version of it quietly tested the fused arm instead:
@@ -186,16 +174,15 @@ fn an_unspilled_muladd_rounds_once() {
 ///   is also exact, which is why the inputs are `A`/`B` halved.
 /// - **The multiplicands are Belady's first victims.** The allocator evicts
 ///   the value read furthest ahead, so what decides the multiplicands' fate is
-///   not how small the pool is (`RegisterFile::MIN_SCRATCH` — a temp cannot
-///   spill, so a one-register pool is not a budget a caller can ask for) but
-///   where their last read falls relative to everything competing with them.
+///   not how small the pool is but where their last read falls relative to
+///   everything competing with them.
 ///   They are defined first and read last, by the `MulAdd` at the root — and
 ///   nothing else may be read *after* the `MulAdd`, or that is what gets
 ///   evicted in their place.
 /// - **The wall is read twice, both times before the `MulAdd`.** The schedule
 ///   is the legalized arena's order, which is post-order from the root: a
-///   term consumed once is defined where it is consumed, and ten such terms
-///   hold one register between them however they were pushed. So every term
+///   term consumed once is defined where it is consumed, and any number of
+///   such terms hold one register between them however they were pushed. So every term
 ///   is summed twice, in opposite orders (the same order would be the same
 ///   nodes): each is live from its first sum to its second, the pool
 ///   overflows, and the multiplicands — read further ahead than any term —
@@ -213,6 +200,11 @@ fn an_unspilled_muladd_rounds_once() {
 /// frame's slots and is nonzero for every kernel at a one-point lattice.
 #[test]
 fn a_spilled_muladd_rounds_twice_on_every_target() {
+    /// Terms in the wall: each is live from its first sum to its second, so
+    /// this many outlast the widest tier's whole register pool (AVX-512's
+    /// thirty-two `zmm`s).
+    const WALL_TERMS: u32 = 48;
+
     fn chain(a: &mut ExprArena, terms: &[ExprId]) -> ExprId {
         terms[1..]
             .iter()
@@ -230,7 +222,7 @@ fn a_spilled_muladd_rounds_twice_on_every_target() {
     let xw = a.push_binary(OpKind::Mul, x, w);
     let mb = a.push_binary(OpKind::Add, yy, xw);
 
-    let wall: Vec<ExprId> = (1..=10u32)
+    let wall: Vec<ExprId> = (1..=WALL_TERMS)
         .map(|i| {
             let c = a.push_const(i as f32);
             let xi = a.push_binary(OpKind::Add, x, c);
@@ -244,16 +236,10 @@ fn a_spilled_muladd_rounds_twice_on_every_target() {
     let addend = a.push_binary(OpKind::Add, addend, backward);
     let root = a.push_ternary(OpKind::MulAdd, ma, mb, addend);
 
-    let result = EmitCtx::with_max_regs(SMALLEST_POOL)
-        .compile(&a, root, pixelflow_ir::LatticeShape::POINT)
-        .expect("compile spilled MulAdd");
+    let result =
+        compile(&a, root, pixelflow_ir::LatticeShape::POINT).expect("compile spilled MulAdd");
     let stores: u64 = result.traffic.scopes.iter().map(|s| s.stores).sum();
     assert!(stores > 0, "scenario failed to create register pressure");
-    let jit = CompiledKernel::new(
-        result.code,
-        result.traffic.branches,
-        pixelflow_ir::LatticeShape::POINT,
-    );
-    let got = eval_point(&jit, HALF_A, HALF_B, &[C, 0.0]);
+    let got = eval_point(&result.code, HALF_A, HALF_B, &[C, 0.0]);
     assert_bits("decomposed MulAdd", got, decomposed(A, B, C));
 }

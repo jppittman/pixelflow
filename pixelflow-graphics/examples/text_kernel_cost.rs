@@ -83,7 +83,7 @@ fn main() {
         let collapse = Collapse {
             domain: Domain {
                 shape: MEASURE_SHAPE,
-                origin: pixelflow_codegen::emit::origin(),
+                origin: [0.0, 0.0].map(|default| pixelflow_ir::Uniform::new(default).decl()),
             },
             lanes: (pixelflow_codegen::jit_vector_bytes() / 4) as u32,
         };

@@ -105,9 +105,9 @@ impl ConstPool {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct LeaRip {
     /// Where the address is materialized.
-    pub dst: PtrReg,
+    dst: PtrReg,
     /// The position it is the address of.
-    pub target: Label,
+    target: Label,
 }
 
 /// Bytes from a `LeaRip`'s start to its displacement field: REX, opcode,
@@ -156,7 +156,7 @@ pub(super) fn anchor(asm: &mut Assembly) {
 /// the AVX-512 tier and 88 ns on AVX2 without this, and 32 and 15 ns with
 /// it. The charge is not the call's: the same sum, run after one call and
 /// never calling again, took 482 ns rather than 266.
-pub(crate) fn return_to_caller(code: &mut Vec<u8>) {
+pub(super) fn return_to_caller(code: &mut Vec<u8>) {
     AsmProgram::from([Inst::Vzeroupper, Inst::Ret]).assemble(code);
 }
 
@@ -167,9 +167,9 @@ pub(crate) fn return_to_caller(code: &mut Vec<u8>) {
 /// 64-bit pointer load: `mov dst, [base + disp32]`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) struct MovLoadPtr {
-    pub dst: PtrReg,
-    pub base: PtrReg,
-    pub disp: i32,
+    pub(super) dst: PtrReg,
+    pub(super) base: PtrReg,
+    pub(super) disp: i32,
 }
 
 impl MovLoadPtr {
@@ -195,20 +195,13 @@ impl MovLoadPtr {
     }
 }
 
-impl AsmInsn for MovLoadPtr {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        self.encode().emit_into(code);
-    }
-}
-
 /// `mov [base + disp32], src` — `REX.W 89 /r`: an address to a frame slot,
 /// the pointer class's spill store. [`MovLoadPtr`]'s mirror.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MovStorePtr {
-    pub src: PtrReg,
-    pub base: PtrReg,
-    pub disp: i32,
+    pub(super) src: PtrReg,
+    pub(super) base: PtrReg,
+    pub(super) disp: i32,
 }
 
 impl MovStorePtr {
@@ -230,13 +223,6 @@ impl MovStorePtr {
     }
 }
 
-impl AsmInsn for MovStorePtr {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        self.encode().emit_into(code);
-    }
-}
-
 /// Bytes per pointer in the context array.
 pub(super) const PTR_BYTES: i32 = 8;
 
@@ -248,9 +234,9 @@ pub(super) const PTR_BYTES: i32 = 8;
 #[derive(Clone, Copy)]
 pub(super) struct BroadcastGprs {
     /// The buffer base pointer.
-    pub base: PtrReg,
+    pub(super) base: PtrReg,
     /// Receives the truncated index.
-    pub index: Gpr,
+    pub(super) index: Gpr,
 }
 
 // =============================================================================
@@ -265,25 +251,18 @@ pub(super) fn emit_test_eax(code: &mut Vec<u8>) {
 #[cfg(test)]
 mod label_tests {
     use super::{Cond, Inst, Jcc, Jmp};
-    use crate::emit::{AsmProgram, Item, Label};
-    use alloc::vec::Vec;
-
-    fn assemble(items: impl IntoIterator<Item = Item<Inst>>) -> Vec<u8> {
-        let mut code = Vec::new();
-        AsmProgram::new(items).assemble(&mut code);
-        code
-    }
+    use crate::emit::{Assembly, Label};
 
     /// The one thing a label does that a fixup token could not: name a
     /// position that does not exist yet.
     #[test]
     fn a_forward_branch_names_a_position_bound_later() {
         let end = Label::new("end");
-        let code = assemble([
-            Item::Inst(Inst::from(Jmp { target: end })),
-            Item::Inst(Inst::Ret),
-            Item::Label(end),
-        ]);
+        let mut asm = Assembly::default();
+        asm.push(Jmp { target: end });
+        asm.push(Inst::Ret);
+        asm.bind(end);
+        let code = asm.finish();
 
         // `jmp rel32` is five bytes; `ret` is one; the label lands at 6. The
         // displacement is measured from the end of the branch, so it is 1.
@@ -297,11 +276,11 @@ mod label_tests {
     #[test]
     fn a_back_edge_resolves_to_a_negative_displacement() {
         let top = Label::new("end");
-        let code = assemble([
-            Item::Label(top),
-            Item::Inst(Inst::Ret),
-            Item::Inst(Inst::from(Jmp { target: top })),
-        ]);
+        let mut asm = Assembly::default();
+        asm.bind(top);
+        asm.push(Inst::Ret);
+        asm.push(Jmp { target: top });
+        let code = asm.finish();
 
         // `ret` at 0, `jmp` at 1..6. Target 0, origin 6, so the displacement
         // is -6 — and getting this sign backwards is the classic way a loop
@@ -311,15 +290,15 @@ mod label_tests {
     }
 
     /// A label may name a position no instruction occupies — the end of the
-    /// program. That is why a label is an item of its own rather than a field
-    /// on an instruction: there is nothing here to hang it on.
+    /// program. That is why binding a label is a step of its own rather than
+    /// a field on an instruction: there is nothing here to hang it on.
     #[test]
     fn a_label_can_end_the_program() {
         let end = Label::new("end");
-        let code = assemble([
-            Item::Inst(Inst::from(Jmp { target: end })),
-            Item::Label(end),
-        ]);
+        let mut asm = Assembly::default();
+        asm.push(Jmp { target: end });
+        asm.bind(end);
+        let code = asm.finish();
         assert_eq!(code.len(), 5);
         assert_eq!(i32::from_le_bytes([code[1], code[2], code[3], code[4]]), 0);
     }
@@ -328,15 +307,15 @@ mod label_tests {
     #[test]
     fn two_labels_can_share_a_position() {
         let (a, b) = (Label::new("end"), Label::new("other"));
-        let code = assemble([
-            Item::Inst(Inst::from(Jcc {
-                condition: Cond::E,
-                target: a,
-            })),
-            Item::Inst(Inst::from(Jmp { target: b })),
-            Item::Label(a),
-            Item::Label(b),
-        ]);
+        let mut asm = Assembly::default();
+        asm.push(Jcc {
+            condition: Cond::E,
+            target: a,
+        });
+        asm.push(Jmp { target: b });
+        asm.bind(a);
+        asm.bind(b);
+        let code = asm.finish();
         // `je` is 6 bytes, `jmp` 5, both landing at 11.
         assert_eq!(code.len(), 11);
         assert_eq!(i32::from_le_bytes([code[2], code[3], code[4], code[5]]), 5);
@@ -348,32 +327,33 @@ mod label_tests {
     #[test]
     fn a_program_is_position_independent() {
         let end = Label::new("end");
-        let items = [
-            Item::Inst(Inst::from(Jmp { target: end })),
-            Item::Label(end),
-        ];
-
-        let mut offset = alloc::vec![0x90u8; 7];
-        AsmProgram::new(items).assemble(&mut offset);
-        assert_eq!(&assemble(items)[..], &offset[7..]);
+        let program = |mut asm: Assembly| {
+            asm.push(Jmp { target: end });
+            asm.bind(end);
+            asm.finish()
+        };
+        let offset = program(Assembly::from_code(alloc::vec![0x90u8; 7]));
+        assert_eq!(&program(Assembly::default())[..], &offset[7..]);
     }
 
     #[test]
     #[should_panic(expected = "never written")]
     fn an_unbound_label_is_a_bug_and_not_a_jump_to_itself() {
-        let _ = assemble([Item::Inst(
-            Jmp {
-                target: Label::new("end"),
-            }
-            .into(),
-        )]);
+        let mut asm = Assembly::default();
+        asm.push(Jmp {
+            target: Label::new("end"),
+        });
+        let code = asm.finish();
+        unreachable!("assembled {} bytes around an unbound label", code.len());
     }
 
     #[test]
     #[should_panic(expected = "written twice")]
     fn a_label_bound_twice_is_a_bug() {
         let twice = Label::new("end");
-        let _ = assemble([Item::Label(twice), Item::Label(twice)]);
+        let mut asm = Assembly::default();
+        asm.bind(twice);
+        asm.bind(twice);
     }
 }
 
@@ -401,37 +381,30 @@ pub(super) mod gpr {
     use super::Gpr;
 
     /// Scratch / `movmskps` destination.
-    pub const RAX: Gpr = Gpr(0);
+    pub(in crate::emit) const RAX: Gpr = Gpr(0);
     /// Scratch; SysV's 4th integer argument, which the kernel ABI does not use.
-    pub const RCX: Gpr = Gpr(1);
+    pub(in crate::emit) const RCX: Gpr = Gpr(1);
     /// 3rd integer argument: the pitch.
-    pub const RDX: Gpr = Gpr(2);
+    pub(in crate::emit) const RDX: Gpr = Gpr(2);
     /// 2nd integer argument: the output plane.
-    pub const RSI: Gpr = Gpr(6);
+    pub(in crate::emit) const RSI: Gpr = Gpr(6);
     /// 1st integer argument: the context pointer — the array of bound buffer
     /// bases, then the uniform and origin blocks. Read-only for the whole
     /// kernel.
-    pub const RDI: Gpr = Gpr(7);
+    pub(in crate::emit) const RDI: Gpr = Gpr(7);
     /// The stack pointer.
-    pub const RSP: Gpr = Gpr(4);
-    /// The extended registers, named for the encoders' tests.
-    pub const R9: Gpr = Gpr(9);
-    pub const R10: Gpr = Gpr(10);
-    pub const R11: Gpr = Gpr(11);
+    pub(in crate::emit) const RSP: Gpr = Gpr(4);
+    pub(in crate::emit) const R9: Gpr = Gpr(9);
+    pub(in crate::emit) const R10: Gpr = Gpr(10);
+    pub(in crate::emit) const R11: Gpr = Gpr(11);
 }
 
 /// SysV argument and scratch pointer registers.
 pub(super) mod ptr {
     use super::PtrReg;
 
-    /// Scratch / base pointer register (`rax`).
-    #[cfg(test)]
-    pub const RAX: PtrReg = PtrReg(0);
-    /// Context pointer register (`rdi`).
-    #[cfg(test)]
-    pub const RDI: PtrReg = PtrReg(7);
     /// Stack pointer register (`rsp`).
-    pub const RSP: PtrReg = PtrReg(4);
+    pub(in crate::emit) const RSP: PtrReg = PtrReg(4);
 }
 
 /// First-class x86-64 instruction.
@@ -442,50 +415,9 @@ pub(super) enum Inst {
     SubImm32 { dst: Gpr, imm: Imm32 },
     Vzeroupper,
     Ret,
-    MovLoadPtr(MovLoadPtr),
-    Encoded(EncodedInst),
-    Jmp(Jmp),
-    Jcc(Jcc),
-}
-
-impl From<EncodedInst> for Inst {
-    #[inline(always)]
-    fn from(e: EncodedInst) -> Self {
-        Inst::Encoded(e)
-    }
-}
-
-impl From<Jmp> for Inst {
-    #[inline(always)]
-    fn from(j: Jmp) -> Self {
-        Inst::Jmp(j)
-    }
-}
-
-impl From<Jcc> for Inst {
-    #[inline(always)]
-    fn from(j: Jcc) -> Self {
-        Inst::Jcc(j)
-    }
-}
-
-impl From<MovLoadPtr> for Inst {
-    #[inline(always)]
-    fn from(m: MovLoadPtr) -> Self {
-        Inst::MovLoadPtr(m)
-    }
 }
 
 impl AsmInsn for Inst {
-    #[inline]
-    fn label_ref(self) -> Option<LabelRef> {
-        match self {
-            Inst::Jmp(j) => j.label_ref(),
-            Inst::Jcc(j) => j.label_ref(),
-            _ => None,
-        }
-    }
-
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
         match self {
@@ -494,17 +426,13 @@ impl AsmInsn for Inst {
             Inst::SubImm32 { dst, imm } => sub(code, dst, imm),
             Inst::Vzeroupper => vzeroupper(code),
             Inst::Ret => ret(code),
-            Inst::Jmp(j) => j.emit_into(code),
-            Inst::Jcc(j) => j.emit_into(code),
-            Inst::MovLoadPtr(m) => m.emit_into(code),
-            Inst::Encoded(e) => e.emit_into(code),
         }
     }
 }
 
 /// A sign-extended 8-bit immediate.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) struct Imm8(pub i8);
+pub(super) struct Imm8(pub(super) i8);
 
 /// `REX.W` plus the extension bits for a two-register form.
 ///
@@ -533,10 +461,10 @@ pub(super) fn mov(code: &mut Vec<u8>, dst: Gpr, src: Gpr) {
     rr(code, 0x89, dst, src);
 }
 
-/// What an [`add`] can add: another register, or a small immediate.
+/// What an [`add`] can add: another register, or a 32-bit immediate.
 ///
-/// The operand's *type* picks the encoding, so callers write `add(c, RSI, R9)`
-/// and `add(c, RSI, Imm8(16))` rather than choosing between differently-named
+/// The operand's *type* picks the encoding, so callers write `add(c, RSP, R9)`
+/// and `add(c, RSP, Imm32(16))` rather than choosing between differently-named
 /// functions — which would put the operand kinds back in the name.
 trait AddSrc {
     /// Emit `add dst, self`.
@@ -550,13 +478,6 @@ impl AddSrc for Gpr {
     }
 }
 
-impl AddSrc for Imm8 {
-    #[inline(always)]
-    fn add_into(self, code: &mut Vec<u8>, dst: Gpr) {
-        code.extend_from_slice(&[rex_w(Gpr(0), dst), 0x83, modrm_rr(0, dst), self.0 as u8]);
-    }
-}
-
 /// `add dst, src`
 #[inline(always)]
 fn add(code: &mut Vec<u8>, dst: Gpr, src: impl AddSrc) {
@@ -565,12 +486,11 @@ fn add(code: &mut Vec<u8>, dst: Gpr, src: impl AddSrc) {
 
 /// A 32-bit immediate.
 ///
-/// Distinct from [`Imm8`] because x86 gives them different opcodes — `81 /n id`
-/// versus the sign-extended `83 /n ib`. The caller writes `add(c, RSP,
-/// Imm32(n))` or `add(c, RSI, Imm8(n))` and the operand type picks; nothing
-/// upstream has to know which opcode that implies.
+/// The `81 /n id` immediate group's operand. The caller writes `add(c, RSP,
+/// Imm32(n))` and the operand type picks the encoding; nothing upstream has to
+/// know which opcode that implies.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) struct Imm32(pub i32);
+pub(super) struct Imm32(pub(super) i32);
 
 /// `REX.W 81 /ext id` — the immediate group with a 32-bit operand.
 #[inline(always)]
@@ -594,7 +514,7 @@ fn sub(code: &mut Vec<u8>, dst: Gpr, Imm32(imm): Imm32) {
 
 /// `ret`
 #[inline(always)]
-pub(super) fn ret(code: &mut Vec<u8>) {
+fn ret(code: &mut Vec<u8>) {
     code.push(0xC3);
 }
 
@@ -606,7 +526,8 @@ fn vzeroupper(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0xC5, 0xF8, 0x77]);
 }
 
-/// The 4-bit condition an x86 `jcc` tests — the whole field, not a selection.
+/// The 4-bit condition an x86 `jcc` tests: the conditions the emitter
+/// branches on.
 ///
 /// `0F 8x rel32` is one instruction whose low opcode nibble *is* this value, so
 /// the assembler encodes it by casting rather than by dispatching to one
@@ -614,39 +535,11 @@ fn vzeroupper(code: &mut Vec<u8>) {
 /// their aliases, because that is what a reader checks against the manual.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum Cond {
-    /// `jo` — overflow.
-    O = 0x0,
-    /// `jno` — no overflow.
-    No = 0x1,
+enum Cond {
     /// `jb` / `jc` / `jnae` — CF set; unsigned `<`.
     B = 0x2,
-    /// `jae` / `jnb` / `jnc` — CF clear; unsigned `>=`.
-    Ae = 0x3,
     /// `je` / `jz` — ZF set.
     E = 0x4,
-    /// `jne` / `jnz` — ZF clear.
-    Ne = 0x5,
-    /// `jbe` / `jna` — unsigned `<=`.
-    Be = 0x6,
-    /// `ja` / `jnbe` — unsigned `>`.
-    A = 0x7,
-    /// `js` — sign set.
-    S = 0x8,
-    /// `jns` — sign clear.
-    Ns = 0x9,
-    /// `jp` / `jpe` — parity even; set by an unordered float compare.
-    P = 0xA,
-    /// `jnp` / `jpo` — parity odd.
-    Np = 0xB,
-    /// `jl` / `jnge` — signed `<`.
-    L = 0xC,
-    /// `jge` / `jnl` — signed `>=`.
-    Ge = 0xD,
-    /// `jle` / `jng` — signed `<=`.
-    Le = 0xE,
-    /// `jg` / `jnle` — signed `>`.
-    G = 0xF,
 }
 
 /// `jmp rel32 target` — an unconditional branch to a [`Label`].
@@ -657,7 +550,7 @@ pub enum Cond {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) struct Jmp {
     /// Where it goes.
-    pub target: Label,
+    pub(super) target: Label,
 }
 
 impl AsmInsn for Jmp {
@@ -679,9 +572,9 @@ impl AsmInsn for Jmp {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) struct Jcc {
     /// What must hold for the branch to be taken.
-    pub condition: Cond,
+    condition: Cond,
     /// Where it goes.
-    pub target: Label,
+    target: Label,
 }
 
 impl Jcc {
@@ -704,8 +597,7 @@ impl Jcc {
         Self::on(Cond::B, target)
     }
 
-    /// The branch on a condition chosen at run time, where no single mnemonic
-    /// names it.
+    /// The branch on `condition`: what each mnemonic above spells.
     #[must_use]
     #[inline(always)]
     const fn on(condition: Cond, target: Label) -> Self {
@@ -793,7 +685,7 @@ fn lea_scaled4(code: &mut Vec<u8>, dst: Gpr, base: Gpr, index: Gpr) {
 
 /// A slot in the allocated spill frame. Kernels are leaves with no base
 /// pointer, so a slot *is* `rsp + offset`, on every x86 tier.
-pub(in crate::emit) const fn frame_slot(offset: u32) -> Mem<Imm32> {
+pub(super) const fn frame_slot(offset: u32) -> Mem<Imm32> {
     Mem {
         base: ptr::RSP,
         disp: Imm32(offset as i32),
@@ -813,10 +705,7 @@ const F32_BYTES: u64 = 4;
 /// [`CompileError::BudgetExceeded`] when `4 * offset` does not fit a signed
 /// 32-bit displacement: an offset past the encoding is refused, never
 /// wrapped into an address that reads some other argument.
-pub(in crate::emit) fn block_element(
-    base: PtrReg,
-    offset: u64,
-) -> Result<Mem<Imm32>, CompileError> {
+pub(super) fn block_element(base: PtrReg, offset: u64) -> Result<Mem<Imm32>, CompileError> {
     let disp = offset
         .checked_mul(F32_BYTES)
         .and_then(|bytes| i32::try_from(bytes).ok())
@@ -833,9 +722,9 @@ pub(in crate::emit) fn block_element(
 /// instruction, which is the only thing that varies between the tiers'
 /// address arithmetic.
 #[derive(Clone, Copy)]
-pub(in crate::emit) struct Convert {
-    pub from_xmm: fn(&mut Vec<u8>, Gpr, Reg),
-    pub from_mem: fn(&mut Vec<u8>, Gpr, Mem<Imm32>),
+pub(super) struct Convert {
+    pub(super) from_xmm: fn(&mut Vec<u8>, Gpr, Reg),
+    pub(super) from_mem: fn(&mut Vec<u8>, Gpr, Mem<Imm32>),
 }
 
 /// `dst = trunc(index)` as a 64-bit integer, wherever a fold keeps its
@@ -843,7 +732,7 @@ pub(in crate::emit) struct Convert {
 /// slot is the index. Shared by the x86 tiers, which differ only in the
 /// *vector* encoding this reads through — the GPR half is the
 /// architecture's.
-pub(in crate::emit) fn index_into(code: &mut Vec<u8>, dst: Gpr, at: Binding, convert: Convert) {
+fn index_into(code: &mut Vec<u8>, dst: Gpr, at: Binding, convert: Convert) {
     match at {
         Binding::Loc(Loc::Reg(r)) => (convert.from_xmm)(code, dst, r),
         Binding::Loc(Loc::Slot(slot)) => (convert.from_mem)(code, dst, frame_slot(slot.offset())),
@@ -859,7 +748,7 @@ pub(in crate::emit) fn index_into(code: &mut Vec<u8>, dst: Gpr, at: Binding, con
 /// The store's address into `scratch[0]`: `out + 4 · (row · pitch + col)`,
 /// leaving `scratch[1]` free. The row and column indices are converted
 /// through `convert`, the tier's own `cvttss2si`.
-pub(in crate::emit) fn write_address(
+pub(super) fn write_address(
     code: &mut Vec<u8>,
     file: &regalloc::RegisterFile,
     write: &WritePlan,
@@ -887,9 +776,9 @@ pub(in crate::emit) fn write_address(
 /// `mod = 00 / 01 / 10` are three modes rather than three spellings of one:
 /// they cost a different number of bytes, and `mod = 00` is not "a
 /// displacement of zero" (see [`NoDisp`]). So the width is picked by the
-/// operand's TYPE, exactly as [`AddSrc`] picks `83 /0 ib` over `81 /0 id` —
-/// never by the caller reaching for a differently-named function, which is
-/// where that choice used to live.
+/// operand's TYPE, exactly as [`AddSrc`] picks `add r/m64, r64` over `81 /0
+/// id` — never by the caller reaching for a differently-named function, which
+/// is where that choice used to live.
 pub(super) trait Disp: Copy {
     /// The ModRM `mod` field this displacement implies.
     const MOD: u8;
@@ -928,36 +817,17 @@ impl Disp for Imm32 {
     }
 }
 
-/// A register usable as the base of a memory address ([`Mem`]).
-pub(super) trait BaseReg: Copy {
-    fn reg_num(self) -> u8;
-}
-
-impl BaseReg for Gpr {
-    #[inline(always)]
-    fn reg_num(self) -> u8 {
-        self.0
-    }
-}
-
-impl BaseReg for PtrReg {
-    #[inline(always)]
-    fn reg_num(self) -> u8 {
-        self.0
-    }
-}
-
 /// An address spelled `[base + disp]`.
 ///
-/// The base being a [`Gpr`] or [`PtrReg`] is the point: `rsp` is a value here. It used to be
-/// the `_rsp` and `_base` suffixes of five separate functions that all encoded
-/// the same `movups`, where nothing could check it.
+/// The base being a [`PtrReg`] is the point: `rsp` is a value here. It used
+/// to be the `_rsp` and `_base` suffixes of five separate functions that all
+/// encoded the same `movups`, where nothing could check it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) struct Mem<D, P = PtrReg> {
+pub(super) struct Mem<D> {
     /// The register the displacement is measured from.
-    pub base: P,
+    pub(super) base: PtrReg,
     /// The displacement — and, through its type, the mode (see [`Disp`]).
-    pub disp: D,
+    pub(super) disp: D,
 }
 
 /// ModRM `rm` meaning "a SIB byte follows" — also the low three bits of
@@ -976,12 +846,7 @@ const SIB_BASE_ONLY: u8 = 0x24;
 /// plane of `f32`s, addressed in one instruction. The tail is the
 /// architecture's, not the prefix's, so the VEX and EVEX tiers share it the
 /// way they share [`mem_operand_into`].
-pub(in crate::emit) fn scaled4_operand_into(
-    inst: &mut EncodedInst,
-    reg: u8,
-    base: Gpr,
-    index: Gpr,
-) {
+pub(super) fn scaled4_operand_into(inst: &mut EncodedInst, reg: u8, base: Gpr, index: Gpr) {
     debug_assert!(index.0 & 7 != RM_SIB, "rsp/r12 cannot index a SIB");
     sib4_tail_into(inst, reg, base, index.0);
 }
@@ -992,7 +857,7 @@ pub(in crate::emit) fn scaled4_operand_into(
 /// only when the index is a general register: as a vector number it is
 /// `ymm4`/`ymm12`, which a gather may perfectly well be indexed by. The
 /// prefix's X bit carries the index's high bit either way.
-pub(in crate::emit) fn vsib4_operand_into(inst: &mut EncodedInst, reg: u8, base: Gpr, index: Reg) {
+pub(super) fn vsib4_operand_into(inst: &mut EncodedInst, reg: u8, base: Gpr, index: Reg) {
     sib4_tail_into(inst, reg, base, index.0);
 }
 
@@ -1007,12 +872,8 @@ fn sib4_tail_into(inst: &mut EncodedInst, reg: u8, base: Gpr, index: u8) {
 }
 
 /// Write the ModRM/SIB/disp tail into an `EncodedInst`.
-pub(in crate::emit) fn mem_operand_into<D: Disp, P: BaseReg>(
-    inst: &mut EncodedInst,
-    reg: u8,
-    addr: Mem<D, P>,
-) {
-    let rm = addr.base.reg_num() & 7;
+pub(super) fn mem_operand_into<D: Disp>(inst: &mut EncodedInst, reg: u8, addr: Mem<D>) {
+    let rm = addr.base.0 & 7;
     debug_assert!(
         D::MOD != NoDisp::MOD || rm != RM_RIP_AT_MOD0,
         "[rbp]/[r13] has no mod=00 form: that encoding is RIP-relative"
@@ -1043,9 +904,9 @@ mod gpr_tests {
     /// /r`), the simplest legacy instruction that takes a [`Mem`]. Test-only
     /// — no tier emits it — so what is under test is [`mem_operand_into`]
     /// and the REX bits, not a 128-bit store.
-    fn movups_store<D: Disp, P: BaseReg>(src: Reg, addr: Mem<D, P>) -> EncodedInst {
+    fn movups_store<D: Disp>(src: Reg, addr: Mem<D>) -> EncodedInst {
         let mut inst = EncodedInst::new();
-        let rex = 0x40 | (u8::from(src.0 >= 8) << 2) | u8::from(addr.base.reg_num() >= 8);
+        let rex = 0x40 | (u8::from(src.0 >= 8) << 2) | u8::from(addr.base.0 >= 8);
         if rex != 0x40 {
             inst.push(rex);
         }
@@ -1061,10 +922,7 @@ mod gpr_tests {
         // REX.W 89 /r — MOV r/m64, r64
         assert_eq!(asm(|c| mov(c, R10, RCX)), [0x49, 0x89, 0xCA]);
         // REX.W 01 /r — ADD r/m64, r64
-        assert_eq!(asm(|c| add(c, RSI, R9)), [0x4C, 0x01, 0xCE]);
-        // REX.W 83 /0 ib — ADD r/m64, imm8
-        assert_eq!(asm(|c| add(c, RSI, Imm8(16))), [0x48, 0x83, 0xC6, 0x10]);
-        assert_eq!(asm(|c| add(c, RSI, Imm8(64))), [0x48, 0x83, 0xC6, 0x40]);
+        assert_eq!(asm(|c| add(c, RSI, Gpr(8))), [0x4C, 0x01, 0xC6]);
         // C3 — RET
         assert_eq!(asm(ret), [0xC3]);
         // VEX.128.0F.WIG 77 — VZEROUPPER
@@ -1100,24 +958,17 @@ mod gpr_tests {
     #[test]
     fn asm_program_declarative_array() {
         let mut buff = Vec::new();
-        AsmProgram::from([Inst::Add { dst: RAX, src: RCX }]).assemble(&mut buff);
-        assert_eq!(buff, [0x48, 0x01, 0xC8]);
+        AsmProgram::from([Inst::Add { dst: R9, src: R10 }]).assemble(&mut buff);
+        assert_eq!(buff, [0x4D, 0x01, 0xD1]);
 
         let mut seq = Vec::new();
-        AsmProgram::from([
-            Inst::Add { dst: RAX, src: RCX },
-            Inst::SubImm32 {
-                dst: RSP,
-                imm: Imm32(32),
-            },
-            Inst::Ret,
-        ])
-        .assemble(&mut seq);
+        AsmProgram::from([Inst::Add { dst: R9, src: R10 }, Inst::Vzeroupper, Inst::Ret])
+            .assemble(&mut seq);
         assert_eq!(
             seq,
             [
-                0x48, 0x01, 0xC8, // add rax, rcx
-                0x48, 0x81, 0xEC, 0x20, 0, 0, 0,    // sub rsp, 32
+                0x4D, 0x01, 0xD1, // add r9, r10
+                0xC5, 0xF8, 0x77, // vzeroupper
                 0xC3, // ret
             ]
         );
@@ -1143,17 +994,15 @@ mod gpr_tests {
     /// nothing.
     #[test]
     fn branches_patch_relative_to_the_next_instruction() {
-        use crate::emit::{AsmProgram, Item, Label};
+        use crate::emit::{Assembly, Label};
 
         let end = Label::new("end");
-        let mut c = Vec::new();
-        AsmProgram::new([
-            Item::Inst(Inst::from(Jmp { target: end })),
-            // Eleven bytes of padding, so the label lands at 16.
-            Item::Inst(Inst::Encoded(EncodedInst::from_slice(&[0x90; 11]))),
-            Item::Label(end),
-        ])
-        .assemble(&mut c);
+        let mut asm = Assembly::default();
+        asm.push(Jmp { target: end });
+        // Eleven bytes of padding, so the label lands at 16.
+        asm.push(EncodedInst::from_slice(&[0x90; 11]));
+        asm.bind(end);
+        let c = asm.finish();
         assert_eq!(c.len(), 16);
         assert_eq!(c[0], 0xE9, "E9 + rel32");
         assert_eq!(
@@ -1163,14 +1012,27 @@ mod gpr_tests {
         );
 
         let top = Label::new("end");
-        let mut c = Vec::new();
-        AsmProgram::new([
-            Item::Label(top),
-            Item::Inst(Inst::from(Jcc::on(Cond::Ae, top))),
-        ])
-        .assemble(&mut c);
-        assert_eq!(c[..2], [0x0F, 0x83]);
+        let mut asm = Assembly::default();
+        asm.bind(top);
+        asm.push(Jcc::on(Cond::B, top));
+        let c = asm.finish();
+        assert_eq!(c[..2], [0x0F, 0x82]);
         assert_eq!(&c[2..6], &(-6i32).to_le_bytes(), "a back edge is negative");
+    }
+
+    /// The `Context` def's own instruction: `mov r9, [rdi + 16]` (`REX.WR 8B
+    /// /r`) for context slot 2.
+    #[test]
+    fn a_context_pointer_is_read_by_one_mov() {
+        let mut code = Vec::new();
+        AsmProgram::from([MovLoadPtr {
+            dst: PtrReg(9),
+            base: PtrReg(7),
+            disp: 2 * PTR_BYTES,
+        }
+        .encode()])
+        .assemble(&mut code);
+        assert_eq!(code, [0x4C, 0x8B, 0x8F, 0x10, 0, 0, 0]);
     }
 
     /// The pointer class's loads and stores reach every GPR and address the
@@ -1218,7 +1080,7 @@ mod gpr_tests {
             one(movups_store(
                 reg,
                 Mem {
-                    base: Gpr(base),
+                    base: PtrReg(base),
                     disp: NoDisp,
                 },
             ))
@@ -1250,9 +1112,9 @@ mod gpr_tests {
             ))
         };
         // 0F 11 /r, mod=01: rsp takes a SIB byte, rax and r10 do not.
-        assert_eq!(store(RSP), [0x0F, 0x11, 0x4C, 0x24, 0x08]);
-        assert_eq!(store(RAX), [0x0F, 0x11, 0x48, 0x08]);
-        assert_eq!(store(R10), [0x41, 0x0F, 0x11, 0x4A, 0x08]);
+        assert_eq!(store(PtrReg(4)), [0x0F, 0x11, 0x4C, 0x24, 0x08]);
+        assert_eq!(store(PtrReg(0)), [0x0F, 0x11, 0x48, 0x08]);
+        assert_eq!(store(PtrReg(10)), [0x41, 0x0F, 0x11, 0x4A, 0x08]);
     }
 
     /// The displacement's *type* picks the encoding, so the same address at the
@@ -1264,14 +1126,14 @@ mod gpr_tests {
         let d8 = one(movups_store(
             Reg(0),
             Mem {
-                base: RSP,
+                base: PtrReg(4),
                 disp: Imm8(16),
             },
         ));
         let d32 = one(movups_store(
             Reg(0),
             Mem {
-                base: RSP,
+                base: PtrReg(4),
                 disp: Imm32(16),
             },
         ));
@@ -1285,14 +1147,14 @@ mod gpr_tests {
         let bare = one(movups_store(
             Reg(0),
             Mem {
-                base: RSI,
+                base: PtrReg(6),
                 disp: NoDisp,
             },
         ));
         let zero = one(movups_store(
             Reg(0),
             Mem {
-                base: RSI,
+                base: PtrReg(6),
                 disp: Imm8(0),
             },
         ));

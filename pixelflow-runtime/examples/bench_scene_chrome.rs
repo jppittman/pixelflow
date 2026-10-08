@@ -127,13 +127,12 @@ fn main() {
     let compiled = Instant::now();
     let program = compile_packed_for::<Rgba8>(&color, [WIDTH as u32, HEIGHT as u32]);
     let compile_time = compiled.elapsed();
-    let code = program.code_bytes().len();
     let packed = Scene::Packed(program.bind(&[]));
 
     println!("chrome sphere as a Scene, {WIDTH}x{HEIGHT}, median of {RUNS} frames (ns/pixel)\n");
     println!(
         "  compile: {nodes} arena nodes over four channels, built in {build_time:?}, \
-         compiled in {compile_time:?} to {code} bytes of code"
+         compiled in {compile_time:?}"
     );
     println!(
         "  the sphere covers {:.2}% of the frame\n",

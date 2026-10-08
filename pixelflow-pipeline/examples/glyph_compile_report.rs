@@ -86,7 +86,7 @@ fn kernels(font: &Font) {
             let started = Instant::now();
             let result = compile_as_baked(arena, root, [tile, tile]);
             let ms = started.elapsed().as_secs_f64() * 1e3;
-            let bytes = result.code.len();
+            let bytes = result.code.as_bytes().len();
             println!(
                 "glyph{tile}_U{:04X}\t{tile}\t{ms:.3}\t{bytes}\t{:016x}",
                 ch as u32,

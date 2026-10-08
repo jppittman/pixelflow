@@ -12,9 +12,9 @@
 //! x86-64 (there is no SSE2 tier any more) and NEON on aarch64. A host below
 //! the floor is refused, loudly, with the feature it lacks named.
 //!
-//! The width follows the tier ([`jit_vector_bytes`]), and nothing else in the
-//! workspace holds one: `pixelflow-core` asks this module rather than
-//! carrying a vector type of its own to assert against.
+//! The width follows the tier ([`jit_vector_bytes`](crate::jit_vector_bytes)),
+//! and nothing else in the workspace holds one: `pixelflow-core` asks for it
+//! rather than carrying a vector type of its own to assert against.
 //!
 //! `PIXELFLOW_ISA` overrides the choice *downward* — `avx2` on an AVX-512
 //! host runs the 256-bit backend, which is how one machine tests both x86
@@ -31,8 +31,6 @@ use std::sync::OnceLock;
 mod x86_64;
 #[cfg(target_arch = "x86_64")]
 use x86_64::runnable;
-#[cfg(all(test, target_arch = "x86_64"))]
-pub(crate) use x86_64::skip_unless_host_runs;
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
@@ -63,10 +61,12 @@ impl Isa {
     /// Bytes in one vector register of this tier: the batch the lattice's
     /// lane fold is executed by. An ISA-defined width, which is why it is a
     /// table here rather than something read off a backend — a `zmm` is 64
-    /// bytes by definition, and `emit`'s tests pin each backend's register
-    /// file to this.
+    /// bytes by definition. This module's tests pin the table and `emit`'s
+    /// pin each backend's register file to the same widths, which is what
+    /// ties [`jit_vector_bytes`](crate::jit_vector_bytes) to the backend a
+    /// compile instantiates.
     #[must_use]
-    pub const fn vector_bytes(self) -> usize {
+    pub(crate) const fn vector_bytes(self) -> usize {
         match self {
             Self::Avx2 => 32,
             Self::Avx512 => 64,
@@ -131,21 +131,6 @@ pub fn detect() -> Isa {
     })
 }
 
-/// Byte width of the vector the JIT emits for on this host: 64 (AVX-512), 32
-/// (AVX2) or 16 (NEON). [`detect`]'s width; the one width in the workspace.
-#[must_use]
-pub fn jit_vector_bytes() -> usize {
-    detect().vector_bytes()
-}
-
-/// Whether this host can execute `isa`'s kernels — regardless of which tier
-/// [`detect`] chose, and without the below-floor panic, since a test asking
-/// whether it can run is not a compile asking for a backend.
-#[must_use]
-pub fn host_runs(isa: Isa) -> bool {
-    runnable().is_ok_and(|tiers| tiers.contains(&isa))
-}
-
 /// `PIXELFLOW_ISA`, if set.
 ///
 /// | value | effect |
@@ -180,12 +165,21 @@ mod tests {
 
     #[test]
     fn the_host_can_execute_the_tier_it_detected() {
-        assert!(host_runs(detect()));
+        let tiers = runnable().expect("this host runs the tests, so it is above the floor");
+        assert!(tiers.contains(&detect()));
     }
 
+    /// A `ymm` is 32 bytes, a `zmm` 64 and a NEON `q` register 16, by
+    /// definition — the same table `emit`'s
+    /// `every_backends_vector_width_is_its_tiers` pins each backend's register
+    /// file to.
     #[test]
-    fn the_width_is_the_tiers() {
-        assert_eq!(jit_vector_bytes(), detect().vector_bytes());
+    fn each_tiers_width_is_its_registers() {
+        let widths = Isa::ALL.map(|isa| (isa, isa.vector_bytes()));
+        assert_eq!(
+            widths,
+            [(Isa::Avx2, 32), (Isa::Avx512, 64), (Isa::Neon, 16)]
+        );
     }
 
     #[test]

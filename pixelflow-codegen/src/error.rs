@@ -10,9 +10,8 @@
 
 use core::fmt;
 
-/// Why [`emit::compile_arena`](crate::emit::compile_arena),
-/// [`emit::compile_collapse`](crate::emit::compile_collapse), and the rest of
-/// this crate's compile entries can fail.
+/// Why [`emit::compile`](crate::emit::compile) and
+/// [`jit_cache::compile`](crate::jit_cache::compile) can fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompileError {
     /// [`pixelflow_ir::passes::legalize`] refused to lower part of the
@@ -27,36 +26,6 @@ pub enum CompileError {
     /// offset — was exceeded by this expression.
     BudgetExceeded(&'static str),
 
-    /// This crate's own bookkeeping (frame layout, red-zone addressing)
-    /// caught itself in a state that should be unreachable for any input.
-    /// Always a bug in `pixelflow-codegen`, never a fact about the kernel.
-    Internal(&'static str),
-
-    /// A branch named a [`Label`](crate::emit::Label) that no
-    /// [`Item::Bind`](crate::emit::Item::Bind) ever bound.
-    ///
-    /// An error rather than a panic because it is the one thing a *program*
-    /// can get wrong that the type system does not already refuse: minting is
-    /// separate from binding precisely so a forward branch can name a position
-    /// that does not exist yet, which means "never bound" is representable.
-    UnboundLabel,
-
-    /// One label was bound at two positions. A name that means two places is
-    /// not a name.
-    DuplicateLabel,
-
-    /// A branch's displacement does not fit its encoding's field — an aarch64
-    /// `B` reaches ±128 MiB and a `B.cond` only ±1 MiB.
-    ///
-    /// A real limit of the instruction, not an invariant to assume away: a
-    /// fully unrolled fold is exactly the kind of body that grows until a
-    /// conditional branch can no longer span it.
-    BranchOutOfRange,
-
-    /// [`ExecutableCode::from_code`](crate::emit::executable::ExecutableCode::from_code)
-    /// was given an empty code buffer — nothing to map or execute.
-    EmptyCodeBuffer,
-
     /// `mmap` refused to create the read-write staging mapping for the
     /// compiled code.
     Mmap,
@@ -70,17 +39,8 @@ impl fmt::Display for CompileError {
         match self {
             Self::Legalize(msg) => write!(f, "expression cannot be legalized: {msg}"),
             Self::BudgetExceeded(msg) => write!(f, "compile budget exceeded: {msg}"),
-            Self::Internal(msg) => {
-                write!(f, "internal pixelflow-codegen invariant violated: {msg}")
-            }
-            Self::EmptyCodeBuffer => write!(f, "empty code buffer"),
             Self::Mmap => write!(f, "mmap failed"),
             Self::Mprotect => write!(f, "mprotect failed"),
-            Self::UnboundLabel => write!(f, "a branch names a label nothing bound"),
-            Self::DuplicateLabel => write!(f, "a label was bound at two positions"),
-            Self::BranchOutOfRange => {
-                write!(f, "branch displacement does not fit its encoding")
-            }
         }
     }
 }

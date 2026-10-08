@@ -53,7 +53,7 @@ pub mod row;
 use std::path::Path;
 use std::sync::Arc;
 
-use pixelflow_codegen::emit::executable::ExecutableCode;
+use pixelflow_codegen::emit::CompiledKernel;
 use pixelflow_codegen::emit::{CompileResult, compile};
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{ExprArena, ExprId};
@@ -140,7 +140,7 @@ pub struct CollapseSession {
 }
 
 struct Sentinel {
-    code: ExecutableCode,
+    code: CompiledKernel,
     buffer: Vec<f32>,
     extent: [u32; 2],
     bytes: u64,
@@ -169,7 +169,7 @@ impl CollapseSession {
         let root = arena.push_unary(pixelflow_ir::OpKind::Sqrt, sum);
         let result = compile_as_baked(&arena, root, SENTINEL_EXTENT);
         let mut sentinel = Sentinel {
-            bytes: result.code.len() as u64,
+            bytes: result.code.as_bytes().len() as u64,
             code: result.code,
             buffer: output_buffer(SENTINEL_EXTENT),
             extent: SENTINEL_EXTENT,
@@ -297,7 +297,7 @@ const ORIGIN: [f32; 2] = [0.5, 0.5];
 #[must_use]
 pub fn features_of(result: &CompileResult) -> StaticFeatures {
     let t = &result.traffic;
-    let scope = |s: &pixelflow_codegen::emit::traffic::ScopeTraffic| ScopeRow {
+    let scope = |s: &pixelflow_codegen::emit::ScopeTraffic| ScopeRow {
         bytes: s.bytes,
         instructions: s.instructions,
         loads_transient: s.loads_transient,
@@ -307,7 +307,7 @@ pub fn features_of(result: &CompileResult) -> StaticFeatures {
     };
     let outer_loop = t.scopes.get(1).copied().unwrap_or_default();
     let inner_loop = sum_scope_traffic(t.scopes.get(2..).unwrap_or(&[]));
-    let dyn_weighted = |pick: fn(&pixelflow_codegen::emit::traffic::ScopeTraffic) -> u64| -> u64 {
+    let dyn_weighted = |pick: fn(&pixelflow_codegen::emit::ScopeTraffic) -> u64| -> u64 {
         t.scopes
             .iter()
             .zip(&t.trips)
@@ -315,7 +315,7 @@ pub fn features_of(result: &CompileResult) -> StaticFeatures {
             .sum()
     };
     StaticFeatures {
-        bytes_total: result.code.len() as u64,
+        bytes_total: result.code.as_bytes().len() as u64,
         frame: scope(&t.body()),
         row: scope(&outer_loop),
         body: scope(&inner_loop),
@@ -335,9 +335,9 @@ pub fn features_of(result: &CompileResult) -> StaticFeatures {
 /// Field-wise sum of several scopes' traffic, for [`features_of`]'s `body`
 /// bucket — every fold nested inside the lattice's own row loop, combined.
 fn sum_scope_traffic(
-    scopes: &[pixelflow_codegen::emit::traffic::ScopeTraffic],
-) -> pixelflow_codegen::emit::traffic::ScopeTraffic {
-    use pixelflow_codegen::emit::traffic::ScopeTraffic;
+    scopes: &[pixelflow_codegen::emit::ScopeTraffic],
+) -> pixelflow_codegen::emit::ScopeTraffic {
+    use pixelflow_codegen::emit::ScopeTraffic;
     scopes
         .iter()
         .fold(ScopeTraffic::default(), |acc, s| ScopeTraffic {
@@ -346,7 +346,6 @@ fn sum_scope_traffic(
             loads_kept: acc.loads_kept + s.loads_kept,
             remats: acc.remats + s.remats,
             stores: acc.stores + s.stores,
-            writes: acc.writes + s.writes,
             bytes: acc.bytes + s.bytes,
         })
 }
@@ -438,7 +437,7 @@ struct Timing {
 }
 
 fn time_kernel(
-    code: &ExecutableCode,
+    code: &CompiledKernel,
     buffer: &mut [f32],
     pitch: usize,
     ctx: *const *const f32,
@@ -468,7 +467,7 @@ fn time_kernel(
 }
 
 fn run_calls(
-    code: &ExecutableCode,
+    code: &CompiledKernel,
     buffer: &mut [f32],
     pitch: usize,
     calls: usize,

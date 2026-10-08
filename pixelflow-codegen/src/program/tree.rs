@@ -92,13 +92,6 @@ impl Tree {
         }
         a
     }
-
-    /// Whether `inner` is `outer` or below it.
-    #[cfg(test)]
-    pub(crate) fn is_within(&self, inner: usize, outer: usize) -> bool {
-        self.depth[inner] >= self.depth[outer]
-            && self.ancestor_at(inner, self.depth[outer]) == outer
-    }
 }
 
 #[cfg(test)]
@@ -124,8 +117,11 @@ mod tests {
         assert_eq!(tree.common_ancestor(deeper, right), 0);
         assert_eq!(tree.common_ancestor(deeper, deep), deep);
         assert_eq!(tree.common_ancestor(deeper, left), left);
-        assert!(tree.is_within(deeper, left));
-        assert!(!tree.is_within(right, left));
+        assert_ne!(
+            tree.common_ancestor(right, left),
+            left,
+            "right is not below left"
+        );
     }
 
     #[test]

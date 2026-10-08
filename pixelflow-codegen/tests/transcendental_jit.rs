@@ -14,7 +14,7 @@ use pixelflow_ir::Kernel;
 
 /// One point of a kernel compiled at [`pixelflow_ir::LatticeShape::POINT`],
 /// read back through the origin block.
-fn eval_point(jit: &pixelflow_codegen::CompiledKernel, x: f32, y: f32) -> f32 {
+fn eval_point(jit: &pixelflow_codegen::emit::CompiledKernel, x: f32, y: f32) -> f32 {
     let mut out = [0.0f32; 1];
     let origin = [x, y];
     // SAFETY: every kernel this file compiles declares no buffer and no
@@ -28,7 +28,7 @@ fn eval_point(jit: &pixelflow_codegen::CompiledKernel, x: f32, y: f32) -> f32 {
     out[0]
 }
 
-fn eval_points(jit: &pixelflow_codegen::CompiledKernel, inputs: &[(f32, f32)]) -> Vec<f32> {
+fn eval_points(jit: &pixelflow_codegen::emit::CompiledKernel, inputs: &[(f32, f32)]) -> Vec<f32> {
     inputs.iter().map(|&(x, y)| eval_point(jit, x, y)).collect()
 }
 

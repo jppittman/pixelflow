@@ -46,11 +46,11 @@ use crate::program::{Def, IfArm, ScheduledOp, ValueId};
 /// Regions are numbered in the order the reverse pass meets them, so a
 /// parent's number is always smaller than its children's.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) struct Region(pub(crate) usize);
+pub(super) struct Region(pub(super) usize);
 
 impl Region {
     /// The scope itself: what no arm owns.
-    pub(crate) const SCOPE: Self = Self(0);
+    const SCOPE: Self = Self(0);
 }
 
 /// One arm of one `If`, as a region.
@@ -59,17 +59,17 @@ pub(super) struct Arm {
     /// Schedule position of the `If` (in the order the ownership was read
     /// from; positions are only names for defs here, the relation does not
     /// depend on them).
-    pub(crate) if_pos: usize,
+    pub(super) if_pos: usize,
     /// The `If`'s mask.
-    pub(crate) mask: ValueId,
+    pub(super) mask: ValueId,
     /// Which arm.
-    pub(crate) arm: IfArm,
+    arm: IfArm,
     /// The region the arm's values belong to.
-    pub(crate) region: Region,
+    pub(super) region: Region,
     /// Latency-prior cycles of everything the arm owns, nested arms and the
     /// folds it owns included: what skipping the arm saves, and so what a
     /// branch over it can pay for.
-    pub(crate) cycles: usize,
+    pub(super) cycles: usize,
 }
 
 /// Ownership of one scope's schedule.
@@ -88,7 +88,7 @@ pub(super) struct Ownership {
 pub(super) struct Positions(Vec<Option<usize>>);
 
 impl Positions {
-    pub(crate) fn of(schedule: &[Def]) -> Self {
+    pub(super) fn of(schedule: &[Def]) -> Self {
         let len = schedule
             .iter()
             .map(|def| def.value.0 as usize + 1)
@@ -101,7 +101,7 @@ impl Positions {
         Self(at)
     }
 
-    pub(crate) fn get(&self, value: ValueId) -> Option<usize> {
+    pub(super) fn get(&self, value: ValueId) -> Option<usize> {
         self.0.get(value.0 as usize).copied().flatten()
     }
 }
@@ -114,7 +114,7 @@ impl Ownership {
     /// scope opens reads from it, which makes the loop's `Reduce` def a reader
     /// of each of those values (`FoldReads`). Both are the old analysis'
     /// inputs, so the two answer the same question.
-    pub(crate) fn of(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Self {
+    pub(super) fn of(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Self {
         let positions = Positions::of(schedule);
         let cycles = CostModel::latency_prior();
         let mut me = Self {
@@ -203,24 +203,18 @@ impl Ownership {
     }
 
     /// Every arm of every `If`, in schedule order, an `If`'s true arm first.
-    pub(crate) fn arms(&self) -> &[Arm] {
+    pub(super) fn arms(&self) -> &[Arm] {
         &self.arms
     }
 
     /// The region the value at `pos` belongs to.
-    pub(crate) fn region_of(&self, pos: usize) -> Region {
+    pub(super) fn region_of(&self, pos: usize) -> Region {
         self.region_of[pos]
     }
 
     /// The regions, for a stage that nests something in them.
-    pub(crate) fn regions(&self) -> &Tree {
+    pub(super) fn regions(&self) -> &Tree {
         &self.regions
-    }
-
-    #[cfg(test)]
-    /// Whether `inner` is `outer` or nested in it.
-    pub(crate) fn is_within(&self, inner: Region, outer: Region) -> bool {
-        self.regions.is_within(inner.0, outer.0)
     }
 }
 
@@ -250,7 +244,11 @@ mod tests {
     /// The positions an arm owns, nested arms included.
     fn owned(own: &Ownership, arm: &Arm, len: usize) -> Vec<usize> {
         (0..len)
-            .filter(|&pos| own.is_within(own.region_of(pos), arm.region))
+            .filter(|&pos| {
+                own.regions()
+                    .common_ancestor(own.region_of(pos).0, arm.region.0)
+                    == arm.region.0
+            })
             .collect()
     }
 
@@ -369,7 +367,11 @@ mod tests {
                 .iter()
                 .map(|arm| {
                     let mut values: Vec<u64> = (0..schedule.len())
-                        .filter(|&pos| own.is_within(own.region_of(pos), arm.region))
+                        .filter(|&pos| {
+                            own.regions()
+                                .common_ancestor(own.region_of(pos).0, arm.region.0)
+                                == arm.region.0
+                        })
                         .map(|pos| schedule[pos].value.0)
                         .collect();
                     values.sort_unstable();
