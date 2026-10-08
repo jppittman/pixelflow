@@ -577,7 +577,12 @@
   addresses of the labels it names. Here, a very small in-memory one: no
   object files, no relocations or symbols beyond labels.
 - **Is not:** stateful; a builder; a code buffer other code writes bytes
-  into; aware of registers, values, scopes or the IR.
+  into; aware of registers, values, scopes or the IR. Not a checker of
+  meaning: it accepts exactly the legal programs. What the machine refuses,
+  such as an operand of the wrong register class or an immediate the
+  encoding cannot hold, its types or its result refuse. What the machine
+  accepts, it accepts. `and` of a mask with `1.0` is legal NEON, and refusing
+  it is the IR's job.
 - **Follows:** it stands alone — its module imports nothing from the rest of
   the crate, and everything above it depends on it, never the reverse.
 - **Lives:** `emit::Assembly` (a push/bind/finish builder with a public `code`
