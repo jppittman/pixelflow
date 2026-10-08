@@ -200,8 +200,7 @@ mod page_tests {
         }
     }
 
-    /// Asked of the machine, not assumed from the OS. A bad `sysconf` fallback
-    /// would show up here as a non-power-of-two or an absurd size.
+    /// Asked of the machine, not assumed from the OS.
     ///
     /// The lower bound and the power of two together are what aarch64's
     /// [`AdrpAdd`](crate::emit::aarch64::AdrpAdd) rests on: they make every

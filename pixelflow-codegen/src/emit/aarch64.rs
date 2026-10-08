@@ -1987,17 +1987,17 @@ pub(crate) mod driver {
             vid: regalloc::ValueId,
             target: Reg,
             locs: &[Option<Binding>],
-        ) -> Reg {
+        ) -> Result<Reg, CompileError> {
             match location_of(locs, vid) {
-                Binding::Loc(Loc::Reg(reg)) => reg,
+                Binding::Loc(Loc::Reg(reg)) => Ok(reg),
                 Binding::Remat(bits) => {
                     emit_const_load(code, target, bits, &self.consts);
-                    target
+                    Ok(target)
                 }
                 Binding::Loc(Loc::Slot(slot)) => {
                     AsmProgram::from([Inst::ldr_q(target, frame_slot(slot.offset()))])
                         .assemble(code);
-                    target
+                    Ok(target)
                 }
                 Binding::Loc(Loc::Ptr(p)) => {
                     unreachable!("{vid:?} is an address in {p:?}; the pointer class resolves it")
@@ -2117,13 +2117,26 @@ pub(crate) mod driver {
             AsmProgram::from([Inst::ldr_q(dst, frame_slot(offset))]).assemble(code);
         }
 
-        fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
+        fn add_scalar(
+            &mut self,
+            code: &mut Vec<u8>,
+            dst: Reg,
+            scratch: Reg,
+            scalar: f32,
+        ) -> Result<(), CompileError> {
             super::emit_fmov_imm(code, scratch, scalar);
             AsmProgram::from([Inst::Fadd(dst, dst, scratch)]).assemble(code);
+            Ok(())
         }
 
-        fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
+        fn load_const(
+            &mut self,
+            code: &mut Vec<u8>,
+            dst: Reg,
+            val: f32,
+        ) -> Result<(), CompileError> {
             super::emit_fmov_imm(code, dst, val);
+            Ok(())
         }
 
         fn alu(&mut self, code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2]) {
@@ -2204,18 +2217,11 @@ pub(crate) mod driver {
                 via
             }
             Binding::Loc(Loc::Ptr(_)) => unreachable!("a fold's binder is a vector"),
-            // A fold whose binder folded to a constant: the trip count was
-            // one and the allocator rematerialized it. Truncate on the host,
-            // which is what the instruction would have done.
-            Binding::Remat(bits) => {
-                let index = f32::from_bits(bits) as i64 as u64;
-                AsmProgram::from([table::Movz::new(dst, index as u16)]).assemble(code);
-                debug_assert!(
-                    index <= u64::from(u16::MAX),
-                    "a rematerialized index fits movz"
-                );
-                return;
-            }
+            // `emit_scope` hands a rematerialized binder over as its slot, so
+            // the only caller, `emit_write`, never holds a constant here.
+            Binding::Remat(bits) => unreachable!(
+                "a fold's binder is read from a register or a slot, never rematerialized ({bits:#x})"
+            ),
         };
         AsmProgram::from([Inst::FcvtzsX { dst, src: from }]).assemble(code);
     }

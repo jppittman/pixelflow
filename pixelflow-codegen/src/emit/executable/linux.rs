@@ -55,7 +55,8 @@ fn sync_instruction_cache(_ptr: *mut u8, _len: usize) {}
 impl CodePage for LinuxCodePage {
     fn page_size() -> usize {
         let n = unsafe { sysconf(_SC_PAGESIZE) };
-        if n > 0 { n as usize } else { 4096 }
+        assert!(n > 0, "sysconf(_SC_PAGESIZE) failed");
+        n as usize
     }
 
     fn map(capacity: usize) -> Result<Self, CompileError> {
@@ -127,7 +128,15 @@ impl CodePage for LinuxCodePage {
 
 impl Drop for LinuxCodePage {
     fn drop(&mut self) {
-        unsafe { munmap(self.ptr.cast::<libc::c_void>(), self.capacity) };
+        // As `ExecutableCode::drop`: the failure is a leak at best and nothing
+        // can be done about it here, but it must not pass unremarked. This
+        // drop is reached on `finish`'s error paths too.
+        let rc = unsafe { munmap(self.ptr.cast::<libc::c_void>(), self.capacity) };
+        debug_assert_eq!(
+            rc, 0,
+            "munmap failed for {:?} ({} bytes)",
+            self.ptr, self.capacity
+        );
     }
 }
 

@@ -10,8 +10,6 @@
 
 use core::fmt;
 
-use pixelflow_ir::kind::OpKind;
-
 /// Why [`emit::compile_arena`](crate::emit::compile_arena),
 /// [`emit::compile_collapse`](crate::emit::compile_collapse), and the rest of
 /// this crate's compile entries can fail.
@@ -23,12 +21,6 @@ pub enum CompileError {
     /// message, carried here rather than restated, since this crate does not
     /// own that pass and a copy would drift from it.
     Legalize(&'static str),
-
-    /// An op reached ternary position in the DAG emitter that isn't `If`
-    /// or `MulAdd`. `passes::legalize` is supposed to leave only those two in
-    /// that position, so this is the pipeline having let one through rather
-    /// than a fact about `op`.
-    UnsupportedOp(OpKind),
 
     /// A fixed-size resource the register allocator or an emitted encoding is
     /// subject to — the 2MB spill frame, aarch64's 12-bit constant-pool `LDR`
@@ -77,9 +69,6 @@ impl fmt::Display for CompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Legalize(msg) => write!(f, "expression cannot be legalized: {msg}"),
-            Self::UnsupportedOp(op) => {
-                write!(f, "unsupported ternary op in DAG compilation: {op:?}")
-            }
             Self::BudgetExceeded(msg) => write!(f, "compile budget exceeded: {msg}"),
             Self::Internal(msg) => {
                 write!(f, "internal pixelflow-codegen invariant violated: {msg}")

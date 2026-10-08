@@ -203,6 +203,11 @@ impl SourceOperand for Storage {
     }
 }
 
+/// The largest frame a kernel may lay out. [`StackFrame::alloc_slot`] refuses
+/// a spill past it and the nest's layout refuses the whole frame (spills, fold
+/// roots and parks) past it, so every slot offset is below it by construction.
+pub(super) const MAX_FRAME: u32 = 2 * 1024 * 1024;
+
 /// A stack frame slot allocator.
 ///
 /// Manages allocation of vector stack slots at a fixed byte stride.
@@ -234,7 +239,6 @@ impl StackFrame {
 
     /// Allocate a slot in the frame.
     pub fn alloc_slot(&mut self) -> Result<Slot, crate::error::CompileError> {
-        const MAX_FRAME: u32 = 2 * 1024 * 1024;
         if self.allocated_bytes > MAX_FRAME - self.vector_bytes {
             return Err(crate::error::CompileError::BudgetExceeded(
                 "spill frame overflow: exceeds 2MB stack limit",

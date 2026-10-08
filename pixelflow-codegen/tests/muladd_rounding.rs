@@ -73,6 +73,11 @@ fn decomposed(a: f32, b: f32, c: f32) -> f32 {
     core::hint::black_box(a * b) + c
 }
 
+/// `RegisterFile::MIN_SCRATCH`, the smallest pool `EmitCtx::with_max_regs`
+/// accepts. That constant is crate-private and this crate cannot name it, so a
+/// floor that rises is caught by `capped`'s assert, which names both numbers.
+const SMALLEST_POOL: u8 = 7;
+
 /// An input where the two forms differ, so an assertion against one of them
 /// genuinely rejects the other. `1.0000001 * 4097.0` needs more mantissa bits
 /// than an `f32` has, and rounding it before the add loses the bit that the
@@ -239,7 +244,7 @@ fn a_spilled_muladd_rounds_twice_on_every_target() {
     let addend = a.push_binary(OpKind::Add, addend, backward);
     let root = a.push_ternary(OpKind::MulAdd, ma, mb, addend);
 
-    let result = EmitCtx::with_max_regs(1)
+    let result = EmitCtx::with_max_regs(SMALLEST_POOL)
         .compile(&a, root, pixelflow_ir::LatticeShape::POINT)
         .expect("compile spilled MulAdd");
     let stores: u64 = result.traffic.scopes.iter().map(|s| s.stores).sum();

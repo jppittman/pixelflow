@@ -61,7 +61,7 @@ pub(crate) const BYTES_PER_LANE: u32 = 4;
 /// way it loads any uniform — once per call, broadcast. What is particular
 /// to them is *where*: not in the link's block, whose layout is the
 /// caller's, but in a block of their own, the context entry after the
-/// link's (see [`KernelFn`](crate::emit::executable::KernelFn)). One identity
+/// link's (see `KernelFn`). One identity
 /// per axis for the whole process, minted once, so every arena declares the
 /// same two instances and [`origin_slots`] can find them by identity
 /// afterwards.
@@ -95,7 +95,7 @@ fn origin_slots(arena: &pixelflow_ir::arena::ExprArena) -> [UniformId; 2] {
 /// [`pixelflow_ir::passes::legalize`], and every fold is emitted as a loop
 /// inside the code — one call fills the whole extent with no per-row or
 /// per-batch Rust↔JIT boundary. Matches the
-/// [`KernelFn`](crate::emit::executable::KernelFn) ABI `(ctx, out, pitch)`.
+/// `KernelFn` ABI `(ctx, out, pitch)`.
 ///
 /// The context is one base pointer per declared buffer, in the arena's slot
 /// order, followed by the uniform block's base pointer (`f32` values in the

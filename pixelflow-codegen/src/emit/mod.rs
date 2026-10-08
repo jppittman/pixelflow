@@ -924,7 +924,9 @@ pub struct EmitCtx {
     ///
     /// Only ever *shrinks* the selected backend's own pool (see
     /// `regalloc::RegisterFile::capped`); setting it low is how a caller
-    /// forces spilling deliberately.
+    /// forces spilling deliberately. A budget below
+    /// `regalloc::RegisterFile::MIN_SCRATCH` panics when the backend is built,
+    /// since the encodings cannot place their temps in a smaller pool.
     ///
     /// `None` rather than "a number at least as large as every pool": that
     /// spelling was a convention no type enforced, and it broke the moment the
@@ -1022,13 +1024,18 @@ trait IsaBackend {
 
     /// Resolve a value to a register, reloading or rematerializing into
     /// `target` if it is not already in one.
+    ///
+    /// # Errors
+    ///
+    /// [`CompileError::BudgetExceeded`] when a rematerialized constant has no
+    /// addressable place in the backend's constant pool.
     fn emit_resolve(
         &mut self,
         code: &mut Vec<u8>,
         vid: regalloc::ValueId,
         target: Reg,
         locs: &[Option<Binding>],
-    ) -> Reg;
+    ) -> Result<Reg, CompileError>;
 
     /// Jump to `label` when **no lane selects `test.arm`**, so the arm can be
     /// skipped.
@@ -1090,10 +1097,26 @@ trait IsaBackend {
     // -------------------------------------------------------------------------
 
     /// `dst += scalar` across every lane, clobbering `scratch`.
-    fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32);
+    ///
+    /// # Errors
+    ///
+    /// [`CompileError::BudgetExceeded`] when the scalar has no addressable
+    /// place in the backend's constant pool.
+    fn add_scalar(
+        &mut self,
+        code: &mut Vec<u8>,
+        dst: Reg,
+        scratch: Reg,
+        scalar: f32,
+    ) -> Result<(), CompileError>;
 
     /// Load an `f32` constant, broadcast across every lane.
-    fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32);
+    ///
+    /// # Errors
+    ///
+    /// [`CompileError::BudgetExceeded`] when the constant has no addressable
+    /// place in the backend's constant pool.
+    fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) -> Result<(), CompileError>;
 
     /// `dst = op(srcs[0], srcs[1])`, an ordinary vector ALU op outside the
     /// schedule: the fold loop's accumulate (`op` is the fold's monoid).
@@ -1540,7 +1563,7 @@ fn emit_scope<B: IsaBackend>(
                             )
                         });
                     locs[vid.0 as usize] = Some(binding(allocation, vid, from_memory));
-                    let got = backend.emit_resolve(&mut asm.code, vid, r, &locs);
+                    let got = backend.emit_resolve(&mut asm.code, vid, r, &locs)?;
                     debug_assert_eq!(got, r, "a value out of a register reloads into the target");
                 }
                 Binding::Loc(Loc::Ptr(p)) => {
@@ -1646,7 +1669,7 @@ fn emit_scope<B: IsaBackend>(
         for (v, to) in core::mem::take(&mut moves[sched_idx]) {
             match to {
                 Binding::Loc(Loc::Reg(r)) => {
-                    let src = backend.emit_resolve(&mut asm.code, v, r, &locs);
+                    let src = backend.emit_resolve(&mut asm.code, v, r, &locs)?;
                     if src != r {
                         backend.emit_mov(&mut asm.code, r, src);
                     }
@@ -1676,7 +1699,7 @@ fn emit_scope<B: IsaBackend>(
             let guard = &if_guards[guard_idx];
             let mask_reg = match location_of(&locs, guard.mask_vid) {
                 Binding::Loc(Loc::Reg(r)) => r,
-                _ => backend.emit_resolve(&mut asm.code, guard.mask_vid, guard_mask(), &locs),
+                _ => backend.emit_resolve(&mut asm.code, guard.mask_vid, guard_mask(), &locs)?,
             };
             let past_arm = arm_join(guard, arm);
             let test = MaskTest {
@@ -1728,7 +1751,7 @@ fn emit_scope<B: IsaBackend>(
                     let target = scratch
                         .reload(0)
                         .expect("a Write's value is not resident and no reload was reserved");
-                    backend.emit_resolve(&mut asm.code, *value, target, &locs)
+                    backend.emit_resolve(&mut asm.code, *value, target, &locs)?
                 }
             };
             backend.emit_write(
@@ -1791,17 +1814,24 @@ fn emit_scope<B: IsaBackend>(
             // result — the slot it was given stays a dead vector of stack.
             let accumulates = fold.monoid() != Monoid::SEQ;
 
-            let mut seed = |backend: &mut B, at: Option<Reg>, value: f32, slot: u32| match at {
-                Some(r) => backend.load_const(&mut asm.code, r, value),
-                None => {
-                    backend.load_const(&mut asm.code, t0, value);
-                    backend.slot_store(&mut asm.code, t0, slot);
+            let mut seed = |backend: &mut B,
+                            at: Option<Reg>,
+                            value: f32,
+                            slot: u32|
+             -> Result<(), CompileError> {
+                match at {
+                    Some(r) => backend.load_const(&mut asm.code, r, value),
+                    None => {
+                        backend.load_const(&mut asm.code, t0, value)?;
+                        backend.slot_store(&mut asm.code, t0, slot);
+                        Ok(())
+                    }
                 }
             };
             if accumulates {
-                seed(backend, acc_reg, fold.monoid().identity(), acc_slot);
+                seed(backend, acc_reg, fold.monoid().identity(), acc_slot)?;
             }
-            seed(backend, binder_reg, fold.range().start as f32, binder_slot);
+            seed(backend, binder_reg, fold.range().start as f32, binder_slot)?;
 
             let top = Label::new(&alloc::format!("reduce{}_top", vid.0));
             let exit = Label::new(&alloc::format!("reduce{}_exit", vid.0));
@@ -1821,7 +1851,7 @@ fn emit_scope<B: IsaBackend>(
                     t0
                 }
             };
-            backend.load_const(&mut asm.code, t1, fold.range().end as f32);
+            backend.load_const(&mut asm.code, t1, fold.range().end as f32)?;
             backend.test_ge(&mut asm.code, t0, [binder_now, t1], scratch.mask_guard_temp);
             backend.branch_if_arm_is_dead(
                 &mut asm,
@@ -1860,10 +1890,10 @@ fn emit_scope<B: IsaBackend>(
             // the whole of "advance the loop".
             let stride = fold.stride() as f32;
             match binder_reg {
-                Some(b) => backend.add_scalar(&mut asm.code, b, t0, stride),
+                Some(b) => backend.add_scalar(&mut asm.code, b, t0, stride)?,
                 None => {
                     backend.slot_load(&mut asm.code, t0, binder_slot);
-                    backend.add_scalar(&mut asm.code, t0, t1, stride);
+                    backend.add_scalar(&mut asm.code, t0, t1, stride)?;
                     backend.slot_store(&mut asm.code, t0, binder_slot);
                 }
             }
@@ -1884,7 +1914,7 @@ fn emit_scope<B: IsaBackend>(
         }
 
         let dst_loc = location_of(&locs, *vid);
-        let plan = resolve_operands(sched_op, dst_loc, &locs, scratch)?;
+        let plan = resolve_operands(sched_op, dst_loc, &locs, scratch);
 
         if let ScheduledOp::Ternary(OpKind::If, mask_vid, true_vid, false_vid) = sched_op
             && let Some(guard) = guard_at[sched_idx].map(|gi| &if_guards[gi])
@@ -1892,7 +1922,7 @@ fn emit_scope<B: IsaBackend>(
         {
             let mask_reg = match location_of(&locs, *mask_vid) {
                 Binding::Loc(Loc::Reg(r)) => r,
-                _ => backend.emit_resolve(&mut asm.code, *mask_vid, guard_mask(), &locs),
+                _ => backend.emit_resolve(&mut asm.code, *mask_vid, guard_mask(), &locs)?,
             };
             let dst = dst_loc.reg();
             let in_reg = |v: regalloc::ValueId| match location_of(&locs, v) {
@@ -1928,7 +1958,7 @@ fn emit_scope<B: IsaBackend>(
             if let Some(freg) = false_reg {
                 backend.emit_mov(&mut asm.code, dst, freg);
             } else {
-                backend.emit_resolve(&mut asm.code, *false_vid, dst, &locs);
+                backend.emit_resolve(&mut asm.code, *false_vid, dst, &locs)?;
             }
             backend.jump(&mut asm, join);
 
@@ -1936,7 +1966,7 @@ fn emit_scope<B: IsaBackend>(
             if let Some(treg) = true_reg {
                 backend.emit_mov(&mut asm.code, dst, treg);
             } else {
-                backend.emit_resolve(&mut asm.code, *true_vid, dst, &locs);
+                backend.emit_resolve(&mut asm.code, *true_vid, dst, &locs)?;
             }
 
             asm.bind(join);
@@ -1986,7 +2016,7 @@ fn emit_scope<B: IsaBackend>(
                 let target = allocation.scratch(sched_len - 1).result.expect(
                     "the allocator reserves a result target on every scope's last instruction",
                 );
-                backend.emit_resolve(&mut asm.code, root, target, &locs)
+                backend.emit_resolve(&mut asm.code, root, target, &locs)?
             }
         })
     };
@@ -2014,12 +2044,15 @@ fn emit_scope<B: IsaBackend>(
 /// If the destination is in a stack slot. A definition writes a register or
 /// nothing at all; a spilled destination was the fixed `reload[0]`, and there
 /// is no such register any more.
+///
+/// If a `Ternary` names an op other than `MulAdd` or `If`: lowering emits no
+/// other, so that is a pipeline bug ([`unimplemented_op`]), not a kernel.
 fn resolve_operands(
     op: &ScheduledOp,
     dst_loc: Binding,
     locs: &[Option<Binding>],
     scratch: regalloc::Scratch,
-) -> Result<InstructionPlan, CompileError> {
+) -> InstructionPlan {
     // The one pointer-class definition, resolved before the vector
     // destination is read: its register is a pointer register by the
     // allocator's own placement, and it has no operands to resolve.
@@ -2031,12 +2064,12 @@ fn resolve_operands(
                  pointer definition a pointer register"
             ),
         };
-        return Ok(InstructionPlan {
+        return InstructionPlan {
             reloads: Vec::new(),
             op: ResolvedOp::Context { dst, slot: *slot },
             setup_mov: None,
             scratch,
-        });
+        };
     }
 
     let dst = match dst_loc {
@@ -2046,12 +2079,12 @@ fn resolve_operands(
         // register nobody reads is what the fixed destination register used to
         // buy.
         Binding::Remat(_) => {
-            return Ok(InstructionPlan {
+            return InstructionPlan {
                 reloads: Vec::new(),
                 op: ResolvedOp::Nop,
                 setup_mov: None,
                 scratch,
-            });
+            };
         }
         Binding::Loc(Loc::Ptr(p)) => panic!(
             "a vector definition landed in pointer register {p:?} — the \
@@ -2293,17 +2326,17 @@ fn resolve_operands(
                         if_false: c_reg,
                     }
                 }
-                _ => return Err(CompileError::UnsupportedOp(*op_kind)),
+                _ => unimplemented_op("the ternary resolver", *op_kind),
             }
         }
     };
 
-    Ok(InstructionPlan {
+    InstructionPlan {
         reloads,
         op: resolved_op,
         setup_mov,
         scratch,
-    })
+    }
 }
 
 /// Where a value lives, from the dense slice the emit loop carries.
@@ -3631,8 +3664,7 @@ mod tests {
         // left=v4, right=v5, dst=v6 — all in registers
         let locs = make_locs(&[(0, 4), (1, 5), (2, 6)], &[]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH);
 
         assert!(plan.reloads.is_empty());
         assert_eq!(
@@ -3656,8 +3688,7 @@ mod tests {
         // left spilled at offset 0, right in v5
         let locs = make_locs(&[(1, 5), (2, 6)], &[(0, 0)]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH);
 
         assert_eq!(plan.reloads.len(), 1);
         assert_eq!(
@@ -3683,8 +3714,7 @@ mod tests {
         // Both spilled: left → dst (temp trick), right → tmp_op
         let locs = make_locs(&[(2, 6)], &[(0, 0), (1, 16)]);
         let op = ScheduledOp::Binary(OpKind::Mul, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH);
 
         assert_eq!(plan.reloads.len(), 2);
         // left → dst (v6), right → tmp_op (v27)
@@ -3748,8 +3778,7 @@ mod tests {
             Binding::Remat(1.5f32.to_bits()),
             locs.as_slice(),
             TEST_SCRATCH,
-        )
-        .unwrap();
+        );
         assert_eq!(plan.op, ResolvedOp::Nop);
         assert!(plan.reloads.is_empty());
     }
@@ -3764,8 +3793,7 @@ mod tests {
             regalloc::ValueId(1),
             regalloc::ValueId(2),
         );
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH);
 
         assert!(plan.reloads.is_empty());
         // c=v7 ≠ dst=v8, so setup_mov should copy c → dst
@@ -3791,8 +3819,7 @@ mod tests {
             regalloc::ValueId(1),
             regalloc::ValueId(2),
         );
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH);
 
         // a → dst, b → tmp_op loaded upfront
         assert_eq!(plan.reloads.len(), 2);
@@ -3839,8 +3866,7 @@ mod tests {
             regalloc::ValueId(1),
             regalloc::ValueId(2),
         );
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH);
 
         // Only a and b reloads upfront — c is deferred
         assert_eq!(plan.reloads.len(), 2);
@@ -3857,8 +3883,7 @@ mod tests {
     fn resolve_var_is_nop() {
         let locs = make_locs(&[(0, 0)], &[]);
         let op = ScheduledOp::Var(0);
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(0)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(0)).into(), locs.as_slice(), TEST_SCRATCH);
         assert_eq!(plan.op, ResolvedOp::Nop);
         assert!(plan.reloads.is_empty());
     }
@@ -3867,8 +3892,7 @@ mod tests {
     fn resolve_const() {
         let locs = make_locs(&[(0, 6)], &[]);
         let op = ScheduledOp::Const(core::f32::consts::PI);
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH);
         assert_eq!(
             plan.op,
             ResolvedOp::LoadConst {
@@ -3951,7 +3975,7 @@ mod tests {
         }
         let root = terms[0];
 
-        let result = EmitCtx::with_max_regs(4)
+        let result = EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH)
             .compile(&arena, root, POINT)
             .expect("arena DAG compile with spills failed");
 
@@ -6832,7 +6856,7 @@ mod tests {
                 vid: regalloc::ValueId,
                 target: Reg,
                 locs: &[Option<Binding>],
-            ) -> Reg {
+            ) -> Result<Reg, CompileError> {
                 self.note_binding(locs.get(vid.0 as usize).copied().flatten());
                 self.inner.emit_resolve(code, vid, target, locs)
             }
@@ -6878,12 +6902,23 @@ mod tests {
                 self.inner.scope_end(scope, bytes);
             }
 
-            fn add_scalar(&mut self, code: &mut Vec<u8>, dst: Reg, scratch: Reg, scalar: f32) {
-                self.inner.add_scalar(code, dst, scratch, scalar);
+            fn add_scalar(
+                &mut self,
+                code: &mut Vec<u8>,
+                dst: Reg,
+                scratch: Reg,
+                scalar: f32,
+            ) -> Result<(), CompileError> {
+                self.inner.add_scalar(code, dst, scratch, scalar)
             }
 
-            fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) {
-                self.inner.load_const(code, dst, val);
+            fn load_const(
+                &mut self,
+                code: &mut Vec<u8>,
+                dst: Reg,
+                val: f32,
+            ) -> Result<(), CompileError> {
+                self.inner.load_const(code, dst, val)
             }
 
             fn alu(&mut self, code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2]) {
