@@ -10,11 +10,13 @@
 //!   entry over a record of ten `f32`s — is one canonical key through
 //!   either, with the same value in each uniform slot, so the JIT compiles
 //!   one program for them and they cannot differ in a bit; and
-//! - **as glyphs**: real glyphs, composed the way §1.7 says the host composes
-//!   one — each piece one `one_piece` instance, the instances summed into one
-//!   ink by the block's `sum2` as a balanced tree, and the block's
-//!   `glyph(ink, bounds)` over it — draw [`glyph`]'s pixels, to the closed
-//!   form's own error bound. Nothing of the builder is on that path: the
+//! - **as glyphs**: every printable ASCII glyph with ink at 7, 16 and 32 px
+//!   (the plan's B7), composed the way §1.7 says the host composes one —
+//!   each piece one `one_piece` instance, the instances summed into one ink
+//!   by the block's `sum2` as a balanced tree, and the block's
+//!   `glyph(ink, bounds)` over it — draws [`glyph`]'s pixels, to the closed
+//!   form's own error bound; the one glyph without ink (space) is pinned by
+//!   name, at every size. Nothing of the builder is on that path: the
 //!   pieces' rows are the font's data ([`pieces`], [`piece_row`]), the box
 //!   is the outline's own ([`Outline::bounds`]), and how far past it
 //!   coverage reaches is the block's `inside`, not the builder's
@@ -40,8 +42,21 @@ use block::{one_piece, Bounds, Row};
 /// The crate's font.
 const FONT_DATA: &[u8] = include_bytes!("../../../assets/DejaVuSansMono-Fallback.ttf");
 
-/// The pixel size the glyphs are drawn at, and their tile's side.
-const SIZE: usize = 16;
+/// The pixel sizes the glyphs are drawn at, each its tile's side: the
+/// sizes the exact-area ratchet holds every coverage to
+/// (`tests/glyph_exact_area.rs`), so this gate and that one read the same
+/// tiles.
+const SIZES: [usize; 3] = [7, 16, 32];
+
+/// The glyphs: printable ASCII, every one of which the font must have.
+const ASCII: core::ops::RangeInclusive<char> = ' '..='~';
+
+/// The glyphs with no ink, at every size: no pieces to compose, so the
+/// language side has nothing to say. Pinned by name and asserted per size,
+/// so a glyph losing its outline at any size is a failure here, not a
+/// skipped case. (The builder's tile is all zero for these by the same
+/// predicate `run` uses, so the name is the pin, not the tile.)
+const EMPTY: [char; 1] = [' '];
 
 /// `row` as the block's record: the columns, in declaration order.
 fn record(row: [f32; PIECE_ROW_COLS]) -> Row {
@@ -106,18 +121,21 @@ fn a_piece_is_one_term_through_either_definition() {
     }
 }
 
-/// Real glyphs composed in the language — a `one_piece` instance per piece,
-/// summed by `sum2`, under `glyph`'s box — draw [`glyph`]'s pixels, to the
-/// closed form's own error bound, which every coverage is held to against
-/// the exact area (`tests/glyph_exact_area.rs`), taken twice.
+/// Every printable ASCII glyph with ink, composed in the language — a
+/// `one_piece` instance per piece, summed by `sum2`, under `glyph`'s box —
+/// draws [`glyph`]'s pixels at 7, 16 and 32 px, to twice the closed form's
+/// error bound, which every coverage is held to against the exact area
+/// (`tests/glyph_exact_area.rs`). The plan's B7: the equivalence gate the
+/// builder's deletion (Phase C) stands on.
 ///
 /// Not to the bit. A piece is one term through either definition (above),
 /// but a fold over a table and a sum of instances over uniforms are two
 /// programs, and the optimizer is free to extract them differently — the
-/// sum's association, which products fuse, what a batch hoists. Measured:
-/// they differ in the low bits of some texels, by at most `1.9·10⁻⁶` on the
-/// AVX-512 and AVX2 tiers alike, where the bound here is `1.6·10⁻⁵` at its
-/// smallest.
+/// sum's association, which products fuse, what a batch hoists. Measured,
+/// on the AVX-512 and AVX2 tiers alike: they differ in the low bits of some
+/// texels, by at most `6.9·10⁻⁷` at 7 px, `2.0·10⁻⁶` at 16 px and
+/// `1.4·10⁻⁶` at 32 px, where the bound here is `7.6·10⁻⁶`, `1.6·10⁻⁵` and
+/// `3.1·10⁻⁵` at its smallest; the run prints each size's spread.
 ///
 /// The box is the outline's own: the block's `inside` reaches the half
 /// pixel past it that coverage does, where the builder's [`Support`] is the
@@ -126,65 +144,85 @@ fn a_piece_is_one_term_through_either_definition() {
 /// The composed program's uniforms are the glyph's box, then each piece's
 /// ten in piece order: the entry's own first, then each argument's in
 /// parameter order, which the balanced tree keeps in piece order — the
-/// order a positional binding of the font's block reads (O3 of the plan).
+/// order a positional binding of the font's block reads (O3 of the plan),
+/// pinned here at every piece count printable ASCII has.
+///
+/// One function, not one test per glyph: each `#[test]` is its own
+/// process under nextest, and the JIT cache is per process, so one sweep
+/// compiles each distinct program once per size — the builder's per
+/// trip-count bucket, the language's per piece count — where a test per
+/// glyph would saturate every glyph again. 57 s in a debug build.
 #[test]
-fn real_glyphs_composed_in_the_language_draw_the_builders_pixels() {
+fn every_ascii_glyph_composed_in_the_language_draws_the_builders_pixels() {
     let font = Font::parse(FONT_DATA).expect("parse font");
-    let mut spread = 0.0f64;
-    for ch in ['A', 'O', 'S', 'g', '8', 'Q'] {
-        let id = font
-            .cmap_lookup(ch)
-            .unwrap_or_else(|| panic!("the font has no glyph for {ch:?}"));
-        let outline = font
-            .outline_scaled_by_id(id, SIZE as f32)
-            .unwrap_or_else(|| panic!("the font has no outline for {ch:?}"));
-        let rows: Vec<[f32; PIECE_ROW_COLS]> =
-            pieces(&outline).into_iter().map(piece_row).collect();
+    for size in SIZES {
+        let mut spread = 0.0f64;
+        let mut empties: Vec<char> = Vec::new();
+        for ch in ASCII {
+            let id = font
+                .cmap_lookup(ch)
+                .unwrap_or_else(|| panic!("the font has no glyph for {ch:?}"));
+            let outline = font
+                .outline_scaled_by_id(id, size as f32)
+                .unwrap_or_else(|| panic!("the font has no outline for {ch:?}"));
+            let rows: Vec<[f32; PIECE_ROW_COLS]> =
+                pieces(&outline).into_iter().map(piece_row).collect();
 
-        let built = glyph(&outline);
-        let centred = built.kernel().at(
-            &Kernel::x().add(&constant(PIXEL_CENTER)),
-            &Kernel::y().add(&constant(PIXEL_CENTER)),
-        );
-        let by_the_builder = built
-            .bake(&centred, Lattice::frame(SIZE, SIZE))
-            .into_buffer();
-
-        let instances: Vec<Kernel> = rows.iter().map(|row| one_piece(record(*row))).collect();
-        let [x0, y0, x1, y1] = outline
-            .bounds()
-            .unwrap_or_else(|| panic!("{ch:?}'s outline has no box"));
-        let written = block::glyph(&ink(&instances), Bounds { x0, y0, x1, y1 });
-        let declared: Vec<f32> = written.uniforms().iter().map(|u| u.default).collect();
-        let in_order: Vec<f32> = [x0, y0, x1, y1]
-            .into_iter()
-            .chain(rows.iter().flatten().copied())
-            .collect();
-        assert_eq!(declared, in_order, "{ch:?}: the box, then each piece's row");
-        let in_the_language = Lattice::frame(SIZE, SIZE).bake(&written).into_buffer();
-
-        assert!(
-            by_the_builder.iter().any(|&v| v > 0.0),
-            "{ch:?} drew nothing to compare"
-        );
-        for (k, (&a, &b)) in by_the_builder.iter().zip(&in_the_language).enumerate() {
-            let (i, j) = (k % SIZE, k / SIZE);
-            let difference = (f64::from(a) - f64::from(b)).abs();
-            assert!(
-                difference <= 2.0 * arithmetic_bound([i, j]),
-                "{ch:?} texel ({i}, {j}): {a} by the builder, {b} in the language"
+            let built = glyph(&outline);
+            let centred = built.kernel().at(
+                &Kernel::x().add(&constant(PIXEL_CENTER)),
+                &Kernel::y().add(&constant(PIXEL_CENTER)),
             );
-            spread = spread.max(difference);
+            let by_the_builder = built
+                .bake(&centred, Lattice::frame(size, size))
+                .into_buffer();
+
+            let (Some([x0, y0, x1, y1]), false) = (outline.bounds(), rows.is_empty()) else {
+                assert!(
+                    by_the_builder.iter().all(|&v| v == 0.0),
+                    "{ch:?} at {size} px has no pieces, yet the builder drew ink"
+                );
+                empties.push(ch);
+                continue;
+            };
+
+            let instances: Vec<Kernel> = rows.iter().map(|row| one_piece(record(*row))).collect();
+            let written = block::glyph(&ink(&instances), Bounds { x0, y0, x1, y1 });
+            let declared: Vec<f32> = written.uniforms().iter().map(|u| u.default).collect();
+            let in_order: Vec<f32> = [x0, y0, x1, y1]
+                .into_iter()
+                .chain(rows.iter().flatten().copied())
+                .collect();
+            assert_eq!(
+                declared, in_order,
+                "{ch:?} at {size} px: the box, then each piece's row"
+            );
+            let in_the_language = Lattice::frame(size, size).bake(&written).into_buffer();
+
+            assert!(
+                by_the_builder.iter().any(|&v| v > 0.0),
+                "{ch:?} at {size} px drew nothing to compare"
+            );
+            for (k, (&a, &b)) in by_the_builder.iter().zip(&in_the_language).enumerate() {
+                let (i, j) = (k % size, k / size);
+                let difference = (f64::from(a) - f64::from(b)).abs();
+                assert!(
+                    difference <= 2.0 * arithmetic_bound(size, [i, j]),
+                    "{ch:?} at {size} px, texel ({i}, {j}): {a} by the builder, {b} in the language"
+                );
+                spread = spread.max(difference);
+            }
         }
+        eprintln!("at {size} px the builder and the language differ by at most {spread:e}");
+        assert_eq!(empties, EMPTY, "the glyphs with no pieces at {size} px");
     }
-    eprintln!("the builder and the language differ by at most {spread:e}");
 }
 
-/// The closed form's error bound at texel `(i, j)` of a [`SIZE`]-px tile,
-/// no arc longer than the tile: `2⁻²²·(1 + X + Y + 2·SIZE)` at the texel's
+/// The closed form's error bound at texel `(i, j)` of a `size`-px tile,
+/// no arc longer than the tile: `2⁻²²·(1 + X + Y + 2·size)` at the texel's
 /// centre (`tests/glyph_exact_area.rs`, `arithmetic_bound`).
-fn arithmetic_bound([i, j]: [usize; 2]) -> f64 {
+fn arithmetic_bound(size: usize, [i, j]: [usize; 2]) -> f64 {
     const ARC_TOLERANCE_UNIT: f64 = 1.0 / 4_194_304.0;
     let (x, y) = (i as f64 + 0.5, j as f64 + 0.5);
-    ARC_TOLERANCE_UNIT * (1.0 + x + y + 2.0 * SIZE as f64)
+    ARC_TOLERANCE_UNIT * (1.0 + x + y + 2.0 * size as f64)
 }
