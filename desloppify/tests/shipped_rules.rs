@@ -1,155 +1,47 @@
-//! The rules and skills in this crate load, and each sees the unit it claims
-//! to. Catches a bad rule file or a dangling skill name before a review does.
+//! The rules and skills in this crate load, and each rule shows a model the
+//! unit of code it claims to — observed in what a review sends the model, and
+//! for path scoping in what the binary reports from the repository root.
 
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
 
-use desloppify::language::Language;
-use desloppify::review::plan;
-use desloppify::rule::{self, Rule, Verdict};
-use desloppify::skills;
-use desloppify::snippet::{outline, snippets};
+use anyhow::Result;
+use desloppify::agent::{self, Answer, Ask, Question};
+use desloppify::decide;
+use desloppify::review::{Reviewers, plan, review};
+use desloppify::rule::{self, Rule};
+use desloppify::skills::{self, Skills};
 
-fn shipped() -> Vec<Rule> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let skills = skills::load(&root.join("skills")).unwrap();
-    rule::load_dir(&root.join("rules"), &skills).unwrap()
+const MIN_CONFIDENCE: f64 = 0.7;
+const CONTEXT_MARKER: &str = "\nFor context only";
+
+fn manifest() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn rule(id: &str) -> Rule {
-    shipped().into_iter().find(|r| r.id == id).unwrap()
+fn shipped_skills() -> Skills {
+    skills::load(&manifest().join("skills")).unwrap()
 }
 
 #[test]
 fn every_shipped_rule_loads() {
-    assert!(!shipped().is_empty());
+    let rules = rule::load_dir(&manifest().join("rules"), &shipped_skills()).unwrap();
+    assert!(!rules.is_empty());
 }
 
-#[test]
-fn every_shipped_rule_lists_its_fine_outcomes_before_its_violations() {
-    for rule in shipped() {
-        let verdicts: Vec<_> = rule.decision.outcomes.iter().map(|o| o.verdict).collect();
-        let first_violation = verdicts
-            .iter()
-            .position(|v| *v == Verdict::Violation)
-            .unwrap();
-        assert!(first_violation > 0, "{} has no fine outcome", rule.id);
-        assert!(
-            verdicts[first_violation..]
-                .iter()
-                .all(|v| *v == Verdict::Violation),
-            "{}",
-            rule.id
-        );
+/// Answers as the dry-run backend does, recording the code each call was
+/// shown.
+struct Recording<A> {
+    inner: A,
+    shown: Mutex<Vec<String>>,
+}
+
+impl<A: Ask> Ask for Recording<A> {
+    async fn ask(&self, question: &Question<'_>) -> Result<Answer> {
+        self.shown.lock().unwrap().push(question.prompt.to_owned());
+        self.inner.ask(question).await
     }
-}
-
-#[test]
-fn signatures_are_shown_without_bodies_joined_in_one_snippet() {
-    let source = "pub fn a(x: u8) -> u8 {\n    x\n}\nfn b() {}\n";
-    let found = snippets(&rule("boolean-argument"), Language::Rust, source).unwrap();
-    assert_eq!(
-        found,
-        [desloppify::snippet::Snippet {
-            first_line: 1,
-            numbered: "    1 | pub fn a(x: u8) -> u8\n  ...\n    4 | fn b()\n".into()
-        }]
-    );
-}
-
-#[test]
-fn types_are_reviewed_each_alone() {
-    let source = "struct A { id: u32 }\nfn f() {}\nenum B { X }\n";
-    let found = snippets(&rule("control-plane-64-bit"), Language::Rust, source).unwrap();
-    let lines: Vec<_> = found.iter().map(|s| s.first_line).collect();
-    assert_eq!(lines, [1, 3]);
-}
-
-#[test]
-fn functions_are_reviewed_each_alone_whole() {
-    let source = "fn f() {\n    let a = x.unwrap();\n}\nfn g() {}\n";
-    let found = snippets(&rule("panicking-unwrap"), Language::Rust, source).unwrap();
-    assert_eq!(found.len(), 2);
-    assert_eq!(
-        found[0].numbered,
-        "    1 | fn f() {\n    2 |     let a = x.unwrap();\n    3 | }\n"
-    );
-}
-
-#[test]
-fn functions_inside_a_cfg_test_module_are_not_reviewed() {
-    let source =
-        "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nmod inner {\n    fn b() {}\n}\n";
-    let found = snippets(&rule("guard-clauses"), Language::Rust, source).unwrap();
-    let lines: Vec<_> = found.iter().map(|s| s.first_line).collect();
-    assert_eq!(lines, [1, 7]);
-}
-
-#[test]
-fn an_outline_keeps_every_line_but_function_bodies_at_its_own_number() {
-    let source = "#[test]\nfn works() {\n    assert!(true);\n}\n\npub struct S;\nimpl S {\n    fn m(&self) {\n        inner();\n    }\n}\n";
-    let shown = outline(Language::Rust, source).unwrap();
-    assert_eq!(
-        shown.numbered,
-        "    1 | #[test]\n    2 | fn works() { … }\n    5 | \n    6 | pub struct S;\n    7 | impl S {\n    8 |     fn m(&self) { … }\n   11 | }\n"
-    );
-    let found = snippets(&rule("test-names-it-should"), Language::Rust, source).unwrap();
-    assert_eq!(found, [shown]);
-}
-
-#[test]
-fn a_function_nested_in_a_body_is_elided_with_it() {
-    let source = "fn outer() {\n    fn inner() {\n    }\n}\nfn after() {}\n";
-    let shown = outline(Language::Rust, source).unwrap();
-    assert_eq!(
-        shown.numbered,
-        "    1 | fn outer() { … }\n    5 | fn after() { … }\n"
-    );
-}
-
-#[test]
-fn path_scoped_rule_reads_only_its_crates() {
-    let rule = rule("no-terminal-logic-in-pixelflow");
-    assert!(
-        rule.files
-            .contains(&PathBuf::from("pixelflow-core/src/lib.rs"))
-    );
-    assert!(
-        rule.files
-            .contains(&PathBuf::from("./pixelflow-graphics/src/fonts/cache.rs"))
-    );
-    assert!(!rule.files.contains(&PathBuf::from("core-term/src/main.rs")));
-}
-
-#[test]
-fn excluded_paths_are_not_read() {
-    let simd = rule("simd-is-codegens");
-    assert!(
-        simd.files
-            .contains(&PathBuf::from("pixelflow-codegen/src/jit_cache.rs"))
-    );
-    assert!(
-        !simd
-            .files
-            .contains(&PathBuf::from("pixelflow-codegen/src/emit/x86.rs"))
-    );
-    let registers = rule("registers-come-from-the-allocator");
-    assert!(
-        registers
-            .files
-            .contains(&PathBuf::from("pixelflow-codegen/src/emit/x86_64.rs"))
-    );
-    assert!(
-        !registers
-            .files
-            .contains(&PathBuf::from("pixelflow-codegen/src/emit/regalloc.rs"))
-    );
-    let unwrap = rule("panicking-unwrap");
-    assert!(
-        !unwrap
-            .files
-            .contains(&PathBuf::from("desloppify/tests/shipped_rules.rs"))
-    );
 }
 
 /// A scratch directory, removed on drop.
@@ -158,14 +50,37 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new(name: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("desloppify-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("rules")).unwrap();
         Self(dir)
     }
 
     fn write(&self, name: &str, text: &str) -> PathBuf {
         let path = self.0.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, text).unwrap();
         path
+    }
+
+    /// Copies the shipped rule `id` into this directory's `rules/`. With
+    /// `Scoping::Dropped` its `paths` and `exclude` are removed, so it reads
+    /// the scratch files it is given.
+    fn copy_rule(&self, id: &str, scoping: Scoping) {
+        let shipped = manifest().join("rules").join(format!("{id}.json"));
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(shipped).unwrap()).unwrap();
+        if scoping == Scoping::Dropped {
+            let fields = json.as_object_mut().unwrap();
+            fields.remove("paths");
+            fields.remove("exclude");
+        }
+        self.write(&format!("rules/{id}.json"), &json.to_string());
+    }
+
+    fn rules(&self) -> Vec<Rule> {
+        rule::load_dir(&self.0.join("rules"), &shipped_skills()).unwrap()
     }
 }
 
@@ -177,45 +92,196 @@ impl Drop for Scratch {
     }
 }
 
-#[test]
-fn module_root_context_attaches_the_mod_rs_outline_to_an_implementation_file() {
-    let dir = Scratch::new("root");
-    dir.write("mod.rs", "mod leaf;\npub fn made() -> u8 {\n    1\n}\n");
-    let leaf = dir.write("leaf.rs", "pub fn exposed() {}\n");
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scoping {
+    Kept,
+    Dropped,
+}
 
-    let rules = shipped();
-    let calls = plan(&rules, &[leaf]).unwrap();
-    let call = calls
-        .iter()
-        .find(|c| {
-            c.rules
-                .iter()
-                .any(|&r| rules[r].id == "interface-lives-in-mod-rs")
-        })
+/// The prompts a dry review of `files` under the shipped rule `id` shows the
+/// model, one per unit, sorted. Each unit is decided once, by the dry-run
+/// model's first outcome — a fine one — so nothing is explained.
+async fn shown(id: &str, files: &[(&str, &str)]) -> Vec<String> {
+    let scratch = Scratch::new(id);
+    scratch.copy_rule(id, Scoping::Dropped);
+    let paths: Vec<_> = files.iter().map(|(p, t)| scratch.write(p, t)).collect();
+    let rules = scratch.rules();
+    let calls = plan(&rules, &paths).unwrap();
+    let reviewers = Arc::new(Reviewers {
+        ask: Recording {
+            inner: agent::dry_run(),
+            shown: Mutex::new(Vec::new()),
+        },
+        decide: decide::none(),
+        min_confidence: MIN_CONFIDENCE,
+    });
+    let report = review(reviewers.clone(), Arc::new(rules), calls)
+        .await
         .unwrap();
-    let root = call.root.as_ref().unwrap();
-    assert_eq!(root.path, dir.0.join("mod.rs"));
+    assert!(report.failures.is_empty() && report.findings.is_empty());
+    let mut shown = reviewers.ask.shown.lock().unwrap().clone();
+    shown.sort();
+    shown
+}
+
+/// The numbered code in a prompt: after the `File:` line, before any
+/// context.
+fn code(prompt: &str) -> &str {
+    let (_, code) = prompt.split_once("\n\n").unwrap();
+    code.split(CONTEXT_MARKER).next().unwrap()
+}
+
+#[tokio::test]
+async fn signatures_are_shown_without_bodies_all_of_a_file_in_one_call() {
+    let shown = shown(
+        "boolean-argument",
+        &[("a.rs", "pub fn a(x: u8) -> u8 {\n    x\n}\nfn b() {}\n")],
+    )
+    .await;
+    assert_eq!(shown.len(), 1);
     assert_eq!(
-        root.text,
-        "    1 | mod leaf;\n    2 | pub fn made() -> u8 { … }\n"
+        code(&shown[0]),
+        "    1 | pub fn a(x: u8) -> u8\n  ...\n    4 | fn b()\n"
     );
 }
 
-#[test]
-fn rules_that_see_the_same_unit_share_its_calls() {
-    let dir = Scratch::new("shared");
-    let file = dir.write("a.rs", "fn a() {}\nfn b() {}\n");
+#[tokio::test]
+async fn types_are_shown_each_alone() {
+    let shown = shown(
+        "control-plane-64-bit",
+        &[("a.rs", "struct A { id: u32 }\nfn f() {}\nenum B { X }\n")],
+    )
+    .await;
+    let codes: Vec<_> = shown.iter().map(|p| code(p)).collect();
+    assert_eq!(
+        codes,
+        ["    1 | struct A { id: u32 }\n", "    3 | enum B { X }\n"]
+    );
+}
 
-    let rules = shipped();
-    let calls = plan(&rules, &[file]).unwrap();
-    let by_function: Vec<_> = calls
-        .iter()
-        .filter(|c| c.rules.iter().any(|&r| rules[r].id == "guard-clauses"))
-        .collect();
-    assert_eq!(by_function.len(), 2, "one call per function");
-    for call in by_function {
-        let ids: Vec<_> = call.rules.iter().map(|&r| rules[r].id.as_str()).collect();
-        assert!(ids.contains(&"magic-numbers"), "{ids:?}");
-        assert!(ids.contains(&"silent-failure"), "{ids:?}");
+#[tokio::test]
+async fn functions_are_shown_each_alone_and_whole() {
+    let shown = shown(
+        "panicking-unwrap",
+        &[("a.rs", "fn f() {\n    let a = x.unwrap();\n}\nfn g() {}\n")],
+    )
+    .await;
+    let codes: Vec<_> = shown.iter().map(|p| code(p)).collect();
+    assert_eq!(
+        codes,
+        [
+            "    1 | fn f() {\n    2 |     let a = x.unwrap();\n    3 | }\n",
+            "    4 | fn g() {}\n"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn functions_inside_a_cfg_test_module_are_never_shown() {
+    let shown = shown(
+        "guard-clauses",
+        &[(
+            "a.rs",
+            "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\nmod inner {\n    fn b() {}\n}\n",
+        )],
+    )
+    .await;
+    let codes: Vec<_> = shown.iter().map(|p| code(p)).collect();
+    assert_eq!(codes, ["    1 | fn a() {}\n", "    7 | fn b() {}\n"]);
+}
+
+#[tokio::test]
+async fn an_outline_keeps_every_line_but_function_bodies_at_its_own_number() {
+    let shown = shown(
+        "test-names-it-should",
+        &[(
+            "a.rs",
+            "#[test]\nfn works() {\n    assert!(true);\n}\n\npub struct S;\nimpl S {\n    fn m(&self) {\n        fn inner() {}\n    }\n}\n",
+        )],
+    )
+    .await;
+    assert_eq!(shown.len(), 1);
+    assert_eq!(
+        code(&shown[0]),
+        "    1 | #[test]\n    2 | fn works() { … }\n    5 | \n    6 | pub struct S;\n    7 | impl S {\n    8 |     fn m(&self) { … }\n   11 | }\n"
+    );
+}
+
+#[tokio::test]
+async fn an_implementation_file_is_shown_with_its_module_roots_outline() {
+    let shown = shown(
+        "interface-lives-in-mod-rs",
+        &[
+            ("m/mod.rs", "mod leaf;\npub fn made() -> u8 {\n    1\n}\n"),
+            ("m/leaf.rs", "pub fn exposed() {}\n"),
+        ],
+    )
+    .await;
+    let leaf = shown.iter().find(|p| p.contains("leaf.rs\n")).unwrap();
+    assert!(
+        leaf.ends_with("mod.rs:\n\n    1 | mod leaf;\n    2 | pub fn made() -> u8 { … }\n"),
+        "{leaf}"
+    );
+}
+
+/// Each rule's decision tally, as the binary prints it, from a dry review of
+/// `file` (relative to the repository root) under the shipped rules `ids`
+/// with their scoping.
+fn decided_from_the_repository_root(ids: &[&str], file: &str) -> String {
+    let scratch = Scratch::new("cli");
+    for id in ids {
+        scratch.copy_rule(id, Scoping::Kept);
     }
+    let output = Command::new(env!("CARGO_BIN_EXE_desloppify"))
+        .current_dir(manifest().parent().unwrap())
+        .args([
+            "--backend",
+            "dry-run",
+            "--system-one",
+            "dry-run",
+            "--findings-only",
+        ])
+        .arg("--rules")
+        .arg(scratch.0.join("rules"))
+        .arg(file)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stderr).unwrap()
+}
+
+#[test]
+fn a_path_scoped_rule_reads_only_the_paths_it_names_from_the_repository_root() {
+    const RULES: [&str; 3] = [
+        "simd-is-codegens",
+        "registers-come-from-the-allocator",
+        "no-terminal-logic-in-pixelflow",
+    ];
+    let reads = |file: &str| {
+        let decided = decided_from_the_repository_root(&RULES, file);
+        RULES
+            .into_iter()
+            .filter(|id| decided.contains(&format!("{id}: ")))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        reads("pixelflow-codegen/src/jit_cache.rs"),
+        [
+            "simd-is-codegens",
+            "registers-come-from-the-allocator",
+            "no-terminal-logic-in-pixelflow"
+        ]
+    );
+    assert_eq!(
+        reads("pixelflow-codegen/src/emit/x86_64.rs"),
+        [
+            "registers-come-from-the-allocator",
+            "no-terminal-logic-in-pixelflow"
+        ]
+    );
+    assert_eq!(
+        reads("pixelflow-codegen/src/emit/regalloc.rs"),
+        ["no-terminal-logic-in-pixelflow"]
+    );
+    assert!(reads("core-term/src/main.rs").is_empty());
 }

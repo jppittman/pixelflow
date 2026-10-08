@@ -85,20 +85,36 @@ A tight contract's signature refuses wrong shapes on its own:
   `bool` mode flag, or `&mut self` on what claims to be a query all admit
   behaviors the contract never stated.
 
-## Tests only ever see the exported API
+## Tests only ever see the production API
 
-Every test is a black-box test. Even when what it checks is a specific
-internal behavior — the cursor stopping at the margin, the AIMD rate halving
-— it drives the module's exported interface and observes what that interface
-returns: feed `EmulatorInput`s and read the snapshot or the returned
-`EmulatorAction`s; call `RateLimiter::wait` and read the waits. Never a
+Every test is a black-box test of the production API: what the crate's real
+callers use. Even when what it checks is a specific internal behavior — the
+cursor stopping at the margin, the AIMD rate halving, a register reaching the
+allocator — it drives that API and observes what it returns: feed
+`EmulatorInput`s and read the snapshot or the returned `EmulatorAction`s; call
+`RateLimiter::wait` and read the waits; compile a kernel and run it. Never a
 `pub(super)` field, a private helper, or a `#[cfg(test)] mod tests` inside an
 implementation file that can see them.
 
-When a behavior cannot be observed or controlled through the interface, that
-is a finding about the interface, not a license to reach in: make the input
-explicit (time becomes a `Clock` the constructor takes; randomness a seed)
-or the effect a returned value. A test generic over the trait
+**No API exists for tests.** Nothing is made public, or `pub(crate)`, or
+`#[cfg(test)]`-visible, so a test can reach it: no test hooks, accessors,
+constructors, re-exports, mocks or `for_test` variants in the source tree.
+The reasoning is one step deeper than "don't reach in": a piece of code
+earns its place by what it does to the production API's output. If changing
+it can change some output a real caller sees, the test observes that output.
+If no production output can change, the code is dead or a no-op — delete it;
+don't expose it so a test can watch it run. So "this can't be tested through
+the interface" is never answered by widening the interface: it is answered by
+finding the output the code affects, or by deleting the code.
+
+Feeding the code is not watching it. Time and randomness are inputs the
+code has either way; a constructor that takes them (a `Clock`, a seed) makes
+the dependency explicit — production passes the system clock, a test passes
+its own. Effects returned as values (`EmulatorAction`, `DriverOut`) are the
+production API, consumed by the real caller. A test may implement a trait the
+production API takes, to feed it. What is a hook is anything a test uses to
+*watch* the code instead of its output: an accessor, a recorder, a counter, a
+mock or a fixture the crate exports. A test generic over a trait
 (`fn contract<P: AnsiParser>(p: P)`) holds every implementation to it.
 
 ## Worked examples

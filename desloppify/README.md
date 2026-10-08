@@ -78,10 +78,13 @@ desloppify follows its own rules: every module is a directory whose `mod.rs`
 is the contract — traits (`agent::Ask`, `decide::Decide`,
 `rate_limit::RateLimiter`, `rate_limit::Clock`), the types they mention, and
 constructors returning `impl Trait` — and every other file is `pub(super)`
-implementation. All tests are in `tests/` and use only the exported API:
-time is an injected `Clock`, so the limiters are tested without sleeping;
-`review` is tested with a scripted `Ask` and `Decide`; Jev is tested against
-a local server speaking its API.
+implementation. All tests are in `tests/` and drive the production API —
+what `main` uses — and nothing is public only so a test can reach it: what
+a rule shows the model is read from the prompts a review sends, path
+scoping from the binary run at the repository root. Time is an injected
+`Clock`, so the limiters are tested without sleeping; `review` is tested
+with a scripted `Ask` and `Decide`; Jev is tested against a local server
+speaking its API.
 
 ## Rules — `rules/<id>.json`
 
@@ -125,7 +128,7 @@ conventional commits) is already a CI job or a lint, and stays there.
 | Rule | Levels | Unit | Source |
 |---|---|---|---|
 | `boolean-argument` | 1→1 | a file's function signatures | STYLE: boolean arguments |
-| `no-tests-inside-the-implementation` | 1→1 | outline | behavioral contracts |
+| `no-tests-inside-the-implementation` | 1→2 | outline | behavioral contracts: no test code or test-only API in the source tree |
 | `test-names-it-should` | 1→1 | outline | STYLE: "it should" names |
 | `actor-lane-choice` | 1→2 | file | CLAUDE.md: actor lanes |
 | `behavior-through-the-trait` | 1→2 | outline + module root | behavioral contracts |
@@ -144,7 +147,7 @@ conventional commits) is already a CI job or a lint, and stays there.
 | `registers-come-from-the-allocator` | 1→2 | each of functions | register-allocation escape hatches plan |
 | `silent-failure` | 1→2 | each of functions | CLAUDE.md: fail loud |
 | `simd-is-codegens` | 1→2 | file | CLAUDE.md: SIMD is an implementation detail |
-| `tests-target-the-contract` | 1→2 | file | behavioral contracts |
+| `tests-target-the-contract` | 1→2 | file | behavioral contracts: tests observe the production API's output |
 | `effects-are-returned` | 2→3 | file | behavioral contracts |
 | `function-shapes` | 2→3 | a crate's function signatures | names vs namespaces, argument structs, denotation, extraction |
 | `invariant-in-comment` | 2→3 | file | CLAUDE.md: denote before you build |

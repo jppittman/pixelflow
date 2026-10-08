@@ -14,13 +14,14 @@
   "skills": [
     "behavioral-contracts"
   ],
-  "question": "Does every test here drive only the exported interface and observe only what it returns?",
+  "question": "Does every test here check its behavior by driving the production API — what the crate's real callers use — and observing that API's output?",
   "fine": {
-    "black_box": "Every test drives the exported interface and observes its outputs, returned effects or observable state."
+    "black_box": "Every test drives the production API and observes its outputs, returned effects or observable state."
   },
   "violations": {
     "reaches_inside": "A test touches `pub(super)` fields or private helpers, constructs internal state directly, or calls an implementation type's internal methods.",
-    "asserts_internals": "A test asserts on intermediate internals rather than returned effects or observable state."
+    "asserts_internals": "A test asserts on intermediate internals rather than the production API's output.",
+    "uses_test_only_api": "A test calls something that exists only for tests: a `#[cfg(test)]` item, a test hook, accessor, recorder, mock or fixture the crate exports, a `for_test` variant, or a public item no production caller uses."
   },
-  "guidance": "Say how the same behavior is observed through the interface — which input to feed, which output to read — and if it cannot be, name the input or effect the interface is missing (an injected clock or seed, a returned effect). Where several tests repeat a check every implementation of a trait should pass, suggest a generic contract test."
+  "guidance": "Name the production entry point and the output the behavior shows up in: which input to feed, which output changes. If no production output can change when the tested code changes, that code is dead or a no-op: say what to delete. Never propose widening an interface, exporting a helper or adding a hook so a test can reach something. Where several tests repeat a check every implementation of a trait should pass, suggest a generic contract test."
 }

@@ -9,12 +9,12 @@ use crate::rule::Rule;
 
 /// Code shown to one call.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Snippet {
+pub(crate) struct Snippet {
     /// 1-based line of the snippet's first line in its file.
-    pub first_line: u64,
+    pub(crate) first_line: u64,
     /// The code, each line prefixed by its line number in the file so the
     /// model can point at lines.
-    pub numbered: String,
+    pub(crate) numbered: String,
 }
 
 /// The snippets `rule` reviews in `source`, a file in `language`, by the
@@ -33,7 +33,7 @@ pub struct Snippet {
 /// # Errors
 ///
 /// tree-sitter cannot load the language's grammar or parse `source`.
-pub fn snippets(rule: &Rule, language: Language, source: &str) -> Result<Vec<Snippet>> {
+pub(crate) fn snippets(rule: &Rule, language: Language, source: &str) -> Result<Vec<Snippet>> {
     capture::snippets(rule, language, source)
 }
 
@@ -45,6 +45,6 @@ pub fn snippets(rule: &Rule, language: Language, source: &str) -> Result<Vec<Sni
 /// # Errors
 ///
 /// tree-sitter cannot load the language's grammar or parse `source`.
-pub fn outline(language: Language, source: &str) -> Result<Snippet> {
+pub(crate) fn outline(language: Language, source: &str) -> Result<Snippet> {
     capture::outline(language, source)
 }

@@ -2,12 +2,9 @@
 
 use std::path::Path;
 
-use serde::Deserialize;
-
 use crate::rule::Part;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
 }

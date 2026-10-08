@@ -52,16 +52,16 @@ use crate::model::ModelLevel;
 use crate::skills::Skills;
 
 /// The capture a part's query names: the code each unit holds.
-pub const TARGET_CAPTURE: &str = "target";
+pub(crate) const TARGET_CAPTURE: &str = "target";
 
 /// A capture a part's query may name inside its target: the target's text
 /// stops where this one starts. A function's signature is its `@target` with
 /// its body as `@cut`.
-pub const CUT_CAPTURE: &str = "cut";
+pub(crate) const CUT_CAPTURE: &str = "cut";
 
 /// The outcome every decision may give besides its own: the code shown is
 /// not enough to decide.
-pub const UNSURE: &str = "unsure";
+pub(crate) const UNSURE: &str = "unsure";
 
 /// Every `*.json` rule in `dir`, sorted by id.
 ///
@@ -80,33 +80,33 @@ pub fn load_dir(dir: &Path, skills: &Skills) -> Result<Vec<Rule>> {
 pub struct Rule {
     /// The rule file's name without `.json`.
     pub id: String,
-    pub files: Files,
-    pub unit: Unit,
-    pub context: Surroundings,
-    pub decision: Decision,
     pub levels: Levels,
+    pub(crate) files: Files,
+    pub(crate) unit: Unit,
+    pub(crate) context: Surroundings,
+    pub(crate) decision: Decision,
     /// The text of the rule's skills, for both of its prompts.
-    pub skills: String,
+    pub(crate) skills: String,
 }
 
 /// A closed-set question asked of every unit.
-pub struct Decision {
-    pub question: String,
+pub(crate) struct Decision {
+    pub(crate) question: String,
     /// The fine outcomes first, then the violations, each in file order.
-    pub outcomes: Vec<Outcome>,
+    pub(crate) outcomes: Vec<Outcome>,
     /// What a finding for a violation should say, beyond where and what.
-    pub guidance: Option<String>,
+    pub(crate) guidance: Option<String>,
 }
 
-pub struct Outcome {
-    pub name: String,
+pub(crate) struct Outcome {
+    pub(crate) name: String,
     /// What choosing this outcome asserts about the code.
-    pub meaning: String,
-    pub verdict: Verdict,
+    pub(crate) meaning: String,
+    pub(crate) verdict: Verdict,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verdict {
+pub(crate) enum Verdict {
     Fine,
     Violation,
 }
@@ -121,7 +121,7 @@ pub struct Levels {
 }
 
 /// The files a rule reads, by path relative to where the review runs.
-pub struct Files {
+pub(crate) struct Files {
     /// `None` reads every file.
     pub(super) include: Option<GlobSet>,
     pub(super) exclude: GlobSet,
@@ -131,13 +131,13 @@ impl Files {
     /// Whether the rule reads `path`: it matches an include glob (or there
     /// are none) and no exclude glob. A leading `./` is ignored.
     #[must_use]
-    pub fn contains(&self, path: &Path) -> bool {
+    pub(crate) fn contains(&self, path: &Path) -> bool {
         files::contains(self, path)
     }
 }
 
 /// What one call reviews.
-pub enum Unit {
+pub(crate) enum Unit {
     /// A whole file.
     File,
     /// A whole file with every function body elided: its items and
@@ -154,18 +154,18 @@ pub enum Unit {
 
 /// A query compiled for its language, with the indexes of its `@target`
 /// and, if it has one, its `@cut`.
-pub struct CompiledQuery {
-    pub language: Language,
-    pub query: tree_sitter::Query,
-    pub target: u32,
-    pub cut: Option<u32>,
+pub(crate) struct CompiledQuery {
+    pub(crate) language: Language,
+    pub(crate) query: tree_sitter::Query,
+    pub(crate) target: u32,
+    pub(crate) cut: Option<u32>,
 }
 
 /// A part of the code every language may have, found by a per-language query
 /// (`Language::query`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Part {
+pub(crate) enum Part {
     Functions,
     /// A function's signature — attributes, visibility, name, parameters,
     /// return type — without its body.
@@ -176,7 +176,7 @@ pub enum Part {
 /// How a file's parts are grouped into calls.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Group {
+pub(crate) enum Group {
     /// One call per part.
     #[default]
     Each,
@@ -191,7 +191,7 @@ pub enum Group {
 /// What a call sees besides the code under review.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Surroundings {
+pub(crate) enum Surroundings {
     /// Nothing else.
     #[default]
     None,

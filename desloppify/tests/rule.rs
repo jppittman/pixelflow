@@ -2,10 +2,13 @@
 //! naming its file, before a review starts.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use desloppify::model::ModelLevel;
-use desloppify::rule::{self, Rule, Verdict};
-use desloppify::skills::Skills;
+use desloppify::review::{Reviewers, plan, review};
+use desloppify::rule::{self, Rule};
+use desloppify::skills;
+use desloppify::{agent, decide};
 
 /// A scratch rules directory holding one rule, removed on drop.
 struct Rules(PathBuf);
@@ -20,7 +23,9 @@ impl Rules {
     }
 
     fn load(&self) -> anyhow::Result<Vec<Rule>> {
-        rule::load_dir(&self.0, &Skills::default())
+        // A skills directory that does not exist holds no skills.
+        let skills = skills::load(&self.0.join("no-skills")).unwrap();
+        rule::load_dir(&self.0, &skills)
     }
 }
 
@@ -50,29 +55,37 @@ fn refused(name: &str, json: &str, because: &str) {
 }
 
 #[test]
-fn a_well_formed_rule_loads_with_its_fine_outcomes_first() {
+fn a_well_formed_rule_loads_with_its_id_and_levels() {
     let rules = Rules::holding("good", &with(r#""levels": {"decide": 1, "explain": 3},"#));
     let loaded = rules.load().unwrap();
     assert_eq!(loaded.len(), 1);
-    let rule = &loaded[0];
-    assert_eq!(rule.id, "good");
+    assert_eq!(loaded[0].id, "good");
     assert_eq!(
-        (rule.levels.decide, rule.levels.explain),
+        (loaded[0].levels.decide, loaded[0].levels.explain),
         (ModelLevel::Lite, ModelLevel::Strong)
     );
-    let outcomes: Vec<_> = rule
-        .decision
-        .outcomes
-        .iter()
-        .map(|o| (o.name.as_str(), o.verdict))
-        .collect();
+}
+
+#[tokio::test]
+async fn a_dry_run_decides_every_unit_by_the_rules_first_fine_outcome_and_explains_nothing() {
+    let rules = Rules::holding("first", &with(r#""levels": {"decide": 1, "explain": 2},"#));
+    let file = rules.0.join("a.rs");
+    std::fs::write(&file, "fn a() {}\nfn b() {}\n").unwrap();
+    let loaded = rules.load().unwrap();
+    let calls = plan(&loaded, &[file]).unwrap();
+    let reviewers = Arc::new(Reviewers {
+        ask: agent::dry_run(),
+        decide: decide::none(),
+        min_confidence: 0.7,
+    });
+    let report = review(reviewers, Arc::new(loaded), calls).await.unwrap();
+
+    // `a_fine` sorts before `b_fine`, and every fine outcome before `v`.
+    let decided: Vec<_> = report.decisions["first"].iter().collect();
+    assert_eq!(decided, [(&"a_fine".to_owned(), &2)]);
     assert_eq!(
-        outcomes,
-        [
-            ("a_fine", Verdict::Fine),
-            ("b_fine", Verdict::Fine),
-            ("v", Verdict::Violation)
-        ]
+        report.usage["first"].calls, 2,
+        "one decision a unit, no explanation"
     );
 }
 

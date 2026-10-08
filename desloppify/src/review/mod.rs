@@ -31,21 +31,21 @@ use crate::snippet::Snippet;
 /// with) that ask about it.
 pub struct Call {
     /// Never empty; every rule here sees the same unit and context.
-    pub rules: Vec<usize>,
+    pub(crate) rules: Vec<usize>,
     /// The file, or for a crate-wide rule the crate's directory.
-    pub path: PathBuf,
-    pub snippet: Snippet,
+    pub(crate) path: PathBuf,
+    pub(crate) snippet: Snippet,
     /// The module root's outline, when the rules ask for it and the file has
     /// one.
-    pub root: Option<Source>,
+    pub(crate) root: Option<Source>,
 }
 
 /// A file shown for context.
 #[derive(Clone, Debug)]
-pub struct Source {
-    pub path: PathBuf,
+pub(crate) struct Source {
+    pub(crate) path: PathBuf,
     /// Numbered, as a snippet is.
-    pub text: String,
+    pub(crate) text: String,
 }
 
 /// Who a review asks, and how sure System One must be to settle a question.

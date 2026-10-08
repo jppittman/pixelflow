@@ -11,10 +11,10 @@ use std::path::Path;
 use anyhow::Result;
 
 /// The file a skill's directory must hold to be a skill.
-pub const SKILL_FILE: &str = "SKILL.md";
+pub(crate) const SKILL_FILE: &str = "SKILL.md";
 
 /// Skills by name: a directory's name, mapped to its `SKILL.md` text.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Skills(pub(super) BTreeMap<String, String>);
 
 impl Skills {

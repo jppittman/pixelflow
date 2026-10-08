@@ -2,7 +2,7 @@
   "unit": "outline",
   "levels": {
     "decide": 1,
-    "explain": 1
+    "explain": 2
   },
   "exclude": [
     "**/*_tests.rs",
@@ -14,12 +14,13 @@
   "skills": [
     "behavioral-contracts"
   ],
-  "question": "Does this file declare a test module inside the source tree, such as `#[cfg(test)] mod tests`?",
+  "question": "Does this source file hold code that exists only for tests: a test module, or anything made to exist or made visible so a test can reach it?",
   "fine": {
-    "no_test_module": "No test module is declared here."
+    "no_test_code": "No test module, and every item here is as visible as its production callers need and no more."
   },
   "violations": {
-    "test_module": "A test module sits in the source tree, where its tests can see private items; tests belong in the crate's `tests/` directory, driving the exported interface."
+    "test_module": "A test module sits in the source tree, such as `#[cfg(test)] mod tests`, where its tests can see private items; tests belong in the crate's `tests/` directory, driving the production API.",
+    "test_only_api": "An item exists, or is visible, only so tests can reach it: `#[cfg(test)]` on a method, constructor, impl, re-export or non-private item; `#[allow(dead_code)]` on something only tests call; a helper, accessor, mock, recorder or fixture named or documented as being for tests (`for_test`, `test_*`, `mock`); visibility wider than production callers need."
   },
-  "guidance": "Name the module and the exported entry point its tests should drive instead."
+  "guidance": "For each, name the production output a test should observe instead: which entry point to call and which output the behavior changes. If no production output can change, the code is dead or a no-op: name it for deletion. Never suggest keeping it, widening it or moving it behind another export."
 }

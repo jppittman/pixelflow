@@ -132,7 +132,15 @@ async fn with<A: Ask>(
 ) -> Result<ExitCode> {
     match args.system_one {
         SystemOne::None => run(ask, decide::none(), args, (rules, plan)).await,
-        SystemOne::Jev => run(ask, decide::jev_from_env(args.jobs)?, args, (rules, plan)).await,
+        SystemOne::Jev => {
+            run(
+                ask,
+                decide::jev(decide::JevConfig::from_env(args.jobs)?),
+                args,
+                (rules, plan),
+            )
+            .await
+        }
         SystemOne::DryRun => run(ask, decide::dry_run(), args, (rules, plan)).await,
     }
 }

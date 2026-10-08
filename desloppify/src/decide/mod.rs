@@ -6,7 +6,7 @@
 //! that rule for the unit, and the rest go on to a model through
 //! [`Ask`](crate::agent::Ask). Three implementations:
 //!
-//! - [`jev`] / [`jev_from_env`]: TypeSafe AI's Jev, a model that returns
+//! - [`jev`]: TypeSafe AI's Jev, a model that returns
 //!   typed decisions with calibrated probabilities instead of text.
 //! - [`dry_run`]: no model — every question is answered with its first label
 //!   at full confidence, and priced by its input.
@@ -79,23 +79,25 @@ pub struct JevConfig {
     pub jobs: NonZeroUsize,
 }
 
+impl JevConfig {
+    /// Configured the way TypeSafe's own SDK is: `TYPESAFE_API_KEY`,
+    /// `TYPESAFE_BASE_URL` (default `https://api.typesafe.ai`) and
+    /// `TYPESAFE_DEFAULT_MODEL` (default `jev-latest`).
+    ///
+    /// # Errors
+    ///
+    /// `TYPESAFE_API_KEY` is unset or empty.
+    pub fn from_env(jobs: NonZeroUsize) -> Result<Self> {
+        jev::from_env(jobs)
+    }
+}
+
 /// Jev, at `config`. Each [`Decide::decide`] is one `POST /v1/systemone`,
 /// retried on 408, 429 and 5xx after the server's `Retry-After` (or a short
 /// backoff), at most twice.
 #[must_use]
 pub fn jev(config: JevConfig) -> impl Decide {
     jev::Jev::new(config)
-}
-
-/// Jev configured the way TypeSafe's own SDK is: `TYPESAFE_API_KEY`,
-/// `TYPESAFE_BASE_URL` (default `https://api.typesafe.ai`) and
-/// `TYPESAFE_DEFAULT_MODEL` (default `jev-latest`).
-///
-/// # Errors
-///
-/// `TYPESAFE_API_KEY` is unset or empty.
-pub fn jev_from_env(jobs: NonZeroUsize) -> Result<impl Decide> {
-    jev::from_env(jobs).map(jev::Jev::new)
 }
 
 /// Decides without a model: every question gets its first label at

@@ -629,8 +629,8 @@ async fn a_module_root_rule_shows_the_root_outline_as_context_and_a_root_file_al
     assert!(!root.prompt.contains("For context only"));
 }
 
-#[test]
-fn files_in_no_known_language_or_outside_a_rules_paths_plan_nothing() {
+#[tokio::test]
+async fn files_in_no_known_language_or_outside_a_rules_paths_are_never_shown() {
     let tree = Tree::new(
         "plan",
         &[(
@@ -644,13 +644,22 @@ fn files_in_no_known_language_or_outside_a_rules_paths_plan_nothing() {
             ("inside/notes.md", "# notes\n"),
         ],
     );
-    let files: Vec<_> = ["inside/a.rs", "outside/b.rs", "inside/notes.md"]
-        .iter()
-        .map(|f| tree.path(f))
-        .collect();
-    let calls = plan(&tree.rules(), &files).unwrap();
-    assert_eq!(calls.len(), 1);
-    assert!(calls[0].path.ends_with("inside/a.rs"));
+    let reviewers = reviewers(
+        Scripted::new(|_| Ok(r#"{"outcome": "f"}"#.into())),
+        decide::none(),
+    );
+    let report = run(
+        &tree,
+        &["inside/a.rs", "outside/b.rs", "inside/notes.md"],
+        &reviewers,
+    )
+    .await;
+
+    let asked = reviewers.ask.asked();
+    assert_eq!(asked.len(), 1);
+    let inside = format!("File: {}\n", tree.path("inside/a.rs").display());
+    assert!(asked[0].prompt.starts_with(&inside), "{}", asked[0].prompt);
+    assert_eq!(decided(&report, "scoped", "f"), 1);
 }
 
 #[tokio::test]
@@ -712,15 +721,7 @@ async fn a_crate_wide_rule_makes_one_call_per_crate_and_findings_keep_their_file
             ("k/src/b.rs", "fn b() {}\n"),
         ],
     );
-    let rules = tree.rules();
     let b = tree.path("k/src/b.rs");
-    let calls = plan(&rules, &[tree.path("k/src/a.rs"), b.clone()]).unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].path, tree.path("k"));
-    let shown = &calls[0].snippet.numbered;
-    assert!(shown.contains("a.rs ==\n    1 | fn a(x: u8)\n"), "{shown}");
-    assert!(shown.contains("b.rs ==\n    1 | fn b()\n"), "{shown}");
-
     let reviewers = reviewers(
         Scripted::new(|asked| {
             Ok(match asked.kind {
@@ -740,9 +741,20 @@ async fn a_crate_wide_rule_makes_one_call_per_crate_and_findings_keep_their_file
         }),
         decide::none(),
     );
-    let report = review(reviewers, Arc::new(rules), calls).await.unwrap();
+    let report = run(&tree, &["k/src/a.rs", "k/src/b.rs"], &reviewers).await;
     assert_eq!(report.findings.len(), 1);
     assert_eq!(report.findings[0].path, b);
+
+    let asked = reviewers.ask.asked();
+    let decisions: Vec<_> = asked.iter().filter(|a| a.kind == Kind::Decide).collect();
+    assert_eq!(decisions.len(), 1, "one call for the crate");
+    let shown = &decisions[0].prompt;
+    assert!(
+        shown.starts_with(&format!("File: {}\n", tree.path("k").display())),
+        "{shown}"
+    );
+    assert!(shown.contains("a.rs ==\n    1 | fn a(x: u8)\n"), "{shown}");
+    assert!(shown.contains("b.rs ==\n    1 | fn b()\n"), "{shown}");
 }
 
 #[tokio::test]
