@@ -1,7 +1,7 @@
 //! Register allocation for scheduled DAG expressions.
 //!
-//! Allocation is one algorithm ([`LinearScan`]) parameterised by one
-//! description of the target ([`RegisterFile`]). Everything that differs
+//! Allocation is one algorithm (`LinearScan`) parameterised by one
+//! description of the target (`RegisterFile`). Everything that differs
 //! between x86-64 and aarch64 — which registers hold the coordinate inputs,
 //! where the allocatable window starts and how wide it is, which fixed
 //! registers spilled operands reload into, how many bytes a spilled vector
@@ -44,7 +44,7 @@ pub(crate) use crate::program::{all_operands, operands, pointer_operand};
 ///
 /// A set says the true thing: these registers, whichever they are.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct RegSet(u32);
+pub(super) struct RegSet(u32);
 
 impl RegSet {
     /// The empty set.
@@ -110,6 +110,7 @@ impl RegSet {
         self.0.count_ones() as u8
     }
 
+    #[cfg(test)]
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
@@ -151,7 +152,7 @@ impl RegSet {
 /// bitset cannot itself be `const`. Small and duplicated beats generic and
 /// non-const.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct GprSet(u32);
+pub(super) struct GprSet(u32);
 
 impl GprSet {
     /// The empty set.
@@ -194,6 +195,7 @@ impl GprSet {
         self.0.count_ones() as u8
     }
 
+    #[cfg(test)]
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
@@ -210,7 +212,7 @@ impl GprSet {
 /// See [`GprSet`] for why this is a third concrete bitset rather than a
 /// generic one: the same const-fn constraint applies.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct MaskSet(u8);
+pub(super) struct MaskSet(u8);
 
 impl MaskSet {
     /// The empty set.
@@ -230,6 +232,7 @@ impl MaskSet {
         Self(bits)
     }
 
+    #[cfg(test)]
     #[must_use]
     pub const fn contains(self, r: KReg) -> bool {
         r.0 < 8 && self.0 & (1 << r.0) != 0
@@ -241,6 +244,7 @@ impl MaskSet {
         self.0.count_ones() as u8
     }
 
+    #[cfg(test)]
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
@@ -253,7 +257,7 @@ impl MaskSet {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub struct RegisterFile {
+pub(crate) struct RegisterFile {
     /// Every register the allocator may hand out.
     ///
     /// Everything outside it — callee-saved registers, the backend's own
@@ -262,7 +266,7 @@ pub struct RegisterFile {
     /// for an input: the collapse ABI passes pointers and a pitch, never a
     /// vector, so every vector register the ABI does not preserve is the
     /// allocator's.
-    pub scratch: RegSet,
+    pub(super) scratch: RegSet,
 
     /// How many registers an `If` short-circuit guard destroys while
     /// reducing its mask to a branch condition.
@@ -344,7 +348,7 @@ pub struct RegisterFile {
     /// GPR-class liveness, no spilling and no eviction: each instruction
     /// simply takes the low members of this set it needs, in order, which
     /// always succeeds because nothing else is ever concurrently live in it.
-    pub gpr_scratch: GprSet,
+    pub(super) gpr_scratch: GprSet,
 
     /// How many GPRs this backend's encoding of `op` needs beyond
     /// [`RegisterFile::gpr_ctx`] — the GPR-class
@@ -362,13 +366,13 @@ pub struct RegisterFile {
     /// with the same eviction, splitting and carrying; only the encodings
     /// that read and write it differ. Empty on a file whose schedules hold no
     /// pointer at all, which every unit-test file is.
-    pub pointers: GprSet,
+    pub(super) pointers: GprSet,
 
     /// AVX-512 mask registers (`k0..k7`) the allocator may hand out as
     /// instruction-scoped scratch: a compare's `vcmpps` destination before it
     /// is widened to a vector mask. Empty on every other backend, which has
     /// no mask-register file at all — masks there are ordinary vectors.
-    pub mask_scratch: MaskSet,
+    pub(super) mask_scratch: MaskSet,
 
     /// The mask-class [`RegisterFile::temps_for`].
     pub mask_temps_for: fn(&ScheduledOp) -> u8,
@@ -551,7 +555,7 @@ impl RegisterFile {
     /// which is exactly what the nest's liveness says and what allocating each
     /// region against the full pool used to ignore.
     #[must_use]
-    pub const fn inside(self, carried: Carried) -> Self {
+    const fn inside(self, carried: Carried) -> Self {
         Self {
             scratch: self.scratch.without(carried.vectors),
             pointers: self.pointers.without(carried.pointers),
@@ -574,7 +578,7 @@ impl RegisterFile {
 /// accumulates: a carry of either class takes a register from that class's
 /// pool in every scope it spans, and the two classes never trade.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Carried {
+struct Carried {
     pub vectors: RegSet,
     pub pointers: GprSet,
 }
@@ -603,7 +607,7 @@ impl Carried {
 /// scope here would be carrying it twice — and a comparison between two
 /// scopes' points is exactly the question a loop nest makes meaningless.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Point {
+pub(super) struct Point {
     /// Position in the scope's schedule.
     pub index: usize,
 }
@@ -631,7 +635,7 @@ impl Point {
 /// (`Allocation::slot_of`). The emitter reads the composition of the two as
 /// [`Loc`](super::Loc).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Where {
+pub(super) enum Where {
     /// In this vector register.
     Reg(Reg),
     /// In this pointer register — a [`Class::Pointer`] value's only kind of
@@ -651,7 +655,7 @@ pub enum Where {
 /// One range of a value's life: from `from` (inclusive) until the next range's
 /// `from` (exclusive), the value lives at `at`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Span {
+pub(super) struct Span {
     /// The program point this range starts at.
     pub from: Point,
     /// Where the value lives over it.
@@ -682,7 +686,7 @@ pub struct Span {
 /// why the `carries` side-channel is gone: it was the half of this answer the
 /// old shape could not hold.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Placement {
+pub(super) struct Placement {
     first: Span,
     rest: Vec<Span>,
 }
@@ -690,7 +694,7 @@ pub struct Placement {
 impl Placement {
     /// A placement that starts at `first` and never changes.
     #[must_use]
-    pub fn new(first: Span) -> Self {
+    fn new(first: Span) -> Self {
         Self {
             first,
             rest: Vec::new(),
@@ -705,7 +709,7 @@ impl Placement {
     /// would make [`Placement::at`] answer with a location the value had
     /// already left.
     #[must_use]
-    pub fn then(mut self, next: Span) -> Self {
+    fn then(mut self, next: Span) -> Self {
         debug_assert!(
             next.from > self.rest.last().unwrap_or(&self.first).from,
             "placement ranges must strictly increase"
@@ -715,6 +719,7 @@ impl Placement {
     }
 
     /// The point this value is defined at — where its first range starts.
+    #[cfg(test)]
     #[must_use]
     pub fn defined_at(&self) -> Point {
         self.first.from
@@ -736,7 +741,7 @@ impl Placement {
     }
 
     /// Every range of this value's life, in order.
-    pub fn spans(&self) -> impl Iterator<Item = Span> + use<'_> {
+    pub(super) fn spans(&self) -> impl Iterator<Item = Span> + use<'_> {
         core::iter::once(self.first).chain(self.rest.iter().copied())
     }
 
@@ -746,24 +751,18 @@ impl Placement {
     }
 
     /// Whether any range of this value's life is in a stack slot.
+    #[cfg(test)]
     #[must_use]
     pub fn spills(&self) -> bool {
         self.locations().any(|at| at == Where::Spilled)
     }
 
     /// Every vector register this value occupies over its life.
+    #[cfg(test)]
     pub fn registers(&self) -> impl Iterator<Item = Reg> + use<'_> {
         self.locations().filter_map(|at| match at {
             Where::Reg(r) => Some(r),
             Where::Ptr(_) | Where::Spilled | Where::Remat(_) => None,
-        })
-    }
-
-    /// Every pointer register this value occupies over its life.
-    pub fn pointers(&self) -> impl Iterator<Item = PtrReg> + use<'_> {
-        self.locations().filter_map(|at| match at {
-            Where::Ptr(p) => Some(p),
-            Where::Reg(_) | Where::Spilled | Where::Remat(_) => None,
         })
     }
 }
@@ -810,7 +809,7 @@ struct ScopeCode {
 /// each other. Reading them positionally out of a shared array is exactly the
 /// convention this replaced.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct Scratch {
+pub(super) struct Scratch {
     /// The encoding's own scratch: a sign mask, a Newton-Raphson correction,
     /// the halves a gather assembles its result from — as many registers as
     /// [`RegisterFile::temps_for`] asked for, and no more.
@@ -1028,7 +1027,7 @@ impl Scratch {
 /// answers are both true, of different scopes, and a nest-wide map has room
 /// for only one of them.
 #[derive(Debug)]
-pub struct NestAllocation {
+pub(super) struct NestAllocation {
     /// The body: what runs once per call.
     body: ScopeCode,
     /// The surviving folds, indexed by [`Scope::Fold`]. Flat storage; the tree
@@ -1089,7 +1088,7 @@ struct FoldScope {
 /// is reserved for either by fiat, so a body's pool is the whole pool minus
 /// what is carried, at any depth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FoldRoots {
+pub(super) struct FoldRoots {
     /// Where the binder lives for the whole of the loop. The loop's trip
     /// test and step read it there, and so does every scope inside that
     /// reads the binder's `Var` — each scope finds that `Var` in its own
@@ -1286,7 +1285,7 @@ impl NestAllocation {
 
     /// How many surviving folds this nest has.
     #[must_use]
-    pub fn fold_count(&self) -> usize {
+    pub(super) fn fold_count(&self) -> usize {
         self.folds.len()
     }
 
@@ -1335,7 +1334,7 @@ impl NestAllocation {
     /// reach the position it opens at (an inconsistency between this nest's
     /// own folds and the schedule that produced them).
     #[must_use]
-    pub fn fold_reduce_vid(&self, j: usize) -> ValueId {
+    pub(super) fn fold_reduce_vid(&self, j: usize) -> ValueId {
         let fold = &self.folds[j];
         self.code(fold.parent)
             .and_then(|c| c.schedule.get(fold.at))
@@ -1353,7 +1352,7 @@ impl NestAllocation {
     /// # Panics
     /// If `j` names no fold in this nest.
     #[must_use]
-    pub fn fold_roots(&self, j: usize) -> FoldRoots {
+    pub(super) fn fold_roots(&self, j: usize) -> FoldRoots {
         self.folds
             .get(j)
             .unwrap_or_else(|| panic!("Fold({j}) is not a fold of this nest"))
@@ -1365,7 +1364,7 @@ impl NestAllocation {
     /// # Panics
     /// If `scope` names a region this nest does not have.
     #[must_use]
-    pub fn scope(&self, scope: Scope) -> Allocation<'_> {
+    pub(super) fn scope(&self, scope: Scope) -> Allocation<'_> {
         assert!(
             self.code(scope).is_some(),
             "{scope:?} is not a scope of this nest"
@@ -1375,7 +1374,7 @@ impl NestAllocation {
 
     /// The body — the whole answer for a loop-free schedule.
     #[must_use]
-    pub fn body(&self) -> Allocation<'_> {
+    pub(super) fn body(&self) -> Allocation<'_> {
         self.scope(Scope::Body)
     }
 
@@ -1430,7 +1429,7 @@ impl NestAllocation {
     ///
     /// `None` for a value no scope parks.
     #[must_use]
-    pub fn carried(&self, root: ValueId) -> Option<Reg> {
+    pub(super) fn carried(&self, root: ValueId) -> Option<Reg> {
         let parking = self
             .scopes()
             .find(|s| self.code(*s).is_some_and(|c| c.roots.contains(&root)))?;
@@ -1460,7 +1459,7 @@ fn dense_len(schedule: &[Def]) -> usize {
 /// The scope is baked in, so callers hand over a *local* schedule index and
 /// cannot name a point in some other scope by accident.
 #[derive(Copy, Clone, Debug)]
-pub struct Allocation<'a> {
+pub(super) struct Allocation<'a> {
     nest: &'a NestAllocation,
     scope: Scope,
 }
@@ -1506,7 +1505,7 @@ impl<'a> Allocation<'a> {
     /// # Panics
     /// If this scope never sees `v`.
     #[must_use]
-    pub fn where_at(&self, v: ValueId, index: usize) -> Where {
+    pub(super) fn where_at(&self, v: ValueId, index: usize) -> Where {
         self.placement(v).at(Point { index })
     }
 
@@ -1519,7 +1518,7 @@ impl<'a> Allocation<'a> {
     /// # Panics
     /// If this scope never sees `v`.
     #[must_use]
-    pub fn at_head(&self, v: ValueId) -> Where {
+    pub(super) fn at_head(&self, v: ValueId) -> Where {
         self.where_at(v, Point::HEAD.index)
     }
 
@@ -1528,7 +1527,7 @@ impl<'a> Allocation<'a> {
     /// # Panics
     /// If this scope never sees `v`.
     #[must_use]
-    pub fn placement(&self, v: ValueId) -> &'a Placement {
+    pub(super) fn placement(&self, v: ValueId) -> &'a Placement {
         self.placement_of(v)
             .unwrap_or_else(|| panic!("{v:?} is not in {:?}", self.scope))
     }
@@ -1540,7 +1539,7 @@ impl<'a> Allocation<'a> {
     /// from inside it — "does the loop within hold this in one register the
     /// whole way", where a value the loop never reads is vacuously fine.
     #[must_use]
-    pub fn placement_of(&self, v: ValueId) -> Option<&'a Placement> {
+    pub(super) fn placement_of(&self, v: ValueId) -> Option<&'a Placement> {
         self.code().placements.get(v.0 as usize)?.as_ref()
     }
 
@@ -1552,7 +1551,7 @@ impl<'a> Allocation<'a> {
     ///
     /// # Panics
     /// If this scope never sees `v`.
-    pub fn transitions(self, v: ValueId) -> impl Iterator<Item = (usize, Where)> + use<'a> {
+    pub(super) fn transitions(self, v: ValueId) -> impl Iterator<Item = (usize, Where)> + use<'a> {
         self.placement(v).spans().map(|s| (s.from.index, s.at))
     }
 
@@ -1562,7 +1561,7 @@ impl<'a> Allocation<'a> {
     /// Only a fold answers: it starts at a def, which is exactly what makes
     /// the nest a tree, so this is the query that distinguishes the two.
     #[must_use]
-    pub fn opens_at(&self) -> Option<(Scope, usize)> {
+    pub(super) fn opens_at(&self) -> Option<(Scope, usize)> {
         match self.scope {
             Scope::Fold(i) => {
                 let fold = &self.nest.folds[i];
@@ -1577,7 +1576,7 @@ impl<'a> Allocation<'a> {
     /// Not a coordinate — see [`Scope`]'s own doc — but the key an emitter
     /// needs to ask [`Allocation::fold_opening_at`] from the right place.
     #[must_use]
-    pub fn scope(&self) -> Scope {
+    pub(super) fn scope(&self) -> Scope {
         self.scope
     }
 
@@ -1589,7 +1588,7 @@ impl<'a> Allocation<'a> {
     /// A linear scan of the nest's folds: there are a handful per kernel at
     /// most, and this is asked once per schedule position during emission.
     #[must_use]
-    pub fn fold_opening_at(&self, at: usize) -> Option<Scope> {
+    pub(super) fn fold_opening_at(&self, at: usize) -> Option<Scope> {
         self.nest
             .folds
             .iter()
@@ -1604,7 +1603,7 @@ impl<'a> Allocation<'a> {
     /// If this scope is not a fold: the body has no binder or accumulator, so
     /// the question has no answer there.
     #[must_use]
-    pub fn fold_roots(&self) -> FoldRoots {
+    pub(super) fn fold_roots(&self) -> FoldRoots {
         match self.scope {
             Scope::Fold(j) => self.nest.fold_roots(j),
             Scope::Body => {
@@ -1623,7 +1622,7 @@ impl<'a> Allocation<'a> {
     /// If `scope` names a scope this nest does not have (see
     /// [`NestAllocation::scope`]).
     #[must_use]
-    pub fn sibling(&self, scope: Scope) -> Self {
+    pub(super) fn sibling(&self, scope: Scope) -> Self {
         self.nest.scope(scope)
     }
 
@@ -1636,7 +1635,7 @@ impl<'a> Allocation<'a> {
     /// each inside the parent and neither inside the other. Answering
     /// "inside" positionally would put a fold's carried value under a
     /// sibling that never runs it.
-    pub fn within(self) -> impl Iterator<Item = Allocation<'a>> + use<'a> {
+    pub(super) fn within(self) -> impl Iterator<Item = Allocation<'a>> + use<'a> {
         let nest = self.nest;
         let me = self.scope;
         nest.scopes()
@@ -1657,7 +1656,7 @@ impl<'a> Allocation<'a> {
     /// Walks up [`NestAllocation::parent_of`]: a scope's ancestors are the
     /// scopes that actually run it.
     #[must_use]
-    pub fn parked_by_an_enclosing_scope(&self, v: ValueId) -> bool {
+    pub(super) fn parked_by_an_enclosing_scope(&self, v: ValueId) -> bool {
         let mut at = self.nest.parent_of(self.scope);
         while let Some(scope) = at {
             if self.nest.code(scope).is_some_and(|c| c.roots.contains(&v)) {
@@ -1745,7 +1744,7 @@ impl<'a> Allocation<'a> {
 /// ([`StackFrame::alloc_slot`]'s limit): the frame is this pass's output, so
 /// a program too large for it is refused here, where the size is known, and
 /// never by a panic.
-pub trait RegisterAllocator {
+pub(super) trait RegisterAllocator {
     /// Place every value in a loop nest.
     ///
     /// This is the whole job, and it is deliberately the *only* method. The
@@ -1806,7 +1805,7 @@ pub trait RegisterAllocator {
 /// coloring does not decide, and this does, is *spill placement*: where a live
 /// range is cut, and where the value comes back.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct LinearScan;
+pub(super) struct LinearScan;
 
 /// Which roots of a nest are carried in registers — the decision every
 /// scope's allocation then follows.
@@ -3585,7 +3584,7 @@ impl LinearScan {
 /// The default for [`RegisterFile::temps_for`]; naming it keeps the field
 /// total, so a new backend states its answer rather than inheriting one.
 #[must_use]
-pub fn no_temps(_op: &ScheduledOp) -> u8 {
+pub(super) fn no_temps(_op: &ScheduledOp) -> u8 {
     0
 }
 

@@ -74,7 +74,7 @@ impl FoldReads {
     ///
     /// If a fold's `ValueId` is not a `Reduce` def of `scope`: a loop opens
     /// where its def is, and nowhere else.
-    pub(crate) fn new<'a>(
+    pub(super) fn new<'a>(
         scope: &[Def],
         folds: impl IntoIterator<Item = (ValueId, &'a [Def], &'a FoldReads)>,
     ) -> Self {
@@ -120,7 +120,7 @@ impl FoldReads {
     /// operands of both register classes — a gather's base pointer is a read
     /// as much as its index is — and, for a `Reduce` that opens a fold here,
     /// what the fold reads.
-    pub(crate) fn reads<'a>(
+    pub(super) fn reads<'a>(
         &'a self,
         value: ValueId,
         op: &'a ScheduledOp,
@@ -145,7 +145,7 @@ impl FoldReads {
 /// loop it opens here ([`FoldReads`]). The summand of an `If` arm's price
 /// and of a fold body's, which are one question: what running these entries
 /// costs.
-pub(crate) fn def_cycles(def: &Def, folds: &FoldReads, cycles: &CostModel) -> usize {
+pub(super) fn def_cycles(def: &Def, folds: &FoldReads, cycles: &CostModel) -> usize {
     match &def.op {
         ScheduledOp::Var(_)
         | ScheduledOp::Lanes(_)
@@ -188,4 +188,4 @@ pub(crate) fn def_cycles(def: &Def, folds: &FoldReads, cycles: &CostModel) -> us
 /// mask (a handful of ops per arm, varying per lane, 3.6x slower with a
 /// guard) and a sphere's silhouette (214 entries, uniformly false in 97% of
 /// batches, 3.2x faster with one).
-pub(crate) const MISPREDICT_PENALTY_CYCLES: usize = 16;
+pub(super) const MISPREDICT_PENALTY_CYCLES: usize = 16;

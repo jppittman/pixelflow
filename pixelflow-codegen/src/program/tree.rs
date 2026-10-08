@@ -14,7 +14,7 @@
 use alloc::vec::Vec;
 
 /// A tree of nodes `0..len()`, rooted at 0.
-pub(crate) struct Tree {
+pub(super) struct Tree {
     parent: Vec<usize>,
     depth: Vec<usize>,
     /// A proper ancestor, chosen so climbs by jumps stay logarithmic.
@@ -23,7 +23,7 @@ pub(crate) struct Tree {
 
 impl Tree {
     /// A tree of the root alone.
-    pub(crate) fn rooted() -> Self {
+    pub(super) fn rooted() -> Self {
         Self {
             parent: alloc::vec![0],
             depth: alloc::vec![0],
@@ -32,7 +32,7 @@ impl Tree {
     }
 
     /// Add a leaf under `parent` and return its number.
-    pub(crate) fn grow(&mut self, parent: usize) -> usize {
+    pub(super) fn grow(&mut self, parent: usize) -> usize {
         let node = self.parent.len();
         let near = self.jump[parent];
         let far = self.jump[near];
@@ -50,22 +50,22 @@ impl Tree {
     }
 
     /// How many nodes there are.
-    pub(crate) fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.parent.len()
     }
 
     /// `node`'s parent; the root's is itself.
-    pub(crate) fn parent(&self, node: usize) -> usize {
+    pub(super) fn parent(&self, node: usize) -> usize {
         self.parent[node]
     }
 
     /// `node`'s distance from the root.
-    pub(crate) fn depth(&self, node: usize) -> usize {
+    pub(super) fn depth(&self, node: usize) -> usize {
         self.depth[node]
     }
 
     /// `node`'s ancestor at `depth`, which must not be deeper than `node`.
-    pub(crate) fn ancestor_at(&self, mut node: usize, depth: usize) -> usize {
+    pub(super) fn ancestor_at(&self, mut node: usize, depth: usize) -> usize {
         while self.depth[node] > depth {
             node = if self.depth[self.jump[node]] >= depth {
                 self.jump[node]
@@ -77,7 +77,7 @@ impl Tree {
     }
 
     /// The deepest node that is an ancestor of both `a` and `b` (or either).
-    pub(crate) fn common_ancestor(&self, a: usize, b: usize) -> usize {
+    pub(super) fn common_ancestor(&self, a: usize, b: usize) -> usize {
         let (mut a, mut b) = match self.depth[a].cmp(&self.depth[b]) {
             core::cmp::Ordering::Greater => (self.ancestor_at(a, self.depth[b]), b),
             core::cmp::Ordering::Less => (a, self.ancestor_at(b, self.depth[a])),

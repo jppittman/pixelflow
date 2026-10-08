@@ -1,7 +1,7 @@
 //! Encoded instruction byte representation for variable-length ISAs (x86-64).
 //!
 //! Architectural limit on x86-64: no instruction can exceed 15 bytes.
-//! [`EncodedInst`] is a 16-byte `Copy` stack struct: 15 payload bytes and a 1-byte length.
+//! `EncodedInst` is a 16-byte `Copy` stack struct: 15 payload bytes and a 1-byte length.
 //! It fits in a single 128-bit register and incurs zero heap allocations.
 
 use alloc::vec::Vec;
@@ -9,9 +9,9 @@ use core::ops::Deref;
 
 /// A stack-allocated encoded instruction (up to 15 bytes).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct EncodedInst {
-    pub bytes: [u8; 15],
-    pub len: u8,
+pub(super) struct EncodedInst {
+    bytes: [u8; 15],
+    len: u8,
 }
 
 impl EncodedInst {
@@ -45,23 +45,6 @@ impl EncodedInst {
         self.len += slice.len() as u8;
     }
 
-    /// Create an encoded instruction from a fixed-size byte array (`N <= 15`).
-    #[must_use]
-    #[inline]
-    pub const fn from_array<const N: usize>(arr: [u8; N]) -> Self {
-        assert!(N <= 15, "x86 instruction cannot exceed 15 bytes");
-        let mut bytes = [0u8; 15];
-        let mut i = 0;
-        while i < N {
-            bytes[i] = arr[i];
-            i += 1;
-        }
-        Self {
-            bytes,
-            len: N as u8,
-        }
-    }
-
     /// Create from a slice (`slice.len() <= 15`).
     #[must_use]
     #[inline]
@@ -80,20 +63,6 @@ impl EncodedInst {
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len as usize]
-    }
-
-    /// Length in bytes.
-    #[must_use]
-    #[inline]
-    pub const fn len(&self) -> usize {
-        self.len as usize
-    }
-
-    /// Whether the instruction is empty.
-    #[must_use]
-    #[inline]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
     }
 }
 

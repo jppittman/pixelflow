@@ -102,7 +102,7 @@ impl Drop for ExecutableCode {
 // =============================================================================
 
 /// The lifecycle of a writable JIT code page transitioning to executable memory.
-pub trait CodePage: Sized {
+trait CodePage: Sized {
     /// Get the system page size for this platform.
     fn page_size() -> usize;
 
@@ -136,14 +136,14 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::MacOsCodePage;
 #[cfg(target_os = "macos")]
-pub type NativeCodePage = macos::MacOsCodePage;
+type NativeCodePage = macos::MacOsCodePage;
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxCodePage;
 #[cfg(target_os = "linux")]
-pub type NativeCodePage = linux::LinuxCodePage;
+type NativeCodePage = linux::LinuxCodePage;
 
 #[cfg(test)]
 mod mock;
@@ -170,7 +170,7 @@ use mock::MockCodePage;
 ///
 /// Every lane of every batch the code computes is stored: the width is the
 /// extent's, and a row's final partial batch stores exactly its remainder.
-pub type KernelFn = extern "C" fn(*const *const f32, *mut f32, usize);
+type KernelFn = extern "C" fn(*const *const f32, *mut f32, usize);
 
 // =============================================================================
 // Tests

@@ -2,9 +2,9 @@
 //!
 //! ## Register allocation
 //!
-//! One allocator — [`regalloc::LinearScan`], linear scan with Belady eviction
+//! One allocator — `regalloc::LinearScan`, linear scan with Belady eviction
 //! and constant rematerialization — parameterised by one description of the
-//! target, [`regalloc::RegisterFile`]. Expressions arrive from e-graph
+//! target, `regalloc::RegisterFile`. Expressions arrive from e-graph
 //! extraction with shared subexpressions, which is why the allocator works on
 //! a DAG schedule rather than a tree.
 //!
@@ -31,13 +31,13 @@
 //!
 //! Values the scratch pool cannot hold go to stack slots. The allocator lays
 //! the whole frame out beside its placements, at the backend's vector stride
-//! ([`regalloc::NestAllocation`]), and the emitter reads every address from
+//! (`regalloc::NestAllocation`), and the emitter reads every address from
 //! it (`regalloc::Allocation::slot_of`) and computes none:
 //! - A value with a slot is stored to it right after its **definition**, which
 //!   every path that reads the value has run — including through an `If`
 //!   guard, which can only skip a definition by skipping every read of it.
 //! - Reloaded into a register the allocator reserved *for that instruction*
-//!   ([`regalloc::Scratch`]); there is no register outside the pool for this,
+//!   (`regalloc::Scratch`); there is no register outside the pool for this,
 //!   and every definition holds a pool register at its own definition.
 //! - `EmitCtx::max_regs` caps the pool below the target's own count, which is
 //!   how register pressure vs. spill tradeoffs are exercised deliberately
@@ -76,7 +76,7 @@ pub mod storage;
 pub mod traffic;
 pub mod x86_64;
 
-pub use encoded::EncodedInst;
+use encoded::EncodedInst;
 pub use storage::{Slot, SourceOperand, StackFrame, Storage, StoreTarget};
 
 use pixelflow_ir::kind::OpKind;
@@ -85,9 +85,9 @@ use pixelflow_ir::kind::OpKind;
 pub use crate::pipeline::{compile, origin};
 pub use crate::program::IfArm;
 use crate::program::IfGuard;
-pub use crate::program::ScheduledOp;
 #[cfg(test)]
-use crate::program::layout::Layout;
+use crate::program::Layout;
+pub use crate::program::ScheduledOp;
 use traffic::{BranchTraffic, Counting, EmitTraffic};
 
 use alloc::vec::Vec;
@@ -119,7 +119,7 @@ pub trait AsmInsn: Copy {
 /// Written as an array or collection of instructions, then assembled into machine code:
 /// ```ignore
 /// AsmProgram::from([
-///     Inst::Mov { src: AX, dst: RX },
+///     Inst::Add { dst: RAX, src: RCX },
 /// ]).assemble(&mut buff);
 /// ```
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -218,7 +218,7 @@ pub fn assemble<I: AsmInsn>(code: &mut Vec<u8>, insts: impl IntoIterator<Item = 
 /// correct.
 ///
 /// A label is the missing name, and it makes a branch an ordinary instruction
-/// again: [`x86_64::Jmp`] and friends *take a `Label`*. Assembling is then two
+/// again: `x86_64::Jmp` and friends *take a `Label`*. Assembling is then two
 /// passes instead of one — lay the items out, then fill in the displacements
 /// that could not be known until the layout was — which is the only thing that
 /// changed.
@@ -732,7 +732,7 @@ pub enum ResolvedOp {
     /// A context pointer: `dst = ctx[slot]`, one `mov`/`ldr` from the
     /// context array the kernel is called with. The definition of every
     /// [`regalloc::Class::Pointer`] value, and the only instruction that
-    /// reads [`regalloc::RegisterFile::gpr_ctx`].
+    /// reads `regalloc::RegisterFile::gpr_ctx`.
     Context { dst: PtrReg, slot: u16 },
     /// The lane fold's binder, materialized: `dst = [0, 1, …, L−1]` as
     /// `f32`s, `L` being the backend's lane count. The one vector constant
@@ -761,7 +761,7 @@ pub enum Reload {
     Const { target: Reg, val_bits: u32 },
     /// Load an address from its stack slot into the pointer register the
     /// allocator reserved for this instruction's base
-    /// ([`regalloc::Scratch::ptr_reload`]).
+    /// (`regalloc::Scratch::ptr_reload`).
     Ptr { target: PtrReg, slot: Slot },
 }
 
@@ -786,7 +786,7 @@ pub struct InstructionPlan {
     /// each holds no live value and is nobody's operand, and all are free again
     /// at the next instruction. An encoding that needs scratch must read this
     /// rather than a `const`, because there is no register reserved for it.
-    pub scratch: regalloc::Scratch,
+    scratch: regalloc::Scratch,
 }
 
 /// Where one operand of an instruction is read from.
@@ -811,7 +811,7 @@ pub enum OperandSource {
     /// tolerates.
     Destination,
     /// Not in a register, and reloaded into the `k`'th register the allocator
-    /// reserved for this instruction ([`regalloc::Scratch::reload`]).
+    /// reserved for this instruction (`regalloc::Scratch::reload`).
     Reload(usize),
 }
 
@@ -923,7 +923,7 @@ pub struct EmitCtx {
     /// Cap on the allocatable scratch pool, or `None` to use the whole thing.
     ///
     /// Only ever *shrinks* the selected backend's own pool (see
-    /// [`regalloc::RegisterFile::capped`]); setting it low is how a caller
+    /// `regalloc::RegisterFile::capped`); setting it low is how a caller
     /// forces spilling deliberately.
     ///
     /// `None` rather than "a number at least as large as every pool": that
@@ -1154,7 +1154,7 @@ pub struct WritePlan {
     pub lanes: u32,
     /// This instruction's reservations: two GPRs for the address, and the
     /// vector or mask temp a backend's remainder store asked for.
-    pub scratch: regalloc::Scratch,
+    scratch: regalloc::Scratch,
 }
 
 /// A guard's question: is this arm dead for the whole batch?
@@ -1191,11 +1191,7 @@ struct MaskTest {
 /// given its table the way a compile gives one.
 #[cfg(test)]
 fn flat_nest(schedule: Vec<regalloc::Def>) -> regalloc::ScopedSchedule {
-    let layout = Layout::of(
-        &schedule,
-        &[],
-        &crate::program::guards::FoldReads::default(),
-    );
+    let layout = Layout::of(&schedule, &[], &crate::program::FoldReads::default());
     regalloc::ScopedSchedule {
         body: regalloc::ScopeRegion {
             roots: Vec::new(),
@@ -2018,7 +2014,7 @@ fn emit_scope<B: IsaBackend>(
 /// If the destination is in a stack slot. A definition writes a register or
 /// nothing at all; a spilled destination was the fixed `reload[0]`, and there
 /// is no such register any more.
-pub fn resolve_operands(
+fn resolve_operands(
     op: &ScheduledOp,
     dst_loc: Binding,
     locs: &[Option<Binding>],
@@ -4370,11 +4366,7 @@ mod tests {
             let mut a = ExprArena::new();
             let (root, _outer, _inner) = nested_guarded_ifs(&mut a);
             let schedule = native_schedule(&a, root, POINT);
-            let layout = Layout::of(
-                &schedule,
-                &[],
-                &crate::program::guards::FoldReads::default(),
-            );
+            let layout = Layout::of(&schedule, &[], &crate::program::FoldReads::default());
             assert!(
                 !layout.is_identity(),
                 "the arms were already runs as written, which this fixture is not"
@@ -5599,7 +5591,7 @@ mod tests {
                 .chunks(4)
                 .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                 .collect();
-            let step = aarch64::table::MAX_ADD_IMM;
+            let step = aarch64::MAX_ADD_IMM;
             let full_adds = PAST_U16_BYTES / step;
             let remainder = PAST_U16_BYTES % step;
             let add = |src: u32, imm: u32| 0x9100_0000 | (imm << 10) | (src << 5) | 16;
@@ -5763,7 +5755,7 @@ mod tests {
                 .chunks(4)
                 .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                 .collect();
-            let step = aarch64::table::MAX_ADD_IMM;
+            let step = aarch64::MAX_ADD_IMM;
             let add_ip0 = 0x9100_0000 | (step << 10) | (16 << 5) | 16;
             let ldr_s_ip0 = |w: u32| (w & !0x1F) == 0xBD40_0000 | (16 << 5);
             assert!(

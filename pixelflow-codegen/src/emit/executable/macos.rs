@@ -55,10 +55,10 @@ impl CodePage for MacOsCodePage {
     }
 
     fn write(&mut self, code: &[u8]) {
-        // `assert!`, not `debug_assert!`: this trait is publicly exported and
-        // its methods are safe, so a downstream caller reaches this
-        // `copy_nonoverlapping` from safe code. A debug-only guard compiles
-        // out of release, where the overrun would write past the mapping.
+        // `assert!`, not `debug_assert!`: this trait's methods are safe, so a
+        // caller reaches this `copy_nonoverlapping` from safe code. A
+        // debug-only guard compiles out of release, where the overrun would
+        // write past the mapping.
         assert!(
             code.len() <= self.capacity,
             "code buffer ({} bytes) exceeds the mapped page ({} bytes)",

@@ -10,7 +10,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use pixelflow_ir::kind::OpKind;
 
-pub mod table;
+mod table;
 pub use table::*;
 
 // =============================================================================
@@ -23,7 +23,7 @@ const WORD_BYTES: usize = 4;
 
 /// Write a 32-bit instruction to the code buffer.
 #[inline]
-pub fn emit32(code: &mut Vec<u8>, inst: u32) {
+fn emit32(code: &mut Vec<u8>, inst: u32) {
     code.extend_from_slice(&inst.to_le_bytes());
 }
 
@@ -37,7 +37,7 @@ pub fn emit32(code: &mut Vec<u8>, inst: u32) {
 /// Compound or fallback instructions (like `LdrQ` with large displacements)
 /// are assembled into code via [`AsmInsn::emit_into`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Inst {
+pub(super) enum Inst {
     // Vector floating-point arithmetic (single instruction)
     Fadd(Reg, Reg, Reg),
     Fsub(Reg, Reg, Reg),
@@ -101,11 +101,6 @@ pub enum Inst {
 impl Inst {
     #[must_use]
     #[inline(always)]
-    pub fn ldr(dst: impl Into<LdrReg>, addr: impl Into<Addr>) -> Self {
-        Self::Ldr(Ldr::new(dst, addr))
-    }
-    #[must_use]
-    #[inline(always)]
     pub fn ldr_q(dst: Reg, addr: Mem) -> Self {
         Self::Ldr(Ldr::q(dst, addr))
     }
@@ -161,11 +156,6 @@ impl Inst {
             dst: dst.into(),
             src: src.into(),
         }
-    }
-    #[must_use]
-    #[inline(always)]
-    pub fn dup_lane0(dst: Reg, src: Reg) -> Self {
-        Self::DupLane0(dst, src)
     }
 
     /// Pure encoding of single-word instructions into a 32-bit machine word.
@@ -535,7 +525,7 @@ pub fn needs_const_pool(val: f32) -> bool {
 /// contributed, which is why [`Assembly::from_code`] keeps no base to
 /// subtract. A displacement cannot tell those two apart. A page can.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct AdrpAdd {
+pub(super) struct AdrpAdd {
     /// Where the address is materialized.
     pub dst: Gpr,
     /// The constant pool's position.
@@ -584,7 +574,7 @@ impl AsmInsn for AdrpAdd {
 
 /// One constant pool entry: the four words of a 128-bit NEON register, lane
 /// 0 first. A splat is the common one; the lattice's iota is the other.
-pub type PoolEntry = [u32; 4];
+type PoolEntry = [u32; 4];
 
 /// Emit a constant pool entry — 16 bytes, lane 0 first.
 pub fn emit_pool_entry(code: &mut Vec<u8>, entry: PoolEntry) {
@@ -2707,7 +2697,7 @@ const CBNZ_W16_OVER_B: u32 =
 /// inside it landed, and this instruction's own size is one of those — so
 /// choosing the short form is branch relaxation, layout iterated to a fixed
 /// point to save four bytes per guard. The pair's size is fixed before a
-/// single byte is laid out, like [`AdrpAdd`]'s, and there is nothing to relax.
+/// single byte is laid out, like `AdrpAdd`'s, and there is nothing to relax.
 ///
 /// W16 rather than a register operand because W16 *is* the branch-test scratch
 /// in this backend's ABI: the guard path reduces a mask into it with

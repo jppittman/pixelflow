@@ -7,12 +7,17 @@
 //! produces and what allocation and emission consume, which is why it lives
 //! under neither.
 
-pub(crate) mod guards;
-pub(crate) mod layout;
-pub(crate) mod lower;
-pub(crate) mod ownership;
+mod guards;
+mod layout;
+mod lower;
+mod ownership;
 mod scopes;
-pub(crate) mod tree;
+mod tree;
+#[cfg(test)]
+pub(crate) use guards::FoldReads;
+#[cfg(test)]
+pub(crate) use layout::Layout;
+pub(crate) use lower::arena_to_schedule;
 #[cfg(test)]
 pub(crate) use scopes::lay_out;
 

@@ -30,7 +30,7 @@ use alloc::vec::Vec;
 /// tier's register file (`avx2::driver::AVX2_FILE`, `avx512::driver::AVX512_FILE`)
 /// keeps its GPR roles clear of it the way they stay clear of the three
 /// arguments.
-pub const POOL_BASE: PtrReg = PtrReg(8);
+const POOL_BASE: PtrReg = PtrReg(8);
 
 /// A kernel's constants, deduplicated, laid out after its `ret`.
 ///
@@ -49,7 +49,7 @@ pub const POOL_BASE: PtrReg = PtrReg(8);
 /// and a store to the red zone followed by a broadcast from it on the wide
 /// ones — a store-forward on the critical path of every constant read.
 #[derive(Default)]
-pub struct ConstPool {
+pub(super) struct ConstPool {
     /// The entries, in pool order.
     entries: Vec<u32>,
     /// Each entry's byte offset, by its bits.
@@ -63,7 +63,7 @@ impl ConstPool {
     /// Always a `disp32`, never a `disp8`: EVEX scales a `disp8` by the
     /// operand's tuple size, VEX does not, and one form for both is worth
     /// three bytes per load.
-    pub fn operand(&mut self, bits: u32) -> Mem<Imm32> {
+    pub(super) fn operand(&mut self, bits: u32) -> Mem<Imm32> {
         let offset = *self.index.entry(bits).or_insert_with(|| {
             let offset = (self.entries.len() * 4) as u32;
             self.entries.push(bits);
@@ -81,7 +81,7 @@ impl ConstPool {
     /// The label is written whether or not there is anything to append: the
     /// anchor names it unconditionally, and `Assembly::finish` panics on a
     /// name nobody wrote.
-    pub fn finish(&self, asm: &mut Assembly) {
+    pub(super) fn finish(&self, asm: &mut Assembly) {
         if !self.entries.is_empty() {
             while !asm.code.len().is_multiple_of(CONST_POOL_ALIGN) {
                 asm.code.push(0);
@@ -99,7 +99,7 @@ impl ConstPool {
 /// `REX.W 8D /r` with the RIP-relative ModRM, the displacement patched once
 /// the label lands. What every x86 tier's [`anchor`] is made of.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct LeaRip {
+struct LeaRip {
     /// Where the address is materialized.
     pub dst: PtrReg,
     /// The position it is the address of.
@@ -129,7 +129,7 @@ impl AsmInsn for LeaRip {
 }
 
 /// Every x86 tier's anchor: `POOL_BASE = &pool`, once, after the frame.
-pub fn anchor(asm: &mut Assembly) {
+pub(super) fn anchor(asm: &mut Assembly) {
     asm.push(LeaRip {
         dst: POOL_BASE,
         target: Label::new(CONST_POOL),
@@ -162,7 +162,7 @@ pub(crate) fn return_to_caller(code: &mut Vec<u8>) {
 
 /// 64-bit pointer load: `mov dst, [base + disp32]`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct MovLoadPtr {
+pub(super) struct MovLoadPtr {
     pub dst: PtrReg,
     pub base: PtrReg,
     pub disp: i32,
@@ -175,7 +175,7 @@ impl MovLoadPtr {
     /// other memory operand here.
     #[must_use]
     #[inline]
-    pub fn encode(self) -> EncodedInst {
+    pub(super) fn encode(self) -> EncodedInst {
         let mut inst = EncodedInst::new();
         inst.push(rex_w(self.dst.as_gpr(), self.base.as_gpr()));
         inst.push(0x8B);
@@ -201,7 +201,7 @@ impl AsmInsn for MovLoadPtr {
 /// `mov [base + disp32], src` — `REX.W 89 /r`: an address to a frame slot,
 /// the pointer class's spill store. [`MovLoadPtr`]'s mirror.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MovStorePtr {
+pub(super) struct MovStorePtr {
     pub src: PtrReg,
     pub base: PtrReg,
     pub disp: i32,
@@ -210,7 +210,7 @@ pub struct MovStorePtr {
 impl MovStorePtr {
     #[must_use]
     #[inline]
-    pub fn encode(self) -> EncodedInst {
+    pub(super) fn encode(self) -> EncodedInst {
         let mut inst = EncodedInst::new();
         inst.push(rex_w(self.src.as_gpr(), self.base.as_gpr()));
         inst.push(0x89);
@@ -234,7 +234,7 @@ impl AsmInsn for MovStorePtr {
 }
 
 /// Bytes per pointer in the context array.
-pub const PTR_BYTES: i32 = 8;
+pub(super) const PTR_BYTES: i32 = 8;
 
 /// The GPRs a broadcast load runs through: the buffer's address, wherever
 /// the allocator keeps that pointer value, and the one index, this
@@ -242,7 +242,7 @@ pub const PTR_BYTES: i32 = 8;
 /// `emit_broadcast_load` truncates lane 0 into the index and reads the
 /// element once, `vbroadcastss [base + index*4]`, into every lane.
 #[derive(Clone, Copy)]
-pub struct BroadcastGprs {
+pub(super) struct BroadcastGprs {
     /// The buffer base pointer.
     pub base: PtrReg,
     /// Receives the truncated index.
@@ -254,7 +254,7 @@ pub struct BroadcastGprs {
 // =============================================================================
 
 /// TEST eax, eax (sets ZF iff eax == 0).
-pub fn emit_test_eax(code: &mut Vec<u8>) {
+pub(super) fn emit_test_eax(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0x85, 0xC0]);
 }
 
@@ -393,14 +393,11 @@ mod label_tests {
 /// The general registers the emitted kernels name. Which is *for* what is
 /// the register file's to say (`avx2::driver::AVX2_FILE`,
 /// `avx512::driver::AVX512_FILE`), not a constant's.
-pub mod gpr {
+pub(super) mod gpr {
     use super::Gpr;
 
     /// Scratch / `movmskps` destination.
     pub const RAX: Gpr = Gpr(0);
-    /// Scratch aliases for RAX.
-    pub const AX: Gpr = RAX;
-    pub const RX: Gpr = RAX;
     /// Scratch; SysV's 4th integer argument, which the kernel ABI does not use.
     pub const RCX: Gpr = Gpr(1);
     /// 3rd integer argument: the pitch.
@@ -414,21 +411,20 @@ pub mod gpr {
     /// The stack pointer.
     pub const RSP: Gpr = Gpr(4);
     /// The extended registers, named for the encoders' tests.
-    pub const R8: Gpr = Gpr(8);
     pub const R9: Gpr = Gpr(9);
     pub const R10: Gpr = Gpr(10);
     pub const R11: Gpr = Gpr(11);
 }
 
 /// SysV argument and scratch pointer registers.
-pub mod ptr {
+pub(super) mod ptr {
     use super::PtrReg;
 
     /// Scratch / base pointer register (`rax`).
+    #[cfg(test)]
     pub const RAX: PtrReg = PtrReg(0);
-    /// Output pointer register (`rsi`).
-    pub const RSI: PtrReg = PtrReg(6);
     /// Context pointer register (`rdi`).
+    #[cfg(test)]
     pub const RDI: PtrReg = PtrReg(7);
     /// Stack pointer register (`rsp`).
     pub const RSP: PtrReg = PtrReg(4);
@@ -436,13 +432,8 @@ pub mod ptr {
 
 /// First-class x86-64 instruction.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Inst {
-    Mov { dst: Gpr, src: Gpr },
-    Xor { dst: Gpr, src: Gpr },
-    Cmp { lhs: Gpr, rhs: Gpr },
-    Inc { dst: Gpr },
+pub(super) enum Inst {
     Add { dst: Gpr, src: Gpr },
-    AddImm8 { dst: Gpr, imm: Imm8 },
     AddImm32 { dst: Gpr, imm: Imm32 },
     SubImm32 { dst: Gpr, imm: Imm32 },
     Vzeroupper,
@@ -494,12 +485,7 @@ impl AsmInsn for Inst {
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
         match self {
-            Inst::Mov { dst, src } => mov(code, dst, src),
-            Inst::Xor { dst, src } => xor(code, dst, src),
-            Inst::Cmp { lhs, rhs } => cmp(code, lhs, rhs),
-            Inst::Inc { dst } => inc(code, dst),
             Inst::Add { dst, src } => add(code, dst, src),
-            Inst::AddImm8 { dst, imm } => add(code, dst, imm),
             Inst::AddImm32 { dst, imm } => add(code, dst, imm),
             Inst::SubImm32 { dst, imm } => sub(code, dst, imm),
             Inst::Vzeroupper => vzeroupper(code),
@@ -514,7 +500,7 @@ impl AsmInsn for Inst {
 
 /// A sign-extended 8-bit immediate.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Imm8(pub i8);
+pub(super) struct Imm8(pub i8);
 
 /// `REX.W` plus the extension bits for a two-register form.
 ///
@@ -539,34 +525,16 @@ fn rr(code: &mut Vec<u8>, opcode: u8, dst: Gpr, src: Gpr) {
 
 /// `mov dst, src`
 #[inline(always)]
-pub fn mov(code: &mut Vec<u8>, dst: Gpr, src: Gpr) {
+pub(super) fn mov(code: &mut Vec<u8>, dst: Gpr, src: Gpr) {
     rr(code, 0x89, dst, src);
-}
-
-/// `xor dst, src` — the idiomatic zeroing form when `dst == src`.
-#[inline(always)]
-pub fn xor(code: &mut Vec<u8>, dst: Gpr, src: Gpr) {
-    rr(code, 0x31, dst, src);
-}
-
-/// `cmp lhs, rhs` — sets the flags a following [`jae`] reads.
-#[inline(always)]
-pub fn cmp(code: &mut Vec<u8>, lhs: Gpr, rhs: Gpr) {
-    rr(code, 0x39, lhs, rhs);
-}
-
-/// `inc dst`
-#[inline(always)]
-pub fn inc(code: &mut Vec<u8>, dst: Gpr) {
-    code.extend_from_slice(&[rex_w(Gpr(0), dst), 0xFF, modrm_rr(0, dst)]);
 }
 
 /// What an [`add`] can add: another register, or a small immediate.
 ///
-/// The operand's *type* picks the encoding, so callers write `add(c, RSI, R8)`
+/// The operand's *type* picks the encoding, so callers write `add(c, RSI, R9)`
 /// and `add(c, RSI, Imm8(16))` rather than choosing between differently-named
 /// functions — which would put the operand kinds back in the name.
-pub trait AddSrc {
+trait AddSrc {
     /// Emit `add dst, self`.
     fn add_into(self, code: &mut Vec<u8>, dst: Gpr);
 }
@@ -587,7 +555,7 @@ impl AddSrc for Imm8 {
 
 /// `add dst, src`
 #[inline(always)]
-pub fn add(code: &mut Vec<u8>, dst: Gpr, src: impl AddSrc) {
+fn add(code: &mut Vec<u8>, dst: Gpr, src: impl AddSrc) {
     src.add_into(code, dst);
 }
 
@@ -598,7 +566,7 @@ pub fn add(code: &mut Vec<u8>, dst: Gpr, src: impl AddSrc) {
 /// Imm32(n))` or `add(c, RSI, Imm8(n))` and the operand type picks; nothing
 /// upstream has to know which opcode that implies.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Imm32(pub i32);
+pub(super) struct Imm32(pub i32);
 
 /// `REX.W 81 /ext id` — the immediate group with a 32-bit operand.
 #[inline(always)]
@@ -616,13 +584,13 @@ impl AddSrc for Imm32 {
 
 /// `sub dst, imm32`
 #[inline(always)]
-pub fn sub(code: &mut Vec<u8>, dst: Gpr, Imm32(imm): Imm32) {
+fn sub(code: &mut Vec<u8>, dst: Gpr, Imm32(imm): Imm32) {
     ri32(code, 5, dst, imm);
 }
 
 /// `ret`
 #[inline(always)]
-pub fn ret(code: &mut Vec<u8>) {
+pub(super) fn ret(code: &mut Vec<u8>) {
     code.push(0xC3);
 }
 
@@ -630,7 +598,7 @@ pub fn ret(code: &mut Vec<u8>) {
 /// registers 0–15, the sixteen a legacy-SSE instruction can name. The same
 /// three bytes on every tier, which is why it lives here.
 #[inline(always)]
-pub fn vzeroupper(code: &mut Vec<u8>) {
+fn vzeroupper(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0xC5, 0xF8, 0x77]);
 }
 
@@ -683,7 +651,7 @@ pub enum Cond {
 /// like any other. It emits a zero displacement; the assembler writes the real
 /// one once the label lands, which is what [`AsmInsn::label_ref`] tells it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Jmp {
+pub(super) struct Jmp {
     /// Where it goes.
     pub target: Label,
 }
@@ -705,7 +673,7 @@ impl AsmInsn for Jmp {
 
 /// `jcc rel32 target` — a conditional branch to a [`Label`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Jcc {
+pub(super) struct Jcc {
     /// What must hold for the branch to be taken.
     pub condition: Cond,
     /// Where it goes.
@@ -722,13 +690,13 @@ impl Jcc {
     /// constant. The mnemonics are the assembler's names for the field.
     #[must_use]
     #[inline(always)]
-    pub const fn je(target: Label) -> Self {
+    pub(super) const fn je(target: Label) -> Self {
         Self::on(Cond::E, target)
     }
     /// `jb` / `jc` / `jnae` — unsigned `<`.
     #[must_use]
     #[inline(always)]
-    pub const fn jb(target: Label) -> Self {
+    pub(super) const fn jb(target: Label) -> Self {
         Self::on(Cond::B, target)
     }
 
@@ -736,7 +704,7 @@ impl Jcc {
     /// names it.
     #[must_use]
     #[inline(always)]
-    pub const fn on(condition: Cond, target: Label) -> Self {
+    const fn on(condition: Cond, target: Label) -> Self {
         Self { condition, target }
     }
 }
@@ -778,7 +746,7 @@ fn patch_rel32(code: &mut [u8], pos: usize, target: usize) {
 
 /// `movabs dst, imm64` — `REX.W B8+rd io`.
 #[inline(always)]
-pub fn movabs(code: &mut Vec<u8>, dst: Gpr, imm: u64) {
+pub(super) fn movabs(code: &mut Vec<u8>, dst: Gpr, imm: u64) {
     code.push(0x48 | ((dst.0 >> 3) & 1));
     code.push(0xB8 | (dst.0 & 7));
     code.extend_from_slice(&imm.to_le_bytes());
@@ -786,7 +754,7 @@ pub fn movabs(code: &mut Vec<u8>, dst: Gpr, imm: u64) {
 
 /// `mov r32, imm32` — `B8+rd id`, zero-extended into the 64-bit register.
 #[inline(always)]
-pub fn mov_imm32(code: &mut Vec<u8>, dst: Gpr, imm: u32) {
+pub(super) fn mov_imm32(code: &mut Vec<u8>, dst: Gpr, imm: u32) {
     if dst.0 >= 8 {
         code.push(0x41);
     }
@@ -796,7 +764,7 @@ pub fn mov_imm32(code: &mut Vec<u8>, dst: Gpr, imm: u32) {
 
 /// `imul dst, src` — `REX.W 0F AF /r`, the two-operand 64-bit multiply.
 #[inline(always)]
-pub fn imul(code: &mut Vec<u8>, dst: Gpr, src: Gpr) {
+fn imul(code: &mut Vec<u8>, dst: Gpr, src: Gpr) {
     code.extend_from_slice(&[rex_w(dst, src), 0x0F, 0xAF, modrm_rr(dst.0, src)]);
 }
 
@@ -806,7 +774,7 @@ pub fn imul(code: &mut Vec<u8>, dst: Gpr, src: Gpr) {
 /// `rbp`/`r13` have no `mod = 00` form as a SIB base (that encoding means
 /// "no base"), so those two take `mod = 01` with a zero `disp8`.
 #[inline(always)]
-pub fn lea_scaled4(code: &mut Vec<u8>, dst: Gpr, base: Gpr, index: Gpr) {
+fn lea_scaled4(code: &mut Vec<u8>, dst: Gpr, base: Gpr, index: Gpr) {
     debug_assert!(index.0 & 7 != RM_SIB, "rsp/r12 cannot index a SIB");
     let rex = 0x48 | (((dst.0 >> 3) & 1) << 2) | (((index.0 >> 3) & 1) << 1) | ((base.0 >> 3) & 1);
     let disp8_form = base.0 & 7 == RM_RIP_AT_MOD0;
@@ -917,7 +885,7 @@ pub(in crate::emit) fn write_address(
 /// operand's TYPE, exactly as [`AddSrc`] picks `83 /0 ib` over `81 /0 id` —
 /// never by the caller reaching for a differently-named function, which is
 /// where that choice used to live.
-pub trait Disp: Copy {
+pub(super) trait Disp: Copy {
     /// The ModRM `mod` field this displacement implies.
     const MOD: u8;
     /// Append the displacement bytes into an `EncodedInst`.
@@ -931,7 +899,7 @@ pub trait Disp: Copy {
 /// RIP-relative, a different address entirely, so those two registers have no
 /// bare `[base]` form and must spell it `Imm8(0)`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct NoDisp;
+pub(super) struct NoDisp;
 
 impl Disp for NoDisp {
     const MOD: u8 = 0x00;
@@ -956,7 +924,7 @@ impl Disp for Imm32 {
 }
 
 /// A register usable as the base of a memory address ([`Mem`]).
-pub trait BaseReg: Copy {
+pub(super) trait BaseReg: Copy {
     fn reg_num(self) -> u8;
 }
 
@@ -980,7 +948,7 @@ impl BaseReg for PtrReg {
 /// the `_rsp` and `_base` suffixes of five separate functions that all encoded
 /// the same `movups`, where nothing could check it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Mem<D, P = PtrReg> {
+pub(super) struct Mem<D, P = PtrReg> {
     /// The register the displacement is measured from.
     pub base: P,
     /// The displacement — and, through its type, the mode (see [`Disp`]).
@@ -1087,17 +1055,8 @@ mod gpr_tests {
     fn encodings_match_the_manual() {
         // REX.W 89 /r — MOV r/m64, r64
         assert_eq!(asm(|c| mov(c, R10, RCX)), [0x49, 0x89, 0xCA]);
-        // REX.W 31 /r — XOR r/m64, r64
-        assert_eq!(asm(|c| xor(c, R11, R11)), [0x4D, 0x31, 0xDB]);
-        assert_eq!(asm(|c| xor(c, R9, R9)), [0x4D, 0x31, 0xC9]);
-        // REX.W 39 /r — CMP r/m64, r64
-        assert_eq!(asm(|c| cmp(c, R11, R10)), [0x4D, 0x39, 0xD3]);
-        assert_eq!(asm(|c| cmp(c, R9, RDX)), [0x49, 0x39, 0xD1]);
-        // REX.W FF /0 — INC r/m64
-        assert_eq!(asm(|c| inc(c, R9)), [0x49, 0xFF, 0xC1]);
-        assert_eq!(asm(|c| inc(c, R11)), [0x49, 0xFF, 0xC3]);
         // REX.W 01 /r — ADD r/m64, r64
-        assert_eq!(asm(|c| add(c, RSI, R8)), [0x4C, 0x01, 0xC6]);
+        assert_eq!(asm(|c| add(c, RSI, R9)), [0x4C, 0x01, 0xCE]);
         // REX.W 83 /0 ib — ADD r/m64, imm8
         assert_eq!(asm(|c| add(c, RSI, Imm8(16))), [0x48, 0x83, 0xC6, 0x10]);
         assert_eq!(asm(|c| add(c, RSI, Imm8(64))), [0x48, 0x83, 0xC6, 0x40]);
@@ -1136,23 +1095,24 @@ mod gpr_tests {
     #[test]
     fn asm_program_declarative_array() {
         let mut buff = Vec::new();
-        AsmProgram::from([Inst::Mov { src: AX, dst: RX }]).assemble(&mut buff);
-        assert_eq!(buff, [0x48, 0x89, 0xC0]);
+        AsmProgram::from([Inst::Add { dst: RAX, src: RCX }]).assemble(&mut buff);
+        assert_eq!(buff, [0x48, 0x01, 0xC8]);
 
         let mut seq = Vec::new();
         AsmProgram::from([
-            Inst::Mov { src: AX, dst: RX },
-            Inst::Xor { dst: R11, src: R11 },
-            Inst::Inc { dst: R9 },
+            Inst::Add { dst: RAX, src: RCX },
+            Inst::SubImm32 {
+                dst: RSP,
+                imm: Imm32(32),
+            },
             Inst::Ret,
         ])
         .assemble(&mut seq);
         assert_eq!(
             seq,
             [
-                0x48, 0x89, 0xC0, // mov rax, rax
-                0x4D, 0x31, 0xDB, // xor r11, r11
-                0x49, 0xFF, 0xC1, // inc r9
+                0x48, 0x01, 0xC8, // add rax, rcx
+                0x48, 0x81, 0xEC, 0x20, 0, 0, 0,    // sub rsp, 32
                 0xC3, // ret
             ]
         );
