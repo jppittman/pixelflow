@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use super::plan::ROOT_FILES;
-use super::{Diagnoses, Diagnosis, Finding, Report};
+use super::{Diagnoses, Diagnosis, Finding, Report, Root};
 use crate::agent::{Ask, Question};
 use crate::language::Language;
 use crate::model::ModelLevel;
@@ -21,6 +21,9 @@ const MIN_RULES: usize = 2;
 const MIN_SYMPTOMS: usize = 3;
 /// A thing is described and diagnosed only if this many symptoms concern it.
 const MIN_SYMPTOMS_PER_THING: usize = 2;
+/// A module's diagnoses are asked for the root beneath them once there are
+/// at least this many.
+const MIN_DIAGNOSES_FOR_ROOT: usize = 2;
 /// The most outline lines the diagnosis is shown of a module: its root
 /// first, then the files with the most symptoms.
 const MAX_SHAPE_LINES: usize = 6000;
@@ -67,6 +70,20 @@ become a type, what would be deleted? And then what follows from that? Keep \
 asking until nothing more falls out, and report the whole chain. Refuse \
 exceptions: a fix that keeps one (\"except this register\", \"except this \
 construct\") is a symptom the diagnosis has not explained yet.";
+
+const ROOTER: &str = "\
+Each diagnosis below explains a cluster of review findings in one module: \
+what one thing in the code is missing or has wrong. Diagnoses are \
+themselves symptoms. Find the deepest model beneath several of them: the \
+thing whose absence or wrong shape makes those diagnoses true at once — a \
+missing phase, a missing type, a wrong boundary — stated as what that thing \
+is. Say which diagnoses it explains, by number, and why each follows from \
+it. Then follow the consequences to closure: with that model in place, what \
+stops being special, what is deleted, and what follows from that, until \
+nothing more falls out. Refuse exceptions: a model that keeps one (\"except \
+this register\", \"except this construct\") has not reached the root. One \
+root, the deepest the evidence supports; if the diagnoses share none, say so \
+and explain none.";
 
 /// One kind of call a diagnosis makes.
 struct Step {
@@ -124,6 +141,22 @@ const DIAGNOSE: Step = Step {
     },
 };
 
+const ROOT: Step = Step {
+    level: ModelLevel::Frontier,
+    system: ROOTER,
+    schema: || {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "root": { "type": "string" },
+                "falls_out": { "type": "string" },
+                "explains": { "type": "array", "items": { "type": "integer" } }
+            },
+            "required": ["root", "falls_out", "explains"]
+        })
+    },
+};
+
 /// One module's symptoms: the findings in it, as indexes into the report.
 struct Cluster {
     component: PathBuf,
@@ -133,6 +166,7 @@ struct Cluster {
 pub(super) async fn diagnose<A: Ask>(agent: &A, report: &Report) -> Result<Diagnoses> {
     let mut diagnoses = Diagnoses::default();
     for cluster in clusters(&report.findings) {
+        let first = diagnoses.diagnoses.len();
         let shape = shape(&cluster, &report.findings)?;
         let symptoms = numbered(&cluster.symptoms, &report.findings);
         let mut session = Session {
@@ -177,6 +211,32 @@ pub(super) async fn diagnose<A: Ask>(agent: &A, report: &Report) -> Result<Diagn
                     ));
                     diagnoses.failures.push(error);
                 }
+            }
+        }
+
+        let found = &diagnoses.diagnoses[first..];
+        if found.len() < MIN_DIAGNOSES_FOR_ROOT {
+            continue;
+        }
+        let rooted = session.root(&cluster, found).await;
+        match rooted {
+            Ok(reply) => {
+                let count = diagnoses.diagnoses.len() - first;
+                diagnoses.roots.push(Root {
+                    component: cluster.component.clone(),
+                    root: reply.root,
+                    falls_out: reply.falls_out,
+                    explains: reply
+                        .explains
+                        .iter()
+                        .filter_map(|n| n.checked_sub(1).filter(|i| *i < count))
+                        .map(|i| first + i)
+                        .collect(),
+                });
+            }
+            Err(error) => {
+                let error = error.context(format!("rooting {}", cluster.component.display()));
+                diagnoses.failures.push(error);
             }
         }
     }
@@ -334,6 +394,14 @@ struct Reply {
     explains: Vec<usize>,
 }
 
+#[derive(Deserialize)]
+struct Rooted {
+    root: String,
+    falls_out: String,
+    /// Diagnosis numbers, from 1, within this module's diagnoses.
+    explains: Vec<usize>,
+}
+
 struct Found {
     denotation: String,
     reply: Reply,
@@ -388,6 +456,29 @@ impl<A: Ask> Session<'_, A> {
             denotation: description,
             reply,
         })
+    }
+
+    /// The model beneath several of a module's `diagnoses`.
+    async fn root(&mut self, cluster: &Cluster, diagnoses: &[Diagnosis]) -> Result<Rooted> {
+        let listed: String = diagnoses
+            .iter()
+            .enumerate()
+            .map(|(n, d)| {
+                format!(
+                    "D{}. {}\nDiagnosis: {}\nWith the thing's shape: {}\n\n",
+                    n + 1,
+                    d.thing,
+                    d.diagnosis,
+                    d.falls_out
+                )
+            })
+            .collect();
+        let prompt = format!(
+            "Module: {}\n\nDiagnoses:\n\n{listed}",
+            cluster.component.display()
+        );
+        let reply = self.ask(&ROOT, &prompt).await?;
+        serde_json::from_str(&reply).with_context(|| format!("reply is not a root: {reply}"))
     }
 
     async fn ask(&mut self, step: &Step, prompt: &str) -> Result<String> {

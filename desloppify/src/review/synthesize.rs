@@ -23,6 +23,8 @@ how many you dropped and why, in one line.\n\
 - Report nothing no reviewer found.\n\
 - Finish with the patterns that recur across files, if any: those are what the \
 author most needs to hear.\n\
+- If roots are given, lead with them: each is the model beneath the \
+diagnoses it explains. Then the diagnoses, then the files.\n\
 - If diagnoses are given, lead with them, before the files: each is the cause \
 of the findings it explains. Say what the thing is, the model the code is \
 missing, and what falls out once the code has the thing's shape; under it, \
@@ -60,6 +62,24 @@ fn brief(rules: &[Rule], report: &Report) -> String {
     }
 
     let mut brief = String::new();
+    if !report.roots.is_empty() {
+        brief.push_str("## Roots\n");
+        for r in &report.roots {
+            let explains: Vec<&str> = r
+                .explains
+                .iter()
+                .filter_map(|&i| report.diagnoses.get(i).map(|d| d.thing.as_str()))
+                .collect();
+            brief.push_str(&format!(
+                "\n### {}\n\nRoot: {}\n\nWhat falls out: {}\n\nExplains the diagnoses of: {}\n",
+                r.component.display(),
+                r.root,
+                r.falls_out,
+                explains.join("; ")
+            ));
+        }
+        brief.push('\n');
+    }
     if !report.diagnoses.is_empty() {
         brief.push_str("## Diagnoses\n");
         for d in &report.diagnoses {

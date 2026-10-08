@@ -38,6 +38,7 @@ enum Kind {
     Identify,
     Describe,
     Diagnose,
+    Root,
     Prose,
 }
 
@@ -61,6 +62,7 @@ fn kind(schema: Option<&serde_json::Value>) -> Kind {
         () if has("things") => Kind::Identify,
         () if has("description") => Kind::Describe,
         () if has("diagnosis") => Kind::Diagnose,
+        () if has("root") => Kind::Root,
         () => panic!("an unknown schema: {schema}"),
     }
 }
@@ -1080,4 +1082,72 @@ async fn the_lead_review_leads_with_the_diagnoses() {
     assert!(brief.contains("a label is a key"), "{brief}");
     assert!(brief.contains("Explains: F1, F3"), "{brief}");
     assert!(brief.contains("- F1 line 1 [first/wrong]: one"), "{brief}");
+}
+
+#[tokio::test]
+async fn several_diagnoses_in_a_module_are_asked_for_the_root_beneath_them() {
+    let (tree, reviewers) = converging("rooted");
+    let report = run(&tree, &["m/mod.rs", "m/a.rs"], &reviewers).await;
+
+    let doctor = Scripted::new(|asked| {
+        Ok(match asked.kind {
+            Kind::Identify => r#"{"things": [
+                {"thing": "an assembler", "context": "c", "symptoms": [1, 2]},
+                {"thing": "a register allocator", "context": "c", "symptoms": [3, 4]}
+            ]}"#
+            .into(),
+            Kind::Describe => r#"{"description": "described"}"#.into(),
+            Kind::Diagnose if asked.prompt.contains("an assembler") => {
+                r#"{"shape": "s", "diagnosis": "labels are names", "falls_out": "f", "explains": [1]}"#.into()
+            }
+            Kind::Diagnose => {
+                r#"{"shape": "s", "diagnosis": "temps are predicted", "falls_out": "f", "explains": [1]}"#.into()
+            }
+            Kind::Root => r#"{"root": "selection is a phase", "falls_out": "the predictions go", "explains": [1, 2, 9]}"#.into(),
+            other => bail!("asked {other:?}"),
+        })
+    });
+    let diagnosed = diagnose(&doctor, &report).await.unwrap();
+    assert!(diagnosed.failures.is_empty(), "{:?}", diagnosed.failures);
+    assert_eq!(diagnosed.diagnoses.len(), 2);
+    assert_eq!(diagnosed.roots.len(), 1);
+    let root = &diagnosed.roots[0];
+    assert_eq!(root.component, tree.path("m"));
+    assert_eq!(root.root, "selection is a phase");
+    // A number past the module's diagnoses names nothing.
+    assert_eq!(root.explains, [0, 1]);
+
+    let asked = doctor.asked();
+    let rooted = asked.iter().find(|a| a.kind == Kind::Root).unwrap();
+    assert_eq!(rooted.level, ModelLevel::Frontier);
+    assert!(
+        rooted
+            .prompt
+            .contains("D1. an assembler\nDiagnosis: labels are names"),
+        "{}",
+        rooted.prompt
+    );
+    assert!(
+        rooted
+            .prompt
+            .contains("D2. a register allocator\nDiagnosis: temps are predicted"),
+        "{}",
+        rooted.prompt
+    );
+    assert_eq!(
+        asked.last().unwrap().kind,
+        Kind::Root,
+        "the root is asked last"
+    );
+}
+
+#[tokio::test]
+async fn one_diagnosis_alone_is_not_asked_for_a_root() {
+    let (tree, reviewers) = converging("one-root");
+    let report = run(&tree, &["m/mod.rs", "m/a.rs"], &reviewers).await;
+    let doctor = Scripted::new(diagnosing);
+    let diagnosed = diagnose(&doctor, &report).await.unwrap();
+    assert_eq!(diagnosed.diagnoses.len(), 1);
+    assert!(diagnosed.roots.is_empty());
+    assert!(doctor.asked().iter().all(|a| a.kind != Kind::Root));
 }
