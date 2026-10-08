@@ -10,12 +10,13 @@
 //!   entry over a record of ten `f32`s — is one canonical key through
 //!   either, with the same value in each uniform slot, so the JIT compiles
 //!   one program for them and they cannot differ in a bit; and
-//! - **as glyphs**: every printable ASCII glyph at 7, 16 and 32 px (the
-//!   plan's B7), composed the way §1.7 says the host composes one — each
-//!   piece one `one_piece` instance, the instances summed into one ink by
-//!   the block's `sum2` as a balanced tree, and the block's
+//! - **as glyphs**: every printable ASCII glyph with ink at 7, 16 and 32 px
+//!   (the plan's B7), composed the way §1.7 says the host composes one —
+//!   each piece one `one_piece` instance, the instances summed into one ink
+//!   by the block's `sum2` as a balanced tree, and the block's
 //!   `glyph(ink, bounds)` over it — draws [`glyph`]'s pixels, to the closed
-//!   form's own error bound. Nothing of the builder is on that path: the
+//!   form's own error bound; the one glyph without ink (space) is pinned by
+//!   name, at every size. Nothing of the builder is on that path: the
 //!   pieces' rows are the font's data ([`pieces`], [`piece_row`]), the box
 //!   is the outline's own ([`Outline::bounds`]), and how far past it
 //!   coverage reaches is the block's `inside`, not the builder's
@@ -42,16 +43,19 @@ use block::{one_piece, Bounds, Row};
 const FONT_DATA: &[u8] = include_bytes!("../../../assets/DejaVuSansMono-Fallback.ttf");
 
 /// The pixel sizes the glyphs are drawn at, each its tile's side: the
-/// smallest the terminal bakes, the atlas's usual, and one where an arc
-/// crosses many texels.
+/// sizes the exact-area ratchet holds every coverage to
+/// (`tests/glyph_exact_area.rs`), so this gate and that one read the same
+/// tiles.
 const SIZES: [usize; 3] = [7, 16, 32];
 
 /// The glyphs: printable ASCII, every one of which the font must have.
 const ASCII: core::ops::RangeInclusive<char> = ' '..='~';
 
-/// The glyphs with no ink: no pieces to compose, so the language side has
-/// nothing to say and the builder's tile must be all zero. Pinned by name,
-/// so a glyph losing its outline is a failure here, not a skipped case.
+/// The glyphs with no ink, at every size: no pieces to compose, so the
+/// language side has nothing to say. Pinned by name and asserted per size,
+/// so a glyph losing its outline at any size is a failure here, not a
+/// skipped case. (The builder's tile is all zero for these by the same
+/// predicate `run` uses, so the name is the pin, not the tile.)
 const EMPTY: [char; 1] = [' '];
 
 /// `row` as the block's record: the columns, in declaration order.
@@ -117,10 +121,10 @@ fn a_piece_is_one_term_through_either_definition() {
     }
 }
 
-/// Every printable ASCII glyph, composed in the language — a `one_piece`
-/// instance per piece, summed by `sum2`, under `glyph`'s box — draws
-/// [`glyph`]'s pixels at 7, 16 and 32 px, to twice the closed form's error
-/// bound, which every coverage is held to against the exact area
+/// Every printable ASCII glyph with ink, composed in the language — a
+/// `one_piece` instance per piece, summed by `sum2`, under `glyph`'s box —
+/// draws [`glyph`]'s pixels at 7, 16 and 32 px, to twice the closed form's
+/// error bound, which every coverage is held to against the exact area
 /// (`tests/glyph_exact_area.rs`). The plan's B7: the equivalence gate the
 /// builder's deletion (Phase C) stands on.
 ///
@@ -141,19 +145,19 @@ fn a_piece_is_one_term_through_either_definition() {
 /// ten in piece order: the entry's own first, then each argument's in
 /// parameter order, which the balanced tree keeps in piece order — the
 /// order a positional binding of the font's block reads (O3 of the plan),
-/// pinned here at every piece count the font has.
+/// pinned here at every piece count printable ASCII has.
 ///
 /// One function, not one test per glyph: each `#[test]` is its own
 /// process under nextest, and the JIT cache is per process, so one sweep
-/// compiles each distinct program once — the builder's per trip-count
-/// bucket, the language's per piece count — where a test per glyph would
-/// saturate every glyph again.
+/// compiles each distinct program once per size — the builder's per
+/// trip-count bucket, the language's per piece count — where a test per
+/// glyph would saturate every glyph again. 57 s in a debug build.
 #[test]
 fn every_ascii_glyph_composed_in_the_language_draws_the_builders_pixels() {
     let font = Font::parse(FONT_DATA).expect("parse font");
-    let mut empties: Vec<char> = Vec::new();
     for size in SIZES {
         let mut spread = 0.0f64;
+        let mut empties: Vec<char> = Vec::new();
         for ch in ASCII {
             let id = font
                 .cmap_lookup(ch)
@@ -178,9 +182,7 @@ fn every_ascii_glyph_composed_in_the_language_draws_the_builders_pixels() {
                     by_the_builder.iter().all(|&v| v == 0.0),
                     "{ch:?} at {size} px has no pieces, yet the builder drew ink"
                 );
-                if size == SIZES[0] {
-                    empties.push(ch);
-                }
+                empties.push(ch);
                 continue;
             };
 
@@ -212,8 +214,8 @@ fn every_ascii_glyph_composed_in_the_language_draws_the_builders_pixels() {
             }
         }
         eprintln!("at {size} px the builder and the language differ by at most {spread:e}");
+        assert_eq!(empties, EMPTY, "the glyphs with no pieces at {size} px");
     }
-    assert_eq!(empties, EMPTY, "the glyphs with no pieces");
 }
 
 /// The closed form's error bound at texel `(i, j)` of a `size`-px tile,
