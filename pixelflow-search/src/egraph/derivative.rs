@@ -122,9 +122,7 @@ mod tests {
         (0..arena.len()).any(|i| {
             matches!(
                 arena.node(ExprId(i as u32)),
-                ExprNode::Unary(OpKind::Dwrt, _)
-                    | ExprNode::Binary(OpKind::Dwrt, _, _)
-                    | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
+                ExprNode::Binary(OpKind::Dwrt, _, _)
             )
         })
     }

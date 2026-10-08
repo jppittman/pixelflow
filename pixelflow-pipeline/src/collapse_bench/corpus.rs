@@ -371,6 +371,18 @@ fn decode(path: &Path) -> CollapseKernel {
             .find(|k| format!("{k:?}") == s)
             .unwrap_or_else(|| panic!("{}: unknown OpKind {s:?}", path.display()))
     };
+    // The arena refuses an op of the wrong arity at construction; refusing it
+    // here names the file instead of the arena.
+    let op_of_arity = |s: &str, arity: usize, what: &str| -> OpKind {
+        let k = op(s);
+        assert_eq!(
+            k.arity(),
+            arity,
+            "{}: {s} is not a {what} op",
+            path.display()
+        );
+        k
+    };
     let id = |s: &str| -> ExprId {
         ExprId(
             s.parse()
@@ -466,9 +478,11 @@ fn decode(path: &Path) -> CollapseKernel {
                 buffer_data.insert(slot, Arc::new(data));
                 continue;
             }
-            ["U", k, a] => arena.push_unary(op(k), id(a)),
-            ["Bi", k, a, b] => arena.push_binary(op(k), id(a), id(b)),
-            ["T", k, a, b, c] => arena.push_ternary(op(k), id(a), id(b), id(c)),
+            ["U", k, a] => arena.push_unary(op_of_arity(k, 1, "unary"), id(a)),
+            ["Bi", k, a, b] => arena.push_binary(op_of_arity(k, 2, "binary"), id(a), id(b)),
+            ["T", k, a, b, c] => {
+                arena.push_ternary(op_of_arity(k, 3, "ternary"), id(a), id(b), id(c))
+            }
             ["N", k, children @ ..] => {
                 let children: Vec<ExprId> = children.iter().map(|c| id(c)).collect();
                 arena.push_nary(op(k), &children)
@@ -748,6 +762,25 @@ mod tests {
         std::fs::write(
             &path,
             format!("{header}\nname stale\nfamily wide\nextent 8 8\nV 0\nroot 0\n"),
+        )
+        .expect("write");
+        let _ = decode(&path);
+    }
+
+    /// A line whose op is not of the arity its tag names is a malformed
+    /// line, refused naming the file, not three stages later in the arena.
+    #[test]
+    #[should_panic(expected = "wrong_arity.txt: Add is not a ternary op")]
+    fn a_ternary_line_naming_a_binary_op_is_refused_naming_the_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "pixelflow-collapse-corpus-arity-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("wrong_arity.txt");
+        std::fs::write(
+            &path,
+            format!("{HEADER}\nname bad\nfamily wide\nextent 8 8\nV 0\nV 1\nT Add 0 1 1\nroot 2\n"),
         )
         .expect("write");
         let _ = decode(&path);

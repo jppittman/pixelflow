@@ -2045,8 +2045,10 @@ fn emit_scope<B: IsaBackend>(
 /// nothing at all; a spilled destination was the fixed `reload[0]`, and there
 /// is no such register any more.
 ///
-/// If a `Ternary` names an op other than `MulAdd` or `If`: lowering emits no
-/// other, so that is a pipeline bug ([`unimplemented_op`]), not a kernel.
+/// If a `Ternary` names an op other than `MulAdd` or `If`: the arena refuses a
+/// ternary node whose op is not ternary when the node is built, `legalize`
+/// lowers every `Gather` to `RawGather`, and lowering forwards nodes unchanged,
+/// so that is a pipeline bug ([`unimplemented_op`]), not a kernel.
 fn resolve_operands(
     op: &ScheduledOp,
     dst_loc: Binding,
