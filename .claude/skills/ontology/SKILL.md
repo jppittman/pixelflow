@@ -14,19 +14,58 @@ is usually a place the definition's consequences were not followed.
 
 ## Label
 
-- **Is:** the name of a position in a program. It denotes a position; the
-  assembler decides the offset.
-- **Is not:** a string; an instruction; a field on an instruction; a handle
-  the assembler mints.
+- **Is:** the name of an address — an abstraction over a position in a
+  program, nothing more. Things *have* labels: a block has one, the constant
+  pool (a data section) has one. A label is minted with the thing that lives
+  at its address, so it always names something and no two things share one.
+- **Is not:** a string; an instruction; a field on an instruction; a sum of
+  the things that can be labelled (`Label::ConstPool | Head(..) | Join(..)`
+  inverts the dependency — the assembler would know codegen's vocabulary, and
+  every new labelled thing would edit the label type); derived from the id of
+  what it names (two sibling folds carry one `ValueId`).
 - **Follows:** an operand can be a label, so a branch is an ordinary
-  instruction whose argument is a label. Binding a label is an item that
-  emits nothing; two labels may name one position. A label is keyed by what it
-  names, so two positions cannot share a key by accident. A loop header is a
-  label, and a block is a label with its instructions.
+  instruction whose argument is a label. The assembler maps labels to
+  addresses and owns nothing else about them. Because the label is born with
+  its block, the code that creates a block holds its label — no map from
+  sites to labels, and no label bound twice or bound nowhere. A loop header is
+  its block's label. A label is a name, so it is `Copy`; it has no public
+  constructor, so it cannot dangle; it is 64-bit, like every id.
 - **Lives:** `emit::Label` — today a 31-byte string built by `format!`, which
-  contradicts this entry. Decided in
-  `docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md` (R0; "A label should
-  be keyed by the node it names").
+  contradicts this entry. History: R0 of
+  `docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md` made a label an
+  item and its reference an operand; "A label should be keyed by the node it
+  names" in the same plan removed the site-to-label map by keying on the
+  node — minting the label with the block removes it without the label
+  knowing about nodes.
+
+## Assembly program
+
+- **Is:** one per kernel: a value made of sections, each a sequence of
+  items — instructions, and label bindings — with the constant pool as a data
+  section. It is the namespace of its labels, and it mints them.
+- **Is not:** a buffer of bytes; split per scope and spliced together (one
+  program, one namespace — a scope is the allocator's concept, not the
+  assembler's).
+- **Follows:** whatever builds the program — instruction selection, then the
+  allocator inserting its own code — builds a value; nothing writes bytes.
+- **Lives:** to be built. Today `emit_scope` assembles each scope into its
+  own `Assembly` and the parent splices the bytes in (`emit/mod.rs`), which
+  contradicts this entry.
+
+## Assembler
+
+- **Is:** a function from an assembly program to binary: lay the sections
+  out, map each label to an address, encode each instruction given the
+  addresses of the labels it names. Here, a very small in-memory one: no
+  object files, no relocations or symbols beyond labels.
+- **Is not:** stateful; a builder; a code buffer other code writes bytes
+  into; aware of registers, values, scopes or the IR.
+- **Follows:** it stands alone — its module imports nothing from the rest of
+  the crate, and everything above it depends on it, never the reverse.
+- **Lives:** `emit::Assembly` (a push/bind/finish builder with a public `code`
+  field the driver writes into) and `AsmProgram` in `emit/mod.rs` — two front
+  ends where the program is the value and `assemble` the function; today's
+  builder contradicts this entry.
 
 ## Operand
 
