@@ -879,7 +879,13 @@ impl UmovW {
     #[must_use]
     #[inline]
     pub(super) fn encode(self) -> u32 {
-        debug_assert!(self.lane < 4);
+        // A lane of 4 carries out of imm5 into bit 21 and encodes a different
+        // instruction. Emission is compile time, so the check costs no render.
+        assert!(
+            self.lane < 4,
+            "UMOV Wd, Vn.S[{}]: a 128-bit register has four 32-bit lanes",
+            self.lane
+        );
         let imm5 = ((self.lane as u32) << 3) | 0b100;
         0x0E00_3C00 | (imm5 << 16) | ((self.src.0 as u32) << 5) | (self.dst.0 as u32)
     }
@@ -969,7 +975,12 @@ impl InsW {
     #[must_use]
     #[inline]
     pub(super) fn encode(self) -> u32 {
-        debug_assert!(self.lane < 4);
+        // As `UmovW::encode`: lane 4 would encode a different instruction.
+        assert!(
+            self.lane < 4,
+            "INS Vd.S[{}], Wn: a 128-bit register has four 32-bit lanes",
+            self.lane
+        );
         let imm5 = ((self.lane as u32) << 3) | 0b100;
         0x4E00_1C00 | (imm5 << 16) | ((self.src.0 as u32) << 5) | (self.dst.0 as u32)
     }

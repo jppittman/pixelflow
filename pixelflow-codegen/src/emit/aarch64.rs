@@ -2204,18 +2204,11 @@ pub(crate) mod driver {
                 via
             }
             Binding::Loc(Loc::Ptr(_)) => unreachable!("a fold's binder is a vector"),
-            // A fold whose binder folded to a constant: the trip count was
-            // one and the allocator rematerialized it. Truncate on the host,
-            // which is what the instruction would have done.
-            Binding::Remat(bits) => {
-                let index = f32::from_bits(bits) as i64 as u64;
-                AsmProgram::from([table::Movz::new(dst, index as u16)]).assemble(code);
-                debug_assert!(
-                    index <= u64::from(u16::MAX),
-                    "a rematerialized index fits movz"
-                );
-                return;
-            }
+            // `emit_scope` hands a rematerialized binder over as its slot, so
+            // the only caller, `emit_write`, never holds a constant here.
+            Binding::Remat(bits) => unreachable!(
+                "a fold's binder is read from a register or a slot, never rematerialized ({bits:#x})"
+            ),
         };
         AsmProgram::from([Inst::FcvtzsX { dst, src: from }]).assemble(code);
     }

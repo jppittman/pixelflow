@@ -750,9 +750,9 @@ fn gather(dst: Reg, base_gpr: u8, index: Reg) -> EncodedInst {
     let idx = index.0;
     let base = base_gpr;
     debug_assert!(d != idx, "vgatherdps: dst and index must differ");
-    debug_assert!(
+    assert!(
         base != 5 && base != 13,
-        "vgatherdps: base must not be rbp/r13"
+        "vgatherdps: base register {base} is rbp/r13, whose mod=00 SIB form means no base"
     );
 
     let r = ((d >> 3) & 1) ^ 1; // dst bit3  -> EVEX.R

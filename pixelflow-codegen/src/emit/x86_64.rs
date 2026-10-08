@@ -844,10 +844,11 @@ pub(in crate::emit) fn index_into(code: &mut Vec<u8>, dst: Gpr, at: Binding, con
         Binding::Loc(Loc::Reg(r)) => (convert.from_xmm)(code, dst, r),
         Binding::Loc(Loc::Slot(slot)) => (convert.from_mem)(code, dst, frame_slot(slot.offset())),
         Binding::Loc(Loc::Ptr(_)) => unreachable!("a fold's binder is a vector"),
-        // A fold whose binder folded to a constant: the trip count was
-        // one and the allocator rematerialized it. Truncate on the host,
-        // which is what the instruction would have done.
-        Binding::Remat(bits) => movabs(code, dst, f32::from_bits(bits) as i64 as u64),
+        // `emit_scope` hands a rematerialized binder over as its slot, so the
+        // only caller, `write_address`, never holds a constant here.
+        Binding::Remat(bits) => unreachable!(
+            "a fold's binder is read from a register or a slot, never rematerialized ({bits:#x})"
+        ),
     }
 }
 
@@ -993,9 +994,9 @@ pub(in crate::emit) fn vsib4_operand_into(inst: &mut EncodedInst, reg: u8, base:
 
 /// The ModRM/SIB bytes both scaled-index forms share.
 fn sib4_tail_into(inst: &mut EncodedInst, reg: u8, base: Gpr, index: u8) {
-    debug_assert!(
+    assert!(
         base.0 & 7 != RM_RIP_AT_MOD0,
-        "[rbp/r13 + index*4] has no mod=00 form: that base means no base"
+        "[{base:?} + index*4] has no mod=00 form: rbp/r13 as a SIB base means no base"
     );
     inst.push(((reg & 7) << 3) | RM_SIB);
     inst.push((0b10 << 6) | ((index & 7) << 3) | (base.0 & 7));

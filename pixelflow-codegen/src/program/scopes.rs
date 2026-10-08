@@ -25,8 +25,17 @@ fn schedule_variance(schedule: &[Def]) -> Vec<pixelflow_ir::variance::Variance> 
         let (vid, op) = (&def.value, &def.op);
         let i = vid.0 as usize;
         v[i] = match op {
-            ScheduledOp::Var(idx) if *idx < Variance::VARIABLES => Variance::from_var(*idx),
-            ScheduledOp::Var(_) => Variance::ALL,
+            // Lowering emits a `Var` only for a binder it found, so an index
+            // past the analysis's bits is a hand-built schedule, which `ALL`
+            // would let through without a name.
+            ScheduledOp::Var(idx) => {
+                assert!(
+                    *idx < Variance::VARIABLES,
+                    "{vid:?} reads Var({idx}), past the {} variables the analysis names",
+                    Variance::VARIABLES
+                );
+                Variance::from_var(*idx)
+            }
             ScheduledOp::Lanes(lane) => Variance::from_var(lane.var()),
             // Invariant across the lattice; unknown until the call. The
             // `CONST` here is what carries it into the per-call scope — a
