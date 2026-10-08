@@ -287,6 +287,23 @@ fn sibling_cases() -> Vec<SiblingRow> {
             sibling_rows::guarded_if_in_fold(),
             REMAINDER_WIDTH,
         ),
+        row("unary_ops_w37", sibling_rows::unary_ops(), REMAINDER_WIDTH),
+        row(
+            "binary_ops_w37",
+            sibling_rows::binary_ops(),
+            REMAINDER_WIDTH,
+        ),
+        row(
+            "shift_muladd_blend_w37",
+            sibling_rows::shift_muladd_blend(),
+            REMAINDER_WIDTH,
+        ),
+        row("memory_w37", sibling_rows::memory(), REMAINDER_WIDTH),
+        row(
+            "deep_frame_w37",
+            sibling_rows::deep_frame(sibling_rows::DEEP_FRAME_TERMS),
+            REMAINDER_WIDTH,
+        ),
     ]
 }
 

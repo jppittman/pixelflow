@@ -6278,10 +6278,17 @@ mod tests {
             rows::parked_roots(rows::PARKED_TERMS)
         }
 
+        fn deep_frame() -> (ExprArena, ExprId) {
+            rows::deep_frame(rows::DEEP_FRAME_TERMS)
+        }
+
         /// The glyph-like fold at the three widths that decide how many
         /// sibling column folds exist (an empty main and a remainder; a main
-        /// alone; both), and each other kernel where both exist.
-        const ROWS: [Row; 6] = [
+        /// alone; both), and each other kernel where both exist. After them,
+        /// the coverage rows: every op the backends owe (`coverage`), every
+        /// way a kernel reads memory, and a frame past what NEON addresses
+        /// directly, all at the width with a remainder.
+        const ROWS: [Row; 11] = [
             Row {
                 name: "glyph_like_w1",
                 build: rows::glyph_like,
@@ -6312,21 +6319,47 @@ mod tests {
                 build: rows::guarded_if_in_fold,
                 width: Width::Remainder,
             },
+            Row {
+                name: "unary_ops_w37",
+                build: rows::unary_ops,
+                width: Width::Remainder,
+            },
+            Row {
+                name: "binary_ops_w37",
+                build: rows::binary_ops,
+                width: Width::Remainder,
+            },
+            Row {
+                name: "shift_muladd_blend_w37",
+                build: rows::shift_muladd_blend,
+                width: Width::Remainder,
+            },
+            Row {
+                name: "memory_w37",
+                build: rows::memory,
+                width: Width::Remainder,
+            },
+            Row {
+                name: "deep_frame_w37",
+                build: deep_frame,
+                width: Width::Remainder,
+            },
         ];
 
         /// A target's emitted code: its length in bytes and the FNV-1a 64
         /// digest of those bytes ([`crate::fnv1a64`]).
         type Bytes = (usize, u64);
 
-        /// `ROWS`' bytes at `28ddbeaf`, per target in [`Target::ALL`]'s order
-        /// (AVX2, AVX-512, aarch64).
+        /// `ROWS`' bytes, per target in [`Target::ALL`]'s order (AVX2,
+        /// AVX-512, aarch64): the first six at `28ddbeaf`, the coverage rows
+        /// after them at `2e490cfe`, where they were first compiled.
         ///
         /// **A refactor does not edit this table; an intentional byte change
         /// does, in a commit of its own that says why.** A commit that edits
         /// it beside other work cannot be told apart from one that moved
         /// bytes by accident, which is the thing it exists to catch. When it
         /// fails, the failure prints the whole recomputed table.
-        const GOLDEN: [[Bytes; 3]; 6] = [
+        const GOLDEN: [[Bytes; 3]; 11] = [
             [
                 (1016, 0x46ec89671d0d59d7),
                 (984, 0x04d391d2df13c4d6),
@@ -6356,6 +6389,31 @@ mod tests {
                 (3012, 0x90101b60330eb1ce),
                 (2932, 0x3943e837c9f115d3),
                 (2144, 0x92246f5ac70b7ef7),
+            ],
+            [
+                (1136, 0xb3294ca012954180),
+                (1120, 0x2a5133484f338421),
+                (704, 0x435919f39c14241c),
+            ],
+            [
+                (932, 0xfa99679abc99f7b8),
+                (1108, 0x9bac855b3070b143),
+                (736, 0xe94f00f62e4f2b4e),
+            ],
+            [
+                (636, 0x140b048db98bf221),
+                (700, 0x18187fcf1e57608f),
+                (432, 0xad9d34cf0f162be5),
+            ],
+            [
+                (500, 0xa8675d79b34a94d3),
+                (596, 0x261da02fa7c98009),
+                (480, 0x4adfc2b1aba3fa1f),
+            ],
+            [
+                (420428, 0x486f93190a3ec20d),
+                (450476, 0x894da10795bcf548),
+                (605648, 0xff316d78ddef246a),
             ],
         ];
 
@@ -6402,7 +6460,7 @@ mod tests {
             }
             assert!(
                 moved.is_empty(),
-                "emitted bytes moved from the table recorded at 28ddbeaf:\n{}\n\n\
+                "emitted bytes moved from GOLDEN:\n{}\n\n\
                  if the change is intentional, re-baseline GOLDEN in its own \
                  commit with:\n{}",
                 moved.join("\n"),

@@ -1355,7 +1355,7 @@ Every commit in this phase is live in production.
   | `binary_ops` | every `REQUIRED_BINARY_OPS` op, with the comparisons consumed by `BitAnd` and `If` |
   | `shift_muladd_blend` | `Shl`, `Shr`, `MulAdd`, an unguarded `If` |
   | `memory` | a lane-varying gather, a lane-uniform broadcast, a uniform at element 0 and one at element 5,000 |
-  | `deep_frame` | `wide_live_range_kernel(n)` from `traffic.rs:815`, with `n` the smallest value whose NEON frame passes 64 KiB, asserted in the test |
+  | `deep_frame` | `deep_frame(n)` in `tests/support/deep_frame.rs` (`traffic.rs`'s `wide_live_range_kernel` is private to its tests and spills 96 bytes at any `n` on NEON), with `n` past the 64 KiB edge: the NEON spill area alone is past `ldr q`'s reach. `tests/deep_frame.rs` compiles it through `compile`, asserting `spill_bytes` and its values against a scalar reference |
 
 - **Bytes:** nothing moves; the rows are new.
 - **Gate:** G.
