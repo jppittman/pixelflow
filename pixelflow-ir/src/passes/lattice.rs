@@ -73,7 +73,7 @@ pub struct Domain {
 ///
 /// # Panics
 ///
-/// - If a `Ref` or a `Dwrt` (any arity) is reachable from
+/// - If a `Ref` or a `Dwrt` (binary or n-ary) is reachable from
 ///   `root`. A `Ref` is a name:
 ///   [`substitute_vars_with`](ExprArena::substitute_vars_with) copies it
 ///   through without reaching the referent's `Var(0)`, so the warp below

@@ -554,18 +554,18 @@ fn read_node_into(
             Ok(arena.push_param(i))
         }
         TAG_UNARY => {
-            let op = read_opkind(r)?;
+            let op = of_arity(read_opkind(r)?, 1)?;
             let a = resolve_child(id_map, r.read_u32()?)?;
             Ok(arena.push_unary(op, a))
         }
         TAG_BINARY => {
-            let op = read_opkind(r)?;
+            let op = of_arity(read_opkind(r)?, 2)?;
             let a = resolve_child(id_map, r.read_u32()?)?;
             let b = resolve_child(id_map, r.read_u32()?)?;
             Ok(arena.push_binary(op, a, b))
         }
         TAG_TERNARY => {
-            let op = read_opkind(r)?;
+            let op = of_arity(read_opkind(r)?, 3)?;
             let a = resolve_child(id_map, r.read_u32()?)?;
             let b = resolve_child(id_map, r.read_u32()?)?;
             let c = resolve_child(id_map, r.read_u32()?)?;
@@ -613,6 +613,19 @@ fn read_opkind(r: &mut Cursor<'_>) -> io::Result<OpKind> {
             format!("no op is encoded by {bytes:?}"),
         )
     })
+}
+
+/// The tag fixed the record's shape; an op of another arity in it is a
+/// malformed file, refused on the reader's own channel before the arena's
+/// assert can see it.
+fn of_arity(op: OpKind, arity: usize) -> io::Result<OpKind> {
+    if op.arity() == arity {
+        return Ok(op);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{op:?} is not an op of arity {arity}"),
+    ))
 }
 
 // ── Minimal cursor for zero-copy reads ───────────────────────────────────────
@@ -711,6 +724,18 @@ mod tests {
         std::env::temp_dir().join(format!("corpus_rt_{name}_{}.bin", std::process::id()))
     }
 
+    #[test]
+    fn a_unary_record_naming_a_binary_op_is_invalid_data() {
+        let mut bytes = vec![TAG_UNARY];
+        bytes.extend_from_slice(&OpKind::Add.marshal().to_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let mut arena = ExprArena::new();
+        let x = arena.push_var(0);
+        let err = read_node_into(&mut Cursor::new(&bytes), &mut arena, &[x])
+            .expect_err("Add is binary; a unary record naming it is malformed");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(arena.len(), 1, "the malformed record entered nothing");
+    }
     #[test]
     fn round_trip_empty() {
         let tmp = unique_tmp("empty");
