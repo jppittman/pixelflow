@@ -206,7 +206,7 @@ impl MvnW {
 
     #[must_use]
     #[inline]
-    pub fn encode(self) -> u32 {
+    pub(super) fn encode(self) -> u32 {
         0x2A20_03E0 | ((self.src.0 as u32 & 0x1F) << 16) | (self.dst.0 as u32 & 0x1F)
     }
 }
@@ -237,7 +237,7 @@ impl<const OPCODE: u32> Binary<OPCODE, Reg, Reg, Reg> {
 
     #[must_use]
     #[inline]
-    pub fn encode(self) -> u32 {
+    pub(super) fn encode(self) -> u32 {
         OPCODE
             | (self.dst.0 as u32 & 0x1F)
             | ((self.lhs.0 as u32 & 0x1F) << 5)
@@ -284,7 +284,7 @@ impl<const OPCODE: u32> Unary<OPCODE, Reg, Reg> {
 
     #[must_use]
     #[inline]
-    pub fn encode(self) -> u32 {
+    pub(super) fn encode(self) -> u32 {
         OPCODE | (self.dst.0 as u32 & 0x1F) | ((self.src.0 as u32 & 0x1F) << 5)
     }
 
@@ -321,7 +321,7 @@ impl<const OPCODE: u32> Reduce<OPCODE, Reg, Reg> {
 
     #[must_use]
     #[inline]
-    pub fn encode(self) -> u32 {
+    pub(super) fn encode(self) -> u32 {
         OPCODE | (self.dst.0 as u32 & 0x1F) | ((self.src.0 as u32 & 0x1F) << 5)
     }
 
@@ -363,7 +363,7 @@ impl Bsl<Reg, Reg, Reg> {
 
     #[must_use]
     #[inline]
-    pub fn encode(self) -> u32 {
+    pub(super) fn encode(self) -> u32 {
         0x6E60_1C00
             | (self.mask.0 as u32 & 0x1F)
             | ((self.if_true.0 as u32 & 0x1F) << 5)
@@ -408,7 +408,7 @@ impl DupLane0 {
 
     #[must_use]
     #[inline]
-    pub fn encode(self) -> u32 {
+    pub(super) fn encode(self) -> u32 {
         0x4E04_0400 | ((self.src.0 as u32) << 5) | (self.dst.0 as u32)
     }
 }
@@ -435,7 +435,7 @@ impl FmovToGp {
 
     #[must_use]
     #[inline]
-    pub fn encode(self) -> u32 {
+    pub(super) fn encode(self) -> u32 {
         0x1E26_0000 | ((self.src.0 as u32) << 5) | 16
     }
 }
@@ -456,7 +456,7 @@ impl Ret {
 
     #[must_use]
     #[inline]
-    pub const fn encode(self) -> u32 {
+    pub(super) const fn encode(self) -> u32 {
         Self::OPCODE
     }
 }
@@ -878,7 +878,7 @@ impl UmovW {
 
     #[must_use]
     #[inline]
-    pub fn encode(self) -> u32 {
+    pub(super) fn encode(self) -> u32 {
         debug_assert!(self.lane < 4);
         let imm5 = ((self.lane as u32) << 3) | 0b100;
         0x0E00_3C00 | (imm5 << 16) | ((self.src.0 as u32) << 5) | (self.dst.0 as u32)
@@ -908,7 +908,7 @@ impl MovX {
 
     #[must_use]
     #[inline]
-    pub fn encode(self) -> u32 {
+    fn encode(self) -> u32 {
         0xAA00_03E0 | ((self.src.0 as u32) << 16) | (self.dst.0 as u32)
     }
 }
@@ -939,7 +939,7 @@ impl FcvtzsX {
 
     #[must_use]
     #[inline]
-    pub fn encode(self) -> u32 {
+    pub(super) fn encode(self) -> u32 {
         0x9E38_0000 | ((self.src.0 as u32) << 5) | (self.dst.0 as u32)
     }
 }
@@ -968,7 +968,7 @@ impl InsW {
 
     #[must_use]
     #[inline]
-    pub fn encode(self) -> u32 {
+    pub(super) fn encode(self) -> u32 {
         debug_assert!(self.lane < 4);
         let imm5 = ((self.lane as u32) << 3) | 0b100;
         0x4E00_1C00 | (imm5 << 16) | ((self.src.0 as u32) << 5) | (self.dst.0 as u32)

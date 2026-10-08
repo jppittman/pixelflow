@@ -5599,7 +5599,7 @@ mod tests {
                 .chunks(4)
                 .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                 .collect();
-            let step = aarch64::table::MAX_ADD_IMM;
+            let step = aarch64::MAX_ADD_IMM;
             let full_adds = PAST_U16_BYTES / step;
             let remainder = PAST_U16_BYTES % step;
             let add = |src: u32, imm: u32| 0x9100_0000 | (imm << 10) | (src << 5) | 16;
@@ -5763,7 +5763,7 @@ mod tests {
                 .chunks(4)
                 .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                 .collect();
-            let step = aarch64::table::MAX_ADD_IMM;
+            let step = aarch64::MAX_ADD_IMM;
             let add_ip0 = 0x9100_0000 | (step << 10) | (16 << 5) | 16;
             let ldr_s_ip0 = |w: u32| (w & !0x1F) == 0xBD40_0000 | (16 << 5);
             assert!(
