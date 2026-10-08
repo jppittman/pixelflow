@@ -39,6 +39,10 @@
 //! - `Uniform` (per-call scalar) reaches `ResolvedOp::Uniform` as a leaf
 //!   definition with no operands — a broadcast load from the block — and is
 //!   pinned byte-for-byte per backend by `tests::uniforms` in `mod.rs`.
+//!
+//! "Absent from every list on purpose" is checked, not asserted: the test at the
+//! foot of this file walks `OpKind::all()` and demands each op sit in exactly
+//! one list above or be named, with its reason, in the test-local `NOT_REQUIRED`.
 
 use pixelflow_ir::kind::OpKind;
 
@@ -84,3 +88,68 @@ pub(crate) const REQUIRED_SHIFT_OPS: &[OpKind] = &[OpKind::Shl, OpKind::Shr];
 /// of them for `MulAdd` alone, since a backend owes both shapes and each
 /// `DeferredReload` spelling of the decomposed one is its own arm.
 pub(crate) const REQUIRED_TERNARY_OPS: &[OpKind] = &[OpKind::MulAdd, OpKind::If];
+
+/// Ops no `REQUIRED_*` list holds, each for the reason beside it. The test
+/// below is the only reader.
+const NOT_REQUIRED: &[OpKind] = &[
+    // Lowered away by `legalize`, so no backend ever sees one: the
+    // transcendentals by `expand_transcendentals`,
+    OpKind::Sin,
+    OpKind::Cos,
+    OpKind::Tan,
+    OpKind::Asin,
+    OpKind::Acos,
+    OpKind::Atan,
+    OpKind::Atan2,
+    OpKind::Exp,
+    OpKind::Exp2,
+    OpKind::Ln,
+    OpKind::Log2,
+    OpKind::Log10,
+    OpKind::Pow,
+    // `Dwrt` by `lower_dwrt`,
+    OpKind::Dwrt,
+    // and `Gather` by `expand_gather`, into index arithmetic plus `RawGather`.
+    OpKind::Gather,
+    // Leaves and memory: each reaches a backend, if at all, as a `ResolvedOp`
+    // of its own shape, pinned by its own test rather than swept.
+    OpKind::Var,       // a binder's placeholder (`Nop`), or the lane iota (`Lanes`)
+    OpKind::Const,     // `LoadConst`
+    OpKind::Buffer,    // `Context`, a base pointer
+    OpKind::Uniform,   // `Uniform`, a broadcast load from the block
+    OpKind::RawGather, // `Gather`, or `Broadcast` when the index is lane-uniform
+    // Never an instruction: handled by the scope walker, or refused outright.
+    OpKind::Reduce, // opens a `Scope::Fold`, a loop
+    OpKind::Seq,    // an effect; emits no bytes
+    OpKind::Tuple,  // `Nary`, which `arena_to_schedule` refuses
+    OpKind::Param,  // a macro-tier slot, refused at scheduling
+];
+
+#[test]
+fn every_op_is_in_exactly_one_required_list_or_named_as_not_required() {
+    let lists: [&[OpKind]; 5] = [
+        REQUIRED_UNARY_OPS,
+        REQUIRED_BINARY_OPS,
+        REQUIRED_SHIFT_OPS,
+        REQUIRED_TERNARY_OPS,
+        NOT_REQUIRED,
+    ];
+
+    let misplaced: Vec<String> = OpKind::all()
+        .filter_map(|op| {
+            let listed: usize = lists
+                .iter()
+                .map(|list| list.iter().filter(|&&listed| listed == op).count())
+                .sum();
+            (listed != 1).then(|| format!("{op:?} is listed {listed} times"))
+        })
+        .collect();
+
+    assert!(
+        misplaced.is_empty(),
+        "every op must be listed exactly once across the four REQUIRED_* lists \
+         and NOT_REQUIRED: {misplaced:?}. A new op the backends must encode \
+         belongs in a REQUIRED_* list; one that never reaches them belongs in \
+         NOT_REQUIRED, with its reason."
+    );
+}
