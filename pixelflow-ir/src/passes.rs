@@ -518,9 +518,9 @@ pub fn lower_dwrt(arena: &mut ExprArena, root: ExprId) -> Result<ExprId, &'stati
             };
             differentiate(arena, m(*expr), var_idx).map(Some)
         }
-        ExprNode::Unary(OpKind::Dwrt, _)
-        | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-        | ExprNode::Nary(OpKind::Dwrt, _) => {
+        // `push_nary` is the one builder that does not check arity, so it is
+        // the one way left to build a `Dwrt` that is not a `Binary`.
+        ExprNode::Nary(OpKind::Dwrt, _) => {
             Err("lower_dwrt: malformed Dwrt node (must be Binary(expr, var))")
         }
         _ => Ok(None),
@@ -541,16 +541,13 @@ pub fn lower_dwrt_owned(
     Ok((owned, new_root))
 }
 
-/// Whether a `Dwrt` of any arity is anywhere in `arena` — the test every
-/// `Dwrt` fast path here makes.
+/// Whether a `Dwrt`, well-formed or not, is anywhere in `arena` — the test
+/// every `Dwrt` fast path here makes.
 fn holds_dwrt(arena: &ExprArena) -> bool {
     arena.nodes().any(|(_, n)| {
         matches!(
             n,
-            ExprNode::Unary(OpKind::Dwrt, _)
-                | ExprNode::Binary(OpKind::Dwrt, _, _)
-                | ExprNode::Ternary(OpKind::Dwrt, _, _, _)
-                | ExprNode::Nary(OpKind::Dwrt, _)
+            ExprNode::Binary(OpKind::Dwrt, _, _) | ExprNode::Nary(OpKind::Dwrt, _)
         )
     })
 }
@@ -1807,35 +1804,34 @@ mod dwrt_tests {
         }
     }
 
+    /// `Dwrt` is `Binary(expr, var)` and nothing else; the arena refuses any
+    /// other arity where the node is built, which is earlier than `lower_dwrt`
+    /// can.
     #[test]
-    fn lower_dwrt_refuses_a_malformed_dwrt_shape() {
-        // `Dwrt` is only well-formed as `Binary(expr, var)`; any other arity
-        // is a malformed node the pass must refuse outright, not silently
-        // reinterpret.
-        const MALFORMED: &str = "lower_dwrt: malformed Dwrt node (must be Binary(expr, var))";
-
+    #[should_panic(expected = "Dwrt is not a unary op")]
+    fn the_arena_refuses_dwrt_as_a_unary_node() {
         let mut a = ExprArena::new();
         let x = a.push_var(0);
-        let root = a.push_unary(OpKind::Dwrt, x);
-        match lower_dwrt_owned(&a, root) {
-            Err(msg) => assert_eq!(msg, MALFORMED),
-            Ok(_) => panic!("expected {MALFORMED:?}"),
-        }
+        a.push_unary(OpKind::Dwrt, x);
+    }
 
+    #[test]
+    #[should_panic(expected = "Dwrt is not a ternary op")]
+    fn the_arena_refuses_dwrt_as_a_ternary_node() {
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
         let z = a.push_const(0.0);
-        let root = a.push_ternary(OpKind::Dwrt, x, y, z);
-        match lower_dwrt_owned(&a, root) {
-            Err(msg) => assert_eq!(msg, MALFORMED),
-            Ok(_) => panic!("expected {MALFORMED:?}"),
-        }
+        a.push_ternary(OpKind::Dwrt, x, y, z);
+    }
 
-        // `Nary` is its own alternative in the malformed-shape matcher, and
-        // `push_nary` can build one — so without this case, removing that
-        // alternative would leave a malformed `Dwrt` reachable while the unary
-        // and ternary assertions above still passed.
+    /// `push_nary` does not check arity, so a `Dwrt` of any child count can
+    /// still be built through it; the pass must refuse it outright, not
+    /// silently reinterpret it.
+    #[test]
+    fn lower_dwrt_refuses_a_malformed_dwrt_shape() {
+        const MALFORMED: &str = "lower_dwrt: malformed Dwrt node (must be Binary(expr, var))";
+
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let y = a.push_var(1);

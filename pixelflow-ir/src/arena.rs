@@ -927,17 +927,32 @@ impl ExprArena {
     }
 
     /// Push a unary operation node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `op` is not a unary op ([`OpKind::arity`] is not 1).
     pub fn push_unary(&mut self, op: OpKind, child: ExprId) -> ExprId {
+        assert_eq!(op.arity(), 1, "{op:?} is not a unary op");
         self.intern(NodeData::Unary(op), &[child])
     }
 
     /// Push a binary operation node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `op` is not a binary op ([`OpKind::arity`] is not 2).
     pub fn push_binary(&mut self, op: OpKind, a: ExprId, b: ExprId) -> ExprId {
+        assert_eq!(op.arity(), 2, "{op:?} is not a binary op");
         self.intern(NodeData::Binary(op), &[a, b])
     }
 
     /// Push a ternary operation node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `op` is not a ternary op ([`OpKind::arity`] is not 3).
     pub fn push_ternary(&mut self, op: OpKind, a: ExprId, b: ExprId, c: ExprId) -> ExprId {
+        assert_eq!(op.arity(), 3, "{op:?} is not a ternary op");
         self.intern(NodeData::Ternary(op), &[a, b, c])
     }
 

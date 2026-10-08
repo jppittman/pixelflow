@@ -1312,36 +1312,18 @@ mod gpr_tests {
         );
     }
 
-    /// The pool's entry `k` is at byte `4k`, so entry 2^29 is the first a
-    /// signed `disp32` cannot hold. It is refused the way `block_element`
-    /// refuses a uniform, not wrapped into an address below the pool. A
-    /// kernel with 2^29 distinct constants is not buildable, so the pool is
-    /// handed that many entries directly; `vec![0; n]` is a zeroed
-    /// allocation whose pages are never touched.
+    /// A constant is entered once, at the next four-byte slot, and read again
+    /// from where it first went. Where the slots run out is
+    /// `an_offset_past_the_displacement_is_refused_on_every_backend`'s: this
+    /// pool's operand is the same `block_element`.
     #[test]
-    fn a_pool_past_the_disp32_is_refused_not_wrapped() {
-        const LAST_FITTING: usize = (1 << 29) - 1;
-        let mut pool = ConstPool {
-            entries: vec![0; LAST_FITTING],
-            index: BTreeMap::new(),
-        };
-        let last = pool.operand(1).expect("entry 2^29 - 1 is at byte 2^31 - 4");
-        assert_eq!(last.disp, Imm32(i32::MAX - 3));
-
-        assert!(
-            matches!(pool.operand(2), Err(CompileError::BudgetExceeded(_))),
-            "entry 2^29 is at byte 2^31, past a signed disp32"
-        );
-        assert_eq!(
-            pool.entries.len(),
-            LAST_FITTING + 1,
-            "a refused constant is not entered"
-        );
-        assert_eq!(
-            pool.operand(1)
-                .expect("an entered constant keeps its place"),
-            last
-        );
+    fn a_constant_is_entered_once_at_four_bytes_a_slot() {
+        let (a, b) = (1.0f32.to_bits(), 2.0f32.to_bits());
+        let mut pool = ConstPool::default();
+        let mut disp = |bits| pool.operand(bits).expect("two entries fit a disp32").disp;
+        let (first, second, again) = (disp(a), disp(b), disp(a));
+        assert_eq!((first, second, again), (Imm32(0), Imm32(4), Imm32(0)));
+        assert_eq!(pool.entries, [a, b], "the repeat is not entered again");
     }
 
     /// `Gpr` and `Reg` name different files; the same index is a different
