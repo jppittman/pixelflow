@@ -11,6 +11,7 @@
 //! call read every finding and write the review a person reads. Each model
 //! call sees one rule and a little code, so none forgets a rule.
 
+mod diagnose;
 mod plan;
 mod reply;
 mod run;
@@ -91,6 +92,43 @@ pub struct Report {
     /// Units each rule's question went to the model for, because System One
     /// did not answer it confidently.
     pub escalated: BTreeMap<String, u64>,
+    /// What the findings are symptoms of, once [`diagnose`] has been asked;
+    /// [`synthesize`] leads with these.
+    pub diagnoses: Vec<Diagnosis>,
+}
+
+/// What a cluster of findings in one module is a symptom of.
+#[derive(Debug, Clone)]
+pub struct Diagnosis {
+    /// The module the symptoms are in.
+    pub component: PathBuf,
+    /// What the code is, in its domain's words: "an assembler".
+    pub thing: String,
+    /// The thing described from first principles, by a call that never saw
+    /// the code.
+    pub denotation: String,
+    /// The description's parts and behaviours mapped onto the code: where
+    /// each is — a type, a function, a convention, nowhere — and what the
+    /// code has that the description does not.
+    pub shape: String,
+    /// The model of the thing that the code is missing or has wrong.
+    pub diagnosis: String,
+    /// The code with the thing's shape: what becomes a type, what is
+    /// deleted, what falls out.
+    pub falls_out: String,
+    /// The findings it explains, as indexes into [`Report::findings`].
+    pub explains: Vec<usize>,
+}
+
+/// What [`diagnose`] produced.
+#[derive(Default)]
+pub struct Diagnoses {
+    pub diagnoses: Vec<Diagnosis>,
+    /// One per module or thing whose call failed or whose reply did not
+    /// match its schema; the others still count.
+    pub failures: Vec<anyhow::Error>,
+    /// Tokens every diagnosis call used.
+    pub usage: Usage,
 }
 
 /// Every call a review of `files` under `rules` makes, in file order. Rules
@@ -123,6 +161,35 @@ pub async fn review<A: Ask, D: Decide>(
     plan: Vec<Call>,
 ) -> Result<Report> {
     run::review(reviewers, rules, plan).await
+}
+
+/// What the findings are symptoms of: from symptom to diagnosis.
+///
+/// A module whose findings converge — at least three, from at least two
+/// rules — is diagnosed in three steps:
+///
+/// 1. One call at [`ModelLevel::Strong`](crate::model::ModelLevel::Strong),
+///    shown the symptoms and the module's outline, names the things they
+///    are about in their domain's words — "an assembler" — each with the
+///    symptoms that concern it.
+/// 2. For each thing at least two symptoms concern, one call at
+///    [`ModelLevel::Frontier`](crate::model::ModelLevel::Frontier) describes
+///    it from first principles: what it is, its parts, what it does, how it
+///    behaves. It is shown only the thing's name and context, never the
+///    code, so it cannot borrow the code's model of itself.
+/// 3. One more frontier call translates that description's shape onto the
+///    code's — where each part is, or that it is nowhere — and states the
+///    diagnosis: the model the code is missing, the symptoms it explains,
+///    and what falls out once the code has the thing's shape.
+///
+/// Every reply is held to a schema. A failed step is a failure in the
+/// result and stops only its own module or thing.
+///
+/// # Errors
+///
+/// A module's files cannot be read or parsed.
+pub async fn diagnose<A: Ask>(agent: &A, report: &Report) -> Result<Diagnoses> {
+    diagnose::diagnose(agent, report).await
 }
 
 /// The review a person reads, written by one call at

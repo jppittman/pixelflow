@@ -11,7 +11,7 @@ use crate::rule::{Group, Part, Rule, Surroundings, Unit};
 use crate::snippet::{Snippet, outline, snippets};
 
 /// File names that make a file its directory's module root.
-const ROOT_FILES: [&str; 3] = ["mod.rs", "lib.rs", "main.rs"];
+pub(super) const ROOT_FILES: [&str; 3] = ["mod.rs", "lib.rs", "main.rs"];
 
 /// What makes two rules' calls about a file the same calls.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

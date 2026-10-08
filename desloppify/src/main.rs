@@ -11,7 +11,7 @@ use desloppify::agent::{self, Ask, Usage};
 use desloppify::decide::{self, Decide};
 use desloppify::model::Provider;
 use desloppify::rate_limit::{self, AdaptiveConfig, RateLimiter, SystemClock, TokenBucketConfig};
-use desloppify::review::{Call, Report, Reviewers, plan, review, synthesize};
+use desloppify::review::{Call, Report, Reviewers, diagnose, plan, review, synthesize};
 use desloppify::rule::{self, Rule};
 use desloppify::skills;
 
@@ -156,7 +156,10 @@ async fn run<A: Ask, D: Decide>(
         decide,
         min_confidence: args.min_confidence,
     });
-    let report = review(reviewers.clone(), rules.clone(), plan).await?;
+    let mut report = review(reviewers.clone(), rules.clone(), plan).await?;
+    let diagnosed = diagnose(&reviewers.ask, &report).await?;
+    report.diagnoses = diagnosed.diagnoses;
+    report.failures.extend(diagnosed.failures);
     for failure in &report.failures {
         eprintln!("error: {failure:#}");
     }
@@ -170,7 +173,11 @@ async fn run<A: Ask, D: Decide>(
         None => print_findings(&report),
     }
     print_decisions(&rules, &report);
-    print_usage(&rules, &report, lead.map(|l| l.usage));
+    let after = After {
+        diagnosis: diagnosed.usage,
+        lead: lead.map(|l| l.usage),
+    };
+    print_usage(&rules, &report, &after);
     let clean = report.findings.is_empty() && report.failures.is_empty();
     Ok(if clean {
         ExitCode::SUCCESS
@@ -198,7 +205,13 @@ fn print_decisions(rules: &[Rule], report: &Report) {
 
 /// Calls and tokens per rule — model calls, at its decide and explain
 /// levels — then System One's and the lead's, to stderr.
-fn print_usage(rules: &[Rule], report: &Report, lead: Option<Usage>) {
+/// What the calls after the rules' own cost.
+struct After {
+    diagnosis: Usage,
+    lead: Option<Usage>,
+}
+
+fn print_usage(rules: &[Rule], report: &Report, after: &After) {
     let row = |usage: &Usage, levels: &str, name: &str| {
         eprintln!(
             "{:>8}  {:>12}  {:>10}  {levels:>6}  {name}",
@@ -224,11 +237,14 @@ fn print_usage(rules: &[Rule], report: &Report, lead: Option<Usage>) {
     }
     row(&total, "", "(model total)");
     row(&report.system_one, "", "(system one)");
-    if let Some(lead) = lead {
+    row(&after.diagnosis, "3→4", "(diagnosis)");
+    if let Some(lead) = after.lead {
         row(&lead, "4", "(lead review)");
     }
 }
 
+/// Each finding as `path:line: [rule/outcome] message`, then each diagnosis
+/// in Markdown.
 fn print_findings(report: &Report) {
     for f in &report.findings {
         println!(
@@ -238,6 +254,26 @@ fn print_findings(report: &Report) {
             f.rule,
             f.outcome,
             f.message
+        );
+    }
+    for d in &report.diagnoses {
+        let explains: Vec<String> = d
+            .explains
+            .iter()
+            .map(|&i| {
+                let f = &report.findings[i];
+                format!("{}:{}", f.path.display(), f.line)
+            })
+            .collect();
+        println!(
+            "\n## {} — {}\n\n**Diagnosis.** {}\n\n**The thing, from first principles.** {}\n\n**Its shape in the code.** {}\n\n**With the thing's shape.** {}\n\n**Explains:** {}",
+            d.thing,
+            d.component.display(),
+            d.diagnosis,
+            d.denotation,
+            d.shape,
+            d.falls_out,
+            explains.join(", ")
         );
     }
 }

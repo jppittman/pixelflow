@@ -31,9 +31,21 @@ TYPESAFE_API_KEY=...  cargo run -p desloppify -- --system-one jev path/to/src  #
 4. **Explain.** A unit decided as one of the rule's `violations` goes to a
    model at `levels.explain`, told the question and the outcome, which reports
    findings: line, what, and the fix.
-5. **Lead review.** One level-4 call reads every finding and writes the
-   review: grouped by file, duplicates across rules merged, trivial or
-   mistaken findings dropped and counted, recurring patterns called out.
+5. **Diagnose.** Findings are symptoms. Where they converge on a module —
+   at least three, from at least two rules — the review asks what they are
+   symptoms *of*, the way a person would: what is this thing, how does it
+   work, what does it do, how does it behave? One level-3 call names the
+   thing in its domain's words ("an assembler"). One level-4 call describes
+   it from first principles and is never shown the code, so it cannot borrow
+   the code's model of itself. A last level-4 call translates that
+   description's shape onto the code's outline — where each part is, or that
+   it is nowhere — and states the diagnosis: the model the code is missing,
+   the symptoms it explains, and what falls out once the code has the
+   thing's shape.
+6. **Lead review.** One level-4 call reads every finding and writes the
+   review, leading with the diagnoses: grouped by file, duplicates across
+   rules merged, trivial or mistaken findings dropped and counted, recurring
+   patterns called out.
    `--findings-only` prints the raw findings instead, one
    `path:line: [rule/outcome] message` per line.
 

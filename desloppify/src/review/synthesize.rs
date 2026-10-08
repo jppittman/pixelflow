@@ -22,7 +22,12 @@ how many you dropped and why, in one line.\n\
 - For each item kept: `path:line`, what is wrong, the rule(s), and the fix.\n\
 - Report nothing no reviewer found.\n\
 - Finish with the patterns that recur across files, if any: those are what the \
-author most needs to hear.";
+author most needs to hear.\n\
+- If diagnoses are given, lead with them, before the files: each is the cause \
+of the findings it explains. Say what the thing is, the model the code is \
+missing, and what falls out once the code has the thing's shape; under it, \
+list the findings it explains by `path:line`, briefly, and do not repeat them \
+in the file sections.";
 
 pub(super) async fn synthesize<A: Ask>(
     agent: &A,
@@ -42,14 +47,37 @@ pub(super) async fn synthesize<A: Ask>(
     agent.ask(&question).await.map(Some)
 }
 
-/// The rules that found something, then the findings by file.
+/// The diagnoses, the rules that found something, then the findings by
+/// file, each numbered `F1`… in report order so a diagnosis can name the
+/// ones it explains.
 fn brief(rules: &[Rule], report: &Report) -> String {
-    let mut by_file: BTreeMap<&PathBuf, Vec<&Finding>> = BTreeMap::new();
-    for finding in &report.findings {
-        by_file.entry(&finding.path).or_default().push(finding);
+    let mut by_file: BTreeMap<&PathBuf, Vec<(usize, &Finding)>> = BTreeMap::new();
+    for (index, finding) in report.findings.iter().enumerate() {
+        by_file
+            .entry(&finding.path)
+            .or_default()
+            .push((index, finding));
     }
 
-    let mut brief = String::from("## Rules\n\n");
+    let mut brief = String::new();
+    if !report.diagnoses.is_empty() {
+        brief.push_str("## Diagnoses\n");
+        for d in &report.diagnoses {
+            let explains: Vec<String> = d.explains.iter().map(|i| format!("F{}", i + 1)).collect();
+            brief.push_str(&format!(
+                "\n### {} — {}\n\nDiagnosis: {}\n\nThe thing, from first principles:\n{}\n\nIts shape in the code: {}\n\nWith the thing's shape: {}\n\nExplains: {}\n",
+                d.thing,
+                d.component.display(),
+                d.diagnosis,
+                d.denotation,
+                d.shape,
+                d.falls_out,
+                explains.join(", ")
+            ));
+        }
+        brief.push('\n');
+    }
+    brief.push_str("## Rules\n\n");
     for rule in rules
         .iter()
         .filter(|r| report.findings.iter().any(|f| f.rule == r.id))
@@ -67,10 +95,14 @@ fn brief(rules: &[Rule], report: &Report) -> String {
     brief.push_str("\n## Findings\n");
     for (path, findings) in by_file {
         brief.push_str(&format!("\n### {}\n\n", path.display()));
-        for f in findings {
+        for (index, f) in findings {
             brief.push_str(&format!(
-                "- line {} [{}/{}]: {}\n",
-                f.line, f.rule, f.outcome, f.message
+                "- F{} line {} [{}/{}]: {}\n",
+                index + 1,
+                f.line,
+                f.rule,
+                f.outcome,
+                f.message
             ));
         }
     }

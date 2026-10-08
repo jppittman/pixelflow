@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 use desloppify::agent::{self, Answer, Ask, Question, Usage};
 use desloppify::decide::{self, Choice, Decide, Decided, Decisions};
 use desloppify::model::ModelLevel;
-use desloppify::review::{Report, Reviewers, plan, review, synthesize};
+use desloppify::review::{Diagnosis, Report, Reviewers, diagnose, plan, review, synthesize};
 use desloppify::rule::{self, Rule};
 use desloppify::skills;
 
@@ -35,6 +35,9 @@ const MIN_CONFIDENCE: f64 = 0.7;
 enum Kind {
     Decide,
     Explain,
+    Identify,
+    Describe,
+    Diagnose,
     Prose,
 }
 
@@ -51,11 +54,15 @@ fn kind(schema: Option<&serde_json::Value>) -> Kind {
     let Some(schema) = schema else {
         return Kind::Prose;
     };
-    if schema["properties"].get("outcome").is_some() {
-        return Kind::Decide;
+    let has = |property: &str| schema["properties"].get(property).is_some();
+    match () {
+        () if has("outcome") => Kind::Decide,
+        () if has("findings") => Kind::Explain,
+        () if has("things") => Kind::Identify,
+        () if has("description") => Kind::Describe,
+        () if has("diagnosis") => Kind::Diagnose,
+        () => panic!("an unknown schema: {schema}"),
     }
-    assert!(schema["properties"].get("findings").is_some(), "{schema}");
-    Kind::Explain
 }
 
 /// Answers every model call with `reply(asked)`, recording what it was
@@ -209,9 +216,7 @@ const UNSURE: &str = r#"{"outcome": "unsure"}"#;
 fn wrong_on_line_one(asked: &Asked) -> Result<String> {
     Ok(match asked.kind {
         Kind::Decide => WRONG.into(),
-        Kind::Explain | Kind::Prose => {
-            r#"{"findings": [{"outcome": "wrong", "line": 1, "message": "needs work"}]}"#.into()
-        }
+        _ => r#"{"findings": [{"outcome": "wrong", "line": 1, "message": "needs work"}]}"#.into(),
     })
 }
 
@@ -768,7 +773,7 @@ async fn the_lead_review_is_one_frontier_call_over_every_finding_with_its_rule()
     assert!(!brief.contains("Nothing is wrong."), "{brief}");
     assert!(brief.contains("a.rs") && brief.contains("b.rs"), "{brief}");
     assert!(
-        brief.contains("- line 1 [everything/wrong]: needs work"),
+        brief.contains("line 1 [everything/wrong]: needs work"),
         "{brief}"
     );
 }
@@ -895,4 +900,184 @@ async fn a_dry_run_decides_every_unit_by_its_first_outcome_and_prices_it_by_its_
     );
     assert_eq!((report.system_one.calls, report.system_one.output), (2, 0));
     assert!(report.system_one.input > 0);
+}
+
+/// Two rules that each find two places wrong in every file: symptoms that
+/// converge on a module from two angles.
+fn converging(name: &str) -> (Tree, Arc<Reviewers<Scripted, impl Decide>>) {
+    let tree = Tree::new(
+        name,
+        &[("first", EVERYTHING), ("second", EVERYTHING)],
+        &[
+            ("m/mod.rs", "mod a;\npub fn distinctive_root() {}\n"),
+            ("m/a.rs", "pub fn distinctive_leaf() {\n    body();\n}\n"),
+        ],
+    );
+    let reviewers = reviewers(
+        Scripted::new(|asked| {
+            Ok(match asked.kind {
+                Kind::Decide => WRONG.into(),
+                _ => r#"{"findings": [{"outcome": "wrong", "line": 1, "message": "one"}, {"outcome": "wrong", "line": 2, "message": "two"}]}"#.into(),
+            })
+        }),
+        decide::none(),
+    );
+    (tree, reviewers)
+}
+
+/// Names an assembler from symptoms 1-3, describes it, and diagnoses it as
+/// explaining symptoms 1 and 3.
+fn diagnosing(asked: &Asked) -> Result<String> {
+    Ok(match asked.kind {
+        Kind::Identify => r#"{"things": [{"thing": "an assembler", "context": "in a JIT", "symptoms": [1, 2, 3]}]}"#.into(),
+        Kind::Describe => r#"{"description": "An assembler turns labelled items into bytes."}"#.into(),
+        Kind::Diagnose => r#"{"shape": "labels are strings", "diagnosis": "a label is a key", "falls_out": "the names go", "explains": [1, 3]}"#.into(),
+        other => bail!("not a diagnosis call: {other:?}"),
+    })
+}
+
+#[tokio::test]
+async fn converging_symptoms_are_named_described_without_the_code_and_diagnosed() {
+    let (tree, reviewers) = converging("diagnosed");
+    let report = run(&tree, &["m/mod.rs", "m/a.rs"], &reviewers).await;
+    assert_eq!(report.findings.len(), 8);
+
+    let doctor = Scripted::new(diagnosing);
+    let diagnosed = diagnose(&doctor, &report).await.unwrap();
+    assert!(diagnosed.failures.is_empty());
+    assert_eq!(diagnosed.diagnoses.len(), 1);
+    let d = &diagnosed.diagnoses[0];
+    assert_eq!(d.component, tree.path("m"));
+    assert_eq!(d.thing, "an assembler");
+    assert_eq!(
+        d.denotation,
+        "An assembler turns labelled items into bytes."
+    );
+    assert_eq!(
+        (d.diagnosis.as_str(), d.falls_out.as_str()),
+        ("a label is a key", "the names go")
+    );
+    // Symptoms 1 and 3 of the thing's own three are the module's first and
+    // third findings, which are the report's.
+    assert_eq!(d.explains, [0, 2]);
+    assert_eq!(diagnosed.usage.calls, 3);
+
+    let asked = doctor.asked();
+    let steps: Vec<_> = asked.iter().map(|a| (a.kind, a.level)).collect();
+    assert_eq!(
+        steps,
+        [
+            (Kind::Identify, ModelLevel::Strong),
+            (Kind::Describe, ModelLevel::Frontier),
+            (Kind::Diagnose, ModelLevel::Frontier),
+        ]
+    );
+    for code in ["distinctive_root", "distinctive_leaf"] {
+        assert!(asked[0].prompt.contains(code), "the namer sees the outline");
+        assert!(
+            !asked[1].prompt.contains(code),
+            "the description never sees the code"
+        );
+        assert!(
+            asked[2].prompt.contains(code),
+            "the diagnosis sees the outline"
+        );
+    }
+    assert_eq!(asked[1].prompt, "an assembler, in a JIT");
+    assert!(
+        asked[2]
+            .prompt
+            .contains("An assembler turns labelled items into bytes.")
+    );
+    assert!(
+        !asked[2].prompt.contains("body()"),
+        "bodies are elided from the shape"
+    );
+}
+
+#[tokio::test]
+async fn symptoms_from_one_rule_alone_are_not_diagnosed() {
+    let tree = Tree::new(
+        "one-rule",
+        &[("first", EVERYTHING)],
+        &[("m/mod.rs", "mod a;\n"), ("m/a.rs", "fn a() {}\n")],
+    );
+    let reviewers = reviewers(
+        Scripted::new(|asked| {
+            Ok(match asked.kind {
+                Kind::Decide => WRONG.into(),
+                _ => r#"{"findings": [{"outcome": "wrong", "line": 1, "message": "one"}, {"outcome": "wrong", "line": 2, "message": "two"}]}"#.into(),
+            })
+        }),
+        decide::none(),
+    );
+    let report = run(&tree, &["m/mod.rs", "m/a.rs"], &reviewers).await;
+    assert_eq!(report.findings.len(), 4);
+
+    let doctor = Scripted::new(diagnosing);
+    let diagnosed = diagnose(&doctor, &report).await.unwrap();
+    assert!(diagnosed.diagnoses.is_empty());
+    assert!(doctor.asked().is_empty());
+}
+
+#[tokio::test]
+async fn a_thing_only_one_symptom_concerns_is_not_described() {
+    let (tree, reviewers) = converging("one-symptom");
+    let report = run(&tree, &["m/mod.rs", "m/a.rs"], &reviewers).await;
+
+    let doctor = Scripted::new(|asked| {
+        Ok(match asked.kind {
+            Kind::Identify => {
+                r#"{"things": [{"thing": "a parser", "context": "c", "symptoms": [2]}]}"#.into()
+            }
+            other => bail!("asked {other:?}"),
+        })
+    });
+    let diagnosed = diagnose(&doctor, &report).await.unwrap();
+    assert!(diagnosed.diagnoses.is_empty() && diagnosed.failures.is_empty());
+    assert_eq!(doctor.asked().len(), 1);
+}
+
+#[tokio::test]
+async fn a_diagnosis_outside_its_schema_is_a_failure_not_an_abort() {
+    let (tree, reviewers) = converging("bad-diagnosis");
+    let report = run(&tree, &["m/mod.rs", "m/a.rs"], &reviewers).await;
+
+    let doctor = Scripted::new(|asked| {
+        Ok(match asked.kind {
+            Kind::Diagnose => "It is an assembler, probably.".into(),
+            _ => diagnosing(asked)?,
+        })
+    });
+    let diagnosed = diagnose(&doctor, &report).await.unwrap();
+    assert!(diagnosed.diagnoses.is_empty());
+    assert_eq!(diagnosed.failures.len(), 1);
+    assert!(format!("{:#}", diagnosed.failures[0]).contains("an assembler"));
+}
+
+#[tokio::test]
+async fn the_lead_review_leads_with_the_diagnoses() {
+    let (tree, reviewers) = converging("lead-diagnosed");
+    let mut report = run(&tree, &["m/mod.rs", "m/a.rs"], &reviewers).await;
+    report.diagnoses = vec![Diagnosis {
+        component: tree.path("m"),
+        thing: "an assembler".into(),
+        denotation: "items into bytes".into(),
+        shape: "labels are strings".into(),
+        diagnosis: "a label is a key".into(),
+        falls_out: "the names go".into(),
+        explains: vec![0, 2],
+    }];
+
+    let lead = Scripted::new(|_| Ok("# Review\n".into()));
+    synthesize(&lead, &tree.rules(), &report)
+        .await
+        .unwrap()
+        .unwrap();
+    let brief = &lead.asked()[0].prompt;
+    let diagnoses = brief.find("## Diagnoses").expect(brief);
+    assert!(diagnoses < brief.find("## Rules").unwrap(), "{brief}");
+    assert!(brief.contains("a label is a key"), "{brief}");
+    assert!(brief.contains("Explains: F1, F3"), "{brief}");
+    assert!(brief.contains("- F1 line 1 [first/wrong]: one"), "{brief}");
 }
