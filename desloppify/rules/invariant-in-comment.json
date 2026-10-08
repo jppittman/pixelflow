@@ -15,7 +15,8 @@
     "invariant_in_comment": "A comment says \"must be\", \"always\", \"never\", \"only ever\", \"assumes\", \"in X space\" or \"caller must ensure\" about a value a type could constrain.",
     "overloaded_type": "One integer or float type carries several meanings depending on its range or a flag.",
     "runtime_guard": "A runtime check defends a property a type would guarantee.",
-    "identity_in_a_string": "An identity — a node or value id, an index, an arm — is formatted into a string or name to serve as a key (`format!(\"v{}_{}\", id, part)`), so keys are kept apart by a naming convention instead of a type that cannot collide."
+    "identity_in_a_string": "An identity — a node or value id, an index, an arm — is formatted into a string or name to serve as a key (`format!(\"v{}_{}\", id, part)`), so keys are kept apart by a naming convention instead of a type that cannot collide.",
+    "copyable_resource": "A finite resource that one component hands out — a register, a stack or buffer slot, a pool entry, a handle — is a Copy type anyone can construct, so claiming one outside its owner, or two holders sharing one, is representable and kept apart only by convention. Resources move, names copy: the owner should mint each one once and hand it out by move or borrow."
   },
   "guidance": "Prioritize where a wrong value would be silently accepted and produce plausible output, and say what type would carry the invariant. `unsafe` SAFETY contracts and checks on external input are not findings."
 }

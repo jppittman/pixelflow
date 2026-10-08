@@ -64,11 +64,18 @@ already exists: recover what the thing *means*, then hold the code to it.
    allocator owns its own spill code, so it allocates the address register
    too.
 
-8. **Subtract.** The change should delete more than it adds. What the new
+8. **Put the opinion in the types.** A rule that the compiler can enforce
+   should be one. Resources move, names copy: a register, a slot or a pool
+   entry is a token that is not `Copy`, minted once by its owner and handed
+   out by move or borrow, so "no allocation outside the allocator" is a
+   compile error, not a convention. Ids, labels and other names can stay
+   `Copy`; they are identities, not capacity.
+
+9. **Subtract.** The change should delete more than it adds. What the new
    model makes unrepresentable goes; what it makes ordinary stops being
    special.
 
-9. **Write the denotation down, then build.** It goes in `docs/plans/` before
+10. **Write the denotation down, then build.** It goes in `docs/plans/` before
    code, and the implementation is obliged to it. After it lands, reread the
    plan against the code: did it carry every consequence, or stop at the
    first?
