@@ -46,7 +46,7 @@ use crate::program::{Def, IfArm, ScheduledOp, ValueId};
 /// Regions are numbered in the order the reverse pass meets them, so a
 /// parent's number is always smaller than its children's.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct Region(pub(crate) usize);
+pub(super) struct Region(pub(crate) usize);
 
 impl Region {
     /// The scope itself: what no arm owns.
@@ -55,7 +55,7 @@ impl Region {
 
 /// One arm of one `If`, as a region.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Arm {
+pub(super) struct Arm {
     /// Schedule position of the `If` (in the order the ownership was read
     /// from; positions are only names for defs here, the relation does not
     /// depend on them).
@@ -73,7 +73,7 @@ pub(crate) struct Arm {
 }
 
 /// Ownership of one scope's schedule.
-pub(crate) struct Ownership {
+pub(super) struct Ownership {
     /// The region each schedule position belongs to.
     region_of: Vec<Region>,
     /// The regions, nested as the `If`s are.
@@ -85,7 +85,7 @@ pub(crate) struct Ownership {
 /// Where a value sits in the scope's schedule, by `ValueId`: dense, because
 /// ids are handed out sequentially. Absent for a value this scope does not
 /// define (a live-in from an enclosing scope).
-pub(crate) struct Positions(Vec<Option<usize>>);
+pub(super) struct Positions(Vec<Option<usize>>);
 
 impl Positions {
     pub(crate) fn of(schedule: &[Def]) -> Self {

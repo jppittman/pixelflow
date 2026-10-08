@@ -10,7 +10,7 @@
 use crate::emit::{CompileResult, EmitCtx, compile_native, native_register_file};
 use crate::error::CompileError;
 use crate::program::ScopedSchedule;
-use crate::program::lower::arena_to_schedule;
+use crate::program::arena_to_schedule;
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{UniformDecl, UniformId, UniformIdentity};
 use pixelflow_ir::passes::lattice::{Collapse, Domain};

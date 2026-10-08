@@ -85,9 +85,9 @@ use pixelflow_ir::kind::OpKind;
 pub use crate::pipeline::{compile, origin};
 pub use crate::program::IfArm;
 use crate::program::IfGuard;
-pub use crate::program::ScheduledOp;
 #[cfg(test)]
-use crate::program::layout::Layout;
+use crate::program::Layout;
+pub use crate::program::ScheduledOp;
 use traffic::{BranchTraffic, Counting, EmitTraffic};
 
 use alloc::vec::Vec;
@@ -1191,11 +1191,7 @@ struct MaskTest {
 /// given its table the way a compile gives one.
 #[cfg(test)]
 fn flat_nest(schedule: Vec<regalloc::Def>) -> regalloc::ScopedSchedule {
-    let layout = Layout::of(
-        &schedule,
-        &[],
-        &crate::program::guards::FoldReads::default(),
-    );
+    let layout = Layout::of(&schedule, &[], &crate::program::FoldReads::default());
     regalloc::ScopedSchedule {
         body: regalloc::ScopeRegion {
             roots: Vec::new(),
@@ -4370,11 +4366,7 @@ mod tests {
             let mut a = ExprArena::new();
             let (root, _outer, _inner) = nested_guarded_ifs(&mut a);
             let schedule = native_schedule(&a, root, POINT);
-            let layout = Layout::of(
-                &schedule,
-                &[],
-                &crate::program::guards::FoldReads::default(),
-            );
+            let layout = Layout::of(&schedule, &[], &crate::program::FoldReads::default());
             assert!(
                 !layout.is_identity(),
                 "the arms were already runs as written, which this fixture is not"
