@@ -210,7 +210,7 @@ fn wrong_on_line_one(asked: &Asked) -> Result<String> {
     Ok(match asked.kind {
         Kind::Decide => WRONG.into(),
         Kind::Explain | Kind::Prose => {
-            r#"{"findings": [{"line": 1, "message": "needs work"}]}"#.into()
+            r#"{"findings": [{"outcome": "wrong", "line": 1, "message": "needs work"}]}"#.into()
         }
     })
 }
@@ -260,7 +260,7 @@ async fn findings_come_back_sorted_by_path_then_line_with_their_rule_and_outcome
         Scripted::new(|asked| {
             Ok(match asked.kind {
                 Kind::Decide => WRONG.into(),
-                _ => r#"{"findings": [{"line": 9, "message": "late"}, {"line": 1, "message": "early"}]}"#
+                _ => r#"{"findings": [{"outcome": "wrong", "line": 9, "message": "late"}, {"outcome": "wrong", "line": 1, "message": "early"}]}"#
                     .into(),
             })
         }),
@@ -415,7 +415,7 @@ async fn a_violation_decided_after_escalating_is_explained_at_the_explain_level(
             Ok(match (asked.kind, asked.level) {
                 (Kind::Decide, ModelLevel::Lite) => UNSURE.into(),
                 (Kind::Decide, _) => WRONG.into(),
-                _ => r#"{"findings": [{"line": 1, "message": "m"}]}"#.into(),
+                _ => r#"{"findings": [{"outcome": "wrong", "line": 1, "message": "m"}]}"#.into(),
             })
         }),
         decide::none(),
@@ -531,6 +531,73 @@ async fn an_explanation_outside_the_findings_schema_is_a_failure_but_the_decisio
     assert!(report.findings.is_empty());
     assert_eq!(report.failures.len(), 1);
     assert_eq!(decided(&report, "everything", "wrong"), 1);
+}
+
+/// A file rule with two ways to violate it.
+const TWO_WAYS: &str = r#"{
+    "unit": "file",
+    "levels": {"decide": 1, "explain": 2},
+    "question": "q",
+    "fine": {"clean": "c"},
+    "violations": {"loud": "It shouts.", "quiet": "It mumbles."}
+}"#;
+
+#[tokio::test]
+async fn an_explanation_reports_each_place_under_the_violation_it_shows() {
+    let tree = Tree::new(
+        "two-ways",
+        &[("rule", TWO_WAYS)],
+        &[("a.rs", "fn a() {}\nfn b() {}\n")],
+    );
+    let reviewers = reviewers(
+        Scripted::new(|asked| {
+            Ok(match asked.kind {
+                Kind::Decide => r#"{"outcome": "loud"}"#.into(),
+                _ => r#"{"findings": [{"outcome": "loud", "line": 1, "message": "a"}, {"outcome": "quiet", "line": 2, "message": "b"}]}"#.into(),
+            })
+        }),
+        decide::none(),
+    );
+    let report = run(&tree, &["a.rs"], &reviewers).await;
+
+    let outcomes: Vec<_> = report.findings.iter().map(|f| f.outcome.as_str()).collect();
+    assert_eq!(outcomes, ["loud", "quiet"]);
+    assert_eq!(decided(&report, "rule", "loud"), 1);
+    let explained = reviewers
+        .ask
+        .asked()
+        .into_iter()
+        .find(|a| a.kind == Kind::Explain)
+        .unwrap();
+    for violation in ["`loud`: It shouts.", "`quiet`: It mumbles."] {
+        assert!(
+            explained.preamble.contains(violation),
+            "{}",
+            explained.preamble
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_finding_under_an_outcome_that_is_not_a_violation_is_a_failure() {
+    let tree = Tree::new(
+        "not-a-violation",
+        &[("rule", TWO_WAYS)],
+        &[("a.rs", "fn a() {}\n")],
+    );
+    let reviewers = reviewers(
+        Scripted::new(|asked| {
+            Ok(match asked.kind {
+                Kind::Decide => r#"{"outcome": "loud"}"#.into(),
+                _ => r#"{"findings": [{"outcome": "clean", "line": 1, "message": "a"}]}"#.into(),
+            })
+        }),
+        decide::none(),
+    );
+    let report = run(&tree, &["a.rs"], &reviewers).await;
+    assert!(report.findings.is_empty());
+    assert_eq!(report.failures.len(), 1);
+    assert!(format!("{:#}", report.failures[0]).contains("clean"));
 }
 
 #[tokio::test]
@@ -733,7 +800,7 @@ async fn a_crate_wide_rule_makes_one_call_per_crate_and_findings_keep_their_file
                             .filter(|p| p.ends_with("b.rs"))
                     });
                     format!(
-                        r#"{{"findings": [{{"path": "{}", "line": 1, "message": "m"}}]}}"#,
+                        r#"{{"findings": [{{"outcome": "v", "path": "{}", "line": 1, "message": "m"}}]}}"#,
                         path.unwrap()
                     )
                 }

@@ -61,7 +61,8 @@ pub struct Reviewers<A, D> {
 pub struct Finding {
     /// The rule's id.
     pub rule: String,
-    /// The violation outcome the unit was decided as.
+    /// The violation outcome this place shows: the one the unit was decided
+    /// as, or another of the rule's violations found beside it.
     pub outcome: String,
     pub path: PathBuf,
     /// The line the model named, as numbered in the snippet it was shown.

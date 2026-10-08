@@ -200,19 +200,19 @@ impl<'a, A: Ask> Asking<'a, A> {
     }
 
     /// The findings a model at the rule's explain level reports for a unit
-    /// decided as `outcome`.
+    /// decided as `outcome`, each under the violation it shows.
     async fn explain(&mut self, outcome: &Outcome) -> Result<Vec<Finding>> {
         let rule = self.rule;
         let system = explain_preamble(rule, outcome);
         let reply = self
-            .ask(rule.levels.explain, &system, &findings_schema())
+            .ask(rule.levels.explain, &system, &findings_schema(rule))
             .await?;
         let path = &self.unit.call.path;
-        Ok(parse_findings(&reply)?
+        Ok(parse_findings(rule, &reply)?
             .into_iter()
             .map(|r| Finding {
                 rule: rule.id.clone(),
-                outcome: outcome.name.clone(),
+                outcome: r.outcome,
                 path: r.path.unwrap_or_else(|| path.clone()),
                 line: r.line,
                 message: r.message,

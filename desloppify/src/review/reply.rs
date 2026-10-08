@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use super::Call;
-use crate::rule::{Outcome, Rule, UNSURE};
+use crate::rule::{Outcome, Rule, UNSURE, Verdict};
 
 const DECIDER: &str = "\
 You answer one question about the code you are shown, by choosing exactly one \
@@ -14,11 +14,13 @@ of the outcomes below. Choose `unsure` only if the code shown is not enough \
 to decide.";
 
 const EXPLAINER: &str = "\
-You explain one decision about the code you are shown. Report each place in \
-the code that makes it so, as a finding: the line number printed in the code, \
-what is wrong and why, and the fix. When the code comes from several files, \
-each under a `== path ==` header, give each finding that header's path. If \
-on reflection nothing in the code makes it so, report no findings.";
+You explain a decision that the code you are shown violates a rule. Report \
+every place in the code that violates it, as a finding: the violation that \
+place shows — the one decided, or another of the rule's violations below — \
+the line number printed in the code, what is wrong and why, and the fix. \
+When the code comes from several files, each under a `== path ==` header, \
+give each finding that header's path. If on reflection nothing in the code \
+violates the rule, report no findings.";
 
 /// The labels a decision chooses from: the rule's outcomes, each with what
 /// it means.
@@ -88,7 +90,16 @@ pub(super) fn parse_decision<'r>(rule: &'r Rule, reply: &str) -> Result<Option<&
     Ok(Some(outcome))
 }
 
-/// The system prompt for explaining why the unit was decided `outcome`.
+/// The rule's violation outcomes, in file order.
+fn violations(rule: &Rule) -> impl Iterator<Item = &Outcome> {
+    rule.decision
+        .outcomes
+        .iter()
+        .filter(|o| o.verdict == Verdict::Violation)
+}
+
+/// The system prompt for explaining a unit decided `outcome`: every
+/// violation of the rule it shows, not only that one.
 pub(super) fn explain_preamble(rule: &Rule, outcome: &Outcome) -> String {
     let guidance = rule
         .decision
@@ -96,14 +107,19 @@ pub(super) fn explain_preamble(rule: &Rule, outcome: &Outcome) -> String {
         .as_deref()
         .map(|g| format!("\n\n{g}"))
         .unwrap_or_default();
+    let violations: String = violations(rule)
+        .map(|o| format!("- `{}`: {}\n", o.name, o.meaning))
+        .collect();
     format!(
-        "{}{EXPLAINER}{guidance}\n\nThe question was: {}\nThe code was decided `{}`: {}",
-        rule.skills, rule.decision.question, outcome.name, outcome.meaning
+        "{}{EXPLAINER}{guidance}\n\nThe question was: {}\nThe code was decided `{}`.\n\nThe rule's violations:\n{violations}",
+        rule.skills, rule.decision.question, outcome.name
     )
 }
 
-/// The shape every explanation's reply must have.
-pub(super) fn findings_schema() -> serde_json::Value {
+/// The shape an explanation's reply must have: findings, each under one of
+/// `rule`'s violation outcomes.
+pub(super) fn findings_schema(rule: &Rule) -> serde_json::Value {
+    let names: Vec<&str> = violations(rule).map(|o| o.name.as_str()).collect();
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -112,11 +128,12 @@ pub(super) fn findings_schema() -> serde_json::Value {
                 "items": {
                     "type": "object",
                     "properties": {
+                        "outcome": { "type": "string", "enum": names },
                         "path": { "type": "string" },
                         "line": { "type": "integer" },
                         "message": { "type": "string" }
                     },
-                    "required": ["line", "message"]
+                    "required": ["outcome", "line", "message"]
                 }
             }
         },
@@ -131,6 +148,8 @@ struct Replies {
 
 #[derive(Deserialize)]
 pub(super) struct Reply {
+    /// The violation outcome this place shows.
+    pub(super) outcome: String,
     /// Set when the code shown came from several files.
     #[serde(default)]
     pub(super) path: Option<PathBuf>,
@@ -138,10 +157,16 @@ pub(super) struct Reply {
     pub(super) message: String,
 }
 
-/// The findings in an explanation's reply.
-pub(super) fn parse_findings(reply: &str) -> Result<Vec<Reply>> {
+/// The findings in an explanation's reply, each under one of `rule`'s
+/// violation outcomes.
+pub(super) fn parse_findings(rule: &Rule, reply: &str) -> Result<Vec<Reply>> {
     let replies: Replies = serde_json::from_str(reply)
         .with_context(|| format!("reply is not a findings object: {reply}"))?;
+    for finding in &replies.findings {
+        if !violations(rule).any(|o| o.name == finding.outcome) {
+            bail!("`{}` is not one of the rule's violations", finding.outcome);
+        }
+    }
     Ok(replies.findings)
 }
 

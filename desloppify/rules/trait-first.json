@@ -7,13 +7,14 @@
   "skills": [
     "style-guide"
   ],
-  "question": "Does this file implement something a second way without a trait, or pay dynamic dispatch on a hot path where the implementations are fixed?",
+  "question": "Does this file do something a second way — a parallel function, a mode flag, or one construct handled outside the mechanism everything else goes through — or pay dynamic dispatch on a hot path where the implementations are fixed?",
   "fine": {
     "one_way_or_trait": "Each category is done one way, or its implementations are impls of one trait; dynamic dispatch, if any, is off the hot path or over an open set."
   },
   "violations": {
     "second_way": "A second implementation as a parallel free function (`foo` and `foo_fast`), a copied type or module, or a mode flag switching an implementation's behavior.",
-    "hot_dyn": "`Box<dyn Trait>`/`&dyn Trait` called per element, pixel or frame where a `match` over an enum or a generic would settle it once."
+    "hot_dyn": "`Box<dyn Trait>`/`&dyn Trait` called per element, pixel or frame where a `match` over an enum or a generic would settle it once.",
+    "bypasses_the_general_path": "One construct is handled outside the mechanism everything else goes through — verbs, temps or a side path of its own — usually beside a comment explaining why it need not go through it. A special case defended in prose is usually a model of the problem that missed a consequence."
   },
-  "guidance": "Name the trait that should exist."
+  "guidance": "Name the trait that should exist. For a bypass, say what the construct is in the general mechanism's own terms, and what deleting the special path removes."
 }
