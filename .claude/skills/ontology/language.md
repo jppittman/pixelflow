@@ -564,16 +564,20 @@
     where `-> f32` is expected reads all-ones as NaN. Refusing bitwise roots
     does not close this, because `If` of numbers is in that domain. "The fix
     is a type, a mask kernel the host cannot pass as a `&Kernel`" (open).
-- **At the machine:** a mask is a predicate value, and its register class is
-  whatever the instruction that defines it writes — a class is a property of
-  an instruction's operands, not a declaration. AVX-512's `vcmpps` writes a
-  `k` register, so there a compare's result is a `k`-class value that a
-  writemask (`vblendmps zmm{k}`), a masked store or gather, a `kand`/`kor` and
-  a `kortest` read directly; NEON's `fcmgt` and AVX2's `vcmpps` write a
-  vector, so there it is vector-class. Where a value's class does not match
-  the operand that reads it (a predicate used as data on AVX-512), selection
-  inserts the conversion (`vpmovm2d`) at that use and nowhere else. This
-  needs no IR type; it falls out of instruction selection being a phase.
+- **At the machine:** a mask is a predicate value, and the backend names the
+  register it lives in: `IsaBackend::Mask`, an associated type. On AVX-512 it
+  is `k`: `vcmpps` writes one, and a writemask (`vblendmps zmm{k}`), a masked
+  store or gather, `kand`/`kor` and `kortest` read one. On NEON and AVX2 it is
+  the vector register, an alias, because their compares write vectors and
+  their blends read them; those ISAs have no mask register, and their
+  instructions take none. An instruction that reads a predicate takes
+  `Self::Mask`, and the allocator allocates that class like any other. Where a
+  predicate is read as data on AVX-512, selection inserts the conversion
+  (`vpmovm2d`) at that use. A missing conversion is a type error there, and on
+  NEON and AVX2 no conversion exists, since the two types are one. None of
+  this needs an IR type. The alias does mean the machine cannot tell a mask
+  from a number on NEON or AVX2, so the domain question ("a mask is not a
+  number") is the IR's to answer, not the backend's.
 - **Lives:** `OpKind::mask`, `OpKind::is_bitwise_domain`
   (`pixelflow-ir/src/kind.rs`); sema's `bool` (`pixelflow-compiler/src/sema.rs`);
   CLAUDE.md "Floating point at the edges"; the-language-is-kernel §1.3, D8,
