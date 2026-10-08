@@ -23,7 +23,7 @@ pub mod isa;
 mod pipeline;
 mod program;
 
-pub mod compiled_kernel;
+mod compiled_kernel;
 pub use compiled_kernel::CompiledKernel;
 pub use error::CompileError;
 // The one vector width in the workspace: the tier's, decided at startup by
