@@ -924,7 +924,9 @@ pub struct EmitCtx {
     ///
     /// Only ever *shrinks* the selected backend's own pool (see
     /// `regalloc::RegisterFile::capped`); setting it low is how a caller
-    /// forces spilling deliberately.
+    /// forces spilling deliberately. A budget below
+    /// `regalloc::RegisterFile::MIN_SCRATCH` panics when the backend is built,
+    /// since the encodings cannot place their temps in a smaller pool.
     ///
     /// `None` rather than "a number at least as large as every pool": that
     /// spelling was a convention no type enforced, and it broke the moment the
@@ -3973,7 +3975,7 @@ mod tests {
         }
         let root = terms[0];
 
-        let result = EmitCtx::with_max_regs(4)
+        let result = EmitCtx::with_max_regs(regalloc::RegisterFile::MIN_SCRATCH)
             .compile(&arena, root, POINT)
             .expect("arena DAG compile with spills failed");
 

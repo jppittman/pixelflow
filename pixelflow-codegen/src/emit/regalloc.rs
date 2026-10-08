@@ -532,17 +532,25 @@ impl RegisterFile {
     /// reserved for reloads or builtins. It does not shrink past
     /// [`MIN_SCRATCH`](Self::MIN_SCRATCH), which is not a budget question but
     /// an encoding one.
+    ///
+    /// # Panics
+    /// If the budget is below [`MIN_SCRATCH`](Self::MIN_SCRATCH). The caller
+    /// is a developer choosing a test knob, and a smaller pool answered with
+    /// the floor would run a different experiment than the one asked for.
     #[must_use]
-    pub const fn capped(self, max_scratch: Option<u8>) -> Self {
+    pub fn capped(self, max_scratch: Option<u8>) -> Self {
         match max_scratch {
-            Some(n) => Self {
-                scratch: self.scratch.take(if n < Self::MIN_SCRATCH {
+            Some(n) => {
+                assert!(
+                    n >= Self::MIN_SCRATCH,
+                    "scratch budget {n} is below RegisterFile::MIN_SCRATCH ({})",
                     Self::MIN_SCRATCH
-                } else {
-                    n
-                }),
-                ..self
-            },
+                );
+                Self {
+                    scratch: self.scratch.take(n),
+                    ..self
+                }
+            }
             None => self,
         }
     }
@@ -4529,11 +4537,12 @@ mod tests {
     }
 
     /// A pool shrunk below what an encoding needs is not a smaller budget, it
-    /// is an instruction with nowhere to put its temp — so `capped` holds the
-    /// floor rather than letting `max_regs` reach through it.
+    /// is an instruction with nowhere to put its temp — so the floor is the
+    /// smallest pool `capped` hands out, and the allocator still finds a temp
+    /// at it.
     #[test]
     fn capping_the_pool_stops_at_the_floor() {
-        let tiny = TEMP_FILE.capped(Some(1));
+        let tiny = TEMP_FILE.capped(Some(RegisterFile::MIN_SCRATCH));
         assert_eq!(tiny.scratch.len(), RegisterFile::MIN_SCRATCH);
 
         // The shape that used to fall through: a `Neg` whose operand is a
