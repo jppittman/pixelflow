@@ -1912,7 +1912,7 @@ fn emit_scope<B: IsaBackend>(
         }
 
         let dst_loc = location_of(&locs, *vid);
-        let plan = resolve_operands(sched_op, dst_loc, &locs, scratch)?;
+        let plan = resolve_operands(sched_op, dst_loc, &locs, scratch);
 
         if let ScheduledOp::Ternary(OpKind::If, mask_vid, true_vid, false_vid) = sched_op
             && let Some(guard) = guard_at[sched_idx].map(|gi| &if_guards[gi])
@@ -2042,12 +2042,15 @@ fn emit_scope<B: IsaBackend>(
 /// If the destination is in a stack slot. A definition writes a register or
 /// nothing at all; a spilled destination was the fixed `reload[0]`, and there
 /// is no such register any more.
+///
+/// If a `Ternary` names an op other than `MulAdd` or `If`: lowering emits no
+/// other, so that is a pipeline bug ([`unimplemented_op`]), not a kernel.
 fn resolve_operands(
     op: &ScheduledOp,
     dst_loc: Binding,
     locs: &[Option<Binding>],
     scratch: regalloc::Scratch,
-) -> Result<InstructionPlan, CompileError> {
+) -> InstructionPlan {
     // The one pointer-class definition, resolved before the vector
     // destination is read: its register is a pointer register by the
     // allocator's own placement, and it has no operands to resolve.
@@ -2059,12 +2062,12 @@ fn resolve_operands(
                  pointer definition a pointer register"
             ),
         };
-        return Ok(InstructionPlan {
+        return InstructionPlan {
             reloads: Vec::new(),
             op: ResolvedOp::Context { dst, slot: *slot },
             setup_mov: None,
             scratch,
-        });
+        };
     }
 
     let dst = match dst_loc {
@@ -2074,12 +2077,12 @@ fn resolve_operands(
         // register nobody reads is what the fixed destination register used to
         // buy.
         Binding::Remat(_) => {
-            return Ok(InstructionPlan {
+            return InstructionPlan {
                 reloads: Vec::new(),
                 op: ResolvedOp::Nop,
                 setup_mov: None,
                 scratch,
-            });
+            };
         }
         Binding::Loc(Loc::Ptr(p)) => panic!(
             "a vector definition landed in pointer register {p:?} — the \
@@ -2321,17 +2324,17 @@ fn resolve_operands(
                         if_false: c_reg,
                     }
                 }
-                _ => return Err(CompileError::UnsupportedOp(*op_kind)),
+                _ => unimplemented_op("the ternary resolver", *op_kind),
             }
         }
     };
 
-    Ok(InstructionPlan {
+    InstructionPlan {
         reloads,
         op: resolved_op,
         setup_mov,
         scratch,
-    })
+    }
 }
 
 /// Where a value lives, from the dense slice the emit loop carries.
@@ -3659,8 +3662,7 @@ mod tests {
         // left=v4, right=v5, dst=v6 — all in registers
         let locs = make_locs(&[(0, 4), (1, 5), (2, 6)], &[]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH);
 
         assert!(plan.reloads.is_empty());
         assert_eq!(
@@ -3684,8 +3686,7 @@ mod tests {
         // left spilled at offset 0, right in v5
         let locs = make_locs(&[(1, 5), (2, 6)], &[(0, 0)]);
         let op = ScheduledOp::Binary(OpKind::Add, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH);
 
         assert_eq!(plan.reloads.len(), 1);
         assert_eq!(
@@ -3711,8 +3712,7 @@ mod tests {
         // Both spilled: left → dst (temp trick), right → tmp_op
         let locs = make_locs(&[(2, 6)], &[(0, 0), (1, 16)]);
         let op = ScheduledOp::Binary(OpKind::Mul, regalloc::ValueId(0), regalloc::ValueId(1));
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH);
 
         assert_eq!(plan.reloads.len(), 2);
         // left → dst (v6), right → tmp_op (v27)
@@ -3776,8 +3776,7 @@ mod tests {
             Binding::Remat(1.5f32.to_bits()),
             locs.as_slice(),
             TEST_SCRATCH,
-        )
-        .unwrap();
+        );
         assert_eq!(plan.op, ResolvedOp::Nop);
         assert!(plan.reloads.is_empty());
     }
@@ -3792,8 +3791,7 @@ mod tests {
             regalloc::ValueId(1),
             regalloc::ValueId(2),
         );
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH);
 
         assert!(plan.reloads.is_empty());
         // c=v7 ≠ dst=v8, so setup_mov should copy c → dst
@@ -3819,8 +3817,7 @@ mod tests {
             regalloc::ValueId(1),
             regalloc::ValueId(2),
         );
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH);
 
         // a → dst, b → tmp_op loaded upfront
         assert_eq!(plan.reloads.len(), 2);
@@ -3867,8 +3864,7 @@ mod tests {
             regalloc::ValueId(1),
             regalloc::ValueId(2),
         );
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(8)).into(), locs.as_slice(), TEST_SCRATCH);
 
         // Only a and b reloads upfront — c is deferred
         assert_eq!(plan.reloads.len(), 2);
@@ -3885,8 +3881,7 @@ mod tests {
     fn resolve_var_is_nop() {
         let locs = make_locs(&[(0, 0)], &[]);
         let op = ScheduledOp::Var(0);
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(0)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(0)).into(), locs.as_slice(), TEST_SCRATCH);
         assert_eq!(plan.op, ResolvedOp::Nop);
         assert!(plan.reloads.is_empty());
     }
@@ -3895,8 +3890,7 @@ mod tests {
     fn resolve_const() {
         let locs = make_locs(&[(0, 6)], &[]);
         let op = ScheduledOp::Const(core::f32::consts::PI);
-        let plan =
-            resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH).unwrap();
+        let plan = resolve_operands(&op, Loc::Reg(Reg(6)).into(), locs.as_slice(), TEST_SCRATCH);
         assert_eq!(
             plan.op,
             ResolvedOp::LoadConst {
