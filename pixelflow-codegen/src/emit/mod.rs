@@ -786,7 +786,7 @@ pub struct InstructionPlan {
     /// each holds no live value and is nobody's operand, and all are free again
     /// at the next instruction. An encoding that needs scratch must read this
     /// rather than a `const`, because there is no register reserved for it.
-    pub scratch: regalloc::Scratch,
+    scratch: regalloc::Scratch,
 }
 
 /// Where one operand of an instruction is read from.
@@ -1154,7 +1154,7 @@ pub struct WritePlan {
     pub lanes: u32,
     /// This instruction's reservations: two GPRs for the address, and the
     /// vector or mask temp a backend's remainder store asked for.
-    pub scratch: regalloc::Scratch,
+    scratch: regalloc::Scratch,
 }
 
 /// A guard's question: is this arm dead for the whole batch?
@@ -2018,7 +2018,7 @@ fn emit_scope<B: IsaBackend>(
 /// If the destination is in a stack slot. A definition writes a register or
 /// nothing at all; a spilled destination was the fixed `reload[0]`, and there
 /// is no such register any more.
-pub fn resolve_operands(
+fn resolve_operands(
     op: &ScheduledOp,
     dst_loc: Binding,
     locs: &[Option<Binding>],

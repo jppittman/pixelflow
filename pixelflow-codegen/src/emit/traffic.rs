@@ -165,7 +165,10 @@ impl EmitTraffic {
     /// scopes finished, into `scopes`' index: the body first, then the folds.
     /// `count` is the number of scopes; one nothing was recorded for is empty.
     #[must_use]
-    pub fn by_index(recorded: Vec<(Scope, ScopeTraffic)>, count: usize) -> Vec<ScopeTraffic> {
+    pub(super) fn by_index(
+        recorded: Vec<(Scope, ScopeTraffic)>,
+        count: usize,
+    ) -> Vec<ScopeTraffic> {
         let mut scopes = alloc::vec![ScopeTraffic::default(); count];
         for (scope, traffic) in recorded {
             scopes[scope_ix(scope)] = traffic;
