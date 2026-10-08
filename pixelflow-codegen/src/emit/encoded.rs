@@ -1,7 +1,7 @@
 //! Encoded instruction byte representation for variable-length ISAs (x86-64).
 //!
 //! Architectural limit on x86-64: no instruction can exceed 15 bytes.
-//! [`EncodedInst`] is a 16-byte `Copy` stack struct: 15 payload bytes and a 1-byte length.
+//! `EncodedInst` is a 16-byte `Copy` stack struct: 15 payload bytes and a 1-byte length.
 //! It fits in a single 128-bit register and incurs zero heap allocations.
 
 use alloc::vec::Vec;

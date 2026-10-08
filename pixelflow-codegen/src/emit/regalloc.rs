@@ -1,7 +1,7 @@
 //! Register allocation for scheduled DAG expressions.
 //!
-//! Allocation is one algorithm ([`LinearScan`]) parameterised by one
-//! description of the target ([`RegisterFile`]). Everything that differs
+//! Allocation is one algorithm (`LinearScan`) parameterised by one
+//! description of the target (`RegisterFile`). Everything that differs
 //! between x86-64 and aarch64 — which registers hold the coordinate inputs,
 //! where the allocatable window starts and how wide it is, which fixed
 //! registers spilled operands reload into, how many bytes a spilled vector

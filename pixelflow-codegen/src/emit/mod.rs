@@ -2,9 +2,9 @@
 //!
 //! ## Register allocation
 //!
-//! One allocator — [`regalloc::LinearScan`], linear scan with Belady eviction
+//! One allocator — `regalloc::LinearScan`, linear scan with Belady eviction
 //! and constant rematerialization — parameterised by one description of the
-//! target, [`regalloc::RegisterFile`]. Expressions arrive from e-graph
+//! target, `regalloc::RegisterFile`. Expressions arrive from e-graph
 //! extraction with shared subexpressions, which is why the allocator works on
 //! a DAG schedule rather than a tree.
 //!
@@ -31,13 +31,13 @@
 //!
 //! Values the scratch pool cannot hold go to stack slots. The allocator lays
 //! the whole frame out beside its placements, at the backend's vector stride
-//! ([`regalloc::NestAllocation`]), and the emitter reads every address from
+//! (`regalloc::NestAllocation`), and the emitter reads every address from
 //! it (`regalloc::Allocation::slot_of`) and computes none:
 //! - A value with a slot is stored to it right after its **definition**, which
 //!   every path that reads the value has run — including through an `If`
 //!   guard, which can only skip a definition by skipping every read of it.
 //! - Reloaded into a register the allocator reserved *for that instruction*
-//!   ([`regalloc::Scratch`]); there is no register outside the pool for this,
+//!   (`regalloc::Scratch`); there is no register outside the pool for this,
 //!   and every definition holds a pool register at its own definition.
 //! - `EmitCtx::max_regs` caps the pool below the target's own count, which is
 //!   how register pressure vs. spill tradeoffs are exercised deliberately
@@ -218,7 +218,7 @@ pub fn assemble<I: AsmInsn>(code: &mut Vec<u8>, insts: impl IntoIterator<Item = 
 /// correct.
 ///
 /// A label is the missing name, and it makes a branch an ordinary instruction
-/// again: [`x86_64::Jmp`] and friends *take a `Label`*. Assembling is then two
+/// again: `x86_64::Jmp` and friends *take a `Label`*. Assembling is then two
 /// passes instead of one — lay the items out, then fill in the displacements
 /// that could not be known until the layout was — which is the only thing that
 /// changed.
@@ -732,7 +732,7 @@ pub enum ResolvedOp {
     /// A context pointer: `dst = ctx[slot]`, one `mov`/`ldr` from the
     /// context array the kernel is called with. The definition of every
     /// [`regalloc::Class::Pointer`] value, and the only instruction that
-    /// reads [`regalloc::RegisterFile::gpr_ctx`].
+    /// reads `regalloc::RegisterFile::gpr_ctx`.
     Context { dst: PtrReg, slot: u16 },
     /// The lane fold's binder, materialized: `dst = [0, 1, …, L−1]` as
     /// `f32`s, `L` being the backend's lane count. The one vector constant
@@ -761,7 +761,7 @@ pub enum Reload {
     Const { target: Reg, val_bits: u32 },
     /// Load an address from its stack slot into the pointer register the
     /// allocator reserved for this instruction's base
-    /// ([`regalloc::Scratch::ptr_reload`]).
+    /// (`regalloc::Scratch::ptr_reload`).
     Ptr { target: PtrReg, slot: Slot },
 }
 
@@ -811,7 +811,7 @@ pub enum OperandSource {
     /// tolerates.
     Destination,
     /// Not in a register, and reloaded into the `k`'th register the allocator
-    /// reserved for this instruction ([`regalloc::Scratch::reload`]).
+    /// reserved for this instruction (`regalloc::Scratch::reload`).
     Reload(usize),
 }
 
@@ -923,7 +923,7 @@ pub struct EmitCtx {
     /// Cap on the allocatable scratch pool, or `None` to use the whole thing.
     ///
     /// Only ever *shrinks* the selected backend's own pool (see
-    /// [`regalloc::RegisterFile::capped`]); setting it low is how a caller
+    /// `regalloc::RegisterFile::capped`); setting it low is how a caller
     /// forces spilling deliberately.
     ///
     /// `None` rather than "a number at least as large as every pool": that

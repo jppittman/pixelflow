@@ -2697,7 +2697,7 @@ const CBNZ_W16_OVER_B: u32 =
 /// inside it landed, and this instruction's own size is one of those — so
 /// choosing the short form is branch relaxation, layout iterated to a fixed
 /// point to save four bytes per guard. The pair's size is fixed before a
-/// single byte is laid out, like [`AdrpAdd`]'s, and there is nothing to relax.
+/// single byte is laid out, like `AdrpAdd`'s, and there is nothing to relax.
 ///
 /// W16 rather than a register operand because W16 *is* the branch-test scratch
 /// in this backend's ABI: the guard path reduces a mask into it with
