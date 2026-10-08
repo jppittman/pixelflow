@@ -55,11 +55,18 @@ function, a value, a convention kept in a comment, or nowhere. Then say what \
 the code has that the description does not.
 
 Then diagnose: the model of the thing that the code is missing or has \
-wrong, stated as what the thing is. Say which symptoms it explains, by \
-number, and what the code looks like with the thing's shape — what becomes \
-a type, what is deleted, what falls out. One diagnosis, the deepest one the \
-evidence supports. If the symptoms are not explained by the shape, say so \
-and explain none.";
+wrong, stated as what the thing is (\"a label is an operand\", \"instruction \
+selection is a phase\"). Say which symptoms it explains, by number. One \
+diagnosis, the deepest one the evidence supports: if it explains only one \
+symptom, look further. If the symptoms are not explained by the shape, say \
+so and explain none.
+
+Then follow the consequences to closure — the step most often skipped. If \
+the code had the thing's shape, what would stop being special, what would \
+become a type, what would be deleted? And then what follows from that? Keep \
+asking until nothing more falls out, and report the whole chain. Refuse \
+exceptions: a fix that keeps one (\"except this register\", \"except this \
+construct\") is a symptom the diagnosis has not explained yet.";
 
 /// One kind of call a diagnosis makes.
 struct Step {

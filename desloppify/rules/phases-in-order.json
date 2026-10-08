@@ -1,0 +1,23 @@
+{
+  "unit": "file",
+  "levels": {
+    "decide": 2,
+    "explain": 3
+  },
+  "exclude": [
+    "**/tests/**",
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests.rs",
+    "**/*_tests.rs"
+  ],
+  "question": "Does this file make an earlier stage of a pipeline predict what a later stage will need, or a later stage make a decision an earlier one owns?",
+  "fine": {
+    "in_order": "Each stage decides what it owns from what the stages before it produced, or the file is not part of a pipeline."
+  },
+  "violations": {
+    "prediction": "An earlier stage is handed, in advance, a count, reservation, size or shape that a later stage will need, because the stage that knows runs too late to say so: e.g. a register allocator told how many registers each op's encoding will want before any instruction has been chosen.",
+    "late_decision": "A later stage makes a decision that belongs to an earlier one, because that stage never made it: e.g. an emitter choosing registers, a renderer deciding layout, a printer deciding what is valid."
+  },
+  "guidance": "Name the missing or misplaced phase: what it is, what it would produce, and what the stages around it would stop predicting or deciding once it exists."
+}

@@ -165,6 +165,7 @@ conventional commits) is already a CI job or a lint, and stays there.
 | `invariant-in-comment` | 2→3 | file | CLAUDE.md: denote before you build |
 | `mod-rs-is-a-contract` | 2→3 | file | behavioral contracts |
 | `trait-first` | 2→3 | file | CLAUDE.md / STYLE: trait first |
+| `phases-in-order` | 2→3 | file | a stage predicting what a later one needs, or deciding what an earlier one owns |
 
 Skills: `style-guide` (STYLE.md distilled), `pixelflow-architecture`
 (CLAUDE.md's constraints) and `behavioral-contracts` (the module shape of
