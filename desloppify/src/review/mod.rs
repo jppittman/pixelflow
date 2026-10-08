@@ -95,6 +95,9 @@ pub struct Report {
     /// What the findings are symptoms of, once [`diagnose`] has been asked;
     /// [`synthesize`] leads with these.
     pub diagnoses: Vec<Diagnosis>,
+    /// What several diagnoses in one module are symptoms of; [`synthesize`]
+    /// leads with these before the diagnoses.
+    pub roots: Vec<Root>,
 }
 
 /// What a cluster of findings in one module is a symptom of.
@@ -120,10 +123,29 @@ pub struct Diagnosis {
     pub explains: Vec<usize>,
 }
 
+/// The model beneath several diagnoses in one module: the diagnoses are its
+/// symptoms, one level up.
+#[derive(Debug, Clone)]
+pub struct Root {
+    /// The module the diagnoses are in.
+    pub component: PathBuf,
+    /// The deepest model the diagnoses support, stated as what the thing is:
+    /// "instruction selection is a phase".
+    pub root: String,
+    /// With that model in place: what stops being special, what is deleted,
+    /// and what follows from that, to closure.
+    pub falls_out: String,
+    /// The diagnoses it explains, as indexes into [`Diagnoses::diagnoses`].
+    pub explains: Vec<usize>,
+}
+
 /// What [`diagnose`] produced.
 #[derive(Default)]
 pub struct Diagnoses {
     pub diagnoses: Vec<Diagnosis>,
+    /// Indexes into `diagnoses` are the indexes of [`Report::diagnoses`]
+    /// once the caller moves them there.
+    pub roots: Vec<Root>,
     /// One per module or thing whose call failed or whose reply did not
     /// match its schema; the others still count.
     pub failures: Vec<anyhow::Error>,
@@ -181,6 +203,9 @@ pub async fn review<A: Ask, D: Decide>(
 ///    code's — where each part is, or that it is nowhere — and states the
 ///    diagnosis: the model the code is missing, the symptoms it explains,
 ///    and what falls out once the code has the thing's shape.
+/// 4. Diagnoses are symptoms too. A module with at least two is asked once
+///    more, at the frontier, for the root beneath them: the deepest model
+///    that makes several true at once, and its consequences to closure.
 ///
 /// Every reply is held to a schema. A failed step is a failure in the
 /// result and stops only its own module or thing.

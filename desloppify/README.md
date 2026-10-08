@@ -41,9 +41,12 @@ TYPESAFE_API_KEY=...  cargo run -p desloppify -- --system-one jev path/to/src  #
    description's shape onto the code's outline — where each part is, or that
    it is nowhere — and states the diagnosis: the model the code is missing,
    the symptoms it explains, and what falls out once the code has the
-   thing's shape.
+   thing's shape. Diagnoses are symptoms too: a module with two or more is
+   asked once more, at level 4, for the root beneath them — the deepest
+   model that makes several true at once, with its consequences followed to
+   closure.
 6. **Lead review.** One level-4 call reads every finding and writes the
-   review, leading with the diagnoses: grouped by file, duplicates across
+   review, leading with the roots, then the diagnoses: grouped by file, duplicates across
    rules merged, trivial or mistaken findings dropped and counted, recurring
    patterns called out.
    `--findings-only` prints the raw findings instead, one

@@ -159,6 +159,7 @@ async fn run<A: Ask, D: Decide>(
     let mut report = review(reviewers.clone(), rules.clone(), plan).await?;
     let diagnosed = diagnose(&reviewers.ask, &report).await?;
     report.diagnoses = diagnosed.diagnoses;
+    report.roots = diagnosed.roots;
     report.failures.extend(diagnosed.failures);
     for failure in &report.failures {
         eprintln!("error: {failure:#}");
@@ -254,6 +255,20 @@ fn print_findings(report: &Report) {
             f.rule,
             f.outcome,
             f.message
+        );
+    }
+    for r in &report.roots {
+        let things: Vec<&str> = r
+            .explains
+            .iter()
+            .filter_map(|&i| report.diagnoses.get(i).map(|d| d.thing.as_str()))
+            .collect();
+        println!(
+            "\n## Root — {}\n\n{}\n\n**What falls out.** {}\n\n**Explains the diagnoses of:** {}",
+            r.component.display(),
+            r.root,
+            r.falls_out,
+            things.join("; ")
         );
     }
     for d in &report.diagnoses {
