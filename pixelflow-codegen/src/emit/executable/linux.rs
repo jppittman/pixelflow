@@ -79,10 +79,10 @@ impl CodePage for LinuxCodePage {
     }
 
     fn write(&mut self, code: &[u8]) {
-        // `assert!`, not `debug_assert!`: this trait is publicly exported and
-        // its methods are safe, so a downstream caller reaches this
-        // `copy_nonoverlapping` from safe code. A debug-only guard compiles
-        // out of release, where the overrun would write past the mapping.
+        // `assert!`, not `debug_assert!`: this trait's methods are safe, so a
+        // caller reaches this `copy_nonoverlapping` from safe code. A
+        // debug-only guard compiles out of release, where the overrun would
+        // write past the mapping.
         assert!(
             code.len() <= self.capacity,
             "code buffer ({} bytes) exceeds the mapped page ({} bytes)",
@@ -142,8 +142,8 @@ mod tests {
     use super::LinuxCodePage;
     use crate::emit::executable::CodePage;
 
-    /// `CodePage` is publicly exported and every one of its methods is safe, so
-    /// this sequence is reachable from a downstream crate without `unsafe`.
+    /// Every one of `CodePage`'s methods is safe, so this sequence is
+    /// reachable without `unsafe`.
     /// Before the guard in `finish`, it returned an `ExecutableCode` whose
     /// `len` exceeded the mapping — and `ExecutableCode::as_bytes` is a safe
     /// `from_raw_parts` over exactly that `len`.
