@@ -5,7 +5,9 @@
 - **Status**: `Proposed`. Revised the same day after JP's rulings on Q1:
   one program per font per zoom level, there are no tables, the control
   points are uniforms, and `select` is renamed `if` (§1.6, §1.7). Revised
-  again 2026-10-01: no arrays (below). Phases A and B are done but B7; Phase C waits on O1–O4.
+  again 2026-10-01: no arrays (below). Phases A and B are done (B7, the
+  equivalence gate, 2026-10-08: every printable ASCII glyph at 7, 16 and
+  32 px); Phase C waits on O3–O4.
   2026-10-01: JP answered O1 and O2 "Yes and yes". Both are built: D-a,
   the O2 half (`feat(compiler): kernel-typed parameters, applied as
   contramap`), and O1, each glyph its own optimization unit in `P`
@@ -477,11 +479,14 @@ tree is not built, and its shape is still the font's (C1).
 `fonts/loop_blinn/kernel_copy.rs` pins it against the builder twice.
 - `a_piece_is_one_term_through_either_definition`: `one_piece` and the
   builder's `piece_term` are one canonical key.
-- `real_glyphs_composed_in_the_language_draw_the_builders_pixels`: DejaVu's
-  A, O, S, g, 8 and Q at 16 px, composed as above, draw the builder
-  `glyph`'s pixels to twice the closed form's error bound. They differ by
-  at most 1.9·10⁻⁶ on AVX-512 and on AVX2, against a bound of 1.6·10⁻⁵ at
-  its smallest.
+- `every_ascii_glyph_composed_in_the_language_draws_the_builders_pixels`
+  (B7): every printable ASCII glyph of DejaVu at 7, 16 and 32 px, composed
+  as above, draws the builder `glyph`'s pixels to twice the closed form's
+  error bound, and the uniform order (O3) holds at every piece count the
+  font has. Measured on AVX-512 and on AVX2 alike: they differ by at most
+  6.9·10⁻⁷ at 7 px, 2.0·10⁻⁶ at 16 px and 1.4·10⁻⁶ at 32 px, against a
+  bound of 7.6·10⁻⁶, 1.6·10⁻⁵ and 3.1·10⁻⁵ at its smallest. One sweep, one
+  process: 57 s in a debug build, so it runs presubmit whole.
 
 **A piece's term is its closed form, not an integral** (JP, 2026-09-29:
 *"delete all the integral stuff. other languages don't try this. probably
