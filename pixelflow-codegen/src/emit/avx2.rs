@@ -342,7 +342,7 @@ pub fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
 
 /// `dst = splat(val)`: `vbroadcastss ymm, [pool]` (VEX.256.66.0F38.W0 18 /r),
 /// one instruction from the kernel's constant pool. Zero is `vxorps`.
-pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::ConstPool) {
+fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::ConstPool) {
     let bits = val.to_bits();
     if bits == 0 {
         vxorps(code, dst.0, dst.0, dst.0);
@@ -359,7 +359,7 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::Con
 ///
 /// [`CompileError::BudgetExceeded`] when the element lies past a `disp32`
 /// ([`x86_64::block_element`]).
-pub fn emit_uniform_load(
+pub(super) fn emit_uniform_load(
     code: &mut Vec<u8>,
     dst: Reg,
     base: PtrReg,
@@ -375,7 +375,12 @@ pub fn emit_uniform_load(
 /// [base + index*4]` (VEX.256.66.0F38.W0 18 /r). See
 /// [`x86_64::BroadcastGprs`] for the register contract; `dst` may alias
 /// `idx`, since the index is in a GPR before `dst` is written.
-pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64::BroadcastGprs) {
+pub(super) fn emit_broadcast_load(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    idx: Reg,
+    gprs: x86_64::BroadcastGprs,
+) {
     AsmProgram::from([
         vcvttss2si_xmm(gprs.index, idx),
         Vex::m0f38_66(0x18).rm_scaled4(dst.0, gprs.base.as_gpr(), gprs.index),
@@ -394,7 +399,7 @@ pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64:
 /// `dst = op(src1, src2)`. VEX is 3-operand/non-destructive: operands are
 /// never clobbered and may alias `dst`. Comparisons produce an ordinary
 /// all-ones/all-zeros vector directly (no k-register step, unlike AVX-512).
-pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Reg) {
+fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Reg) {
     let (d, s1, s2) = (dst.0, src1.0, src2.0);
     if let Some(pred) = cmp_pred(op) {
         vcmpps(code, d, s1, s2, pred);
@@ -419,7 +424,7 @@ pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Re
 /// The temp is the allocator's for this instruction; only `Neg` and `Abs`
 /// use it, to hold the sign mask they XOR or AND with, which comes from the
 /// kernel's constant pool like any other constant.
-pub fn emit_unary(code: &mut Vec<u8>, unary: super::Unary, pool: &mut x86_64::ConstPool) {
+fn emit_unary(code: &mut Vec<u8>, unary: super::Unary, pool: &mut x86_64::ConstPool) {
     let super::Unary { op, dst, src, temp } = unary;
     match op {
         OpKind::Sqrt => vsqrtps(code, dst.0, src.0),
@@ -533,7 +538,7 @@ fn vextractps_store<D: Disp>(addr: Mem<D>, src: Reg, lane: u8) -> EncodedInst {
 const IOTA_BYTES: u64 = 0x0706_0504_0302_0100;
 
 /// Emit a shift of i32 lanes by a compile-time immediate.
-pub fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount: u8) {
+fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount: u8) {
     match op {
         OpKind::Shl => vpslld_imm(code, dst.0, src.0, amount),
         OpKind::Shr => vpsrld_imm(code, dst.0, src.0, amount),
@@ -547,7 +552,7 @@ pub fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount
 /// `tmp` is the allocator's temp for this instruction, which it picks disjoint
 /// from every operand — the `debug_assert` restates that here, where the
 /// instruction would silently blend garbage if it ever failed.
-pub fn emit_if(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg, tmp: Option<Reg>) {
+fn emit_if(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg, tmp: Option<Reg>) {
     let tmp = super::declared_temp(tmp);
     debug_assert!(tmp.0 != dst.0 && tmp.0 != if_true.0 && tmp.0 != if_false.0);
     vandps(code, tmp.0, dst.0, if_true.0);
@@ -556,7 +561,7 @@ pub fn emit_if(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg, tmp: O
 }
 
 /// `vmovmskps eax, ymmSRC` — gather the 8 lane sign bits into eax[7:0].
-pub fn emit_movmskps_eax(code: &mut Vec<u8>, src: Reg) {
+fn emit_movmskps_eax(code: &mut Vec<u8>, src: Reg) {
     assemble(code, [Vex::m0f(0x50).rrr(0, UNUSED_VVVV, src.0)]);
 }
 
@@ -564,7 +569,7 @@ pub fn emit_movmskps_eax(code: &mut Vec<u8>, src: Reg) {
 /// compares the raw byte pattern, which is what an 8-lane all-true check
 /// (`eax == 0xFF`) needs (`0x83`'s sign-extension would compare against
 /// `0xFFFFFFFF`, which `vmovmskps`'s zero-extended result can never equal).
-pub fn emit_cmp_al_imm8(code: &mut Vec<u8>, imm: u8) {
+fn emit_cmp_al_imm8(code: &mut Vec<u8>, imm: u8) {
     code.push(0x3C);
     code.push(imm);
 }
@@ -591,7 +596,7 @@ fn vfmadd231ps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
 /// register pressure pulls `a` and `b` apart from `c`. Both are pinned as
 /// bytes by `emit::tests::muladd_encoding` and as values by
 /// `tests/muladd_rounding.rs`.
-pub fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
+fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
     vfmadd231ps(code, dst.0, a.0, b.0);
 }
 
@@ -610,7 +615,7 @@ pub fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
 /// all three are distinct, and the allocator's temps are disjoint from
 /// the destination and each other by construction.
 #[derive(Clone, Copy)]
-pub struct GatherTemps {
+struct GatherTemps {
     /// Vector register for the truncated integer indices.
     pub idx_int: Reg,
     /// Vector register for the mask, all-ones going in and cleared on exit.
@@ -624,7 +629,7 @@ pub struct GatherTemps {
 /// `rbp`/`r13` (the pointer pool is `r9`–`r11`, so the SIB's no-base
 /// encoding is unreachable).
 #[must_use]
-pub fn gather(dst: Reg, base: PtrReg, index: Reg, mask: Reg) -> EncodedInst {
+fn gather(dst: Reg, base: PtrReg, index: Reg, mask: Reg) -> EncodedInst {
     debug_assert!(
         dst != index && dst != mask && index != mask,
         "vgatherdps: dst, index and mask must be three registers"
@@ -636,7 +641,7 @@ pub fn gather(dst: Reg, base: PtrReg, index: Reg, mask: Reg) -> EncodedInst {
 /// holds the *float* indices (the lowering already clamped them in range);
 /// `base` the buffer's address. `dst` may alias `idx`: the indices are
 /// truncated into `t.idx_int` before the first write to `dst`.
-pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx: Reg, base: PtrReg, t: GatherTemps) {
+fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx: Reg, base: PtrReg, t: GatherTemps) {
     debug_assert!(
         t.idx_int != idx,
         "the truncated indices must not overwrite the float ones"

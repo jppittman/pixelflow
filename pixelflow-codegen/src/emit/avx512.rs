@@ -465,7 +465,7 @@ pub fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
 /// The pool's operand is a full `disp32`, not EVEX's compressed `disp8`: the
 /// compressed form scales the byte by the tuple element size (4 for a
 /// `vbroadcastss` scalar source), and `disp32` is never scaled.
-pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::ConstPool) {
+fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::ConstPool) {
     let bits = val.to_bits();
     if bits == 0 {
         vxorps(code, dst.0, dst.0, dst.0);
@@ -484,7 +484,7 @@ pub fn emit_const(code: &mut Vec<u8>, dst: Reg, val: f32, pool: &mut x86_64::Con
 ///
 /// [`CompileError::BudgetExceeded`] when the element lies past a `disp32`
 /// ([`x86_64::block_element`]).
-pub fn emit_uniform_load(
+pub(super) fn emit_uniform_load(
     code: &mut Vec<u8>,
     dst: Reg,
     base: PtrReg,
@@ -501,7 +501,12 @@ pub fn emit_uniform_load(
 /// writemask, no `vgatherdps`. See [`x86_64::BroadcastGprs`] for the
 /// register contract; `dst` may alias `idx`, since the index is in a GPR
 /// before `dst` is written.
-pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64::BroadcastGprs) {
+pub(super) fn emit_broadcast_load(
+    code: &mut Vec<u8>,
+    dst: Reg,
+    idx: Reg,
+    gprs: x86_64::BroadcastGprs,
+) {
     AsmProgram::from([
         vcvttss2si_xmm(gprs.index, idx),
         Evex::m0f38_66(0x18).rm_scaled4(dst.0, gprs.base.as_gpr(), gprs.index),
@@ -522,7 +527,7 @@ pub fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64:
 /// EVEX is 3-operand and non-destructive: `src1`/`src2` are never clobbered
 /// and may alias `dst`.
 /// Returns `Err` for ops not in the Stage-1 arithmetic subset.
-pub fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Reg) {
+fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Reg) {
     let (d, s1, s2) = (dst.0, src1.0, src2.0);
     match op {
         OpKind::Add => vaddps(code, d, s1, s2),
@@ -572,7 +577,7 @@ fn cmp_pred(op: OpKind) -> Option<u8> {
 
 /// Whether `op` is a comparison handled by [`emit_compare`].
 #[must_use]
-pub fn is_compare(op: OpKind) -> bool {
+fn is_compare(op: OpKind) -> bool {
     cmp_pred(op).is_some()
 }
 
@@ -586,7 +591,7 @@ pub fn is_compare(op: OpKind) -> bool {
 ///
 /// `srcs` is a pair rather than two more positional args to stay inside this
 /// crate's 5-argument ceiling.
-pub fn emit_compare(code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2], k: KReg) {
+fn emit_compare(code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2], k: KReg) {
     let Some(pred) = cmp_pred(op) else {
         unimplemented_op("avx-512", op)
     };
@@ -628,7 +633,7 @@ pub fn emit_if(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg) {
 /// fixed `0xC9` ModRM byte (`11 001 001`, encoding k1,k1) is correct as long
 /// as `k` is `k1`; `debug_assert` states that rather than silently emitting
 /// the wrong register the moment a second mask register is ever wanted here.
-pub fn emit_mask_flags(code: &mut Vec<u8>, mask: Reg, k: KReg) {
+fn emit_mask_flags(code: &mut Vec<u8>, mask: Reg, k: KReg) {
     debug_assert_eq!(k, KReg(1), "kortestw's ModRM below hardcodes k1,k1");
     assemble(
         code,
@@ -643,7 +648,7 @@ pub fn emit_mask_flags(code: &mut Vec<u8>, mask: Reg, k: KReg) {
 /// Emit `dst = src << amount` / `dst = src >> amount` (logical, zero-fill)
 /// on lane bit patterns. The amount is a compile-time immediate — the
 /// schedule folds the `Const` RHS out (`ScheduledOp::ShiftImm`).
-pub fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount: u8) {
+fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount: u8) {
     match op {
         OpKind::Shl => vpslld_imm(code, dst.0, src.0, amount),
         OpKind::Shr => vpsrld_imm(code, dst.0, src.0, amount),
@@ -656,7 +661,7 @@ pub fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount
 /// The temp is the allocator's for this instruction; only `Neg` and `Abs`
 /// use it, to hold the sign mask, which comes from the kernel's constant pool
 /// like any other constant.
-pub fn emit_unary(code: &mut Vec<u8>, unary: super::Unary, pool: &mut x86_64::ConstPool) {
+fn emit_unary(code: &mut Vec<u8>, unary: super::Unary, pool: &mut x86_64::ConstPool) {
     let super::Unary { op, dst, src, temp } = unary;
     match op {
         OpKind::Sqrt => vsqrtps(code, dst.0, src.0),
@@ -694,7 +699,7 @@ pub fn emit_unary(code: &mut Vec<u8>, unary: super::Unary, pool: &mut x86_64::Co
 /// `vfmadd231ps dst, a, b` (EVEX.512.66.0F38.W0 B8 /r), which is
 /// `dst = a*b + dst`. The 231 form is the one whose accumulator is the
 /// destination, so `c` needs no move.
-pub fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
+fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
     assemble(code, [Evex::m0f38_66(0xB8).rrr(dst.0, a.0, b.0)]);
 }
 
@@ -740,7 +745,7 @@ pub fn emit_set_gather_mask(code: &mut Vec<u8>) {
 /// (mod=00 SIB base restriction) — the emitter uses `rax`.
 /// Pure encoding for `vgatherdps zmmDST{k1}, [baseGPR + zmmINDEX*4]`
 #[must_use]
-pub fn gather(dst: Reg, base_gpr: u8, index: Reg) -> EncodedInst {
+fn gather(dst: Reg, base_gpr: u8, index: Reg) -> EncodedInst {
     let d = dst.0;
     let idx = index.0;
     let base = base_gpr;
