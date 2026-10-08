@@ -76,7 +76,7 @@ pub mod storage;
 pub mod traffic;
 pub mod x86_64;
 
-pub use encoded::EncodedInst;
+use encoded::EncodedInst;
 pub use storage::{Slot, SourceOperand, StackFrame, Storage, StoreTarget};
 
 use pixelflow_ir::kind::OpKind;
@@ -119,7 +119,7 @@ pub trait AsmInsn: Copy {
 /// Written as an array or collection of instructions, then assembled into machine code:
 /// ```ignore
 /// AsmProgram::from([
-///     Inst::Mov { src: AX, dst: RX },
+///     Inst::Add { dst: RAX, src: RCX },
 /// ]).assemble(&mut buff);
 /// ```
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
