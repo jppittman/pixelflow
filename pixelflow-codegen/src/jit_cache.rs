@@ -50,8 +50,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::vec::Vec;
 
-use crate::CompiledKernel;
 use crate::emit;
+use crate::emit::CompiledKernel;
 use crate::error::CompileError;
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{BufferDecl, ExprNode, UniformDecl};
@@ -93,7 +93,7 @@ pub struct Linked {
 /// Panics if the arena — as handed in, or as saturation leaves it — names a
 /// retired coordinate axis (`Var(2)`/`Var(3)`, the old Z and W). The
 /// assertion itself lives one layer down, in
-/// [`emit::compile`](crate::emit::compile), because that is the boundary
+/// [`emit::compile`], because that is the boundary
 /// every route to machine code passes through and this is only one of them.
 /// Compile a [`Kernel`](pixelflow_ir::Kernel) for a lattice of the given `shape`.
 pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Linked, CompileError> {
@@ -179,7 +179,7 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // don't serialize. A racing duplicate compile wastes work; the first
     // insertion wins so all callers share one region.
     let result = emit_fn()?;
-    let compiled = Arc::new(CompiledKernel::new(result.code));
+    let compiled = Arc::new(result.code);
     let mut guard = cache.lock().expect("jit_cache: lock poisoned");
     let kernel = guard.entry(key).or_insert(compiled).clone();
     Ok(Linked {

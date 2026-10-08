@@ -127,7 +127,7 @@ curvature heuristic.
 The four channels are compiled together (`render::scene::compile_packed_for`),
 so the geometry they share is emitted once — the "mullet" saving the jet tier
 got from carrying colour as an opaque `Discrete` is now the compiler's, and is
-pinned by `scene3d_test::four_channels_share_one_geometry`.
+pinned by `render::packed::tests::four_channels_share_one_geometry`.
 
 ## Materialization boundaries
 

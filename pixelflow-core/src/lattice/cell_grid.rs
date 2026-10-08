@@ -1239,12 +1239,16 @@ mod tests {
 
         let a = CellGridProgram::compile(shape, [0.9, 0.8, 0.7, 0.6]);
         let b = CellGridProgram::compile(shape, [0.9, 0.8, 0.7, 0.6]);
+        let extent = pixelflow_ir::LatticeShape::new([shape.frame_w, shape.frame_h]);
+        let (ka, kb) = (shape.channel_kernels(), shape.channel_kernels());
         for c in 0..4 {
+            let compiled = |k: &Kernel| {
+                pixelflow_codegen::jit_cache::compile(k, extent)
+                    .expect("compile")
+                    .kernel
+            };
             assert!(
-                core::ptr::eq(
-                    a.channels[c].code_bytes().as_ptr(),
-                    b.channels[c].code_bytes().as_ptr()
-                ),
+                Arc::ptr_eq(&compiled(&ka.channels[c]), &compiled(&kb.channels[c])),
                 "one shape, one compiled kernel per channel"
             );
         }

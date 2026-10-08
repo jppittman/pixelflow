@@ -8,8 +8,8 @@ use crate::error::CompileError;
 use alloc::vec::Vec;
 use pixelflow_ir::kind::OpKind;
 
-pub(super) mod table;
-pub(super) use table::*;
+mod table;
+use table::*;
 
 // =============================================================================
 // Instruction Encoding Helpers
@@ -247,7 +247,7 @@ impl crate::emit::AsmInsn for Inst {
 /// value and `dup` spreads it. `base` is the block's address, wherever the
 /// allocator keeps that pointer value. An element past the 12-bit scaled
 /// immediate is addressed through IP0, as any deep displacement is
-/// ([`table::address_in_ip0`]).
+/// (`table::address_in_ip0`).
 ///
 /// # Errors
 ///
@@ -256,7 +256,7 @@ impl crate::emit::AsmInsn for Inst {
 /// address that reads some other argument. That bound is the operand
 /// type's, not the instruction's: `imm12` is the instruction's, and the IP0
 /// fallback covers everything past it up to `Mem`'s.
-pub(super) fn emit_uniform_load(
+fn emit_uniform_load(
     code: &mut Vec<u8>,
     dst: Reg,
     base: PtrReg,
@@ -374,14 +374,13 @@ fn try_encode_fmov_imm8(val: f32) -> Option<u8> {
 // Constant Pool Support
 // =============================================================================
 
-/// The pool's name and alignment are every backend's, not this one's: x86
-/// anchors `r8` to a pool of the same name the same way `X17` is anchored
-/// here.
+// The pool's name and alignment are every backend's, not this one's: x86
+// anchors `r8` to a pool of the same name the same way `X17` is anchored here.
 use super::CONST_POOL_ALIGN;
 
 /// Returns true if the given f32 needs a constant pool entry (not zero, not FMOV-encodable).
 #[must_use]
-pub(super) fn needs_const_pool(val: f32) -> bool {
+fn needs_const_pool(val: f32) -> bool {
     val.to_bits() != 0 && try_encode_fmov_imm8(val).is_none()
 }
 
@@ -423,12 +422,12 @@ pub(super) fn needs_const_pool(val: f32) -> bool {
 /// address that is not 4 KiB-aligned and every `ADRP` here is off by a page.
 ///
 /// Two things hold it up, and both are checked rather than assumed:
-/// [`CodePage::from_code`](crate::emit::executable::CodePage::from_code)
+/// `CodePage::from_code`
 /// writes the buffer at offset 0 of a mapping whose size — and therefore
 /// whose base — is a whole number of pages, pinned by
-/// `page_size_is_a_sane_power_of_two`; and an [`Assembly`] position is an
+/// `page_size_is_a_sane_power_of_two`; and an [`Assembly`](crate::emit::Assembly) position is an
 /// offset into the *whole* buffer rather than into the part one program
-/// contributed, which is why [`Assembly::from_code`] keeps no base to
+/// contributed, which is why [`Assembly::from_code`](crate::emit::Assembly::from_code) keeps no base to
 /// subtract. A displacement cannot tell those two apart. A page can.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct AdrpAdd {
@@ -509,7 +508,7 @@ struct GatherGprs {
     val: Gpr,
 }
 
-/// dst.4S = base[idx_int.S[lane]] for each lane — the NEON gather: four scalar
+/// `dst.4S = base[idx_int.S[lane]]` for each lane — the NEON gather: four scalar
 /// loads through GP scratch. `base` is the buffer's address, wherever the
 /// allocator keeps that pointer value; `idx_int` holds int32 lane indices
 /// (already converted and in-bounds by the `expand_gather` lowering).
@@ -539,11 +538,11 @@ fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx_int: Reg, base: PtrReg, gprs: G
 /// The GP registers a broadcast load runs through: the buffer's address,
 /// wherever the allocator keeps that pointer value, and the one index, this
 /// instruction's `RegisterFile::gpr_scratch` reservation.
-pub(super) struct BroadcastGprs {
+struct BroadcastGprs {
     /// The buffer base pointer.
-    pub(super) base: PtrReg,
+    base: PtrReg,
     /// Receives the truncated index.
-    pub(super) index: Gpr,
+    index: Gpr,
 }
 
 /// `dst = splat(base[idx])`, the index being the same in every lane of
@@ -551,7 +550,7 @@ pub(super) struct BroadcastGprs {
 /// w<index>, uxtw #2]` reads the element and `dup` spreads it. Three
 /// instructions where the gather is thirteen; `dst` may alias `idx`, since
 /// the index is in a GPR before `dst` is written.
-pub(super) fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: BroadcastGprs) {
+fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: BroadcastGprs) {
     AsmProgram::from([
         Inst::FcvtzsX {
             dst: gprs.index,
@@ -649,7 +648,7 @@ fn temps_for(op: &super::ScheduledOp) -> u8 {
 }
 
 /// How many GPRs this backend's encoding of `op` needs beyond
-/// [`regalloc::RegisterFile::gpr_ctx`].
+/// [`regalloc::RegisterFile::gpr_ctx`](crate::emit::regalloc::RegisterFile::gpr_ctx).
 ///
 /// `Gather`'s scalar-load sequence needs a per-lane index and a loaded
 /// value, each a GPR; `Broadcast` its one index, the element landing
@@ -755,6 +754,111 @@ fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Reg) {
 mod tests {
     use super::*;
     use crate::emit::{Assembly, CONST_POOL};
+
+    /// `code`'s instruction words.
+    fn words(code: &[u8]) -> Vec<u32> {
+        code.chunks(WORD_BYTES)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect()
+    }
+
+    /// Offset 3 shifted up by a full 16-bit range: where a 16-bit slot used
+    /// to wrap back to argument 3.
+    const PAST_U16: u64 = 3 + (u16::MAX as u64 + 1);
+
+    /// The uniform read for `offset = 3, dst = 5` through the block in `x9`:
+    /// `ldr s5, [x9, #12]`, `dup v5.4s, v5.s[0]` (checked against `llvm-mc
+    /// --disassemble`, LLVM 18). The block's address is a pointer-class
+    /// value the allocator placed, so no load of it appears here: that is the
+    /// `Context` def's, once per call.
+    #[test]
+    fn a_uniform_read_is_a_scalar_load_and_a_dup() {
+        let mut code = Vec::new();
+        emit_uniform_load(&mut code, Reg(5), ptr::X9, 3).expect("fits");
+        assert_eq!(words(&code), [0xBD40_0D25, 0x4E04_04A5]);
+    }
+
+    /// Past the old 16-bit width the scaled immediate (4095 elements) no
+    /// longer reaches, so the address is computed into IP0 in `add`-immediate
+    /// steps and `[x16]` is read — the same path a deep spill frame takes.
+    #[test]
+    fn a_uniform_read_past_the_scaled_immediate_goes_through_ip0() {
+        const PAST_U16_BYTES: u32 = 262_156;
+        let mut code = Vec::new();
+        emit_uniform_load(&mut code, Reg(5), ptr::X9, PAST_U16).expect("fits");
+        let step = MAX_ADD_IMM;
+        let full_adds = PAST_U16_BYTES / step;
+        let remainder = PAST_U16_BYTES % step;
+        let add = |src: u32, imm: u32| 0x9100_0000 | (imm << 10) | (src << 5) | 16;
+        let mut want = alloc::vec![add(9, step)];
+        want.extend(core::iter::repeat_n(add(16, step), full_adds as usize - 1));
+        want.push(add(16, remainder));
+        want.push(0xBD40_0000 | (16 << 5) | 5); // ldr s5, [x16]
+        want.push(0x4E04_04A5); // dup v5.4s, v5.s[0]
+        assert_eq!(words(&code), want);
+    }
+
+    /// The width is the encoder's, and an offset past it is refused, never
+    /// wrapped: a wrapped displacement would be a load of some other
+    /// argument, with plausible pixels. [`Mem`] holds a 32-bit byte offset.
+    #[test]
+    fn an_offset_past_the_byte_offset_is_refused() {
+        const LAST: u64 = u32::MAX as u64 / 4;
+        let refused = emit_uniform_load(&mut Vec::new(), Reg(0), ptr::X9, LAST + 1);
+        assert!(
+            matches!(refused, Err(CompileError::BudgetExceeded(_))),
+            "expected a refusal, got {refused:?}"
+        );
+    }
+
+    /// The lane-uniform read for `dst = 5, idx = 6` through `x9` and `x10`:
+    /// `fcvtzs x10, s6`, `ldr s5, [x9, w10, uxtw #2]`, `dup v5.4s, v5.s[0]`.
+    /// The base's own load is the `Context` def's, once per call.
+    #[test]
+    fn a_lane_uniform_read_truncates_then_loads_and_dups() {
+        let mut code = Vec::new();
+        emit_broadcast_load(
+            &mut code,
+            Reg(5),
+            Reg(6),
+            BroadcastGprs {
+                base: ptr::X9,
+                index: gpr::X10,
+            },
+        );
+        assert_eq!(words(&code), [0x9E38_00CA, 0xBC6A_5925, 0x4E04_04A5]);
+    }
+
+    /// The one word `f` emits.
+    fn shift_word(f: impl FnOnce(&mut Vec<u8>)) -> u32 {
+        let mut code = Vec::new();
+        f(&mut code);
+        let word: [u8; WORD_BYTES] = code.as_slice().try_into().expect("one instruction");
+        u32::from_le_bytes(word)
+    }
+
+    /// The immediate shifts' words, as the ARM ARM spells them: `immh:immb`
+    /// is `64 - shift` for `USHR .4S` and `32 + shift` for `SHL .4S`, with
+    /// `immh` = `01xx` selecting the 32-bit lane. A field one bit off decodes
+    /// as `.8H` or `.2D` — a different instruction that crosses lanes — and
+    /// executing a shift on the host cannot see that anywhere but aarch64.
+    #[test]
+    fn immediate_shifts_encode_a_32_bit_lane() {
+        // ushr v0.4s, v0.4s, #23
+        assert_eq!(
+            shift_word(|c| emit_ushr(c, Reg(0), Reg(0), 23)),
+            0x6F29_0400
+        );
+        // ushr v3.4s, v7.4s, #32: the widest count `.4S` holds.
+        assert_eq!(
+            shift_word(|c| emit_ushr(c, Reg(3), Reg(7), 32)),
+            0x6F20_04E3
+        );
+        // shl v1.4s, v2.4s, #8
+        assert_eq!(shift_word(|c| emit_shl(c, Reg(1), Reg(2), 8)), 0x4F28_5441);
+        // shl v4.4s, v5.4s, #31: the widest count `.4S` holds.
+        assert_eq!(shift_word(|c| emit_shl(c, Reg(4), Reg(5), 31)), 0x4F3F_54A4);
+    }
 
     #[test]
     fn fmov_imm8_common_values() {
@@ -1098,7 +1202,7 @@ mod tests {
 // The NEON `IsaBackend` driver
 // =============================================================================
 
-/// The aarch64 half of code generation: the [`IsaBackend`](super::super::IsaBackend)
+/// The aarch64 half of code generation: the [`IsaBackend`](crate::emit::IsaBackend)
 /// implementation and the constant pool it needs.
 ///
 /// **This file is where aarch64-specific bugs live, and the only place they
@@ -1107,7 +1211,7 @@ mod tests {
 /// machine computes NEON instruction words perfectly well. Only
 /// `compile_native` in `emit` decides which backend a process instantiates
 /// — from the tier `crate::isa` read off the CPU — and only
-/// [`executable`](super::super::executable) needs the matching CPU.
+/// [`executable`](crate::emit::executable) needs the matching CPU.
 ///
 /// The consequence worth stating: a change that does not touch an ISA file
 /// cannot introduce a platform-specific bug. That is the same bargain `unsafe`
@@ -1297,25 +1401,12 @@ pub(super) mod driver {
 
     pub(in crate::emit) struct Aarch64Backend {
         consts: ConstPool,
-        file: regalloc::RegisterFile,
     }
 
     impl Aarch64Backend {
-        /// The constant pool as emitted so far.
-        ///
-        /// Test-only, and says so in the type: its one reader is the test
-        /// pinning that the pool APPENDS across the two bodies a collapse
-        /// compile pushes through one backend. A reset there is the glyph-ink
-        /// regression.
-        #[cfg(test)]
-        pub(in crate::emit) fn pool_entries(&self) -> &[PoolEntry] {
-            &self.consts.entries
-        }
-
-        pub(in crate::emit) fn new(ctx: EmitCtx) -> Self {
+        pub(in crate::emit) fn new() -> Self {
             Self {
                 consts: ConstPool::new(),
-                file: AARCH64_FILE.capped(ctx.max_regs),
             }
         }
     }
@@ -1326,7 +1417,7 @@ pub(super) mod driver {
         }
 
         fn register_file(&self) -> regalloc::RegisterFile {
-            self.file
+            AARCH64_FILE
         }
 
         fn begin(&mut self, schedule: &[regalloc::Def]) -> Result<(), CompileError> {
@@ -1550,11 +1641,12 @@ pub(super) mod driver {
             let row = crate::emit::declared_gpr_temp(write.scratch.gpr_temp(0));
             let col = crate::emit::declared_gpr_temp(write.scratch.gpr_temp(1));
             let via = crate::emit::declared_temp(write.scratch.temp(0));
-            let out = self
-                .file
+            let out = AARCH64_FILE
                 .gpr_out
                 .expect("NEON's store needs the output pointer");
-            let pitch = self.file.gpr_pitch.expect("NEON's store needs the pitch");
+            let pitch = AARCH64_FILE
+                .gpr_pitch
+                .expect("NEON's store needs the pitch");
             index_into(code, row, write.row, via);
             index_into(code, col, write.col, via);
             AsmProgram::from([
@@ -1801,6 +1893,72 @@ pub(super) mod driver {
             None => {}
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::emit::regalloc;
+
+        /// The aarch64 constant pool must APPEND across the scopes a collapse
+        /// compile pushes through one backend, never reset.
+        ///
+        /// An earlier scope's bytes already have the first pool's X17-relative
+        /// offsets baked in, so a reset leaves them pointing at different
+        /// constants — the "macOS glyph-ink regression", which painted glyphs with
+        /// the wrong ink and was only ever observable by running the app on a Mac.
+        ///
+        /// It is an aarch64 bug, not a macOS one, and now it is a sub-millisecond
+        /// unit test on every host.
+        #[test]
+        fn aarch64_const_pool_appends_across_scopes() {
+            /// One scope: a uniform (read through its block's pointer) times a
+            /// constant only the pool can hold.
+            fn scope_for(k: f32) -> Vec<regalloc::Def> {
+                alloc::vec![
+                    regalloc::Def {
+                        value: regalloc::ValueId(0),
+                        op: ScheduledOp::Context(0),
+                    },
+                    regalloc::Def {
+                        value: regalloc::ValueId(1),
+                        op: ScheduledOp::Uniform(regalloc::ValueId(0), 0),
+                    },
+                    regalloc::Def {
+                        value: regalloc::ValueId(2),
+                        op: ScheduledOp::Const(k),
+                    },
+                    regalloc::Def {
+                        value: regalloc::ValueId(3),
+                        op: ScheduledOp::Binary(
+                            OpKind::Mul,
+                            regalloc::ValueId(1),
+                            regalloc::ValueId(2),
+                        ),
+                    },
+                ]
+            }
+
+            // Two constants that genuinely need the pool (not FMOV-immediate).
+            let (first, second) = (0.123_456_79_f32, 987.654_3_f32);
+            assert!(needs_const_pool(first));
+            assert!(needs_const_pool(second));
+
+            let mut backend = Aarch64Backend::new();
+            crate::emit::tests::emit_dag_body(scope_for(first), &mut backend).expect("first scope");
+            let after_first = backend.consts.entries.to_vec();
+            assert!(!after_first.is_empty(), "the first scope pooled nothing");
+            crate::emit::tests::emit_dag_body(scope_for(second), &mut backend)
+                .expect("second scope");
+
+            assert!(
+                backend.consts.entries.starts_with(&after_first),
+                "the second scope RESET the constant pool: the first scope's \
+                 baked-in X17-relative offsets now name different constants — the \
+                 glyph-ink regression. Pool was {after_first:?}, became {:?}",
+                backend.consts.entries
+            );
+        }
+    }
 }
 
 // =============================================================================
@@ -1809,16 +1967,16 @@ pub(super) mod driver {
 // =============================================================================
 
 /// Physical pointer registers used by AAPCS64 emitted kernels.
-pub(super) mod ptr {
+mod ptr {
     use super::PtrReg;
 
     /// 1st argument: context pointer — array of bound buffer bases, then
     /// the uniform and origin blocks.
-    pub(in crate::emit) const X0: PtrReg = PtrReg(0);
+    pub(super) const X0: PtrReg = PtrReg(0);
     /// 2nd argument: the output plane.
     pub(super) const X1: PtrReg = PtrReg(1);
     /// Scratch: a gather's base pointer, a store's address.
-    pub(in crate::emit) const X9: PtrReg = PtrReg(9);
+    pub(super) const X9: PtrReg = PtrReg(9);
     /// IP0, intra-procedure scratch (displacement fallback).
     pub(super) const X16: PtrReg = PtrReg(16);
     /// IP1, intra-procedure scratch (constant-pool anchor).
@@ -1828,7 +1986,7 @@ pub(super) mod ptr {
 }
 
 /// AAPCS64 general-purpose registers (integers, indices, the pitch).
-pub(super) mod gpr {
+mod gpr {
     use super::Gpr;
 
     /// 3rd argument: the pitch.
@@ -1841,7 +1999,7 @@ pub(super) mod gpr {
     pub(super) const X7: Gpr = Gpr(7);
     pub(super) const X8: Gpr = Gpr(8);
     /// Scratch: a gather's index, a store's column.
-    pub(in crate::emit) const X10: Gpr = Gpr(10);
+    pub(super) const X10: Gpr = Gpr(10);
     /// Scratch: a gather's value.
     pub(super) const X11: Gpr = Gpr(11);
     /// The pointer pool, continued past the scratch.
@@ -2005,7 +2163,7 @@ impl AsmInsn for BranchIfW16Zero {
 #[cfg(test)]
 mod label_tests {
     use super::*;
-    use crate::emit::{Assembly, EmitCtx, IfArm, IsaBackend, Label, MaskTest};
+    use crate::emit::{Assembly, IfArm, IsaBackend, Label, MaskTest};
 
     /// One known word, so a test can measure distances in instructions without
     /// depending on any real encoding.
@@ -2016,33 +2174,6 @@ mod label_tests {
     /// changed about it.
     const OLD_CBZ_W16: u32 = 0x3400_0010;
 
-    /// One item of a test program: an instruction, or a label bound here.
-    #[derive(Copy, Clone)]
-    enum Item {
-        Inst(Inst),
-        B(B),
-        Pair(BranchIfW16Zero),
-        Label(Label),
-    }
-
-    /// `items`, assembled after the bytes already in `code`.
-    fn assemble_after(code: Vec<u8>, items: impl IntoIterator<Item = Item>) -> Vec<u8> {
-        let mut asm = Assembly::from_code(code);
-        for item in items {
-            match item {
-                Item::Inst(inst) => asm.push(inst),
-                Item::B(b) => asm.push(b),
-                Item::Pair(pair) => asm.push(pair),
-                Item::Label(label) => asm.bind(label),
-            }
-        }
-        asm.finish()
-    }
-
-    fn assemble(items: impl IntoIterator<Item = Item>) -> Vec<u8> {
-        assemble_after(Vec::new(), items)
-    }
-
     fn word_at(code: &[u8], at: usize) -> u32 {
         u32::from_le_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]])
     }
@@ -2050,12 +2181,12 @@ mod label_tests {
     #[test]
     fn forward_branch_counts_instructions_not_bytes() {
         let end = Label::new("end");
-        let code = assemble([
-            Item::B(B { target: end }),
-            Item::Inst(NOP),
-            Item::Inst(NOP),
-            Item::Label(end),
-        ]);
+        let mut asm = Assembly::default();
+        asm.push(B { target: end });
+        asm.push(NOP);
+        asm.push(NOP);
+        asm.bind(end);
+        let code = asm.finish();
         // Three instructions ahead of the branch's own address.
         assert_eq!(word_at(&code, 0) & 0x03FF_FFFF, 3);
     }
@@ -2063,12 +2194,12 @@ mod label_tests {
     #[test]
     fn a_back_edge_is_negative() {
         let top = Label::new("end");
-        let code = assemble([
-            Item::Label(top),
-            Item::Inst(NOP),
-            Item::Inst(NOP),
-            Item::B(B { target: top }),
-        ]);
+        let mut asm = Assembly::default();
+        asm.bind(top);
+        asm.push(NOP);
+        asm.push(NOP);
+        asm.push(B { target: top });
+        let code = asm.finish();
         // The branch sits two instructions past the label, so -2 words, in
         // imm26's two's complement.
         assert_eq!(
@@ -2102,11 +2233,11 @@ mod label_tests {
     #[test]
     fn a_branch_on_w16_is_cbnz_over_b() {
         let exit = Label::new("end");
-        let code = assemble([
-            Item::Pair(BranchIfW16Zero { target: exit }),
-            Item::Inst(NOP),
-            Item::Label(exit),
-        ]);
+        let mut asm = Assembly::default();
+        asm.push(BranchIfW16Zero { target: exit });
+        asm.push(NOP);
+        asm.bind(exit);
+        let code = asm.finish();
         assert_eq!(code.len(), 3 * WORD_BYTES, "cbnz, b, nop");
         let (cbnz, b) = (word_at(&code, 0), word_at(&code, 4));
 
@@ -2124,7 +2255,7 @@ mod label_tests {
     /// the way the emitter builds it: the backend's verb, the arm's body, the
     /// label bound past it, then the assembler's patch pass.
     fn guard_over_arm(arm: IfArm, filler: usize) -> Vec<u32> {
-        let mut backend = driver::Aarch64Backend::new(EmitCtx::default());
+        let mut backend = driver::Aarch64Backend::new();
         let mut asm = Assembly::default();
         let past_arm = Label::new("past_arm");
         let test = MaskTest {
@@ -2198,12 +2329,15 @@ mod label_tests {
     }
 
     /// A label may name a position no instruction occupies — the end of the
-    /// program. That is why a label is an item of its own rather than a field
-    /// on an instruction: there is nothing here to hang it on.
+    /// program. That is why binding a label is a step of its own rather than
+    /// a field on an instruction: there is nothing here to hang it on.
     #[test]
     fn a_label_can_end_the_program() {
         let end = Label::new("end");
-        let code = assemble([Item::B(B { target: end }), Item::Label(end)]);
+        let mut asm = Assembly::default();
+        asm.push(B { target: end });
+        asm.bind(end);
+        let code = asm.finish();
         assert_eq!(code.len(), 4);
         assert_eq!(word_at(&code, 0) & 0x03FF_FFFF, 1);
     }
@@ -2211,13 +2345,14 @@ mod label_tests {
     #[test]
     fn a_program_is_position_independent() {
         let end = Label::new("end");
-        let items = [
-            Item::B(B { target: end }),
-            Item::Inst(NOP),
-            Item::Label(end),
-        ];
-        let offset = assemble_after(alloc::vec![0xAAu8; 4], items);
-        assert_eq!(&assemble(items)[..], &offset[4..]);
+        let program = |mut asm: Assembly| {
+            asm.push(B { target: end });
+            asm.push(NOP);
+            asm.bind(end);
+            asm.finish()
+        };
+        let offset = program(Assembly::from_code(alloc::vec![0xAAu8; 4]));
+        assert_eq!(&program(Assembly::default())[..], &offset[4..]);
     }
 
     #[test]

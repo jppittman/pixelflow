@@ -51,7 +51,7 @@ use crate::program::tree::Tree;
 use crate::program::{ArmPair, Def, IfGuard, ValueId};
 
 /// A scope's schedule order and the branches over it.
-pub(crate) struct Layout {
+pub(super) struct Layout {
     /// The old position of each new position: the schedule to emit is
     /// `order.map(|old| schedule[old])`.
     order: Vec<usize>,
@@ -59,7 +59,7 @@ pub(crate) struct Layout {
     /// the old schedule (a fold's `at`) is carried to the new one.
     pub(super) position: Vec<usize>,
     /// The `If`s with a branch, in new positions, ascending.
-    pub(crate) guards: Vec<IfGuard>,
+    pub(super) guards: Vec<IfGuard>,
 }
 
 /// The blocks of one scope: the earning arm regions, nested as they are in the
@@ -112,7 +112,7 @@ impl Layout {
     /// The layout of `schedule`, from the ownership of its values.
     ///
     /// `external` and `folds` are as for [`Ownership::of`].
-    pub(crate) fn of(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Self {
+    pub(super) fn of(schedule: &[Def], external: &[ValueId], folds: &FoldReads) -> Self {
         let own = Ownership::of(schedule, external, folds);
         Self::from(schedule, folds, &own)
     }
@@ -291,7 +291,7 @@ impl Layout {
     }
 
     /// `schedule` in the new order.
-    pub(crate) fn apply(&self, schedule: &[Def]) -> Vec<Def> {
+    pub(super) fn apply(&self, schedule: &[Def]) -> Vec<Def> {
         self.order
             .iter()
             .map(|&old| schedule[old].clone())
@@ -308,7 +308,7 @@ mod tests {
 
     impl Layout {
         /// Whether the schedule is returned as it came.
-        pub(crate) fn is_identity(&self) -> bool {
+        fn is_identity(&self) -> bool {
             self.order.iter().enumerate().all(|(new, &old)| new == old)
         }
 
@@ -318,12 +318,7 @@ mod tests {
         ///
         /// A schedule that reads a value before it defines it (a hand-built
         /// fixture) has no order to keep, and passes.
-        pub(crate) fn is_sound(
-            &self,
-            schedule: &[Def],
-            roots: &[ValueId],
-            folds: &FoldReads,
-        ) -> bool {
+        fn is_sound(&self, schedule: &[Def], roots: &[ValueId], folds: &FoldReads) -> bool {
             if !reads_follow(0..schedule.len(), schedule, folds) {
                 return true;
             }
@@ -335,7 +330,7 @@ mod tests {
     /// Whether, taking `schedule`'s defs in `order`, every read follows the value
     /// it reads. A value this schedule does not define (a live-in) is not read
     /// from here.
-    pub(crate) fn reads_follow(
+    fn reads_follow(
         order: impl Iterator<Item = usize>,
         schedule: &[Def],
         folds: &FoldReads,
@@ -396,13 +391,18 @@ mod tests {
                 .guards
                 .iter()
                 .find(|g| schedule[layout.order[g.if_idx]].value == schedule[pair[0].if_pos].value);
-            for arm in pair {
+            // An `If`'s true arm first (`Ownership::arms`).
+            for (arm, which) in pair.iter().zip(IfArm::ALL) {
                 let owned: Vec<ValueId> = (0..schedule.len())
-                    .filter(|&pos| own.is_within(own.region_of(pos), arm.region))
+                    .filter(|&pos| {
+                        own.regions()
+                            .common_ancestor(own.region_of(pos).0, arm.region.0)
+                            == arm.region.0
+                    })
                     .map(|pos| schedule[pos].value)
                     .collect();
                 let run: Vec<ValueId> = guard
-                    .map(|g| g.range(arm.arm))
+                    .map(|g| g.range(which))
                     .filter(|&(start, end)| start != end)
                     .map(|(start, end)| {
                         (start..end)
@@ -419,7 +419,7 @@ mod tests {
                 assert_eq!(
                     run, owned,
                     "the {:?} arm of the If at {} is not exactly the run of what it owns",
-                    arm.arm, arm.if_pos
+                    which, arm.if_pos
                 );
                 assert!(arm.cycles > MISPREDICT_PENALTY_CYCLES);
             }

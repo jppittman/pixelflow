@@ -370,7 +370,7 @@ fn emit_const(
 ///
 /// [`CompileError::BudgetExceeded`] when the element lies past a `disp32`
 /// ([`x86_64::block_element`]).
-pub(super) fn emit_uniform_load(
+fn emit_uniform_load(
     code: &mut Vec<u8>,
     dst: Reg,
     base: PtrReg,
@@ -386,12 +386,7 @@ pub(super) fn emit_uniform_load(
 /// [base + index*4]` (VEX.256.66.0F38.W0 18 /r). See
 /// [`x86_64::BroadcastGprs`] for the register contract; `dst` may alias
 /// `idx`, since the index is in a GPR before `dst` is written.
-pub(super) fn emit_broadcast_load(
-    code: &mut Vec<u8>,
-    dst: Reg,
-    idx: Reg,
-    gprs: x86_64::BroadcastGprs,
-) {
+fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64::BroadcastGprs) {
     AsmProgram::from([
         vcvttss2si_xmm(gprs.index, idx),
         Vex::m0f38_66(0x18).rm_scaled4(dst.0, gprs.base.as_gpr(), gprs.index),
@@ -498,7 +493,7 @@ fn temps_for(op: &super::ScheduledOp) -> u8 {
 }
 
 /// How many GPRs this backend's encoding of `op` needs beyond
-/// [`regalloc::RegisterFile::gpr_ctx`].
+/// [`regalloc::RegisterFile::gpr_ctx`](crate::emit::regalloc::RegisterFile::gpr_ctx).
 ///
 /// `Gather` and `Uniform` need none: the base each addresses is a pointer
 /// value the allocator carries, and `vgatherdps` takes its indices as a
@@ -581,7 +576,7 @@ fn emit_if(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg, tmp: Optio
     vorps(code, dst.0, tmp.0, dst.0);
 }
 
-/// `vmovmskps eax, ymmSRC` — gather the 8 lane sign bits into eax[7:0].
+/// `vmovmskps eax, ymmSRC` — gather the 8 lane sign bits into `eax[7:0]`.
 fn emit_movmskps_eax(code: &mut Vec<u8>, src: Reg) {
     assemble(code, [Vex::m0f(0x50).rrr(0, UNUSED_VVVV, src.0)]);
 }
@@ -681,17 +676,95 @@ mod tests {
     //! `ymm` kernels and execute them on the host.
     use super::*;
 
-    /// Executes the bytes on this host's CPU, so every test first asks
-    /// whether it can (`skip_unless_host_runs!`); the encodings themselves
-    /// are pinned bytewise on every host by the tests above. The `extern
+    /// Offset 3 shifted up by a full 16-bit range: where a 16-bit slot used
+    /// to wrap back to argument 3.
+    const PAST_U16: u64 = 3 + (u16::MAX as u64 + 1);
+
+    /// The uniform read for `dst = 5` through the block in `rax`: offset 3
+    /// is `vbroadcastss ymm5, [rax + 12]` (checked against `llvm-mc
+    /// --disassemble`, LLVM 18), and an offset past the old 16-bit width
+    /// carries its full `disp32` with the same prefix and ModRM. The block's
+    /// address is a pointer-class value the allocator placed, so no load of
+    /// it appears here: that is the `Context` def's, once per call.
+    #[test]
+    fn a_uniform_read_is_one_broadcast_load() {
+        let mut code = Vec::new();
+        emit_uniform_load(&mut code, Reg(5), PtrReg(0), 3).expect("fits");
+        assert_eq!(code, [0xC4, 0xE2, 0x7D, 0x18, 0xA8, 0x0C, 0, 0, 0]);
+
+        let mut code = Vec::new();
+        emit_uniform_load(&mut code, Reg(5), PtrReg(0), PAST_U16).expect("fits");
+        assert_eq!(code, [0xC4, 0xE2, 0x7D, 0x18, 0xA8, 0x0C, 0x00, 0x04, 0x00]);
+    }
+
+    /// The width is the encoder's, and an offset past it is refused, never
+    /// wrapped: a wrapped displacement would be a load of some other argument,
+    /// with plausible pixels. `disp32` is signed, so the last element it
+    /// reaches is at `i32::MAX / 4` — and a refused offset emits nothing.
+    #[test]
+    fn an_offset_past_the_disp32_is_refused() {
+        const LAST_DISP32: u64 = i32::MAX as u64 / 4;
+        let mut code = Vec::new();
+        emit_uniform_load(&mut code, Reg(0), PtrReg(0), LAST_DISP32)
+            .expect("the last element a disp32 reaches");
+        for offset in [LAST_DISP32 + 1, u64::MAX] {
+            let mut code = Vec::new();
+            let refused = emit_uniform_load(&mut code, Reg(0), PtrReg(0), offset);
+            assert!(
+                matches!(refused, Err(CompileError::BudgetExceeded(_))),
+                "offset {offset}: expected a refusal, got {refused:?}"
+            );
+            assert!(code.is_empty(), "offset {offset}: a refusal emitted bytes");
+        }
+    }
+
+    /// The lane-uniform read for `dst = 5, idx = 6`: `vcvttss2si rcx, xmm6`
+    /// then `vbroadcastss ymm5, [rax + rcx*4]` (checked against `objdump
+    /// -M intel`); and with the base and index past the low eight, `[r9 +
+    /// r11*4]` sets `X` and `B` in the prefix (clear, inverted). The base's
+    /// own load is the `Context` def's, once per call, not this instruction's.
+    #[test]
+    fn a_lane_uniform_read_truncates_then_broadcasts() {
+        let low = x86_64::BroadcastGprs {
+            base: PtrReg(0),
+            index: x86_64::gpr::RCX,
+        };
+        let mut code = Vec::new();
+        emit_broadcast_load(&mut code, Reg(5), Reg(6), low);
+        assert_eq!(
+            code,
+            [
+                0xC4, 0xE1, 0xFE, 0x2C, 0xCE, 0xC4, 0xE2, 0x7D, 0x18, 0x2C, 0x88
+            ]
+        );
+
+        let high = x86_64::BroadcastGprs {
+            base: PtrReg(9),
+            index: Gpr(11),
+        };
+        let mut code = Vec::new();
+        emit_broadcast_load(&mut code, Reg(5), Reg(6), high);
+        // `vcvttss2si r11, xmm6`, whose VEX.R carries the GPR's high bit.
+        assert_eq!(&code[..5], [0xC4, 0x61, 0xFE, 0x2C, 0xDE]);
+        assert_eq!(&code[5..], [0xC4, 0x82, 0x7D, 0x18, 0x2C, 0x99]);
+    }
+
+    /// Executes the bytes on this host's CPU — AVX2 with FMA is the floor
+    /// every x86-64 host the JIT runs on has (`isa::detect` refuses one
+    /// below it); the encodings themselves are pinned bytewise on every host
+    /// by the tests above. The `extern
     /// "C"` kernels take `ymm` values, which the ABI only lets a caller
     /// compiled with AVX pass — hence `#[target_feature]` on the functions
     /// that call them, and nowhere else.
     #[cfg(target_arch = "x86_64")]
     mod runtime {
         use super::super::*;
-        use crate::emit::executable::ExecutableCode;
-        use crate::isa::{Isa, skip_unless_host_runs};
+
+        /// `ret` (`C3`): the end of a hand-assembled test kernel, which
+        /// returns its `__m256`/`__m512` in the vector register a
+        /// `vzeroupper` would clear.
+        const RET: u8 = 0xC3;
+        use crate::emit::executable::CompiledKernel;
         use core::arch::x86_64::*;
 
         #[allow(improper_ctypes_definitions)]
@@ -699,7 +772,7 @@ mod tests {
 
         fn run(body: &[u8], xs: [f32; 8], ys: [f32; 8], zs: [f32; 8]) -> [f32; 8] {
             let mut code = body.to_vec();
-            crate::emit::x86_64::ret(&mut code);
+            code.push(RET);
             // SAFETY: every caller is a test that checked the host runs AVX2.
             unsafe { run_code(&code, xs, ys, zs) }
         }
@@ -717,7 +790,7 @@ mod tests {
             let mut asm = crate::emit::Assembly::default();
             x86_64::anchor(&mut asm);
             asm.code.extend_from_slice(body);
-            crate::emit::x86_64::ret(&mut asm.code);
+            asm.code.push(RET);
             pool.finish(&mut asm);
             // SAFETY: every caller is a test that checked the host runs AVX2.
             unsafe { run_code(&asm.finish(), xs, ys, zs) }
@@ -729,9 +802,9 @@ mod tests {
         /// is compiled with AVX enabled to be allowed to pass `ymm` values.
         #[target_feature(enable = "avx2")]
         unsafe fn run_code(code: &[u8], xs: [f32; 8], ys: [f32; 8], zs: [f32; 8]) -> [f32; 8] {
-            let exec = unsafe { ExecutableCode::from_code(code).expect("mmap") };
+            let exec = unsafe { CompiledKernel::from_code(code).expect("mmap") };
             unsafe {
-                let f: K = exec.as_fn();
+                let f: K = core::mem::transmute(exec.as_bytes().as_ptr());
                 let r = f(
                     _mm256_loadu_ps(xs.as_ptr()),
                     _mm256_loadu_ps(ys.as_ptr()),
@@ -791,7 +864,6 @@ mod tests {
 
         #[test]
         fn emit_binary_matches_the_scalar_reference_for_every_arithmetic_op() {
-            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let cases: &[BinaryCase] = &[
                 (OpKind::Add, |a, b| a + b),
@@ -810,7 +882,6 @@ mod tests {
 
         #[test]
         fn emit_binary_produces_an_all_ones_mask_when_lt_holds() {
-            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Lt, X, X, Y);
@@ -823,7 +894,6 @@ mod tests {
 
         #[test]
         fn emit_movmskps_eax_gathers_the_lanewise_compare_mask_sign_bits() {
-            skip_unless_host_runs!(Isa::Avx2);
             #[allow(improper_ctypes_definitions)]
             type MaskCheck = unsafe extern "C" fn(__m256, __m256) -> i32;
 
@@ -833,10 +903,10 @@ mod tests {
             #[target_feature(enable = "avx2")]
             unsafe fn run_mask(body: &[u8], xs: [f32; 8], ys: [f32; 8]) -> i32 {
                 let mut code = body.to_vec();
-                crate::emit::x86_64::ret(&mut code);
-                let exec = unsafe { ExecutableCode::from_code(&code).expect("mmap") };
+                code.push(RET);
+                let exec = unsafe { CompiledKernel::from_code(&code).expect("mmap") };
                 unsafe {
-                    let f: MaskCheck = exec.as_fn();
+                    let f: MaskCheck = core::mem::transmute(exec.as_bytes().as_ptr());
                     f(_mm256_loadu_ps(xs.as_ptr()), _mm256_loadu_ps(ys.as_ptr()))
                 }
             }
@@ -864,7 +934,6 @@ mod tests {
 
         #[test]
         fn emit_unary_computes_sqrt_neg_and_abs_per_lane() {
-            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let unary = |op, src, temp| crate::emit::Unary {
                 op,
@@ -890,7 +959,6 @@ mod tests {
 
         #[test]
         fn emit_if_blends_if_true_and_if_false_by_the_mask() {
-            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Lt, Reg(5), X, Y); // mask
@@ -908,7 +976,6 @@ mod tests {
         /// every read is one broadcast from it.
         #[test]
         fn emit_const_broadcasts_and_adds_to_every_lane() {
-            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut pool = x86_64::ConstPool::default();
             let mut c = Vec::new();
@@ -927,7 +994,6 @@ mod tests {
 
         #[test]
         fn emit_fmadd_c_in_dst_computes_the_fused_multiply_add() {
-            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             emit_mov(&mut c, Reg(5), Z);
@@ -946,7 +1012,6 @@ mod tests {
         /// forms genuinely disagree, and this asserts the bits.
         #[test]
         fn emit_fmadd_c_in_dst_rounds_once_not_twice() {
-            skip_unless_host_runs!(Isa::Avx2);
             let xs = [1.000_000_1f32; 8];
             let ys = [4097.0f32; 8];
             let zs = [4097.0f32; 8];
@@ -975,7 +1040,6 @@ mod tests {
 
         #[test]
         fn emit_load_after_emit_store_recovers_the_spilled_value() {
-            skip_unless_host_runs!(Isa::Avx2);
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
             AsmProgram::from([crate::emit::x86_64::Inst::SubImm32 {
@@ -1002,7 +1066,6 @@ mod tests {
         /// `rdi`, holding the buffer's own address.
         #[test]
         fn emit_gather_reads_the_value_at_each_lanes_index() {
-            skip_unless_host_runs!(Isa::Avx2);
             #[allow(improper_ctypes_definitions)]
             type G = unsafe extern "C" fn(*const f32, __m256) -> __m256;
 
@@ -1011,12 +1074,12 @@ mod tests {
             /// The host must execute AVX2 (checked above).
             #[target_feature(enable = "avx2")]
             unsafe fn run_gather(
-                exec: &ExecutableCode,
+                exec: &CompiledKernel,
                 base: *const f32,
                 idx: [f32; 8],
             ) -> [f32; 8] {
                 unsafe {
-                    let f: G = exec.as_fn();
+                    let f: G = core::mem::transmute(exec.as_bytes().as_ptr());
                     let r = f(base, _mm256_loadu_ps(idx.as_ptr()));
                     let mut out = [0.0f32; 8];
                     _mm256_storeu_ps(out.as_mut_ptr(), r);
@@ -1042,9 +1105,9 @@ mod tests {
                 if dst != Reg(0) {
                     emit_mov(&mut c, Reg(0), dst);
                 }
-                crate::emit::x86_64::ret(&mut c);
+                c.push(RET);
 
-                let exec = unsafe { ExecutableCode::from_code(&c).expect("mmap") };
+                let exec = unsafe { CompiledKernel::from_code(&c).expect("mmap") };
                 // SAFETY: the host runs AVX2, checked at the top of this test.
                 let out = unsafe { run_gather(&exec, buf.as_ptr(), idx) };
                 for i in 0..8 {
@@ -1135,7 +1198,7 @@ mod tests {
 /// compiles, typechecks and is swept for op coverage on every host, whatever
 /// CPU it has. Only `compile_native` in `emit` decides which backend a
 /// process instantiates — from the tier `crate::isa` read off the CPU — and
-/// only [`executable`](super::super::executable) needs the matching hardware.
+/// only [`executable`](crate::emit::executable) needs the matching hardware.
 ///
 /// The consequence worth stating: a change that does not touch an ISA file
 /// cannot introduce a platform-specific bug. That is the bargain `unsafe`
@@ -1202,14 +1265,12 @@ pub(super) mod driver {
     /// AVX2 implementation of the shared driver's leaf operations.
     pub(in crate::emit) struct Avx2Backend {
         consts: x86::ConstPool,
-        file: regalloc::RegisterFile,
     }
 
     impl Avx2Backend {
-        pub(in crate::emit) fn new(ctx: EmitCtx) -> Self {
+        pub(in crate::emit) fn new() -> Self {
             Self {
                 consts: x86::ConstPool::default(),
-                file: AVX2_FILE.capped(ctx.max_regs),
             }
         }
 
@@ -1234,7 +1295,7 @@ pub(super) mod driver {
         }
 
         fn register_file(&self) -> regalloc::RegisterFile {
-            self.file
+            AVX2_FILE
         }
 
         /// Nothing to seed: the pool fills as constants are emitted.
@@ -1318,8 +1379,7 @@ pub(super) mod driver {
                     super::emit_uniform_load(code, *dst, *base, *offset)?;
                 }
                 ResolvedOp::Context { dst, slot } => {
-                    let ctx = self
-                        .file
+                    let ctx = AVX2_FILE
                         .gpr_ctx
                         .expect("x86's context read needs the GPR context input");
                     AsmProgram::from([x86::MovLoadPtr {
@@ -1517,7 +1577,7 @@ pub(super) mod driver {
         fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan) {
             let addr = write_address(
                 code,
-                &self.file,
+                &AVX2_FILE,
                 write,
                 Convert {
                     from_xmm: |code, dst, src| {
@@ -1529,7 +1589,7 @@ pub(super) mod driver {
                 },
             );
             let base = PtrReg(addr.0);
-            let lanes = self.file.vector_bytes / 4;
+            let lanes = AVX2_FILE.vector_bytes / 4;
             if write.lanes == lanes {
                 AsmProgram::from([Vex::m0f(0x11).rm(write.value.0, Mem { base, disp: NoDisp })])
                     .assemble(code);

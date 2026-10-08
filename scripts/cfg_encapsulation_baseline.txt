@@ -17,9 +17,7 @@ core-term/src/main.rs	#[cfg(unix)]	let log_file = {
 core-term/src/main.rs	#[cfg(unix)]	{
 pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "aarch64")]	{
 pixelflow-codegen/src/emit/executable.rs	#[cfg(target_arch = "x86_64")]	{
-pixelflow-codegen/src/emit/executable.rs	#[cfg(target_os = "linux")]	linux::test_sync_empty();
 pixelflow-codegen/src/emit/executable.rs	#[cfg(target_os = "linux")]	type NativeCodePage = linux::LinuxCodePage;
-pixelflow-codegen/src/emit/executable.rs	#[cfg(target_os = "macos")]	macos::test_sync_empty();
 pixelflow-codegen/src/emit/executable.rs	#[cfg(target_os = "macos")]	type NativeCodePage = macos::MacOsCodePage;
 pixelflow-codegen/src/emit/executable.rs	#[cfg(unix)]	pub(super) unsafe fn from_code(code: &[u8]) -> Result<Self, CompileError> {
 pixelflow-codegen/src/emit/executable.rs	#[cfg(unix)]	unsafe {

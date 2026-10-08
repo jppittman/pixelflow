@@ -62,9 +62,8 @@ fn color_chrome_sphere() {
     scene.render(&mut frame, 1);
     let elapsed = start.elapsed();
     println!(
-        "packed chrome sphere: {elapsed:?} ({:.2} Mpix/s), {} bytes of code",
-        (W * H) as f64 / elapsed.as_secs_f64() / 1_000_000.0,
-        program.code_bytes().len()
+        "packed chrome sphere: {elapsed:?} ({:.2} Mpix/s)",
+        (W * H) as f64 / elapsed.as_secs_f64() / 1_000_000.0
     );
 
     let path = std::env::temp_dir().join("pixelflow_color_chrome.ppm");
@@ -137,40 +136,6 @@ fn floor_only() {
 
 /// **The mullet contract, restated for the compiler.**
 ///
-/// The jet tier ran geometry once and carried colour as an opaque packed
-/// `Discrete` because running the geometry once per channel cost 3x. Four
-/// channel kernels are four separate expressions over the *same* geometry, so
-/// that saving is now a property of the compiler rather than of the scene's
-/// shape: the four copies hash-cons into one e-class and the geometry is
-/// emitted once.
-///
-/// Measured as emitted code size, which is exact and has no timing variance:
-/// a four-channel chrome sphere against the same scene with one channel live.
-/// Duplicated geometry would show up as a multiple, not a margin. (Replaces
-/// `mullet_vs_3channel_comparison`, which compared two hand-written scene
-/// shapes that no longer exist.)
-#[test]
-fn four_channels_share_one_geometry() {
-    const W: usize = 400;
-    const H: usize = 300;
-
-    let four = chrome_color(W, H);
-    // The same scene with one channel live: every leaf keeps its red and
-    // zeroes the rest, so the geometry and the choice are the same expression.
-    let one = four.map_channels(&|ch| [ch[0].clone(), k(0.0), k(0.0), k(1.0)]);
-
-    let four = compile_packed_for::<Rgba8>(&four, [W as u32, H as u32]);
-    let one = compile_packed_for::<Rgba8>(&one, [W as u32, H as u32]);
-    let (four, one) = (four.code_bytes().len(), one.code_bytes().len());
-    let ratio = four as f64 / one as f64;
-    println!("four channels: {four} bytes; one channel: {one} bytes ({ratio:.2}x)");
-    assert!(
-        ratio < 2.0,
-        "four channels emitted {ratio:.2}x the code of one, which is the \
-         geometry being emitted per channel rather than shared"
-    );
-}
-
 /// The chrome sphere against a golden, small enough to keep in the tree.
 #[test]
 fn chrome_unit_sphere() {

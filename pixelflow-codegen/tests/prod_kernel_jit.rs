@@ -51,11 +51,11 @@ fn reference(x: f32, y: f32, freq: f32, amp: f32, bias: f32) -> f32 {
 // Executing JIT code: one single-point lattice call per coordinate.
 // ---------------------------------------------------------------------------
 
-use pixelflow_codegen::emit::ExecutableCode;
+use pixelflow_codegen::emit::CompiledKernel;
 
 /// One point of a kernel compiled at [`LatticeShape::POINT`]: the sample at
 /// `(x, y)`, read back through the origin block.
-fn eval_at(code: &ExecutableCode, x: f32, y: f32) -> f32 {
+fn eval_at(code: &CompiledKernel, x: f32, y: f32) -> f32 {
     let mut out = [0.0f32; 1];
     let origin = [x, y];
     // SAFETY: this arena declares no buffers and no uniform, so `ctx[0]` —

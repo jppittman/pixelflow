@@ -56,7 +56,7 @@ fn shift_immediate(op: OpKind, count: f32) -> u8 {
     count as u8
 }
 
-/// Build a schedule directly from an [`ExprArena`].
+/// Build a schedule directly from an [`ExprArena`](pixelflow_ir::arena::ExprArena).
 ///
 /// The arena stores nodes in topological order (children before parents by
 /// construction). We filter to reachable nodes, remap `ExprId` to `ValueId`,
@@ -319,13 +319,13 @@ pub(crate) fn arena_to_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::schedule_for;
+    use crate::pipeline::tests::schedule_for;
     use pixelflow_ir::LatticeShape;
     use pixelflow_ir::arena::{ExprArena, ExprId};
 
     /// Lanes in one SIMD batch at the tier this host selected.
     fn lanes() -> usize {
-        crate::isa::jit_vector_bytes() / core::mem::size_of::<f32>()
+        crate::jit_vector_bytes() / core::mem::size_of::<f32>()
     }
 
     /// One sample, so the lattice's origin *is* the point the kernel is

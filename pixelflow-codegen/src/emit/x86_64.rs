@@ -252,41 +252,17 @@ pub(super) fn emit_test_eax(code: &mut Vec<u8>) {
 mod label_tests {
     use super::{Cond, Inst, Jcc, Jmp};
     use crate::emit::{Assembly, Label};
-    use alloc::vec::Vec;
-
-    /// One item of a test program: an instruction, or a label bound here.
-    #[derive(Copy, Clone)]
-    enum Item {
-        Ret,
-        Jmp(Jmp),
-        Jcc(Jcc),
-        Label(Label),
-    }
-
-    /// `items`, assembled after the bytes already in `code`.
-    fn assemble_after(code: Vec<u8>, items: impl IntoIterator<Item = Item>) -> Vec<u8> {
-        let mut asm = Assembly::from_code(code);
-        for item in items {
-            match item {
-                Item::Ret => asm.push(Inst::Ret),
-                Item::Jmp(jmp) => asm.push(jmp),
-                Item::Jcc(jcc) => asm.push(jcc),
-                Item::Label(label) => asm.bind(label),
-            }
-        }
-        asm.finish()
-    }
-
-    fn assemble(items: impl IntoIterator<Item = Item>) -> Vec<u8> {
-        assemble_after(Vec::new(), items)
-    }
 
     /// The one thing a label does that a fixup token could not: name a
     /// position that does not exist yet.
     #[test]
     fn a_forward_branch_names_a_position_bound_later() {
         let end = Label::new("end");
-        let code = assemble([Item::Jmp(Jmp { target: end }), Item::Ret, Item::Label(end)]);
+        let mut asm = Assembly::default();
+        asm.push(Jmp { target: end });
+        asm.push(Inst::Ret);
+        asm.bind(end);
+        let code = asm.finish();
 
         // `jmp rel32` is five bytes; `ret` is one; the label lands at 6. The
         // displacement is measured from the end of the branch, so it is 1.
@@ -300,7 +276,11 @@ mod label_tests {
     #[test]
     fn a_back_edge_resolves_to_a_negative_displacement() {
         let top = Label::new("end");
-        let code = assemble([Item::Label(top), Item::Ret, Item::Jmp(Jmp { target: top })]);
+        let mut asm = Assembly::default();
+        asm.bind(top);
+        asm.push(Inst::Ret);
+        asm.push(Jmp { target: top });
+        let code = asm.finish();
 
         // `ret` at 0, `jmp` at 1..6. Target 0, origin 6, so the displacement
         // is -6 — and getting this sign backwards is the classic way a loop
@@ -310,12 +290,15 @@ mod label_tests {
     }
 
     /// A label may name a position no instruction occupies — the end of the
-    /// program. That is why a label is an item of its own rather than a field
-    /// on an instruction: there is nothing here to hang it on.
+    /// program. That is why binding a label is a step of its own rather than
+    /// a field on an instruction: there is nothing here to hang it on.
     #[test]
     fn a_label_can_end_the_program() {
         let end = Label::new("end");
-        let code = assemble([Item::Jmp(Jmp { target: end }), Item::Label(end)]);
+        let mut asm = Assembly::default();
+        asm.push(Jmp { target: end });
+        asm.bind(end);
+        let code = asm.finish();
         assert_eq!(code.len(), 5);
         assert_eq!(i32::from_le_bytes([code[1], code[2], code[3], code[4]]), 0);
     }
@@ -324,15 +307,15 @@ mod label_tests {
     #[test]
     fn two_labels_can_share_a_position() {
         let (a, b) = (Label::new("end"), Label::new("other"));
-        let code = assemble([
-            Item::Jcc(Jcc {
-                condition: Cond::E,
-                target: a,
-            }),
-            Item::Jmp(Jmp { target: b }),
-            Item::Label(a),
-            Item::Label(b),
-        ]);
+        let mut asm = Assembly::default();
+        asm.push(Jcc {
+            condition: Cond::E,
+            target: a,
+        });
+        asm.push(Jmp { target: b });
+        asm.bind(a);
+        asm.bind(b);
+        let code = asm.finish();
         // `je` is 6 bytes, `jmp` 5, both landing at 11.
         assert_eq!(code.len(), 11);
         assert_eq!(i32::from_le_bytes([code[2], code[3], code[4], code[5]]), 5);
@@ -344,25 +327,33 @@ mod label_tests {
     #[test]
     fn a_program_is_position_independent() {
         let end = Label::new("end");
-        let items = [Item::Jmp(Jmp { target: end }), Item::Label(end)];
-
-        let offset = assemble_after(alloc::vec![0x90u8; 7], items);
-        assert_eq!(&assemble(items)[..], &offset[7..]);
+        let program = |mut asm: Assembly| {
+            asm.push(Jmp { target: end });
+            asm.bind(end);
+            asm.finish()
+        };
+        let offset = program(Assembly::from_code(alloc::vec![0x90u8; 7]));
+        assert_eq!(&program(Assembly::default())[..], &offset[7..]);
     }
 
     #[test]
     #[should_panic(expected = "never written")]
     fn an_unbound_label_is_a_bug_and_not_a_jump_to_itself() {
-        let _ = assemble([Item::Jmp(Jmp {
+        let mut asm = Assembly::default();
+        asm.push(Jmp {
             target: Label::new("end"),
-        })]);
+        });
+        let code = asm.finish();
+        unreachable!("assembled {} bytes around an unbound label", code.len());
     }
 
     #[test]
     #[should_panic(expected = "written twice")]
     fn a_label_bound_twice_is_a_bug() {
         let twice = Label::new("end");
-        let _ = assemble([Item::Label(twice), Item::Label(twice)]);
+        let mut asm = Assembly::default();
+        asm.bind(twice);
+        asm.bind(twice);
     }
 }
 
@@ -523,7 +514,7 @@ fn sub(code: &mut Vec<u8>, dst: Gpr, Imm32(imm): Imm32) {
 
 /// `ret`
 #[inline(always)]
-pub(super) fn ret(code: &mut Vec<u8>) {
+fn ret(code: &mut Vec<u8>) {
     code.push(0xC3);
 }
 
@@ -535,7 +526,8 @@ fn vzeroupper(code: &mut Vec<u8>) {
     code.extend_from_slice(&[0xC5, 0xF8, 0x77]);
 }
 
-/// The 4-bit condition an x86 `jcc` tests — the whole field, not a selection.
+/// The 4-bit condition an x86 `jcc` tests: the conditions the emitter
+/// branches on.
 ///
 /// `0F 8x rel32` is one instruction whose low opcode nibble *is* this value, so
 /// the assembler encodes it by casting rather than by dispatching to one
@@ -605,8 +597,7 @@ impl Jcc {
         Self::on(Cond::B, target)
     }
 
-    /// The branch on a condition chosen at run time, where no single mnemonic
-    /// names it.
+    /// The branch on `condition`: what each mnemonic above spells.
     #[must_use]
     #[inline(always)]
     const fn on(condition: Cond, target: Label) -> Self {
@@ -785,9 +776,9 @@ pub(super) fn write_address(
 /// `mod = 00 / 01 / 10` are three modes rather than three spellings of one:
 /// they cost a different number of bytes, and `mod = 00` is not "a
 /// displacement of zero" (see [`NoDisp`]). So the width is picked by the
-/// operand's TYPE, exactly as [`AddSrc`] picks `83 /0 ib` over `81 /0 id` —
-/// never by the caller reaching for a differently-named function, which is
-/// where that choice used to live.
+/// operand's TYPE, exactly as [`AddSrc`] picks `add r/m64, r64` over `81 /0
+/// id` — never by the caller reaching for a differently-named function, which
+/// is where that choice used to live.
 pub(super) trait Disp: Copy {
     /// The ModRM `mod` field this displacement implies.
     const MOD: u8;
@@ -826,27 +817,15 @@ impl Disp for Imm32 {
     }
 }
 
-/// A register usable as the base of a memory address ([`Mem`]).
-pub(super) trait BaseReg: Copy {
-    fn reg_num(self) -> u8;
-}
-
-impl BaseReg for PtrReg {
-    #[inline(always)]
-    fn reg_num(self) -> u8 {
-        self.0
-    }
-}
-
 /// An address spelled `[base + disp]`.
 ///
-/// The base being a [`Gpr`] or [`PtrReg`] is the point: `rsp` is a value here. It used to be
-/// the `_rsp` and `_base` suffixes of five separate functions that all encoded
-/// the same `movups`, where nothing could check it.
+/// The base being a [`PtrReg`] is the point: `rsp` is a value here. It used
+/// to be the `_rsp` and `_base` suffixes of five separate functions that all
+/// encoded the same `movups`, where nothing could check it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) struct Mem<D, P = PtrReg> {
+pub(super) struct Mem<D> {
     /// The register the displacement is measured from.
-    pub(super) base: P,
+    pub(super) base: PtrReg,
     /// The displacement — and, through its type, the mode (see [`Disp`]).
     pub(super) disp: D,
 }
@@ -893,12 +872,8 @@ fn sib4_tail_into(inst: &mut EncodedInst, reg: u8, base: Gpr, index: u8) {
 }
 
 /// Write the ModRM/SIB/disp tail into an `EncodedInst`.
-pub(super) fn mem_operand_into<D: Disp, P: BaseReg>(
-    inst: &mut EncodedInst,
-    reg: u8,
-    addr: Mem<D, P>,
-) {
-    let rm = addr.base.reg_num() & 7;
+pub(super) fn mem_operand_into<D: Disp>(inst: &mut EncodedInst, reg: u8, addr: Mem<D>) {
+    let rm = addr.base.0 & 7;
     debug_assert!(
         D::MOD != NoDisp::MOD || rm != RM_RIP_AT_MOD0,
         "[rbp]/[r13] has no mod=00 form: that encoding is RIP-relative"
@@ -929,9 +904,9 @@ mod gpr_tests {
     /// /r`), the simplest legacy instruction that takes a [`Mem`]. Test-only
     /// — no tier emits it — so what is under test is [`mem_operand_into`]
     /// and the REX bits, not a 128-bit store.
-    fn movups_store<D: Disp, P: BaseReg>(src: Reg, addr: Mem<D, P>) -> EncodedInst {
+    fn movups_store<D: Disp>(src: Reg, addr: Mem<D>) -> EncodedInst {
         let mut inst = EncodedInst::new();
-        let rex = 0x40 | (u8::from(src.0 >= 8) << 2) | u8::from(addr.base.reg_num() >= 8);
+        let rex = 0x40 | (u8::from(src.0 >= 8) << 2) | u8::from(addr.base.0 >= 8);
         if rex != 0x40 {
             inst.push(rex);
         }

@@ -230,7 +230,7 @@ fn evaluate(arena: &ExprArena, root: ExprId, n: usize) -> Emitted {
     Emitted {
         outputs: out,
         spills: result.spill_count,
-        bytes: result.code.len(),
+        bytes: result.code.as_bytes().len(),
     }
 }
 

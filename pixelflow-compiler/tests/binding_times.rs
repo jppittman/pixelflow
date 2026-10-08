@@ -75,8 +75,11 @@ fn program_key(k: &Kernel) -> Vec<u8> {
 /// The address of the code `k` compiles to at `FRAME`'s shape: one compiled
 /// region per program, shared by every kernel of it.
 fn code_at_frame(k: &Kernel) -> *const u8 {
-    Manifold::compile(k, [FRAME.0 as u32, FRAME.1 as u32])
-        .code_bytes()
+    let shape = pixelflow_ir::LatticeShape::new([FRAME.0 as u32, FRAME.1 as u32]);
+    pixelflow_codegen::jit_cache::compile(k, shape)
+        .expect("compile")
+        .kernel
+        .as_bytes()
         .as_ptr()
 }
 

@@ -9,7 +9,7 @@
 use std::fmt;
 
 use pixelflow_codegen::CompileError;
-use pixelflow_codegen::emit::ExecutableCode;
+use pixelflow_codegen::emit::CompiledKernel;
 use pixelflow_codegen::emit::compile;
 use pixelflow_ir::{ExprArena, ExprId, LatticeShape, OpKind};
 
@@ -838,7 +838,7 @@ fn lanes() -> usize {
 
 /// Run `exec_code` once, filling `out` (one row, whose width is `out.len()`)
 /// starting from `origin`: `x = origin[0] + col`, `y = origin[1] + row` for
-/// `row` fixed at 0 — the whole-plane [`ExecutableCode::call`] ABI, one call.
+/// `row` fixed at 0 — the whole-plane [`CompiledKernel::call`] ABI, one call.
 ///
 /// # Safety
 ///
@@ -849,7 +849,7 @@ fn lanes() -> usize {
 /// built from `Var(0)`/`Var(1)` and constants alone, so the uniform-block
 /// slot is never dereferenced and its value here is unobserved.
 #[inline(always)]
-unsafe fn call_at(exec_code: &ExecutableCode, origin: &[f32; 2], out: &mut [f32]) {
+unsafe fn call_at(exec_code: &CompiledKernel, origin: &[f32; 2], out: &mut [f32]) {
     let ctx: [*const f32; 2] = [core::ptr::null(), origin.as_ptr()];
     let pitch = out.len();
     // SAFETY: forwarded from this function's own contract.
@@ -880,7 +880,7 @@ unsafe fn call_at(exec_code: &ExecutableCode, origin: &[f32; 2], out: &mut [f32]
 /// inlined body compiled to, and an un-inlined call would add call overhead
 /// that perturbs the 2-8ns measurement this loop exists to make.
 #[inline(always)]
-fn latency_chain_step(exec_code: &ExecutableCode, prev: &mut [f32; 2], scratch: &mut [f32]) {
+fn latency_chain_step(exec_code: &CompiledKernel, prev: &mut [f32; 2], scratch: &mut [f32]) {
     std::hint::black_box(&*prev);
     // SAFETY: forwarded from `measure_exec_code`'s own call to `call_at`.
     unsafe {
@@ -897,7 +897,7 @@ fn latency_chain_step(exec_code: &ExecutableCode, prev: &mut [f32; 2], scratch: 
 /// `exec_code` must have been compiled at `shape_for(mode)` — see
 /// [`call_at`]'s safety contract, which this function relies on throughout.
 fn measure_exec_code(
-    exec_code: &ExecutableCode,
+    exec_code: &CompiledKernel,
     start_batches: usize,
     mode: BenchMode,
 ) -> Result<RawMeasurement, BenchError> {
@@ -1141,7 +1141,7 @@ fn identity_arena() -> (ExprArena, ExprId) {
 /// E-core-placement class of shift that no scalar correction can repair; see
 /// that constant's doc for the full three-tier drift policy.
 pub struct BenchSession {
-    sentinel_code: ExecutableCode,
+    sentinel_code: CompiledKernel,
     calibration_ns: f64,
     sentinel_samples: Vec<SentinelSample>,
     overhead_throughput_ns: f64,
@@ -1313,7 +1313,7 @@ impl BenchSession {
     ///
     /// This is the "time the exact artifact that passed the check" entry
     /// point: callers that compiled and correctness-gated an
-    /// [`ExecutableCode`] in a preparation phase hand that same object here,
+    /// [`CompiledKernel`] in a preparation phase hand that same object here,
     /// so no compilation (with its allocation and icache pollution) happens
     /// inside the timed phase, and the timed code is bit-identical to the
     /// checked code. `arena`/`root` must be the expression `code` was
@@ -1330,7 +1330,7 @@ impl BenchSession {
     /// per-expression plausibility floor (audit M4).
     pub fn benchmark_compiled(
         &mut self,
-        code: &ExecutableCode,
+        code: &CompiledKernel,
         arena: &ExprArena,
         root: ExprId,
         mode: BenchMode,
@@ -1347,7 +1347,7 @@ impl BenchSession {
     /// one delegating to the other.
     fn measure_gated(
         &mut self,
-        code: &ExecutableCode,
+        code: &CompiledKernel,
         arena: &ExprArena,
         root: ExprId,
         mode: BenchMode,
@@ -1565,7 +1565,7 @@ pub fn benchmark_compile_fresh(
         let result =
             compile(arena, root, LatticeShape::POINT).map_err(BenchError::CompileFailed)?;
         std::hint::black_box(result.code.as_bytes().first());
-        code_bytes = result.code.len();
+        code_bytes = result.code.as_bytes().len();
         drop(result); // munmap inside the timed window
         *t = nanos_now() - start;
     }
@@ -1779,7 +1779,7 @@ mod tests {
 
     #[test]
     fn benchmark_compiled_times_the_given_code_object() {
-        // Fix 3 substrate: a pre-compiled ExecutableCode can be timed
+        // Fix 3 substrate: a pre-compiled CompiledKernel can be timed
         // directly, with no compile inside the session call, and yields the
         // same outputs as the compile-inside path.
         let (arena, root) = sentinel_arena();

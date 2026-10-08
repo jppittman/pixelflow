@@ -52,7 +52,7 @@ use alloc::vec::Vec;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use pixelflow_codegen::CompiledKernel;
+use pixelflow_codegen::emit::CompiledKernel;
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{BufferDecl, BufferIdentity, UniformDecl, UniformIdentity};
 use pixelflow_ir::{Kernel, Uniform};
@@ -388,9 +388,8 @@ const SAMPLE_CENTER: f32 = 0.5;
 /// packed manifold is four channel kernels compiled through here with an
 /// integer pack at the root. Not three paths — one, sampled three ways.
 pub struct Manifold {
-    /// The code at this manifold's own extent, compiled up front.
-    jit: Arc<CompiledKernel>,
-    /// That code and every other shape's, as they are asked for.
+    /// The code at this manifold's own extent, compiled up front, and every
+    /// other shape's, as they are asked for.
     codes: Arc<Codes>,
     /// The lattice shape this manifold was compiled for, `[x, y]`: the shape
     /// [`Lattice::collapse`](crate::Lattice::collapse) fills.
@@ -470,7 +469,6 @@ impl Manifold {
         let slots: Arc<[BufferDecl]> = linked.buffers.into();
         let link = Arc::new(Link::new(linked.uniforms, kernel.uniforms()));
         Self {
-            jit: Arc::clone(&linked.kernel),
             codes: Arc::new(Codes {
                 kernel: kernel.clone(),
                 slots: Arc::clone(&slots),
@@ -514,13 +512,6 @@ impl Manifold {
             values: Arc::clone(&self.defaults),
             link: Arc::clone(&self.link),
         }
-    }
-
-    /// The emitted bytes of the code compiled at this manifold's own extent
-    /// (research/profiling harness).
-    #[must_use]
-    pub fn code_bytes(&self) -> &[u8] {
-        self.jit.code_bytes()
     }
 
     /// Bind one frame's memory: each declared slot takes the buffer carrying

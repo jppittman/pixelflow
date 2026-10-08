@@ -47,7 +47,7 @@
 use pixelflow_ir::kind::OpKind;
 
 /// Ops that reach `IsaBackend::emit_plan` as `ResolvedOp::Unary { op, .. }`.
-pub(crate) const REQUIRED_UNARY_OPS: &[OpKind] = &[
+pub(super) const REQUIRED_UNARY_OPS: &[OpKind] = &[
     OpKind::Neg,
     OpKind::Sqrt,
     OpKind::Rsqrt,
@@ -61,7 +61,7 @@ pub(crate) const REQUIRED_UNARY_OPS: &[OpKind] = &[
 ];
 
 /// Ops that reach `IsaBackend::emit_plan` as `ResolvedOp::Binary { op, .. }`.
-pub(crate) const REQUIRED_BINARY_OPS: &[OpKind] = &[
+pub(super) const REQUIRED_BINARY_OPS: &[OpKind] = &[
     OpKind::Add,
     OpKind::Sub,
     OpKind::Mul,
@@ -80,14 +80,14 @@ pub(crate) const REQUIRED_BINARY_OPS: &[OpKind] = &[
 ];
 
 /// Ops that reach `IsaBackend::emit_plan` as `ResolvedOp::ShiftImm { op, .. }`.
-pub(crate) const REQUIRED_SHIFT_OPS: &[OpKind] = &[OpKind::Shl, OpKind::Shr];
+pub(super) const REQUIRED_SHIFT_OPS: &[OpKind] = &[OpKind::Shl, OpKind::Shr];
 
 /// Ops with a bespoke `ResolvedOp` shape (`FusedMulAdd`/`DecomposedMulAdd` for
 /// `MulAdd`, `If` for `If`). Listed for documentation; the per-backend
 /// tests build these plans explicitly rather than looping generically — four
 /// of them for `MulAdd` alone, since a backend owes both shapes and each
 /// `DeferredReload` spelling of the decomposed one is its own arm.
-pub(crate) const REQUIRED_TERNARY_OPS: &[OpKind] = &[OpKind::MulAdd, OpKind::If];
+pub(super) const REQUIRED_TERNARY_OPS: &[OpKind] = &[OpKind::MulAdd, OpKind::If];
 
 /// Ops no `REQUIRED_*` list holds, each for the reason beside it. The test
 /// below is the only reader.

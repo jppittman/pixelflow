@@ -214,7 +214,7 @@ fn through_the_jit(
 fn jit_columns(production: &Result<Linked, CompileError>) -> String {
     match production {
         Ok(linked) => {
-            let bytes = linked.kernel.code_bytes();
+            let bytes = linked.kernel.as_bytes();
             format!("jit_len={:<6} jit_fnv={:016x}", bytes.len(), fnv1a64(bytes))
         }
         Err(e) => format!("jit ERROR {e:?}"),
@@ -293,8 +293,8 @@ fn sibling_cases() -> Vec<SiblingRow> {
 /// One scope's counts, in a fixed order.
 fn counts(t: &ScopeTraffic) -> String {
     format!(
-        "instructions={} loads_transient={} loads_kept={} remats={} stores={} writes={} bytes={}",
-        t.instructions, t.loads_transient, t.loads_kept, t.remats, t.stores, t.writes, t.bytes
+        "instructions={} loads_transient={} loads_kept={} remats={} stores={} bytes={}",
+        t.instructions, t.loads_transient, t.loads_kept, t.remats, t.stores, t.bytes
     )
 }
 

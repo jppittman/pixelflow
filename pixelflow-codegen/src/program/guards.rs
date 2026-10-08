@@ -54,7 +54,7 @@ use crate::program::{Def, ScheduledOp, ValueId};
 /// by that fold's own `FoldReads`. That is why each construction site builds
 /// the innermost scope's first.
 #[derive(Default)]
-pub(crate) struct FoldReads(BTreeMap<ValueId, OpenedFold>);
+pub(super) struct FoldReads(BTreeMap<ValueId, OpenedFold>);
 
 /// One loop a scope opens, as that scope sees it.
 struct OpenedFold {

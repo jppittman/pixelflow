@@ -59,9 +59,6 @@ pub struct ScopeTraffic {
     pub remats: u64,
     /// Stack stores emitted: spills, parks, a fold's slot-held roots.
     pub stores: u64,
-    /// The lattice's own stores — one per `Write`, whatever its width. Not a
-    /// spill: the output plane is the kernel's result, not its scratch.
-    pub writes: u64,
     /// Bytes of machine code the scope's own instructions occupy, excluding
     /// the scopes nested inside it, so every byte lands in exactly one scope.
     pub bytes: u64,
@@ -377,7 +374,6 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
     }
 
     fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan) {
-        self.current().writes += 1;
         self.inner.emit_write(code, write);
     }
 
@@ -388,7 +384,6 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
 
 #[cfg(test)]
 mod tests {
-    use crate::emit::EmitCtx;
     use pixelflow_ir::OpKind;
     use pixelflow_ir::arena::{ExprArena, ExprId};
 
@@ -596,7 +591,7 @@ mod tests {
             ],
             op: ResolvedOp::Nop,
             setup_mov: None,
-            scratch: regalloc::Scratch::for_test(None, [None, None]),
+            scratch: regalloc::tests::scratch(None, [None, None]),
         };
 
         counting.emit_plan(&mut code, &plan).expect("emit_plan");
@@ -741,12 +736,9 @@ mod tests {
         assert_eq!(counting.take(0), ScopeTraffic::default());
     }
 
-    /// Registers to allocate in the pressure test: small enough that a
-    /// deliberately wide expression cannot fit, on every tier.
-    const TIGHT_POOL: u8 = 7;
-
     /// A wide sum whose terms are all pushed before any is consumed, so more
-    /// values are live at once than `TIGHT_POOL` can hold.
+    /// values are live at once than a pool at the floor
+    /// ([`AtFloor`](crate::emit::tests::AtFloor)) can hold.
     fn wide_live_range_kernel(terms: usize) -> (ExprArena, ExprId) {
         let mut a = ExprArena::new();
         let x = a.push_var(0);
@@ -767,7 +759,7 @@ mod tests {
 
     const SHAPE: LatticeShape = LatticeShape::new([16, 2]);
 
-    /// Spilling under a tight pool must show up as traffic. If a future
+    /// Spilling at the floor must show up as traffic. If a future
     /// emission path routes a store or a reload around the decorator, this is
     /// the test that notices — the store-after-definition path in particular,
     /// which moved out of `InstructionPlan` and into `emit_store` when class C
@@ -775,14 +767,10 @@ mod tests {
     #[test]
     fn a_kernel_that_must_spill_reports_stores_and_loads() {
         let (arena, root) = wide_live_range_kernel(24);
-        let result = EmitCtx {
-            max_regs: Some(TIGHT_POOL),
-        }
-        .compile(&arena, root, SHAPE)
-        .expect("compile");
+        let result = crate::emit::tests::compile_at_floor(&arena, root, SHAPE);
         assert!(
             result.spill_count > 0,
-            "24 values live against a {TIGHT_POOL}-register pool did not spill; \
+            "24 values live against a pool at the floor did not spill; \
              the scenario has stopped testing its subject"
         );
         let t = &result.traffic;
@@ -804,22 +792,99 @@ mod tests {
         );
     }
 
-    /// The lattice's stores are counted apart from spills: a kernel that
-    /// spills nothing still writes every batch of every row.
+    /// Every byte up to the return is counted by exactly one scope or by the
+    /// scaffold, on every backend, with the whole pool and at the floor
+    /// ([`AtFloor`](crate::emit::tests::AtFloor)), where the 24-term kernel
+    /// spills: what the counts add up to is where the return ends.
+    ///
+    /// The scaffold is what the function's code leaves after the scopes'
+    /// bytes, the body and what trails the return, so a scope that miscounted
+    /// would move the sum off the return by exactly its error. The returns
+    /// are spelled as the manuals spell them rather than as the encoders under
+    /// test do: `vzeroupper; ret` on x86, `RET` on aarch64.
     #[test]
-    fn every_batch_of_every_row_is_one_write() {
-        let (arena, root) = wide_live_range_kernel(2);
-        let result = crate::emit::compile(&arena, root, SHAPE).expect("compile");
-        let t = &result.traffic;
-        let dynamic_writes: u64 = t
-            .scopes
-            .iter()
-            .zip(&t.trips)
-            .map(|(s, trips)| s.writes * trips)
-            .sum();
-        let lanes = crate::isa::jit_vector_bytes() as u64 / 4;
-        let [width, rows] = SHAPE.extent().map(u64::from);
-        assert_eq!(dynamic_writes, rows * width.div_ceil(lanes));
+    fn the_counted_bytes_end_at_the_return() {
+        use crate::emit::tests::{AtFloor, compile_schedule};
+        use crate::emit::{IsaBackend, aarch64, avx2, avx512};
+        use crate::pipeline::tests::{BYTES_PER_LANE, schedule_for};
+
+        const X86_RETURN: [u8; 4] = [0xC5, 0xF8, 0x77, 0xC3];
+        const NEON_RETURN: [u8; 4] = 0xD65F_03C0u32.to_le_bytes();
+
+        /// The stack stores `kernel` compiled by `backend` emits, once its
+        /// counted bytes are checked to end at the return `ret`.
+        fn check<B: IsaBackend>(
+            tier: &str,
+            mut backend: B,
+            ret: [u8; 4],
+            kernel: (&ExprArena, ExprId),
+        ) -> u64 {
+            let (arena, root) = kernel;
+            let lanes = backend.register_file().vector_bytes / BYTES_PER_LANE;
+            let result = compile_schedule(schedule_for(arena, root, SHAPE, lanes), &mut backend)
+                .unwrap_or_else(|e| panic!("{tier}: {e:?}"));
+            let t = &result.traffic;
+            let counted = t.scopes.iter().map(|s| s.bytes).sum::<u64>() + t.scaffold.bytes;
+            let code = result.code.as_bytes();
+            let end = usize::try_from(counted).expect("a kernel's bytes fit an address");
+            assert!(
+                (ret.len()..=code.len()).contains(&end),
+                "{tier}: {counted} bytes counted of {}",
+                code.len()
+            );
+            assert_eq!(
+                code[end - ret.len()..end],
+                ret,
+                "{tier}: the counted bytes do not end at the return"
+            );
+            t.scopes.iter().map(|s| s.stores).sum()
+        }
+
+        for terms in [2, 8, 24] {
+            let (arena, root) = wide_live_range_kernel(terms);
+            let kernel = (&arena, root);
+            let floor_stores = [
+                check(
+                    "NEON",
+                    aarch64::driver::Aarch64Backend::new(),
+                    NEON_RETURN,
+                    kernel,
+                ),
+                check("AVX2", avx2::driver::Avx2Backend::new(), X86_RETURN, kernel),
+                check(
+                    "AVX-512",
+                    avx512::driver::Avx512Backend::new(),
+                    X86_RETURN,
+                    kernel,
+                ),
+                check(
+                    "NEON at the floor",
+                    AtFloor(aarch64::driver::Aarch64Backend::new(), 0),
+                    NEON_RETURN,
+                    kernel,
+                ),
+                check(
+                    "AVX2 at the floor",
+                    AtFloor(avx2::driver::Avx2Backend::new(), 0),
+                    X86_RETURN,
+                    kernel,
+                ),
+                check(
+                    "AVX-512 at the floor",
+                    AtFloor(avx512::driver::Avx512Backend::new(), 0),
+                    X86_RETURN,
+                    kernel,
+                ),
+            ];
+            if terms == 24 {
+                assert!(
+                    floor_stores[3..].iter().all(|&stores| stores > 0),
+                    "24 values against a pool at the floor stored nothing on some \
+                     backend ({floor_stores:?}); the spilling half of this test has \
+                     stopped testing anything"
+                );
+            }
+        }
     }
 
     /// The scaffold is the same code under every allocation of a kernel, so it
@@ -829,8 +894,9 @@ mod tests {
     /// Every backend, from this host, since each emits its own frame.
     #[test]
     fn the_scaffolds_traffic_does_not_move_with_the_pool() {
-        use crate::emit::{IsaBackend, aarch64, avx2, avx512, compile_schedule};
-        use crate::pipeline::{BYTES_PER_LANE, schedule_for};
+        use crate::emit::tests::{AtFloor, compile_schedule};
+        use crate::emit::{IsaBackend, aarch64, avx2, avx512};
+        use crate::pipeline::tests::{BYTES_PER_LANE, schedule_for};
 
         fn traffic<B: IsaBackend>(mut backend: B, arena: &ExprArena, root: ExprId) -> EmitTraffic {
             let lanes = backend.register_file().vector_bytes / BYTES_PER_LANE;
@@ -840,25 +906,29 @@ mod tests {
                 .traffic
         }
         let (arena, root) = wide_live_range_kernel(24);
-        let tight = || EmitCtx {
-            max_regs: Some(TIGHT_POOL),
-        };
-        let loose = EmitCtx::default;
         let budgets = [
             (
                 "NEON",
-                traffic(aarch64::driver::Aarch64Backend::new(tight()), &arena, root),
-                traffic(aarch64::driver::Aarch64Backend::new(loose()), &arena, root),
+                traffic(
+                    AtFloor(aarch64::driver::Aarch64Backend::new(), 0),
+                    &arena,
+                    root,
+                ),
+                traffic(aarch64::driver::Aarch64Backend::new(), &arena, root),
             ),
             (
                 "AVX2",
-                traffic(avx2::driver::Avx2Backend::new(tight()), &arena, root),
-                traffic(avx2::driver::Avx2Backend::new(loose()), &arena, root),
+                traffic(AtFloor(avx2::driver::Avx2Backend::new(), 0), &arena, root),
+                traffic(avx2::driver::Avx2Backend::new(), &arena, root),
             ),
             (
                 "AVX-512",
-                traffic(avx512::driver::Avx512Backend::new(tight()), &arena, root),
-                traffic(avx512::driver::Avx512Backend::new(loose()), &arena, root),
+                traffic(
+                    AtFloor(avx512::driver::Avx512Backend::new(), 0),
+                    &arena,
+                    root,
+                ),
+                traffic(avx512::driver::Avx512Backend::new(), &arena, root),
             ),
         ];
         for (name, t, l) in budgets {

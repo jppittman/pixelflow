@@ -19,8 +19,8 @@ use super::{
 };
 use crate::error::CompileError;
 use crate::program::IfGuard;
-pub(super) use crate::program::{Class, Def, Scope, ScopedSchedule, ValueId};
-pub(super) use crate::program::{all_operands, operands, pointer_operand};
+use crate::program::{Class, all_operands, pointer_operand};
+pub(super) use crate::program::{Def, Scope, ScopedSchedule, ValueId, operands};
 
 /// The complete platform-dependent surface of register allocation.
 ///
@@ -109,25 +109,6 @@ impl RegSet {
     #[must_use]
     pub(super) const fn len(self) -> u8 {
         self.0.count_ones() as u8
-    }
-
-    /// The lowest `n` members, or all of them if the set is smaller.
-    ///
-    /// This is how [`EmitCtx::max_regs`](super::EmitCtx) forces spilling for
-    /// pressure testing: it only ever shrinks.
-    #[must_use]
-    const fn take(self, n: u8) -> Self {
-        let mut kept = 0u32;
-        let mut taken = 0u8;
-        let mut r = 0u8;
-        while r < 32 {
-            if taken < n && self.0 & (1 << r) != 0 {
-                kept |= 1 << r;
-                taken += 1;
-            }
-            r += 1;
-        }
-        Self(kept)
     }
 
     /// Members low to high.
@@ -234,7 +215,7 @@ impl MaskSet {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct RegisterFile {
+pub(super) struct RegisterFile {
     /// Every register the allocator may hand out.
     ///
     /// Everything outside it — callee-saved registers, the backend's own
@@ -293,17 +274,16 @@ pub(crate) struct RegisterFile {
     /// once a universal 16 that each wide backend divided back out at its
     /// every use site; a slot offset that failed to be a multiple of 16 would
     /// then have truncated two live values onto the same stack slot.
-    pub(crate) vector_bytes: u32,
+    pub(super) vector_bytes: u32,
 
     /// The GPR holding the JIT ABI's context-pointer argument (the array of
     /// buffer base pointers a `Gather`/`Uniform` load indexes into), if this
     /// target's encodings read one. `None` on a backend with neither op.
     ///
-    /// Pinned like a vector `Var` input — fixed by the calling convention,
-    /// never itself allocated — and declared here for the same reason
-    /// [`RegisterFile::inputs`] is: so [`RegisterFile::checked`] can prove it
-    /// misses [`RegisterFile::gpr_scratch`], rather than a comment asserting
-    /// the two constants never collide.
+    /// Pinned — fixed by the calling convention, never itself allocated — and
+    /// declared here so [`RegisterFile::checked`] can prove it misses
+    /// [`RegisterFile::gpr_scratch`], rather than a comment asserting the two
+    /// constants never collide.
     pub(super) gpr_ctx: Option<Gpr>,
 
     /// The GPR holding the JIT ABI's output-plane argument — where a `Write`
@@ -490,7 +470,7 @@ impl RegisterFile {
     /// one below the floor. Lowering `MAX_TEMPS` to two moves every carry
     /// budget, so it is a change to measure on its own rather than fold in
     /// here.
-    pub(super) const MIN_SCRATCH: u8 = Scratch::MAX_TEMPS as u8 + 3;
+    const MIN_SCRATCH: u8 = Scratch::MAX_TEMPS as u8 + 3;
 
     /// The smallest pointer pool a schedule holding a pointer can be
     /// allocated against: one. No instruction both defines an address and
@@ -498,38 +478,6 @@ impl RegisterFile {
     /// `Context` def's destination, or as the reload of a base in a slot.
     /// A file whose schedules hold no pointer at all may declare none.
     const MIN_POINTERS: u8 = 1;
-
-    /// Cap the scratch pool at a smaller budget, leaving every other region
-    /// where it is.
-    ///
-    /// This is how [`EmitCtx::max_regs`](super::EmitCtx) forces spilling for
-    /// pressure testing. It only ever *shrinks* the pool: a budget above the
-    /// target's own count would hand the allocator registers this file has
-    /// reserved for reloads or builtins. It does not shrink past
-    /// [`MIN_SCRATCH`](Self::MIN_SCRATCH), which is not a budget question but
-    /// an encoding one.
-    ///
-    /// # Panics
-    /// If the budget is below [`MIN_SCRATCH`](Self::MIN_SCRATCH). The caller
-    /// is a developer choosing a test knob, and a smaller pool answered with
-    /// the floor would run a different experiment than the one asked for.
-    #[must_use]
-    pub(super) fn capped(self, max_scratch: Option<u8>) -> Self {
-        match max_scratch {
-            Some(n) => {
-                assert!(
-                    n >= Self::MIN_SCRATCH,
-                    "scratch budget {n} is below RegisterFile::MIN_SCRATCH ({})",
-                    Self::MIN_SCRATCH
-                );
-                Self {
-                    scratch: self.scratch.take(n),
-                    ..self
-                }
-            }
-            None => self,
-        }
-    }
 
     /// This file as a scope *inside* a loop sees it: each pool minus every
     /// register carrying a value of its class across that loop.
@@ -594,7 +542,7 @@ impl Carried {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct Point {
     /// Position in the scope's schedule.
-    pub(super) index: usize,
+    index: usize,
 }
 
 impl Point {
@@ -640,11 +588,11 @@ pub(super) enum Where {
 /// One range of a value's life: from `from` (inclusive) until the next range's
 /// `from` (exclusive), the value lives at `at`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) struct Span {
+struct Span {
     /// The program point this range starts at.
-    pub(super) from: Point,
+    from: Point,
     /// Where the value lives over it.
-    pub(super) at: Where,
+    at: Where,
 }
 
 /// Where a value lives, at every point of **one scope**.
@@ -719,7 +667,7 @@ impl Placement {
     }
 
     /// Every range of this value's life, in order.
-    pub(super) fn spans(&self) -> impl Iterator<Item = Span> + use<'_> {
+    fn spans(&self) -> impl Iterator<Item = Span> + use<'_> {
         core::iter::once(self.first).chain(self.rest.iter().copied())
     }
 
@@ -788,7 +736,7 @@ pub(super) struct Scratch {
     ///
     /// Private, and read through [`Scratch::reload`], because *which* operand
     /// takes which of these is not positional guesswork: it is
-    /// [`operand_sources`](super::operand_sources), the one function both the
+    /// [`operand_sources`], the one function both the
     /// allocator (counting reservations) and the emitter (naming registers)
     /// call. A second copy of that mapping would be a convention spanning two
     /// files, and it is precisely the convention that has to hold
@@ -889,52 +837,6 @@ impl Scratch {
     /// never two at once.
     const MAX_MASK_TEMPS: usize = 1;
 
-    /// A `Scratch` with the registers a test wants to hand an encoder.
-    ///
-    /// The allocator is what fills these in production; a test that exercises
-    /// one encoding in isolation has no allocator, so it says outright which
-    /// registers the encoder may destroy.
-    #[cfg(test)]
-    #[must_use]
-    pub(super) const fn for_test(
-        temps: Option<[Reg; Self::MAX_TEMPS]>,
-        reloads: [Option<Reg>; Self::MAX_RELOADS],
-    ) -> Self {
-        Self::for_test_with_classes(temps, reloads, None, None)
-    }
-
-    /// [`Scratch::for_test`], additionally handing an encoder the GPR- and
-    /// mask-class scratch it asks for — the class-B tests (a backend's
-    /// `Gather`/`Uniform`/compare coverage) need these too.
-    #[cfg(test)]
-    #[must_use]
-    pub(super) const fn for_test_with_classes(
-        temps: Option<[Reg; Self::MAX_TEMPS]>,
-        reloads: [Option<Reg>; Self::MAX_RELOADS],
-        gpr_temps: Option<[Gpr; Self::MAX_GPR_TEMPS]>,
-        mask_temp: Option<KReg>,
-    ) -> Self {
-        let temps = match temps {
-            Some([a, b, c, d]) => [Some(a), Some(b), Some(c), Some(d)],
-            None => [None; Self::MAX_TEMPS],
-        };
-        let gpr_temps = match gpr_temps {
-            Some([a, b, c]) => [Some(a), Some(b), Some(c)],
-            None => [None; Self::MAX_GPR_TEMPS],
-        };
-        Self {
-            temps,
-            reloads,
-            guard_mask: None,
-            guard_temp: None,
-            result: None,
-            gpr_temps,
-            mask_temps: [mask_temp],
-            mask_guard_temp: mask_temp,
-            ptr_reload: None,
-        }
-    }
-
     /// The `i`'th register this instruction's encoding asked for.
     ///
     /// `i` is the backend's own numbering, matching the count its
@@ -946,7 +848,7 @@ impl Scratch {
 
     /// The `i`'th reload target this instruction reserved.
     ///
-    /// `i` is [`operand_sources`](super::operand_sources)' numbering, which is
+    /// `i` is [`operand_sources`]' numbering, which is
     /// operand order over the operands that need one.
     #[must_use]
     pub(super) fn reload(&self, i: usize) -> Option<Reg> {
@@ -1325,7 +1227,7 @@ impl NestAllocation {
     /// # Panics
     /// If `j` names no fold in this nest.
     #[must_use]
-    pub(super) fn fold_roots(&self, j: usize) -> FoldRoots {
+    fn fold_roots(&self, j: usize) -> FoldRoots {
         self.folds
             .get(j)
             .unwrap_or_else(|| panic!("Fold({j}) is not a fold of this nest"))
@@ -1451,7 +1353,7 @@ impl<'a> Allocation<'a> {
     }
 
     /// This scope's `If` short-circuit guards: the table the nest was handed
-    /// in ([`ScopeRegion::guards`]), read back.
+    /// in ([`ScopeRegion::guards`](crate::program::ScopeRegion::guards)), read back.
     ///
     /// The schedule an emitter reads here is the one the allocator scanned —
     /// [`schedule`](Self::schedule) never reorders it — so these indices are
@@ -1832,7 +1734,7 @@ fn scope_ix(scope: Scope) -> usize {
 }
 
 /// The two per-class budgets [`plan_carries`] fills, indexed by
-/// [`Budget::of`].
+/// [`Class::ix`].
 type Budget = [usize; 2];
 
 impl Class {
@@ -3019,7 +2921,7 @@ impl LinearScan {
     /// with and the roots it hands to the scopes inside it ([`Boundary`]).
     ///
     /// `guards` are this schedule's `If` guards, as the scope was handed them
-    /// ([`ScopeRegion::guards`]): they name which entries a branch skips, and
+    /// ([`ScopeRegion::guards`](crate::program::ScopeRegion::guards)): they name which entries a branch skips, and
     /// the scan keeps a split range from naming a register a skipped arm never
     /// loaded.
     ///
@@ -3571,11 +3473,86 @@ fn operands_of(sop: &ScheduledOp, class: Class) -> impl Iterator<Item = ValueId>
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
-    use crate::emit::{allocate_flat, flat_nest};
-    use crate::program::{IfArm, ScopeFold, ScopeRegion, lay_out};
+    use crate::emit::tests::allocate_nest;
+
+    /// The smallest scratch pool the encodings can place their temps in
+    /// ([`RegisterFile::MIN_SCRATCH`]), for a test of another module that
+    /// allocates at it.
+    pub(in crate::emit) const FLOOR: u8 = RegisterFile::MIN_SCRATCH;
+
+    /// `file` with its scratch pool cut to its lowest [`FLOOR`]` + above`
+    /// members: the floor, plus headroom.
+    pub(in crate::emit) fn at_floor(file: RegisterFile, above: u8) -> RegisterFile {
+        let kept: Vec<Reg> = file
+            .scratch
+            .iter()
+            .take(usize::from(FLOOR + above))
+            .collect();
+        RegisterFile {
+            scratch: RegSet::of(&kept),
+            ..file
+        }
+    }
+
+    /// `p`'s ranges, in order, as `(the index each starts at, where the value
+    /// lives over it)`.
+    pub(in crate::emit) fn ranges(p: &Placement) -> Vec<(usize, Where)> {
+        p.spans().map(|s| (s.from.index, s.at)).collect()
+    }
+
+    /// Where fold `j`'s binder and accumulator live across its loop.
+    pub(in crate::emit) fn fold_roots(nest: &NestAllocation, j: usize) -> [Where; 2] {
+        let roots = nest.fold_roots(j);
+        [roots.binder, roots.accumulator]
+    }
+    use crate::program::{IfArm, ScopeFold, ScopeRegion};
     use pixelflow_ir::kind::OpKind;
+
+    /// A `Scratch` with the registers a test wants to hand an encoder.
+    ///
+    /// The allocator is what fills these in production; a test that exercises
+    /// one encoding in isolation has no allocator, so it says outright which
+    /// registers the encoder may destroy.
+    #[must_use]
+    pub(in crate::emit) const fn scratch(
+        temps: Option<[Reg; Scratch::MAX_TEMPS]>,
+        reloads: [Option<Reg>; Scratch::MAX_RELOADS],
+    ) -> Scratch {
+        scratch_with_classes(temps, reloads, None, None)
+    }
+
+    /// [`scratch`], additionally handing an encoder the GPR- and
+    /// mask-class scratch it asks for — the class-B tests (a backend's
+    /// `Gather`/`Uniform`/compare coverage) need these too.
+    #[must_use]
+    pub(in crate::emit) const fn scratch_with_classes(
+        temps: Option<[Reg; Scratch::MAX_TEMPS]>,
+        reloads: [Option<Reg>; Scratch::MAX_RELOADS],
+        gpr_temps: Option<[Gpr; Scratch::MAX_GPR_TEMPS]>,
+        mask_temp: Option<KReg>,
+    ) -> Scratch {
+        let temps = match temps {
+            Some([a, b, c, d]) => [Some(a), Some(b), Some(c), Some(d)],
+            None => [None; Scratch::MAX_TEMPS],
+        };
+        let gpr_temps = match gpr_temps {
+            Some([a, b, c]) => [Some(a), Some(b), Some(c)],
+            None => [None; Scratch::MAX_GPR_TEMPS],
+        };
+        Scratch {
+            temps,
+            reloads,
+            guard_mask: None,
+            guard_temp: None,
+            result: None,
+            gpr_temps,
+            mask_temps: [mask_temp],
+            mask_guard_temp: mask_temp,
+            ptr_reload: None,
+        }
+    }
 
     /// Whether any range of `p`'s life is in a stack slot.
     fn spills(p: &Placement) -> bool {
@@ -3588,15 +3565,6 @@ mod tests {
             Where::Reg(r) => Some(r),
             Where::Ptr(_) | Where::Spilled | Where::Remat(_) => None,
         })
-    }
-
-    /// `nest` with its guards tabulated the way a compile tabulates them.
-    ///
-    /// The allocator is handed finished nests, and a literal a test writes by
-    /// hand has no table until it is given one.
-    fn guarded(mut nest: ScopedSchedule) -> ScopedSchedule {
-        lay_out(&mut nest);
-        nest
     }
 
     // --- bit sets ---
@@ -3652,21 +3620,6 @@ mod tests {
         // holding it must not treat Reg(32) as a member too (an `<=` bound
         // check would shift by 32, which is out of range for a `u32`).
         assert!(!s.contains(Reg(32)));
-    }
-
-    #[test]
-    fn reg_set_take_keeps_only_the_lowest_n_members() {
-        let t = RegSet::of(&[Reg(1), Reg(3), Reg(5)]).take(2);
-        assert!(t.contains(Reg(1)));
-        assert!(t.contains(Reg(3)));
-        assert!(!t.contains(Reg(5)));
-        assert_eq!(t.len(), 2);
-    }
-
-    #[test]
-    fn reg_set_take_beyond_its_size_returns_the_whole_set() {
-        let s = RegSet::of(&[Reg(1), Reg(3)]);
-        assert_eq!(s.take(10), s);
     }
 
     #[test]
@@ -3784,7 +3737,7 @@ mod tests {
     }
 
     fn alloc(schedule: Vec<Def>) -> NestAllocation {
-        allocate_flat(schedule, &TEST_FILE)
+        allocate_nest(schedule, &TEST_FILE)
     }
 
     /// A scope nothing crosses into or out of. A `const` item, so the
@@ -4192,7 +4145,7 @@ mod tests {
     #[test]
     fn a_temp_collides_with_neither_the_operand_nor_the_destination() {
         let schedule = vec![leaf(0), def(1, ScheduledOp::Unary(OpKind::Neg, ValueId(0)))];
-        let a = allocate_flat(schedule, &TEMP_FILE);
+        let a = allocate_nest(schedule, &TEMP_FILE);
 
         let temp = a.body().scratch(1).temp(0).expect("`Neg` asked for a temp");
         assert!(
@@ -4244,7 +4197,7 @@ mod tests {
             ScheduledOp::Ternary(OpKind::If, ValueId(2), ValueId(3), ValueId(4)),
         ));
         let at_if = schedule.len() - 1;
-        let a = allocate_flat(schedule, &TEMP_FILE);
+        let a = allocate_nest(schedule, &TEMP_FILE);
         let s = a.body().scratch(at_if);
 
         // The reservation answers the question it is for: how many of this
@@ -4460,25 +4413,25 @@ mod tests {
     /// Nothing is reserved for an operand that is already in a register.
     #[test]
     fn a_resident_operand_reserves_no_reload_target() {
-        let a = allocate_flat(add_two_leaves(), &TEMP_FILE);
+        let a = allocate_nest(add_two_leaves(), &TEMP_FILE);
         let s = a.body().scratch(2);
         assert_eq!(s.reload(0), None);
         assert_eq!(s.reload(1), None);
     }
 
-    /// A pool shrunk below what an encoding needs is not a smaller budget, it
+    /// A pool smaller than what an encoding needs is not a smaller budget, it
     /// is an instruction with nowhere to put its temp — so the floor is the
-    /// smallest pool `capped` hands out, and the allocator still finds a temp
-    /// at it.
+    /// smallest pool a file declares, and the allocator still finds a temp at
+    /// it.
     #[test]
-    fn capping_the_pool_stops_at_the_floor() {
-        let tiny = TEMP_FILE.capped(Some(RegisterFile::MIN_SCRATCH));
+    fn the_allocator_finds_a_temp_at_the_floor() {
+        let tiny = TEMP_FILE;
         assert_eq!(tiny.scratch.len(), RegisterFile::MIN_SCRATCH);
 
         // The shape that used to fall through: a `Neg` whose operand is a
         // computed value, so the temp has to miss a pool register that is
         // already holding something.
-        let a = allocate_flat(
+        let a = allocate_nest(
             vec![
                 leaf(0),
                 leaf(1),
@@ -4495,7 +4448,7 @@ mod tests {
     /// everywhere else, which is the whole reason for asking per-op.
     #[test]
     fn an_op_that_asks_for_no_temp_gets_none() {
-        let a = allocate_flat(add_two_leaves(), &TEMP_FILE);
+        let a = allocate_nest(add_two_leaves(), &TEMP_FILE);
         assert_eq!(a.body().scratch(2).temp(0), None, "`Add` asked for no temp");
     }
 
@@ -4510,7 +4463,7 @@ mod tests {
             def(3, ScheduledOp::Unary(OpKind::Sqrt, ValueId(2))),
             def(4, ScheduledOp::Unary(OpKind::Sqrt, ValueId(3))),
         ];
-        let a = allocate_flat(schedule, &TEMP_FILE);
+        let a = allocate_nest(schedule, &TEMP_FILE);
         assert_eq!(spill_count(&a), 0, "four values fit a four-register pool");
 
         let temp = a.body().scratch(1).temp(0).expect("`Neg` asked for a temp");
@@ -4659,7 +4612,7 @@ mod tests {
                 ..TEST_FILE
             }
             .checked();
-            let a = allocate_flat(
+            let a = allocate_nest(
                 over_the_pool(width, |_| ScheduledOp::Unary(OpKind::Neg, ValueId(0))),
                 &file,
             );
@@ -4720,7 +4673,7 @@ mod tests {
         let limit = 2 * 1024 * 1024 / u64::from(file.vector_bytes);
         let width = limit + u64::from(RegisterFile::MIN_SCRATCH) + 1;
         let result = LinearScan.allocate_nest(
-            flat_nest(over_the_pool(width, |_| {
+            ScopedSchedule::from_schedule(over_the_pool(width, |_| {
                 ScheduledOp::Unary(OpKind::Neg, ValueId(0))
             })),
             &file,
@@ -4856,7 +4809,7 @@ mod tests {
         body.push(def(200, ScheduledOp::Binary(OpKind::Add, acc, ValueId(0))));
         let alloc = LinearScan
             .allocate_nest(
-                guarded(ScopedSchedule {
+                ScopedSchedule {
                     body: ScopeRegion {
                         roots: vec![root],
                         guards: Vec::new(),
@@ -4872,7 +4825,7 @@ mod tests {
                             def(51, ScheduledOp::Binary(OpKind::Add, ValueId(50), root)),
                         ],
                     }],
-                }),
+                },
                 &TEST_FILE,
             )
             .expect("a test nest fits the frame");
@@ -4898,7 +4851,7 @@ mod tests {
         let c = ValueId(1);
         let alloc = LinearScan
             .allocate_nest(
-                guarded(ScopedSchedule {
+                ScopedSchedule {
                     body: ScopeRegion {
                         roots: vec![c],
                         guards: Vec::new(),
@@ -4919,7 +4872,7 @@ mod tests {
                             def(51, ScheduledOp::Binary(OpKind::Add, ValueId(50), c)),
                         ],
                     }],
-                }),
+                },
                 &NEST_FILE,
             )
             .expect("a test nest fits the frame");
@@ -5282,7 +5235,7 @@ mod tests {
         // destination, which is the other way a destination could be pushed
         // onto an operand.
         for file in [&TEST_FILE, &TEMP_FILE] {
-            let a = allocate_flat(schedule.clone(), file);
+            let a = allocate_nest(schedule.clone(), file);
             assert!(
                 spill_count(&a) > 0,
                 "the schedule has to reach eviction for this to test anything"
@@ -5408,7 +5361,7 @@ mod tests {
             acc = ValueId(width + i);
         }
         for file in [&TEST_FILE, &TEMP_FILE] {
-            let a = allocate_flat(schedule.clone(), file);
+            let a = allocate_nest(schedule.clone(), file);
             assert!(spill_count(&a) > 0, "the schedule has to reach eviction");
             assert_reservations_match_residency(&a.body(), file);
         }
@@ -5437,7 +5390,7 @@ mod tests {
             .map(|i| def(i, ScheduledOp::Const(1.0)))
             .collect();
         body.push(def(roots, ScheduledOp::Reduce(fold_meta(), ValueId(0))));
-        guarded(ScopedSchedule {
+        ScopedSchedule {
             body: ScopeRegion {
                 roots: (0..roots).map(ValueId).collect(),
                 schedule: body,
@@ -5450,7 +5403,7 @@ mod tests {
                 schedule: core::iter::once(binder.clone()).chain(reads).collect(),
                 guards: Vec::new(),
             }],
-        })
+        }
     }
 
     /// The roots go in the order of what a carry saves, then of their ids:
@@ -5497,7 +5450,7 @@ mod tests {
         let park = ValueId(5);
         LinearScan
             .allocate_nest(
-                guarded(ScopedSchedule {
+                ScopedSchedule {
                     body: ScopeRegion {
                         roots: vec![park],
                         guards: Vec::new(),
@@ -5539,7 +5492,7 @@ mod tests {
                             schedule: vec![def(50, ScheduledOp::Unary(OpKind::Neg, ValueId(10)))],
                         },
                     ],
-                }),
+                },
                 &NEST_FILE,
             )
             .expect("a test nest fits the frame")
@@ -5630,7 +5583,7 @@ mod tests {
             let (a, b) = (ValueId(2), ValueId(3));
             let alloc = LinearScan
                 .allocate_nest(
-                    guarded(ScopedSchedule {
+                    ScopedSchedule {
                         body: ScopeRegion {
                             roots: vec![a, b],
                             guards: Vec::new(),
@@ -5653,7 +5606,7 @@ mod tests {
                                 def(52, ScheduledOp::Binary(OpKind::Add, ValueId(51), b)),
                             ],
                         }],
-                    }),
+                    },
                     &file,
                 )
                 .expect("a test nest fits the frame");
@@ -5710,7 +5663,7 @@ mod tests {
         let unused = ValueId(6);
         let alloc = LinearScan
             .allocate_nest(
-                guarded(ScopedSchedule {
+                ScopedSchedule {
                     body: ScopeRegion {
                         roots: vec![read, unused],
                         guards: Vec::new(),
@@ -5729,7 +5682,7 @@ mod tests {
                         guards: Vec::new(),
                         schedule: vec![def(50, ScheduledOp::Unary(OpKind::Neg, read))],
                     }],
-                }),
+                },
                 &NEST_FILE,
             )
             .expect("a test nest fits the frame");
@@ -5774,7 +5727,7 @@ mod tests {
             .checked();
             let alloc = LinearScan
                 .allocate_nest(
-                    guarded(ScopedSchedule {
+                    ScopedSchedule {
                         body: ScopeRegion {
                             roots: vec![base],
                             guards: Vec::new(),
@@ -5798,7 +5751,7 @@ mod tests {
                                 def(51, ScheduledOp::Gather(ValueId(50), base)),
                             ],
                         }],
-                    }),
+                    },
                     &file,
                 )
                 .expect("a test nest fits the frame");
@@ -5864,7 +5817,7 @@ mod tests {
             .checked();
             let alloc = LinearScan
                 .allocate_nest(
-                    guarded(ScopedSchedule {
+                    ScopedSchedule {
                         body: ScopeRegion {
                             roots: vec![vector, pointer],
                             guards: Vec::new(),
@@ -5888,7 +5841,7 @@ mod tests {
                                 def(53, ScheduledOp::Gather(ValueId(52), pointer)),
                             ],
                         }],
-                    }),
+                    },
                     &file,
                 )
                 .expect("a test nest fits the frame");
@@ -6039,7 +5992,7 @@ mod tests {
     fn a_folds_parent_must_already_exist() {
         let _ = LinearScan
             .allocate_nest(
-                guarded(ScopedSchedule {
+                ScopedSchedule {
                     body: ScopeRegion {
                         roots: Vec::new(),
                         guards: Vec::new(),
@@ -6055,7 +6008,7 @@ mod tests {
                         guards: Vec::new(),
                         schedule: vec![leaf(50)],
                     }],
-                }),
+                },
                 &NEST_FILE,
             )
             .expect("a test nest fits the frame");
@@ -6087,7 +6040,7 @@ mod tests {
         outer.push(def(99, ScheduledOp::Reduce(fold_meta(), ValueId(0))));
         let alloc = LinearScan
             .allocate_nest(
-                guarded(ScopedSchedule {
+                ScopedSchedule {
                     body: ScopeRegion {
                         roots: roots.clone(),
                         guards: Vec::new(),
@@ -6100,7 +6053,7 @@ mod tests {
                         guards: Vec::new(),
                         schedule: inner,
                     }],
-                }),
+                },
                 &NEST_FILE,
             )
             .expect("a test nest fits the frame");
@@ -6188,7 +6141,7 @@ mod tests {
         let root = ValueId(5);
         let alloc = LinearScan
             .allocate_nest(
-                guarded(ScopedSchedule {
+                ScopedSchedule {
                     body: ScopeRegion {
                         roots: vec![root],
                         guards: Vec::new(),
@@ -6212,7 +6165,7 @@ mod tests {
                             def(5, ScheduledOp::Const(0.0)),
                         ],
                     }],
-                }),
+                },
                 &NEST_FILE,
             )
             .expect("a test nest fits the frame");
@@ -6300,15 +6253,6 @@ mod tests {
             regs,
             alloc::vec![Reg(4), Reg(5), Reg(6), Reg(7), Reg(8), Reg(14), Reg(15)]
         );
-    }
-
-    /// `capped` shrinks a non-contiguous pool to its lowest members.
-    #[test]
-    fn capping_takes_the_lowest_members() {
-        let set = RegSet::of(&[Reg(4), Reg(9), Reg(14), Reg(15)]);
-        let regs: alloc::vec::Vec<Reg> = set.take(2).iter().collect();
-        assert_eq!(regs, alloc::vec![Reg(4), Reg(9)]);
-        assert_eq!(set.take(99).len(), 4, "capping never grows the pool");
     }
 
     #[test]

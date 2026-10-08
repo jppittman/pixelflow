@@ -2,12 +2,12 @@
 //!
 //! One function does what the stages in between are for. The arena is
 //! legalized into the lattice's folds (`pixelflow_ir::passes::legalize`),
-//! lowered to a flat schedule ([`crate::program::lower`]), split into its nest
+//! lowered to a flat schedule ([`crate::program::arena_to_schedule`]), split into its nest
 //! ([`ScopedSchedule::from_schedule`]), and handed to the emitter, which
 //! allocates and emits it ([`compile_native`]). Nothing here is the emitter's:
 //! `emit/` is handed a finished program and names none of the stages above it.
 
-use crate::emit::{CompileResult, EmitCtx, compile_native, native_register_file};
+use crate::emit::{CompileResult, compile_native};
 use crate::error::CompileError;
 use crate::program::ScopedSchedule;
 use crate::program::arena_to_schedule;
@@ -15,43 +15,8 @@ use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{UniformDecl, UniformId, UniformIdentity};
 use pixelflow_ir::passes::lattice::{Collapse, Domain};
 
-impl EmitCtx {
-    /// Compile an [`ExprArena`](pixelflow_ir::arena::ExprArena) DAG under this
-    /// configuration.
-    ///
-    /// The configured spelling of [`compile`]. It is a method rather than a
-    /// `compile_with_ctx` free function because the suffix was only ever
-    /// standing in for a receiver: the config is the thing that varies, so the
-    /// config is what should be on the left.
-    ///
-    /// # Errors
-    ///
-    /// If the arena contains a construct no pass can lower, or the emitter
-    /// cannot allocate a frame for it.
-    pub(super) fn compile(
-        self,
-        arena: &pixelflow_ir::arena::ExprArena,
-        root: pixelflow_ir::arena::ExprId,
-        shape: LatticeShape,
-    ) -> Result<CompileResult, CompileError> {
-        let lanes = native_register_file(self.clone()).vector_bytes / BYTES_PER_LANE;
-        let collapse = Collapse {
-            domain: Domain {
-                shape,
-                origin: origin(),
-            },
-            lanes,
-        };
-        let (arena, root) = pixelflow_ir::passes::legalize(arena, root, &collapse)
-            .map_err(CompileError::Legalize)?;
-        let origin_ids = origin_slots(&arena);
-        let schedule = arena_to_schedule(&arena, root, origin_ids);
-        compile_native(ScopedSchedule::from_schedule(schedule), self)
-    }
-}
-
 /// A lane is one `f32`.
-pub(crate) const BYTES_PER_LANE: u32 = 4;
+const BYTES_PER_LANE: u32 = 4;
 
 /// The two per-call scalars every collapse reads: where the lattice's sample
 /// `(0, 0)` lies, `x0` then `y0`.
@@ -123,19 +88,20 @@ pub fn compile(
          lattice no longer has; a per-call scalar is a Uniform",
         arena.retired_axis(root)
     );
-    EmitCtx::default().compile(arena, root, shape)
+    let lanes = (crate::jit_vector_bytes() as u32) / BYTES_PER_LANE;
+    let schedule = lower(arena, root, shape, lanes)?;
+    compile_native(ScopedSchedule::from_schedule(schedule))
 }
 
 /// `passes::legalize` at `shape` for a target of `lanes` lanes, then
-/// `arena_to_schedule`: everything a compile entry point runs before the
-/// emitter is handed a schedule.
-#[cfg(test)]
-pub(crate) fn schedule_for(
-    a: &pixelflow_ir::arena::ExprArena,
+/// `arena_to_schedule`: everything [`compile`] runs before the emitter is
+/// handed a schedule.
+fn lower(
+    arena: &pixelflow_ir::arena::ExprArena,
     root: pixelflow_ir::arena::ExprId,
     shape: LatticeShape,
     lanes: u32,
-) -> Vec<crate::program::Def> {
+) -> Result<Vec<crate::program::Def>, CompileError> {
     let collapse = Collapse {
         domain: Domain {
             shape,
@@ -143,7 +109,28 @@ pub(crate) fn schedule_for(
         },
         lanes,
     };
-    let (a, root) = pixelflow_ir::passes::legalize(a, root, &collapse).expect("legalize");
-    let ids = origin_slots(&a);
-    arena_to_schedule(&a, root, ids)
+    let (arena, root) =
+        pixelflow_ir::passes::legalize(arena, root, &collapse).map_err(CompileError::Legalize)?;
+    let origin_ids = origin_slots(&arena);
+    Ok(arena_to_schedule(&arena, root, origin_ids))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::LatticeShape;
+
+    /// A lane is one `f32`.
+    pub(crate) const BYTES_PER_LANE: u32 = super::BYTES_PER_LANE;
+
+    /// `passes::legalize` at `shape` for a target of `lanes` lanes, then
+    /// `arena_to_schedule`: everything a compile runs before the emitter is
+    /// handed a schedule, at a width a test chooses.
+    pub(crate) fn schedule_for(
+        a: &pixelflow_ir::arena::ExprArena,
+        root: pixelflow_ir::arena::ExprId,
+        shape: LatticeShape,
+        lanes: u32,
+    ) -> Vec<crate::program::Def> {
+        super::lower(a, root, shape, lanes).expect("legalize")
+    }
 }

@@ -63,7 +63,7 @@ pub(super) struct Arm {
     /// The `If`'s mask.
     pub(super) mask: ValueId,
     /// Which arm.
-    pub(super) arm: IfArm,
+    arm: IfArm,
     /// The region the arm's values belong to.
     pub(super) region: Region,
     /// Latency-prior cycles of everything the arm owns, nested arms and the
@@ -216,12 +216,6 @@ impl Ownership {
     pub(super) fn regions(&self) -> &Tree {
         &self.regions
     }
-
-    #[cfg(test)]
-    /// Whether `inner` is `outer` or nested in it.
-    pub(crate) fn is_within(&self, inner: Region, outer: Region) -> bool {
-        self.regions.is_within(inner.0, outer.0)
-    }
 }
 
 #[cfg(test)]
@@ -250,7 +244,11 @@ mod tests {
     /// The positions an arm owns, nested arms included.
     fn owned(own: &Ownership, arm: &Arm, len: usize) -> Vec<usize> {
         (0..len)
-            .filter(|&pos| own.is_within(own.region_of(pos), arm.region))
+            .filter(|&pos| {
+                own.regions()
+                    .common_ancestor(own.region_of(pos).0, arm.region.0)
+                    == arm.region.0
+            })
             .collect()
     }
 
@@ -369,7 +367,11 @@ mod tests {
                 .iter()
                 .map(|arm| {
                     let mut values: Vec<u64> = (0..schedule.len())
-                        .filter(|&pos| own.is_within(own.region_of(pos), arm.region))
+                        .filter(|&pos| {
+                            own.regions()
+                                .common_ancestor(own.region_of(pos).0, arm.region.0)
+                                == arm.region.0
+                        })
                         .map(|pos| schedule[pos].value.0)
                         .collect();
                     values.sort_unstable();

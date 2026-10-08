@@ -24,7 +24,6 @@ pixelflow-compiler = { path = "../pixelflow-compiler" }
 # `kernel!` in `fonts/` expands into code that constructs IR values, so
 # this is a real dependency, not just a dev one.
 pixelflow-ir = { path = "../pixelflow-ir" }
-pixelflow-codegen = { path = "../pixelflow-codegen" }
 
 # Actor system for async rendering
 actor-scheduler = { path = "../actor-scheduler" }
@@ -40,6 +39,7 @@ windows-sys = { version = "0.59", features = ["Win32_System_Memory", "Win32_Foun
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+pixelflow-codegen = { path = "../pixelflow-codegen" }
 proptest = "1.4"
 tempfile = "3.10"
 pixelflow-compiler = { path = "../pixelflow-compiler" }

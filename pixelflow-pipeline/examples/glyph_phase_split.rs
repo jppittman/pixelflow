@@ -169,7 +169,7 @@ fn main() {
             println!(
                 "glyph{tile}_U{:04X}\t{tile}\t{opt:.3}\t{emit:.3}\t{nodes_in}\t{nodes_out}\t{}\t{}\t{:?}",
                 ch as u32,
-                result.code.len(),
+                result.code.as_bytes().len(),
                 fnv1a64_hex(result.code.as_bytes()),
                 trips
             );

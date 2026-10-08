@@ -18,16 +18,16 @@ The rules, over the non-test, non-comment, non-string text of each file:
       `program/mod.rs` defines (`IfGuard`, `ScopedSchedule`, `Def`, ...) and
       nothing behind it. The list is the filesystem's, not a hand-kept one, so
       a submodule added later is covered the day it is added,
-    - `crate::pipeline`, `crate::jit_cache`, `crate::compiled_kernel` (the
-      driver and what drives it). The one exemption is a plain `pub use`
-      re-export (`pub use crate::pipeline::{compile, origin};`): it keeps a
+    - `crate::pipeline`, `crate::jit_cache` (the driver and what drives it).
+      The one exemption is a plain `pub use` re-export
+      (`pub use crate::pipeline::compile;`): it keeps a
       public path where it was and is not a use. `pub(crate) use` and `use`
       are not re-exports and are not exempt, and nothing else is exempt from
       anything else.
 
   Rule P (every `pixelflow-codegen/src/program/**/*.rs`) may not name
     `crate::emit`, `crate::isa`, `crate::pipeline`, `crate::jit_cache`,
-    `crate::compiled_kernel`, `regalloc`, `executable` or `ExecutableCode`.
+    `regalloc`, `executable` or `CompiledKernel`.
     `program/` MAY name `pixelflow_search`: pricing an arm is its business.
 
 What is not scanned, deliberately: comments and string literals (prose and
@@ -305,17 +305,17 @@ def rules(program_submodules):
         (rf"\bprogram\s*::\s*(?:{sub})\b", False),
         (rf"\bprogram\s*::\s*\{{[^;]*?\b(?:{sub})\b", False),
         (r"\bprogram\s*::\s*\*", False),
-        (r"\b(?:crate|super)\s*::\s*(?:jit_cache|compiled_kernel)\b", False),
-        (r"\b(?:crate|super)\s*::\s*\{[^;]*?\b(?:jit_cache|compiled_kernel)\b", False),
+        (r"\b(?:crate|super)\s*::\s*jit_cache\b", False),
+        (r"\b(?:crate|super)\s*::\s*\{[^;]*?\bjit_cache\b", False),
         (r"\b(?:crate|super)\s*::\s*pipeline\b", True),
         (r"\b(?:crate|super)\s*::\s*\{[^;]*?\bpipeline\b", True),
     ]
     program = [
-        (r"\b(?:crate|super)\s*::\s*(?:emit|isa|pipeline|jit_cache|compiled_kernel)\b", False),
-        (r"\b(?:crate|super)\s*::\s*\{[^;]*?\b(?:emit|isa|pipeline|jit_cache|compiled_kernel)\b", False),
+        (r"\b(?:crate|super)\s*::\s*(?:emit|isa|pipeline|jit_cache)\b", False),
+        (r"\b(?:crate|super)\s*::\s*\{[^;]*?\b(?:emit|isa|pipeline|jit_cache)\b", False),
         (r"\bregalloc\b", False),
         (r"\bexecutable\b", False),
-        (r"\bExecutableCode\b", False),
+        (r"\bCompiledKernel\b", False),
     ]
     return {"E": emit, "P": program}
 
@@ -454,7 +454,7 @@ def self_test():
     case("pub use of the search is still flagged", "pub use pixelflow_search::egraph::CostModel;\n", 1)
     case("grouped crate:: use of the driver", "use crate::{error, pipeline::compile};\n", 1)
     case("grouped crate:: use of the cache", "use crate::{jit_cache::compile};\n", 1)
-    case("multi-line grouped crate:: use", "use crate::{\n    error,\n    compiled_kernel::K,\n};\n", 1)
+    case("multi-line grouped crate:: use", "use crate::{\n    error,\n    jit_cache::K,\n};\n", 1)
     case("grouped super::super:: use of the driver", "use super::super::{pipeline};\n", 1)
     case("grouped crate:: use of other things is fine", "use crate::{error::CompileError, program::Def};\n", 0)
     case("a name that only starts with pipeline", "use crate::{pipeline_stats::X};\n", 0)
@@ -484,7 +484,7 @@ def self_test():
     )
     case("P: emit", "use crate::emit::guards::X;\n", 1, "P")
     case("P: regalloc", "fn f(d: regalloc::Def) {}\n", 1, "P")
-    case("P: executable and ExecutableCode", "use executable::ExecutableCode;\n", 2, "P")
+    case("P: executable and CompiledKernel", "use executable::CompiledKernel;\n", 2, "P")
     case("P: pipeline", "use crate::pipeline::compile;\n", 1, "P")
     case("P: pub use does not exempt the pipeline", "pub use crate::pipeline::compile;\n", 1, "P")
     case("P may name the search", token + "\n", 0, "P")

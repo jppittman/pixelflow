@@ -279,7 +279,7 @@ pub(super) const S_BYTES: u32 = 4;
 /// The largest value a 12-bit scaled immediate holds.
 const MAX_IMM12: u32 = 4095;
 /// The largest 16-byte-aligned displacement `add`'s own 12-bit immediate holds.
-pub(in crate::emit) const MAX_ADD_IMM: u32 = 4080;
+pub(super) const MAX_ADD_IMM: u32 = 4080;
 
 /// An address spelled `[base, #offset]` — the scaled-immediate addressing mode.
 ///
@@ -287,11 +287,11 @@ pub(in crate::emit) const MAX_ADD_IMM: u32 = 4080;
 /// The base being a [`PtrReg`] guarantees an integer counter or index cannot
 /// be mistakenly passed as an address.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(in crate::emit) struct Mem {
+pub(super) struct Mem {
     /// The register holding the base address.
-    pub(in crate::emit) base: PtrReg,
+    pub(super) base: PtrReg,
     /// Displacement in bytes; must be a multiple of the access size.
-    pub(in crate::emit) offset: u32,
+    pub(super) offset: u32,
 }
 
 /// An address spelled `[base, w<index>, uxtw #2]` — a 32-bit index register,
@@ -502,7 +502,7 @@ impl AsmInsn for LdrSIndexed {
     }
 }
 
-/// UMOV Wd, Vn.S[lane] — extract a 32-bit vector lane into a GP register.
+/// `UMOV Wd, Vn.S[lane]` — extract a 32-bit vector lane into a GP register.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) struct UmovW {
     dst: Gpr,
@@ -584,7 +584,7 @@ impl FcvtzsX {
     }
 }
 
-/// INS Vd.S[lane], Wn — insert a GP register into a 32-bit vector lane.
+/// `INS Vd.S[lane], Wn` — insert a GP register into a 32-bit vector lane.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) struct InsW {
     dst: Reg,

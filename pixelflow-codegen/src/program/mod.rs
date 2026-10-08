@@ -13,13 +13,7 @@ mod lower;
 mod ownership;
 mod scopes;
 mod tree;
-#[cfg(test)]
-pub(crate) use guards::FoldReads;
-#[cfg(test)]
-pub(crate) use layout::Layout;
 pub(crate) use lower::arena_to_schedule;
-#[cfg(test)]
-pub(crate) use scopes::lay_out;
 
 use alloc::vec::Vec;
 
@@ -310,7 +304,7 @@ impl IfGuard {
     /// Whether this arm is guarded (has a non-empty range).
     #[must_use]
     #[inline]
-    pub(super) fn is_guarded(&self, arm: IfArm) -> bool {
+    fn is_guarded(&self, arm: IfArm) -> bool {
         let (s, e) = self.range(arm);
         s != e
     }

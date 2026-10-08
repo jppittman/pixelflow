@@ -121,13 +121,6 @@ impl CellGridPackedManifold {
         self.packed.shifts()
     }
 
-    /// The compiled kernel's emitted bytes, for the profiling harness in
-    /// `cell_grid`'s tests. `Manifold::code_bytes` is the public way in.
-    #[cfg(test)]
-    pub(crate) fn code_bytes(&self) -> &[u8] {
-        self.packed.code_bytes()
-    }
-
     /// Lay `metrics` out for this program: the block its kernel reads, plus
     /// the grid's index range at that metric. **This is the whole of a resize
     /// that keeps the shape** — no arena, no saturation, no compile.
@@ -354,7 +347,16 @@ mod tests {
             scale: 1.0,
         };
         let program = CellGridPackedManifold::compile(shape, [0.1, 0.1, 0.1, 1.0], [0, 8, 16, 24]);
-        let code = program.code_bytes();
+        // The program's own code: the cache hands back the entry it compiled.
+        let linked = pixelflow_codegen::jit_cache::compile(
+            &packed_kernel(
+                &Rgba::from(&shape.channel_kernels().channels),
+                [0, 8, 16, 24],
+            ),
+            pixelflow_ir::LatticeShape::new([shape.frame_w, shape.frame_h]),
+        )
+        .expect("compile");
+        let code = linked.kernel.as_bytes();
         println!(
             "CODE_BASE=0x{:x} CODE_LEN={}",
             code.as_ptr() as usize,
@@ -705,8 +707,16 @@ mod tests {
 
         let a = CellGridPackedManifold::compile(shape, bg, RGBA_SHIFTS);
         let b = CellGridPackedManifold::compile(shape, bg, RGBA_SHIFTS);
+        let compiled = || {
+            pixelflow_codegen::jit_cache::compile(
+                &packed_kernel(&Rgba::from(&shape.channel_kernels().channels), RGBA_SHIFTS),
+                pixelflow_ir::LatticeShape::new([shape.frame_w, shape.frame_h]),
+            )
+            .expect("compile")
+            .kernel
+        };
         assert!(
-            core::ptr::eq(a.code_bytes().as_ptr(), b.code_bytes().as_ptr()),
+            Arc::ptr_eq(&compiled(), &compiled()),
             "one shape, one compiled kernel — the JIT cache is keyed on the \
              extents and the leaf slots, and a metric is neither"
         );

@@ -8,8 +8,8 @@
 //! extraction with shared subexpressions, which is why the allocator works on
 //! a DAG schedule rather than a tree.
 //!
-//! All four backends run that same allocator behind the same driver
-//! ([`IsaBackend`]). What a backend contributes is its `RegisterFile` — the
+//! All three backends run that same allocator behind the same driver
+//! (`IsaBackend`). What a backend contributes is its `RegisterFile` — the
 //! allocatable pool, how many registers its encodings and its guards
 //! destroy, vector width, the ABI's three pointer registers — and its
 //! instruction encodings. Nothing else about a target reaches the
@@ -39,8 +39,6 @@
 //! - Reloaded into a register the allocator reserved *for that instruction*
 //!   (`regalloc::Scratch`); there is no register outside the pool for this,
 //!   and every definition holds a pool register at its own definition.
-//! - `EmitCtx::max_regs` caps the pool below the target's own count, which is
-//!   how register pressure vs. spill tradeoffs are exercised deliberately
 
 /// The one way a backend refuses an op.
 ///
@@ -76,7 +74,10 @@ mod storage;
 mod traffic;
 mod x86_64;
 
-pub use executable::ExecutableCode;
+// The whole public surface: the driver (it lives in pipeline.rs, and keeps
+// this path), what it hands back, and the counts inside that.
+pub use crate::pipeline::compile;
+pub use executable::CompiledKernel;
 pub use traffic::{EmitTraffic, ScopeTraffic};
 
 use encoded::EncodedInst;
@@ -84,12 +85,8 @@ use storage::{Slot, StackFrame};
 
 use pixelflow_ir::kind::OpKind;
 
-// The driver lives in pipeline.rs; these two keep their public paths.
-pub use crate::pipeline::compile;
 use crate::program::IfArm;
 use crate::program::IfGuard;
-#[cfg(test)]
-use crate::program::Layout;
 use crate::program::ScheduledOp;
 use traffic::Counting;
 
@@ -290,8 +287,7 @@ struct LabelRef {
 /// binds a label where one lands. Two passes: lay out, then patch.
 #[derive(Default)]
 struct Assembly {
-    /// The bytes so far. Public because emitting into it is what a backend verb
-    /// does.
+    /// The bytes so far: what a backend verb emits into.
     code: Vec<u8>,
     bound: alloc::collections::BTreeMap<Label, usize>,
     pending: Vec<(usize, LabelRef)>,
@@ -427,7 +423,7 @@ enum Loc {
     /// Value is in a vector register.
     Reg(Reg),
     /// Value is an address, in a pointer register — a
-    /// [`regalloc::Class::Pointer`] value's only kind of register.
+    /// [`Class::Pointer`](crate::program::Class::Pointer) value's only kind of register.
     Ptr(PtrReg),
     /// Value is spilled to a stack slot.
     Slot(Slot),
@@ -561,7 +557,7 @@ enum ResolvedOp {
     Uniform { dst: Reg, base: PtrReg, offset: u64 },
     /// A context pointer: `dst = ctx[slot]`, one `mov`/`ldr` from the
     /// context array the kernel is called with. The definition of every
-    /// [`regalloc::Class::Pointer`] value, and the only instruction that
+    /// [`Class::Pointer`](crate::program::Class::Pointer) value, and the only instruction that
     /// reads `regalloc::RegisterFile::gpr_ctx`.
     Context { dst: PtrReg, slot: u16 },
     /// The lane fold's binder, materialized: `dst = [0, 1, …, L−1]` as
@@ -747,29 +743,11 @@ fn declared_mask_temp(temp: Option<KReg>) -> KReg {
     )
 }
 
-/// Emission context with register budget for ML training.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct EmitCtx {
-    /// Cap on the allocatable scratch pool, or `None` to use the whole thing.
-    ///
-    /// Only ever *shrinks* the selected backend's own pool (see
-    /// `regalloc::RegisterFile::capped`); setting it low is how a caller
-    /// forces spilling deliberately. A budget below
-    /// `regalloc::RegisterFile::MIN_SCRATCH` panics when the backend is built,
-    /// since the encodings cannot place their temps in a smaller pool.
-    ///
-    /// `None` rather than "a number at least as large as every pool": that
-    /// spelling was a convention no type enforced, and it broke the moment the
-    /// pools grew — a default of 10 silently capped AVX-512's 22 registers
-    /// back to 10 while its doc comment still claimed it "caps nothing".
-    max_regs: Option<u8>,
-}
-
-/// Compile result with metadata for ML training.
-///
+/// What [`compile`] hands back: the code, and what was emitted, counted —
+/// the static half of what a measurement harness prices a kernel by.
 pub struct CompileResult {
     /// The executable code.
-    pub code: ExecutableCode,
+    pub code: CompiledKernel,
     /// Number of spills performed.
     pub spill_count: u64,
     /// Total stack space used for spills (bytes). A frame offset, not a
@@ -781,7 +759,7 @@ pub struct CompileResult {
     /// slot of their own — the loop-invariant code motion, counted.
     pub hoisted_values: u64,
     /// What was emitted, per scope of the nest — the static half of a cost
-    /// model's inputs. Counted, never optimized: see [`traffic`](self::traffic).
+    /// model's inputs. Counted, never optimized: see [`EmitTraffic`].
     pub traffic: EmitTraffic,
 }
 
@@ -807,9 +785,8 @@ trait IsaBackend {
     /// This backend's register file: the whole of what allocation and frame
     /// layout need to know about the target.
     ///
-    /// Backends declare it as a `const` next to their encodings and clamp its
-    /// scratch pool to [`EmitCtx::max_regs`] at construction. It is the only
-    /// target-dependent input to any of the shared logic here.
+    /// Backends declare it as a `const` next to their encodings. It is the
+    /// only target-dependent input to any of the shared logic here.
     fn register_file(&self) -> regalloc::RegisterFile;
 
     /// Per-compile setup before any code is emitted (e.g. seed a constant pool).
@@ -946,7 +923,7 @@ trait IsaBackend {
     /// A default over [`IsaBackend::alu`]: every backend but AVX-512 computes
     /// a comparison exactly like any other binary op. AVX-512 represents a
     /// comparison's result as a k-register before it is widened to an
-    /// ordinary vector mask ([`RegisterFile::mask_guard_temps`]), which
+    /// ordinary vector mask ([`RegisterFile::mask_guard_temps`](regalloc::RegisterFile::mask_guard_temps)), which
     /// `mask_scratch` supplies — the one other place besides an `If`
     /// guard that needs it — and every other backend ignores.
     fn test_ge(
@@ -1022,76 +999,6 @@ struct MaskTest {
     mask_scratch: Option<KReg>,
     /// Which arm is being skipped.
     arm: IfArm,
-}
-
-/// A loop-free schedule as a nest: one body, no folds, nothing carried across
-/// anything, laid out as `program::scopes::lay_out` lays out a scope.
-///
-/// What a test that builds a schedule by hand allocates: the allocator is
-/// handed a finished nest, tables included, so a bare schedule has to be
-/// given its table the way a compile gives one.
-#[cfg(test)]
-fn flat_nest(schedule: Vec<regalloc::Def>) -> regalloc::ScopedSchedule {
-    let layout = Layout::of(&schedule, &[], &crate::program::FoldReads::default());
-    regalloc::ScopedSchedule {
-        body: crate::program::ScopeRegion {
-            roots: Vec::new(),
-            schedule: layout.apply(&schedule),
-            guards: layout.guards,
-        },
-        folds: Vec::new(),
-    }
-}
-
-/// [`flat_nest`], allocated.
-#[cfg(test)]
-fn allocate_flat(
-    schedule: Vec<regalloc::Def>,
-    file: &regalloc::RegisterFile,
-) -> regalloc::NestAllocation {
-    use regalloc::RegisterAllocator;
-    regalloc::LinearScan
-        .allocate_nest(flat_nest(schedule), file)
-        .expect("a test nest fits the frame")
-}
-
-/// What a test that lowers a kernel allocates: the schedule is scoped by the
-/// same [`regalloc::ScopedSchedule::from_schedule`] a compile uses.
-#[cfg(test)]
-fn allocate_nest(
-    schedule: Vec<regalloc::Def>,
-    file: &regalloc::RegisterFile,
-) -> regalloc::NestAllocation {
-    use regalloc::RegisterAllocator;
-    regalloc::LinearScan
-        .allocate_nest(regalloc::ScopedSchedule::from_schedule(schedule), file)
-        .expect("a test nest fits the frame")
-}
-
-/// [`compile_via_backend`] on a lowered schedule: what a test that compiles
-/// for a chosen backend hands it, scoped the way a compile scopes it.
-#[cfg(test)]
-fn compile_schedule<B: IsaBackend>(
-    schedule: Vec<regalloc::Def>,
-    backend: &mut B,
-) -> Result<CompileResult, CompileError> {
-    compile_via_backend(regalloc::ScopedSchedule::from_schedule(schedule), backend)
-}
-
-/// Allocate a straight-line schedule and emit it as one scope's body.
-///
-/// Production compiles allocate the whole nest at once
-/// ([`regalloc::RegisterAllocator::allocate_nest`]) so every scope's
-/// addresses are known before any of them is emitted; this is the one-scope
-/// convenience the emitter's own tests are written against.
-#[cfg(test)]
-fn emit_dag_body<B: IsaBackend>(
-    schedule: Vec<regalloc::Def>,
-    backend: &mut B,
-) -> Result<(Vec<u8>, Reg), CompileError> {
-    let nest = allocate_flat(schedule, &backend.register_file());
-    let (code, result) = emit_scope(nest.body(), backend)?;
-    Ok((code, result.expect("a value-rooted schedule has a result")))
 }
 
 /// Where `v` lives when the allocator says `at`: the arrow from a
@@ -2197,24 +2104,11 @@ fn location_of(locs: &[Option<Binding>], vid: regalloc::ValueId) -> Binding {
 /// and the `mmap`/`mprotect` that makes bytes callable) and nowhere else.
 pub(crate) fn compile_native(
     program: regalloc::ScopedSchedule,
-    ctx: EmitCtx,
 ) -> Result<CompileResult, CompileError> {
     match crate::isa::detect() {
-        Isa::Avx2 => compile_via_backend(program, &mut avx2::driver::Avx2Backend::new(ctx)),
-        Isa::Avx512 => compile_via_backend(program, &mut avx512::driver::Avx512Backend::new(ctx)),
-        Isa::Neon => compile_via_backend(program, &mut aarch64::driver::Aarch64Backend::new(ctx)),
-    }
-}
-
-/// The register file of the backend [`compile_native`] instantiates: the
-/// width a kernel is legalized at before it is scheduled, and what the
-/// allocator's tests allocate against without emitting. The same `match`, so
-/// the two cannot name different backends.
-pub(crate) fn native_register_file(ctx: EmitCtx) -> regalloc::RegisterFile {
-    match crate::isa::detect() {
-        Isa::Avx2 => avx2::driver::Avx2Backend::new(ctx).register_file(),
-        Isa::Avx512 => avx512::driver::Avx512Backend::new(ctx).register_file(),
-        Isa::Neon => aarch64::driver::Aarch64Backend::new(ctx).register_file(),
+        Isa::Avx2 => compile_via_backend(program, &mut avx2::driver::Avx2Backend::new()),
+        Isa::Avx512 => compile_via_backend(program, &mut avx512::driver::Avx512Backend::new()),
+        Isa::Neon => compile_via_backend(program, &mut aarch64::driver::Aarch64Backend::new()),
     }
 }
 
@@ -2285,7 +2179,7 @@ fn compile_via_backend<B: IsaBackend>(
         .parks()
         .filter(|root| nest.carried(*root).is_some())
         .count() as u64;
-    let exec = unsafe { executable::ExecutableCode::from_code(&code)? };
+    let exec = unsafe { executable::CompiledKernel::from_code(&code)? };
     Ok(CompileResult {
         code: exec,
         spill_count: nest.body().spill_slots(),
@@ -2312,13 +2206,208 @@ const FRAME_HEADROOM: usize = 64;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::{BYTES_PER_LANE, schedule_for};
+    use crate::pipeline::tests::{BYTES_PER_LANE, schedule_for};
     use pixelflow_ir::LatticeShape;
     use pixelflow_ir::arena::{ExprArena, ExprId, UniformId};
 
+    /// A schedule allocated as a compile allocates it: scoped by the same
+    /// [`regalloc::ScopedSchedule::from_schedule`], so a hand-built
+    /// loop-free schedule is one body laid out as a compile lays one out.
+    pub(super) fn allocate_nest(
+        schedule: Vec<regalloc::Def>,
+        file: &regalloc::RegisterFile,
+    ) -> regalloc::NestAllocation {
+        use regalloc::RegisterAllocator;
+        regalloc::LinearScan
+            .allocate_nest(regalloc::ScopedSchedule::from_schedule(schedule), file)
+            .expect("a test nest fits the frame")
+    }
+
+    /// [`compile_via_backend`] on a lowered schedule: what a test that compiles
+    /// for a chosen backend hands it, scoped the way a compile scopes it.
+    pub(super) fn compile_schedule<B: IsaBackend>(
+        schedule: Vec<regalloc::Def>,
+        backend: &mut B,
+    ) -> Result<CompileResult, CompileError> {
+        compile_via_backend(regalloc::ScopedSchedule::from_schedule(schedule), backend)
+    }
+
+    /// Allocate a straight-line schedule and emit it as one scope's body: the
+    /// one-scope view the emitter's own tests are written against.
+    pub(super) fn emit_dag_body<B: IsaBackend>(
+        schedule: Vec<regalloc::Def>,
+        backend: &mut B,
+    ) -> Result<(Vec<u8>, Reg), CompileError> {
+        let nest = allocate_nest(schedule, &backend.register_file());
+        let (code, result) = emit_scope(nest.body(), backend)?;
+        Ok((code, result.expect("a value-rooted schedule has a result")))
+    }
+
+    /// The register file of the backend [`compile_native`] instantiates on
+    /// this host.
+    fn native_file() -> regalloc::RegisterFile {
+        match crate::isa::detect() {
+            Isa::Avx2 => avx2::driver::Avx2Backend::new().register_file(),
+            Isa::Avx512 => avx512::driver::Avx512Backend::new().register_file(),
+            Isa::Neon => aarch64::driver::Aarch64Backend::new().register_file(),
+        }
+    }
+
+    /// A backend whose scratch pool is `.1` registers above the floor
+    /// ([`regalloc::tests::at_floor`]): how a test reaches, on a kernel small enough to reason
+    /// about, the allocation a kernel too wide for the whole pool gets. Every
+    /// verb but [`IsaBackend::register_file`] is the wrapped backend's own.
+    pub(super) struct AtFloor<B>(pub(super) B, pub(super) u8);
+
+    impl<B: IsaBackend> IsaBackend for AtFloor<B> {
+        fn jump(&mut self, asm: &mut Assembly, label: Label) {
+            self.0.jump(asm, label);
+        }
+        fn register_file(&self) -> regalloc::RegisterFile {
+            regalloc::tests::at_floor(self.0.register_file(), self.1)
+        }
+        fn begin(&mut self, schedule: &[regalloc::Def]) -> Result<(), CompileError> {
+            self.0.begin(schedule)
+        }
+        fn emit_plan(
+            &mut self,
+            code: &mut Vec<u8>,
+            plan: &InstructionPlan,
+        ) -> Result<(), CompileError> {
+            self.0.emit_plan(code, plan)
+        }
+        fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg) {
+            self.0.emit_mov(code, dst, src);
+        }
+        fn emit_store(
+            &mut self,
+            code: &mut Vec<u8>,
+            src: Reg,
+            offset: u32,
+        ) -> Result<(), CompileError> {
+            self.0.emit_store(code, src, offset)
+        }
+        fn ptr_store(&mut self, code: &mut Vec<u8>, src: PtrReg, offset: u32) {
+            self.0.ptr_store(code, src, offset);
+        }
+        fn ptr_load(&mut self, code: &mut Vec<u8>, dst: PtrReg, offset: u32) {
+            self.0.ptr_load(code, dst, offset);
+        }
+        fn ptr_mov(&mut self, code: &mut Vec<u8>, dst: PtrReg, src: PtrReg) {
+            self.0.ptr_mov(code, dst, src);
+        }
+        fn emit_resolve(
+            &mut self,
+            code: &mut Vec<u8>,
+            vid: regalloc::ValueId,
+            target: Reg,
+            locs: &[Option<Binding>],
+        ) -> Result<Reg, CompileError> {
+            self.0.emit_resolve(code, vid, target, locs)
+        }
+        fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
+            self.0.branch_if_arm_is_dead(asm, test, label);
+        }
+        fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {
+            self.0.frame_alloc(code, bytes);
+        }
+        fn frame_free(&mut self, code: &mut Vec<u8>, bytes: u32) {
+            self.0.frame_free(code, bytes);
+        }
+        fn anchor(&mut self, asm: &mut Assembly) {
+            self.0.anchor(asm);
+        }
+        fn finish(&mut self, asm: &mut Assembly) {
+            self.0.finish(asm);
+        }
+        fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
+            self.0.slot_store(code, src, offset);
+        }
+        fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
+            self.0.slot_load(code, dst, offset);
+        }
+        fn scope_begin(&mut self) {
+            self.0.scope_begin();
+        }
+        fn scope_end(&mut self, scope: regalloc::Scope, bytes: u64) {
+            self.0.scope_end(scope, bytes);
+        }
+        fn add_scalar(
+            &mut self,
+            code: &mut Vec<u8>,
+            dst: Reg,
+            scratch: Reg,
+            scalar: f32,
+        ) -> Result<(), CompileError> {
+            self.0.add_scalar(code, dst, scratch, scalar)
+        }
+        fn load_const(
+            &mut self,
+            code: &mut Vec<u8>,
+            dst: Reg,
+            val: f32,
+        ) -> Result<(), CompileError> {
+            self.0.load_const(code, dst, val)
+        }
+        fn alu(&mut self, code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2]) {
+            self.0.alu(code, op, dst, srcs);
+        }
+        fn test_ge(
+            &mut self,
+            code: &mut Vec<u8>,
+            dst: Reg,
+            srcs: [Reg; 2],
+            mask_scratch: Option<KReg>,
+        ) {
+            self.0.test_ge(code, dst, srcs, mask_scratch);
+        }
+        fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan) {
+            self.0.emit_write(code, write);
+        }
+        fn emit_ret(&mut self, code: &mut Vec<u8>) {
+            self.0.emit_ret(code);
+        }
+    }
+
+    /// `a` compiled for this host with the native backend at the floor
+    /// ([`AtFloor`]).
+    pub(super) fn compile_at_floor(
+        a: &ExprArena,
+        root: ExprId,
+        shape: LatticeShape,
+    ) -> CompileResult {
+        compile_above_floor(a, root, shape, 0)
+    }
+
+    /// `a` compiled for this host with the native backend `above` registers
+    /// above the floor ([`AtFloor`]).
+    fn compile_above_floor(
+        a: &ExprArena,
+        root: ExprId,
+        shape: LatticeShape,
+        above: u8,
+    ) -> CompileResult {
+        let schedule = native_schedule(a, root, shape);
+        match crate::isa::detect() {
+            Isa::Avx2 => compile_schedule(
+                schedule,
+                &mut AtFloor(avx2::driver::Avx2Backend::new(), above),
+            ),
+            Isa::Avx512 => compile_schedule(
+                schedule,
+                &mut AtFloor(avx512::driver::Avx512Backend::new(), above),
+            ),
+            Isa::Neon => compile_schedule(
+                schedule,
+                &mut AtFloor(aarch64::driver::Aarch64Backend::new(), above),
+            ),
+        }
+        .expect("a test kernel compiles at the floor")
+    }
+
     /// Lanes in one SIMD batch at the tier this host selected.
     fn lanes() -> usize {
-        crate::isa::jit_vector_bytes() / core::mem::size_of::<f32>()
+        crate::jit_vector_bytes() / core::mem::size_of::<f32>()
     }
 
     /// One sample, so the lattice's origin *is* the point the kernel is
@@ -2337,19 +2426,15 @@ mod tests {
     /// `zmm` 64 and a NEON `q` register 16, by definition.
     #[test]
     fn every_backends_vector_width_is_its_tiers() {
-        let ctx = EmitCtx::default;
         let files = [
-            (
-                Isa::Avx2,
-                avx2::driver::Avx2Backend::new(ctx()).register_file(),
-            ),
+            (Isa::Avx2, avx2::driver::Avx2Backend::new().register_file()),
             (
                 Isa::Avx512,
-                avx512::driver::Avx512Backend::new(ctx()).register_file(),
+                avx512::driver::Avx512Backend::new().register_file(),
             ),
             (
                 Isa::Neon,
-                aarch64::driver::Aarch64Backend::new(ctx()).register_file(),
+                aarch64::driver::Aarch64Backend::new().register_file(),
             ),
         ];
         for (isa, file) in files {
@@ -2360,6 +2445,12 @@ mod tests {
             };
             assert_eq!(file.vector_bytes, isa_bytes, "{isa:?}");
         }
+        // And the width a compile legalizes at (`jit_vector_bytes`) is the
+        // width of the backend it instantiates.
+        assert_eq!(
+            native_file().vector_bytes as usize,
+            crate::jit_vector_bytes()
+        );
     }
 
     /// Run the collapse `code` is over a plane of exactly `shape`'s extent,
@@ -2369,7 +2460,7 @@ mod tests {
     /// block, and `(x, y)` is where the lattice's sample `(0, 0)` lies. The
     /// pitch is the width, so a sample reads as `out[row * width + col]`.
     fn collapse_into(
-        code: &executable::ExecutableCode,
+        code: &executable::CompiledKernel,
         buffers: &[*const f32],
         uniforms: &[f32],
         (x, y): (f32, f32),
@@ -2391,14 +2482,14 @@ mod tests {
     }
 
     /// Evaluate a kernel compiled at [`POINT`] at one lattice point.
-    fn eval_point(code: &executable::ExecutableCode, x: f32, y: f32) -> f32 {
+    fn eval_point(code: &executable::CompiledKernel, x: f32, y: f32) -> f32 {
         collapse_into(code, &[], &[], (x, y), POINT)[0]
     }
 
     /// Evaluate a kernel compiled at [`batch`]: one row of `lanes()` samples
     /// from `(x, y)`.
     fn eval_batch(
-        code: &executable::ExecutableCode,
+        code: &executable::CompiledKernel,
         buffers: &[*const f32],
         uniforms: &[f32],
         x: f32,
@@ -2422,7 +2513,7 @@ mod tests {
     /// guarded arm, arms guarded, and schedule entries under a guard (an
     /// entry inside two nested arms counts in each).
     fn census(a: &ExprArena, root: ExprId, shape: LatticeShape) -> (usize, usize, usize) {
-        let file = native_register_file(EmitCtx::default());
+        let file = native_file();
         let nest = allocate_nest(native_schedule(a, root, shape), &file);
         let scopes = core::iter::once(regalloc::Scope::Body)
             .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
@@ -2430,7 +2521,10 @@ mod tests {
         for scope in scopes {
             for guard in nest.scope(scope).if_guards() {
                 census.0 += usize::from(guard.has_guarded_arm());
-                for arm in IfArm::ALL.into_iter().filter(|&arm| guard.is_guarded(arm)) {
+                for arm in IfArm::ALL.into_iter().filter(|&arm| {
+                    let (start, end) = guard.range(arm);
+                    start != end
+                }) {
                     let (start, end) = guard.range(arm);
                     census.1 += 1;
                     census.2 += end - start;
@@ -2480,9 +2574,8 @@ mod tests {
         let body = sum_arena.push_binary(OpKind::Add, x, i);
         let sum_fold = Fold::new(Monoid::SUM, binder, 0..4);
         let sum_root = sum_arena.push_reduce(sum_fold, body);
-        let sum_code = EmitCtx::default()
-            .compile(&sum_arena, sum_root, POINT)
-            .expect("a surviving SUM Reduce compiles");
+        let sum_code =
+            compile(&sum_arena, sum_root, POINT).expect("a surviving SUM Reduce compiles");
 
         for x in [0.0f32, 2.0, -1.5, 10.0] {
             let got = eval_point(&sum_code.code, x, 0.0);
@@ -2497,9 +2590,8 @@ mod tests {
         let body = min_arena.push_binary(OpKind::Sub, x, i);
         let min_fold = Fold::new(Monoid::MIN, binder, 0..4);
         let min_root = min_arena.push_reduce(min_fold, body);
-        let min_code = EmitCtx::default()
-            .compile(&min_arena, min_root, POINT)
-            .expect("a surviving MIN Reduce compiles");
+        let min_code =
+            compile(&min_arena, min_root, POINT).expect("a surviving MIN Reduce compiles");
 
         for x in [0.0f32, 2.0, -1.5, 10.0] {
             let got = eval_point(&min_code.code, x, 0.0);
@@ -2538,9 +2630,7 @@ mod tests {
         let plus_shared = a.push_binary(OpKind::Add, reduce, shared);
         let root = a.push_binary(OpKind::Add, plus_shared, y);
 
-        let code = EmitCtx::default()
-            .compile(&a, root, POINT)
-            .expect("a fold that feeds further arithmetic compiles");
+        let code = compile(&a, root, POINT).expect("a fold that feeds further arithmetic compiles");
 
         for (x, y) in [(0.0f32, 0.0f32), (2.0, 1.0), (-1.5, 3.0), (10.0, -4.0)] {
             let got = eval_point(&code.code, x, y);
@@ -2593,9 +2683,7 @@ mod tests {
         let reduce = a.push_reduce(fold, body);
         let root = a.push_binary(OpKind::Add, shared, reduce);
 
-        let code = EmitCtx::default()
-            .compile(&a, root, POINT)
-            .expect("interleaved shared-leaf order compiles");
+        let code = compile(&a, root, POINT).expect("interleaved shared-leaf order compiles");
 
         for x in [0.0f32, 2.0, -1.5, 10.0] {
             let got = eval_point(&code.code, x, 0.0);
@@ -2679,9 +2767,7 @@ mod tests {
             .collect();
         let root = tree_sum(&mut a, joined);
 
-        let code = EmitCtx::default()
-            .compile(&a, root, POINT)
-            .expect("a fold under register pressure compiles");
+        let code = compile(&a, root, POINT).expect("a fold under register pressure compiles");
 
         for xv in [0.0f32, 1.0, -2.5, 7.0] {
             let got = eval_point(&code.code, xv, 0.0);
@@ -2731,15 +2817,10 @@ mod tests {
         // With the whole pool and at the floor: the outer body never reads
         // its own binder, only the inner one does, so at the floor the inner
         // scope reads an enclosing loop's counter from that loop's slot.
-        for ctx in [
-            EmitCtx::default(),
-            EmitCtx {
-                max_regs: Some(regalloc::RegisterFile::MIN_SCRATCH),
-            },
+        for code in [
+            compile(&a, root, POINT).expect("a fold inside a fold compiles"),
+            compile_at_floor(&a, root, POINT),
         ] {
-            let code = ctx
-                .compile(&a, root, POINT)
-                .expect("a fold inside a fold compiles");
             for x in [0.0f32, 2.0, -1.5, 10.0] {
                 let got = eval_point(&code.code, x, 0.0);
                 let want = 6.0 * x + 3.0;
@@ -2758,9 +2839,7 @@ mod tests {
     #[test]
     fn a_reduce_three_deep_compiles_and_runs() {
         let (a, root) = three_deep_contraction();
-        let code = EmitCtx::default()
-            .compile(&a, root, POINT)
-            .expect("a fold three deep compiles");
+        let code = compile(&a, root, POINT).expect("a fold three deep compiles");
         assert_three_deep(&code);
     }
 
@@ -2822,13 +2901,10 @@ mod tests {
         let right = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..2), two_i);
         let root = a.push_binary(OpKind::Add, left, right);
 
-        for ctx in [
-            EmitCtx::default(),
-            EmitCtx {
-                max_regs: Some(regalloc::RegisterFile::MIN_SCRATCH),
-            },
+        for code in [
+            compile(&a, root, POINT).expect("sibling folds compile"),
+            compile_at_floor(&a, root, POINT),
         ] {
-            let code = ctx.compile(&a, root, POINT).expect("sibling folds compile");
             for x in [0.0f32, 2.0, -1.5, 10.0] {
                 let got = eval_point(&code.code, x, 0.0);
                 let want = 3.0 * x + 5.0;
@@ -2860,7 +2936,7 @@ mod tests {
         let sum = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), two_i);
         let root = a.push_binary(OpKind::Add, x, sum);
 
-        let file = native_register_file(EmitCtx::default());
+        let file = native_file();
         let nest = allocate_nest(native_schedule(&a, root, POINT), &file);
         let j = kernel_fold(&nest, 3).expect("the kernel's fold is three trips");
         assert_eq!(
@@ -2870,9 +2946,7 @@ mod tests {
              per call, not to a lattice fold that reruns it per sample"
         );
 
-        let code = EmitCtx::default()
-            .compile(&a, root, POINT)
-            .expect("a hoisted fold compiles");
+        let code = compile(&a, root, POINT).expect("a hoisted fold compiles");
         for x in [0.0f32, 2.0, -1.5, 10.0] {
             let got = eval_point(&code.code, x, 0.0);
             assert_eq!(got, x + 6.0, "at x={x}");
@@ -2908,20 +2982,14 @@ mod tests {
         let carried = |file: &regalloc::RegisterFile| -> usize {
             let nest = allocate_nest(native_schedule(&a, root, POINT), file);
             (0..nest.fold_count())
-                .flat_map(|j| {
-                    let roots = nest.fold_roots(j);
-                    [roots.binder, roots.accumulator]
-                })
+                .flat_map(|j| regalloc::tests::fold_roots(&nest, j))
                 .filter(|at| matches!(at, regalloc::Where::Reg(_)))
                 .count()
         };
-        let floor = regalloc::RegisterFile::MIN_SCRATCH;
+        let floor = regalloc::tests::FLOOR;
         let mut previous = None;
         for above in [0, 5] {
-            let ctx = EmitCtx {
-                max_regs: Some(floor + above),
-            };
-            let file = native_register_file(ctx.clone());
+            let file = regalloc::tests::at_floor(native_file(), above);
             assert_eq!(
                 file.scratch.len(),
                 floor + above,
@@ -2942,10 +3010,7 @@ mod tests {
                 );
             }
             previous = Some(count);
-            let code = ctx
-                .compile(&a, root, POINT)
-                .expect("a fold three deep compiles");
-            assert_three_deep(&code);
+            assert_three_deep(&compile_above_floor(&a, root, POINT, above));
         }
     }
 
@@ -2974,7 +3039,7 @@ mod tests {
 
         // The structure: two folds, neither inside the other — the inner's
         // def sits in the outer's schedule as a placeholder, opening nothing.
-        let file = native_register_file(EmitCtx::default());
+        let file = native_file();
         let nest = allocate_nest(native_schedule(&a, root, POINT), &file);
         let inner_j = kernel_fold(&nest, 3).expect("the inner fold is three trips");
         let outer_j = kernel_fold(&nest, 2).expect("the outer fold is two trips");
@@ -2999,9 +3064,7 @@ mod tests {
             "nothing behind the placeholder is copied in"
         );
 
-        let code = EmitCtx::default()
-            .compile(&a, root, POINT)
-            .expect("a hoisted fold compiles");
+        let code = compile(&a, root, POINT).expect("a hoisted fold compiles");
         for x in [0.0f32, 2.0, -1.5, 10.0] {
             let got = eval_point(&code.code, x, 0.0);
             let want = 9.0 * x + 10.0;
@@ -3025,9 +3088,7 @@ mod tests {
         let inner = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), xi);
         let root = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..2), inner);
 
-        let code = EmitCtx::default()
-            .compile(&a, root, POINT)
-            .expect("a fold whose body is a hoisted fold compiles");
+        let code = compile(&a, root, POINT).expect("a fold whose body is a hoisted fold compiles");
         for x in [0.0f32, 2.0, -1.5, 10.0] {
             let got = eval_point(&code.code, x, 0.0);
             let want = 6.0 * x + 6.0;
@@ -3093,9 +3154,7 @@ mod tests {
         let outer_body = tree_sum(&mut a, joined);
         let root = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..J), outer_body);
 
-        let code = EmitCtx::default()
-            .compile(&a, root, POINT)
-            .expect("nested folds under register pressure compile");
+        let code = compile(&a, root, POINT).expect("nested folds under register pressure compile");
 
         for xv in [0.0f32, 1.0, -2.5, 7.0] {
             let got = eval_point(&code.code, xv, 0.0);
@@ -3146,10 +3205,9 @@ mod tests {
         let scaled = a.push_binary(OpKind::Mul, y, u);
         let root = a.push_binary(OpKind::Add, a.clone().push_var(0).max(x).min(x), scaled);
 
-        let ctx = EmitCtx::default();
-        let mut neon = aarch64::driver::Aarch64Backend::new(ctx.clone());
-        let mut avx2b = avx2::driver::Avx2Backend::new(ctx.clone());
-        let mut avx512b = avx512::driver::Avx512Backend::new(ctx);
+        let mut neon = aarch64::driver::Aarch64Backend::new();
+        let mut avx2b = avx2::driver::Avx2Backend::new();
+        let mut avx512b = avx512::driver::Avx512Backend::new();
 
         // Each backend is handed a schedule legalized at *its own* lane
         // count: the lattice's lane fold is the one part of a collapse whose
@@ -3167,6 +3225,7 @@ mod tests {
         let neon_len = compile_schedule(for_backend(neon.register_file()), &mut neon)
             .expect("NEON emit")
             .code
+            .as_bytes()
             .len();
         assert!(
             neon_len > 0 && neon_len.is_multiple_of(4),
@@ -3178,6 +3237,7 @@ mod tests {
                 compile_schedule(for_backend(avx2b.register_file()), &mut avx2b)
                     .expect("AVX2")
                     .code
+                    .as_bytes()
                     .len(),
             ),
             (
@@ -3185,6 +3245,7 @@ mod tests {
                 compile_schedule(for_backend(avx512b.register_file()), &mut avx512b)
                     .expect("AVX-512")
                     .code
+                    .as_bytes()
                     .len(),
             ),
         ] {
@@ -3321,72 +3382,8 @@ mod tests {
             ("if", &if_arena, if_root),
             ("fold", &fold, fold_root),
         ];
-        let ctx = EmitCtx::default;
-        check("AVX2", || avx2::driver::Avx2Backend::new(ctx()), &kernels);
-        check(
-            "AVX-512",
-            || avx512::driver::Avx512Backend::new(ctx()),
-            &kernels,
-        );
-    }
-
-    /// The aarch64 constant pool must APPEND across the scopes a collapse
-    /// compile pushes through one backend, never reset.
-    ///
-    /// An earlier scope's bytes already have the first pool's X17-relative
-    /// offsets baked in, so a reset leaves them pointing at different
-    /// constants — the "macOS glyph-ink regression", which painted glyphs with
-    /// the wrong ink and was only ever observable by running the app on a Mac.
-    ///
-    /// It is an aarch64 bug, not a macOS one, and now it is a sub-millisecond
-    /// unit test on every host.
-    #[test]
-    fn aarch64_const_pool_appends_across_scopes() {
-        /// One scope: a uniform (read through its block's pointer) times a
-        /// constant only the pool can hold.
-        fn scope_for(k: f32) -> Vec<regalloc::Def> {
-            alloc::vec![
-                regalloc::Def {
-                    value: regalloc::ValueId(0),
-                    op: ScheduledOp::Context(0),
-                },
-                regalloc::Def {
-                    value: regalloc::ValueId(1),
-                    op: ScheduledOp::Uniform(regalloc::ValueId(0), 0),
-                },
-                regalloc::Def {
-                    value: regalloc::ValueId(2),
-                    op: ScheduledOp::Const(k),
-                },
-                regalloc::Def {
-                    value: regalloc::ValueId(3),
-                    op: ScheduledOp::Binary(
-                        OpKind::Mul,
-                        regalloc::ValueId(1),
-                        regalloc::ValueId(2),
-                    ),
-                },
-            ]
-        }
-
-        // Two constants that genuinely need the pool (not FMOV-immediate).
-        let (first, second) = (0.123_456_79_f32, 987.654_3_f32);
-        assert!(aarch64::needs_const_pool(first));
-        assert!(aarch64::needs_const_pool(second));
-
-        let mut backend = aarch64::driver::Aarch64Backend::new(EmitCtx::default());
-        emit_dag_body(scope_for(first), &mut backend).expect("first scope");
-        let after_first = backend.pool_entries().to_vec();
-        assert!(!after_first.is_empty(), "the first scope pooled nothing");
-        emit_dag_body(scope_for(second), &mut backend).expect("second scope");
-
-        assert!(
-            backend.pool_entries().starts_with(&after_first),
-            "the second scope RESET the constant pool: the first scope's \
-             baked-in X17-relative offsets now name different constants — the \
-             glyph-ink regression. Pool was {after_first:?}, became {:?}",
-            backend.pool_entries()
-        );
+        check("AVX2", avx2::driver::Avx2Backend::new, &kernels);
+        check("AVX-512", avx512::driver::Avx512Backend::new, &kernels);
     }
 
     // =========================================================================
@@ -3399,7 +3396,7 @@ mod tests {
     #[test]
     fn a_parked_placeholder_is_addressed_at_its_park() {
         let (a, root) = shared_leaf_kernel();
-        let file = native_register_file(EmitCtx::default());
+        let file = native_file();
         let nest = allocate_nest(native_schedule(&a, root, batch()), &file);
         let mut placeholders = 0;
         for j in 0..nest.fold_count() {
@@ -3436,7 +3433,7 @@ mod tests {
     #[test]
     fn a_shared_leaf_is_placed_once_per_scope() {
         let (a, root) = shared_leaf_kernel();
-        let file = native_register_file(EmitCtx::default());
+        let file = native_file();
         let nest = allocate_nest(native_schedule(&a, root, batch()), &file);
 
         // Every value a scope schedules has an answer at a point in that
@@ -3495,7 +3492,7 @@ mod tests {
 
     /// The scratch these `resolve_operands` tests are written against.
     const TEST_SCRATCH: regalloc::Scratch =
-        regalloc::Scratch::for_test(None, [Some(RELOAD[0]), Some(RELOAD[1])]);
+        regalloc::tests::scratch(None, [Some(RELOAD[0]), Some(RELOAD[1])]);
 
     /// Dense `ValueId -> Binding`, as the emit loop builds it.
     fn make_locs(
@@ -3843,13 +3840,13 @@ mod tests {
     /// of the collapse body, and leave nothing to spill.
     ///
     /// The pressure comes from the live ranges rather than from the budget.
-    /// This used to be `(X+Y)·(X−Y) + (X·Y)·(X+1)` under `max_regs(2)`, which
-    /// keeps at most three values live: it spilled only because two registers
-    /// is fewer than three, and a two-register pool is no longer a budget a
-    /// caller can ask for (`RegisterFile::MIN_SCRATCH` — an instruction temp
-    /// cannot spill). Ten live values outrun every backend's floor, so the
-    /// subject here — what spilling *does* — no longer depends on how small
-    /// the pool can be made.
+    /// This used to be `(X+Y)·(X−Y) + (X·Y)·(X+1)` in a two-register pool,
+    /// which keeps at most three values live: it spilled only because two
+    /// registers is fewer than three, and no pool is that small any more
+    /// (`RegisterFile::MIN_SCRATCH` — an instruction temp cannot spill). Ten
+    /// live values outrun every backend's floor ([`AtFloor`]), so the subject
+    /// here — what spilling *does* — no longer depends on how small the pool
+    /// can be made.
     #[test]
     fn arena_compile_with_spills() {
         let mut arena = ExprArena::new();
@@ -3874,11 +3871,7 @@ mod tests {
         }
         let root = terms[0];
 
-        let result = EmitCtx {
-            max_regs: Some(regalloc::RegisterFile::MIN_SCRATCH),
-        }
-        .compile(&arena, root, POINT)
-        .expect("arena DAG compile with spills failed");
+        let result = compile_at_floor(&arena, root, POINT);
 
         assert!(
             result.spill_count > 0,
@@ -4002,7 +3995,7 @@ mod tests {
         /// forming — they would just be testing an ordinary `If`, which is
         /// the silent-decay shape this file has been bitten by before.
         fn assert_guard_forms(a: &ExprArena, root: ExprId) {
-            let file = native_register_file(EmitCtx::default());
+            let file = native_file();
             let nest = allocate_nest(native_schedule(a, root, POINT), &file);
             assert!(
                 guarded_scope(&nest).is_some(),
@@ -4129,9 +4122,12 @@ mod tests {
         /// three guards over six arms.
         ///
         /// The control is the silhouette mask over arms cheaper than the
-        /// mispredict they would risk: one `If` and no guard, as the real
-        /// sphere over sky reads `(0, 0, 0)`. Counting `If`s would not tell
-        /// it from the other; the arms' cost does.
+        /// mispredict they would risk: one `If` and no guard. (The real sphere
+        /// over sky read `(0, 0, 0)` before the layout chose the order and
+        /// reads `(1, 1, 37)` since — its sky arm is costlier than this
+        /// control's; docs/results/2026-10-03-guard-structure-baseline.md.)
+        /// Counting `If`s would not tell it from the other; the arms' cost
+        /// does.
         #[test]
         fn a_chrome_shaped_kernel_keeps_its_branches() {
             let mut a = ExprArena::new();
@@ -4158,8 +4154,8 @@ mod tests {
         /// The chrome sphere at the scale of one channel: `sphere.select(
         /// world(mirrored), world(ray))`, each `world(r) = floor.select(
         /// checker(r), sky(r))` (`pixelflow-graphics`'s `scene3d`, the scene
-        /// `examples/chrome_asm.rs` compiles). Three `If`s: the sphere's, and
-        /// one per world.
+        /// `render::packed`'s code pins compile). Three `If`s: the sphere's,
+        /// and one per world.
         ///
         /// Arithmetic only. A transcendental expands into `If`s of its own, so
         /// a census over one would move whenever an expansion did, which is
@@ -4282,22 +4278,44 @@ mod tests {
             let mut a = ExprArena::new();
             let (root, _outer, _inner) = nested_guarded_ifs(&mut a);
             let schedule = native_schedule(&a, root, POINT);
-            let layout = Layout::of(&schedule, &[], &crate::program::FoldReads::default());
+            let written: Vec<regalloc::ValueId> = schedule.iter().map(|d| d.value).collect();
+            let nest = allocate_nest(schedule, &native_file());
+            // The scopes holding the `If`s: the column fold's, and its
+            // remainder's where the lattice strip-mines it — each a copy.
+            let mut guarded: Vec<Vec<IfGuard>> = Vec::new();
+            let mut moved = false;
+            for scope in core::iter::once(regalloc::Scope::Body)
+                .chain((0..nest.fold_count()).map(regalloc::Scope::Fold))
+            {
+                let view = nest.scope(scope);
+                let laid: Vec<regalloc::ValueId> =
+                    view.schedule().iter().map(|d| d.value).collect();
+                let as_written: Vec<regalloc::ValueId> = written
+                    .iter()
+                    .copied()
+                    .filter(|v| laid.contains(v))
+                    .collect();
+                moved |= laid != as_written;
+                if !view.if_guards().is_empty() {
+                    guarded.push(view.if_guards().to_vec());
+                }
+            }
             assert!(
-                !layout.is_identity(),
+                moved,
                 "the arms were already runs as written, which this fixture is not"
             );
-            assert_eq!(
-                layout.guards.len(),
-                2,
-                "both the outer and the inner select must earn a guard, got {:?}",
-                layout.guards
-            );
-            assert!(
-                layout.guards.iter().all(|g| g.has_guarded_arm()),
-                "a guard with an empty range is not a guard: {:?}",
-                layout.guards
-            );
+            assert!(!guarded.is_empty(), "no scope earned a guard");
+            for guards in guarded {
+                assert_eq!(
+                    guards.len(),
+                    2,
+                    "both the outer and the inner select must earn a guard, got {guards:?}"
+                );
+                assert!(
+                    guards.iter().all(|g| g.has_guarded_arm()),
+                    "a guard with an empty range is not a guard: {guards:?}"
+                );
+            }
         }
 
         /// The laid-out kernel's answer, against the same expression
@@ -4407,10 +4425,7 @@ mod tests {
             assert_guard_forms(&a, root);
 
             // The mask must actually be the value that spills.
-            let ctx = EmitCtx {
-                max_regs: Some(regalloc::RegisterFile::MIN_SCRATCH),
-            };
-            let file = native_register_file(ctx.clone());
+            let file = regalloc::tests::at_floor(native_file(), 0);
             let nest = allocate_nest(native_schedule(&a, root, POINT), &file);
             let (view, guard) = guarded_scope(&nest).expect("a guard formed above");
             assert!(
@@ -4419,9 +4434,7 @@ mod tests {
                  test exists for is never reached"
             );
 
-            let result = ctx
-                .compile(&a, root, POINT)
-                .expect("spilled guarded If compile");
+            let result = compile_at_floor(&a, root, POINT);
 
             for &(px, py) in &[(3.0f32, 2.0f32), (-2.0, 0.5), (0.5, -1.0)] {
                 let b = filler_value(px) * py;
@@ -4498,9 +4511,7 @@ mod tests {
             let carried = a.push_binary(OpKind::Sub, x, y);
             let root = a.push_binary(OpKind::Add, after, carried);
 
-            let file = native_register_file(EmitCtx {
-                max_regs: Some(regalloc::RegisterFile::MIN_SCRATCH),
-            });
+            let file = regalloc::tests::at_floor(native_file(), 0);
             let nest = allocate_nest(native_schedule(&a, root, POINT), &file);
             let mut scopes = core::iter::once(regalloc::Scope::Body)
                 .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
@@ -4509,7 +4520,10 @@ mod tests {
                     nest.scope(s)
                         .if_guards()
                         .iter()
-                        .find(|g| g.is_guarded(IfArm::True))
+                        .find(|g| {
+                            let (start, end) = g.range(IfArm::True);
+                            start != end
+                        })
                         .map(|g| (s, g.clone()))
                 })
                 .expect("the true arm is exclusive and contiguous, so it is guarded");
@@ -4542,21 +4556,16 @@ mod tests {
                 spills(view.placement(f.split)),
                 "the value under test stayed in a register, so nothing is split"
             );
-            let kept = view
-                .placement(f.split)
-                .spans()
-                .any(|s| matches!(s.at, regalloc::Where::Reg(_)) && s.from.index >= f.arm.0);
+            let kept = regalloc::tests::ranges(view.placement(f.split))
+                .into_iter()
+                .any(|(from, at)| matches!(at, regalloc::Where::Reg(_)) && from >= f.arm.0);
             assert!(
                 kept,
                 "the value was never brought back into a register inside the \
                  arm, so the confinement rule this test exists for is not exercised"
             );
 
-            let result = EmitCtx {
-                max_regs: Some(regalloc::RegisterFile::MIN_SCRATCH),
-            }
-            .compile(&f.arena, f.root, POINT)
-            .expect("split-across-a-guard compile");
+            let result = compile_at_floor(&f.arena, f.root, POINT);
             // x < 0 is the all-false mask: the true arm — and the reload
             // inside it — never runs, and the read after it must still be the
             // value.
@@ -4586,21 +4595,20 @@ mod tests {
         #[test]
         fn a_kept_reload_inside_a_guarded_arm_ends_at_the_arm() {
             let f = split_across_a_guarded_arm();
-            let spans: alloc::vec::Vec<regalloc::Span> =
-                f.nest.scope(f.scope).placement(f.split).spans().collect();
-            let kept = spans
+            let ranges = regalloc::tests::ranges(f.nest.scope(f.scope).placement(f.split));
+            let kept = ranges
                 .iter()
-                .position(|s| matches!(s.at, regalloc::Where::Reg(_)) && s.from.index >= f.arm.0)
+                .position(|&(from, at)| matches!(at, regalloc::Where::Reg(_)) && from >= f.arm.0)
                 .expect("a register range begins inside the arm");
             assert!(
-                spans[kept].from.index < f.arm.1,
+                ranges[kept].0 < f.arm.1,
                 "the range begins outside the arm it was confined to"
             );
-            let reverted = spans
+            let reverted = ranges
                 .get(kept + 1)
                 .expect("a confined range is followed by the range it reverts to");
             assert_eq!(
-                reverted.from.index, f.arm.1,
+                reverted.0, f.arm.1,
                 "a register range that begins inside a guarded arm must end \
                  where the arm does: a read after it would name a register the \
                  skipped path never loaded"
@@ -4612,10 +4620,10 @@ mod tests {
             // still passes — while the skipped path reads a register it never
             // loaded. This is the assertion that would have caught it.
             assert!(
-                !matches!(reverted.at, regalloc::Where::Reg(_)),
+                !matches!(reverted.1, regalloc::Where::Reg(_)),
                 "the range after a confined one must be in memory, not a \
                  register the skipped path never wrote: {:?}",
-                reverted.at
+                reverted.1
             );
         }
     }
@@ -5129,7 +5137,7 @@ mod tests {
 
         /// One point of a kernel whose single argument is bound to `u` — the
         /// lattice-invariant third input a test used to spell `Var(2)`.
-        fn eval_point_with_arg(code: &executable::ExecutableCode, x: f32, y: f32, u: f32) -> f32 {
+        fn eval_point_with_arg(code: &executable::CompiledKernel, x: f32, y: f32, u: f32) -> f32 {
             collapse_into(code, &[], &[u], (x, y), POINT)[0]
         }
 
@@ -5149,9 +5157,8 @@ mod tests {
         /// which counts a scope's parked roots and its store along with them
         /// — both are in a slot by construction rather than by pressure, so
         /// no kernel ever reaches zero by that measure.
-        fn sample_spills(a: &ExprArena, root: ExprId, ctx: EmitCtx) -> usize {
-            let file = native_register_file(ctx);
-            let nest = allocate_nest(native_schedule(a, root, POINT), &file);
+        fn sample_spills(a: &ExprArena, root: ExprId, file: &regalloc::RegisterFile) -> usize {
+            let nest = allocate_nest(native_schedule(a, root, POINT), file);
             let scopes = core::iter::once(regalloc::Scope::Body)
                 .chain((0..nest.fold_count()).map(regalloc::Scope::Fold));
             scopes
@@ -5211,7 +5218,7 @@ mod tests {
 
             let sched = compile(&a, root, POINT).expect("compile");
             assert_eq!(
-                sample_spills(&a, root, EmitCtx::default()),
+                sample_spills(&a, root, &native_file()),
                 0,
                 "should fit without spilling"
             );
@@ -5253,15 +5260,9 @@ mod tests {
             }
             let root = terms[0];
 
-            let ctx = EmitCtx {
-                max_regs: Some(regalloc::RegisterFile::MIN_SCRATCH),
-            };
-            let sched = ctx
-                .clone()
-                .compile(&a, root, POINT)
-                .expect("scheduled compile");
+            let sched = compile_at_floor(&a, root, POINT);
             assert!(
-                sample_spills(&a, root, ctx) > 0,
+                sample_spills(&a, root, &regalloc::tests::at_floor(native_file(), 0)) > 0,
                 "expected spilling; widen the expression if this regresses"
             );
 
@@ -5454,124 +5455,13 @@ mod tests {
             }
         }
 
-        /// The bytes, per backend, for `offset = 3, dst = 5` through the
-        /// block in `rax` / `x9`. Checked against `llvm-mc --disassemble`
-        /// (LLVM 18): `vbroadcastss 12(%rax), %ymm5` / `%zmm5`;
-        /// `ldr s5, [x9, #12]`, `dup v5.4s, v5.s[0]`. The block's address is
-        /// a pointer-class value the allocator placed, so no load of it
-        /// appears here: that is the `Context` def's, once per call.
-        #[test]
-        fn every_backend_encodes_the_broadcast_load() {
-            let mut avx2 = Vec::new();
-            avx2::emit_uniform_load(&mut avx2, Reg(5), PtrReg(0), 3).expect("fits");
-            assert_eq!(avx2, [0xC4, 0xE2, 0x7D, 0x18, 0xA8, 0x0C, 0, 0, 0]);
-
-            let mut avx512 = Vec::new();
-            avx512::emit_uniform_load(&mut avx512, Reg(5), PtrReg(0), 3).expect("fits");
-            assert_eq!(avx512, [0x62, 0xF2, 0x7D, 0x48, 0x18, 0xA8, 0x0C, 0, 0, 0]);
-
-            let mut neon = Vec::new();
-            aarch64::emit_uniform_load(&mut neon, Reg(5), aarch64::ptr::X9, 3).expect("fits");
-            let words: Vec<u32> = neon
-                .chunks(4)
-                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-                .collect();
-            assert_eq!(words, [0xBD40_0D25, 0x4E04_04A5]);
-        }
-
         /// The slot `UniformId` used to stop at, and one past it, in
-        /// bytes: `65_539` is the offset above, shifted up by a full 16-bit
-        /// range, so that the byte offset `262_156` (`0x0004_000C`) is
-        /// `0x0C` wrapped to 16 bits — the load a narrower offset would
-        /// have emitted for it, reading argument 3.
+        /// bytes: offset 3 shifted up by a full 16-bit range, so that the
+        /// byte offset `262_156` (`0x0004_000C`) is `0x0C` wrapped to 16 bits
+        /// — the load a narrower offset would have emitted for it, reading
+        /// argument 3.
         const PAST_U16: u64 = 3 + (u16::MAX as u64 + 1);
         const PAST_U16_BYTES: u32 = 262_156;
-
-        /// The same load with the offset past the old width: the x86 tiers
-        /// carry the full `disp32` (same prefix and ModRM as the offset-3
-        /// bytes above, only the displacement changes), and NEON, whose
-        /// scaled immediate stops at 4095 elements, computes the address
-        /// into IP0 in `add`-immediate steps and reads `[x16]` — the same
-        /// path a deep spill frame takes.
-        #[test]
-        fn every_backend_encodes_a_load_past_the_old_u16_offset() {
-            let mut avx2 = Vec::new();
-            avx2::emit_uniform_load(&mut avx2, Reg(5), PtrReg(0), PAST_U16).expect("fits");
-            assert_eq!(avx2, [0xC4, 0xE2, 0x7D, 0x18, 0xA8, 0x0C, 0x00, 0x04, 0x00]);
-
-            let mut avx512 = Vec::new();
-            avx512::emit_uniform_load(&mut avx512, Reg(5), PtrReg(0), PAST_U16).expect("fits");
-            assert_eq!(
-                avx512,
-                [0x62, 0xF2, 0x7D, 0x48, 0x18, 0xA8, 0x0C, 0x00, 0x04, 0x00]
-            );
-
-            let mut neon = Vec::new();
-            aarch64::emit_uniform_load(&mut neon, Reg(5), aarch64::ptr::X9, PAST_U16)
-                .expect("fits");
-            let words: Vec<u32> = neon
-                .chunks(4)
-                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-                .collect();
-            let step = aarch64::MAX_ADD_IMM;
-            let full_adds = PAST_U16_BYTES / step;
-            let remainder = PAST_U16_BYTES % step;
-            let add = |src: u32, imm: u32| 0x9100_0000 | (imm << 10) | (src << 5) | 16;
-            let mut want = alloc::vec![add(9, step)];
-            want.extend(core::iter::repeat_n(add(16, step), full_adds as usize - 1));
-            want.push(add(16, remainder));
-            want.push(0xBD40_0000 | (16 << 5) | 5); // ldr s5, [x16]
-            want.push(0x4E04_04A5); // dup v5.4s, v5.s[0]
-            assert_eq!(words, want);
-        }
-
-        /// The width is the encoder's, and an offset past it is refused,
-        /// never wrapped: a wrapped displacement would be a load of some
-        /// other argument, with plausible pixels. x86's `disp32` is signed,
-        /// so the last element it reaches is at `i32::MAX / 4`; NEON's
-        /// [`aarch64::Mem`] holds a 32-bit byte offset.
-        #[test]
-        fn an_offset_past_the_displacement_is_refused_on_every_backend() {
-            const LAST_DISP32: u64 = i32::MAX as u64 / 4;
-            const LAST_NEON: u64 = u32::MAX as u64 / 4;
-            let refused = |r: Result<(), CompileError>| {
-                assert!(
-                    matches!(r, Err(CompileError::BudgetExceeded(_))),
-                    "expected a refusal, got {r:?}"
-                );
-            };
-
-            let mut code = Vec::new();
-            avx2::emit_uniform_load(&mut code, Reg(0), PtrReg(0), LAST_DISP32)
-                .expect("the last element a disp32 reaches");
-            refused(avx2::emit_uniform_load(
-                &mut code,
-                Reg(0),
-                PtrReg(0),
-                LAST_DISP32 + 1,
-            ));
-            avx512::emit_uniform_load(&mut code, Reg(0), PtrReg(0), LAST_DISP32)
-                .expect("the last element a disp32 reaches");
-            refused(avx512::emit_uniform_load(
-                &mut code,
-                Reg(0),
-                PtrReg(0),
-                LAST_DISP32 + 1,
-            ));
-            refused(aarch64::emit_uniform_load(
-                &mut code,
-                Reg(0),
-                aarch64::ptr::X9,
-                LAST_NEON + 1,
-            ));
-            // And nothing wrapped: a refused offset emits no bytes at all.
-            refused(avx2::emit_uniform_load(
-                &mut Vec::new(),
-                Reg(0),
-                PtrReg(0),
-                u64::MAX,
-            ));
-        }
 
         /// The whole path at that width: an arena declaring more arguments
         /// than 16 bits index, reading the last, scheduled and emitted by
@@ -5611,13 +5501,12 @@ mod tests {
             let u = a.push_uniform(last);
             let root = a.push_binary(OpKind::Add, xy, u);
 
-            let ctx = EmitCtx::default();
             let for_backend = |file: regalloc::RegisterFile| {
                 schedule_for(&a, root, POINT, file.vector_bytes / BYTES_PER_LANE)
             };
-            let mut avx2b = avx2::driver::Avx2Backend::new(ctx.clone());
-            let mut avx512b = avx512::driver::Avx512Backend::new(ctx.clone());
-            let mut neon = aarch64::driver::Aarch64Backend::new(ctx);
+            let mut avx2b = avx2::driver::Avx2Backend::new();
+            let mut avx512b = avx512::driver::Avx512Backend::new();
+            let mut neon = aarch64::driver::Aarch64Backend::new();
 
             // Every uniform read, as (the context slot of the block it reads,
             // its offset in that block), sorted.
@@ -5677,7 +5566,8 @@ mod tests {
                 .chunks(4)
                 .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
                 .collect();
-            let step = aarch64::MAX_ADD_IMM;
+            // The largest 16-byte-aligned step `add`'s 12-bit immediate holds.
+            let step = 4080;
             let add_ip0 = 0x9100_0000 | (step << 10) | (16 << 5) | 16;
             let ldr_s_ip0 = |w: u32| (w & !0x1F) == 0xBD40_0000 | (16 << 5);
             assert!(
@@ -5799,67 +5689,6 @@ mod tests {
                 );
             }
         }
-
-        /// The bytes, per backend, for `dst = 5, idx = 6` through the base in
-        /// `rax` and the index in `rcx` — `vcvttss2si rcx, xmm6`,
-        /// `vbroadcastss ymm5/zmm5, [rax + rcx*4]` — and through `x9`
-        /// and `x10`: `fcvtzs x10, s6`, `ldr s5, [x9, w10, uxtw #2]`, `dup
-        /// v5.4s, v5.s[0]`. The x86 encodings were checked against
-        /// `objdump -M intel`. The base's own load is the `Context` def's,
-        /// once per call, not this instruction's.
-        #[test]
-        fn every_backend_encodes_the_lane_uniform_read() {
-            let gprs = x86_64::BroadcastGprs {
-                base: PtrReg(0),
-                index: x86_64::gpr::RCX,
-            };
-
-            let mut avx2 = Vec::new();
-            avx2::emit_broadcast_load(&mut avx2, Reg(5), Reg(6), gprs);
-            assert_eq!(&avx2[..5], &[0xC4, 0xE1, 0xFE, 0x2C, 0xCE]);
-            assert_eq!(&avx2[5..], &[0xC4, 0xE2, 0x7D, 0x18, 0x2C, 0x88]);
-
-            let mut avx512 = Vec::new();
-            avx512::emit_broadcast_load(&mut avx512, Reg(5), Reg(6), gprs);
-            assert_eq!(&avx512[..6], &[0x62, 0xF1, 0xFE, 0x48, 0x2C, 0xCE]);
-            assert_eq!(&avx512[6..], &[0x62, 0xF2, 0x7D, 0x48, 0x18, 0x2C, 0x88]);
-
-            let mut neon = Vec::new();
-            aarch64::emit_broadcast_load(
-                &mut neon,
-                Reg(5),
-                Reg(6),
-                aarch64::BroadcastGprs {
-                    base: aarch64::ptr::X9,
-                    index: aarch64::gpr::X10,
-                },
-            );
-            let words: Vec<u32> = neon
-                .chunks(4)
-                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
-                .collect();
-            assert_eq!(words, [0x9E38_00CA, 0xBC6A_5925, 0x4E04_04A5]);
-        }
-
-        /// A base in a pointer register past the low eight, and one past the
-        /// low eight of the index: `vbroadcastss ymm5, [r9 + r11*4]` sets
-        /// `X` and `B` in the prefix (clear, inverted), per tier, after a
-        /// `vcvttss2si r11, xmm6` whose VEX.R carries the GPR's high bit.
-        #[test]
-        fn the_broadcast_addresses_high_pointer_registers() {
-            let gprs = x86_64::BroadcastGprs {
-                base: PtrReg(9),
-                index: Gpr(11),
-            };
-            let mut avx2 = Vec::new();
-            avx2::emit_broadcast_load(&mut avx2, Reg(5), Reg(6), gprs);
-            assert_eq!(&avx2[..5], &[0xC4, 0x61, 0xFE, 0x2C, 0xDE]);
-            assert_eq!(&avx2[5..], &[0xC4, 0x82, 0x7D, 0x18, 0x2C, 0x99]);
-
-            let mut avx512 = Vec::new();
-            avx512::emit_broadcast_load(&mut avx512, Reg(5), Reg(6), gprs);
-            assert_eq!(&avx512[6..], &[0x62, 0x92, 0x7D, 0x48, 0x18, 0x2C, 0x99]);
-        }
     }
 
     /// A buffer's base is a value the allocator places: the `Context` def is
@@ -5886,7 +5715,7 @@ mod tests {
         #[test]
         fn a_base_read_inside_a_fold_is_carried_into_it() {
             let (a, root) = gather_by_row();
-            let file = native_register_file(EmitCtx::default());
+            let file = native_file();
             let nest = allocate_nest(native_schedule(&a, root, batch()), &file);
             let mut reads = 0;
             for j in 0..nest.fold_count() {
@@ -5932,11 +5761,8 @@ mod tests {
                 .filter(|d| matches!(d.op, ScheduledOp::Context(_)))
                 .count();
             assert!(pointers >= 2, "a buffer and the origin block: {pointers}");
-            let res = compile_schedule(
-                schedule,
-                &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
-            )
-            .expect("compile");
+            let res =
+                compile_schedule(schedule, &mut avx2::driver::Avx2Backend::new()).expect("compile");
             let loads = res
                 .code
                 .as_bytes()
@@ -5972,7 +5798,7 @@ mod tests {
                 // `Gpr(9..=11)`/`KReg(1)` stand in the same way for the
                 // GPR/mask-class reservations `Gather`/`Uniform`/compare ask
                 // for.
-                scratch: regalloc::Scratch::for_test_with_classes(
+                scratch: regalloc::tests::scratch_with_classes(
                     Some([Reg(15), Reg(14), Reg(13), Reg(12)]),
                     [Some(Reg(11)), Some(Reg(10))],
                     Some([Gpr(9), Gpr(10), Gpr(11)]),
@@ -6104,23 +5930,17 @@ mod tests {
         // hole this closes for all three at once.
         #[test]
         fn avx2_backend_covers_required_ops() {
-            assert_covers_required_ops(
-                "Avx2Backend",
-                &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
-            );
+            assert_covers_required_ops("Avx2Backend", &mut avx2::driver::Avx2Backend::new());
         }
 
         #[test]
         fn avx512_backend_covers_required_ops() {
-            assert_covers_required_ops(
-                "Avx512Backend",
-                &mut avx512::driver::Avx512Backend::new(EmitCtx::default()),
-            );
+            assert_covers_required_ops("Avx512Backend", &mut avx512::driver::Avx512Backend::new());
         }
 
         #[test]
         fn aarch64_backend_covers_required_ops() {
-            let mut backend = aarch64::driver::Aarch64Backend::new(EmitCtx::default());
+            let mut backend = aarch64::driver::Aarch64Backend::new();
             assert_covers_required_ops("Aarch64Backend", &mut backend);
         }
     }
@@ -6160,7 +5980,7 @@ mod tests {
                 reloads: alloc::vec::Vec::new(),
                 op,
                 setup_mov: None,
-                scratch: regalloc::Scratch::for_test(None, [None, None]),
+                scratch: regalloc::tests::scratch(None, [None, None]),
             }
         }
 
@@ -6194,27 +6014,18 @@ mod tests {
         fn fused_encodes_to_the_targets_fma() {
             // VEX.256.66.0F38.W0 B8 /r — vfmadd231ps ymm4, ymm5, ymm6.
             assert_eq!(
-                encode(
-                    &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
-                    fused()
-                ),
+                encode(&mut avx2::driver::Avx2Backend::new(), fused()),
                 alloc::vec![0xc4, 0xe2, 0x55, 0xb8, 0xe6],
                 "AVX2 fused MulAdd"
             );
             // EVEX.512.66.0F38.W0 B8 /r — vfmadd231ps zmm4, zmm5, zmm6.
             assert_eq!(
-                encode(
-                    &mut avx512::driver::Avx512Backend::new(EmitCtx::default()),
-                    fused()
-                ),
+                encode(&mut avx512::driver::Avx512Backend::new(), fused()),
                 alloc::vec![0x62, 0xf2, 0x55, 0x48, 0xb8, 0xe6],
                 "AVX-512 fused MulAdd"
             );
             // FMLA V4.4S, V5.4S, V6.4S.
-            let neon = encode(
-                &mut aarch64::driver::Aarch64Backend::new(EmitCtx::default()),
-                fused(),
-            );
+            let neon = encode(&mut aarch64::driver::Aarch64Backend::new(), fused());
             assert_eq!(
                 neon,
                 0x4e26_cca4u32.to_le_bytes(), // fmla v4.4s, v5.4s, v6.4s
@@ -6229,10 +6040,7 @@ mod tests {
         #[test]
         fn decomposed_encodes_to_a_multiply_and_an_add() {
             assert_eq!(
-                encode(
-                    &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
-                    decomposed(None)
-                ),
+                encode(&mut avx2::driver::Avx2Backend::new(), decomposed(None)),
                 alloc::vec![
                     0xc4, 0xe1, 0x54, 0x59, 0xe6, // vmulps ymm4, ymm5, ymm6
                     0xc4, 0xe1, 0x5c, 0x58, 0xe7, // vaddps ymm4, ymm4, ymm7
@@ -6240,10 +6048,7 @@ mod tests {
                 "AVX2 decomposed MulAdd"
             );
             assert_eq!(
-                encode(
-                    &mut avx512::driver::Avx512Backend::new(EmitCtx::default()),
-                    decomposed(None)
-                ),
+                encode(&mut avx512::driver::Avx512Backend::new(), decomposed(None)),
                 alloc::vec![
                     0x62, 0xf1, 0x54, 0x48, 0x59, 0xe6, // vmulps zmm4, zmm5, zmm6
                     0x62, 0xf1, 0x5c, 0x48, 0x58, 0xe7, // vaddps zmm4, zmm4, zmm7
@@ -6251,7 +6056,7 @@ mod tests {
                 "AVX-512 decomposed MulAdd"
             );
             let neon = encode(
-                &mut aarch64::driver::Aarch64Backend::new(EmitCtx::default()),
+                &mut aarch64::driver::Aarch64Backend::new(),
                 decomposed(None),
             );
             assert_eq!(
@@ -6314,18 +6119,9 @@ mod tests {
                 }
             }
 
-            check(
-                "AVX2",
-                &mut avx2::driver::Avx2Backend::new(EmitCtx::default()),
-            );
-            check(
-                "AVX-512",
-                &mut avx512::driver::Avx512Backend::new(EmitCtx::default()),
-            );
-            check(
-                "aarch64",
-                &mut aarch64::driver::Aarch64Backend::new(EmitCtx::default()),
-            );
+            check("AVX2", &mut avx2::driver::Avx2Backend::new());
+            check("AVX-512", &mut avx512::driver::Avx512Backend::new());
+            check("aarch64", &mut aarch64::driver::Aarch64Backend::new());
         }
 
         /// A `MulAdd` node really does reach a backend as `FusedMulAdd` when
@@ -6340,7 +6136,7 @@ mod tests {
             let z = a.push_binary(OpKind::Add, y, x);
             let root = a.push_ternary(OpKind::MulAdd, x, y, z);
 
-            let mut backend = avx2::driver::Avx2Backend::new(EmitCtx::default());
+            let mut backend = avx2::driver::Avx2Backend::new();
             let lanes = backend.register_file().vector_bytes / BYTES_PER_LANE;
             let result = compile_schedule(schedule_for(&a, root, POINT, lanes), &mut backend)
                 .expect("AVX2 emit");
@@ -6408,16 +6204,16 @@ mod tests {
                 }
             }
 
-            /// `subject` compiled for this target, under `ctx`.
-            fn compile(self, ctx: EmitCtx, subject: Subject<'_>) -> CompileResult {
+            /// `subject` compiled for this target.
+            fn compile(self, subject: Subject<'_>) -> CompileResult {
                 let lanes = self.lanes();
                 match self {
-                    Self::Avx2 => compile_on(avx2::driver::Avx2Backend::new(ctx), lanes, subject),
+                    Self::Avx2 => compile_on(avx2::driver::Avx2Backend::new(), lanes, subject),
                     Self::Avx512 => {
-                        compile_on(avx512::driver::Avx512Backend::new(ctx), lanes, subject)
+                        compile_on(avx512::driver::Avx512Backend::new(), lanes, subject)
                     }
                     Self::Aarch64 => {
-                        compile_on(aarch64::driver::Aarch64Backend::new(ctx), lanes, subject)
+                        compile_on(aarch64::driver::Aarch64Backend::new(), lanes, subject)
                     }
                 }
             }
@@ -6575,7 +6371,7 @@ mod tests {
         ///
         /// Host-independent by construction, and the tests that follow it
         /// hold it to that: nothing here reads [`crate::isa::detect`],
-        /// `PIXELFLOW_ISA`, [`crate::isa::jit_vector_bytes`] or the CPU. Each
+        /// `PIXELFLOW_ISA`, [`crate::jit_vector_bytes`] or the CPU. Each
         /// target is legalized at its own lane count and emitted by its own
         /// backend with the default context.
         #[test]
@@ -6591,7 +6387,7 @@ mod tests {
                         root,
                         shape: row.width.at(target),
                     };
-                    let result = target.compile(EmitCtx::default(), subject);
+                    let result = target.compile(subject);
                     let code = result.code.as_bytes();
                     let actual = (code.len(), crate::fnv1a64(code));
                     if actual != pin {
@@ -6862,11 +6658,13 @@ mod tests {
             let shape = LatticeShape::new([rows::REMAINDER_WIDTH, rows::ROWS]);
             let schedule = schedule_for(&a, root, shape, Target::Avx2.lanes());
 
-            let floor = EmitCtx {
-                max_regs: Some(regalloc::RegisterFile::MIN_SCRATCH),
-            };
-            for (pool, ctx) in [("floor", floor), ("whole", EmitCtx::default())] {
-                let mut backend = avx2::driver::Avx2Backend::new(ctx);
+            let whole = avx2::driver::Avx2Backend::new()
+                .register_file()
+                .scratch
+                .len()
+                - regalloc::tests::FLOOR;
+            for (pool, above) in [("floor", 0), ("whole", whole)] {
+                let mut backend = AtFloor(avx2::driver::Avx2Backend::new(), above);
                 let file = backend.register_file();
                 let nest = regalloc::LinearScan
                     .allocate_nest(

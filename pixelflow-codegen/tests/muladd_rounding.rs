@@ -23,12 +23,12 @@
 //! all four backends from any host by `emit::tests::muladd_encoding`.
 #![cfg(target_arch = "x86_64")]
 
-use pixelflow_codegen::emit::{ExecutableCode, compile};
+use pixelflow_codegen::emit::{CompiledKernel, compile};
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId};
 
 /// One point of a kernel compiled at [`pixelflow_ir::LatticeShape::POINT`],
-/// the one sample read back. `ExecutableCode::call` is the collapse driver's
+/// the one sample read back. `CompiledKernel::call` is the collapse driver's
 /// entry; a test that wants one number owns this loop rather than the crate
 /// growing a point API for it.
 ///
@@ -36,7 +36,7 @@ use pixelflow_ir::arena::{ExprArena, ExprId};
 /// wall's multiplier, which used to be the Z and W coordinates — and is the
 /// uniform block the context passes it in, since these arenas declare no
 /// buffer.
-fn eval_point(jit: &ExecutableCode, x: f32, y: f32, block: &[f32]) -> f32 {
+fn eval_point(jit: &CompiledKernel, x: f32, y: f32, block: &[f32]) -> f32 {
     let mut out = [0.0f32; 1];
     let origin = [x, y];
     // SAFETY: `ctx[0]` is the uniform block — one `f32` per declared

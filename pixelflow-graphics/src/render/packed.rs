@@ -152,15 +152,6 @@ impl PackedManifold {
         self.program.buffers()
     }
 
-    /// The compiled kernel's emitted bytes — what the scene will actually
-    /// run, for a harness that measures or disassembles it
-    /// ([`pixelflow_core::Manifold::code_bytes`] is the same hook one
-    /// layer down). Inspection only: nothing about rendering goes through it.
-    #[must_use]
-    pub fn code_bytes(&self) -> &[u8] {
-        self.program.code_bytes()
-    }
-
     /// The kernel's arguments, in the order the block holds them.
     #[must_use]
     pub fn uniforms(&self) -> &[UniformDecl] {
@@ -371,4 +362,145 @@ mod tests {
             0xff00_0000 | 0xff_0000
         );
     }
+
+    // -- The code a scene compiles to ---------------------------------------
+    //
+    // A guarded `If` and a blended one produce the same picture, so no golden
+    // sees a scene lose a branch; it only gets slower — the chrome sphere ran
+    // 3.5x slower on AVX-512 and 2.6x on AVX2 when its arms lost their
+    // contiguity (docs/results/2026-10-03-guard-structure-baseline.md). What
+    // the compile emits is the output that does see it, so the tests below
+    // read the code through `jit_cache::compile`, the entry a
+    // [`PackedManifold`] compiles by.
+
+    /// The frame the scenes compile at: the size the throughput numbers are
+    /// quoted for.
+    const FRAME: [u32; 2] = [1920, 1080];
+
+    fn ray() -> crate::scene3d::Ray {
+        crate::scene3d::Ray::through_screen(FRAME[0] as f32, FRAME[1] as f32)
+    }
+
+    fn sphere_hit(ray: &crate::scene3d::Ray) -> crate::scene3d::Hit {
+        let k = Kernel::constant;
+        crate::scene3d::Sphere::new([k(0.0), k(0.0), k(4.0)], k(1.0)).hit(ray)
+    }
+
+    /// The floor checker under the sky: what one ray sees of the world.
+    fn world(ray: &crate::scene3d::Ray) -> Rgba {
+        use crate::scene3d::{checker, sky, Plane};
+        let floor = Plane::at_height(Kernel::constant(-1.0)).hit(ray);
+        floor.select(
+            &checker(&floor.point()[0], &floor.point()[2], &floor.footprint()),
+            &sky(ray),
+        )
+    }
+
+    /// A chrome sphere over a checker floor, reflecting the floor and sky:
+    /// the sphere's `If`, and a world's `If`s on each side of it.
+    fn chrome() -> Rgba {
+        let ray = ray();
+        let sphere = sphere_hit(&ray);
+        let mirrored = ray.reflected(sphere.normal());
+        sphere.select(&world(&mirrored), &world(&ray))
+    }
+
+    /// The sphere's silhouette over the sky, and nothing else: one `If`
+    /// whose costly arm is worth a branch.
+    fn silhouette() -> Rgba {
+        let ray = ray();
+        sphere_hit(&ray).select(&Rgba::opaque_gray(0.5), &crate::scene3d::sky(&ray))
+    }
+
+    /// `color`'s packed program as this host's tier emits it for a frame.
+    fn code_of(color: &Rgba) -> Vec<u8> {
+        pixelflow_codegen::jit_cache::compile(
+            &packed_kernel(color, RGBA),
+            pixelflow_ir::LatticeShape::new(FRAME),
+        )
+        .expect("compile")
+        .kernel
+        .as_bytes()
+        .to_vec()
+    }
+
+    /// The jet tier ran geometry once and carried colour as an opaque packed
+    /// `Discrete` because running the geometry once per channel cost 3x. Four
+    /// channel kernels are four separate expressions over the *same*
+    /// geometry, so that saving is now a property of the compiler rather than
+    /// of the scene's shape: the four copies hash-cons into one e-class and
+    /// the geometry is emitted once.
+    ///
+    /// Measured as emitted code size, which is exact and has no timing
+    /// variance: a four-channel chrome sphere against the same scene with one
+    /// channel live. Duplicated geometry would show up as a multiple, not a
+    /// margin.
+    #[test]
+    fn four_channels_share_one_geometry() {
+        let four = chrome();
+        // The same scene with one channel live: every leaf keeps its red and
+        // zeroes the rest, so the geometry and the choice are the same
+        // expression.
+        let k = Kernel::constant;
+        let one = four.map_channels(&|ch| [ch[0].clone(), k(0.0), k(0.0), k(1.0)]);
+        let (four, one) = (code_of(&four).len(), code_of(&one).len());
+        let ratio = four as f64 / one as f64;
+        assert!(
+            ratio < 2.0,
+            "four channels emitted {ratio:.2}x the code of one ({four} bytes against \
+             {one}), which is the geometry being emitted per channel rather than shared"
+        );
+    }
+
+    /// The chrome sphere's and the silhouette's code, pinned per tier as
+    /// `(bytes, fnv1a64)`.
+    ///
+    /// A digest rather than a count of guards: the guard tables are the
+    /// emitter's, and nothing a caller holds names them, while the code is
+    /// what the compile hands back. So this moves with any change to the
+    /// emitted code, deliberately — a change that meant to move it re-pins
+    /// from the values the failure prints, after checking the scene's
+    /// branches with the emitter's census (`emit::tests::census`) and its
+    /// throughput (`pixelflow-runtime`'s `bench_scene_chrome`).
+    #[test]
+    fn the_scenes_emit_their_pinned_code() {
+        let scenes: [(&str, Rgba, TierPins); 2] = [
+            ("chrome", chrome(), CHROME_PINS),
+            ("silhouette", silhouette(), SILHOUETTE_PINS),
+        ];
+        let tier = pixelflow_codegen::isa::detect().name();
+        let mut moved = Vec::new();
+        for (name, scene, pins) in scenes {
+            let code = code_of(&scene);
+            let emitted = (code.len(), pixelflow_codegen::fnv1a64(&code));
+            let &(_, len, fnv) = pins
+                .iter()
+                .find(|(t, _, _)| *t == tier)
+                .unwrap_or_else(|| panic!("{name} has no pin for the {tier} tier"));
+            if emitted != (len, fnv) {
+                moved.push(format!(
+                    "{name} on {tier}: pinned ({len}, {fnv:#018x}), emitted ({}, {:#018x})",
+                    emitted.0, emitted.1
+                ));
+            }
+        }
+        assert!(moved.is_empty(), "scene code moved:\n{}", moved.join("\n"));
+    }
+
+    /// One kernel's code on each tier, `(tier, bytes, fnv1a64)`.
+    type TierPins = [(&'static str, usize, u64); 3];
+
+    /// The chrome sphere's code per tier.
+    const CHROME_PINS: TierPins = [
+        ("avx2", 6192, 0x1503_af84_be6a_9e42),
+        ("avx512", 6224, 0x74b7_beb5_086e_6818),
+        ("neon", 3520, 0x296f_c552_9eba_0d85),
+    ];
+
+    /// The silhouette's code per tier.
+    const SILHOUETTE_PINS: TierPins = [
+        ("avx2", 1276, 0x1d42_97fa_4eec_b1f4),
+        ("avx512", 1196, 0x1080_ada6_22ad_f852),
+        ("neon", 976, 0xd6f5_70fd_e78e_6f74),
+    ];
 }

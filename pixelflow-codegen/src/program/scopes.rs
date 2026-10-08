@@ -144,7 +144,7 @@ impl ScopedSchedule {
 /// scope's layout permutes its schedule, and a fold's `at` is a position in
 /// its parent's, so each scope's children are carried to the new order as the
 /// scope is laid out.
-pub(crate) fn lay_out(scoped: &mut ScopedSchedule) {
+fn lay_out(scoped: &mut ScopedSchedule) {
     let slot = |scope: Scope| match scope {
         Scope::Body => 0,
         Scope::Fold(j) => j + 1,
@@ -571,14 +571,14 @@ fn attach_fold(scoped: &mut ScopedSchedule, fold: PendingFold, parent: Scope, at
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::schedule_for;
+    use crate::pipeline::tests::schedule_for;
     use pixelflow_ir::LatticeShape;
     use pixelflow_ir::arena::{ExprArena, ExprId, UniformDecl, UniformIdentity};
     use pixelflow_ir::kind::OpKind;
 
     /// Lanes in one SIMD batch at the tier this host selected.
     fn lanes() -> usize {
-        crate::isa::jit_vector_bytes() / core::mem::size_of::<f32>()
+        crate::jit_vector_bytes() / core::mem::size_of::<f32>()
     }
 
     /// One full batch of one row: `x` runs `x0 .. x0 + lanes()`, which is

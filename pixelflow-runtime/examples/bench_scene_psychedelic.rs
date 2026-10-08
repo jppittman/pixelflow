@@ -74,14 +74,9 @@ fn packed_scene() -> Scene {
     let compiled = Instant::now();
     let program = compile_packed_for::<Rgba8>(&color, [WIDTH as u32, HEIGHT as u32]);
     let compile_time = compiled.elapsed();
-    // The emitted size, printed because it is the exact quantity a codegen
-    // change must not move on a shader whose colour is a leaf; the compile
-    // time because a scene's compile is a budget (~250 ms, plan §5.3) that
-    // an extraction change must report on both production shapes.
-    println!(
-        "  packed kernel: compiled in {compile_time:?} to {} bytes of code",
-        program.code_bytes().len()
-    );
+    // The compile time, because a scene's compile is a budget (~250 ms, plan
+    // §5.3) that an extraction change must report on both production shapes.
+    println!("  packed kernel: compiled in {compile_time:?}");
     let block = program.block();
     Scene::Packed(program.bind_with(&[], &block))
 }
