@@ -679,7 +679,6 @@ jobs:
           tests=(
             color_chrome_sphere
             floor_only
-            four_channels_share_one_geometry
           )
           for test_name in "${tests[@]}"; do
             cargo nextest run -p pixelflow-graphics \
@@ -688,6 +687,12 @@ jobs:
               --profile ci \
               --no-tests fail
           done
+          # Reads the emitted code of the scene's packed kernel, which only
+          # render::packed can build, so it lives beside it.
+          cargo nextest run -p pixelflow-graphics --lib \
+            -E "test(=render::packed::tests::four_channels_share_one_geometry)" \
+            --profile ci \
+            --no-tests fail
 
       - name: Check ray/surface composition contracts
         shell: bash
