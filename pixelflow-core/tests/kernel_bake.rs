@@ -108,6 +108,4 @@ fn each_lattice_extent_is_its_own_kernel() {
     let wider = compile(Lattice::frame(9, 8));
     assert!(std::sync::Arc::ptr_eq(&first, &again));
     assert!(!std::sync::Arc::ptr_eq(&first, &wider));
-    assert_eq!(first.shape().extent(), [8, 8]);
-    assert_eq!(wider.shape().extent(), [9, 8]);
 }

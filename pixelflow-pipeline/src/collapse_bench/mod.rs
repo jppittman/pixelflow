@@ -53,7 +53,7 @@ pub mod row;
 use std::path::Path;
 use std::sync::Arc;
 
-use pixelflow_codegen::emit::executable::ExecutableCode;
+use pixelflow_codegen::emit::ExecutableCode;
 use pixelflow_codegen::emit::{CompileResult, compile};
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{ExprArena, ExprId};
@@ -297,7 +297,7 @@ const ORIGIN: [f32; 2] = [0.5, 0.5];
 #[must_use]
 pub fn features_of(result: &CompileResult) -> StaticFeatures {
     let t = &result.traffic;
-    let scope = |s: &pixelflow_codegen::emit::traffic::ScopeTraffic| ScopeRow {
+    let scope = |s: &pixelflow_codegen::emit::ScopeTraffic| ScopeRow {
         bytes: s.bytes,
         instructions: s.instructions,
         loads_transient: s.loads_transient,
@@ -307,7 +307,7 @@ pub fn features_of(result: &CompileResult) -> StaticFeatures {
     };
     let outer_loop = t.scopes.get(1).copied().unwrap_or_default();
     let inner_loop = sum_scope_traffic(t.scopes.get(2..).unwrap_or(&[]));
-    let dyn_weighted = |pick: fn(&pixelflow_codegen::emit::traffic::ScopeTraffic) -> u64| -> u64 {
+    let dyn_weighted = |pick: fn(&pixelflow_codegen::emit::ScopeTraffic) -> u64| -> u64 {
         t.scopes
             .iter()
             .zip(&t.trips)
@@ -335,9 +335,9 @@ pub fn features_of(result: &CompileResult) -> StaticFeatures {
 /// Field-wise sum of several scopes' traffic, for [`features_of`]'s `body`
 /// bucket — every fold nested inside the lattice's own row loop, combined.
 fn sum_scope_traffic(
-    scopes: &[pixelflow_codegen::emit::traffic::ScopeTraffic],
-) -> pixelflow_codegen::emit::traffic::ScopeTraffic {
-    use pixelflow_codegen::emit::traffic::ScopeTraffic;
+    scopes: &[pixelflow_codegen::emit::ScopeTraffic],
+) -> pixelflow_codegen::emit::ScopeTraffic {
+    use pixelflow_codegen::emit::ScopeTraffic;
     scopes
         .iter()
         .fold(ScopeTraffic::default(), |acc, s| ScopeTraffic {

@@ -12,7 +12,7 @@ use super::{CodePage, ExecutableCode};
 use crate::error::CompileError;
 
 /// A mapped, writable code page on macOS.
-pub struct MacOsCodePage {
+pub(super) struct MacOsCodePage {
     ptr: *mut u8,
     capacity: usize,
 }
@@ -117,7 +117,7 @@ impl Drop for MacOsCodePage {
 }
 
 #[cfg(test)]
-pub(crate) fn test_sync_empty() {
+pub(super) fn test_sync_empty() {
     let mut byte = 0u8;
     sync_instruction_cache(&raw mut byte, 0);
 }

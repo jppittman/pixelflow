@@ -278,7 +278,7 @@ const UNUSED_VVVV: u8 = 0;
 ///
 /// Only the `Neg`/`Abs` sign mask: EVEX is non-destructive and `vpternlogd`
 /// blends an `If` with no temporary.
-pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
+fn temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
         ScheduledOp::Unary(OpKind::Neg | OpKind::Abs, _) => 1,
@@ -303,7 +303,7 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
 /// each before combining them into the address, and the remainder's
 /// writemask rides in through the second once the address is done with it;
 /// the iota carries each eight bytes in through one.
-pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
+fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
         ScheduledOp::Write { .. } => 2,
@@ -318,7 +318,7 @@ pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
 /// work and now a `RegisterFile::mask_scratch` reservation — and a remainder
 /// store's writemask. Every other op either has no mask (arithmetic) or
 /// reads the mask as an ordinary vector (`If`).
-pub(crate) fn mask_temps_for(op: &super::ScheduledOp) -> u8 {
+fn mask_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
         ScheduledOp::Binary(op_kind, ..) if is_compare(*op_kind) => 1,
@@ -452,7 +452,7 @@ fn vpsrld_imm(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
 }
 
 /// vmovaps zmmDST, zmmSRC — register copy (EVEX.512.0F.W0 28 /r).
-pub fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
+fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     if dst.0 == src.0 {
         return;
     }
@@ -623,7 +623,7 @@ fn emit_compare(code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2], k: KRe
 /// One `vpternlogd dst, if_true, if_false, 0xCA` (EVEX.512.66.0F3A.W0 25 /r ib):
 /// the truth table 0xCA computes `A?B:C` per bit with A=dst(mask), B=if_true,
 /// C=if_false, i.e. a per-lane select for an all-ones/all-zeros mask.
-pub fn emit_if(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg) {
+fn emit_if(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg) {
     assemble(
         code,
         [Evex::m0f3a_66(0x25)
@@ -738,7 +738,7 @@ fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
 /// (EVEX.512.F3.0F.W0 5B /r). The lowered gather index is an exact non-negative
 /// integer in float form, so truncation is lossless and matches the reference
 /// interpreter's `floorf(index) as usize`.
-pub fn emit_cvttps2dq(code: &mut Vec<u8>, dst: Reg, src: Reg) {
+fn emit_cvttps2dq(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     assemble(code, [Evex::m0f_f3(0x5B).rrr(dst.0, UNUSED_VVVV, src.0)]);
 }
 
@@ -746,7 +746,7 @@ pub fn emit_cvttps2dq(code: &mut Vec<u8>, dst: Reg, src: Reg) {
 ///
 /// A gather requires a non-zero writemask and *clears* the bits it completes, so
 /// this must run before each gather. Clobbers `eax` (caller-saved scratch).
-pub fn emit_set_gather_mask(code: &mut Vec<u8>) {
+fn emit_set_gather_mask(code: &mut Vec<u8>) {
     assemble(
         code,
         [
@@ -802,7 +802,7 @@ fn gather(dst: Reg, base_gpr: u8, index: Reg) -> EncodedInst {
     inst
 }
 
-pub fn emit_gather(code: &mut Vec<u8>, dst: Reg, base_gpr: u8, index: Reg) {
+fn emit_gather(code: &mut Vec<u8>, dst: Reg, base_gpr: u8, index: Reg) {
     AsmProgram::from([gather(dst, base_gpr, index)]).assemble(code);
 }
 
@@ -1214,7 +1214,7 @@ mod tests {
 /// cannot introduce a platform-specific bug. That is the bargain `unsafe`
 /// makes — confine what cannot be checked, so the rest is checked by
 /// construction.
-pub(crate) mod driver {
+pub(super) mod driver {
     use super::super::*;
     use super::{
         AsmProgram, Evex, IOTA_BYTES, Mem, NoDisp, UNUSED_VVVV, frame_slot, kmovw_from_gpr,
@@ -1275,13 +1275,13 @@ pub(crate) mod driver {
     .checked();
 
     /// AVX-512 implementation of the shared driver's leaf operations.
-    pub(crate) struct Avx512Backend {
+    pub(in crate::emit) struct Avx512Backend {
         consts: x86::ConstPool,
         file: regalloc::RegisterFile,
     }
 
     impl Avx512Backend {
-        pub(crate) fn new(ctx: EmitCtx) -> Self {
+        pub(in crate::emit) fn new(ctx: EmitCtx) -> Self {
             Self {
                 consts: x86::ConstPool::default(),
                 file: AVX512_FILE.capped(ctx.max_regs),

@@ -8,9 +8,9 @@
 
 use std::fmt;
 
+use pixelflow_codegen::CompileError;
+use pixelflow_codegen::emit::ExecutableCode;
 use pixelflow_codegen::emit::compile;
-use pixelflow_codegen::emit::executable::ExecutableCode;
-use pixelflow_codegen::error::CompileError;
 use pixelflow_ir::{ExprArena, ExprId, LatticeShape, OpKind};
 
 /// Number of timed samples per expression. Take the median.

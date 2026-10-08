@@ -28,7 +28,7 @@ impl EmitCtx {
     ///
     /// If the arena contains a construct no pass can lower, or the emitter
     /// cannot allocate a frame for it.
-    pub fn compile(
+    pub(super) fn compile(
         self,
         arena: &pixelflow_ir::arena::ExprArena,
         root: pixelflow_ir::arena::ExprId,
@@ -65,7 +65,7 @@ pub(crate) const BYTES_PER_LANE: u32 = 4;
 /// per axis for the whole process, minted once, so every arena declares the
 /// same two instances and [`origin_slots`] can find them by identity
 /// afterwards.
-pub fn origin() -> [UniformDecl; 2] {
+fn origin() -> [UniformDecl; 2] {
     static ORIGIN: std::sync::OnceLock<[UniformDecl; 2]> = std::sync::OnceLock::new();
     *ORIGIN.get_or_init(|| {
         [0.0, 0.0].map(|default| UniformDecl {

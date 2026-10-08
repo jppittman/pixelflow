@@ -5,7 +5,6 @@
 //! It fits in a single 128-bit register and incurs zero heap allocations.
 
 use alloc::vec::Vec;
-use core::ops::Deref;
 
 /// A stack-allocated encoded instruction (up to 15 bytes).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -18,7 +17,7 @@ impl EncodedInst {
     /// Create an empty encoded instruction.
     #[must_use]
     #[inline]
-    pub const fn new() -> Self {
+    pub(super) const fn new() -> Self {
         Self {
             bytes: [0u8; 15],
             len: 0,
@@ -27,7 +26,7 @@ impl EncodedInst {
 
     /// Push a single byte into the instruction buffer.
     #[inline]
-    pub fn push(&mut self, byte: u8) {
+    pub(super) fn push(&mut self, byte: u8) {
         assert!(self.len < 15, "x86 instruction cannot exceed 15 bytes");
         self.bytes[self.len as usize] = byte;
         self.len += 1;
@@ -35,7 +34,7 @@ impl EncodedInst {
 
     /// Extend the instruction buffer by a byte slice.
     #[inline]
-    pub fn extend(&mut self, slice: &[u8]) {
+    pub(super) fn extend(&mut self, slice: &[u8]) {
         assert!(
             self.len as usize + slice.len() <= 15,
             "x86 instruction cannot exceed 15 bytes"
@@ -48,7 +47,7 @@ impl EncodedInst {
     /// Create from a slice (`slice.len() <= 15`).
     #[must_use]
     #[inline]
-    pub fn from_slice(slice: &[u8]) -> Self {
+    pub(super) fn from_slice(slice: &[u8]) -> Self {
         assert!(slice.len() <= 15, "x86 instruction cannot exceed 15 bytes");
         let mut bytes = [0u8; 15];
         bytes[..slice.len()].copy_from_slice(slice);
@@ -61,24 +60,8 @@ impl EncodedInst {
     /// Return the encoded instruction bytes as a slice.
     #[must_use]
     #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
+    fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len as usize]
-    }
-}
-
-impl Deref for EncodedInst {
-    type Target = [u8];
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        self.as_bytes()
-    }
-}
-
-impl AsRef<[u8]> for EncodedInst {
-    #[inline]
-    fn as_ref(&self) -> &[u8] {
-        self.as_bytes()
     }
 }
 
@@ -86,12 +69,5 @@ impl crate::emit::AsmInsn for EncodedInst {
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
         code.extend_from_slice(self.as_bytes());
-    }
-}
-
-impl Default for EncodedInst {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
     }
 }

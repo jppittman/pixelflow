@@ -51,7 +51,7 @@ fn reference(x: f32, y: f32, freq: f32, amp: f32, bias: f32) -> f32 {
 // Executing JIT code: one single-point lattice call per coordinate.
 // ---------------------------------------------------------------------------
 
-use pixelflow_codegen::emit::executable::ExecutableCode;
+use pixelflow_codegen::emit::ExecutableCode;
 
 /// One point of a kernel compiled at [`LatticeShape::POINT`]: the sample at
 /// `(x, y)`, read back through the origin block.

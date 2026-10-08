@@ -66,7 +66,7 @@ impl Isa {
     /// bytes by definition, and `emit`'s tests pin each backend's register
     /// file to this.
     #[must_use]
-    pub const fn vector_bytes(self) -> usize {
+    const fn vector_bytes(self) -> usize {
         match self {
             Self::Avx2 => 32,
             Self::Avx512 => 64,
@@ -138,14 +138,6 @@ pub fn jit_vector_bytes() -> usize {
     detect().vector_bytes()
 }
 
-/// Whether this host can execute `isa`'s kernels — regardless of which tier
-/// [`detect`] chose, and without the below-floor panic, since a test asking
-/// whether it can run is not a compile asking for a backend.
-#[must_use]
-pub fn host_runs(isa: Isa) -> bool {
-    runnable().is_ok_and(|tiers| tiers.contains(&isa))
-}
-
 /// `PIXELFLOW_ISA`, if set.
 ///
 /// | value | effect |
@@ -180,7 +172,8 @@ mod tests {
 
     #[test]
     fn the_host_can_execute_the_tier_it_detected() {
-        assert!(host_runs(detect()));
+        let tiers = runnable().expect("this host runs the tests, so it is above the floor");
+        assert!(tiers.contains(&detect()));
     }
 
     #[test]

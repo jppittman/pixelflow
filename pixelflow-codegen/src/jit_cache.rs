@@ -179,11 +179,7 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // don't serialize. A racing duplicate compile wastes work; the first
     // insertion wins so all callers share one region.
     let result = emit_fn()?;
-    let compiled = Arc::new(CompiledKernel::new(
-        result.code,
-        result.traffic.branches,
-        shape,
-    ));
+    let compiled = Arc::new(CompiledKernel::new(result.code));
     let mut guard = cache.lock().expect("jit_cache: lock poisoned");
     let kernel = guard.entry(key).or_insert(compiled).clone();
     Ok(Linked {
@@ -516,8 +512,6 @@ mod tests {
             !Arc::ptr_eq(&frame, &wider),
             "one more column is a different lattice, hence a different kernel"
         );
-        assert_eq!(frame.shape(), TEST_SHAPE);
-        assert_eq!(wider.shape().extent(), [65, 64]);
     }
 
     // ─────────────────────── the link step ───────────────────────

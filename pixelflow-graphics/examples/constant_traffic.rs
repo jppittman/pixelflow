@@ -48,7 +48,7 @@ fn report(label: &str, kernel: &Kernel, shape: LatticeShape) {
     let [w, h] = shape.extent();
     println!(
         "{label} at {w}x{h}: {} bytes, {} spill slots, {} parked roots, {} memory ops per call",
-        t.bytes(),
+        result.code.len(),
         result.spill_count,
         result.hoisted_values,
         t.dynamic_memory_ops()

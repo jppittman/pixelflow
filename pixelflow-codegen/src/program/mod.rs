@@ -28,7 +28,7 @@ use pixelflow_ir::kind::OpKind;
 
 /// A value in the program (SSA-style).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ValueId(pub u64);
+pub(crate) struct ValueId(pub(super) u64);
 
 /// Which register file a value lives in: a vector of `f32` lanes, or an
 /// address.
@@ -41,7 +41,7 @@ pub struct ValueId(pub u64);
 /// gets a `PtrReg` where it demands one because the allocator never held
 /// the address anywhere else (docs/plans/2026-09-22-a-pointer-is-a-value.md).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Class {
+pub(crate) enum Class {
     /// One SIMD batch of `f32`, in a `Reg`.
     Vector,
     /// An address, in a `PtrReg`.
@@ -54,16 +54,16 @@ pub enum Class {
 /// schedule is a sequence of these, and a value's program point is its index
 /// in that sequence.
 #[derive(Clone, Debug)]
-pub struct Def {
+pub(crate) struct Def {
     /// The value this step defines.
-    pub value: ValueId,
+    pub(super) value: ValueId,
     /// The operation that computes it.
-    pub op: ScheduledOp,
+    pub(super) op: ScheduledOp,
 }
 
 /// Info about an operation in the schedule.
 #[derive(Debug, Clone)]
-pub enum ScheduledOp {
+pub(crate) enum ScheduledOp {
     /// Variable reference (input register)
     Var(u8),
     /// Constant value
@@ -155,7 +155,7 @@ impl ScheduledOp {
     /// [`ScheduledOp::Context`] is an address, everything else is a vector
     /// (an effect's "value" included, which is never placed anywhere).
     #[must_use]
-    pub fn class(&self) -> Class {
+    pub(super) fn class(&self) -> Class {
         match self {
             ScheduledOp::Context(_) => Class::Pointer,
             _ => Class::Vector,
@@ -182,7 +182,7 @@ impl ScheduledOp {
 /// the way down. The derived `Ord` is therefore **not** nesting order — it
 /// is a total order over names, for deterministic keying.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Scope {
+pub(crate) enum Scope {
     /// The whole function: what runs once per call, and holds the outermost
     /// fold's def.
     Body,
@@ -206,45 +206,45 @@ pub enum Scope {
 ///
 /// The body is a field rather than `folds[0]` because it is genuinely a
 /// different thing: it wraps everything and opens nowhere.
-pub struct ScopedSchedule {
+pub(crate) struct ScopedSchedule {
     /// What runs once per call.
-    pub body: ScopeRegion,
+    pub(super) body: ScopeRegion,
     /// The surviving folds, in [`Scope::Fold`] order — every one of them,
     /// the lattice's own included.
-    pub folds: Vec<ScopeFold>,
+    pub(super) folds: Vec<ScopeFold>,
 }
 
 /// One scope of a [`ScopedSchedule`] that opens nowhere: the body.
-pub struct ScopeRegion {
+pub(crate) struct ScopeRegion {
     /// Values this scope computes for the ones inside it.
-    pub roots: Vec<ValueId>,
+    pub(super) roots: Vec<ValueId>,
     /// What it computes, in topological order.
-    pub schedule: Vec<Def>,
+    pub(super) schedule: Vec<Def>,
     /// This scope's `If` guards: which entries of `schedule` each branch
     /// skips. A table over `schedule`, handed in with it — the allocator
     /// places split ranges around the arms it names and the emitter branches
     /// over them, and neither derives them.
-    pub(crate) guards: Vec<IfGuard>,
+    pub(super) guards: Vec<IfGuard>,
 }
 
 /// One surviving fold of a [`ScopedSchedule`]: a scope that opens in the
 /// middle of another scope.
-pub struct ScopeFold {
+pub(crate) struct ScopeFold {
     /// The scope whose schedule holds this loop's def.
-    pub parent: Scope,
+    pub(super) parent: Scope,
     /// Which def of `parent` — the `Reduce` this is the body of.
-    pub at: usize,
+    pub(super) at: usize,
     /// Values this fold computes for the scopes inside it.
-    pub roots: Vec<ValueId>,
+    pub(super) roots: Vec<ValueId>,
     /// The loop body, in topological order.
-    pub schedule: Vec<Def>,
+    pub(super) schedule: Vec<Def>,
     /// The body's `If` guards, as [`ScopeRegion::guards`].
-    pub(crate) guards: Vec<IfGuard>,
+    pub(super) guards: Vec<IfGuard>,
 }
 
 /// Which arm of an `If` node a guard branch skips or targets.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum IfArm {
+pub(crate) enum IfArm {
     /// The `if_true` arm: skipped when all lanes of the mask are false.
     True,
     /// The `if_false` arm: skipped when all lanes of the mask are true.
@@ -253,20 +253,20 @@ pub enum IfArm {
 
 impl IfArm {
     /// Both arms of an `If`.
-    pub const ALL: [Self; 2] = [Self::True, Self::False];
+    pub(super) const ALL: [Self; 2] = [Self::True, Self::False];
 }
 
 /// A value associated with each arm of an `If` node (`True` and `False`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct ArmPair<T> {
-    pub true_arm: T,
-    pub false_arm: T,
+pub(crate) struct ArmPair<T> {
+    true_arm: T,
+    false_arm: T,
 }
 
 impl<T> ArmPair<T> {
     /// Construct a pair from true-arm and false-arm values.
     #[inline]
-    pub const fn new(true_arm: T, false_arm: T) -> Self {
+    pub(super) const fn new(true_arm: T, false_arm: T) -> Self {
         Self {
             true_arm,
             false_arm,
@@ -275,7 +275,7 @@ impl<T> ArmPair<T> {
 
     /// Iterate over references to both arm values.
     #[inline]
-    pub fn values(&self) -> impl Iterator<Item = &T> {
+    pub(super) fn values(&self) -> impl Iterator<Item = &T> {
         [&self.true_arm, &self.false_arm].into_iter()
     }
 }
@@ -288,19 +288,19 @@ impl<T> ArmPair<T> {
 #[derive(Debug, Clone)]
 pub(crate) struct IfGuard {
     /// Schedule index of the If node itself.
-    pub(crate) if_idx: usize,
+    pub(super) if_idx: usize,
     /// ValueId of the mask operand (already computed before arms).
-    pub(crate) mask_vid: ValueId,
+    pub(super) mask_vid: ValueId,
     /// Range of schedule indices exclusive to each arm: `[start, end)`.
     /// Empty if `start == end`.
-    pub(crate) ranges: ArmPair<(usize, usize)>,
+    pub(super) ranges: ArmPair<(usize, usize)>,
 }
 
 impl IfGuard {
     /// Schedule index range exclusive to the given arm: `[start, end)`.
     #[must_use]
     #[inline]
-    pub(crate) const fn range(&self, arm: IfArm) -> (usize, usize) {
+    pub(super) const fn range(&self, arm: IfArm) -> (usize, usize) {
         match arm {
             IfArm::True => self.ranges.true_arm,
             IfArm::False => self.ranges.false_arm,
@@ -310,7 +310,7 @@ impl IfGuard {
     /// Whether this arm is guarded (has a non-empty range).
     #[must_use]
     #[inline]
-    pub(crate) fn is_guarded(&self, arm: IfArm) -> bool {
+    pub(super) fn is_guarded(&self, arm: IfArm) -> bool {
         let (s, e) = self.range(arm);
         s != e
     }
@@ -318,16 +318,8 @@ impl IfGuard {
     /// Whether either arm is guarded.
     #[must_use]
     #[inline]
-    pub(crate) fn has_guarded_arm(&self) -> bool {
+    pub(super) fn has_guarded_arm(&self) -> bool {
         IfArm::ALL.iter().any(|&arm| self.is_guarded(arm))
-    }
-
-    /// Total entries skipped across both arms.
-    #[must_use]
-    #[inline]
-    pub(crate) fn total_guarded_entries(&self) -> usize {
-        (self.ranges.true_arm.1 - self.ranges.true_arm.0)
-            + (self.ranges.false_arm.1 - self.ranges.false_arm.0)
     }
 }
 
@@ -390,7 +382,7 @@ pub(crate) fn all_operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> +
 /// plus the body a `Reduce` folds and the two effects a `Seq` orders — the
 /// children a walk of the DAG's structure follows, as opposed to the
 /// registers an instruction reads ([`operands`]).
-pub(crate) fn structural_children(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use<'_> {
+fn structural_children(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use<'_> {
     let extra = match sop {
         ScheduledOp::Reduce(_, body) => [Some(*body), None],
         ScheduledOp::Seq(a, b) => [Some(*a), Some(*b)],

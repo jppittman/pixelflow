@@ -33,7 +33,7 @@ pub enum CompileError {
     Internal(&'static str),
 
     /// A branch named a [`Label`](crate::emit::Label) that no
-    /// [`Item::Bind`](crate::emit::Item::Bind) ever bound.
+    /// [`Assembly::bind`](crate::emit::Assembly::bind) ever bound.
     ///
     /// An error rather than a panic because it is the one thing a *program*
     /// can get wrong that the type system does not already refuse: minting is

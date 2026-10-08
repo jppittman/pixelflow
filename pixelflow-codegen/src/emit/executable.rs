@@ -25,7 +25,7 @@ impl ExecutableCode {
     /// The caller must ensure the code buffer contains valid machine code
     /// for the current architecture.
     #[cfg(unix)]
-    pub unsafe fn from_code(code: &[u8]) -> Result<Self, CompileError> {
+    pub(super) unsafe fn from_code(code: &[u8]) -> Result<Self, CompileError> {
         NativeCodePage::from_code(code)
     }
 
@@ -36,7 +36,7 @@ impl ExecutableCode {
     /// and signature for type `F`.
     #[inline]
     #[must_use]
-    pub unsafe fn as_fn<F>(&self) -> F {
+    pub(super) unsafe fn as_fn<F>(&self) -> F {
         // SAFETY: Caller guarantees F matches the compiled code's signature.
         unsafe { core::mem::transmute_copy(&self.ptr) }
     }
@@ -134,14 +134,10 @@ trait CodePage: Sized {
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::MacOsCodePage;
-#[cfg(target_os = "macos")]
 type NativeCodePage = macos::MacOsCodePage;
 
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "linux")]
-pub use linux::LinuxCodePage;
 #[cfg(target_os = "linux")]
 type NativeCodePage = linux::LinuxCodePage;
 

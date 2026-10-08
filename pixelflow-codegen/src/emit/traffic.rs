@@ -21,10 +21,9 @@
 //! is written, and a trait method that disappears is a compile error rather
 //! than a silently dropped term.
 
-use super::regalloc::{NestAllocation, Scope, ValueId};
+use super::regalloc::{Scope, ValueId};
 use super::{Binding, InstructionPlan, IsaBackend, Loc, PtrReg, Reg, Reload, WritePlan};
 use crate::error::CompileError;
-use crate::program::IfArm;
 use alloc::vec::Vec;
 
 /// Emitted traffic within one scope of the nest.
@@ -72,57 +71,8 @@ impl ScopeTraffic {
     /// Loads plus stores — the quantity #1150's table reports, and the one
     /// the 2026-09-04 measurements found does not predict AVX-512 time.
     #[must_use]
-    pub const fn memory_ops(&self) -> u64 {
+    const fn memory_ops(&self) -> u64 {
         self.loads_transient + self.loads_kept + self.stores
-    }
-}
-
-/// How much of the nest the emitter branches over: the structure of its
-/// `If` guards, which no pixel can show.
-///
-/// A guarded `If` and a blended one compute the same picture, so a render
-/// cannot tell a kernel that kept its branches from one that lost them; it
-/// only runs slower. These three counts are the part of a compile's decision
-/// that a golden is blind to, read off the tables the emitter branches on
-/// (`Allocation::if_guards`) rather than re-derived, so they are what was
-/// emitted by construction.
-///
-/// Three numbers because a count of guards alone is a weak gate: an `If` that
-/// stops earning a branch lowers `guards`, an arm that stops being one
-/// contiguous run lowers `arms_branched`, and a run that shrinks lowers
-/// `arm_entries` — an arm lost behind an unchanged guard count is exactly the
-/// failure the second and third exist to see.
-///
-/// Counted, never read by the emitter, like everything in this module.
-/// Control-plane quantities (they describe the program), so 64 bits.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BranchTraffic {
-    /// `If`s with at least one arm under a branch.
-    pub guards: u64,
-    /// Arms under a branch: a guard buys one or both of its two.
-    pub arms_branched: u64,
-    /// Schedule entries under a branch, summed over every such arm (an entry
-    /// inside two nested arms counts in each).
-    pub arm_entries: u64,
-}
-
-impl BranchTraffic {
-    /// The branches `nest`'s tables hold, over its body and its folds.
-    #[must_use]
-    pub(super) fn of(nest: &NestAllocation) -> Self {
-        let scopes = core::iter::once(Scope::Body).chain((0..nest.fold_count()).map(Scope::Fold));
-        let mut branches = Self::default();
-        for scope in scopes {
-            for guard in nest.scope(scope).if_guards() {
-                branches.guards += u64::from(guard.has_guarded_arm());
-                branches.arms_branched += IfArm::ALL
-                    .iter()
-                    .filter(|&&arm| guard.is_guarded(arm))
-                    .count() as u64;
-                branches.arm_entries += guard.total_guarded_entries() as u64;
-            }
-        }
-        branches
     }
 }
 
@@ -143,12 +93,6 @@ pub struct EmitTraffic {
     /// allocations — recorded separately rather than folded into a scope so
     /// that stays visible.
     pub scaffold: ScopeTraffic,
-    /// Bytes after the return: the constant pool and the padding that aligns
-    /// it. The pool is the kernel's; the padding follows the code's length,
-    /// so this is the one count that can differ between two allocations of a
-    /// kernel with no instruction differing, by less than
-    /// [`CONST_POOL_ALIGN`](super::CONST_POOL_ALIGN).
-    pub trailing: u64,
     /// Bytes one spilled register occupies: the backend's vector width.
     pub vector_bytes: u32,
     /// Registers the allocator had to hand out.
@@ -156,8 +100,6 @@ pub struct EmitTraffic {
     /// Parked roots that hold a register across the scopes inside them
     /// rather than a slot.
     pub carried: u64,
-    /// The `If` branches the nest was emitted with.
-    pub branches: BranchTraffic,
 }
 
 impl EmitTraffic {
@@ -180,13 +122,6 @@ impl EmitTraffic {
     #[must_use]
     pub fn body(&self) -> ScopeTraffic {
         self.scopes.first().copied().unwrap_or_default()
-    }
-
-    /// Every scope's bytes plus the function's own and what trails its return
-    /// — the whole of what was emitted, by construction.
-    #[must_use]
-    pub fn bytes(&self) -> u64 {
-        self.scopes.iter().map(|s| s.bytes).sum::<u64>() + self.scaffold.bytes + self.trailing
     }
 
     /// Memory operations one call executes: each scope's, weighted by how
@@ -832,30 +767,6 @@ mod tests {
 
     const SHAPE: LatticeShape = LatticeShape::new([16, 2]);
 
-    /// The completeness property the decorator exists to have: every byte the
-    /// driver emitted landed in exactly one scope's count.
-    ///
-    /// This is what a set of increments at the driver's emission sites cannot
-    /// promise — one forgotten site there is a silently missing term, and here
-    /// it is a failing assertion.
-    #[test]
-    fn every_emitted_byte_is_attributed_to_exactly_one_scope() {
-        for terms in [2usize, 8, 24] {
-            let (arena, root) = wide_live_range_kernel(terms);
-            let result = EmitCtx::with_max_regs(TIGHT_POOL)
-                .compile(&arena, root, SHAPE)
-                .expect("compile");
-            let t = &result.traffic;
-            assert_eq!(
-                t.bytes() as usize,
-                result.code.len(),
-                "{terms} terms: {} bytes attributed, {} emitted",
-                t.bytes(),
-                result.code.len()
-            );
-        }
-    }
-
     /// Spilling under a tight pool must show up as traffic. If a future
     /// emission path routes a store or a reload around the decorator, this is
     /// the test that notices — the store-after-definition path in particular,
@@ -864,9 +775,11 @@ mod tests {
     #[test]
     fn a_kernel_that_must_spill_reports_stores_and_loads() {
         let (arena, root) = wide_live_range_kernel(24);
-        let result = EmitCtx::with_max_regs(TIGHT_POOL)
-            .compile(&arena, root, SHAPE)
-            .expect("compile");
+        let result = EmitCtx {
+            max_regs: Some(TIGHT_POOL),
+        }
+        .compile(&arena, root, SHAPE)
+        .expect("compile");
         assert!(
             result.spill_count > 0,
             "24 values live against a {TIGHT_POOL}-register pool did not spill; \
@@ -913,14 +826,10 @@ mod tests {
     /// is counted apart from the scopes rather than folded into one — a
     /// difference between two allocations must not be able to hide there.
     ///
-    /// Every backend, from this host, since each emits its own frame. What
-    /// trails the return is counted apart again: the constant pool is the
-    /// kernel's, but the padding that aligns it follows the code's length, so
-    /// that count may move with the budget by less than one alignment — and
-    /// it is the only count that may.
+    /// Every backend, from this host, since each emits its own frame.
     #[test]
     fn the_scaffolds_traffic_does_not_move_with_the_pool() {
-        use crate::emit::{CONST_POOL_ALIGN, IsaBackend, aarch64, avx2, avx512, compile_schedule};
+        use crate::emit::{IsaBackend, aarch64, avx2, avx512, compile_schedule};
         use crate::pipeline::{BYTES_PER_LANE, schedule_for};
 
         fn traffic<B: IsaBackend>(mut backend: B, arena: &ExprArena, root: ExprId) -> EmitTraffic {
@@ -931,7 +840,9 @@ mod tests {
                 .traffic
         }
         let (arena, root) = wide_live_range_kernel(24);
-        let tight = || EmitCtx::with_max_regs(TIGHT_POOL);
+        let tight = || EmitCtx {
+            max_regs: Some(TIGHT_POOL),
+        };
         let loose = EmitCtx::default;
         let budgets = [
             (
@@ -954,13 +865,6 @@ mod tests {
             assert_eq!(
                 t.scaffold, l.scaffold,
                 "{name}: the scaffold changed with the register budget"
-            );
-            assert!(
-                t.trailing.abs_diff(l.trailing) < CONST_POOL_ALIGN as u64,
-                "{name}: what trails the return changed with the register budget by more \
-                 than the pool's alignment: {} vs {} bytes",
-                t.trailing,
-                l.trailing
             );
         }
     }

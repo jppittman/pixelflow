@@ -6,8 +6,8 @@ use alloc::vec::Vec;
 
 /// An in-memory code page for testing.
 #[derive(Clone, Debug)]
-pub struct MockCodePage {
-    bytes: Vec<u8>,
+pub(super) struct MockCodePage {
+    pub(super) bytes: Vec<u8>,
 }
 
 impl CodePage for MockCodePage {

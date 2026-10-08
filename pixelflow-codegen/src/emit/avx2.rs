@@ -333,7 +333,7 @@ fn vextractf128(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
 }
 
 /// `vmovaps ymmDST, ymmSRC` — register copy.
-pub fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
+fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     if dst.0 == src.0 {
         return;
     }
@@ -475,7 +475,7 @@ fn emit_unary(
 ///
 /// `Neg`/`Abs` build a sign mask, and the `If` blends through a temporary;
 /// every other encoding here is a single non-destructive VEX instruction.
-pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
+fn temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
         ScheduledOp::Unary(OpKind::Neg | OpKind::Abs, _) => 1,
@@ -506,7 +506,7 @@ pub(crate) fn temps_for(op: &super::ScheduledOp) -> u8 {
 /// element through a SIB. A `Write` converts its row and column into one
 /// each before combining them into the address; the iota carries its eight
 /// bytes in through one.
-pub(crate) fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
+fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
         ScheduledOp::Write { .. } => 2,
@@ -638,9 +638,9 @@ fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
 #[derive(Clone, Copy)]
 struct GatherTemps {
     /// Vector register for the truncated integer indices.
-    pub idx_int: Reg,
+    idx_int: Reg,
     /// Vector register for the mask, all-ones going in and cleared on exit.
-    pub mask: Reg,
+    mask: Reg,
 }
 
 /// `vgatherdps ymmDST, [baseGPR + ymmINDEX*4], ymmMASK` —
@@ -1033,7 +1033,7 @@ mod tests {
                     &mut c,
                     dst,
                     Reg(0),
-                    x86_64::ptr::RDI,
+                    PtrReg(7),
                     GatherTemps {
                         idx_int: Reg(13),
                         mask: Reg(14),
@@ -1088,7 +1088,7 @@ mod tests {
         let mut c = Vec::new();
         AsmProgram::from([
             gather(Reg(13), PtrReg(11), Reg(14), Reg(15)),
-            gather(Reg(0), x86_64::ptr::RDI, Reg(13), Reg(14)),
+            gather(Reg(0), PtrReg(7), Reg(13), Reg(14)),
         ])
         .assemble(&mut c);
         assert_eq!(
@@ -1141,7 +1141,7 @@ mod tests {
 /// cannot introduce a platform-specific bug. That is the bargain `unsafe`
 /// makes — confine what cannot be checked, so the rest is checked by
 /// construction.
-pub(crate) mod driver {
+pub(super) mod driver {
     use super::super::*;
     use super::{
         AsmProgram, IOTA_BYTES, Mem, NoDisp, UNUSED_VVVV, Vex, frame_slot, vcvttss2si_mem,
@@ -1200,13 +1200,13 @@ pub(crate) mod driver {
     .checked();
 
     /// AVX2 implementation of the shared driver's leaf operations.
-    pub(crate) struct Avx2Backend {
+    pub(in crate::emit) struct Avx2Backend {
         consts: x86::ConstPool,
         file: regalloc::RegisterFile,
     }
 
     impl Avx2Backend {
-        pub(crate) fn new(ctx: EmitCtx) -> Self {
+        pub(in crate::emit) fn new(ctx: EmitCtx) -> Self {
             Self {
                 consts: x86::ConstPool::default(),
                 file: AVX2_FILE.capped(ctx.max_regs),

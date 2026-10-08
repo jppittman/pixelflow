@@ -88,7 +88,7 @@ fn dump_production_glyph_arenas() {
             let collapse = Collapse {
                 domain: Domain {
                     shape: LatticeShape::new([tile_px as u32, tile_px as u32]),
-                    origin: pixelflow_codegen::emit::origin(),
+                    origin: [0.0, 0.0].map(|default| pixelflow_ir::Uniform::new(default).decl()),
                 },
                 lanes: (pixelflow_codegen::jit_vector_bytes() / 4) as u32,
             };

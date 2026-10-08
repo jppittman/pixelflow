@@ -12,7 +12,7 @@ use super::{CodePage, ExecutableCode};
 use crate::error::CompileError;
 
 /// A mapped, writable code page on Linux.
-pub struct LinuxCodePage {
+pub(super) struct LinuxCodePage {
     ptr: *mut u8,
     capacity: usize,
 }
@@ -141,7 +141,7 @@ impl Drop for LinuxCodePage {
 }
 
 #[cfg(test)]
-pub(crate) fn test_sync_empty() {
+pub(super) fn test_sync_empty() {
     let mut byte = 0u8;
     sync_instruction_cache(&raw mut byte, 0);
 }

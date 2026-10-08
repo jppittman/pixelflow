@@ -54,10 +54,10 @@ use crate::program::{ArmPair, Def, IfGuard, ValueId};
 pub(crate) struct Layout {
     /// The old position of each new position: the schedule to emit is
     /// `order.map(|old| schedule[old])`.
-    pub(crate) order: Vec<usize>,
+    order: Vec<usize>,
     /// The new position of each old position: how a table of positions into
     /// the old schedule (a fold's `at`) is carried to the new one.
-    pub(crate) position: Vec<usize>,
+    pub(super) position: Vec<usize>,
     /// The `If`s with a branch, in new positions, ascending.
     pub(crate) guards: Vec<IfGuard>,
 }

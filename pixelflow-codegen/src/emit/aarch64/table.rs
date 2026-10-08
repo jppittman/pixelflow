@@ -7,7 +7,7 @@
 //!
 //! Magic hex opcodes live strictly on the typed instruction definitions in this table.
 
-use crate::emit::{AsmInsn, Gpr, PtrReg, Reg, SourceOperand, StoreTarget};
+use crate::emit::{AsmInsn, Gpr, PtrReg, Reg};
 use alloc::vec::Vec;
 
 // =============================================================================
@@ -16,26 +16,20 @@ use alloc::vec::Vec;
 
 /// 12-bit unsigned immediate for AArch64 arithmetic instructions.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Imm12(pub u16);
+pub(super) struct Imm12(pub(super) u16);
 
-/// 64-bit integer addition: `ADD Xd, Xn, Xm` or `ADD Xd, Xn, #imm12`
+/// 64-bit integer addition of an immediate: `ADD Xd, Xn, #imm12`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct AddI64<O = Gpr> {
-    pub dst: Gpr,
-    pub src: Gpr,
-    pub operand: O,
+pub(super) struct AddI64 {
+    dst: Gpr,
+    src: Gpr,
+    operand: Imm12,
 }
 
-impl<O> AddI64<O> {
+impl AddI64 {
     #[must_use]
     #[inline]
-    pub const fn new_raw(dst: Gpr, src: Gpr, operand: O) -> Self {
-        Self { dst, src, operand }
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn new(dst: impl Into<Gpr>, src: impl Into<Gpr>, operand: O) -> Self {
+    pub(super) fn new(dst: impl Into<Gpr>, src: impl Into<Gpr>, operand: Imm12) -> Self {
         Self {
             dst: dst.into(),
             src: src.into(),
@@ -44,18 +38,7 @@ impl<O> AddI64<O> {
     }
 }
 
-impl AsmInsn for AddI64<Gpr> {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        let w = 0x8B00_0000
-            | ((self.operand.0 as u32 & 0x1F) << 16)
-            | ((self.src.0 as u32 & 0x1F) << 5)
-            | (self.dst.0 as u32 & 0x1F);
-        code.extend_from_slice(&w.to_le_bytes());
-    }
-}
-
-impl AsmInsn for AddI64<Imm12> {
+impl AsmInsn for AddI64 {
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
         let w = 0x9100_0000
@@ -66,24 +49,18 @@ impl AsmInsn for AddI64<Imm12> {
     }
 }
 
-/// 64-bit integer subtraction: `SUB Xd, Xn, Xm` or `SUB Xd, Xn, #imm12`
+/// 64-bit integer subtraction of an immediate: `SUB Xd, Xn, #imm12`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct SubI64<O = Gpr> {
-    pub dst: Gpr,
-    pub src: Gpr,
-    pub operand: O,
+pub(super) struct SubI64 {
+    dst: Gpr,
+    src: Gpr,
+    operand: Imm12,
 }
 
-impl<O> SubI64<O> {
+impl SubI64 {
     #[must_use]
     #[inline]
-    pub const fn new_raw(dst: Gpr, src: Gpr, operand: O) -> Self {
-        Self { dst, src, operand }
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn new(dst: impl Into<Gpr>, src: impl Into<Gpr>, operand: O) -> Self {
+    pub(super) fn new(dst: impl Into<Gpr>, src: impl Into<Gpr>, operand: Imm12) -> Self {
         Self {
             dst: dst.into(),
             src: src.into(),
@@ -92,18 +69,7 @@ impl<O> SubI64<O> {
     }
 }
 
-impl AsmInsn for SubI64<Gpr> {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        let w = 0xCB00_0000
-            | ((self.operand.0 as u32 & 0x1F) << 16)
-            | ((self.src.0 as u32 & 0x1F) << 5)
-            | (self.dst.0 as u32 & 0x1F);
-        code.extend_from_slice(&w.to_le_bytes());
-    }
-}
-
-impl AsmInsn for SubI64<Imm12> {
+impl AsmInsn for SubI64 {
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
         let w = 0xD100_0000
@@ -114,90 +80,17 @@ impl AsmInsn for SubI64<Imm12> {
     }
 }
 
-/// 64-bit integer compare: `CMP Xn, Xm` (encoded as `SUBS XZR, Xn, Xm`)
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct CmpI64 {
-    pub lhs: Gpr,
-    pub rhs: Gpr,
-}
-
-impl CmpI64 {
-    #[must_use]
-    #[inline]
-    pub const fn new_raw(lhs: Gpr, rhs: Gpr) -> Self {
-        Self { lhs, rhs }
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn new(lhs: impl Into<Gpr>, rhs: impl Into<Gpr>) -> Self {
-        Self {
-            lhs: lhs.into(),
-            rhs: rhs.into(),
-        }
-    }
-}
-
-impl AsmInsn for CmpI64 {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        let w = 0xEB00_0000
-            | ((self.rhs.0 as u32 & 0x1F) << 16)
-            | ((self.lhs.0 as u32 & 0x1F) << 5)
-            | 31;
-        code.extend_from_slice(&w.to_le_bytes());
-    }
-}
-
-/// Move wide with zero: `MOVZ Xd, #imm16`
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Movz {
-    pub dst: Gpr,
-    pub imm: u16,
-}
-
-impl Movz {
-    #[must_use]
-    #[inline]
-    pub const fn new_raw(dst: Gpr, imm: u16) -> Self {
-        Self { dst, imm }
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn new(dst: impl Into<Gpr>, imm: u16) -> Self {
-        Self {
-            dst: dst.into(),
-            imm,
-        }
-    }
-}
-
-impl AsmInsn for Movz {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        let w = 0xD280_0000 | ((self.imm as u32) << 5) | (self.dst.0 as u32 & 0x1F);
-        code.extend_from_slice(&w.to_le_bytes());
-    }
-}
-
 /// Bitwise NOT of 32-bit general-purpose register: `MVN Wd, Wm` (encoded as `ORN Wd, WZR, Wm`)
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct MvnW {
-    pub dst: Gpr,
-    pub src: Gpr,
+pub(super) struct MvnW {
+    dst: Gpr,
+    src: Gpr,
 }
 
 impl MvnW {
     #[must_use]
     #[inline]
-    pub const fn new_raw(dst: Gpr, src: Gpr) -> Self {
-        Self { dst, src }
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn new(dst: impl Into<Gpr>, src: impl Into<Gpr>) -> Self {
+    pub(super) fn new(dst: impl Into<Gpr>, src: impl Into<Gpr>) -> Self {
         Self {
             dst: dst.into(),
             src: src.into(),
@@ -211,27 +104,20 @@ impl MvnW {
     }
 }
 
-impl AsmInsn for MvnW {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        code.extend_from_slice(&self.encode().to_le_bytes());
-    }
-}
-
 /// Binary vector operation: V × V → V
 ///
 /// Denotes `dst = lhs ⊗ rhs` across all vector lanes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Binary<const OPCODE: u32, D = Reg, L = Reg, R = Reg> {
-    pub dst: D,
-    pub lhs: L,
-    pub rhs: R,
+pub(super) struct Binary<const OPCODE: u32, D = Reg, L = Reg, R = Reg> {
+    dst: D,
+    lhs: L,
+    rhs: R,
 }
 
 impl<const OPCODE: u32> Binary<OPCODE, Reg, Reg, Reg> {
     #[must_use]
     #[inline]
-    pub const fn new(dst: Reg, lhs: Reg, rhs: Reg) -> Self {
+    pub(super) const fn new(dst: Reg, lhs: Reg, rhs: Reg) -> Self {
         Self { dst, lhs, rhs }
     }
 
@@ -243,42 +129,21 @@ impl<const OPCODE: u32> Binary<OPCODE, Reg, Reg, Reg> {
             | ((self.lhs.0 as u32 & 0x1F) << 5)
             | ((self.rhs.0 as u32 & 0x1F) << 16)
     }
-
-    /// Attempt to construct a concrete register binary op from abstract storage operands.
-    #[must_use]
-    #[inline]
-    pub fn from_operands<D: StoreTarget, L: SourceOperand, R: SourceOperand>(
-        dst: D,
-        lhs: L,
-        rhs: R,
-    ) -> Option<Self> {
-        let d = dst.target_reg()?;
-        let l = lhs.source_reg()?;
-        let r = rhs.source_reg()?;
-        Some(Self::new(d, l, r))
-    }
-}
-
-impl<const OPCODE: u32> AsmInsn for Binary<OPCODE, Reg, Reg, Reg> {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        code.extend_from_slice(&self.encode().to_le_bytes());
-    }
 }
 
 /// Unary vector operation: V → V
 ///
 /// Denotes `dst = f(src)` across all vector lanes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Unary<const OPCODE: u32, D = Reg, S = Reg> {
-    pub dst: D,
-    pub src: S,
+pub(super) struct Unary<const OPCODE: u32, D = Reg, S = Reg> {
+    dst: D,
+    src: S,
 }
 
 impl<const OPCODE: u32> Unary<OPCODE, Reg, Reg> {
     #[must_use]
     #[inline]
-    pub const fn new(dst: Reg, src: Reg) -> Self {
+    pub(super) const fn new(dst: Reg, src: Reg) -> Self {
         Self { dst, src }
     }
 
@@ -286,36 +151,20 @@ impl<const OPCODE: u32> Unary<OPCODE, Reg, Reg> {
     #[inline]
     pub(super) fn encode(self) -> u32 {
         OPCODE | (self.dst.0 as u32 & 0x1F) | ((self.src.0 as u32 & 0x1F) << 5)
-    }
-
-    /// Attempt to construct a concrete register unary op from abstract storage operands.
-    #[must_use]
-    #[inline]
-    pub fn from_operands<D: StoreTarget, S: SourceOperand>(dst: D, src: S) -> Option<Self> {
-        let d = dst.target_reg()?;
-        let s = src.source_reg()?;
-        Some(Self::new(d, s))
-    }
-}
-
-impl<const OPCODE: u32> AsmInsn for Unary<OPCODE, Reg, Reg> {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        code.extend_from_slice(&self.encode().to_le_bytes());
     }
 }
 
 /// Vector-to-scalar horizontal reduction: V → S
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Reduce<const OPCODE: u32, D = Reg, S = Reg> {
-    pub dst: D,
-    pub src: S,
+pub(super) struct Reduce<const OPCODE: u32, D = Reg, S = Reg> {
+    dst: D,
+    src: S,
 }
 
 impl<const OPCODE: u32> Reduce<OPCODE, Reg, Reg> {
     #[must_use]
     #[inline]
-    pub const fn new(dst: Reg, src: Reg) -> Self {
+    pub(super) const fn new(dst: Reg, src: Reg) -> Self {
         Self { dst, src }
     }
 
@@ -324,36 +173,20 @@ impl<const OPCODE: u32> Reduce<OPCODE, Reg, Reg> {
     pub(super) fn encode(self) -> u32 {
         OPCODE | (self.dst.0 as u32 & 0x1F) | ((self.src.0 as u32 & 0x1F) << 5)
     }
-
-    /// Attempt to construct a concrete register reduction op from abstract storage operands.
-    #[must_use]
-    #[inline]
-    pub fn from_operands<D: StoreTarget, S: SourceOperand>(dst: D, src: S) -> Option<Self> {
-        let d = dst.target_reg()?;
-        let s = src.source_reg()?;
-        Some(Self::new(d, s))
-    }
-}
-
-impl<const OPCODE: u32> AsmInsn for Reduce<OPCODE, Reg, Reg> {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        code.extend_from_slice(&self.encode().to_le_bytes());
-    }
 }
 
 /// Bitwise select: `mask = (mask & if_true) | (~mask & if_false)`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Bsl<M = Reg, T = Reg, F = Reg> {
-    pub mask: M,
-    pub if_true: T,
-    pub if_false: F,
+pub(super) struct Bsl<M = Reg, T = Reg, F = Reg> {
+    mask: M,
+    if_true: T,
+    if_false: F,
 }
 
 impl Bsl<Reg, Reg, Reg> {
     #[must_use]
     #[inline]
-    pub const fn new(mask: Reg, if_true: Reg, if_false: Reg) -> Self {
+    pub(super) const fn new(mask: Reg, if_true: Reg, if_false: Reg) -> Self {
         Self {
             mask,
             if_true,
@@ -369,40 +202,19 @@ impl Bsl<Reg, Reg, Reg> {
             | ((self.if_true.0 as u32 & 0x1F) << 5)
             | ((self.if_false.0 as u32 & 0x1F) << 16)
     }
-
-    /// Attempt to construct a concrete register Bsl from abstract storage operands.
-    #[must_use]
-    #[inline]
-    pub fn from_operands<M: SourceOperand, T: SourceOperand, F: SourceOperand>(
-        mask: M,
-        if_true: T,
-        if_false: F,
-    ) -> Option<Self> {
-        let m = mask.source_reg()?;
-        let t = if_true.source_reg()?;
-        let f = if_false.source_reg()?;
-        Some(Self::new(m, t, f))
-    }
-}
-
-impl AsmInsn for Bsl<Reg, Reg, Reg> {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        code.extend_from_slice(&self.encode().to_le_bytes());
-    }
 }
 
 /// Broadcast a lane of a vector register across all lanes: `DUP Vd.4S, Vn.s[0]`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct DupLane0 {
-    pub dst: Reg,
-    pub src: Reg,
+pub(super) struct DupLane0 {
+    dst: Reg,
+    src: Reg,
 }
 
 impl DupLane0 {
     #[must_use]
     #[inline]
-    pub const fn new(dst: Reg, src: Reg) -> Self {
+    pub(super) const fn new(dst: Reg, src: Reg) -> Self {
         Self { dst, src }
     }
 
@@ -413,23 +225,16 @@ impl DupLane0 {
     }
 }
 
-impl AsmInsn for DupLane0 {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        code.extend_from_slice(&self.encode().to_le_bytes());
-    }
-}
-
 /// Move vector lane 0 to general purpose register: `FMOV X16, D<src>`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct FmovToGp {
-    pub src: Reg,
+pub(super) struct FmovToGp {
+    src: Reg,
 }
 
 impl FmovToGp {
     #[must_use]
     #[inline]
-    pub const fn new(src: Reg) -> Self {
+    pub(super) const fn new(src: Reg) -> Self {
         Self { src }
     }
 
@@ -440,19 +245,12 @@ impl FmovToGp {
     }
 }
 
-impl AsmInsn for FmovToGp {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        code.extend_from_slice(&self.encode().to_le_bytes());
-    }
-}
-
 /// Return from subroutine: `RET`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Ret;
+pub(super) struct Ret;
 
 impl Ret {
-    pub const OPCODE: u32 = 0xD65F_03C0;
+    const OPCODE: u32 = 0xD65F_03C0;
 
     #[must_use]
     #[inline]
@@ -470,18 +268,18 @@ impl AsmInsn for Ret {
 
 /// A 32-bit scalar float register (the `s0`..`s31` view of a vector register).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SReg(pub Reg);
+pub(super) struct SReg(pub(super) Reg);
 
 /// Bytes moved by a `q` (128-bit vector) access — also the scale of its offset.
-pub const Q_BYTES: u32 = 16;
+const Q_BYTES: u32 = 16;
 /// Bytes moved by an `x` (64-bit general/pointer) access.
-pub const X_BYTES: u32 = 8;
+pub(super) const X_BYTES: u32 = 8;
 /// Bytes moved by an `s` (32-bit scalar SIMD&FP) access.
-pub const S_BYTES: u32 = 4;
+pub(super) const S_BYTES: u32 = 4;
 /// The largest value a 12-bit scaled immediate holds.
-pub const MAX_IMM12: u32 = 4095;
+const MAX_IMM12: u32 = 4095;
 /// The largest 16-byte-aligned displacement `add`'s own 12-bit immediate holds.
-pub const MAX_ADD_IMM: u32 = 4080;
+pub(in crate::emit) const MAX_ADD_IMM: u32 = 4080;
 
 /// An address spelled `[base, #offset]` — the scaled-immediate addressing mode.
 ///
@@ -489,37 +287,21 @@ pub const MAX_ADD_IMM: u32 = 4080;
 /// The base being a [`PtrReg`] guarantees an integer counter or index cannot
 /// be mistakenly passed as an address.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Mem {
+pub(in crate::emit) struct Mem {
     /// The register holding the base address.
-    pub base: PtrReg,
+    pub(in crate::emit) base: PtrReg,
     /// Displacement in bytes; must be a multiple of the access size.
-    pub offset: u32,
-}
-
-impl Mem {
-    #[must_use]
-    #[inline]
-    pub const fn new(base: PtrReg, offset: u32) -> Self {
-        Self { base, offset }
-    }
+    pub(in crate::emit) offset: u32,
 }
 
 /// An address spelled `[base, w<index>, uxtw #2]` — a 32-bit index register,
 /// zero-extended to 64 bits and scaled by 4.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct MemIndexed {
+pub(super) struct MemIndexed {
     /// The register holding the buffer base pointer.
-    pub base: PtrReg,
+    pub(super) base: PtrReg,
     /// The element index, read as the 32-bit `w<index>`.
-    pub index: Gpr,
-}
-
-impl MemIndexed {
-    #[must_use]
-    #[inline]
-    pub const fn new(base: PtrReg, index: Gpr) -> Self {
-        Self { base, index }
-    }
+    pub(super) index: Gpr,
 }
 
 /// Rewrite `addr` as `[x16]`, computing `base + offset` into IP0 first.
@@ -527,7 +309,7 @@ impl MemIndexed {
 /// The fallback for a displacement past the 12-bit scaled immediate — a spill
 /// frame deeper than 64 KiB. `add`'s immediate is 12 bits too, so a large
 /// displacement takes several of them.
-pub fn address_in_ip0(code: &mut Vec<u8>, Mem { base, offset }: Mem) -> Mem {
+fn address_in_ip0(code: &mut Vec<u8>, Mem { base, offset }: Mem) -> Mem {
     let mut remaining = offset;
     let first = remaining.min(MAX_ADD_IMM);
     AddI64::new(Gpr(16), base.as_gpr(), Imm12(first as u16)).emit_into(code);
@@ -545,9 +327,9 @@ pub fn address_in_ip0(code: &mut Vec<u8>, Mem { base, offset }: Mem) -> Mem {
 
 /// `STR Qt, [Xn, #imm12*16]`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct StrQ {
-    pub src: Reg,
-    pub addr: Mem,
+pub(super) struct StrQ {
+    pub(super) src: Reg,
+    pub(super) addr: Mem,
 }
 
 impl AsmInsn for StrQ {
@@ -573,9 +355,9 @@ impl AsmInsn for StrQ {
 
 /// `STR Xt, [Xn, #imm12*8]`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct StrX {
-    pub src: PtrReg,
-    pub addr: Mem,
+pub(super) struct StrX {
+    pub(super) src: PtrReg,
+    pub(super) addr: Mem,
 }
 
 impl AsmInsn for StrX {
@@ -600,9 +382,9 @@ impl AsmInsn for StrX {
 
 /// `LDR Qt, [Xn, #imm12*16]`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct LdrQ {
-    pub dst: Reg,
-    pub addr: Mem,
+pub(super) struct LdrQ {
+    pub(super) dst: Reg,
+    pub(super) addr: Mem,
 }
 
 impl AsmInsn for LdrQ {
@@ -628,9 +410,9 @@ impl AsmInsn for LdrQ {
 
 /// `LDR Xt, [Xn, #imm12*8]`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct LdrX {
-    pub dst: PtrReg,
-    pub addr: Mem,
+pub(super) struct LdrX {
+    pub(super) dst: PtrReg,
+    pub(super) addr: Mem,
 }
 
 impl AsmInsn for LdrX {
@@ -655,9 +437,9 @@ impl AsmInsn for LdrX {
 
 /// `LDR St, [Xn, #imm12*4]`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct LdrS {
-    pub dst: SReg,
-    pub addr: Mem,
+pub(super) struct LdrS {
+    pub(super) dst: SReg,
+    pub(super) addr: Mem,
 }
 
 impl AsmInsn for LdrS {
@@ -683,9 +465,9 @@ impl AsmInsn for LdrS {
 
 /// `LDR Wt, [Xn, Wm, UXTW #2]`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct LdrW {
-    pub dst: Gpr,
-    pub addr: MemIndexed,
+pub(super) struct LdrW {
+    pub(super) dst: Gpr,
+    pub(super) addr: MemIndexed,
 }
 
 impl AsmInsn for LdrW {
@@ -702,9 +484,9 @@ impl AsmInsn for LdrW {
 /// `ldr s<dst>, [base, w<index>, uxtw #2]` — one element of a plane of
 /// `f32`s straight into lane 0, where a `dup` can spread it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct LdrSIndexed {
-    pub dst: SReg,
-    pub addr: MemIndexed,
+pub(super) struct LdrSIndexed {
+    pub(super) dst: SReg,
+    pub(super) addr: MemIndexed,
 }
 
 impl AsmInsn for LdrSIndexed {
@@ -722,16 +504,16 @@ impl AsmInsn for LdrSIndexed {
 
 /// UMOV Wd, Vn.S[lane] — extract a 32-bit vector lane into a GP register.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct UmovW {
-    pub dst: Gpr,
-    pub src: Reg,
-    pub lane: u8,
+pub(super) struct UmovW {
+    dst: Gpr,
+    src: Reg,
+    lane: u8,
 }
 
 impl UmovW {
     #[must_use]
     #[inline]
-    pub const fn new(dst: Gpr, src: Reg, lane: u8) -> Self {
+    pub(super) const fn new(dst: Gpr, src: Reg, lane: u8) -> Self {
         Self { dst, src, lane }
     }
 
@@ -750,24 +532,17 @@ impl UmovW {
     }
 }
 
-impl AsmInsn for UmovW {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        code.extend_from_slice(&self.encode().to_le_bytes());
-    }
-}
-
 /// MOV Xd, Xm — `ORR Xd, XZR, Xm`: an address between pointer registers.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct MovX {
-    pub dst: PtrReg,
-    pub src: PtrReg,
+pub(super) struct MovX {
+    dst: PtrReg,
+    src: PtrReg,
 }
 
 impl MovX {
     #[must_use]
     #[inline]
-    pub const fn new(dst: PtrReg, src: PtrReg) -> Self {
+    pub(super) const fn new(dst: PtrReg, src: PtrReg) -> Self {
         Self { dst, src }
     }
 
@@ -790,15 +565,15 @@ impl AsmInsn for MovX {
 /// index, becomes an address. The scalar form of [`Fcvtzs`], whose `.4S`
 /// result stays in the vector file.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct FcvtzsX {
-    pub dst: Gpr,
-    pub src: Reg,
+pub(super) struct FcvtzsX {
+    dst: Gpr,
+    src: Reg,
 }
 
 impl FcvtzsX {
     #[must_use]
     #[inline]
-    pub const fn new(dst: Gpr, src: Reg) -> Self {
+    pub(super) const fn new(dst: Gpr, src: Reg) -> Self {
         Self { dst, src }
     }
 
@@ -809,25 +584,18 @@ impl FcvtzsX {
     }
 }
 
-impl AsmInsn for FcvtzsX {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        code.extend_from_slice(&self.encode().to_le_bytes());
-    }
-}
-
 /// INS Vd.S[lane], Wn — insert a GP register into a 32-bit vector lane.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct InsW {
-    pub dst: Reg,
-    pub lane: u8,
-    pub src: Gpr,
+pub(super) struct InsW {
+    dst: Reg,
+    lane: u8,
+    src: Gpr,
 }
 
 impl InsW {
     #[must_use]
     #[inline]
-    pub const fn new(dst: Reg, lane: u8, src: Gpr) -> Self {
+    pub(super) const fn new(dst: Reg, lane: u8, src: Gpr) -> Self {
         Self { dst, lane, src }
     }
 
@@ -845,88 +613,60 @@ impl InsW {
     }
 }
 
-impl AsmInsn for InsW {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        code.extend_from_slice(&self.encode().to_le_bytes());
-    }
-}
-
 // =============================================================================
 // Instruction Table (Type Aliases with Local Opcodes)
 // =============================================================================
 
 // Binary arithmetic (V × V → V)
-pub type Fadd = Binary<0x4E20_D400>;
-pub type Fsub = Binary<0x4EA0_D400>;
-pub type Fmul = Binary<0x6E20_DC00>;
-pub type Fdiv = Binary<0x6E20_FC00>;
-pub type Fmla = Binary<0x4E20_CC00>;
-pub type Fmin = Binary<0x4EA0_F400>;
-pub type Fmax = Binary<0x4E20_F400>;
+pub(super) type Fadd = Binary<0x4E20_D400>;
+pub(super) type Fsub = Binary<0x4EA0_D400>;
+pub(super) type Fmul = Binary<0x6E20_DC00>;
+pub(super) type Fdiv = Binary<0x6E20_FC00>;
+pub(super) type Fmla = Binary<0x4E20_CC00>;
+pub(super) type Fmin = Binary<0x4EA0_F400>;
+pub(super) type Fmax = Binary<0x4E20_F400>;
 
 // Unary arithmetic (V → V)
-pub type Fsqrt = Unary<0x6EA1_F800>;
-pub type Fabs = Unary<0x4EA0_F800>;
-pub type Fneg = Unary<0x6EA0_F800>;
-pub type Not = Unary<0x2E20_5800>;
+pub(super) type Fsqrt = Unary<0x6EA1_F800>;
+pub(super) type Fabs = Unary<0x4EA0_F800>;
+pub(super) type Fneg = Unary<0x6EA0_F800>;
+pub(super) type Not = Unary<0x2E20_5800>;
 
 // Rounding
-pub type Frintm = Unary<0x4E21_9800>; // floor
-pub type Frintp = Unary<0x4EA1_8800>; // ceil
-pub type Frinta = Unary<0x6E21_8800>; // round
+pub(super) type Frintm = Unary<0x4E21_9800>; // floor
+pub(super) type Frintp = Unary<0x4EA1_8800>; // ceil
+pub(super) type Frinta = Unary<0x6E21_8800>; // round
 
 // Reciprocal estimate / steps
-pub type Frsqrte = Unary<0x6EA1_D800>;
-pub type Frsqrts = Binary<0x4EA0_FC00>;
-pub type Frecpe = Unary<0x4EA1_D800>;
-pub type Frecps = Binary<0x4E20_FC00>;
+pub(super) type Frsqrte = Unary<0x6EA1_D800>;
+pub(super) type Frsqrts = Binary<0x4EA0_FC00>;
+pub(super) type Frecpe = Unary<0x4EA1_D800>;
+pub(super) type Frecps = Binary<0x4E20_FC00>;
 
 // Vector comparisons (result is bit mask)
-pub type Fcmgt = Binary<0x6EA0_E400>;
-pub type Fcmge = Binary<0x6E20_E400>;
-pub type Fcmeq = Binary<0x4E20_E400>;
+pub(super) type Fcmgt = Binary<0x6EA0_E400>;
+pub(super) type Fcmge = Binary<0x6E20_E400>;
+pub(super) type Fcmeq = Binary<0x4E20_E400>;
 
 // Integer vector operations
-pub type AddI32 = Binary<0x4EA0_8400>;
-pub type And = Binary<0x4E20_1C00>;
-pub type Orr = Binary<0x4EA0_1C00>;
+pub(super) type AddI32 = Binary<0x4EA0_8400>;
+pub(super) type And = Binary<0x4E20_1C00>;
+pub(super) type Orr = Binary<0x4EA0_1C00>;
 
 // Conversions
-pub type Fcvtzs = Unary<0x4EA1_B800>; // float -> signed int32
-pub type Scvtf = Unary<0x4E21_D800>; // signed int32 -> float
+pub(super) type Fcvtzs = Unary<0x4EA1_B800>; // float -> signed int32
+pub(super) type Scvtf = Unary<0x4E21_D800>; // signed int32 -> float
 
 // Reductions (V → S)
-pub type Uminv = Reduce<0x6EB1_A800>;
-pub type Umaxv = Reduce<0x6E30_A800>;
+pub(super) type Uminv = Reduce<0x6EB1_A800>;
+pub(super) type Umaxv = Reduce<0x6E30_A800>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit::Loc;
 
     #[test]
-    fn binary_and_unary_from_abstract_operands() {
-        let dst = Reg(0);
-        let lhs = Loc::Reg(Reg(1));
-        let rhs = Loc::Reg(Reg(2));
-
-        let add = Fadd::from_operands(dst, lhs, rhs).expect("all in registers");
-        assert_eq!(add.encode(), Fadd::new(Reg(0), Reg(1), Reg(2)).encode());
-
-        let sqrt = Fsqrt::from_operands(dst, lhs).expect("all in registers");
-        assert_eq!(sqrt.encode(), Fsqrt::new(Reg(0), Reg(1)).encode());
-    }
-
-    #[test]
-    fn add_i64_encodes_register_and_immediate() {
-        let mut code_reg = Vec::new();
-        AddI64::new(Gpr(0), Gpr(1), Gpr(2)).emit_into(&mut code_reg);
-        assert_eq!(
-            code_reg,
-            (0x8B00_0000u32 | (2 << 16) | (1 << 5)).to_le_bytes()
-        );
-
+    fn add_i64_encodes_an_immediate() {
         let mut code_imm = Vec::new();
         AddI64::new(Gpr(0), Gpr(1), Imm12(42)).emit_into(&mut code_imm);
         assert_eq!(

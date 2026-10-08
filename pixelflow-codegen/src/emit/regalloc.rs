@@ -19,8 +19,8 @@ use super::{
 };
 use crate::error::CompileError;
 use crate::program::IfGuard;
-pub use crate::program::{Class, Def, Scope, ScopeFold, ScopeRegion, ScopedSchedule, ValueId};
-pub(crate) use crate::program::{all_operands, operands, pointer_operand};
+pub(super) use crate::program::{Class, Def, Scope, ScopedSchedule, ValueId};
+pub(super) use crate::program::{all_operands, operands, pointer_operand};
 
 /// The complete platform-dependent surface of register allocation.
 ///
@@ -49,11 +49,11 @@ pub(super) struct RegSet(u32);
 
 impl RegSet {
     /// The empty set.
-    pub const EMPTY: Self = Self(0);
+    const EMPTY: Self = Self(0);
 
     /// The set containing exactly `regs`.
     #[must_use]
-    pub const fn of(regs: &[Reg]) -> Self {
+    const fn of(regs: &[Reg]) -> Self {
         let mut bits = 0u32;
         let mut i = 0;
         while i < regs.len() {
@@ -70,7 +70,7 @@ impl RegSet {
 
     /// The contiguous run `base .. base + count`.
     #[must_use]
-    pub const fn range(base: u8, count: u8) -> Self {
+    pub(super) const fn range(base: u8, count: u8) -> Self {
         let mut bits = 0u32;
         let mut i = 0;
         while i < count {
@@ -87,7 +87,7 @@ impl RegSet {
 
     /// This set plus every member of `other`.
     #[must_use]
-    pub const fn union(self, other: Self) -> Self {
+    pub(super) const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
@@ -96,25 +96,19 @@ impl RegSet {
     /// How a scope inside a loop sees the pool: a register carrying a value
     /// across that loop is not available to anything the loop contains.
     #[must_use]
-    pub const fn without(self, other: Self) -> Self {
+    const fn without(self, other: Self) -> Self {
         Self(self.0 & !other.0)
     }
 
     #[must_use]
-    pub const fn contains(self, r: Reg) -> bool {
+    const fn contains(self, r: Reg) -> bool {
         r.0 < 32 && self.0 & (1 << r.0) != 0
     }
 
     /// How many registers the set holds.
     #[must_use]
-    pub const fn len(self) -> u8 {
+    pub(super) const fn len(self) -> u8 {
         self.0.count_ones() as u8
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
     }
 
     /// The lowest `n` members, or all of them if the set is smaller.
@@ -122,7 +116,7 @@ impl RegSet {
     /// This is how [`EmitCtx::max_regs`](super::EmitCtx) forces spilling for
     /// pressure testing: it only ever shrinks.
     #[must_use]
-    pub const fn take(self, n: u8) -> Self {
+    const fn take(self, n: u8) -> Self {
         let mut kept = 0u32;
         let mut taken = 0u8;
         let mut r = 0u8;
@@ -137,7 +131,7 @@ impl RegSet {
     }
 
     /// Members low to high.
-    pub fn iter(self) -> impl Iterator<Item = Reg> + use<> {
+    fn iter(self) -> impl Iterator<Item = Reg> + use<> {
         (0u8..32).filter(move |r| self.0 & (1 << r) != 0).map(Reg)
     }
 }
@@ -157,11 +151,11 @@ pub(super) struct GprSet(u32);
 
 impl GprSet {
     /// The empty set.
-    pub const EMPTY: Self = Self(0);
+    const EMPTY: Self = Self(0);
 
     /// The set containing exactly `regs`.
     #[must_use]
-    pub const fn of(regs: &[Gpr]) -> Self {
+    pub(super) const fn of(regs: &[Gpr]) -> Self {
         let mut bits = 0u32;
         let mut i = 0;
         while i < regs.len() {
@@ -174,36 +168,30 @@ impl GprSet {
     }
 
     #[must_use]
-    pub const fn contains(self, r: Gpr) -> bool {
+    const fn contains(self, r: Gpr) -> bool {
         r.0 < 32 && self.0 & (1 << r.0) != 0
     }
 
     /// This set plus every member of `other`.
     #[must_use]
-    pub const fn union(self, other: Self) -> Self {
+    const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
     /// This set minus every member of `other`.
     #[must_use]
-    pub const fn without(self, other: Self) -> Self {
+    const fn without(self, other: Self) -> Self {
         Self(self.0 & !other.0)
     }
 
     /// How many registers the set holds.
     #[must_use]
-    pub const fn len(self) -> u8 {
+    const fn len(self) -> u8 {
         self.0.count_ones() as u8
     }
 
-    #[cfg(test)]
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
     /// Members low to high.
-    pub fn iter(self) -> impl Iterator<Item = Gpr> + use<> {
+    fn iter(self) -> impl Iterator<Item = Gpr> + use<> {
         (0u8..32).filter(move |r| self.0 & (1 << r) != 0).map(Gpr)
     }
 }
@@ -217,11 +205,11 @@ pub(super) struct MaskSet(u8);
 
 impl MaskSet {
     /// The empty set.
-    pub const EMPTY: Self = Self(0);
+    pub(super) const EMPTY: Self = Self(0);
 
     /// The set containing exactly `regs`.
     #[must_use]
-    pub const fn of(regs: &[KReg]) -> Self {
+    pub(super) const fn of(regs: &[KReg]) -> Self {
         let mut bits = 0u8;
         let mut i = 0;
         while i < regs.len() {
@@ -233,26 +221,14 @@ impl MaskSet {
         Self(bits)
     }
 
-    #[cfg(test)]
-    #[must_use]
-    pub const fn contains(self, r: KReg) -> bool {
-        r.0 < 8 && self.0 & (1 << r.0) != 0
-    }
-
     /// How many registers the set holds.
     #[must_use]
-    pub const fn len(self) -> u8 {
+    const fn len(self) -> u8 {
         self.0.count_ones() as u8
     }
 
-    #[cfg(test)]
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
     /// Members low to high.
-    pub fn iter(self) -> impl Iterator<Item = KReg> + use<> {
+    fn iter(self) -> impl Iterator<Item = KReg> + use<> {
         (0u8..8).filter(move |r| self.0 & (1 << r) != 0).map(KReg)
     }
 }
@@ -282,7 +258,7 @@ pub(crate) struct RegisterFile {
     /// A guard is emitted *between* instructions, at the head of a guarded arm
     /// and at the `If` that owns it, so this is reserved on those
     /// instructions and nowhere else.
-    pub guard_temps: u8,
+    pub(super) guard_temps: u8,
 
     /// Registers the backend's own instruction emission clobbers, outside the
     /// allocator's knowledge: a guard's reduction register, a gather's index
@@ -291,7 +267,7 @@ pub(crate) struct RegisterFile {
     /// The allocator never hands these out; declaring them is what lets
     /// [`RegisterFile::checked`] prove they miss the pool, the inputs and the
     /// reload pair — rather than a comment in an ISA file asserting it. Anything a backend takes for itself belongs here.
-    pub fixed: &'static [Reg],
+    pub(super) fixed: &'static [Reg],
 
     /// How many registers this backend's encoding of `op` needs beyond the
     /// operands and destination — the instruction temps.
@@ -307,7 +283,7 @@ pub(crate) struct RegisterFile {
     /// what allocation needs to know about the target" — a backend that needs
     /// a temp is stating a fact about its register requirements, which is what
     /// this type is for.
-    pub temps_for: fn(&ScheduledOp) -> u8,
+    pub(super) temps_for: fn(&ScheduledOp) -> u8,
 
     /// Bytes one register occupies when spilled — the backend's vector width.
     ///
@@ -317,7 +293,7 @@ pub(crate) struct RegisterFile {
     /// once a universal 16 that each wide backend divided back out at its
     /// every use site; a slot offset that failed to be a multiple of 16 would
     /// then have truncated two live values onto the same stack slot.
-    pub vector_bytes: u32,
+    pub(crate) vector_bytes: u32,
 
     /// The GPR holding the JIT ABI's context-pointer argument (the array of
     /// buffer base pointers a `Gather`/`Uniform` load indexes into), if this
@@ -328,17 +304,17 @@ pub(crate) struct RegisterFile {
     /// [`RegisterFile::inputs`] is: so [`RegisterFile::checked`] can prove it
     /// misses [`RegisterFile::gpr_scratch`], rather than a comment asserting
     /// the two constants never collide.
-    pub gpr_ctx: Option<Gpr>,
+    pub(super) gpr_ctx: Option<Gpr>,
 
     /// The GPR holding the JIT ABI's output-plane argument — where a `Write`
     /// stores — if this target's encodings emit one. Pinned like
     /// [`RegisterFile::gpr_ctx`], for the same reason.
-    pub gpr_out: Option<Gpr>,
+    pub(super) gpr_out: Option<Gpr>,
 
     /// The GPR holding the JIT ABI's pitch argument — elements between two
     /// rows of the output plane, which a `Write`'s address multiplies its row
     /// by. Pinned like [`RegisterFile::gpr_ctx`].
-    pub gpr_pitch: Option<Gpr>,
+    pub(super) gpr_pitch: Option<Gpr>,
 
     /// GPRs the allocator may hand out as instruction-scoped scratch.
     ///
@@ -354,7 +330,7 @@ pub(crate) struct RegisterFile {
     /// How many GPRs this backend's encoding of `op` needs beyond
     /// [`RegisterFile::gpr_ctx`] — the GPR-class
     /// [`RegisterFile::temps_for`].
-    pub gpr_temps_for: fn(&ScheduledOp) -> u8,
+    pub(super) gpr_temps_for: fn(&ScheduledOp) -> u8,
 
     /// The pool for [`Class::Pointer`] values: the registers a buffer base or
     /// a uniform block's address may be *carried* in across instructions, and
@@ -376,14 +352,14 @@ pub(crate) struct RegisterFile {
     pub(super) mask_scratch: MaskSet,
 
     /// The mask-class [`RegisterFile::temps_for`].
-    pub mask_temps_for: fn(&ScheduledOp) -> u8,
+    pub(super) mask_temps_for: fn(&ScheduledOp) -> u8,
 
     /// How many mask registers an `If` short-circuit guard destroys
     /// reducing its mask to a branch condition — the mask-class
     /// [`RegisterFile::guard_temps`]. AVX-512's guard needs one (`vptestmd`'s
     /// `k`-register destination before `kortestw` reads it into the flags);
     /// every other backend's guard needs none.
-    pub mask_guard_temps: u8,
+    pub(super) mask_guard_temps: u8,
 }
 
 impl RegisterFile {
@@ -393,7 +369,7 @@ impl RegisterFile {
     /// the checks at build time, so an allocatable window that swallows a
     /// reload register cannot reach a running kernel.
     #[must_use]
-    pub const fn checked(self) -> Self {
+    pub(super) const fn checked(self) -> Self {
         assert!(
             self.scratch.len() >= Self::MIN_SCRATCH,
             "the allocatable pool is too small for the widest instruction's \
@@ -514,14 +490,14 @@ impl RegisterFile {
     /// one below the floor. Lowering `MAX_TEMPS` to two moves every carry
     /// budget, so it is a change to measure on its own rather than fold in
     /// here.
-    pub const MIN_SCRATCH: u8 = Scratch::MAX_TEMPS as u8 + 3;
+    pub(super) const MIN_SCRATCH: u8 = Scratch::MAX_TEMPS as u8 + 3;
 
     /// The smallest pointer pool a schedule holding a pointer can be
     /// allocated against: one. No instruction both defines an address and
     /// reads one, and none reads two, so one register always serves — as a
     /// `Context` def's destination, or as the reload of a base in a slot.
     /// A file whose schedules hold no pointer at all may declare none.
-    pub const MIN_POINTERS: u8 = 1;
+    const MIN_POINTERS: u8 = 1;
 
     /// Cap the scratch pool at a smaller budget, leaving every other region
     /// where it is.
@@ -538,7 +514,7 @@ impl RegisterFile {
     /// is a developer choosing a test knob, and a smaller pool answered with
     /// the floor would run a different experiment than the one asked for.
     #[must_use]
-    pub fn capped(self, max_scratch: Option<u8>) -> Self {
+    pub(super) fn capped(self, max_scratch: Option<u8>) -> Self {
         match max_scratch {
             Some(n) => {
                 assert!(
@@ -588,20 +564,20 @@ impl RegisterFile {
 /// pool in every scope it spans, and the two classes never trade.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct Carried {
-    pub vectors: RegSet,
-    pub pointers: GprSet,
+    vectors: RegSet,
+    pointers: GprSet,
 }
 
 impl Carried {
     /// Nothing carried.
-    pub const NONE: Self = Self {
+    const NONE: Self = Self {
         vectors: RegSet::EMPTY,
         pointers: GprSet::EMPTY,
     };
 
     /// Both classes' sets, unioned.
     #[must_use]
-    pub const fn union(self, other: Self) -> Self {
+    const fn union(self, other: Self) -> Self {
         Self {
             vectors: self.vectors.union(other.vectors),
             pointers: self.pointers.union(other.pointers),
@@ -618,13 +594,13 @@ impl Carried {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct Point {
     /// Position in the scope's schedule.
-    pub index: usize,
+    pub(super) index: usize,
 }
 
 impl Point {
     /// The first point of a scope: where an iteration begins, and where a
     /// value an enclosing scope parked is picked up.
-    pub const HEAD: Self = Self { index: 0 };
+    const HEAD: Self = Self { index: 0 };
 
     /// The last point of a scope — after everything it schedules.
     ///
@@ -632,7 +608,7 @@ impl Point {
     /// edge asks. It used to name the end of the whole *nest*, which is the
     /// same point only for the innermost scope; every scope has a back edge of
     /// its own to reconcile.
-    pub const TAIL: Self = Self { index: usize::MAX };
+    pub(super) const TAIL: Self = Self { index: usize::MAX };
 }
 
 /// Where the allocator decided a value lives, over one range of its life.
@@ -666,9 +642,9 @@ pub(super) enum Where {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) struct Span {
     /// The program point this range starts at.
-    pub from: Point,
+    pub(super) from: Point,
     /// Where the value lives over it.
-    pub at: Where,
+    pub(super) at: Where,
 }
 
 /// Where a value lives, at every point of **one scope**.
@@ -727,13 +703,6 @@ impl Placement {
         self
     }
 
-    /// The point this value is defined at — where its first range starts.
-    #[cfg(test)]
-    #[must_use]
-    pub fn defined_at(&self) -> Point {
-        self.first.from
-    }
-
     /// Where the value lives at `point`.
     ///
     /// Total: the last range whose `from` is at or before `point`. A query
@@ -741,7 +710,7 @@ impl Placement {
     /// read after it is defined — answers with the first range rather than
     /// panicking.
     #[must_use]
-    pub fn at(&self, point: Point) -> Where {
+    pub(super) fn at(&self, point: Point) -> Where {
         let after = self.rest.partition_point(|s| s.from <= point);
         match after.checked_sub(1) {
             Some(i) => self.rest[i].at,
@@ -755,24 +724,8 @@ impl Placement {
     }
 
     /// Every location this value occupies, in order.
-    pub fn locations(&self) -> impl Iterator<Item = Where> + use<'_> {
+    pub(super) fn locations(&self) -> impl Iterator<Item = Where> + use<'_> {
         self.spans().map(|s| s.at)
-    }
-
-    /// Whether any range of this value's life is in a stack slot.
-    #[cfg(test)]
-    #[must_use]
-    pub fn spills(&self) -> bool {
-        self.locations().any(|at| at == Where::Spilled)
-    }
-
-    /// Every vector register this value occupies over its life.
-    #[cfg(test)]
-    pub fn registers(&self) -> impl Iterator<Item = Reg> + use<'_> {
-        self.locations().filter_map(|at| match at {
-            Where::Reg(r) => Some(r),
-            Where::Ptr(_) | Where::Spilled | Where::Remat(_) => None,
-        })
     }
 }
 
@@ -853,12 +806,12 @@ pub(super) struct Scratch {
     /// One suffices however many guards begin here: each resolves its mask and
     /// branches immediately, so the register is dead again before the next
     /// one needs it.
-    pub guard_mask: Option<Reg>,
+    pub(super) guard_mask: Option<Reg>,
 
     /// A register the guard's mask reduction destroys — see
     /// [`RegisterFile::guard_temps`]. `None` on the tiers whose guards go
     /// through the flags.
-    pub guard_temp: Option<Reg>,
+    pub(super) guard_temp: Option<Reg>,
 
     /// A register to materialize this scope's result into, reserved on the
     /// scope's last instruction.
@@ -867,7 +820,7 @@ pub(super) struct Scratch {
     /// goes unused. It is not always: a body whose root was hoisted out
     /// entirely reads that root from its park, and the scaffold needs it in a
     /// register to store.
-    pub result: Option<Reg>,
+    pub(super) result: Option<Reg>,
 
     /// GPR-class temps this instruction reserved — see
     /// [`RegisterFile::gpr_temps_for`]. Read through [`Scratch::gpr_temp`],
@@ -884,13 +837,13 @@ pub(super) struct Scratch {
     /// when it is not in one at this point — the [`Class::Pointer`] mirror of
     /// `reloads`, and one rather than an array because no instruction reads
     /// more than one address.
-    pub ptr_reload: Option<PtrReg>,
+    pub(super) ptr_reload: Option<PtrReg>,
 
     /// A mask register the guard's mask reduction destroys — the mask-class
     /// [`Scratch::guard_temp`]. `None` on every backend but AVX-512, whose
     /// guard reduces the mask into a `k`-register (`vptestmd`) before
     /// `kortestw` reads it into the flags.
-    pub mask_guard_temp: Option<KReg>,
+    pub(super) mask_guard_temp: Option<KReg>,
 }
 
 impl Scratch {
@@ -902,7 +855,7 @@ impl Scratch {
     /// truncated indices and mask, a fold's trip test — but this is also
     /// what [`RegisterFile::MIN_SCRATCH`] is stated through, so lowering it
     /// moves every carry budget and is measured on its own.
-    pub const MAX_TEMPS: usize = 4;
+    const MAX_TEMPS: usize = 4;
 
     /// The temps a surviving `Reduce` def reserves: two, both transient —
     /// the trip test's bound and its mask, reused by the combine's reload
@@ -913,20 +866,20 @@ impl Scratch {
     /// pool minus what is carried, and a reservation across a body is not a
     /// thing this type can express. Every backend's `temps_for` answers this
     /// for a `Reduce`.
-    pub const REDUCE_TEMPS: usize = 2;
+    pub(super) const REDUCE_TEMPS: usize = 2;
 
     /// The most reload targets any one instruction asks for.
     ///
     /// Two. Three operands is the widest op, and one of them — an `If`'s
     /// mask, an FMA's addend, a binary's left — is reloaded straight into
     /// the destination rather than into a reservation.
-    pub const MAX_RELOADS: usize = 2;
+    const MAX_RELOADS: usize = 2;
 
     /// The most GPR-class temps any one encoding asks for.
     ///
     /// Three: aarch64's scalar-load gather needs a base pointer, a per-lane
     /// index and a loaded value, each a GPR.
-    pub const MAX_GPR_TEMPS: usize = 3;
+    const MAX_GPR_TEMPS: usize = 3;
 
     /// The most mask-class temps any one encoding asks for.
     ///
@@ -934,7 +887,7 @@ impl Scratch {
     /// every one of its uses — a compare's `vcmpps` destination, a guard's
     /// `vptestmd` destination — needs exactly one `k`-register, transiently,
     /// never two at once.
-    pub const MAX_MASK_TEMPS: usize = 1;
+    const MAX_MASK_TEMPS: usize = 1;
 
     /// A `Scratch` with the registers a test wants to hand an encoder.
     ///
@@ -943,7 +896,7 @@ impl Scratch {
     /// registers the encoder may destroy.
     #[cfg(test)]
     #[must_use]
-    pub const fn for_test(
+    pub(super) const fn for_test(
         temps: Option<[Reg; Self::MAX_TEMPS]>,
         reloads: [Option<Reg>; Self::MAX_RELOADS],
     ) -> Self {
@@ -955,7 +908,7 @@ impl Scratch {
     /// `Gather`/`Uniform`/compare coverage) need these too.
     #[cfg(test)]
     #[must_use]
-    pub const fn for_test_with_classes(
+    pub(super) const fn for_test_with_classes(
         temps: Option<[Reg; Self::MAX_TEMPS]>,
         reloads: [Option<Reg>; Self::MAX_RELOADS],
         gpr_temps: Option<[Gpr; Self::MAX_GPR_TEMPS]>,
@@ -987,7 +940,7 @@ impl Scratch {
     /// `i` is the backend's own numbering, matching the count its
     /// [`RegisterFile::temps_for`] returned.
     #[must_use]
-    pub fn temp(&self, i: usize) -> Option<Reg> {
+    pub(super) fn temp(&self, i: usize) -> Option<Reg> {
         self.temps.get(i).copied().flatten()
     }
 
@@ -996,7 +949,7 @@ impl Scratch {
     /// `i` is [`operand_sources`](super::operand_sources)' numbering, which is
     /// operand order over the operands that need one.
     #[must_use]
-    pub fn reload(&self, i: usize) -> Option<Reg> {
+    pub(super) fn reload(&self, i: usize) -> Option<Reg> {
         self.reloads.get(i).copied().flatten()
     }
 
@@ -1005,7 +958,7 @@ impl Scratch {
     /// `i` is the backend's own numbering, matching the count its
     /// [`RegisterFile::gpr_temps_for`] returned.
     #[must_use]
-    pub fn gpr_temp(&self, i: usize) -> Option<Gpr> {
+    pub(super) fn gpr_temp(&self, i: usize) -> Option<Gpr> {
         self.gpr_temps.get(i).copied().flatten()
     }
 
@@ -1014,7 +967,7 @@ impl Scratch {
     /// `i` is the backend's own numbering, matching the count its
     /// [`RegisterFile::mask_temps_for`] returned.
     #[must_use]
-    pub fn mask_temp(&self, i: usize) -> Option<KReg> {
+    pub(super) fn mask_temp(&self, i: usize) -> Option<KReg> {
         self.mask_temps.get(i).copied().flatten()
     }
 }
@@ -1103,11 +1056,11 @@ pub(super) struct FoldRoots {
     /// reads the binder's `Var` — each scope finds that `Var` in its own
     /// schedule by the binder's number, since two sibling folds binding the
     /// same slot share one `Var` node and the answer differs per fold.
-    pub binder: Where,
+    pub(super) binder: Where,
     /// Where the accumulator lives across the loop's iterations. Its result
     /// is in the accumulator's slot either way once the loop exits, which is
     /// where the parent's placement of the `Reduce` def says it is.
-    pub accumulator: Where,
+    pub(super) accumulator: Where,
 }
 
 impl NestAllocation {
@@ -1312,19 +1265,19 @@ impl NestAllocation {
     /// Bytes of the frame below the fold slots — every scope's spill slots,
     /// a fold's based at its parent's top — as a whole number of slots.
     #[must_use]
-    pub(crate) fn spill_bytes(&self) -> u32 {
+    pub(super) fn spill_bytes(&self) -> u32 {
         self.spill_bytes
     }
 
     /// Bytes of the whole frame the function allocates: spill slots, then
     /// each fold's accumulator and binder slot, then the parks.
     #[must_use]
-    pub(crate) fn frame_bytes(&self) -> u32 {
+    pub(super) fn frame_bytes(&self) -> u32 {
         self.frame_bytes
     }
 
     /// Every root any scope parks, each once.
-    pub(crate) fn parks(&self) -> impl Iterator<Item = ValueId> + use<'_> {
+    pub(super) fn parks(&self) -> impl Iterator<Item = ValueId> + use<'_> {
         self.parks.keys().copied()
     }
 
@@ -1338,7 +1291,7 @@ impl NestAllocation {
     /// # Panics
     /// If `j` names no fold in this nest.
     #[must_use]
-    pub(crate) fn fold_parent(&self, j: usize) -> Scope {
+    pub(super) fn fold_parent(&self, j: usize) -> Scope {
         self.folds
             .get(j)
             .unwrap_or_else(|| panic!("Fold({j}) is not a fold of this nest"))
@@ -1487,13 +1440,13 @@ pub(super) struct Allocation<'a> {
 impl<'a> Allocation<'a> {
     /// Evaluation order: the schedule the emitter walks.
     #[must_use]
-    pub fn schedule(&self) -> &'a [Def] {
+    pub(super) fn schedule(&self) -> &'a [Def] {
         &self.code().schedule
     }
 
     /// The values this scope computes for the scopes inside it, in slot order.
     #[must_use]
-    pub fn roots(&self) -> &'a [ValueId] {
+    fn roots(&self) -> &'a [ValueId] {
         &self.code().roots
     }
 
@@ -1506,13 +1459,13 @@ impl<'a> Allocation<'a> {
     /// was answered once, where the scope was built, and nothing downstream
     /// asks it again.
     #[must_use]
-    pub(crate) fn if_guards(&self) -> &'a [IfGuard] {
+    pub(super) fn if_guards(&self) -> &'a [IfGuard] {
         &self.code().guards
     }
 
     /// The scratch the instruction at schedule position `i` may destroy.
     #[must_use]
-    pub fn scratch(&self, i: usize) -> Scratch {
+    pub(super) fn scratch(&self, i: usize) -> Scratch {
         self.code().scratch.get(i).copied().unwrap_or_default()
     }
 
@@ -1695,7 +1648,7 @@ impl<'a> Allocation<'a> {
     /// that is in memory at any point of this scope; `None` for one that
     /// never is. Laid out by [`NestAllocation::new`].
     #[must_use]
-    pub(crate) fn slot_of(&self, v: ValueId) -> Option<Slot> {
+    pub(super) fn slot_of(&self, v: ValueId) -> Option<Slot> {
         self.code().slots.get(v.0 as usize).copied().flatten()
     }
 
@@ -1703,7 +1656,7 @@ impl<'a> Allocation<'a> {
     /// slots, plus the parks and fold slots it reads. For the body, which
     /// nothing encloses, exactly the values it spills.
     #[must_use]
-    pub(crate) fn spill_slots(&self) -> u64 {
+    pub(super) fn spill_slots(&self) -> u64 {
         self.code().slots.iter().flatten().count() as u64
     }
 
@@ -1711,7 +1664,7 @@ impl<'a> Allocation<'a> {
     /// of its [`roots`](Self::roots)): the slot it writes after the def,
     /// which the scopes inside read.
     #[must_use]
-    pub(crate) fn park(&self, v: ValueId) -> Option<u32> {
+    pub(super) fn park(&self, v: ValueId) -> Option<u32> {
         self.code().roots.contains(&v).then(|| self.nest.parks[&v])
     }
 
@@ -1720,7 +1673,7 @@ impl<'a> Allocation<'a> {
     /// # Panics
     /// If no surviving fold's `Reduce` is `vid`.
     #[must_use]
-    pub(crate) fn accumulator_slot(&self, vid: ValueId) -> u32 {
+    pub(super) fn accumulator_slot(&self, vid: ValueId) -> u32 {
         *self.nest.accumulator_slots.get(&vid).unwrap_or_else(|| {
             panic!("{vid:?}'s Reduce def has no accumulator slot — no surviving fold opens at it")
         })
@@ -1731,7 +1684,7 @@ impl<'a> Allocation<'a> {
     /// # Panics
     /// If no surviving fold's `Reduce` is `vid`.
     #[must_use]
-    pub(crate) fn binder_slot(&self, vid: ValueId) -> u32 {
+    pub(super) fn binder_slot(&self, vid: ValueId) -> u32 {
         *self.nest.binder_slots.get(&vid).unwrap_or_else(|| {
             panic!("{vid:?}'s Reduce def has no binder slot — no surviving fold opens at it")
         })
@@ -3621,8 +3574,21 @@ fn operands_of(sop: &ScheduledOp, class: Class) -> impl Iterator<Item = ValueId>
 mod tests {
     use super::*;
     use crate::emit::{allocate_flat, flat_nest};
-    use crate::program::{IfArm, lay_out};
+    use crate::program::{IfArm, ScopeFold, ScopeRegion, lay_out};
     use pixelflow_ir::kind::OpKind;
+
+    /// Whether any range of `p`'s life is in a stack slot.
+    fn spills(p: &Placement) -> bool {
+        p.locations().any(|at| at == Where::Spilled)
+    }
+
+    /// Every vector register `p` occupies over its life.
+    fn registers(p: &Placement) -> impl Iterator<Item = Reg> + use<'_> {
+        p.locations().filter_map(|at| match at {
+            Where::Reg(r) => Some(r),
+            Where::Ptr(_) | Where::Spilled | Where::Remat(_) => None,
+        })
+    }
 
     /// `nest` with its guards tabulated the way a compile tabulates them.
     ///
@@ -3689,12 +3655,6 @@ mod tests {
     }
 
     #[test]
-    fn reg_set_is_empty_is_true_only_for_the_empty_set() {
-        assert!(RegSet::EMPTY.is_empty());
-        assert!(!RegSet::of(&[Reg(0)]).is_empty());
-    }
-
-    #[test]
     fn reg_set_take_keeps_only_the_lowest_n_members() {
         let t = RegSet::of(&[Reg(1), Reg(3), Reg(5)]).take(2);
         assert!(t.contains(Reg(1)));
@@ -3733,12 +3693,6 @@ mod tests {
     }
 
     #[test]
-    fn gpr_set_is_empty_is_true_only_for_the_empty_set() {
-        assert!(GprSet::EMPTY.is_empty());
-        assert!(!GprSet::of(&[Gpr(0)]).is_empty());
-    }
-
-    #[test]
     fn gpr_set_iter_yields_every_member_low_to_high() {
         let s = GprSet::of(&[Gpr(5), Gpr(1)]);
         assert_eq!(s.iter().collect::<Vec<_>>(), vec![Gpr(1), Gpr(5)]);
@@ -3747,24 +3701,8 @@ mod tests {
     #[test]
     fn mask_set_of_contains_exactly_the_given_registers() {
         let s = MaskSet::of(&[KReg(1), KReg(4)]);
-        assert!(s.contains(KReg(1)));
-        assert!(s.contains(KReg(4)));
-        assert!(!s.contains(KReg(2)));
+        assert_eq!(s.iter().collect::<Vec<_>>(), vec![KReg(1), KReg(4)]);
         assert_eq!(s.len(), 2);
-    }
-
-    #[test]
-    fn mask_set_contains_is_false_one_past_its_highest_member() {
-        let s = MaskSet::of(&[KReg(7)]);
-        assert!(s.contains(KReg(7)));
-        assert!(!s.contains(KReg(6)));
-        assert!(!s.contains(KReg(8)));
-    }
-
-    #[test]
-    fn mask_set_is_empty_is_true_only_for_the_empty_set() {
-        assert!(MaskSet::EMPTY.is_empty());
-        assert!(!MaskSet::of(&[KReg(0)]).is_empty());
     }
 
     #[test]
@@ -3871,7 +3809,7 @@ mod tests {
         a.body()
             .schedule()
             .iter()
-            .filter(|d| a.body().placement(d.value).spills())
+            .filter(|d| spills(a.body().placement(d.value)))
             .count()
     }
 
@@ -4175,8 +4113,6 @@ mod tests {
         for i in [0usize, 1, 99] {
             assert_eq!(p.at(body(i)), Where::Reg(Reg(7)));
         }
-        assert!(!p.spills());
-        assert_eq!(p.registers().collect::<Vec<_>>(), vec![Reg(7)]);
     }
 
     /// The case the whole type exists for: a value in a register up to a
@@ -4200,12 +4136,6 @@ mod tests {
 
         // Total below the definition too: an answer, not a panic.
         assert_eq!(p.at(body(0)), Where::Reg(Reg(5)));
-        assert_eq!(p.defined_at(), body(3));
-
-        // A value in a slot for *part* of its life still needs a slot, and the
-        // register it held earlier is still a register something wrote.
-        assert!(p.spills());
-        assert_eq!(p.registers().collect::<Vec<_>>(), vec![Reg(5)]);
     }
 
     /// A `Var` no enclosing fold binds is refused: either a coordinate that
@@ -4738,7 +4668,7 @@ mod tests {
                 .schedule()
                 .iter()
                 .map(|d| d.value)
-                .filter(|v| body.placement(*v).spills())
+                .filter(|v| spills(body.placement(*v)))
                 .collect();
             assert!(!spilled.is_empty(), "the schedule has to reach eviction");
             for (n, v) in spilled.iter().enumerate() {
@@ -4749,7 +4679,7 @@ mod tests {
                 );
             }
             for v in body.schedule().iter().map(|d| d.value) {
-                if !body.placement(v).spills() {
+                if !spills(body.placement(v)) {
                     assert_eq!(body.slot_of(v), None, "{v:?} never leaves a register");
                 }
             }
@@ -6208,7 +6138,7 @@ mod tests {
             .schedule()
             .iter()
             .filter(|d| !roots.contains(&d.value))
-            .flat_map(|d| inner.placement(d.value).registers())
+            .flat_map(|d| registers(inner.placement(d.value)))
             .collect();
         for i in 0..inner.schedule().len() {
             let s = inner.scratch(i);

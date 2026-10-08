@@ -10,38 +10,23 @@
 //! lanes are folds the kernel was wrapped in before it was scheduled
 //! (docs/plans/2026-09-16-collapse-is-a-fold.md).
 
-use crate::emit::executable::ExecutableCode;
-use crate::emit::traffic::BranchTraffic;
-use pixelflow_ir::LatticeShape;
+use crate::emit::ExecutableCode;
 
 /// One kernel's emitted code, at one lattice shape. Owns the executable
 /// memory; no cache — the caller decides its lifetime.
 pub struct CompiledKernel {
     code: ExecutableCode,
-    branches: BranchTraffic,
-    shape: LatticeShape,
 }
 
 impl CompiledKernel {
-    /// Wrap newly compiled executable code into a `CompiledKernel` for a
-    /// lattice of `shape`.
+    /// Wrap newly compiled executable code into a `CompiledKernel`.
     ///
-    /// The shape is what the code *is*: its loop bounds are the extent, so a
-    /// call fills exactly `shape` samples and nothing about that is decided
-    /// at the call.
+    /// The lattice shape is what the code *is*: its loop bounds are the
+    /// extent it was compiled at, so a call fills exactly that many samples
+    /// and nothing about that is decided at the call.
     #[must_use]
-    pub const fn new(code: ExecutableCode, branches: BranchTraffic, shape: LatticeShape) -> Self {
-        Self {
-            code,
-            branches,
-            shape,
-        }
-    }
-
-    /// The lattice this kernel was compiled for.
-    #[must_use]
-    pub const fn shape(&self) -> LatticeShape {
-        self.shape
+    pub(super) const fn new(code: ExecutableCode) -> Self {
+        Self { code }
     }
 
     /// The emitted machine code, for offline inspection (disassembly,
@@ -49,15 +34,6 @@ impl CompiledKernel {
     #[must_use]
     pub fn code_bytes(&self) -> &[u8] {
         self.code.as_bytes()
-    }
-
-    /// The `If` branches the code was emitted with — structure no pixel can
-    /// show, since a guarded `If` and a blended one compute the same
-    /// samples. Inspection only, like [`code_bytes`](Self::code_bytes): it is
-    /// what a test reads to fail on a kernel that lost an arm's branch.
-    #[must_use]
-    pub const fn branches(&self) -> BranchTraffic {
-        self.branches
     }
 
     /// Collapse: fill every sample of the shape this kernel was compiled at,
@@ -70,7 +46,7 @@ impl CompiledKernel {
     ///   (read only when the arena declares a uniform) and then the origin
     ///   block's — two `f32`s, `x0` then `y0`.
     /// - `out` must be writable for `(height - 1) * pitch + width` elements,
-    ///   `[width, height]` being [`shape`](Self::shape)'s extent.
+    ///   `[width, height]` being the extent the kernel was compiled at.
     #[inline(always)]
     pub unsafe fn call(&self, ctx: *const *const f32, out: *mut f32, pitch: usize) {
         // SAFETY: delegated to `ExecutableCode`, which invokes the emitted
