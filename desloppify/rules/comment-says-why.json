@@ -1,10 +1,23 @@
 {
-  "level": 1,
-  "scope": "functions",
+  "unit": "functions",
+  "levels": {
+    "decide": 1,
+    "explain": 2
+  },
   "exclude": [
+    "**/*_tests.rs",
     "**/benches/**",
     "**/examples/**",
+    "**/tests.rs",
     "**/tests/**"
   ],
-  "prompt": "Flag `//` comments that say what the code does instead of why it is the way it is: comments restating the next line, step narration (\"Step 1:\", \"Now we...\", \"Here we...\"), history (\"previously\", \"changed to\", \"updated to\", \"no longer\"), and commented-out code. Where a 'what' comment covers a block that would be clearer as a named helper, say so: the comment is that helper's rustdoc. Do not flag rustdoc (`///`, `//!`), SAFETY comments, or comments explaining a non-obvious reason, trade-off, or workaround."
+  "question": "Do this function's `//` comments say what the code does, narrate it, or record its history, instead of why it is the way it is?",
+  "fine": {
+    "says_why": "Every `//` comment explains a reason, trade-off, workaround or non-obvious invariant — or there are none. Rustdoc (`///`, `//!`) and SAFETY comments don't count."
+  },
+  "violations": {
+    "says_what": "A comment restates the code, narrates steps (\"Step 1:\", \"Now we...\", \"Here we...\"), or covers a block that would be clearer as a named helper.",
+    "history": "A comment records history (\"previously\", \"changed to\", \"updated to\", \"no longer\") or keeps commented-out code."
+  },
+  "guidance": "Where a 'what' comment covers a block, name the helper it should become: the comment is that helper's rustdoc."
 }

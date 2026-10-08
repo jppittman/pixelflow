@@ -1,6 +1,9 @@
 {
-  "level": 2,
-  "scope": "functions",
+  "unit": "functions",
+  "levels": {
+    "decide": 1,
+    "explain": 2
+  },
   "paths": [
     "pixelflow-ir/**",
     "pixelflow-codegen/**",
@@ -8,9 +11,19 @@
     "pixelflow-compiler/**"
   ],
   "exclude": [
+    "**/*_tests.rs",
     "**/benches/**",
     "**/examples/**",
+    "**/tests.rs",
     "**/tests/**"
   ],
-  "prompt": "Flag hand-rolled expansions worse than an instruction the targets already have (`(x + 0.5).floor()` for round, `1/sqrt(x)` where rsqrt is meant, a compare-and-select emulating min/max), and hot-path instructions spent making an op match scalar IEEE behavior on edge cases \u2014 this codebase deliberately takes whatever the hardware instruction does (NaN handling, signed zeros, rounding ties) and does not promise scalar Rust's answer. Also flag a function returning a clamped value outside its documented domain where the contract is to return NaN: precision may be traded for speed, range never is."
+  "question": "Does this function hand-roll what a hardware instruction already does, spend instructions matching scalar IEEE edge cases, or clamp where its contract is NaN?",
+  "fine": {
+    "takes_the_instruction": "It uses the instructions the targets have and takes their edge-case behavior — or it computes nothing of the kind."
+  },
+  "violations": {
+    "worse_expansion": "A hand-rolled expansion worse than an instruction the targets have: `(x + 0.5).floor()` for round, `1/sqrt(x)` where rsqrt is meant, a compare-and-select emulating min/max.",
+    "conformance_tax": "Hot-path instructions spent making an op match scalar Rust's NaN, signed-zero or rounding-tie behavior, which this codebase deliberately does not promise.",
+    "clamped_range": "A value clamped into range outside the function's documented domain where the contract is to return NaN: precision may be traded for speed, range never is."
+  }
 }

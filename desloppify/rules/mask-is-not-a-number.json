@@ -1,6 +1,9 @@
 {
-  "level": 2,
-  "scope": "functions",
+  "unit": "functions",
+  "levels": {
+    "decide": 1,
+    "explain": 2
+  },
   "paths": [
     "pixelflow-ir/**",
     "pixelflow-codegen/**",
@@ -8,9 +11,18 @@
     "pixelflow-compiler/**"
   ],
   "exclude": [
+    "**/*_tests.rs",
     "**/benches/**",
     "**/examples/**",
+    "**/tests.rs",
     "**/tests/**"
   ],
-  "prompt": "Flag code that treats a comparison result or mask as a number: a true mask spelled `1.0` (or any constant other than via `OpKind::mask`), arithmetic on a mask, a bitwise-domain result passed through a numeric fold or a finiteness check that would read all-ones as NaN. Also flag constant folding of an op whose result differs by target (Min/Max with NaN or signed zeros, Gt/Ge with NaN, Round ties, Recip/Rsqrt, TruncToInt out of range, out-of-range shifts) at build time."
+  "question": "Does this function treat a comparison result or mask as a number, or constant-fold an op whose result differs by target?",
+  "fine": {
+    "masks_are_masks": "Masks are only built by `OpKind::mask` and only combined bitwise, and no target-dependent op is folded — or the function handles neither."
+  },
+  "violations": {
+    "mask_as_number": "A true mask spelled `1.0` or another constant, arithmetic on a mask, or a bitwise-domain result passed through a numeric fold or a finiteness check that reads all-ones as NaN.",
+    "folds_target_dependent_op": "A build-time fold of an op whose result differs by target: Min/Max with NaN or signed zeros, Gt/Ge with NaN, Round ties, Recip/Rsqrt, TruncToInt out of range, out-of-range shifts."
+  }
 }

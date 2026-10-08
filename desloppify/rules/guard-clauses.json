@@ -1,10 +1,24 @@
 {
-  "level": 1,
-  "scope": "functions",
+  "unit": "functions",
+  "levels": {
+    "decide": 1,
+    "explain": 2
+  },
   "exclude": [
+    "**/*_tests.rs",
     "**/benches/**",
     "**/examples/**",
+    "**/tests.rs",
     "**/tests/**"
   ],
-  "prompt": "Read each function top to bottom and track the cases still open: inputs not yet handled, invariants not yet checked. That number should only go down as you read: the top is the hardest part, where everything is still possible, each guard discharges one case and exits, and at the bottom one case is left and what to do is obvious. Flag functions where it doesn't: the main path indented inside the happy branch of an `if`/`if let`/`match` whose other branch only bails out; an `else` after a branch that already returns, breaks or continues; `if let Some(x) = ... { ... } else { return }` that `let ... else` or `?` would flatten; a check made late that could be made first; and cases reopened after being handled (a value re-checked further down). Report the line where the case should have been discharged and how. Do not flag a single shallow `if`, or a `match` whose arms are all real work."
+  "question": "Reading this function top to bottom, does the number of open cases — inputs not yet handled, invariants not yet checked — only go down?",
+  "fine": {
+    "cases_go_down": "Each case is discharged by a guard that exits, and by the bottom one case is left and the main path is flat — or the function is straight-line."
+  },
+  "violations": {
+    "nested_main_path": "The main path is indented inside a branch whose other arm only bails out, or an `if let ... else { return }` that `let ... else` or `?` would flatten.",
+    "else_after_exit": "An `else` follows a branch that already returns, breaks or continues.",
+    "late_check": "A check that could be made first is made late, or a case already handled is reopened further down."
+  },
+  "guidance": "Name the line where the case should be discharged, and how."
 }

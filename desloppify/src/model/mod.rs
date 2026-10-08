@@ -33,6 +33,19 @@ impl TryFrom<u64> for ModelLevel {
     }
 }
 
+impl ModelLevel {
+    /// The next level up; `None` at the top.
+    #[must_use]
+    pub(crate) fn above(self) -> Option<Self> {
+        match self {
+            Self::Lite => Some(Self::Fast),
+            Self::Fast => Some(Self::Strong),
+            Self::Strong => Some(Self::Frontier),
+            Self::Frontier => None,
+        }
+    }
+}
+
 impl From<ModelLevel> for u64 {
     fn from(level: ModelLevel) -> Self {
         level as u64
@@ -49,7 +62,7 @@ pub enum Provider {
 impl Provider {
     /// The model this provider uses for `level`.
     #[must_use]
-    pub fn model(self, level: ModelLevel) -> &'static str {
+    pub(crate) fn model(self, level: ModelLevel) -> &'static str {
         match (self, level) {
             (Self::Anthropic, ModelLevel::Lite) => "claude-haiku-4-5",
             (Self::Anthropic, ModelLevel::Fast) => "claude-sonnet-5-5",

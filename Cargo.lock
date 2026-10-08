@@ -618,6 +618,8 @@ dependencies = [
  "clap",
  "globset",
  "http",
+ "httparse",
+ "reqwest",
  "rig-core",
  "schemars",
  "serde",

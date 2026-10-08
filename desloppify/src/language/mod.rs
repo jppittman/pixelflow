@@ -2,12 +2,9 @@
 
 use std::path::Path;
 
-use serde::Deserialize;
-
 use crate::rule::Part;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Language {
     Rust,
 }
@@ -40,22 +37,18 @@ impl Language {
             (Self::Rust, Part::FunctionSignatures) => {
                 Some("[(function_item body: (_) @cut) (function_signature_item)] @target")
             }
-            (Self::Rust, Part::FunctionNames) => Some("(function_item name: (identifier) @target)"),
-            (Self::Rust, Part::FunctionBodies) => Some("(function_item body: (block) @target)"),
             (Self::Rust, Part::Types) => {
                 Some("[(struct_item) (enum_item) (union_item) (trait_item) (type_item)] @target")
             }
-            (Self::Rust, Part::Comments) => Some("[(line_comment) (block_comment)] @target"),
         }
     }
 
-    /// The node kinds that are a function in this language: what a
-    /// [`Review::Function`](crate::rule::Review::Function) capture is shown
-    /// inside.
+    /// The tree-sitter query whose `@target` captures are the function
+    /// bodies an outline elides.
     #[must_use]
-    pub fn function_kinds(self) -> &'static [&'static str] {
+    pub fn bodies(self) -> &'static str {
         match self {
-            Self::Rust => &["function_item"],
+            Self::Rust => "(function_item body: (_) @target)",
         }
     }
 

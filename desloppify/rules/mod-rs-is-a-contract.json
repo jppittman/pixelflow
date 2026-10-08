@@ -1,19 +1,33 @@
 {
-  "level": 3,
-  "scope": "file",
+  "unit": "file",
+  "levels": {
+    "decide": 2,
+    "explain": 3
+  },
   "paths": [
     "**/mod.rs",
     "**/lib.rs"
   ],
   "exclude": [
-    "**/tests/**",
+    "**/*_tests.rs",
     "**/benches/**",
     "**/examples/**",
     "**/tests.rs",
-    "**/*_tests.rs"
+    "**/tests/**"
   ],
   "skills": [
     "behavioral-contracts"
   ],
-  "prompt": "This is a module root. It should read as the module's contract. Flag: algorithm bodies or logic beyond constructors and trivial delegation (they belong in implementation files); public behavior offered as free functions or inherent methods with no trait stating its shape \u2014 a real trait, or, for a single implementation, a trait shape in the module docs (an `ignore` code block declaring the trait and naming the type that implements it); a documented shape that disagrees with the type's actual public methods (one missing, one extra, a signature that differs); traits whose rustdoc does not state what they denote, their preconditions, postconditions and guarantees precisely enough to write a test from (flag vague words: \"handles\", \"may\", \"for example\", \"etc.\", \"if something goes wrong\"); signatures looser than their contract (an `Option`/`Result` whose failure cases the doc doesn't enumerate, `bool` flags, `&mut self` on a query, several entry points where one closed input enum would make the contract total); and a missing module doc where the module has a lifecycle or topology a caller must know. For each, say what the tighter version is."
+  "question": "Does this module root read as the module's contract?",
+  "fine": {
+    "contract": "It declares traits — or, for a single implementation, a trait shape in its module docs — with testable contracts, the types they mention, constructors, `pub use`, and a module doc where a caller needs one, and holds no algorithm bodies."
+  },
+  "violations": {
+    "implementation_in_root": "Algorithm bodies or logic beyond constructors and trivial delegation.",
+    "behavior_without_shape": "Public behavior offered as free functions or inherent methods with no trait or documented trait shape stating it.",
+    "shape_drift": "A documented trait shape that disagrees with the type's actual public methods: one missing, one extra, a signature that differs.",
+    "vague_contract": "A trait's rustdoc does not state what it denotes, its preconditions, postconditions and guarantees precisely enough to test (\"handles\", \"may\", \"for example\"), or a module with a lifecycle or topology has no module doc.",
+    "loose_signature": "A signature looser than its contract: an `Option`/`Result` whose failures the doc doesn't enumerate, a `bool` flag, `&mut self` on a query, several entry points where one closed input enum would make the contract total."
+  },
+  "guidance": "For each, say what the tighter version is."
 }

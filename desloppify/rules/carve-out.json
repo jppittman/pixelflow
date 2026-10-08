@@ -1,0 +1,26 @@
+{
+  "unit": "functions",
+  "levels": {
+    "decide": 1,
+    "explain": 2
+  },
+  "exclude": [
+    "**/tests/**",
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests.rs",
+    "**/*_tests.rs"
+  ],
+  "skills": [
+    "ontology"
+  ],
+  "question": "Does this function carve out a special case — a branch, flag, sentinel or match arm that handles one kind of input apart — where a deeper model of the thing would make that input an ordinary case?",
+  "fine": {
+    "real_distinction": "Every branch separates things that are genuinely different in the domain, each handled as what it is; or the function does not branch beyond guard clauses."
+  },
+  "violations": {
+    "carve_out": "A branch exists because the general path cannot take one input or construct: `if is_reduce`, `unreachable!(\"… must special-case it\")`, a sentinel value, a flag or Option field for one caller, an \"edge case\" or \"special case\" comment. A model in which that input is an instance of the general case would delete the branch.",
+    "exception_to_a_rule": "The code or its comment states a principle and an exception to it (\"never X, except here\"), or reserves something by convention for one purpose."
+  },
+  "guidance": "Name the deeper model: say what the carved-out case IS, as an instance of the general one (\"a loop header is a label\", \"a temp is a value\", \"the pool base is a value\"), and what deleting the branch would take. Where the ontology defines the term, use its definition."
+}

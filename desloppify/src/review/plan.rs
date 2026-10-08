@@ -7,19 +7,90 @@ use anyhow::{Context, Result};
 
 use super::{Call, Source};
 use crate::language::Language;
-use crate::rule::{Review, Rule, Scope, Surroundings};
-use crate::snippet::{Snippet, snippets};
+use crate::rule::{Group, Part, Rule, Surroundings, Unit};
+use crate::snippet::{Snippet, outline, snippets};
 
 /// File names that make a file its directory's module root.
-const ROOT_FILES: [&str; 3] = ["mod.rs", "lib.rs", "main.rs"];
+pub(super) const ROOT_FILES: [&str; 3] = ["mod.rs", "lib.rs", "main.rs"];
 
-/// The root file of the module `path` belongs to, unless `path` is one.
+/// What makes two rules' calls about a file the same calls.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Seen {
+    File,
+    Outline,
+    Parts(Part, Group),
+}
+
+fn seen(rule: &Rule) -> Seen {
+    match &rule.unit {
+        Unit::File => Seen::File,
+        Unit::Outline => Seen::Outline,
+        Unit::Parts { part, group, .. } => Seen::Parts(*part, *group),
+    }
+}
+
+pub(super) fn plan(rules: &[Rule], files: &[PathBuf]) -> Result<Vec<Call>> {
+    let mut calls = Vec::new();
+    // Crate-wide rules gather each file's parts here, keyed by rule and
+    // crate, and become one call per crate once every file is read.
+    let mut crates: BTreeMap<(usize, PathBuf), Vec<(PathBuf, Snippet)>> = BTreeMap::new();
+    for path in files {
+        let Some(language) = Language::of(path) else {
+            continue;
+        };
+        let source =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut shared: BTreeMap<(Seen, Surroundings), Vec<usize>> = BTreeMap::new();
+        for (index, rule) in rules.iter().enumerate() {
+            if rule.files.contains(path) {
+                shared
+                    .entry((seen(rule), rule.context))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        for ((seen, context), indexes) in shared {
+            let snippets = snippets(&rules[indexes[0]], language, &source)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            if snippets.is_empty() {
+                continue;
+            }
+            if let Seen::Parts(_, Group::Crate) = seen {
+                for &index in &indexes {
+                    let gathered = crates.entry((index, crate_of(path))).or_default();
+                    gathered.extend(snippets.iter().cloned().map(|s| (path.clone(), s)));
+                }
+                continue;
+            }
+            let root = match context {
+                Surroundings::None => None,
+                Surroundings::ModuleRoot => module_root(path)?,
+            };
+            calls.extend(snippets.into_iter().map(|snippet| Call {
+                rules: indexes.clone(),
+                path: path.clone(),
+                snippet,
+                root: root.clone(),
+            }));
+        }
+    }
+    calls.extend(crates.into_iter().map(|((rule, krate), files)| Call {
+        rules: vec![rule],
+        path: krate,
+        snippet: under_headers(files),
+        root: None,
+    }));
+    Ok(calls)
+}
+
+/// The outline of the root file of the module `path` belongs to, unless
+/// `path` is one.
 fn module_root(path: &Path) -> Result<Option<Source>> {
-    if path
+    let is_root = path
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| ROOT_FILES.contains(&n))
-    {
+        .is_some_and(|n| ROOT_FILES.contains(&n));
+    if is_root {
         return Ok(None);
     }
     let Some(dir) = path.parent() else {
@@ -31,70 +102,22 @@ fn module_root(path: &Path) -> Result<Option<Source>> {
         .map(|name| dir.join(name))
         .chain(std::iter::once(dir.with_extension("rs")));
     for root in candidates {
-        if root.is_file() {
-            let text = std::fs::read_to_string(&root)
-                .with_context(|| format!("reading {}", root.display()))?;
-            return Ok(Some(Source { path: root, text }));
+        if !root.is_file() {
+            continue;
         }
-    }
-    Ok(None)
-}
-
-pub(super) fn plan(rules: &[Rule], files: &[PathBuf]) -> Result<Vec<Call>> {
-    let mut calls = Vec::new();
-    // Crate-wide rules gather each file's captures here, keyed by rule and
-    // crate, and become one call per crate once every file is read.
-    let mut crates: BTreeMap<(usize, PathBuf), Vec<(PathBuf, Snippet)>> = BTreeMap::new();
-    for path in files {
-        let Some(language) = Language::of(path) else {
+        let text = std::fs::read_to_string(&root)
+            .with_context(|| format!("reading {}", root.display()))?;
+        let Some(language) = Language::of(&root) else {
             continue;
         };
-        let source =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        for (index, rule) in rules
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.files.contains(path))
-        {
-            let snippets = snippets(rule, language, &source)
-                .with_context(|| format!("parsing {}", path.display()))?;
-            if snippets.is_empty() {
-                continue;
-            }
-            if is_crate_wide(rule) {
-                let gathered = crates.entry((index, crate_of(path))).or_default();
-                gathered.extend(snippets.into_iter().map(|s| (path.clone(), s)));
-                continue;
-            }
-            let root = match rule.context {
-                Surroundings::None => None,
-                Surroundings::ModuleRoot => module_root(path)?,
-            };
-            calls.extend(snippets.into_iter().map(|snippet| Call {
-                rule: index,
-                path: path.clone(),
-                snippet,
-                root: root.clone(),
-            }));
-        }
+        let outline =
+            outline(language, &text).with_context(|| format!("parsing {}", root.display()))?;
+        return Ok(Some(Source {
+            path: root,
+            text: outline.numbered,
+        }));
     }
-    calls.extend(crates.into_iter().map(|((rule, krate), files)| Call {
-        rule,
-        path: krate,
-        snippet: under_headers(files),
-        root: None,
-    }));
-    Ok(calls)
-}
-
-fn is_crate_wide(rule: &Rule) -> bool {
-    matches!(
-        rule.scope,
-        Scope::Captures {
-            review: Review::Crate,
-            ..
-        }
-    )
+    Ok(None)
 }
 
 /// The directory of the nearest `Cargo.toml` above `path`; the current

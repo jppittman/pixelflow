@@ -1,8 +1,23 @@
 {
-  "level": 1,
-  "scope": {
-    "language": "rust",
-    "query": "(function_item parameters: (parameters (parameter type: (primitive_type) @type (#eq? @type \"bool\")))) @target"
+  "unit": "function_signatures",
+  "group": "file",
+  "levels": {
+    "decide": 1,
+    "explain": 1
   },
-  "prompt": "Flag a `bool` parameter that selects between two behaviors. Suggest an enum or two functions. Do not flag a `bool` that is data (a field value being set, a flag being stored)."
+  "exclude": [
+    "**/*_tests.rs",
+    "**/benches/**",
+    "**/examples/**",
+    "**/tests.rs",
+    "**/tests/**"
+  ],
+  "question": "Does any function here take a `bool` parameter that selects between two behaviors?",
+  "fine": {
+    "no_mode_flags": "No `bool` parameter, or every one is data being stored or set rather than a switch between behaviors."
+  },
+  "violations": {
+    "mode_flag": "A `bool` parameter chooses which of two behaviors the function performs, so a call like `f(true)` says nothing at the call site."
+  },
+  "guidance": "For each, suggest the enum or the two functions that replace it."
 }

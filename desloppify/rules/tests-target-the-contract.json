@@ -1,6 +1,9 @@
 {
-  "level": 2,
-  "scope": "file",
+  "unit": "file",
+  "levels": {
+    "decide": 1,
+    "explain": 2
+  },
   "paths": [
     "**/tests/**",
     "**/benches/**",
@@ -8,9 +11,17 @@
     "**/tests.rs",
     "**/*_tests.rs"
   ],
-  "context": "module_root",
   "skills": [
     "behavioral-contracts"
   ],
-  "prompt": "These are tests. Every test must be black-box: it may only drive the module's exported interface and observe what that interface returns, even when the behavior it checks is internal. Flag any test that reaches past it: touching `pub(super)` fields or private helpers, constructing internal state directly instead of reaching it through the interface's inputs, calling an implementation type's internal methods, or asserting on intermediates rather than the returned effects or observable state. For each, say how the same behavior is observed through the interface (which input to feed, which output to read), and if it cannot be, name the input or effect the interface is missing \u2014 an injected clock or seed, a returned effect \u2014 rather than suggesting a way in. Where several tests repeat a check every implementation of a trait should pass, suggest a generic contract test (`fn contract<T: Trait>(...)`)."
+  "question": "Does every test here check its behavior by driving the production API — what the crate's real callers use — and observing that API's output?",
+  "fine": {
+    "black_box": "Every test drives the production API and observes its outputs, returned effects or observable state."
+  },
+  "violations": {
+    "reaches_inside": "A test touches `pub(super)` fields or private helpers, constructs internal state directly, or calls an implementation type's internal methods.",
+    "asserts_internals": "A test asserts on intermediate internals rather than the production API's output.",
+    "uses_test_only_api": "A test uses something no production caller needs: a `#[cfg(test)]` item, an accessor, recorder, counter, mock or fixture the crate exports for tests, a `for_test` variant, or any public item only tests call. Injecting a dependency the production constructor takes (a clock, a seed, a backend trait) is not this."
+  },
+  "guidance": "Name the production entry point and the output the behavior shows up in: which input to feed, which output changes. If no production output can change when the tested code changes, that code is dead or a no-op: say what to delete. Never propose widening an interface, exporting a helper or adding a hook so a test can reach something. Where several tests repeat a check every implementation of a trait should pass, suggest a generic contract test."
 }

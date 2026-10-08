@@ -7,12 +7,11 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 
-use std::collections::BTreeMap;
-
 use desloppify::agent::{self, Ask, Usage};
+use desloppify::decide::{self, Decide};
 use desloppify::model::Provider;
 use desloppify::rate_limit::{self, AdaptiveConfig, RateLimiter, SystemClock, TokenBucketConfig};
-use desloppify::review::{Call, Report, plan, review, synthesize};
+use desloppify::review::{Call, Report, Reviewers, diagnose, plan, review, synthesize};
 use desloppify::rule::{self, Rule};
 use desloppify::skills;
 
@@ -39,6 +38,17 @@ enum Backend {
     DryRun,
 }
 
+/// Who answers each rule's question first.
+#[derive(Clone, Copy, ValueEnum)]
+enum SystemOne {
+    /// Nobody: every question goes to the model.
+    None,
+    /// TypeSafe AI's Jev, from `TYPESAFE_API_KEY`.
+    Jev,
+    /// No model: price System One's requests without making them.
+    DryRun,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum Limiter {
     /// Find the provider's limit: slow down on 429s, speed up without them.
@@ -55,6 +65,11 @@ struct Args {
     paths: Vec<PathBuf>,
     #[arg(long, value_enum, default_value_t = Backend::Anthropic)]
     backend: Backend,
+    #[arg(long, value_enum, default_value_t = SystemOne::None)]
+    system_one: SystemOne,
+    /// System One answers below this confidence go to the model.
+    #[arg(long, default_value_t = 0.7)]
+    min_confidence: f64,
     #[arg(long, value_enum, default_value_t = Limiter::Adaptive)]
     limiter: Limiter,
     /// Adaptive: calls per minute to start at.
@@ -98,10 +113,10 @@ async fn main() -> Result<ExitCode> {
     let plan = plan(&rules, &files)?;
 
     match args.backend {
-        Backend::Anthropic => run(api(Provider::Anthropic, &args)?, &args, rules, plan).await,
-        Backend::Gemini => run(api(Provider::Gemini, &args)?, &args, rules, plan).await,
-        Backend::ClaudeCode => run(agent::claude_code(args.jobs), &args, rules, plan).await,
-        Backend::DryRun => run(agent::dry_run(), &args, rules, plan).await,
+        Backend::Anthropic => with(api(Provider::Anthropic, &args)?, &args, rules, plan).await,
+        Backend::Gemini => with(api(Provider::Gemini, &args)?, &args, rules, plan).await,
+        Backend::ClaudeCode => with(agent::claude_code(args.jobs), &args, rules, plan).await,
+        Backend::DryRun => with(agent::dry_run(), &args, rules, plan).await,
     }
 }
 
@@ -109,27 +124,60 @@ fn api(provider: Provider, args: &Args) -> Result<impl Ask> {
     agent::from_env(provider, limiter(args), args.jobs)
 }
 
-async fn run<A: Ask>(
-    agent: A,
+async fn with<A: Ask>(
+    ask: A,
     args: &Args,
     rules: Arc<Vec<Rule>>,
     plan: Vec<Call>,
 ) -> Result<ExitCode> {
-    let agent = Arc::new(agent);
-    let report = review(agent.clone(), rules.clone(), plan).await?;
+    match args.system_one {
+        SystemOne::None => run(ask, decide::none(), args, (rules, plan)).await,
+        SystemOne::Jev => {
+            run(
+                ask,
+                decide::jev(decide::JevConfig::from_env(args.jobs)?),
+                args,
+                (rules, plan),
+            )
+            .await
+        }
+        SystemOne::DryRun => run(ask, decide::dry_run(), args, (rules, plan)).await,
+    }
+}
+
+async fn run<A: Ask, D: Decide>(
+    ask: A,
+    decide: D,
+    args: &Args,
+    (rules, plan): (Arc<Vec<Rule>>, Vec<Call>),
+) -> Result<ExitCode> {
+    let reviewers = Arc::new(Reviewers {
+        ask,
+        decide,
+        min_confidence: args.min_confidence,
+    });
+    let mut report = review(reviewers.clone(), rules.clone(), plan).await?;
+    let diagnosed = diagnose(&reviewers.ask, &report).await?;
+    report.diagnoses = diagnosed.diagnoses;
+    report.failures.extend(diagnosed.failures);
     for failure in &report.failures {
         eprintln!("error: {failure:#}");
     }
     let lead = if args.findings_only {
         None
     } else {
-        synthesize(&*agent, &rules, &report).await?
+        synthesize(&reviewers.ask, &rules, &report).await?
     };
     match &lead {
         Some(review) => println!("{}", review.text),
         None => print_findings(&report),
     }
-    print_usage(&rules, &report, lead.map(|l| l.usage));
+    print_decisions(&rules, &report);
+    let after = After {
+        diagnosis: diagnosed.usage,
+        lead: lead.map(|l| l.usage),
+    };
+    print_usage(&rules, &report, &after);
     let clean = report.findings.is_empty() && report.failures.is_empty();
     Ok(if clean {
         ExitCode::SUCCESS
@@ -138,43 +186,94 @@ async fn run<A: Ask>(
     })
 }
 
-/// Calls and tokens per rule, per level, and the lead's, to stderr.
-fn print_usage(rules: &[Rule], report: &Report, lead: Option<Usage>) {
-    let row = |usage: &Usage, level: &str, name: &str| {
+/// How each rule decided its units, and how many went to the model, to
+/// stderr.
+fn print_decisions(rules: &[Rule], report: &Report) {
+    for rule in rules {
+        let Some(tally) = report.decisions.get(&rule.id) else {
+            continue;
+        };
+        let outcomes: Vec<String> = tally.iter().map(|(o, n)| format!("{o} {n}")).collect();
+        let escalated = report.escalated.get(&rule.id).copied().unwrap_or_default();
         eprintln!(
-            "{:>8}  {:>12}  {:>10}  {level:>5}  {name}",
+            "{}: {} (escalated {escalated})",
+            rule.id,
+            outcomes.join(", ")
+        );
+    }
+}
+
+/// Calls and tokens per rule — model calls, at its decide and explain
+/// levels — then System One's and the lead's, to stderr.
+/// What the calls after the rules' own cost.
+struct After {
+    diagnosis: Usage,
+    lead: Option<Usage>,
+}
+
+fn print_usage(rules: &[Rule], report: &Report, after: &After) {
+    let row = |usage: &Usage, levels: &str, name: &str| {
+        eprintln!(
+            "{:>8}  {:>12}  {:>10}  {levels:>6}  {name}",
             usage.calls, usage.input, usage.output
         );
     };
     eprintln!(
-        "{:>8}  {:>12}  {:>10}  level  rule",
+        "{:>8}  {:>12}  {:>10}  levels  rule",
         "calls", "in tokens", "out tokens"
     );
-    let mut per_level: BTreeMap<u64, Usage> = BTreeMap::new();
+    let mut total = Usage::default();
     for rule in rules {
         let Some(usage) = report.usage.get(&rule.id) else {
             continue;
         };
-        let level = u64::from(rule.level);
-        row(usage, &level.to_string(), &rule.id);
-        *per_level.entry(level).or_default() += *usage;
+        let levels = format!(
+            "{}→{}",
+            u64::from(rule.levels.decide),
+            u64::from(rule.levels.explain)
+        );
+        row(usage, &levels, &rule.id);
+        total += *usage;
     }
-    for (level, usage) in &per_level {
-        row(usage, &level.to_string(), "(level total)");
-    }
-    if let Some(lead) = lead {
+    row(&total, "", "(model total)");
+    row(&report.system_one, "", "(system one)");
+    row(&after.diagnosis, "3→4", "(diagnosis)");
+    if let Some(lead) = after.lead {
         row(&lead, "4", "(lead review)");
     }
 }
 
+/// Each finding as `path:line: [rule/outcome] message`, then each diagnosis
+/// in Markdown.
 fn print_findings(report: &Report) {
     for f in &report.findings {
         println!(
-            "{}:{}: [{}] {}",
+            "{}:{}: [{}/{}] {}",
             f.path.display(),
             f.line,
             f.rule,
+            f.outcome,
             f.message
+        );
+    }
+    for d in &report.diagnoses {
+        let explains: Vec<String> = d
+            .explains
+            .iter()
+            .map(|&i| {
+                let f = &report.findings[i];
+                format!("{}:{}", f.path.display(), f.line)
+            })
+            .collect();
+        println!(
+            "\n## {} — {}\n\n**Diagnosis.** {}\n\n**The thing, from first principles.** {}\n\n**Its shape in the code.** {}\n\n**With the thing's shape.** {}\n\n**Explains:** {}",
+            d.thing,
+            d.component.display(),
+            d.diagnosis,
+            d.denotation,
+            d.shape,
+            d.falls_out,
+            explains.join(", ")
         );
     }
 }

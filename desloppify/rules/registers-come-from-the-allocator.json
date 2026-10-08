@@ -1,0 +1,25 @@
+{
+  "unit": "functions",
+  "levels": {
+    "decide": 1,
+    "explain": 2
+  },
+  "paths": [
+    "pixelflow-codegen/src/**"
+  ],
+  "exclude": [
+    "**/tests/**",
+    "pixelflow-codegen/src/emit/regalloc.rs",
+    "pixelflow-codegen/src/emit/regalloc/**"
+  ],
+  "question": "The project's goal is no register allocation outside the register allocator. Does this function choose which register holds something — a value, an instruction temp, a reload, a pointer, a loop counter, a mask, a constant-pool base — instead of encoding registers the allocator handed it?",
+  "fine": {
+    "encodes_given_registers": "It only encodes registers it was given — parameters, its instruction plan, the allocation — or names no registers.",
+    "declares_to_the_allocator": "It tells the allocator which registers exist, which are fixed by the call ABI (the kernel's ctx, out and pitch arguments), and which it may use: a `RegisterFile` or the like."
+  },
+  "violations": {
+    "chooses_register": "It picks a register itself: a literal or named register used as a destination, scratch, temp, base, index or counter in emitted code.",
+    "convention_register": "It relies on a register being held or free by convention across instructions (\"r8 holds the pool base\", \"x17 is free here\"), safe only by an argument in a comment."
+  },
+  "guidance": "Say what the allocator would have to know to make the choice instead: a temp demand, a register class, a value with a live range, a loop-carried value."
+}

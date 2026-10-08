@@ -1,19 +1,26 @@
 {
-  "level": 1,
-  "scope": {
-    "language": "rust",
-    "query": "(mod_item name: (identifier) @name body: (_) @cut (#match? @name \"^tests?$|_tests?$\")) @target"
+  "unit": "outline",
+  "levels": {
+    "decide": 1,
+    "explain": 2
   },
-  "review": "together",
   "exclude": [
-    "**/tests/**",
+    "**/*_tests.rs",
     "**/benches/**",
     "**/examples/**",
     "**/tests.rs",
-    "**/*_tests.rs"
+    "**/tests/**"
   ],
   "skills": [
     "behavioral-contracts"
   ],
-  "prompt": "Shown are test modules declared inside the source tree, where they can see the module's private items. Tests belong in the crate's `tests/` directory, where only the exported interface is visible. Flag each one: its tests should move there and drive the exported API."
+  "question": "Does this source file hold code that exists only for tests: a test module, or anything made to exist or made visible so a test can reach it?",
+  "fine": {
+    "no_test_code": "No test module, and every item here is as visible as its production callers need and no more."
+  },
+  "violations": {
+    "test_module": "A test module sits in the source tree, such as `#[cfg(test)] mod tests`, where its tests can see private items; tests belong in the crate's `tests/` directory, driving the production API.",
+    "test_only_api": "An item exists, or is visible, only so tests can reach it — production does not need it: `#[cfg(test)]` on a method, constructor, impl, re-export or non-private item; `#[allow(dead_code)]` on something only tests call; an accessor, recorder, counter, mock or fixture no production caller uses; visibility wider than production callers need. A dependency the production constructor takes (a clock, a seed, a backend trait) is not this."
+  },
+  "guidance": "For each, name the production output a test should observe instead: which entry point to call and which output the behavior changes. If no production output can change, the code is dead or a no-op: name it for deletion. Never suggest keeping it, widening it or moving it behind another export."
 }
