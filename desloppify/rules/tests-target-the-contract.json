@@ -21,7 +21,7 @@
   "violations": {
     "reaches_inside": "A test touches `pub(super)` fields or private helpers, constructs internal state directly, or calls an implementation type's internal methods.",
     "asserts_internals": "A test asserts on intermediate internals rather than the production API's output.",
-    "uses_test_only_api": "A test calls something that exists only for tests: a `#[cfg(test)]` item, a test hook, accessor, recorder, mock or fixture the crate exports, a `for_test` variant, or a public item no production caller uses."
+    "uses_test_only_api": "A test uses something no production caller needs: a `#[cfg(test)]` item, an accessor, recorder, counter, mock or fixture the crate exports for tests, a `for_test` variant, or any public item only tests call. Injecting a dependency the production constructor takes (a clock, a seed, a backend trait) is not this."
   },
   "guidance": "Name the production entry point and the output the behavior shows up in: which input to feed, which output changes. If no production output can change when the tested code changes, that code is dead or a no-op: say what to delete. Never propose widening an interface, exporting a helper or adding a hook so a test can reach something. Where several tests repeat a check every implementation of a trait should pass, suggest a generic contract test."
 }

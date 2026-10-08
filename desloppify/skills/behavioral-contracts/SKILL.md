@@ -107,14 +107,12 @@ don't expose it so a test can watch it run. So "this can't be tested through
 the interface" is never answered by widening the interface: it is answered by
 finding the output the code affects, or by deleting the code.
 
-Feeding the code is not watching it. Time and randomness are inputs the
-code has either way; a constructor that takes them (a `Clock`, a seed) makes
-the dependency explicit — production passes the system clock, a test passes
-its own. Effects returned as values (`EmulatorAction`, `DriverOut`) are the
-production API, consumed by the real caller. A test may implement a trait the
-production API takes, to feed it. What is a hook is anything a test uses to
-*watch* the code instead of its output: an accessor, a recorder, a counter, a
-mock or a fixture the crate exports. A test generic over a trait
+Production decides the API. An accessor, recorder, counter, mock or fixture
+exists only if production needs it; when production does, a test may use it
+like any other caller. The one place a test may shape the API is dependency
+injection, when we choose it: a dependency the code needs either way — a `Clock`, a seed, a
+backend trait — taken by the constructor, so production passes the real one
+and a test passes its own. A test generic over a trait
 (`fn contract<P: AnsiParser>(p: P)`) holds every implementation to it.
 
 ## Worked examples

@@ -20,7 +20,7 @@
   },
   "violations": {
     "test_module": "A test module sits in the source tree, such as `#[cfg(test)] mod tests`, where its tests can see private items; tests belong in the crate's `tests/` directory, driving the production API.",
-    "test_only_api": "An item exists, or is visible, only so tests can reach it: `#[cfg(test)]` on a method, constructor, impl, re-export or non-private item; `#[allow(dead_code)]` on something only tests call; a helper, accessor, mock, recorder or fixture named or documented as being for tests (`for_test`, `test_*`, `mock`); visibility wider than production callers need."
+    "test_only_api": "An item exists, or is visible, only so tests can reach it — production does not need it: `#[cfg(test)]` on a method, constructor, impl, re-export or non-private item; `#[allow(dead_code)]` on something only tests call; an accessor, recorder, counter, mock or fixture no production caller uses; visibility wider than production callers need. A dependency the production constructor takes (a clock, a seed, a backend trait) is not this."
   },
   "guidance": "For each, name the production output a test should observe instead: which entry point to call and which output the behavior changes. If no production output can change, the code is dead or a no-op: name it for deletion. Never suggest keeping it, widening it or moving it behind another export."
 }
