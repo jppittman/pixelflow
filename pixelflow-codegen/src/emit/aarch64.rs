@@ -67,8 +67,13 @@ pub(super) enum Inst {
     Bsl(Reg, Reg, Reg),
 
     // Memory transfers
-    Ldr(Ldr),
-    Str(Str),
+    LdrQ(LdrQ),
+    LdrX(LdrX),
+    LdrS(LdrS),
+    LdrW(LdrW),
+    LdrSIndexed(LdrSIndexed),
+    StrQ(StrQ),
+    StrX(StrX),
 
     // Integer & lane operations
     DupLane0(Reg, Reg),
@@ -102,37 +107,43 @@ impl Inst {
     #[must_use]
     #[inline(always)]
     pub fn ldr_q(dst: Reg, addr: Mem) -> Self {
-        Self::Ldr(Ldr::q(dst, addr))
+        Self::LdrQ(LdrQ { dst, addr })
     }
     #[must_use]
     #[inline(always)]
     pub fn ldr_x(dst: PtrReg, addr: Mem) -> Self {
-        Self::Ldr(Ldr::x(dst, addr))
+        Self::LdrX(LdrX { dst, addr })
     }
     #[must_use]
     #[inline(always)]
     pub fn ldr_s(dst: Reg, addr: Mem) -> Self {
-        Self::Ldr(Ldr::s(dst, addr))
+        Self::LdrS(LdrS {
+            dst: SReg(dst),
+            addr,
+        })
     }
     #[must_use]
     #[inline(always)]
     pub fn ldr_w(dst: Gpr, addr: MemIndexed) -> Self {
-        Self::Ldr(Ldr::w(dst, addr))
+        Self::LdrW(LdrW { dst, addr })
     }
     #[must_use]
     #[inline(always)]
     pub fn ldr_s_indexed(dst: Reg, addr: MemIndexed) -> Self {
-        Self::Ldr(Ldr::s_indexed(dst, addr))
+        Self::LdrSIndexed(LdrSIndexed {
+            dst: SReg(dst),
+            addr,
+        })
     }
     #[must_use]
     #[inline(always)]
     pub fn str_q(src: Reg, addr: Mem) -> Self {
-        Self::Str(Str::q(src, addr))
+        Self::StrQ(StrQ { src, addr })
     }
     #[must_use]
     #[inline(always)]
     pub fn str_x(src: PtrReg, addr: Mem) -> Self {
-        Self::Str(Str::x(src, addr))
+        Self::StrX(StrX { src, addr })
     }
     #[must_use]
     #[inline(always)]
@@ -185,7 +196,13 @@ impl Inst {
             Inst::Fcmge(dst, s1, s2) => Fcmge::new(dst, s1, s2).encode(),
             Inst::Fcmeq(dst, s1, s2) => Fcmeq::new(dst, s1, s2).encode(),
             Inst::Bsl(mask, if_true, if_false) => Bsl::new(mask, if_true, if_false).encode(),
-            Inst::Ldr(_) | Inst::Str(_) => {
+            Inst::LdrQ(_)
+            | Inst::LdrX(_)
+            | Inst::LdrS(_)
+            | Inst::LdrW(_)
+            | Inst::LdrSIndexed(_)
+            | Inst::StrQ(_)
+            | Inst::StrX(_) => {
                 panic!("Ldr and Str must be emitted via emit_into or AsmProgram")
             }
             Inst::DupLane0(dst, src) => DupLane0::new(dst, src).encode(),
@@ -210,7 +227,7 @@ impl Inst {
             Inst::B(_) => 0x1400_0000,
             Inst::BCond(b) => 0x5400_0000 | b.condition as u32,
             // Two words, not one — `encode` is for single-word instructions
-            // only, same exclusion as `Ldr`/`Str` above.
+            // only, same exclusion as the loads and stores above.
             Inst::BranchIfW16Zero(_) => {
                 panic!("BranchIfW16Zero must be emitted via emit_into or AsmProgram")
             }
@@ -221,17 +238,52 @@ impl Inst {
     }
 }
 
-impl From<Ldr> for Inst {
+impl From<LdrQ> for Inst {
     #[inline(always)]
-    fn from(l: Ldr) -> Self {
-        Inst::Ldr(l)
+    fn from(l: LdrQ) -> Self {
+        Inst::LdrQ(l)
     }
 }
 
-impl From<Str> for Inst {
+impl From<LdrX> for Inst {
     #[inline(always)]
-    fn from(s: Str) -> Self {
-        Inst::Str(s)
+    fn from(l: LdrX) -> Self {
+        Inst::LdrX(l)
+    }
+}
+
+impl From<LdrS> for Inst {
+    #[inline(always)]
+    fn from(l: LdrS) -> Self {
+        Inst::LdrS(l)
+    }
+}
+
+impl From<LdrW> for Inst {
+    #[inline(always)]
+    fn from(l: LdrW) -> Self {
+        Inst::LdrW(l)
+    }
+}
+
+impl From<LdrSIndexed> for Inst {
+    #[inline(always)]
+    fn from(l: LdrSIndexed) -> Self {
+        Inst::LdrSIndexed(l)
+    }
+}
+
+impl From<StrQ> for Inst {
+    #[inline(always)]
+    fn from(s: StrQ) -> Self {
+        Inst::StrQ(s)
+    }
+}
+
+impl From<StrX> for Inst {
+    #[inline(always)]
+    fn from(s: StrX) -> Self {
+        Inst::StrX(s)
     }
 }
 
@@ -321,8 +373,13 @@ impl crate::emit::AsmInsn for Inst {
             Inst::BCond(b) => b.emit_into(code),
             Inst::BranchIfW16Zero(b) => b.emit_into(code),
             Inst::AdrpAdd(a) => a.emit_into(code),
-            Inst::Ldr(ldr) => ldr.emit_into(code),
-            Inst::Str(str) => str.emit_into(code),
+            Inst::LdrQ(l) => l.emit_into(code),
+            Inst::LdrX(l) => l.emit_into(code),
+            Inst::LdrS(l) => l.emit_into(code),
+            Inst::LdrW(l) => l.emit_into(code),
+            Inst::LdrSIndexed(l) => l.emit_into(code),
+            Inst::StrQ(s) => s.emit_into(code),
+            Inst::StrX(s) => s.emit_into(code),
             Inst::Mov(dst, src) => {
                 if dst != src {
                     emit32(code, Orr::new(dst, src, src).encode());
@@ -1289,7 +1346,7 @@ mod tests {
     }
 
     /// `Inst::encode` is for single-word instructions; `AdrpAdd` is two, like
-    /// `Ldr` and `Str`, and says so rather than handing back half of itself.
+    /// the loads and stores, and says so rather than handing back half of itself.
     #[test]
     #[should_panic(expected = "AdrpAdd")]
     fn adrp_add_has_no_single_word_encoding() {
