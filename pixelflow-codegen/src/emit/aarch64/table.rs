@@ -472,20 +472,6 @@ impl AsmInsn for Ret {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SReg(pub Reg);
 
-impl From<Reg> for SReg {
-    #[inline(always)]
-    fn from(r: Reg) -> Self {
-        SReg(r)
-    }
-}
-
-impl From<SReg> for Reg {
-    #[inline(always)]
-    fn from(s: SReg) -> Self {
-        s.0
-    }
-}
-
 /// Bytes moved by a `q` (128-bit vector) access — also the scale of its offset.
 pub const Q_BYTES: u32 = 16;
 /// Bytes moved by an `x` (64-bit general/pointer) access.
@@ -557,307 +543,180 @@ pub fn address_in_ip0(code: &mut Vec<u8>, Mem { base, offset }: Mem) -> Mem {
     }
 }
 
-/// Register operand for a store instruction.
+/// `STR Qt, [Xn, #imm12*16]`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum StrReg {
-    /// 128-bit vector register (`Qt`).
-    Q(Reg),
-    /// 64-bit pointer/GP register (`Xt`).
-    X(PtrReg),
-}
-
-impl From<Reg> for StrReg {
-    #[inline(always)]
-    fn from(r: Reg) -> Self {
-        StrReg::Q(r)
-    }
-}
-
-impl From<PtrReg> for StrReg {
-    #[inline(always)]
-    fn from(p: PtrReg) -> Self {
-        StrReg::X(p)
-    }
-}
-
-/// Store register: `STR src, [addr]`
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Str {
-    pub src: StrReg,
+pub struct StrQ {
+    pub src: Reg,
     pub addr: Mem,
 }
 
-impl Str {
-    #[must_use]
-    #[inline]
-    pub const fn new_raw(src: StrReg, addr: Mem) -> Self {
-        Self { src, addr }
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn q(src: Reg, addr: Mem) -> Self {
-        Self {
-            src: StrReg::Q(src),
-            addr,
-        }
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn x(src: PtrReg, addr: Mem) -> Self {
-        Self {
-            src: StrReg::X(src),
-            addr,
-        }
-    }
-}
-
-impl AsmInsn for Str {
+impl AsmInsn for StrQ {
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
-        match self.src {
-            StrReg::Q(src) => {
-                assert!(
-                    self.addr.offset.is_multiple_of(Q_BYTES),
-                    "128-bit access offset {} is not 16-byte aligned",
-                    self.addr.offset
-                );
-                let a = if self.addr.offset / Q_BYTES > MAX_IMM12 {
-                    address_in_ip0(code, self.addr)
-                } else {
-                    self.addr
-                };
-                let w = 0x3D80_0000
-                    | ((a.offset / Q_BYTES) << 10)
-                    | ((a.base.0 as u32) << 5)
-                    | (src.0 as u32);
-                code.extend_from_slice(&w.to_le_bytes());
-            }
-            StrReg::X(src) => {
-                assert!(
-                    self.addr.offset.is_multiple_of(X_BYTES),
-                    "pointer store offset {} not 8-byte aligned",
-                    self.addr.offset
-                );
-                let imm12 = self.addr.offset / X_BYTES;
-                assert!(
-                    imm12 <= MAX_IMM12,
-                    "pointer store offset {} exceeds STR imm12 range",
-                    self.addr.offset
-                );
-                let w =
-                    0xF900_0000 | (imm12 << 10) | ((self.addr.base.0 as u32) << 5) | (src.0 as u32);
-                code.extend_from_slice(&w.to_le_bytes());
-            }
-        }
+        assert!(
+            self.addr.offset.is_multiple_of(Q_BYTES),
+            "128-bit access offset {} is not 16-byte aligned",
+            self.addr.offset
+        );
+        let a = if self.addr.offset / Q_BYTES > MAX_IMM12 {
+            address_in_ip0(code, self.addr)
+        } else {
+            self.addr
+        };
+        let w = 0x3D80_0000
+            | ((a.offset / Q_BYTES) << 10)
+            | ((a.base.0 as u32) << 5)
+            | (self.src.0 as u32);
+        code.extend_from_slice(&w.to_le_bytes());
     }
 }
 
-/// Register destination for a load instruction.
+/// `STR Xt, [Xn, #imm12*8]`
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum LdrReg {
-    /// 128-bit vector register (`Qt`).
-    Q(Reg),
-    /// 64-bit pointer/GP register (`Xt`).
-    X(PtrReg),
-    /// 32-bit scalar float in vector lane 0 (`St`).
-    S(Reg),
-    /// 32-bit general-purpose word (`Wt`).
-    W(Gpr),
+pub struct StrX {
+    pub src: PtrReg,
+    pub addr: Mem,
 }
 
-impl From<Reg> for LdrReg {
-    #[inline(always)]
-    fn from(r: Reg) -> Self {
-        LdrReg::Q(r)
-    }
-}
-
-impl From<PtrReg> for LdrReg {
-    #[inline(always)]
-    fn from(p: PtrReg) -> Self {
-        LdrReg::X(p)
-    }
-}
-
-impl From<SReg> for LdrReg {
-    #[inline(always)]
-    fn from(s: SReg) -> Self {
-        LdrReg::S(s.0)
-    }
-}
-
-impl From<Gpr> for LdrReg {
-    #[inline(always)]
-    fn from(g: Gpr) -> Self {
-        LdrReg::W(g)
-    }
-}
-
-/// Addressing mode for a load instruction.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Addr {
-    Offset(Mem),
-    Indexed(MemIndexed),
-}
-
-impl From<Mem> for Addr {
-    #[inline(always)]
-    fn from(m: Mem) -> Self {
-        Addr::Offset(m)
-    }
-}
-
-impl From<MemIndexed> for Addr {
-    #[inline(always)]
-    fn from(m: MemIndexed) -> Self {
-        Addr::Indexed(m)
-    }
-}
-
-/// Load register: `LDR dst, [addr]`
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Ldr {
-    pub dst: LdrReg,
-    pub addr: Addr,
-}
-
-impl Ldr {
-    #[must_use]
-    #[inline]
-    pub const fn new_raw(dst: LdrReg, addr: Addr) -> Self {
-        Self { dst, addr }
-    }
-
-    #[must_use]
-    #[inline]
-    pub fn new(dst: impl Into<LdrReg>, addr: impl Into<Addr>) -> Self {
-        Self {
-            dst: dst.into(),
-            addr: addr.into(),
-        }
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn q(dst: Reg, addr: Mem) -> Self {
-        Self {
-            dst: LdrReg::Q(dst),
-            addr: Addr::Offset(addr),
-        }
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn x(dst: PtrReg, addr: Mem) -> Self {
-        Self {
-            dst: LdrReg::X(dst),
-            addr: Addr::Offset(addr),
-        }
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn s(dst: Reg, addr: Mem) -> Self {
-        Self {
-            dst: LdrReg::S(dst),
-            addr: Addr::Offset(addr),
-        }
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn w(dst: Gpr, addr: MemIndexed) -> Self {
-        Self {
-            dst: LdrReg::W(dst),
-            addr: Addr::Indexed(addr),
-        }
-    }
-
-    /// `ldr s<dst>, [base, w<index>, uxtw #2]` — one element of a plane of
-    /// `f32`s straight into lane 0, where a `dup` can spread it.
-    #[must_use]
-    #[inline]
-    pub const fn s_indexed(dst: Reg, addr: MemIndexed) -> Self {
-        Self {
-            dst: LdrReg::S(dst),
-            addr: Addr::Indexed(addr),
-        }
-    }
-}
-
-impl AsmInsn for Ldr {
+impl AsmInsn for StrX {
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
-        match (self.dst, self.addr) {
-            (LdrReg::Q(dst), Addr::Offset(addr)) => {
-                assert!(
-                    addr.offset.is_multiple_of(Q_BYTES),
-                    "128-bit access offset {} is not 16-byte aligned",
-                    addr.offset
-                );
-                let a = if addr.offset / Q_BYTES > MAX_IMM12 {
-                    address_in_ip0(code, addr)
-                } else {
-                    addr
-                };
-                let w = 0x3DC0_0000
-                    | ((a.offset / Q_BYTES) << 10)
-                    | ((a.base.0 as u32) << 5)
-                    | (dst.0 as u32);
-                code.extend_from_slice(&w.to_le_bytes());
-            }
-            (LdrReg::X(dst), Addr::Offset(addr)) => {
-                assert!(
-                    addr.offset.is_multiple_of(X_BYTES),
-                    "pointer load offset {} not 8-byte aligned",
-                    addr.offset
-                );
-                let imm12 = addr.offset / X_BYTES;
-                assert!(
-                    imm12 <= MAX_IMM12,
-                    "pointer load offset {} exceeds LDR imm12 range",
-                    addr.offset
-                );
-                let w = 0xF940_0000 | (imm12 << 10) | ((addr.base.0 as u32) << 5) | (dst.0 as u32);
-                code.extend_from_slice(&w.to_le_bytes());
-            }
-            (LdrReg::S(dst), Addr::Offset(addr)) => {
-                assert!(
-                    addr.offset.is_multiple_of(S_BYTES),
-                    "32-bit access offset {} is not 4-byte aligned",
-                    addr.offset
-                );
-                let a = if addr.offset / S_BYTES > MAX_IMM12 {
-                    address_in_ip0(code, addr)
-                } else {
-                    addr
-                };
-                let w = 0xBD40_0000
-                    | ((a.offset / S_BYTES) << 10)
-                    | ((a.base.0 as u32) << 5)
-                    | (dst.0 as u32);
-                code.extend_from_slice(&w.to_le_bytes());
-            }
-            (LdrReg::W(dst), Addr::Indexed(addr)) => {
-                let w = 0xB860_5800
-                    | ((addr.index.0 as u32) << 16)
-                    | ((addr.base.0 as u32) << 5)
-                    | (dst.0 as u32);
-                code.extend_from_slice(&w.to_le_bytes());
-            }
-            // The same register-offset form with the SIMD&FP bit (bit 26)
-            // set: `LDR St, [Xn, Wm, UXTW #2]`.
-            (LdrReg::S(dst), Addr::Indexed(addr)) => {
-                let w = 0xBC60_5800
-                    | ((addr.index.0 as u32) << 16)
-                    | ((addr.base.0 as u32) << 5)
-                    | (dst.0 as u32);
-                code.extend_from_slice(&w.to_le_bytes());
-            }
-            _ => panic!("unsupported Ldr combination: {:?}", (self.dst, self.addr)),
-        }
+        assert!(
+            self.addr.offset.is_multiple_of(X_BYTES),
+            "pointer store offset {} not 8-byte aligned",
+            self.addr.offset
+        );
+        let imm12 = self.addr.offset / X_BYTES;
+        assert!(
+            imm12 <= MAX_IMM12,
+            "pointer store offset {} exceeds STR imm12 range",
+            self.addr.offset
+        );
+        let w =
+            0xF900_0000 | (imm12 << 10) | ((self.addr.base.0 as u32) << 5) | (self.src.0 as u32);
+        code.extend_from_slice(&w.to_le_bytes());
+    }
+}
+
+/// `LDR Qt, [Xn, #imm12*16]`
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LdrQ {
+    pub dst: Reg,
+    pub addr: Mem,
+}
+
+impl AsmInsn for LdrQ {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        assert!(
+            self.addr.offset.is_multiple_of(Q_BYTES),
+            "128-bit access offset {} is not 16-byte aligned",
+            self.addr.offset
+        );
+        let a = if self.addr.offset / Q_BYTES > MAX_IMM12 {
+            address_in_ip0(code, self.addr)
+        } else {
+            self.addr
+        };
+        let w = 0x3DC0_0000
+            | ((a.offset / Q_BYTES) << 10)
+            | ((a.base.0 as u32) << 5)
+            | (self.dst.0 as u32);
+        code.extend_from_slice(&w.to_le_bytes());
+    }
+}
+
+/// `LDR Xt, [Xn, #imm12*8]`
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LdrX {
+    pub dst: PtrReg,
+    pub addr: Mem,
+}
+
+impl AsmInsn for LdrX {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        assert!(
+            self.addr.offset.is_multiple_of(X_BYTES),
+            "pointer load offset {} not 8-byte aligned",
+            self.addr.offset
+        );
+        let imm12 = self.addr.offset / X_BYTES;
+        assert!(
+            imm12 <= MAX_IMM12,
+            "pointer load offset {} exceeds LDR imm12 range",
+            self.addr.offset
+        );
+        let w =
+            0xF940_0000 | (imm12 << 10) | ((self.addr.base.0 as u32) << 5) | (self.dst.0 as u32);
+        code.extend_from_slice(&w.to_le_bytes());
+    }
+}
+
+/// `LDR St, [Xn, #imm12*4]`
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LdrS {
+    pub dst: SReg,
+    pub addr: Mem,
+}
+
+impl AsmInsn for LdrS {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        assert!(
+            self.addr.offset.is_multiple_of(S_BYTES),
+            "32-bit access offset {} is not 4-byte aligned",
+            self.addr.offset
+        );
+        let a = if self.addr.offset / S_BYTES > MAX_IMM12 {
+            address_in_ip0(code, self.addr)
+        } else {
+            self.addr
+        };
+        let w = 0xBD40_0000
+            | ((a.offset / S_BYTES) << 10)
+            | ((a.base.0 as u32) << 5)
+            | (self.dst.0.0 as u32);
+        code.extend_from_slice(&w.to_le_bytes());
+    }
+}
+
+/// `LDR Wt, [Xn, Wm, UXTW #2]`
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LdrW {
+    pub dst: Gpr,
+    pub addr: MemIndexed,
+}
+
+impl AsmInsn for LdrW {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        let w = 0xB860_5800
+            | ((self.addr.index.0 as u32) << 16)
+            | ((self.addr.base.0 as u32) << 5)
+            | (self.dst.0 as u32);
+        code.extend_from_slice(&w.to_le_bytes());
+    }
+}
+
+/// `ldr s<dst>, [base, w<index>, uxtw #2]` — one element of a plane of
+/// `f32`s straight into lane 0, where a `dup` can spread it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct LdrSIndexed {
+    pub dst: SReg,
+    pub addr: MemIndexed,
+}
+
+impl AsmInsn for LdrSIndexed {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        // The same register-offset form as `LdrW` with the SIMD&FP bit
+        // (bit 26) set: `LDR St, [Xn, Wm, UXTW #2]`.
+        let w = 0xBC60_5800
+            | ((self.addr.index.0 as u32) << 16)
+            | ((self.addr.base.0 as u32) << 5)
+            | (self.dst.0.0 as u32);
+        code.extend_from_slice(&w.to_le_bytes());
     }
 }
 
