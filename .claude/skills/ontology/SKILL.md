@@ -38,6 +38,22 @@ is usually a place the definition's consequences were not followed.
   node — minting the label with the block removes it without the label
   knowing about nodes.
 
+## Assembler
+
+- **Is:** a function from a program of items — instructions, label
+  bindings, data in sections — to bytes, mapping each label to an address and
+  filling in every label operand. Here, a very small in-memory one: no object
+  files, no relocations or symbols beyond labels.
+- **Is not:** a code buffer other code writes bytes into; aware of registers,
+  values, scopes or the IR.
+- **Follows:** it stands alone — its module imports nothing from the rest of
+  the crate, and everything above it depends on it, never the reverse. It
+  mints labels; an instruction encodes itself given the addresses of the
+  labels it names; the constant pool is a section with a label.
+- **Lives:** `emit::Assembly`, `AsmInsn`, `AsmProgram` in `emit/mod.rs` —
+  today beside the driver, with a public `code` field the driver writes
+  bytes into directly, which contradicts this entry.
+
 ## Operand
 
 - **Is:** an argument of an instruction: a register (a value with an access —
