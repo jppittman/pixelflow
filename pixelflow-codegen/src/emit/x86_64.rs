@@ -641,6 +641,18 @@ pub(super) enum Lanewise {
     WidenBytes,
 }
 
+/// The predicate of a `vcmpps`: its imm8.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum Pred {
+    Eq = 0,
+    Lt = 1,
+    Le = 2,
+    Ne = 4,
+    Ge = 5,
+    /// `>`: the unordered-safe "not less-or-equal".
+    Nle = 6,
+}
+
 /// The rounding mode of a `vroundps` or `vrndscaleps`: its imm8.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum Rounding {

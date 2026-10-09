@@ -26,11 +26,11 @@
 
 use super::x86_64;
 use super::x86_64::{
-    Alu, Direction, Disp, Imm32, Lanewise, Mem, NoDisp, Rounding, Truncate, frame_slot,
+    Alu, Direction, Disp, Imm32, Lanewise, Mem, NoDisp, Pred, Rounding, Truncate, frame_slot,
 };
 use super::{
-    AsmInsn, AsmProgram, EncodedInst, Gpr, Integer, KReg, Physical, Pointer, PtrReg, Reg, Stage,
-    Vector, assemble, unimplemented_op,
+    AsmInsn, AsmProgram, EncodedInst, Flags, Gpr, Integer, KReg, Opmask, Physical, Pointer, PtrReg,
+    Reg, Stage, Vector, unimplemented_op,
 };
 use crate::error::CompileError;
 use alloc::vec::Vec;
@@ -211,6 +211,27 @@ impl Evex {
         inst
     }
 
+    /// `op zmmREG{k}, [base + zmm_index*4]` — the VSIB form a gather
+    /// addresses through. The index's high bits ride in X and V', inverted
+    /// like R and B, and `vvvv` is unused.
+    fn vsib_scaled4(self, reg: u8, base: Gpr, index: Reg) -> EncodedInst {
+        let mut inst = EncodedInst::new();
+        let r = ((reg >> 3) & 1) ^ 1;
+        let rp = ((reg >> 4) & 1) ^ 1;
+        let b = ((base.0 >> 3) & 1) ^ 1;
+        let x = ((index.0 >> 3) & 1) ^ 1;
+        let vp = ((index.0 >> 4) & 1) ^ 1;
+
+        self.prefix_into(
+            &mut inst,
+            (r << 7) | (x << 6) | (b << 5) | (rp << 4),
+            0x0F,
+            vp,
+        );
+        x86_64::vsib4_operand_into(&mut inst, reg, base, index);
+        inst
+    }
+
     /// The 4-byte EVEX prefix plus the opcode byte, shared by every form.
     /// `reg_ext` is the assembled `R X B R'` nibble of P0; `vvvv`/`vp` are the
     /// extra-source fields. Every one of them is already inverted by the
@@ -354,6 +375,51 @@ enum Inst<S: Stage> {
         dst: S::Tie<Vector>,
         src: S::Read<Integer>,
     },
+    /// `vcmpps dst, a, b, pred`: a bit where it holds, clear where it does not.
+    CmpK {
+        pred: Pred,
+        dst: S::Write<Opmask>,
+        a: S::Read<Vector>,
+        b: S::Read<Vector>,
+    },
+    /// `vpmovm2d dst, k`: an all-ones lane where the bit is set, all-zero
+    /// where it is not. AVX-512**DQ**, not F: an F-only part would fault.
+    Movm2d {
+        dst: S::Write<Vector>,
+        k: S::Read<Opmask>,
+    },
+    /// `vptestmd dst, a, b`: a bit where the lanes' AND is nonzero.
+    Ptestm {
+        dst: S::Write<Opmask>,
+        a: S::Read<Vector>,
+        b: S::Read<Vector>,
+    },
+    /// `kortestw k, k`: ZF iff no bit is set, CF iff all sixteen are.
+    KorTest {
+        flags: S::Write<Flags>,
+        k: S::Read<Opmask>,
+    },
+    /// `kmovw dst, src`: the low sixteen bits of a general register.
+    Kmovw {
+        dst: S::Write<Opmask>,
+        src: S::Read<Integer>,
+    },
+    /// `vgatherdps dst{mask}, [base + index*4]`: one `f32` per lane whose
+    /// `mask` bit is set. The instruction clears the bits as it completes
+    /// lanes, and `#UD`s if `dst` and `index` are one register.
+    Gather {
+        dst: S::Early<Vector>,
+        base: S::Read<Pointer>,
+        index: S::Read<Vector>,
+        mask: S::Tie<Opmask>,
+    },
+    /// `vmovups [dst]{mask}, src`: the lanes whose bit is set, the rest of
+    /// memory left untouched.
+    StoreMasked {
+        dst: Mem<S, NoDisp>,
+        src: S::Read<Vector>,
+        mask: S::Read<Opmask>,
+    },
     /// `vmovups dst, [src]`: a slot.
     Load {
         dst: S::Write<Vector>,
@@ -421,6 +487,34 @@ impl Inst<Physical> {
                 .xmm()
                 .imm(1)
                 .rrr(dst.0, dst.0, src.0),
+            Inst::CmpK { pred, dst, a, b } => Evex::m0f(0xC2).imm(pred as u8).rrr(dst.0, a.0, b.0),
+            Inst::Movm2d { dst, k } => Evex::m0f38_f3(0x38).rrr(dst.0, UNUSED_VVVV, k.0),
+            Inst::Ptestm { dst, a, b } => Evex::m0f38_66(0x27).rrr(dst.0, a.0, b.0),
+            // `VEX.L0.0F.W0 98 /r`, both operands the one mask register.
+            Inst::KorTest { flags: (), k } => {
+                EncodedInst::from_slice(&[0xC5, 0xF8, 0x98, 0xC0 | (k.0 << 3) | k.0])
+            }
+            // `VEX.L0.0F.W0 92 /r`, in the three-byte prefix.
+            Inst::Kmovw { dst, src } => {
+                // B̄ is inverted: set when the source needs no extension bit.
+                let no_extension = if src.0 < 8 { 0x20 } else { 0x00 };
+                let modrm = 0xC0 | ((dst.0 & 7) << 3) | (src.0 & 7);
+                EncodedInst::from_slice(&[0xC4, 0xC1 | no_extension, 0x78, 0x92, modrm])
+            }
+            Inst::Gather {
+                dst,
+                base,
+                index,
+                mask,
+            } => {
+                debug_assert!(dst != index, "vgatherdps: dst and index must differ");
+                // `base` is never `rbp`/`r13` (the pointer pool is `r9`-`r11`),
+                // so the SIB's no-base encoding is unreachable.
+                Evex::m0f38_66(0x92)
+                    .masked(mask)
+                    .vsib_scaled4(dst.0, base.as_gpr(), index)
+            }
+            Inst::StoreMasked { dst, src, mask } => Evex::m0f(0x11).masked(mask).rm(src.0, dst),
             Inst::Load { dst, src } => Evex::m0f(0x10).rm(dst.0, src),
             Inst::Store { dst, src } => Evex::m0f(0x11).rm(src.0, dst),
             Inst::StoreBatch { dst, src } => Evex::m0f(0x11).rm(src.0, dst),
@@ -514,24 +608,20 @@ fn mask_temps_for(op: &super::ScheduledOp) -> u8 {
 // The store, and the iota
 // =============================================================================
 
-/// `kmovw k, r32` — `VEX.L0.0F.W0 92 /r`.
-#[must_use]
-fn kmovw_from_gpr(k: KReg, src: Gpr) -> EncodedInst {
-    let bbit = if src.0 >= 8 { 0x00 } else { 0x20 };
-    let mut inst = EncodedInst::new();
-    inst.push(0xC4);
-    inst.push(0x80 | 0x40 | bbit | 0x01); // R̄ X̄ B̄ map=0F
-    inst.push(0x78); // W=0, vvvv=1111, L=0, pp=00
-    inst.push(0x92);
-    inst.push(0xC0 | ((k.0 & 7) << 3) | (src.0 & 7));
-    inst
-}
-
-/// `vmovups [addr]{k}, zmm` — the full-width store under a writemask, which
-/// leaves the masked-off lanes of memory untouched.
-#[must_use]
-fn vmovups_store_masked<D: Disp>(addr: Mem<Physical, D>, src: Reg, k: KReg) -> EncodedInst {
-    Evex::m0f(0x11).masked(k).rm(src.0, addr)
+/// Set the gather's writemask `k1` to all-ones: `mov eax, 0xFFFF`, then
+/// `kmovw k1, eax` in the two-byte VEX prefix, which [`Inst::Kmovw`] (the
+/// three-byte form) does not encode. A gather clears the bits it completes, so
+/// this runs before each one, and it clobbers `eax`. A `kxnorw k1, k1, k1`
+/// would need neither `eax` nor a second instruction, but it reads the `k1`
+/// the previous gather is still clearing, which chains each gather behind the
+/// last. C2 allocates the mask and picks.
+fn set_gather_mask(code: &mut Vec<u8>) {
+    x86_64::Gp::MovImm32 {
+        dst: x86_64::gpr::RAX,
+        imm: 0xFFFF,
+    }
+    .emit_into(code);
+    EncodedInst::from_slice(&[0xC5, 0xF8, 0x92, 0xC8]).emit_into(code);
 }
 
 /// The bytes `0..8` and `8..16`, little end first: what two `movabs` carry
@@ -664,23 +754,15 @@ fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, a: Reg, b: Reg) {
 // `mask_guard_temp` rather than a hardcoded constant.
 // =============================================================================
 
-/// `vcmpps`/`vpternlog` predicate (imm8). Same ordering as the AVX2 path.
-const CMP_EQ: u8 = 0;
-const CMP_LT: u8 = 1;
-const CMP_LE: u8 = 2;
-const CMP_NEQ: u8 = 4;
-const CMP_GE: u8 = 5;
-const CMP_GT: u8 = 6;
-
-/// Map a comparison `OpKind` to its `vcmpps` predicate imm8.
-fn cmp_pred(op: OpKind) -> Option<u8> {
+/// Map a comparison `OpKind` to its `vcmpps` predicate.
+fn cmp_pred(op: OpKind) -> Option<Pred> {
     Some(match op {
-        OpKind::Eq => CMP_EQ,
-        OpKind::Ne => CMP_NEQ,
-        OpKind::Lt => CMP_LT,
-        OpKind::Le => CMP_LE,
-        OpKind::Gt => CMP_GT,
-        OpKind::Ge => CMP_GE,
+        OpKind::Eq => Pred::Eq,
+        OpKind::Ne => Pred::Ne,
+        OpKind::Lt => Pred::Lt,
+        OpKind::Le => Pred::Le,
+        OpKind::Gt => Pred::Nle,
+        OpKind::Ge => Pred::Ge,
         _ => return None,
     })
 }
@@ -694,10 +776,10 @@ fn is_compare(op: OpKind) -> bool {
 /// Emit `dst = (srcs[0] <op> srcs[1]) ? all-ones : all-zeros` as a vector
 /// mask.
 ///
-/// `vcmpps k, src1, src2, pred` (EVEX.512.0F.W0 C2 /r ib) writes a k-register —
-/// this instruction's `RegisterFile::mask_scratch` reservation, `k` — and
-/// `vpmovm2d dst, k` (EVEX.512.F3.0F38.W0 38 /r) widens it to a per-lane
-/// all-ones/all-zeros vector occupying the allocator-assigned `dst` zmm.
+/// `vcmpps k, src1, src2, pred` writes a k-register — this instruction's
+/// `RegisterFile::mask_scratch` reservation, `k` — and `vpmovm2d dst, k`
+/// widens it to a per-lane all-ones/all-zeros vector occupying the
+/// allocator-assigned `dst` zmm.
 ///
 /// `srcs` is a pair rather than two more positional args to stay inside this
 /// crate's 5-argument ceiling.
@@ -705,38 +787,8 @@ fn emit_compare(code: &mut Vec<u8>, op: OpKind, dst: Reg, srcs: [Reg; 2], k: KRe
     let Some(pred) = cmp_pred(op) else {
         unimplemented_op("avx-512", op)
     };
-    let [src1, src2] = srcs;
-    // The k destination is encoded in ModRM.reg — `rrr`'s first slot.
-    assemble(
-        code,
-        [
-            Evex::m0f(0xC2).imm(pred).rrr(k.0, src1.0, src2.0),
-            Evex::m0f38_f3(0x38).rrr(dst.0, UNUSED_VVVV, k.0),
-        ],
-    );
-}
-
-/// Set flags from a vector mask for the If short-circuit guards.
-///
-/// `vptestmd k, mask, mask` sets `k[i]` for each nonzero lane — `k` is this
-/// guard's `RegisterFile::mask_guard_temps` reservation; `kortestw k,k` then
-/// sets ZF iff `k == 0` (all lanes false) and CF iff `k == 0xFFFF` (all 16
-/// lanes true). The caller follows with `jz` (all-false) or `jc` (all-true).
-///
-/// `kortestw`'s encoding is `VEX.L0.0F.W0 98 /r` with both operands `k1` —
-/// only `k1` is ever reserved for a guard (`MAX_MASK_TEMPS` is 1), so the
-/// fixed `0xC9` ModRM byte (`11 001 001`, encoding k1,k1) is correct as long
-/// as `k` is `k1`; `debug_assert` states that rather than silently emitting
-/// the wrong register the moment a second mask register is ever wanted here.
-fn emit_mask_flags(code: &mut Vec<u8>, mask: Reg, k: KReg) {
-    debug_assert_eq!(k, KReg(1), "kortestw's ModRM below hardcodes k1,k1");
-    assemble(
-        code,
-        [
-            Evex::m0f38_66(0x27).rrr(k.0, mask.0, mask.0),
-            EncodedInst::from_slice(&[0xC5, 0xF8, 0x98, 0xC9]),
-        ],
-    );
+    let [a, b] = srcs;
+    AsmProgram::from([Inst::CmpK { pred, dst: k, a, b }, Inst::Movm2d { dst, k }]).assemble(code);
 }
 
 /// Emit `dst = src << amount` / `dst = src >> amount` (logical, zero-fill)
@@ -812,80 +864,6 @@ fn emit_unary(
 /// destination, so `c` needs no move.
 fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
     Inst::Fma231 { acc: dst, a, b }.emit_into(code);
-}
-
-// =============================================================================
-// Bound-memory gather (RawGather lowering target)
-//
-// `vgatherdps zmm{k1}, [base_gpr + zmm_index*4]` reads one f32 per lane from a
-// bound buffer. The lowered index is a float (`clamp(floor(x))·1 + …`), so it is
-// first truncated to signed int32 lanes with `vcvttps2dq`. The writemask k1 must
-// be all-ones going in (the instruction clears completed lanes), so it is reset
-// before every gather.
-// =============================================================================
-
-/// Set the gather writemask `k1` to all-ones (`mov eax, 0xFFFF; kmovw k1, eax`).
-///
-/// A gather requires a non-zero writemask and *clears* the bits it completes, so
-/// this must run before each gather. Clobbers `eax` (caller-saved scratch).
-fn emit_set_gather_mask(code: &mut Vec<u8>) {
-    assemble(
-        code,
-        [
-            EncodedInst::from_slice(&[0xB8, 0xFF, 0xFF, 0x00, 0x00]),
-            EncodedInst::from_slice(&[0xC5, 0xF8, 0x92, 0xC8]),
-        ],
-    );
-}
-
-/// `vgatherdps zmmDST{k1}, [baseGPR + zmmINDEX*4]`
-/// (EVEX.512.66.0F38.W0 92 /vsib, mask = k1, scale = 4).
-///
-/// Gathers one f32 per lane at `base + index_lane*4`. The caller must ensure
-/// `k1` is all-ones ([`emit_set_gather_mask`]), the index lanes are int32
-/// (`Lanewise::ToInt`), and `dst != index` (the instruction forbids the
-/// destination and index vectors aliasing). `base_gpr` must not be rbp/r13
-/// (mod=00 SIB base restriction) — the emitter uses `rax`.
-/// Pure encoding for `vgatherdps zmmDST{k1}, [baseGPR + zmmINDEX*4]`
-#[must_use]
-fn gather(dst: Reg, base_gpr: u8, index: Reg) -> EncodedInst {
-    let d = dst.0;
-    let idx = index.0;
-    let base = base_gpr;
-    debug_assert!(d != idx, "vgatherdps: dst and index must differ");
-    assert!(
-        base != 5 && base != 13,
-        "vgatherdps: base register {base} is rbp/r13, whose mod=00 SIB form means no base"
-    );
-
-    let r = ((d >> 3) & 1) ^ 1; // dst bit3  -> EVEX.R
-    let rp = ((d >> 4) & 1) ^ 1; // dst bit4  -> EVEX.R'
-    let x = ((idx >> 3) & 1) ^ 1; // index bit3 -> EVEX.X
-    let b = ((base >> 3) & 1) ^ 1; // base bit3  -> EVEX.B
-    let vp = ((idx >> 4) & 1) ^ 1; // index bit4 -> EVEX.V'
-    let vvvv = 0x0F; // unused -> encoded 1111
-
-    let p0 = (r << 7) | (x << 6) | (b << 5) | (rp << 4) | (Map::M0F38 as u8);
-    // W=0 (bit7 clear): gather uses signed dword indices.
-    let p1 = (vvvv << 3) | (1 << 2) | (Pp::P66 as u8);
-    // z=0, L'L=10 (512-bit), b=0, V' = index bit4, aaa=001 (k1).
-    let p2 = (0b10 << 5) | (vp << 3) | 0b001;
-
-    let mut inst = EncodedInst::new();
-    inst.push(0x62);
-    inst.push(p0);
-    inst.push(p1);
-    inst.push(p2);
-    inst.push(0x92);
-    // ModRM: mod=00, reg=dst[2:0], r/m=100 (SIB follows).
-    inst.push(((d & 7) << 3) | 0b100);
-    // SIB: scale=10 (*4), index=idx[2:0], base=base[2:0].
-    inst.push((0b10 << 6) | ((idx & 7) << 3) | (base & 7));
-    inst
-}
-
-fn emit_gather(code: &mut Vec<u8>, dst: Reg, base_gpr: u8, index: Reg) {
-    AsmProgram::from([gather(dst, base_gpr, index)]).assemble(code);
 }
 
 #[cfg(test)]
@@ -1076,6 +1054,19 @@ mod tests {
                 _mm512_storeu_ps(out.as_mut_ptr(), r);
                 out
             }
+        }
+
+        /// Set `k1` to all-ones and gather `dst = [base + index*4]` under it,
+        /// as the driver does before every gather.
+        fn gather_through_k1(c: &mut Vec<u8>, dst: Reg, base: PtrReg, index: Reg) {
+            set_gather_mask(c);
+            AsmProgram::from([Inst::Gather {
+                dst,
+                base,
+                index,
+                mask: KReg(1),
+            }])
+            .assemble(c);
         }
 
         fn lanes() -> ([f32; 16], [f32; 16], [f32; 16]) {
@@ -1318,8 +1309,7 @@ mod tests {
                 src: Reg(0),
             }
             .emit_into(&mut c); // zmm13 = (i32) idx_float
-            emit_set_gather_mask(&mut c); // k1 = 0xFFFF
-            emit_gather(&mut c, Reg(14), 7, Reg(13)); // zmm14{k1} = [rdi + zmm13*4]
+            gather_through_k1(&mut c, Reg(14), PtrReg(7), Reg(13)); // zmm14{k1} = [rdi + zmm13*4]
             emit_mov(&mut c, Reg(0), Reg(14)); // return in zmm0
             c.push(RET);
 
@@ -1362,8 +1352,7 @@ mod tests {
                 src: Reg(0),
             }
             .emit_into(&mut c); // zmm21 = (i32) idx_float
-            emit_set_gather_mask(&mut c);
-            emit_gather(&mut c, Reg(20), 9, Reg(21)); // zmm20{k1} = [r9 + zmm21*4]
+            gather_through_k1(&mut c, Reg(20), PtrReg(9), Reg(21)); // zmm20{k1} = [r9 + zmm21*4]
             emit_mov(&mut c, Reg(0), Reg(20));
             c.push(RET);
 
@@ -1434,10 +1423,7 @@ mod tests {
 /// construction.
 pub(super) mod driver {
     use super::super::*;
-    use super::{
-        AsmProgram, IOTA_BYTES, Inst, Lanewise, Mem, NoDisp, frame_slot, kmovw_from_gpr,
-        vmovups_store_masked,
-    };
+    use super::{AsmProgram, IOTA_BYTES, Inst, Lanewise, Mem, NoDisp, frame_slot};
     use crate::emit::x86_64 as x86;
     use crate::emit::x86_64::write_address;
     use crate::error::CompileError;
@@ -1600,18 +1586,26 @@ pub(super) mod driver {
                 ResolvedOp::Gather { dst, idx, base } => {
                     // dst = base[idx]: `vgatherdps` through `k1`, `base`
                     // being the buffer's address wherever the allocator
-                    // keeps it (never `rbp`/`r13` — the pointer pool is
-                    // `r9`-`r11`, so the SIB's no-base encoding is unreachable).
+                    // keeps it. The lowered index is a float, so it is
+                    // truncated to int32 lanes first, and `k1` is all-ones
+                    // going in (the instruction clears the bits it
+                    // completes), so it is reset before every gather.
                     let idx_int = crate::emit::declared_temp(plan.scratch.temp(0));
                     let gather_dst = crate::emit::declared_temp(plan.scratch.temp(1));
-                    Inst::Unary {
+                    AsmProgram::from([Inst::Unary {
                         op: Lanewise::ToInt,
                         dst: idx_int,
                         src: *idx,
-                    }
-                    .emit_into(code);
-                    super::emit_set_gather_mask(code);
-                    super::emit_gather(code, gather_dst, base.0, idx_int);
+                    }])
+                    .assemble(code);
+                    super::set_gather_mask(code);
+                    AsmProgram::from([Inst::Gather {
+                        dst: gather_dst,
+                        base: *base,
+                        index: idx_int,
+                        mask: KReg(1),
+                    }])
+                    .assemble(code);
                     super::emit_mov(code, *dst, gather_dst);
                 }
                 ResolvedOp::Broadcast { dst, idx, base } => {
@@ -1752,7 +1746,12 @@ pub(super) mod driver {
         /// lands in a `k`-register before `kortestw` can read it.
         fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
             let k = crate::emit::declared_mask_temp(test.mask_scratch);
-            super::emit_mask_flags(&mut asm.run, test.reg, k);
+            asm.push(Inst::Ptestm {
+                dst: k,
+                a: test.reg,
+                b: test.reg,
+            });
+            asm.push(Inst::KorTest { flags: (), k });
             // One `kortest` sets both answers at once, so the arm picks the
             // condition rather than a different reduction.
             asm.push(match test.arm {
@@ -1853,8 +1852,12 @@ pub(super) mod driver {
             }
             .emit_into(code);
             AsmProgram::from([
-                kmovw_from_gpr(k, mask),
-                vmovups_store_masked(at, write.value, k),
+                Inst::Kmovw { dst: k, src: mask },
+                Inst::StoreMasked {
+                    dst: at,
+                    src: write.value,
+                    mask: k,
+                },
             ])
             .assemble(code);
         }
@@ -1892,20 +1895,42 @@ pub(super) mod driver {
         fn a_masked_store_and_its_mask_encode_as_the_manual_says() {
             let mut c = Vec::new();
             // kmovw k1, ecx — VEX.L0.0F.W0 92 /r
-            AsmProgram::from([kmovw_from_gpr(KReg(1), x86::gpr::RCX)]).assemble(&mut c);
+            Inst::Kmovw {
+                dst: KReg(1),
+                src: x86::gpr::RCX,
+            }
+            .emit_into(&mut c);
             assert_eq!(c, [0xC4, 0xE1, 0x78, 0x92, 0xC9]);
+            // kmovw k2, r9d — the source past r8 clears B
+            let mut c = Vec::new();
+            Inst::Kmovw {
+                dst: KReg(2),
+                src: Gpr(9),
+            }
+            .emit_into(&mut c);
+            assert_eq!(c, [0xC4, 0xC1, 0x78, 0x92, 0xD1]);
             // vmovups [rax]{k1}, zmm4 — EVEX.512.0F.W0 11 /r, aaa = 001
             let mut c = Vec::new();
-            AsmProgram::from([vmovups_store_masked(
-                Mem {
+            Inst::StoreMasked {
+                dst: Mem {
                     base: PtrReg(0),
                     disp: NoDisp,
                 },
-                Reg(4),
-                KReg(1),
-            )])
-            .assemble(&mut c);
+                src: Reg(4),
+                mask: KReg(1),
+            }
+            .emit_into(&mut c);
             assert_eq!(c, [0x62, 0xF1, 0x7C, 0x49, 0x11, 0x20]);
+            // kortestw k1, k1 and k5, k5 — VEX.L0.0F.W0 98 /r, the register in both fields
+            let mut c = Vec::new();
+            for k in [1, 5] {
+                Inst::KorTest {
+                    flags: (),
+                    k: KReg(k),
+                }
+                .emit_into(&mut c);
+            }
+            assert_eq!(c, [0xC5, 0xF8, 0x98, 0xC9, 0xC5, 0xF8, 0x98, 0xED]);
             // vmovq xmm20, rax — EVEX.128.66.0F.W1 6E /r, an extended register
             let mut c = Vec::new();
             Inst::Movq {

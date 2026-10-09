@@ -1168,7 +1168,7 @@ In the new pipeline, none of these is ever written. The legacy code is deleted i
 | H5 | `emit_fmov_imm`'s `w16` path (`aarch64.rs:466-477`) | `movz/movk w16; dup` | Every constant is selected: `movi`, `fmov`, or `ldr q, [p, #off]` | C4 |
 | H6 | `address_in_ip0` (`table.rs:530`), called by `StrQ` (`562`), `LdrQ` (`617`) and `LdrS` (`672`). `LdrS` also serves `emit_uniform_load` (`aarch64.rs:410`) and `index_into`'s slot read (`2269`). `StrX`/`LdrX` panic past `imm12` (`table.rs:589-594`, `644-648`), and `LdrX` serves `Context` (`aarch64.rs:2390-2401`), so a context slot of 4096 or more panics | IP0 as an address, and two panics | Spills: `spill`/`reload` emit `SlotAddr { dst: Write<Pointer>, slot }` (`add t, sp, #hi, lsl 12; add t, t, #lo`); narrow slots always encode. Non-frame loads (`Uniform`, `Context`): selection emits `t = AddImm(base, #hi, lsl 12)`, `ldr [t, #lo]`, and `movz/movk` plus a register `add` past 16 MiB. The binder read is an ordinary reload. One instruction replaces today's chain of `add #4080` | C4 |
 | H7 | `kortestw` bytes hardwiring `k1,k1` (`avx512.rs:647-653`) | An encoder that ignores its register | `KorTest { flags: Write<Flags>, k: Read<Opmask> }` encodes `k.number()` | A11b field; C2 value |
-| H8 | Gather mask `mov eax, 0xFFFF; kmovw k1, eax` (`avx512.rs:749`); `aaa = 001` (`789`); `gpr_temps_for(Gather) = 0` | `rax` and `k1` clobbered, undeclared | `k = KOnes` (`kxnorw k, k, k`: no general register), then `Gather { dst: Early<Vector>, mask: Tie<Opmask> }` | C2 |
+| H8 | Gather mask `mov eax, 0xFFFF; kmovw k1, eax` (`avx512.rs:749`); `aaa = 001` (`789`); `gpr_temps_for(Gather) = 0` | `rax` and `k1` clobbered, undeclared | `k = KOnes` (`kxnorw k, k, k`: no general register), then `Gather { dst: Early<Vector>, mask: Tie<Opmask> }`. `kxnorw` reads its own operand, and `vgatherdps` writes the mask it gathers under, so a `KOnes` on the previous gather's mask chains each gather behind the last (the `mov`/`kmovw` pair only writes). C2 gives `KOnes` a source nothing writes, or measures the chain | C2 |
 | H9 | Gather into `temp(1)`, then `vmovaps` (`avx512.rs:1368-1381`) | A temp plus a move standing in for an early def | `dst: S::Early<Vector>`; the move is gone | C2 |
 | H10 | Fold `t0`/`t1` (`mod.rs:1798`); seed through `t0` (`1825-1826`); `acc = if body_result == t0 {…}` (`1881`) | The driver aliasing registers by hand | Seeds are preheader `Target` arguments; the accumulate is `Binary(combine, acc, body)` | B3 |
 | H11 | `test_ge` borrowing the guard's `k` (`mod.rs:1855`; `avx512.rs:1604-1613`) | One mask register serving two roles | `done` is an ordinary compare; its `Opmask` value is its own | B3, C2 |
@@ -1213,7 +1213,7 @@ The narrowing already removes these, so they are not listed again here: `Item`, 
 
 **A9–A12.** Every free byte-writer in `x86_64.rs`, `avx2.rs`, `avx512.rs`, `aarch64.rs` and `table.rs` becomes an `Inst<S>` arm plus its `encode` arm. Deleted along the way:
 - `emit_test_eax`, `emit_movmskps_eax`, `emit_cmp_al_imm8` (gone at A9 and A10b: `Gp::Test`, `Inst::MoveMask`, `Gp::CmpByte`);
-- `emit_set_gather_mask`, `emit_mask_flags`, `gather(…, base_gpr: u8, …)`;
+- `emit_set_gather_mask`, `emit_mask_flags`, `gather(…, base_gpr: u8, …)` (gone at A11b: `Inst::Ptestm`, `Inst::KorTest`, `Inst::Gather`; the gather's mask set is the transitional `set_gather_mask`, which C2 deletes);
 - aarch64's positional `Inst` (`aarch64.rs:41`) and `BranchIfW16Zero`'s fixed register.
 
 **D1 — the legacy pipeline.**
@@ -1472,17 +1472,16 @@ Every commit in this phase is live in production.
 
 #### A11a / A11b: AVX-512's EVEX and mask instructions are values
 
-- **Files:** `avx512.rs`.
+- **Files:** `avx512.rs`, `x86_64.rs` (the shared operation enums, `Truncate`), `avx2.rs` (the enums it no longer defines), `mod.rs` (the `Opmask` marker; `assemble` and `AsmProgram::new` go).
 - **A11a:** `avx512::Inst<S>` arms for every EVEX instruction that does not name a `k` register: ALU, unary, round, shift, `Fma231`, the `If` blend (`Blend`, one `vpternlogd` with the select table), copy, convert (`Cvtt`, `CvttMem`, `Movq`, `InsertHigh`), and memory (`Load`, `Store`, `StoreBatch`, `Broadcast`, `BroadcastIndexed`). The operation enums both x86 tiers name (`Alu`, `Lanewise`, `Rounding`, `Direction`) move to `x86_64.rs`, each tier giving them its own `vex()` or `evex()`; `x86_64::Convert` and `index_into`'s function-pointer pair give way to a `Truncate` trait that the two `Inst`s implement, so `write_address` is generic over the tier.
 - **A11b:** the `Opmask`-file fields:
-  - `CmpK { dst: Write<Opmask> }`, `Movm2d`, `Ptestm`, `Kand`, `Kor`;
-  - `BlendK { dst, mask: Read<Opmask>, a, b }` (`vblendmps zmm{k}`);
+  - `CmpK { dst: Write<Opmask> }`, `Movm2d`, `Ptestm`;
   - `KorTest { flags, k: Read<Opmask> }`, which encodes `k.number()`;
-  - `Kmovw`, `KOnes`;
+  - `Kmovw`;
   - `Gather { dst: Early, mask: Tie<Opmask> }`, encoding `aaa = mask.number()`;
-  - the masked store.
+  - `StoreMasked`, the remainder's masked store.
 
-  `eax` and `k1` become literals at the construction site.
+  `Pred` joins the shared operation enums in `x86_64.rs`, and the `Opmask` marker is built here. `Kand`, `Kor`, `BlendK` and `KOnes` are not built: nothing selects them until C2's `type Lane`, their first reader (`KOnes` also chains gathers; see H8). The gather keeps `mov eax, 0xFFFF; kmovw k1, eax` as `set_gather_mask`, whose `kmovw` is the two-byte VEX form that `Kmovw` (three bytes) does not encode. C2 deletes it.
 - **Deferred from A9, whose first reader is here:** the `Opmask` marker (`Class::Physical = KReg`).
 - **Bytes:** identical.
 - **Gate:** G each.

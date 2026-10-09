@@ -26,7 +26,7 @@
 
 use super::x86_64;
 use super::x86_64::{
-    Alu, Direction, Disp, Imm8, Imm32, Lanewise, Mem, NoDisp, Rounding, Truncate, frame_slot,
+    Alu, Direction, Disp, Imm8, Imm32, Lanewise, Mem, NoDisp, Pred, Rounding, Truncate, frame_slot,
 };
 use super::{
     AsmInsn, AsmProgram, EncodedInst, Gpr, Integer, Physical, Pointer, PtrReg, Reg, Stage, Vector,
@@ -246,18 +246,6 @@ impl Alu {
             Alu::IAdd => Vex::m0f_66(0xFE),
         }
     }
-}
-
-/// The predicate of a `vcmpps`: its imm8.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Pred {
-    Eq = 0,
-    Lt = 1,
-    Le = 2,
-    Ne = 4,
-    Ge = 5,
-    /// `>`: the unordered-safe "not less-or-equal".
-    Nle = 6,
 }
 
 impl Lanewise {
