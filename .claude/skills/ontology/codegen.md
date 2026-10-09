@@ -332,7 +332,10 @@
   reload targets are per-instruction roles.
 - **Lives:** `Where::{Spilled, Remat}`, `LinearScan`
   (`pixelflow-codegen/src/emit/regalloc/mod.rs`); escape-hatches step 2 and the
-  2026-09-05 block.
+  2026-09-05 block. The selection pipeline's first allocator,
+  `regalloc::local::allocate`, is this taken to its limit: every value is
+  stored at its definition and reloaded at every read, so nothing is in a
+  register across an instruction but a `Flags` value.
 
 ### Slot. Homonym
 
@@ -372,7 +375,10 @@
   allocation.
 - **Lives:** `NestAllocation::new` (`pixelflow-codegen/src/emit/regalloc/mod.rs`),
   `StackFrame` (`emit/storage.rs`); the
-  `a_folds_spill_slots_do_not_alias_its_parents` guard (`emit/mod.rs`).
+  `a_folds_spill_slots_do_not_alias_its_parents` guard (`emit/mod.rs`). The
+  selection pipeline's is `regalloc::resource::Frame`, laid out by
+  `regalloc::local::allocate` from value intervals before any instruction is
+  bound.
 
 ### Arm ownership. Homonym of Arm
 
@@ -451,7 +457,10 @@
   with no counter and no back edge.
 - **Lives:** decided in `docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md`
   (R1: "the accumulate is an ordinary `Binary` def … the allocator learns
-  nothing about folds"); today emitted by verbs in
+  nothing about folds"); selected as blocks by `Selector::fold`
+  (`pixelflow-codegen/src/emit/select.rs`, B3 of
+  `docs/plans/2026-10-08-selection-is-a-phase.md`, unused until B4), whose
+  `Loop::trips` is the body's runs per call; today emitted by verbs in
   `pixelflow-codegen/src/emit/mod.rs`'s `Reduce` arm ("seed, test, body,
   combine, step", with `Scratch::REDUCE_TEMPS`, labels
   `reduce{vid}_top`/`reduce{vid}_exit`), which contradicts it.
@@ -543,7 +552,10 @@
   instruction enums: `Gp<S>`, x86's general-register instructions, generic
   over a `Stage` and with named fields typed by `Class` (`emit/x86_64.rs`);
   `Inst<S>` in `emit/avx2.rs` and `emit/avx512.rs`, the VEX and EVEX
-  instructions, over the same vocabulary; `Inst` in `emit/aarch64.rs`. Today
+  instructions, over the same vocabulary, and `avx2::Op<S>`, the instruction
+  AVX2's selection puts in a block; `Inst` in `emit/aarch64.rs`. One encoder
+  serves the legacy `Physical` stage and the allocator's `Bound` one, through
+  `Placed` (`emit/mod.rs`), until D1. Today
   most emission is `LegacyBackend` verbs writing bytes inline ("Instructions:
   bytes written inline by ~236 functions, not values", denotational-diagnosis;
   e.g. `emit_write(&mut self, code: &mut Vec<u8>, …)`), which contradicts
@@ -552,7 +564,7 @@
 ### Branch
 
 - **Is:** "A branch is an ordinary instruction": `Gp::Jmp { to }` and
-  `Gp::Jcc { cond, flags, taken, next }` and `Gp::Fallthrough` on x86; `B`, `BCond` and `CbzFar` on
+  `Gp::Jcc { cond, flags, taken, next }` and `Gp::Fallthrough` on x86; `B` and `CbzFar` on
   aarch64. The condition is the opcode's own field (`Cond`, whose
   discriminants are the manual's values).
 - **Is not:** something that returns a position. Not hand-picked mnemonics
@@ -658,4 +670,7 @@
   (`pixelflow-codegen/src/isa/mod.rs`), `emit::compile_native`
   (`pub(crate)`, `emit/mod.rs`, which calls `detect()` itself);
   `2026-09-22-the-isa-is-decided-at-startup.md`; CLAUDE.md "SIMD Backend
-  Selection".
+  Selection". While the selection series is in flight, `PIXELFLOW_CODEGEN=
+  legacy|selection` (default `legacy`, read once like `detect`) picks the
+  pipeline per process, and `selection` on a tier with no selection backend is
+  refused, never downgraded (`emit::pipeline`).

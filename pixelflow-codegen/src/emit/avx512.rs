@@ -187,7 +187,7 @@ impl Evex {
             0x0F,
             1,
         );
-        x86_64::mem_operand_into(&mut inst, reg, addr);
+        x86_64::mem_operand_into(&mut inst, reg, addr.base.0, addr.disp);
         inst
     }
 
@@ -207,7 +207,7 @@ impl Evex {
             0x0F,
             1,
         );
-        x86_64::scaled4_operand_into(&mut inst, reg, base, index);
+        x86_64::scaled4_operand_into(&mut inst, reg, base.0, index.0);
         inst
     }
 
@@ -228,7 +228,7 @@ impl Evex {
             0x0F,
             vp,
         );
-        x86_64::vsib4_operand_into(&mut inst, reg, base, index);
+        x86_64::vsib4_operand_into(&mut inst, reg, base.0, index.0);
         inst
     }
 
@@ -573,18 +573,18 @@ fn temps_for(op: &super::ScheduledOp) -> u8 {
 /// How many GPRs this backend's encoding of `op` needs beyond
 /// [`regalloc::RegisterFile::gpr_ctx`](crate::emit::regalloc::RegisterFile::gpr_ctx).
 ///
-/// `Gather` and `Uniform` need none: the base each addresses is a pointer
-/// value the allocator carries, and `vgatherdps` takes its indices as a
-/// vector. `Broadcast` needs one for its index, since it addresses the
-/// element through a SIB. A `Write` converts its row and column into one
-/// each before combining them into the address, and the remainder's
+/// `Uniform` needs none: the base it addresses is a pointer value the
+/// allocator carries. `Gather` takes its indices as a vector, so its one is
+/// for the writemask's all-ones. `Broadcast` needs one for its index, since it
+/// addresses the element through a SIB. A `Write` converts its row and column
+/// into one each before combining them into the address, and the remainder's
 /// writemask rides in through the second once the address is done with it;
 /// the iota carries each eight bytes in through one.
 fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
         ScheduledOp::Write { .. } => 2,
-        ScheduledOp::Broadcast(..) | ScheduledOp::Lanes(_) => 1,
+        ScheduledOp::Broadcast(..) | ScheduledOp::Lanes(_) | ScheduledOp::Gather(..) => 1,
         _ => 0,
     }
 }
@@ -593,8 +593,8 @@ fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
 ///
 /// A comparison's `vcmpps` destination — `k1`, chosen by hand before this
 /// work and now a `RegisterFile::mask_scratch` reservation — a gather's
-/// writemask, and a remainder store's writemask. Every other op either has no mask (arithmetic) or
-/// reads the mask as an ordinary vector (`If`).
+/// writemask, and a remainder store's writemask. Every other op either has no
+/// mask (arithmetic) or reads the mask as an ordinary vector (`If`).
 fn mask_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
@@ -609,21 +609,25 @@ fn mask_temps_for(op: &super::ScheduledOp) -> u8 {
 // The store, and the iota
 // =============================================================================
 
-/// Set the gather's writemask `mask` to all-ones: `mov eax, 0xFFFF`, then
-/// `kmovw mask, eax` in the two-byte VEX prefix, which [`Inst::Kmovw`] (the
+/// Set the gather's writemask `mask` to all-ones: `mov ones, 0xFFFF`, then
+/// `kmovw mask, ones` in the two-byte VEX prefix, which [`Inst::Kmovw`] (the
 /// three-byte form) does not encode. A gather clears the bits it completes, so
-/// this runs before each one, and it clobbers `eax`. A `kxnorw k1, k1, k1`
-/// would need neither `eax` nor a second instruction, but it reads the mask
-/// the previous gather is still clearing, which chains each gather behind the
-/// last. C2 allocates the mask and picks.
-fn set_gather_mask(code: &mut Vec<u8>, mask: KReg) {
+/// this runs before each one, and it clobbers `ones`, the gather's declared
+/// GPR temp. A `kxnorw k1, k1, k1` would need neither a GPR nor a second
+/// instruction, but it reads the mask the previous gather is still clearing,
+/// which chains each gather behind the last. C2 allocates the mask and picks.
+fn set_gather_mask(code: &mut Vec<u8>, mask: KReg, ones: Gpr) {
+    assert!(
+        ones.0 < 8,
+        "the two-byte VEX prefix has no bit to extend r/m"
+    );
     x86_64::Gp::MovImm32 {
-        dst: x86_64::gpr::RAX,
+        dst: ones,
         imm: 0xFFFF,
     }
     .emit_into(code);
-    // ModRM `11 mask eax`: the mask in the reg field, `eax` (0) in r/m.
-    let modrm = 0xC0 | (mask.0 << 3);
+    // ModRM `11 mask ones`: the mask in the reg field, `ones` in r/m.
+    let modrm = 0xC0 | (mask.0 << 3) | ones.0;
     EncodedInst::from_slice(&[0xC5, 0xF8, 0x92, modrm]).emit_into(code);
 }
 
@@ -1063,7 +1067,7 @@ mod tests {
         /// as the driver does before every gather.
         fn gather_through_k1(c: &mut Vec<u8>, dst: Reg, base: PtrReg, index: Reg) {
             let mask = KReg(1);
-            set_gather_mask(c, mask);
+            set_gather_mask(c, mask, x86_64::gpr::RAX);
             Inst::Gather {
                 dst,
                 base,
@@ -1337,12 +1341,13 @@ mod tests {
         #[test]
         fn a_gather_addresses_high_numbered_vector_registers_and_a_gpr_base() {
             skip_unless_avx512_is_selected!();
-            // The production driver always gathers through rax (base_gpr=0)
-            // with dst/idx below zmm16 in every kernel this test suite
-            // compiles, so `a_gather_reads_the_value_at_each_lanes_index`
-            // never sets the R'/B/V' extension bits this emitter also has to
-            // encode. Move the base pointer into r9 (>= r8) and gather
-            // into/from zmm registers >= 16 to pin them, mirroring
+            // The production driver's gather base is a pointer in r9-r11 (rax
+            // is clobbered just before the gather), and its dst/idx are below
+            // zmm16 in every kernel this test suite compiles, so
+            // `a_gather_reads_the_value_at_each_lanes_index` never sets the
+            // R'/B/V' extension bits this emitter also has to encode. Move the
+            // base pointer into r9 (>= r8) and gather into/from zmm registers
+            // >= 16 to pin them, mirroring
             // `emit_binary_writes_a_high_numbered_register`'s zmm20 case.
             let mut c = Vec::new();
             x86_64::Gp::Mov {
@@ -1461,17 +1466,17 @@ pub(super) mod driver {
         gpr_out: Some(x86::gpr::RSI),
         gpr_pitch: Some(x86::gpr::RDX),
         // rax/rcx: the broadcast's index, the store's row and column, the
-        // iota's bytes. `vgatherdps`'s native addressing needs no per-lane
-        // index GPR.
+        // iota's bytes, a gather's all-ones. `vgatherdps`'s native addressing
+        // needs no per-lane index GPR.
         gpr_scratch: regalloc::GprSet::of(&[x86::gpr::RAX, x86::gpr::RCX]),
         gpr_temps_for: super::gpr_temps_for,
         // r9-r11: the pointer class's pool, the caller-saved GPRs left after
         // the arguments, the scratch and `r8` (the constant pool's anchor).
         pointers: regalloc::GprSet::of(&[x86::gpr::R9, x86::gpr::R10, x86::gpr::R11]),
         // AVX-512's mask-register file: k1, transient scratch for a
-        // compare's `vcmpps` destination, a guard's `vptestmd` destination
-        // and a remainder store's writemask, never the same instruction's
-        // use of two at once.
+        // compare's `vcmpps` destination, a guard's `vptestmd` destination,
+        // a gather's writemask and a remainder store's writemask, never the
+        // same instruction's use of two at once.
         mask_scratch: regalloc::MaskSet::of(&[KReg(1)]),
         mask_temps_for: super::mask_temps_for,
         // `vptestmd`'s k-register destination, reduced to flags by
@@ -1603,7 +1608,8 @@ pub(super) mod driver {
                     }
                     .emit_into(code);
                     let mask = crate::emit::declared_mask_temp(plan.scratch.mask_temp(0));
-                    super::set_gather_mask(code, mask);
+                    let ones = crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0));
+                    super::set_gather_mask(code, mask, ones);
                     Inst::Gather {
                         dst: gather_dst,
                         base: *base,

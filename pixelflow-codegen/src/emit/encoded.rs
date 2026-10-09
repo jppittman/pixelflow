@@ -60,7 +60,7 @@ impl EncodedInst {
     /// Return the encoded instruction bytes as a slice.
     #[must_use]
     #[inline]
-    fn as_bytes(&self) -> &[u8] {
+    pub(super) fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len as usize]
     }
 }

@@ -4,16 +4,14 @@
 //! [`Pending`] are private to it, so a definition can only be made by a
 //! [`Builder`], and a [`Function`] only leaves one through
 //! [`Builder::finish`], which asserts the invariants its doc names.
-#![expect(dead_code, reason = "live from B4")]
 
 use super::{
     Block, Class, ClassId, Constant, Constants, Entry, Function, IsaBackend, Label, Labels, Loop,
-    Operand, Scope, Selected, Spill, Target, Value, ValueName, operands,
+    Operand, Pushed, Scope, Selected, Spill, Target, Value, ValueName, operands,
 };
 use crate::error::CompileError;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::marker::PhantomData;
 
 /// The right to define one fresh value of class `C`.
 ///
@@ -78,52 +76,55 @@ impl Pending {
         self.label
     }
 
-    /// Parameter `i` as a `Value<C>`.
-    ///
-    /// # Panics
-    /// If the parameter is not of class `C`.
-    pub(super) fn param<C: Class>(&self, i: usize) -> Value<C> {
-        value(self.params[i])
+    /// The parameters, as the allocator names them.
+    pub(super) fn params(&self) -> &[ValueName] {
+        &self.params
     }
 }
 
 impl Entry {
     fn of([ctx, out, pitch]: [ValueName; 3]) -> Self {
         Self {
-            ctx: value(ctx),
-            out: value(out),
-            pitch: value(pitch),
+            ctx: ctx.typed(),
+            out: out.typed(),
+            pitch: pitch.typed(),
         }
     }
 }
 
-/// `name` as a `Value<C>`.
-///
-/// # Panics
-/// If `name` is not of class `C`.
-fn value<C: Class>(name: ValueName) -> Value<C> {
-    assert_eq!(name.class, C::ID, "{name:?} is not of the class asked for");
-    Value {
-        id: name.id,
-        _class: PhantomData,
-    }
+/// A block's successors: the `Target` operands of its last instruction.
+fn targets<I>(block: &Block<Pushed<I>>) -> impl Iterator<Item = &Target> {
+    block
+        .insts
+        .last()
+        .into_iter()
+        .flat_map(|pushed| &pushed.operands)
+        .filter_map(|operand| match operand {
+            Operand::Target(target) => Some(target),
+            Operand::Reg { .. } | Operand::Frame(_) => None,
+        })
+}
+
+/// Whether the block's last instruction branches: nothing follows it.
+fn ended<I>(block: &Block<Pushed<I>>) -> bool {
+    targets(block).next().is_some()
 }
 
 /// How selection writes a function, one block at a time.
 pub(super) struct Builder<B: IsaBackend> {
     labels: Labels,
-    /// One entry per value minted: whether its definition has been pushed.
-    /// A value's id is its index.
+    /// One entry per value minted: its class, and whether its definition has
+    /// been pushed. A value's id is its index.
+    classes: Vec<ClassId>,
     defined: Vec<bool>,
     /// In layout order. The last is open.
-    blocks: Vec<Block<B::Inst<Selected>>>,
-    /// The targets of each block's last instruction; empty until it has one.
-    successors: Vec<Vec<Target>>,
+    blocks: Vec<Block<Pushed<B::Inst<Selected>>>>,
     loops: Vec<Loop>,
     constants: Constants<B::Constant>,
     interned: BTreeMap<B::Constant, Constant>,
     /// Blocks minted and not yet entered.
     pending: usize,
+    #[expect(dead_code, reason = "live from C4")]
     anchors: B::Anchors,
 }
 
@@ -138,9 +139,9 @@ impl<B: IsaBackend> Builder<B> {
         let head = labels.mint();
         let mut builder = Self {
             labels,
+            classes: Vec::new(),
             defined: Vec::new(),
             blocks: Vec::new(),
-            successors: Vec::new(),
             loops: Vec::new(),
             constants,
             interned: BTreeMap::new(),
@@ -156,12 +157,13 @@ impl<B: IsaBackend> Builder<B> {
 
     fn mint(&mut self, class: ClassId) -> ValueName {
         let id = self.defined.len() as u64;
+        self.classes.push(class);
         self.defined.push(false);
         ValueName { id, class }
     }
 
     fn fresh<C: Class>(&mut self) -> Value<C> {
-        value(self.mint(C::ID))
+        self.mint(C::ID).typed()
     }
 
     fn open(&mut self, label: Label, params: Vec<ValueName>, scope: Scope) {
@@ -171,7 +173,6 @@ impl<B: IsaBackend> Builder<B> {
             insts: Vec::new(),
             scope,
         });
-        self.successors.push(Vec::new());
     }
 
     pub(super) fn def<C: Class>(&mut self) -> Def<C> {
@@ -180,6 +181,7 @@ impl<B: IsaBackend> Builder<B> {
         }
     }
 
+    #[expect(dead_code, reason = "live from B8")]
     pub(super) fn early<C: Class>(&mut self) -> Early<C> {
         Early {
             value: self.fresh(),
@@ -200,14 +202,18 @@ impl<B: IsaBackend> Builder<B> {
     /// - the open block has ended;
     /// - a write not minted by this builder, or already defined;
     /// - a read of a value not yet defined, which includes a read of a value
-    ///   this same instruction defines.
+    ///   this same instruction defines;
+    /// - an [`Operand::Frame`]: only the instructions the allocator inserts
+    ///   carry a slot.
     pub(super) fn push(&mut self, inst: B::Inst<Selected>) {
         let open = self.blocks.len() - 1;
         assert!(
-            self.successors[open].is_empty(),
+            !ended(&self.blocks[open]),
             "{:?} has ended: nothing follows a branch in its block",
             self.blocks[open].label
         );
+        // The one walk of this instruction: the block keeps the list beside it,
+        // for the allocator.
         let operands = operands::<B>(&inst);
         for operand in &operands {
             match operand {
@@ -219,14 +225,13 @@ impl<B: IsaBackend> Builder<B> {
                 ),
             }
         }
-        for operand in operands {
+        for operand in &operands {
             match operand {
-                Operand::Reg { value, access } if !access.reads() => self.define(value),
-                Operand::Reg { .. } | Operand::Frame(_) => {}
-                Operand::Target(target) => self.successors[open].push(target),
+                Operand::Reg { value, access } if !access.reads() => self.define(*value),
+                Operand::Reg { .. } | Operand::Frame(_) | Operand::Target(_) => {}
             }
         }
-        self.blocks[open].insts.push(inst);
+        self.blocks[open].insts.push(Pushed { inst, operands });
     }
 
     fn assert_defined(&self, value: ValueName) {
@@ -262,7 +267,7 @@ impl<B: IsaBackend> Builder<B> {
     pub(super) fn enter(&mut self, block: Pending) {
         let open = self.blocks.len() - 1;
         assert!(
-            !self.successors[open].is_empty(),
+            ended(&self.blocks[open]),
             "{:?} ends without a branch, and {:?} follows it",
             self.blocks[open].label,
             block.label
@@ -310,6 +315,7 @@ impl<B: IsaBackend> Builder<B> {
 
     /// Per-function selection state the backend keeps (aarch64: the pool base
     /// value).
+    #[expect(dead_code, reason = "live from C4")]
     pub(super) fn anchors(&mut self) -> &mut B::Anchors {
         &mut self.anchors
     }
@@ -317,14 +323,18 @@ impl<B: IsaBackend> Builder<B> {
     /// The finished function: its open block is the exit.
     ///
     /// # Panics
-    /// If any invariant of [`Function`] does not hold, or a block was minted
-    /// and never entered. Each is a selection bug, never a fact about a
-    /// kernel.
+    /// If any invariant of [`Function`] does not hold, a block was minted and
+    /// never entered, or a value was minted and never defined (a dropped
+    /// [`Def`], [`Early`] or [`Tie`]). Each is a selection bug, never a fact
+    /// about a kernel.
     pub(super) fn finish(self) -> Function<B> {
         assert_eq!(self.pending, 0, "a block was minted and never entered");
+        if let Some(id) = self.defined.iter().position(|&defined| !defined) {
+            panic!("value {id} was minted and its definition dropped: nothing writes it");
+        }
         let exit = self.blocks.len() - 1;
         assert!(
-            self.successors[exit].is_empty(),
+            !ended(&self.blocks[exit]),
             "{:?} ends in a branch, so the function has no exit",
             self.blocks[exit].label
         );
@@ -340,10 +350,11 @@ impl<B: IsaBackend> Builder<B> {
         };
 
         let mut latches: Vec<Option<usize>> = alloc::vec![None; self.loops.len()];
-        for (i, targets) in self.successors.iter().enumerate() {
-            let from = self.blocks[i].label;
+        for (i, block) in self.blocks.iter().enumerate() {
+            let from = block.label;
+            let targets: Vec<&Target> = targets(block).collect();
             assert!(targets.len() <= 2, "{from:?} has {} targets", targets.len());
-            for target in targets {
+            for &target in &targets {
                 let to = block_of(target.label);
                 let params = &self.blocks[to].params;
                 assert!(
@@ -371,7 +382,7 @@ impl<B: IsaBackend> Builder<B> {
                     target.label
                 );
             }
-            if let [_, next] = targets.as_slice() {
+            if let [_, next] = targets[..] {
                 assert!(
                     self.blocks
                         .get(i + 1)
@@ -394,9 +405,9 @@ impl<B: IsaBackend> Builder<B> {
                 (block_of(l.head), latch)
             })
             .collect();
-        for (i, targets) in self.successors.iter().enumerate() {
-            let from = self.blocks[i].label;
-            for target in targets {
+        for (i, block) in self.blocks.iter().enumerate() {
+            let from = block.label;
+            for target in targets(block) {
                 let to = block_of(target.label);
                 if to <= i + 1 {
                     continue;
@@ -426,6 +437,8 @@ impl<B: IsaBackend> Builder<B> {
             loops: self.loops,
             constants: self.constants,
             labels: self.labels,
+            classes: self.classes,
+            scheduled: Vec::new(),
         }
     }
 }
@@ -436,11 +449,11 @@ impl<B: IsaBackend> Builder<B> {
 pub(super) struct Spiller<'a, B: IsaBackend> {
     /// The next value id: the allocator continues the function's numbering.
     next: &'a mut u64,
-    insts: &'a mut Vec<B::Inst<Selected>>,
+    insts: &'a mut Vec<Pushed<B::Inst<Selected>>>,
 }
 
 impl<'a, B: IsaBackend> Spiller<'a, B> {
-    pub(super) fn new(next: &'a mut u64, insts: &'a mut Vec<B::Inst<Selected>>) -> Self {
+    pub(super) fn new(next: &'a mut u64, insts: &'a mut Vec<Pushed<B::Inst<Selected>>>) -> Self {
         Self { next, insts }
     }
 
@@ -448,11 +461,14 @@ impl<'a, B: IsaBackend> Spiller<'a, B> {
         let id = *self.next;
         *self.next += 1;
         Def {
-            value: value(ValueName { id, class: C::ID }),
+            value: ValueName { id, class: C::ID }.typed(),
         }
     }
 
+    /// Append `inst` with its operand list, which is computed here and
+    /// nowhere else.
     pub(in crate::emit) fn push(&mut self, inst: B::Inst<Selected>) {
-        self.insts.push(inst);
+        let operands = operands::<B>(&inst);
+        self.insts.push(Pushed { inst, operands });
     }
 }

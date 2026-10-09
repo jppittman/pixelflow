@@ -21,8 +21,12 @@
 //! is written, and a trait method that disappears is a compile error rather
 //! than a silently dropped term.
 
+use super::asm::Assembled;
+use super::regalloc::local::{Allocated, Origin};
 use super::regalloc::{Scope, ValueId};
-use super::{Binding, InstructionPlan, LegacyBackend, Loc, PtrReg, Reg, Reload, WritePlan};
+use super::{
+    Binding, InstructionPlan, IsaBackend, LegacyBackend, Loc, PtrReg, Reg, Reload, WritePlan,
+};
 use crate::error::CompileError;
 use alloc::vec::Vec;
 
@@ -103,6 +107,49 @@ impl EmitTraffic {
         scopes
     }
 
+    /// What an allocated kernel contains, read off its blocks: each scope's
+    /// instructions as the driver tallied them, its loads and stores by why the
+    /// allocator inserted them, and its bytes between its blocks' addresses.
+    /// The function's frame and return are the body's instructions here, so
+    /// the scaffold is empty, and no register is reserved or carried.
+    #[must_use]
+    pub(super) fn of<B: IsaBackend>(allocated: &Allocated<'_, B>, assembled: &Assembled) -> Self {
+        let mut scopes = alloc::vec![ScopeTraffic::default(); allocated.scheduled.len()];
+        for (scope, &instructions) in scopes.iter_mut().zip(&allocated.scheduled) {
+            scope.instructions = instructions;
+        }
+        let ends = allocated
+            .blocks
+            .iter()
+            .skip(1)
+            .map(|block| block.label)
+            .chain([allocated.text_end]);
+        let mut trips = alloc::vec![1; scopes.len()];
+        for (block, end) in allocated.blocks.iter().zip(ends) {
+            let scope = &mut scopes[scope_ix(block.scope)];
+            scope.bytes += (assembled.address(end) - assembled.address(block.label)) as u64;
+            for emitted in &block.insts {
+                match emitted.origin {
+                    Origin::Selected => {}
+                    Origin::Reload => scope.loads += 1,
+                    Origin::Spill => scope.stores += 1,
+                }
+            }
+            // A loop's head is the first block of its fold's scope.
+            if let Some(looped) = allocated.loops.iter().find(|l| l.head == block.label) {
+                trips[scope_ix(block.scope)] = looped.trips;
+            }
+        }
+        Self {
+            scopes,
+            trips,
+            scaffold: ScopeTraffic::default(),
+            vector_bytes: B::FILE.vector_bytes() as u32,
+            pool: 0,
+            carried: 0,
+        }
+    }
+
     /// The body's traffic: what runs once per call.
     #[must_use]
     pub fn body(&self) -> ScopeTraffic {
@@ -126,7 +173,7 @@ impl EmitTraffic {
 }
 
 /// The index a scope's count is kept under: the body first, then the folds.
-fn scope_ix(scope: Scope) -> usize {
+pub(super) fn scope_ix(scope: Scope) -> usize {
     match scope {
         Scope::Body => 0,
         Scope::Fold(j) => j + 1,

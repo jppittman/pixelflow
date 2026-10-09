@@ -320,7 +320,8 @@ pub fn features_of(result: &CompileResult) -> StaticFeatures {
         body: scope(&inner_loop),
         scaffold: scope(&t.scaffold),
         spill_slots: result.spill_count,
-        frame_bytes: result.spill_bytes,
+        frame_bytes: u32::try_from(result.frame_bytes)
+            .expect("the frame is capped at 2 MiB, which a u32 holds"),
         hoisted: result.hoisted_values,
         carried: t.carried,
         pool: u32::from(t.pool),

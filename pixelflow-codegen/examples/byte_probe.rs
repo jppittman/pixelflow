@@ -331,8 +331,8 @@ fn print_sibling_row(row: &SiblingRow) {
     };
     let t = &r.traffic;
     println!(
-        "    compile: spill_count={} spill_bytes={} hoisted_values={} vector_bytes={} pool={}",
-        r.spill_count, r.spill_bytes, r.hoisted_values, t.vector_bytes, t.pool
+        "    compile: spill_count={} frame_bytes={} hoisted_values={} vector_bytes={} pool={}",
+        r.spill_count, r.frame_bytes, r.hoisted_values, t.vector_bytes, t.pool
     );
     println!(
         "    traffic: carried={} scopes={}",

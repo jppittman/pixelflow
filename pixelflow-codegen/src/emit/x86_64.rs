@@ -12,9 +12,10 @@
 //! the 128-bit tier that used to sit in this file is gone
 //! (docs/plans/2026-09-22-the-isa-is-decided-at-startup.md §7).
 
+use super::asm::Encoding;
 use super::{
     AsmInsn, Assembly, Binding, EncodedInst, Flags, Gpr, Integer, Label, LabelRef, Loc, Physical,
-    Pointer, PtrReg, Reg, Stage, WritePlan, regalloc,
+    Placed, Pointer, PtrReg, Rebind, Reg, Selected, Stage, WritePlan, regalloc,
 };
 use crate::error::CompileError;
 use alloc::collections::BTreeMap;
@@ -294,6 +295,13 @@ pub(super) enum Gp<S: Stage> {
         dst: S::Write<Pointer>,
         src: S::Read<Pointer>,
     },
+    /// `mov dst, src`, an integer between registers: the same bytes as
+    /// [`Gp::Mov`], and not the same instruction, because an address and an
+    /// integer are different classes.
+    MovInt {
+        dst: S::Write<Integer>,
+        src: S::Read<Integer>,
+    },
     /// `mov r32, imm32`: zero-extended into the 64-bit register.
     MovImm32 { dst: S::Write<Integer>, imm: u32 },
     /// `movabs dst, imm64`
@@ -328,6 +336,26 @@ pub(super) enum Gp<S: Stage> {
         dst: Mem<S, Imm32>,
         src: S::Read<Pointer>,
     },
+    /// `mov [rsp + slot], src`: the allocator's spill of an address.
+    SpillPtr {
+        src: S::Read<Pointer>,
+        slot: S::Slot,
+    },
+    /// `mov dst, [rsp + slot]`: the allocator's reload of an address.
+    ReloadPtr {
+        dst: S::Write<Pointer>,
+        slot: S::Slot,
+    },
+    /// `mov [rsp + slot], src`: the allocator's spill of an integer.
+    SpillInt {
+        src: S::Read<Integer>,
+        slot: S::Slot,
+    },
+    /// `mov dst, [rsp + slot]`: the allocator's reload of an integer.
+    ReloadInt {
+        dst: S::Write<Integer>,
+        slot: S::Slot,
+    },
     /// `test src32, src32`: ZF iff the low half is zero.
     Test {
         flags: S::Write<Flags>,
@@ -355,7 +383,6 @@ pub(super) enum Gp<S: Stage> {
     Jmp { to: S::Target },
     /// Go to the position laid out right after this instruction: encodes to
     /// nothing, and is what a transfer to the next block is.
-    #[expect(dead_code, reason = "live from B3")]
     Fallthrough { to: S::Target },
     /// `lea dst, [rip + to]`: a position's address, in one instruction.
     LeaRip {
@@ -414,76 +441,191 @@ impl Gp<Physical> {
             next,
         }
     }
+}
 
-    fn encode(self) -> EncodedInst {
+impl Gp<Selected> {
+    /// Rebuild at stage `T`, visiting each operand once, in field order.
+    pub(super) fn walk<T: Stage>(&self, f: &mut impl Rebind<T>) -> Gp<T> {
+        match self {
+            Gp::Mov { dst, src } => Gp::Mov {
+                dst: f.write(dst),
+                src: f.read(*src),
+            },
+            Gp::MovInt { dst, src } => Gp::MovInt {
+                dst: f.write(dst),
+                src: f.read(*src),
+            },
+            Gp::MovImm32 { dst, imm } => Gp::MovImm32 {
+                dst: f.write(dst),
+                imm: *imm,
+            },
+            Gp::Movabs { dst, imm } => Gp::Movabs {
+                dst: f.write(dst),
+                imm: *imm,
+            },
+            Gp::Imul { dst, src, flags } => Gp::Imul {
+                dst: f.tie(dst),
+                src: f.read(*src),
+                flags: f.write(flags),
+            },
+            Gp::Add { dst, src, flags } => Gp::Add {
+                dst: f.tie(dst),
+                src: f.read(*src),
+                flags: f.write(flags),
+            },
+            Gp::Lea4 { dst, base, index } => Gp::Lea4 {
+                dst: f.write(dst),
+                base: f.read(*base),
+                index: f.read(*index),
+            },
+            Gp::MovLoad { dst, src } => Gp::MovLoad {
+                dst: f.write(dst),
+                src: src.walk(f),
+            },
+            Gp::MovStore { dst, src } => Gp::MovStore {
+                dst: dst.walk(f),
+                src: f.read(*src),
+            },
+            Gp::SpillPtr { src, slot } => Gp::SpillPtr {
+                src: f.read(*src),
+                slot: f.slot(*slot),
+            },
+            Gp::ReloadPtr { dst, slot } => Gp::ReloadPtr {
+                dst: f.write(dst),
+                slot: f.slot(*slot),
+            },
+            Gp::SpillInt { src, slot } => Gp::SpillInt {
+                src: f.read(*src),
+                slot: f.slot(*slot),
+            },
+            Gp::ReloadInt { dst, slot } => Gp::ReloadInt {
+                dst: f.write(dst),
+                slot: f.slot(*slot),
+            },
+            Gp::Test { flags, src } => Gp::Test {
+                flags: f.write(flags),
+                src: f.read(*src),
+            },
+            Gp::CmpByte { flags, src, imm } => Gp::CmpByte {
+                flags: f.write(flags),
+                src: f.read(*src),
+                imm: *imm,
+            },
+            Gp::Jcc {
+                cond,
+                flags,
+                taken,
+                next,
+            } => Gp::Jcc {
+                cond: *cond,
+                flags: f.read(*flags),
+                taken: f.target(taken),
+                next: f.target(next),
+            },
+            Gp::Jmp { to } => Gp::Jmp { to: f.target(to) },
+            Gp::Fallthrough { to } => Gp::Fallthrough { to: f.target(to) },
+            // A position's address is a data label, which `walk` would
+            // report as a branch: selection reads its constants RIP-relative
+            // and never selects this.
+            Gp::LeaRip { .. } => unreachable!("selection never selects `lea dst, [rip + to]`"),
+            Gp::Enter { size: _, flags } => Gp::Enter {
+                size: f.frame_size(),
+                flags: f.write(flags),
+            },
+            Gp::Ret { size: _, flags } => Gp::Ret {
+                size: f.frame_size(),
+                flags: f.write(flags),
+            },
+        }
+    }
+}
+
+impl<S: Placed> Gp<S> {
+    pub(super) fn encode(&self) -> EncodedInst {
         let mut inst = EncodedInst::new();
         match self {
-            Gp::Mov { dst, src } => inst.extend(&rr(0x89, dst.as_gpr(), src.as_gpr())),
+            Gp::Mov { dst, src } => {
+                inst.extend(&rr(0x89, S::write::<Pointer>(dst), S::read::<Pointer>(src)));
+            }
+            Gp::MovInt { dst, src } => {
+                inst.extend(&rr(0x89, S::write::<Integer>(dst), S::read::<Integer>(src)));
+            }
             Gp::MovImm32 { dst, imm } => {
-                if dst.0 >= 8 {
+                let dst = S::write::<Integer>(dst);
+                if dst >= 8 {
                     inst.push(0x41);
                 }
-                inst.push(0xB8 | (dst.0 & 7));
+                inst.push(0xB8 | (dst & 7));
                 inst.extend(&imm.to_le_bytes());
             }
             Gp::Movabs { dst, imm } => {
-                inst.push(0x48 | ((dst.0 >> 3) & 1));
-                inst.push(0xB8 | (dst.0 & 7));
+                let dst = S::write::<Integer>(dst);
+                inst.push(0x48 | ((dst >> 3) & 1));
+                inst.push(0xB8 | (dst & 7));
                 inst.extend(&imm.to_le_bytes());
             }
-            Gp::Imul {
-                dst,
-                src,
-                flags: (),
-            } => {
-                inst.extend(&[rex_w(dst, src), 0x0F, 0xAF, modrm_rr(dst.0, src)]);
+            Gp::Imul { dst, src, .. } => {
+                let (dst, src) = (S::tie::<Integer>(dst), S::read::<Integer>(src));
+                inst.extend(&[rex_w(dst, src), 0x0F, 0xAF, modrm_rr(dst, src)]);
             }
-            Gp::Add {
-                dst,
-                src,
-                flags: (),
-            } => inst.extend(&rr(0x01, dst, src)),
+            Gp::Add { dst, src, .. } => {
+                inst.extend(&rr(0x01, S::tie::<Integer>(dst), S::read::<Integer>(src)));
+            }
             // `rbp`/`r13` have no `mod = 00` form as a SIB base (that
             // encoding means "no base"), so those two take `mod = 01` with a
             // zero `disp8`.
             Gp::Lea4 { dst, base, index } => {
-                debug_assert!(index.0 & 7 != RM_SIB, "rsp/r12 cannot index a SIB");
-                let disp8_form = base.0 & 7 == RM_RIP_AT_MOD0;
+                let (dst, base, index) = (
+                    S::write::<Pointer>(dst),
+                    S::read::<Pointer>(base),
+                    S::read::<Integer>(index),
+                );
+                debug_assert!(index & 7 != RM_SIB, "rsp/r12 cannot index a SIB");
+                let disp8_form = base & 7 == RM_RIP_AT_MOD0;
                 inst.push(
-                    0x48 | (((dst.0 >> 3) & 1) << 2)
-                        | (((index.0 >> 3) & 1) << 1)
-                        | ((base.0 >> 3) & 1),
+                    0x48 | (((dst >> 3) & 1) << 2) | (((index >> 3) & 1) << 1) | ((base >> 3) & 1),
                 );
                 inst.push(0x8D);
-                inst.push(if disp8_form { 0x40 } else { 0x00 } | ((dst.0 & 7) << 3) | RM_SIB);
-                inst.push((0b10 << 6) | ((index.0 & 7) << 3) | (base.0 & 7));
+                inst.push(if disp8_form { 0x40 } else { 0x00 } | ((dst & 7) << 3) | RM_SIB);
+                inst.push((0b10 << 6) | ((index & 7) << 3) | (base & 7));
                 if disp8_form {
                     inst.push(0);
                 }
             }
             Gp::MovLoad { dst, src } => {
-                inst.push(rex_w(dst.as_gpr(), src.base.as_gpr()));
+                let (dst, base) = (S::write::<Pointer>(dst), S::read::<Pointer>(&src.base));
+                inst.push(rex_w(dst, base));
                 inst.push(0x8B);
-                mem_operand_into(&mut inst, dst.0, src);
+                mem_operand_into(&mut inst, dst, base, src.disp);
             }
             Gp::MovStore { dst, src } => {
-                inst.push(rex_w(src.as_gpr(), dst.base.as_gpr()));
+                let (src, base) = (S::read::<Pointer>(src), S::read::<Pointer>(&dst.base));
+                inst.push(rex_w(src, base));
                 inst.push(0x89);
-                mem_operand_into(&mut inst, src.0, dst);
+                mem_operand_into(&mut inst, src, base, dst.disp);
             }
-            Gp::Test { flags: (), src } => {
-                if src.0 >= 8 {
+            Gp::SpillPtr { src, slot } => {
+                spill_into(&mut inst, S::read::<Pointer>(src), Imm32(S::slot(slot)));
+            }
+            Gp::SpillInt { src, slot } => {
+                spill_into(&mut inst, S::read::<Integer>(src), Imm32(S::slot(slot)));
+            }
+            Gp::ReloadPtr { dst, slot } => {
+                reload_into(&mut inst, S::write::<Pointer>(dst), Imm32(S::slot(slot)));
+            }
+            Gp::ReloadInt { dst, slot } => {
+                reload_into(&mut inst, S::write::<Integer>(dst), Imm32(S::slot(slot)));
+            }
+            Gp::Test { src, .. } => {
+                let src = S::read::<Integer>(src);
+                if src >= 8 {
                     inst.push(0x45);
                 }
                 inst.push(0x85);
-                inst.push(modrm_rr(src.0, src));
+                inst.push(modrm_rr(src, src));
             }
-            Gp::CmpByte {
-                flags: (),
-                src,
-                imm,
-            } => {
-                match src.0 {
+            Gp::CmpByte { src, imm, .. } => {
+                match S::read::<Integer>(src) {
                     // The accumulator has a short form.
                     0 => inst.push(0x3C),
                     n => {
@@ -492,29 +634,28 @@ impl Gp<Physical> {
                             inst.push(0x40 | ((n >> 3) & 1));
                         }
                         inst.push(0x80);
-                        inst.push(modrm_rr(7, src));
+                        inst.push(modrm_rr(7, n));
                     }
                 }
-                inst.push(imm);
+                inst.push(*imm);
             }
-            Gp::Jcc {
-                cond, flags: (), ..
-            } => inst.extend(&[0x0F, 0x80 | cond as u8, 0, 0, 0, 0]),
+            Gp::Jcc { cond, .. } => inst.extend(&[0x0F, 0x80 | *cond as u8, 0, 0, 0, 0]),
             Gp::Jmp { .. } => inst.extend(&[0xE9, 0, 0, 0, 0]),
             Gp::Fallthrough { .. } => {}
             Gp::LeaRip { dst, .. } => {
-                inst.push(0x48 | (((dst.0 >> 3) & 1) << 2));
+                let dst = S::write::<Pointer>(dst);
+                inst.push(0x48 | (((dst >> 3) & 1) << 2));
                 inst.push(0x8D);
-                inst.push(((dst.0 & 7) << 3) | RM_RIP_AT_MOD0);
+                inst.push(((dst & 7) << 3) | RM_RIP_AT_MOD0);
                 inst.extend(&[0, 0, 0, 0]);
             }
-            Gp::Enter { size, flags: () } => {
-                inst.extend(&[rex_w(Gpr(0), RSP), 0x81, modrm_rr(5, RSP)]);
-                inst.extend(&size.to_le_bytes());
+            Gp::Enter { size, .. } => {
+                inst.extend(&[rex_w(0, RSP.0), 0x81, modrm_rr(5, RSP.0)]);
+                inst.extend(&S::frame_size(size).to_le_bytes());
             }
-            Gp::Ret { size, flags: () } => {
-                inst.extend(&[rex_w(Gpr(0), RSP), 0x81, modrm_rr(0, RSP)]);
-                inst.extend(&size.to_le_bytes());
+            Gp::Ret { size, .. } => {
+                inst.extend(&[rex_w(0, RSP.0), 0x81, modrm_rr(0, RSP.0)]);
+                inst.extend(&S::frame_size(size).to_le_bytes());
                 // `vzeroupper`: `VEX.128.0F.WIG 77`, zeroing bits 128 and up of
                 // vector registers 0–15, the sixteen a legacy-SSE instruction
                 // can name. The same three bytes on every tier.
@@ -523,6 +664,21 @@ impl Gp<Physical> {
             }
         }
         inst
+    }
+
+    /// The instruction's bytes, and the label fields in them.
+    pub(super) fn assemble(&self, out: &mut Encoding<'_>) {
+        out.bytes(self.encode().as_bytes());
+        match self {
+            Gp::Jmp { to } => out.field(JMP_DISP, S::target(to), patch_rel32),
+            Gp::Jcc { taken, next, .. } => {
+                out.field(JCC_DISP, S::target(taken), patch_rel32);
+                out.falls_through(S::target(next));
+            }
+            Gp::Fallthrough { to } => out.falls_through(S::target(to)),
+            Gp::LeaRip { to, .. } => out.field(LEA_RIP_DISP, S::target(to), patch_rel32),
+            _ => {}
+        }
     }
 }
 
@@ -561,20 +717,34 @@ pub(super) struct Imm32(pub(super) i32);
 /// `R` extends the ModRM.reg field (the source here), `B` extends ModRM.rm
 /// (the destination).
 #[inline(always)]
-const fn rex_w(reg: Gpr, rm: Gpr) -> u8 {
-    0x48 | (((reg.0 >> 3) & 1) << 2) | ((rm.0 >> 3) & 1)
+const fn rex_w(reg: u8, rm: u8) -> u8 {
+    0x48 | (((reg >> 3) & 1) << 2) | ((rm >> 3) & 1)
 }
 
 /// ModRM for the register-direct form: `mod = 11`.
 #[inline(always)]
-const fn modrm_rr(reg: u8, rm: Gpr) -> u8 {
-    0xC0 | ((reg & 7) << 3) | (rm.0 & 7)
+const fn modrm_rr(reg: u8, rm: u8) -> u8 {
+    0xC0 | ((reg & 7) << 3) | (rm & 7)
 }
 
 /// `REX.W opcode /r` with both operands in registers.
 #[inline(always)]
-const fn rr(opcode: u8, dst: Gpr, src: Gpr) -> [u8; 3] {
-    [rex_w(src, dst), opcode, modrm_rr(src.0, dst)]
+const fn rr(opcode: u8, dst: u8, src: u8) -> [u8; 3] {
+    [rex_w(src, dst), opcode, modrm_rr(src, dst)]
+}
+
+/// `mov [rsp + slot], src`.
+fn spill_into(inst: &mut EncodedInst, src: u8, slot: Imm32) {
+    inst.push(rex_w(src, RSP.0));
+    inst.push(0x89);
+    mem_operand_into(inst, src, RSP.0, slot);
+}
+
+/// `mov dst, [rsp + slot]`.
+fn reload_into(inst: &mut EncodedInst, dst: u8, slot: Imm32) {
+    inst.push(rex_w(dst, RSP.0));
+    inst.push(0x8B);
+    mem_operand_into(inst, dst, RSP.0, slot);
 }
 
 /// The 4-bit condition an x86 `jcc` tests: the conditions the emitter
@@ -605,7 +775,7 @@ const LEA_RIP_DISP: usize = 3;
 ///
 /// `rel32` is measured from the *end* of the instruction, which is the end of
 /// the displacement field itself.
-fn patch_rel32(code: &mut [u8], pos: usize, target: usize) {
+pub(super) fn patch_rel32(code: &mut [u8], pos: usize, target: usize) {
     let rel = (target as i64) - (pos as i64 + 4);
     let rel = i32::try_from(rel).expect("an x86 rel32 spans \u{00b1}2 GiB");
     code[pos..pos + 4].copy_from_slice(&rel.to_le_bytes());
@@ -702,7 +872,7 @@ pub(super) const fn frame_slot(offset: u32) -> Mem<Physical, Imm32> {
 }
 
 /// Bytes one `f32` occupies: the element pitch of a uniform block.
-const F32_BYTES: u64 = 4;
+pub(super) const F32_BYTES: u64 = 4;
 
 /// The `offset`-th `f32` of the block at `base`, `[base + 4*offset]`, as a
 /// `disp32` operand — the one place a uniform's or a pool entry's 64-bit
@@ -718,16 +888,27 @@ pub(super) fn block_element(
     base: PtrReg,
     offset: u64,
 ) -> Result<Mem<Physical, Imm32>, CompileError> {
-    let disp = offset
-        .checked_mul(F32_BYTES)
-        .and_then(|bytes| i32::try_from(bytes).ok())
-        .ok_or(CompileError::BudgetExceeded(
-            "block offset past x86's disp32",
-        ))?;
     Ok(Mem {
         base,
-        disp: Imm32(disp),
+        disp: displacement(offset, F32_BYTES)?,
     })
+}
+
+/// The `disp32` that reaches element `index` of an array of `size`-byte
+/// elements.
+///
+/// # Errors
+///
+/// [`CompileError::BudgetExceeded`] when it does not fit a signed 32-bit
+/// displacement.
+pub(super) fn displacement(index: u64, size: u64) -> Result<Imm32, CompileError> {
+    index
+        .checked_mul(size)
+        .and_then(|bytes| i32::try_from(bytes).ok())
+        .map(Imm32)
+        .ok_or(CompileError::BudgetExceeded(
+            "block offset past x86's disp32",
+        ))
 }
 
 /// `dst = trunc(index)` as a 64-bit integer, wherever a fold keeps its
@@ -849,6 +1030,16 @@ pub(super) struct Mem<S: Stage, D> {
     pub(super) disp: D,
 }
 
+impl<D: Copy> Mem<Selected, D> {
+    /// Rebuild at stage `T`: the base is the one operand.
+    pub(super) fn walk<T: Stage>(&self, f: &mut impl Rebind<T>) -> Mem<T, D> {
+        Mem {
+            base: f.read(self.base),
+            disp: self.disp,
+        }
+    }
+}
+
 /// ModRM `rm` meaning "a SIB byte follows" — also the low three bits of
 /// `rsp`/`r12`, which is why exactly those two bases always take one.
 const RM_SIB: u8 = 0b100;
@@ -864,10 +1055,10 @@ const SIB_BASE_ONLY: u8 = 0x24;
 /// `mod = 00`, a SIB with scale 4 and no displacement — the element of a
 /// plane of `f32`s, addressed in one instruction. The tail is the
 /// architecture's, not the prefix's, so the VEX and EVEX tiers share it the
-/// way they share [`mem_operand_into`].
-pub(super) fn scaled4_operand_into(inst: &mut EncodedInst, reg: u8, base: Gpr, index: Gpr) {
-    debug_assert!(index.0 & 7 != RM_SIB, "rsp/r12 cannot index a SIB");
-    sib4_tail_into(inst, reg, base, index.0);
+/// way they share [`mem_operand_into`]. Registers are hardware numbers.
+pub(super) fn scaled4_operand_into(inst: &mut EncodedInst, reg: u8, base: u8, index: u8) {
+    debug_assert!(index & 7 != RM_SIB, "rsp/r12 cannot index a SIB");
+    sib4_tail_into(inst, reg, base, index);
 }
 
 /// [`scaled4_operand_into`] with a *vector* index — the VSIB a gather
@@ -876,23 +1067,23 @@ pub(super) fn scaled4_operand_into(inst: &mut EncodedInst, reg: u8, base: Gpr, i
 /// only when the index is a general register: as a vector number it is
 /// `ymm4`/`ymm12`, which a gather may perfectly well be indexed by. The
 /// prefix's X bit carries the index's high bit either way.
-pub(super) fn vsib4_operand_into(inst: &mut EncodedInst, reg: u8, base: Gpr, index: Reg) {
-    sib4_tail_into(inst, reg, base, index.0);
+pub(super) fn vsib4_operand_into(inst: &mut EncodedInst, reg: u8, base: u8, index: u8) {
+    sib4_tail_into(inst, reg, base, index);
 }
 
 /// The ModRM/SIB bytes both scaled-index forms share.
-fn sib4_tail_into(inst: &mut EncodedInst, reg: u8, base: Gpr, index: u8) {
+fn sib4_tail_into(inst: &mut EncodedInst, reg: u8, base: u8, index: u8) {
     assert!(
-        base.0 & 7 != RM_RIP_AT_MOD0,
-        "[{base:?} + index*4] has no mod=00 form: rbp/r13 as a SIB base means no base"
+        base & 7 != RM_RIP_AT_MOD0,
+        "[r{base} + index*4] has no mod=00 form: rbp/r13 as a SIB base means no base"
     );
     inst.push(((reg & 7) << 3) | RM_SIB);
-    inst.push((0b10 << 6) | ((index & 7) << 3) | (base.0 & 7));
+    inst.push((0b10 << 6) | ((index & 7) << 3) | (base & 7));
 }
 
-/// Write the ModRM/SIB/disp tail into an `EncodedInst`.
-pub(super) fn mem_operand_into<D: Disp>(inst: &mut EncodedInst, reg: u8, addr: Mem<Physical, D>) {
-    let rm = addr.base.0 & 7;
+/// Write the ModRM/SIB/disp tail of `[base + disp]` into an `EncodedInst`.
+pub(super) fn mem_operand_into<D: Disp>(inst: &mut EncodedInst, reg: u8, base: u8, disp: D) {
+    let rm = base & 7;
     debug_assert!(
         D::MOD != NoDisp::MOD || rm != RM_RIP_AT_MOD0,
         "[rbp]/[r13] has no mod=00 form: that encoding is RIP-relative"
@@ -901,7 +1092,14 @@ pub(super) fn mem_operand_into<D: Disp>(inst: &mut EncodedInst, reg: u8, addr: M
     if rm == RM_SIB {
         inst.push(SIB_BASE_ONLY);
     }
-    addr.disp.emit_inst(inst);
+    disp.emit_inst(inst);
+}
+
+/// The ModRM and `disp32` of `[rip + label]`: the displacement is a label
+/// field, the last four bytes of the instruction.
+pub(super) fn rip_operand_into(inst: &mut EncodedInst, reg: u8) {
+    inst.push(((reg & 7) << 3) | RM_RIP_AT_MOD0);
+    inst.extend(&[0, 0, 0, 0]);
 }
 
 #[cfg(test)]
@@ -943,7 +1141,7 @@ mod gpr_tests {
         }
         inst.push(0x0F);
         inst.push(0x11);
-        mem_operand_into(&mut inst, src.0, addr);
+        mem_operand_into(&mut inst, src.0, addr.base.0, addr.disp);
         inst
     }
 

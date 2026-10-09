@@ -57,6 +57,7 @@ pub(super) struct Encoding<'a> {
     /// Where this instruction starts in `code`.
     start: usize,
     fields: &'a mut Vec<(usize, Label, Patch)>,
+    falls: &'a mut Vec<(usize, Label)>,
 }
 
 impl Encoding<'_> {
@@ -68,6 +69,29 @@ impl Encoding<'_> {
     pub(super) fn field(&mut self, at: usize, label: Label, patch: Patch) {
         self.fields.push((self.start + at, label, patch));
     }
+
+    /// A zero-width field at the end of this instruction, after its bytes:
+    /// `label` must be bound exactly there. A fall-through, checked and not
+    /// assumed.
+    pub(super) fn falls_through(&mut self, label: Label) {
+        self.falls.push((self.code.len(), label));
+    }
+}
+
+/// An assembled program: its bytes, and where each label landed.
+pub(super) struct Assembled {
+    pub(super) code: Vec<u8>,
+    addresses: Vec<Option<usize>>,
+}
+
+impl Assembled {
+    /// Where `label` is bound, in bytes from the start of the program.
+    ///
+    /// # Panics
+    /// If the program never bound it.
+    pub(super) fn address(&self, label: Label) -> usize {
+        self.addresses[label.0 as usize].unwrap_or_else(|| panic!("{label:?} was never bound"))
+    }
 }
 
 /// Lay out `text` then `data`, encode each instruction with `encode`, and
@@ -76,16 +100,18 @@ impl Encoding<'_> {
 /// # Panics
 ///
 /// If a label is bound twice, bound with an id at or above the count this
-/// program minted, or named and never bound. A foreign id below that count is
+/// program minted, named and never bound, or not bound where an instruction
+/// that falls through to it ends. A foreign id below that count is
 /// indistinguishable from one of its own and binds silently. Only this crate
 /// writes these programs, so each is a bug here rather than a fact about the
 /// kernel being compiled.
 pub(super) fn assemble<I>(
     program: &AsmProgram<I>,
     encode: impl Fn(&I, &mut Encoding<'_>),
-) -> Vec<u8> {
+) -> Assembled {
     let mut code = Vec::new();
     let mut fields = Vec::new();
+    let mut falls = Vec::new();
     let mut addresses: Vec<Option<usize>> = alloc::vec![None; program.labels.next as usize];
     for item in program.text.iter().chain(&program.data) {
         match item {
@@ -106,6 +132,7 @@ pub(super) fn assemble<I>(
                         code: &mut code,
                         start,
                         fields: &mut fields,
+                        falls: &mut falls,
                     },
                 );
             }
@@ -119,5 +146,11 @@ pub(super) fn assemble<I>(
         };
         patch(&mut code, at, target);
     }
-    code
+    for (end, label) in falls {
+        assert!(
+            addresses.get(label.0 as usize) == Some(&Some(end)),
+            "{label:?} is not bound where the instruction falling through to it ends"
+        );
+    }
+    Assembled { code, addresses }
 }

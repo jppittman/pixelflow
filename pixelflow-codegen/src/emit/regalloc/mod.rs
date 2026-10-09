@@ -12,7 +12,6 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::storage::MAX_FRAME;
 use super::{
     Gpr, KReg, OperandSource, PtrReg, Reg, ScheduledOp, Slot, StackFrame, operand_sources,
     reloads_wanted,
@@ -22,9 +21,11 @@ use crate::program::IfGuard;
 use crate::program::{Class, all_operands, pointer_operand};
 pub(super) use crate::program::{Def, Scope, ScopedSchedule, ValueId, operands};
 
+pub(super) mod local;
 mod policy;
 pub(super) mod resource;
 use policy::{Budget, Candidate, EvictionRank, ReadHere, Store};
+use resource::MAX_FRAME;
 
 /// The complete platform-dependent surface of register allocation.
 ///

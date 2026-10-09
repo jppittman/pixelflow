@@ -24,15 +24,21 @@
 //! first, from a register the allocator reserved for it, the way the
 //! AVX-512 tier resets `k1`.
 
+use super::asm::Encoding;
+use super::build::{Builder, Def, Spiller};
+use super::regalloc::resource::FrameSlot;
+use super::register_file::{EntryRegisters, Members, RegisterFile};
 use super::x86_64;
 use super::x86_64::{
     Alu, Direction, Disp, Imm8, Imm32, Lanewise, Mem, NoDisp, Pred, Rounding, Truncate, frame_slot,
 };
 use super::{
-    AsmInsn, AsmProgram, EncodedInst, Gpr, Integer, Physical, Pointer, PtrReg, Reg, Stage, Vector,
-    unimplemented_op,
+    AsmInsn, AsmProgram, Bound, Class, ClassId, Edges, EncodedInst, FrameSize, Gpr, Integer,
+    IsaBackend, Label, LaneOp, Physical, Placed, Pointer, PtrReg, Rebind, Reg, Selected, Spill,
+    Stage, Store, Target, Test, Value, ValueName, Vector, unimplemented_op,
 };
 use crate::error::CompileError;
+use crate::program::IfArm;
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
 
@@ -154,30 +160,43 @@ impl Vex {
         inst
     }
 
-    /// `op reg, [addr]` — the memory-operand form, for any base and any
+    /// `op reg, [base + disp]` — the memory-operand form, for any base and any
     /// displacement mode. The prefix is VEX's; the ModRM/SIB/displacement tail
-    /// is the architecture's, so it comes from `x86_64::mem_operand`.
-    fn rm<D: Disp>(self, reg: u8, addr: Mem<Physical, D>) -> EncodedInst {
+    /// is the architecture's, so it comes from `x86_64::mem_operand_into`.
+    fn rm<D: Disp>(self, reg: u8, base: u8, disp: D) -> EncodedInst {
         let mut inst = EncodedInst::new();
         // R and B are stored inverted; X is unused (no index register).
         let rbit = if reg >= 8 { 0x00 } else { 0x80 };
-        let bbit = if addr.base.0 >= 8 { 0x00 } else { 0x20 };
+        let bbit = if base >= 8 { 0x00 } else { 0x20 };
         inst.push(0xC4);
         inst.push(rbit | 0x40 | bbit | self.map as u8);
         inst.push(((self.w as u8) << 7) | (0xF << 3) | ((self.l256 as u8) << 2) | self.pp as u8); // vvvv unused
         inst.push(self.opcode);
-        x86_64::mem_operand_into(&mut inst, reg, addr);
+        x86_64::mem_operand_into(&mut inst, reg, base, disp);
+        inst
+    }
+
+    /// `op reg, [rip + disp32]`: the displacement is the last four bytes, a
+    /// label field.
+    fn rip(self, reg: u8) -> EncodedInst {
+        let mut inst = EncodedInst::new();
+        let rbit = if reg >= 8 { 0x00 } else { 0x80 };
+        inst.push(0xC4);
+        inst.push(rbit | 0x60 | self.map as u8);
+        inst.push(((self.w as u8) << 7) | (0xF << 3) | ((self.l256 as u8) << 2) | self.pp as u8); // vvvv unused
+        inst.push(self.opcode);
+        x86_64::rip_operand_into(&mut inst, reg);
         inst
     }
 
     /// `op reg, [base + index*4]` — the SIB form with a scaled index, which
     /// a broadcast load reads one element of a plane through. X carries the
     /// index's high bit, inverted like R and B.
-    fn rm_scaled4(self, reg: u8, base: Gpr, index: Gpr) -> EncodedInst {
+    fn rm_scaled4(self, reg: u8, base: u8, index: u8) -> EncodedInst {
         let mut inst = EncodedInst::new();
         let rbit = if reg >= 8 { 0x00 } else { 0x80 };
-        let xbit = if index.0 >= 8 { 0x00 } else { 0x40 };
-        let bbit = if base.0 >= 8 { 0x00 } else { 0x20 };
+        let xbit = if index >= 8 { 0x00 } else { 0x40 };
+        let bbit = if base >= 8 { 0x00 } else { 0x20 };
         inst.push(0xC4);
         inst.push(rbit | xbit | bbit | self.map as u8);
         inst.push(((self.w as u8) << 7) | (0xF << 3) | ((self.l256 as u8) << 2) | self.pp as u8); // vvvv unused
@@ -192,11 +211,11 @@ impl Vex {
     /// the SIB tail is the same bytes with a vector number in the index
     /// field (`x86_64::vsib4_operand_into`, which knows `ymm4`/`ymm12` are
     /// not `rsp`/`r12`). `vvvv` is the gather's mask.
-    fn vsib_scaled4(self, reg: u8, vvvv: u8, base: Gpr, index: Reg) -> EncodedInst {
+    fn vsib_scaled4(self, reg: u8, vvvv: u8, base: u8, index: u8) -> EncodedInst {
         let mut inst = EncodedInst::new();
         let rbit = if reg >= 8 { 0x00 } else { 0x80 };
-        let xbit = if index.0 >= 8 { 0x00 } else { 0x40 };
-        let bbit = if base.0 >= 8 { 0x00 } else { 0x20 };
+        let xbit = if index >= 8 { 0x00 } else { 0x40 };
+        let bbit = if base >= 8 { 0x00 } else { 0x20 };
         inst.push(0xC4);
         inst.push(rbit | xbit | bbit | self.map as u8);
         inst.push(
@@ -223,8 +242,8 @@ impl VexImm {
         inst
     }
     /// Memory form with the imm8 appended.
-    fn rm<D: Disp>(self, reg: u8, addr: Mem<Physical, D>) -> EncodedInst {
-        let mut inst = self.vex.rm(reg, addr);
+    fn rm<D: Disp>(self, reg: u8, base: u8, disp: D) -> EncodedInst {
+        let mut inst = self.vex.rm(reg, base, disp);
         inst.push(self.imm);
         inst
     }
@@ -267,7 +286,7 @@ impl Lanewise {
 /// three-operand and non-destructive, so no destination here is tied to a
 /// source, and an operand may be the register the result is written to.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Inst<S: Stage> {
+pub(super) enum Inst<S: Stage> {
     /// `op dst, a, b`
     Alu {
         op: Alu,
@@ -313,10 +332,23 @@ enum Inst<S: Stage> {
     /// `vpcmpeqd dst, dst, dst`: all-ones, whatever `dst` held. Its reads are
     /// not operands, because the result does not depend on them.
     Ones { dst: S::Write<Vector> },
+    /// `vxorps dst, dst, dst`: zero, whatever `dst` held. Its reads are not
+    /// operands, because the result does not depend on them.
+    Zero { dst: S::Write<Vector> },
     /// `vmovaps dst, src`
     Mov {
         dst: S::Write<Vector>,
         src: S::Read<Vector>,
+    },
+    /// `vbroadcastss dst, [rip + at]`: one pool entry, whose label the
+    /// kernel's constants bind.
+    LoadConst { dst: S::Write<Vector>, at: Label },
+    /// `vmovups [rsp + slot], src`: the allocator's spill.
+    SpillVector { src: S::Read<Vector>, slot: S::Slot },
+    /// `vmovups dst, [rsp + slot]`: the allocator's reload.
+    ReloadVector {
+        dst: S::Write<Vector>,
+        slot: S::Slot,
     },
     /// `vcvttss2si dst, src`: lane 0, truncated to a 64-bit integer.
     Cvtt {
@@ -389,16 +421,143 @@ enum Inst<S: Stage> {
     },
 }
 
-impl Inst<Physical> {
-    fn encode(self) -> EncodedInst {
+impl Inst<Selected> {
+    /// Rebuild at stage `T`, visiting each operand once, in field order.
+    pub(super) fn walk<T: Stage>(&self, f: &mut impl Rebind<T>) -> Inst<T> {
         match self {
-            Inst::Alu { op, dst, a, b } => op.vex().rrr(dst.0, a.0, b.0),
-            Inst::Cmp { pred, dst, a, b } => Vex::m0f(0xC2).imm(pred as u8).rrr(dst.0, a.0, b.0),
-            Inst::Unary { op, dst, src } => op.vex().rrr(dst.0, UNUSED_VVVV, src.0),
+            Inst::Alu { op, dst, a, b } => Inst::Alu {
+                op: *op,
+                dst: f.write(dst),
+                a: f.read(*a),
+                b: f.read(*b),
+            },
+            Inst::Cmp { pred, dst, a, b } => Inst::Cmp {
+                pred: *pred,
+                dst: f.write(dst),
+                a: f.read(*a),
+                b: f.read(*b),
+            },
+            Inst::Unary { op, dst, src } => Inst::Unary {
+                op: *op,
+                dst: f.write(dst),
+                src: f.read(*src),
+            },
+            Inst::Round { mode, dst, src } => Inst::Round {
+                mode: *mode,
+                dst: f.write(dst),
+                src: f.read(*src),
+            },
+            Inst::Shift {
+                direction,
+                dst,
+                src,
+                amount,
+            } => Inst::Shift {
+                direction: *direction,
+                dst: f.write(dst),
+                src: f.read(*src),
+                amount: *amount,
+            },
+            Inst::Fma231 { acc, a, b } => Inst::Fma231 {
+                acc: f.tie(acc),
+                a: f.read(*a),
+                b: f.read(*b),
+            },
+            Inst::Ones { dst } => Inst::Ones { dst: f.write(dst) },
+            Inst::Zero { dst } => Inst::Zero { dst: f.write(dst) },
+            Inst::Mov { dst, src } => Inst::Mov {
+                dst: f.write(dst),
+                src: f.read(*src),
+            },
+            Inst::LoadConst { dst, at } => Inst::LoadConst {
+                dst: f.write(dst),
+                at: *at,
+            },
+            Inst::SpillVector { src, slot } => Inst::SpillVector {
+                src: f.read(*src),
+                slot: f.slot(*slot),
+            },
+            Inst::ReloadVector { dst, slot } => Inst::ReloadVector {
+                dst: f.write(dst),
+                slot: f.slot(*slot),
+            },
+            Inst::Cvtt { dst, src } => Inst::Cvtt {
+                dst: f.write(dst),
+                src: f.read(*src),
+            },
+            Inst::Movq { dst, src } => Inst::Movq {
+                dst: f.write(dst),
+                src: f.read(*src),
+            },
+            Inst::Load { dst, src } => Inst::Load {
+                dst: f.write(dst),
+                src: src.walk(f),
+            },
+            Inst::Store { dst, src } => Inst::Store {
+                dst: dst.walk(f),
+                src: f.read(*src),
+            },
+            Inst::StoreBatch { dst, src } => Inst::StoreBatch {
+                dst: dst.walk(f),
+                src: f.read(*src),
+            },
+            Inst::Broadcast { dst, src } => Inst::Broadcast {
+                dst: f.write(dst),
+                src: src.walk(f),
+            },
+            Inst::BroadcastIndexed { dst, base, index } => Inst::BroadcastIndexed {
+                dst: f.write(dst),
+                base: f.read(*base),
+                index: f.read(*index),
+            },
+            Inst::Gather {
+                dst,
+                base,
+                index,
+                mask,
+            } => Inst::Gather {
+                dst: f.early(dst),
+                base: f.read(*base),
+                index: f.read(*index),
+                mask: f.tie(mask),
+            },
+            Inst::MoveMask { dst, src } => Inst::MoveMask {
+                dst: f.write(dst),
+                src: f.read(*src),
+            },
+            Inst::CvttMem { dst, src } => Inst::CvttMem {
+                dst: f.write(dst),
+                src: src.walk(f),
+            },
+            Inst::ExtractHigh { dst, src } => Inst::ExtractHigh {
+                dst: f.write(dst),
+                src: f.read(*src),
+            },
+            Inst::ExtractLane { dst, src, lane } => Inst::ExtractLane {
+                dst: dst.walk(f),
+                src: f.read(*src),
+                lane: *lane,
+            },
+        }
+    }
+}
+
+impl<S: Placed> Inst<S> {
+    fn encode(&self) -> EncodedInst {
+        let vector = |reg: &S::Read<Vector>| S::read::<Vector>(reg);
+        let write = |reg: &S::Write<Vector>| S::write::<Vector>(reg);
+        match self {
+            Inst::Alu { op, dst, a, b } => op.vex().rrr(write(dst), vector(a), vector(b)),
+            Inst::Cmp { pred, dst, a, b } => {
+                Vex::m0f(0xC2)
+                    .imm(*pred as u8)
+                    .rrr(write(dst), vector(a), vector(b))
+            }
+            Inst::Unary { op, dst, src } => op.vex().rrr(write(dst), UNUSED_VVVV, vector(src)),
             Inst::Round { mode, dst, src } => {
                 Vex::m0f3a_66(0x08)
-                    .imm(mode as u8)
-                    .rrr(dst.0, UNUSED_VVVV, src.0)
+                    .imm(*mode as u8)
+                    .rrr(write(dst), UNUSED_VVVV, vector(src))
             }
             // The destination is `vvvv` and the `/digit` is `reg`.
             Inst::Shift {
@@ -407,45 +566,137 @@ impl Inst<Physical> {
                 src,
                 amount,
             } => Vex::m0f_66(0x72)
-                .imm(amount)
-                .rrr(direction as u8, dst.0, src.0),
-            Inst::Fma231 { acc, a, b } => Vex::m0f38_66(0xB8).rrr(acc.0, a.0, b.0),
-            Inst::Ones { dst } => Vex::m0f_66(0x76).rrr(dst.0, dst.0, dst.0),
-            Inst::Mov { dst, src } => Vex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0),
-            Inst::Cvtt { dst, src } => Vex::m0f_f3(0x2C).w1().rrr(dst.0, UNUSED_VVVV, src.0),
-            Inst::Movq { dst, src } => Vex::m0f_66(0x6E).w1().xmm().rrr(dst.0, UNUSED_VVVV, src.0),
-            Inst::Load { dst, src } => Vex::m0f(0x10).rm(dst.0, src),
-            Inst::Store { dst, src } => Vex::m0f(0x11).rm(src.0, dst),
-            Inst::StoreBatch { dst, src } => Vex::m0f(0x11).rm(src.0, dst),
-            Inst::Broadcast { dst, src } => Vex::m0f38_66(0x18).rm(dst.0, src),
-            Inst::BroadcastIndexed { dst, base, index } => {
-                Vex::m0f38_66(0x18).rm_scaled4(dst.0, base.as_gpr(), index)
+                .imm(*amount)
+                .rrr(*direction as u8, write(dst), vector(src)),
+            Inst::Fma231 { acc, a, b } => {
+                Vex::m0f38_66(0xB8).rrr(S::tie::<Vector>(acc), vector(a), vector(b))
             }
+            Inst::Ones { dst } => {
+                let dst = write(dst);
+                Vex::m0f_66(0x76).rrr(dst, dst, dst)
+            }
+            Inst::Zero { dst } => {
+                let dst = write(dst);
+                Alu::Xor.vex().rrr(dst, dst, dst)
+            }
+            Inst::Mov { dst, src } => Vex::m0f(0x28).rrr(write(dst), UNUSED_VVVV, vector(src)),
+            Inst::LoadConst { dst, .. } => Vex::m0f38_66(0x18).rip(write(dst)),
+            Inst::SpillVector { src, slot } => {
+                Vex::m0f(0x11).rm(vector(src), x86_64::ptr::RSP.0, Imm32(S::slot(slot)))
+            }
+            Inst::ReloadVector { dst, slot } => {
+                Vex::m0f(0x10).rm(write(dst), x86_64::ptr::RSP.0, Imm32(S::slot(slot)))
+            }
+            Inst::Cvtt { dst, src } => {
+                Vex::m0f_f3(0x2C)
+                    .w1()
+                    .rrr(S::write::<Integer>(dst), UNUSED_VVVV, vector(src))
+            }
+            Inst::Movq { dst, src } => {
+                Vex::m0f_66(0x6E)
+                    .w1()
+                    .xmm()
+                    .rrr(write(dst), UNUSED_VVVV, S::read::<Integer>(src))
+            }
+            Inst::Load { dst, src } => {
+                Vex::m0f(0x10).rm(write(dst), S::read::<Pointer>(&src.base), src.disp)
+            }
+            Inst::Store { dst, src } => {
+                Vex::m0f(0x11).rm(vector(src), S::read::<Pointer>(&dst.base), dst.disp)
+            }
+            Inst::StoreBatch { dst, src } => {
+                Vex::m0f(0x11).rm(vector(src), S::read::<Pointer>(&dst.base), dst.disp)
+            }
+            Inst::Broadcast { dst, src } => {
+                Vex::m0f38_66(0x18).rm(write(dst), S::read::<Pointer>(&src.base), src.disp)
+            }
+            Inst::BroadcastIndexed { dst, base, index } => Vex::m0f38_66(0x18).rm_scaled4(
+                write(dst),
+                S::read::<Pointer>(base),
+                S::read::<Integer>(index),
+            ),
             Inst::Gather {
                 dst,
                 base,
                 index,
                 mask,
             } => {
+                let (dst, index, mask) = (
+                    S::early::<Vector>(dst),
+                    vector(index),
+                    S::tie::<Vector>(mask),
+                );
                 debug_assert!(
                     dst != index && dst != mask && index != mask,
                     "vgatherdps: dst, index and mask must be three registers"
                 );
-                // `base` is never `rbp`/`r13` (the pointer pool is `r9`-`r11`),
-                // so the SIB's no-base encoding is unreachable.
-                Vex::m0f38_66(0x92).vsib_scaled4(dst.0, mask.0, base.as_gpr(), index)
+                // `base` is never `rbp`/`r13`, so the SIB's no-base encoding
+                // is unreachable.
+                Vex::m0f38_66(0x92).vsib_scaled4(dst, mask, S::read::<Pointer>(base), index)
             }
-            Inst::MoveMask { dst, src } => Vex::m0f(0x50).rrr(dst.0, UNUSED_VVVV, src.0),
-            Inst::CvttMem { dst, src } => Vex::m0f_f3(0x2C).w1().rm(dst.0, src),
+            Inst::MoveMask { dst, src } => {
+                Vex::m0f(0x50).rrr(S::write::<Integer>(dst), UNUSED_VVVV, vector(src))
+            }
+            Inst::CvttMem { dst, src } => Vex::m0f_f3(0x2C).w1().rm(
+                S::write::<Integer>(dst),
+                S::read::<Pointer>(&src.base),
+                src.disp,
+            ),
             // The destination is the `rm` operand here, the reverse of the
             // usual direction.
             Inst::ExtractHigh { dst, src } => {
-                Vex::m0f3a_66(0x19).imm(1).rrr(src.0, UNUSED_VVVV, dst.0)
+                Vex::m0f3a_66(0x19)
+                    .imm(1)
+                    .rrr(vector(src), UNUSED_VVVV, write(dst))
             }
             Inst::ExtractLane { dst, src, lane } => {
-                debug_assert!(lane < 4, "vextractps reads the low 128 bits");
-                Vex::m0f3a_66(0x17).xmm().imm(lane).rm(src.0, dst)
+                debug_assert!(*lane < 4, "vextractps reads the low 128 bits");
+                Vex::m0f3a_66(0x17).xmm().imm(*lane).rm(
+                    vector(src),
+                    S::read::<Pointer>(&dst.base),
+                    dst.disp,
+                )
             }
+        }
+    }
+
+    /// The instruction's bytes, and the label fields in them.
+    pub(super) fn assemble(&self, out: &mut Encoding<'_>) {
+        match self {
+            Inst::LoadConst { at, .. } => {
+                let inst = self.encode();
+                out.bytes(inst.as_bytes());
+                // The displacement is the instruction's last four bytes.
+                out.field(inst.as_bytes().len() - 4, *at, x86_64::patch_rel32);
+            }
+            _ => out.bytes(self.encode().as_bytes()),
+        }
+    }
+}
+
+/// What the selection pipeline builds for AVX2: a vector instruction or a
+/// general-register one (the loop nest's, and the store's address
+/// arithmetic). One type so a block holds both; no derives, because a
+/// selected instruction owns its definitions.
+pub(super) enum Op<S: Stage> {
+    Vector(Inst<S>),
+    General(x86_64::Gp<S>),
+}
+
+impl Op<Selected> {
+    fn walk<T: Stage>(&self, f: &mut impl Rebind<T>) -> Op<T> {
+        match self {
+            Op::Vector(inst) => Op::Vector(inst.walk(f)),
+            Op::General(gp) => Op::General(gp.walk(f)),
+        }
+    }
+}
+
+impl<'m> Op<Bound<'m, Avx2>> {
+    fn assemble(&self, out: &mut Encoding<'_>) {
+        match self {
+            Op::Vector(inst) => inst.assemble(out),
+            Op::General(gp) => gp.assemble(out),
         }
     }
 }
@@ -465,18 +716,6 @@ impl Truncate for Inst<Physical> {
     fn from_slot(dst: Gpr, src: Mem<Physical, Imm32>) -> Self {
         Inst::CvttMem { dst, src }
     }
-}
-
-fn cmp_pred(op: OpKind) -> Option<Pred> {
-    Some(match op {
-        OpKind::Eq => Pred::Eq,
-        OpKind::Ne => Pred::Ne,
-        OpKind::Lt => Pred::Lt,
-        OpKind::Le => Pred::Le,
-        OpKind::Gt => Pred::Nle,
-        OpKind::Ge => Pred::Ge,
-        _ => return None,
-    })
 }
 
 /// `vmovaps ymmDST, ymmSRC` — register copy.
@@ -565,27 +804,87 @@ fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64::Bro
 // Op dispatch
 // =============================================================================
 
-/// `dst = op(src1, src2)`. VEX is 3-operand/non-destructive: operands are
-/// never clobbered and may alias `dst`. Comparisons produce an ordinary
-/// all-ones/all-zeros vector directly (no k-register step, unlike AVX-512).
-fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, a: Reg, b: Reg) {
-    if let Some(pred) = cmp_pred(op) {
-        Inst::Cmp { pred, dst, a, b }.emit_into(code);
-        return;
-    }
-    let op = match op {
-        OpKind::Add => Alu::Add,
-        OpKind::Sub => Alu::Sub,
-        OpKind::Mul => Alu::Mul,
-        OpKind::Div => Alu::Div,
-        OpKind::Min => Alu::Min,
-        OpKind::Max => Alu::Max,
-        OpKind::BitAnd => Alu::And,
-        OpKind::BitOr => Alu::Or,
-        OpKind::IAdd => Alu::IAdd,
+/// The one instruction a binary op is.
+enum BinaryForm {
+    Alu(Alu),
+    /// A comparison produces an ordinary all-ones/all-zeros vector directly
+    /// (no k-register step, unlike AVX-512).
+    Cmp(Pred),
+}
+
+fn binary_form(op: OpKind) -> BinaryForm {
+    match op {
+        OpKind::Eq => BinaryForm::Cmp(Pred::Eq),
+        OpKind::Ne => BinaryForm::Cmp(Pred::Ne),
+        OpKind::Lt => BinaryForm::Cmp(Pred::Lt),
+        OpKind::Le => BinaryForm::Cmp(Pred::Le),
+        OpKind::Gt => BinaryForm::Cmp(Pred::Nle),
+        OpKind::Ge => BinaryForm::Cmp(Pred::Ge),
+        OpKind::Add => BinaryForm::Alu(Alu::Add),
+        OpKind::Sub => BinaryForm::Alu(Alu::Sub),
+        OpKind::Mul => BinaryForm::Alu(Alu::Mul),
+        OpKind::Div => BinaryForm::Alu(Alu::Div),
+        OpKind::Min => BinaryForm::Alu(Alu::Min),
+        OpKind::Max => BinaryForm::Alu(Alu::Max),
+        OpKind::BitAnd => BinaryForm::Alu(Alu::And),
+        OpKind::BitOr => BinaryForm::Alu(Alu::Or),
+        OpKind::IAdd => BinaryForm::Alu(Alu::IAdd),
         _ => unimplemented_op("avx2", op),
-    };
-    Inst::Alu { op, dst, a, b }.emit_into(code);
+    }
+}
+
+impl BinaryForm {
+    fn inst<S: Stage>(
+        self,
+        dst: S::Write<Vector>,
+        a: S::Read<Vector>,
+        b: S::Read<Vector>,
+    ) -> Inst<S> {
+        match self {
+            BinaryForm::Alu(op) => Inst::Alu { op, dst, a, b },
+            BinaryForm::Cmp(pred) => Inst::Cmp { pred, dst, a, b },
+        }
+    }
+}
+
+/// `dst = op(src1, src2)`. VEX is 3-operand/non-destructive: operands are
+/// never clobbered and may alias `dst`.
+fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, a: Reg, b: Reg) {
+    binary_form(op).inst::<Physical>(dst, a, b).emit_into(code);
+}
+
+/// The one instruction a unary op is.
+enum UnaryForm {
+    Lanewise(Lanewise),
+    Round(Rounding),
+    /// `Neg` and `Abs` xor or and the sign bit, which is a constant to hold in
+    /// a register first.
+    Signed {
+        op: Alu,
+        bits: u32,
+    },
+}
+
+fn unary_form(op: OpKind) -> UnaryForm {
+    match op {
+        OpKind::Sqrt => UnaryForm::Lanewise(Lanewise::Sqrt),
+        OpKind::Rsqrt => UnaryForm::Lanewise(Lanewise::Rsqrt),
+        OpKind::Recip => UnaryForm::Lanewise(Lanewise::Recip),
+        OpKind::Neg => UnaryForm::Signed {
+            op: Alu::Xor,
+            bits: 0x8000_0000,
+        },
+        OpKind::Abs => UnaryForm::Signed {
+            op: Alu::And,
+            bits: 0x7FFF_FFFF,
+        },
+        OpKind::Floor => UnaryForm::Round(Rounding::Floor),
+        OpKind::Ceil => UnaryForm::Round(Rounding::Ceil),
+        OpKind::Round => UnaryForm::Round(Rounding::Nearest),
+        OpKind::TruncToInt => UnaryForm::Lanewise(Lanewise::ToInt),
+        OpKind::IntToFloat => UnaryForm::Lanewise(Lanewise::FromInt),
+        _ => unimplemented_op("avx2", op),
+    }
 }
 
 /// `dst = op(src)`.
@@ -604,30 +903,19 @@ fn emit_unary(
     pool: &mut x86_64::ConstPool,
 ) -> Result<(), CompileError> {
     let super::Unary { op, dst, src, temp } = unary;
-    let lanewise = |op| Inst::Unary { op, dst, src };
-    let round = |mode| Inst::Round { mode, dst, src };
-    let mut signed = |op, bits| {
-        let mask = super::declared_temp(temp);
-        emit_const(code, mask, f32::from_bits(bits), pool)?;
-        Ok::<_, CompileError>(Inst::Alu {
-            op,
-            dst,
-            a: src,
-            b: mask,
-        })
-    };
-    let inst = match op {
-        OpKind::Sqrt => lanewise(Lanewise::Sqrt),
-        OpKind::Rsqrt => lanewise(Lanewise::Rsqrt),
-        OpKind::Recip => lanewise(Lanewise::Recip),
-        OpKind::Neg => signed(Alu::Xor, 0x8000_0000)?,
-        OpKind::Abs => signed(Alu::And, 0x7FFF_FFFF)?,
-        OpKind::Floor => round(Rounding::Floor),
-        OpKind::Ceil => round(Rounding::Ceil),
-        OpKind::Round => round(Rounding::Nearest),
-        OpKind::TruncToInt => lanewise(Lanewise::ToInt),
-        OpKind::IntToFloat => lanewise(Lanewise::FromInt),
-        _ => unimplemented_op("avx2", op),
+    let inst = match unary_form(op) {
+        UnaryForm::Lanewise(op) => Inst::Unary { op, dst, src },
+        UnaryForm::Round(mode) => Inst::Round { mode, dst, src },
+        UnaryForm::Signed { op, bits } => {
+            let mask = super::declared_temp(temp);
+            emit_const(code, mask, f32::from_bits(bits), pool)?;
+            Inst::Alu {
+                op,
+                dst,
+                a: src,
+                b: mask,
+            }
+        }
     };
     inst.emit_into(code);
     Ok(())
@@ -685,15 +973,18 @@ fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
 /// `vpmovzxbd` to widen into the iota.
 const IOTA_BYTES: u64 = 0x0706_0504_0302_0100;
 
-/// Emit a shift of i32 lanes by a compile-time immediate.
-fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount: u8) {
-    let direction = match op {
+fn shift_direction(op: OpKind) -> Direction {
+    match op {
         OpKind::Shl => Direction::Left,
         OpKind::Shr => Direction::Right,
         _ => unimplemented_op("avx2", op),
-    };
+    }
+}
+
+/// Emit a shift of i32 lanes by a compile-time immediate.
+fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount: u8) {
     Inst::Shift {
-        direction,
+        direction: shift_direction(op),
         dst,
         src,
         amount,
@@ -779,6 +1070,387 @@ fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx: Reg, base: PtrReg, t: GatherTe
         },
     ])
     .assemble(code);
+}
+
+// =============================================================================
+// Selection
+// =============================================================================
+
+/// The AVX2 machine, as the selection pipeline sees it.
+pub(in crate::emit) enum Avx2 {}
+
+/// The caller-saved general registers, by hardware number: `rax`, `rcx`,
+/// `rdx`, `rsi`, `rdi` and `r8`-`r11`. A callee-saved register would cost a
+/// prologue, and `rsp` is the frame's.
+const GENERAL: &[u8] = &[0, 1, 2, 6, 7, 8, 9, 10, 11];
+
+/// Define a value of class `C` with `make`, which builds the vector
+/// instruction that writes it.
+fn vex<C: Class>(b: &mut Builder<Avx2>, make: impl FnOnce(Def<C>) -> Inst<Selected>) -> Value<C> {
+    let dst = b.def();
+    let value = dst.value();
+    b.push(Op::Vector(make(dst)));
+    value
+}
+
+/// Define a value of class `C` with `make`, which builds the
+/// general-register instruction that writes it.
+fn general<C: Class>(
+    b: &mut Builder<Avx2>,
+    make: impl FnOnce(Def<C>) -> x86_64::Gp<Selected>,
+) -> Value<C> {
+    let dst = b.def();
+    let value = dst.value();
+    b.push(Op::General(make(dst)));
+    value
+}
+
+/// A fresh value of class `D` for an instruction of the allocator's to
+/// define, and its name as the class `C` the allocator asked for.
+fn defined<C: Spill, D: Spill>(b: &mut Spiller<'_, Avx2>) -> (Def<D>, Value<C>) {
+    let dst = b.def::<D>();
+    let value = dst.value().name().typed();
+    (dst, value)
+}
+
+impl IsaBackend for Avx2 {
+    type Inst<S: Stage> = Op<S>;
+    type Constant = u32;
+    type Anchors = ();
+    type Lane = Value<Vector>;
+
+    // SysV has no callee-saved vector registers and the collapse ABI passes
+    // no vector, so all sixteen `ymm` are the allocator's.
+    const FILE: RegisterFile = RegisterFile::new(
+        Members {
+            vector: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            general: GENERAL,
+            opmask: &[],
+            flags: &[0],
+        },
+        EntryRegisters {
+            ctx: x86_64::gpr::RDI.0,
+            out: x86_64::gpr::RSI.0,
+            pitch: x86_64::gpr::RDX.0,
+        },
+        32,
+    );
+    const POOL_REACH: u64 = i32::MAX as u64 / 4;
+
+    fn lane(b: &mut Builder<Self>, op: LaneOp<Self>) -> Result<Value<Vector>, CompileError> {
+        Ok(match op {
+            LaneOp::Const(value) => match value.to_bits() {
+                0 => vex(b, |dst| Inst::Zero { dst }),
+                u32::MAX => vex(b, |dst| Inst::Ones { dst }),
+                bits => {
+                    let at = b.constant(bits)?.label;
+                    vex(b, |dst| Inst::LoadConst { dst, at })
+                }
+            },
+            // The bytes `0..8` in through a general register, widened to
+            // dwords, converted.
+            LaneOp::Lanes => {
+                let bytes = general(b, |dst| x86_64::Gp::Movabs {
+                    dst,
+                    imm: IOTA_BYTES,
+                });
+                let packed = vex(b, |dst| Inst::Movq { dst, src: bytes });
+                let widened = vex(b, |dst| Inst::Unary {
+                    op: Lanewise::WidenBytes,
+                    dst,
+                    src: packed,
+                });
+                vex(b, |dst| Inst::Unary {
+                    op: Lanewise::FromInt,
+                    dst,
+                    src: widened,
+                })
+            }
+            LaneOp::Unary(op, src) => match unary_form(op) {
+                UnaryForm::Lanewise(op) => vex(b, |dst| Inst::Unary { op, dst, src }),
+                UnaryForm::Round(mode) => vex(b, |dst| Inst::Round { mode, dst, src }),
+                UnaryForm::Signed { op, bits } => {
+                    let mask = Self::lane(b, LaneOp::Const(f32::from_bits(bits)))?;
+                    vex(b, |dst| Inst::Alu {
+                        op,
+                        dst,
+                        a: src,
+                        b: mask,
+                    })
+                }
+            },
+            LaneOp::Binary(op, a, c) => vex(b, |dst| binary_form(op).inst(dst, a, c)),
+            LaneOp::MulAdd(x, y, addend) => {
+                let acc = b.tie(addend);
+                let result = acc.write();
+                b.push(Op::Vector(Inst::Fma231 { acc, a: x, b: y }));
+                result
+            }
+            // `cond ? if_true : if_false`, bit by bit.
+            LaneOp::Blend {
+                cond,
+                if_true,
+                if_false,
+            } => {
+                let kept = vex(b, |dst| Inst::Alu {
+                    op: Alu::And,
+                    dst,
+                    a: cond,
+                    b: if_true,
+                });
+                let other = vex(b, |dst| Inst::Alu {
+                    op: Alu::AndNot,
+                    dst,
+                    a: cond,
+                    b: if_false,
+                });
+                vex(b, |dst| Inst::Alu {
+                    op: Alu::Or,
+                    dst,
+                    a: kept,
+                    b: other,
+                })
+            }
+            LaneOp::Shift(op, src, amount) => vex(b, |dst| Inst::Shift {
+                direction: shift_direction(op),
+                dst,
+                src,
+                amount,
+            }),
+            // `vbroadcastss dst, [block + 4·element]`.
+            LaneOp::Uniform { base, element } => {
+                let disp = x86_64::displacement(element, x86_64::F32_BYTES)?;
+                vex(b, |dst| Inst::Broadcast {
+                    dst,
+                    src: Mem { base, disp },
+                })
+            }
+            // The gather and the broadcast arrive with B8.
+            LaneOp::Gather { .. } | LaneOp::Broadcast { .. } => {
+                unimplemented_op("avx2", OpKind::RawGather)
+            }
+        })
+    }
+
+    fn lane_name(lane: Value<Vector>) -> ValueName {
+        lane.name()
+    }
+
+    fn param_lane(param: ValueName) -> Value<Vector> {
+        param.typed()
+    }
+
+    /// `mov p, [ctx + 8·slot]`.
+    fn context(
+        b: &mut Builder<Self>,
+        ctx: Value<Pointer>,
+        slot: u64,
+    ) -> Result<Value<Pointer>, CompileError> {
+        let disp = x86_64::displacement(slot, x86_64::PTR_BYTES as u64)?;
+        Ok(general(b, |dst| x86_64::Gp::MovLoad {
+            dst,
+            src: Mem { base: ctx, disp },
+        }))
+    }
+
+    /// `out + 4·(row·pitch + col)`: each index is lane 0 of its binder,
+    /// truncated. A full batch is one `vmovups`; a remainder is `vextractps`
+    /// per lane, the low four straight out of the value and the rest out of
+    /// its high half.
+    fn store(b: &mut Builder<Self>, store: Store<Self>) {
+        let Store {
+            out,
+            pitch,
+            row,
+            col,
+            value,
+            lanes,
+        } = store;
+        let row = vex(b, |dst| Inst::Cvtt { dst, src: row });
+        let col = vex(b, |dst| Inst::Cvtt { dst, src: col });
+        let (scaled, flags) = (b.tie(row), b.def());
+        let row_pitch = scaled.write();
+        b.push(Op::General(x86_64::Gp::Imul {
+            dst: scaled,
+            src: pitch,
+            flags,
+        }));
+        let (summed, flags) = (b.tie(row_pitch), b.def());
+        let index = summed.write();
+        b.push(Op::General(x86_64::Gp::Add {
+            dst: summed,
+            src: col,
+            flags,
+        }));
+        let base = general(b, |dst| x86_64::Gp::Lea4 {
+            dst,
+            base: out,
+            index,
+        });
+        if u64::from(lanes) == Self::FILE.vector_bytes() / 4 {
+            b.push(Op::Vector(Inst::StoreBatch {
+                dst: Mem { base, disp: NoDisp },
+                src: value,
+            }));
+            return;
+        }
+        let mut half = value;
+        for lane in 0..lanes {
+            if lane == 4 {
+                half = vex(b, |dst| Inst::ExtractHigh { dst, src: value });
+            }
+            b.push(Op::Vector(Inst::ExtractLane {
+                dst: Mem {
+                    base,
+                    disp: Imm8((lane * 4) as i8),
+                },
+                src: half,
+                lane: (lane % 4) as u8,
+            }));
+        }
+    }
+
+    /// `vmovmskps`, then `test` (ZF iff no lane is set) or `cmp al, 0xFF` (ZF
+    /// iff all eight are), then `je`: the `cmp al` form on a byte, because the
+    /// sign-extending `cmp eax, imm8` could never equal a zero-extended mask.
+    fn branch(b: &mut Builder<Self>, test: Test<Self>, edges: Edges) {
+        let bits = vex(b, |dst| Inst::MoveMask {
+            dst,
+            src: test.cond,
+        });
+        let flags = b.def();
+        let tested = flags.value();
+        b.push(Op::General(match test.dead {
+            IfArm::True => x86_64::Gp::Test { flags, src: bits },
+            IfArm::False => x86_64::Gp::CmpByte {
+                flags,
+                src: bits,
+                imm: 0xFF,
+            },
+        }));
+        let next = Target {
+            label: edges.next,
+            args: Vec::new(),
+        };
+        b.push(Op::General(x86_64::Gp::Jcc {
+            cond: x86_64::Cond::E,
+            flags: tested,
+            taken: edges.taken,
+            next,
+        }));
+    }
+
+    fn jump(b: &mut Builder<Self>, to: Target, next: Label) {
+        b.push(Op::General(if to.label == next {
+            x86_64::Gp::Fallthrough { to }
+        } else {
+            x86_64::Gp::Jmp { to }
+        }));
+    }
+
+    fn enter(b: &mut Builder<Self>) {
+        let flags = b.def();
+        b.push(Op::General(x86_64::Gp::Enter {
+            size: FrameSize,
+            flags,
+        }));
+    }
+
+    fn ret(b: &mut Builder<Self>) {
+        let flags = b.def();
+        b.push(Op::General(x86_64::Gp::Ret {
+            size: FrameSize,
+            flags,
+        }));
+    }
+
+    fn copy<C: Spill>(b: &mut Spiller<'_, Self>, src: Value<C>) -> Value<C> {
+        match C::ID {
+            ClassId::Vector => {
+                let (dst, copy) = defined::<C, Vector>(b);
+                b.push(Op::Vector(Inst::Mov {
+                    dst,
+                    src: src.name().typed(),
+                }));
+                copy
+            }
+            ClassId::Pointer => {
+                let (dst, copy) = defined::<C, Pointer>(b);
+                b.push(Op::General(x86_64::Gp::Mov {
+                    dst,
+                    src: src.name().typed(),
+                }));
+                copy
+            }
+            ClassId::Integer => {
+                let (dst, copy) = defined::<C, Integer>(b);
+                b.push(Op::General(x86_64::Gp::MovInt {
+                    dst,
+                    src: src.name().typed(),
+                }));
+                copy
+            }
+            ClassId::Opmask | ClassId::Flags => unreachable!("AVX2 has no {:?} to copy", C::ID),
+        }
+    }
+
+    fn spill<C: Spill>(b: &mut Spiller<'_, Self>, src: Value<C>, slot: &FrameSlot) {
+        let slot = slot.name();
+        b.push(match C::ID {
+            ClassId::Vector => Op::Vector(Inst::SpillVector {
+                src: src.name().typed(),
+                slot,
+            }),
+            ClassId::Pointer => Op::General(x86_64::Gp::SpillPtr {
+                src: src.name().typed(),
+                slot,
+            }),
+            ClassId::Integer => Op::General(x86_64::Gp::SpillInt {
+                src: src.name().typed(),
+                slot,
+            }),
+            ClassId::Opmask | ClassId::Flags => unreachable!("AVX2 has no {:?} to spill", C::ID),
+        });
+    }
+
+    fn reload<C: Spill>(b: &mut Spiller<'_, Self>, slot: &FrameSlot) -> Value<C> {
+        let slot = slot.name();
+        match C::ID {
+            ClassId::Vector => {
+                let (dst, reloaded) = defined::<C, Vector>(b);
+                b.push(Op::Vector(Inst::ReloadVector { dst, slot }));
+                reloaded
+            }
+            ClassId::Pointer => {
+                let (dst, reloaded) = defined::<C, Pointer>(b);
+                b.push(Op::General(x86_64::Gp::ReloadPtr { dst, slot }));
+                reloaded
+            }
+            ClassId::Integer => {
+                let (dst, reloaded) = defined::<C, Integer>(b);
+                b.push(Op::General(x86_64::Gp::ReloadInt { dst, slot }));
+                reloaded
+            }
+            ClassId::Opmask | ClassId::Flags => unreachable!("AVX2 has no {:?} to reload", C::ID),
+        }
+    }
+
+    // Constants become rematerializable with B7.
+    fn rematerializable(_: &Op<Selected>) -> bool {
+        false
+    }
+
+    fn walk<T: Stage>(inst: &Op<Selected>, f: &mut impl Rebind<T>) -> Op<T> {
+        inst.walk(f)
+    }
+
+    fn encode(inst: &Op<Bound<'_, Self>>, out: &mut Encoding<'_>) {
+        inst.assemble(out);
+    }
+
+    fn constant_bytes(constant: u32) -> Vec<u8> {
+        constant.to_le_bytes().to_vec()
+    }
 }
 
 #[cfg(test)]

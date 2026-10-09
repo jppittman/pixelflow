@@ -46,7 +46,7 @@ pub struct StaticFeatures {
     /// Frame slots holding a value with an address: the body's
     /// `regalloc::Allocation::spill_slots`.
     pub spill_slots: u64,
-    /// Stack bytes the frame occupies: `CompileResult::spill_bytes`, a frame
+    /// Stack bytes the frame occupies: `CompileResult::frame_bytes`, a frame
     /// offset bounded by `StackFrame`'s 2 MiB limit and the slot encodings,
     /// not a program count.
     pub frame_bytes: u32,

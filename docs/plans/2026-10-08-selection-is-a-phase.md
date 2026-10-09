@@ -77,7 +77,7 @@ These are binding. Where a later section disagrees, this section wins, and the i
    - AVX-512: `enum { Vector(Value<Vector>), Opmask(Value<Opmask>) }`. A comparison selects `vcmpps k` and yields an `Opmask` lane; `BitAnd`/`BitOr` of two `Opmask` lanes select `kandw`/`korw`.
 
    Consequences:
-   - The driver binds each IR value to a `B::Lane` and hands lanes back to the backend. It never asks whether a value is a mask: only AVX-512 knows that a lane can live in `k`. A block parameter takes its lane's class (`IsaBackend::lane_class`).
+   - The driver binds each IR value to a `B::Lane` and hands lanes back to the backend. It never asks whether a value is a mask: only AVX-512 knows that a lane can live in `k`. A block parameter takes its lane's class (`IsaBackend::lane_name`).
    - There is no conversion, as a concept or as a trait method. Where an IR value is read in the other file, AVX-512's selection picks an instruction that reads it where it is:
      - an `If` whose condition is an `Opmask` lane is `vblendmps zmm{k}`; on a `Vector` lane it is `vpternlogd 0xCA`, today's blend;
      - a guard on an `Opmask` lane is `kortestw`; on a `Vector` lane it is `vptestmd`, then `kortestw`;
@@ -209,7 +209,7 @@ allocate : machine function over values → machine function over registers and 
 **The allocator writes its own code.**
 
 - It asks the backend for a copy, a spill or a reload at the slot it chose. When the offset does not encode, the backend answers with address arithmetic over a fresh `Pointer` value, which the allocator allocates on the spot.
-- The frame lays out the narrow classes (`Pointer`, `Integer`, `Opmask`, 8 bytes each) first, sized from their peak live count. So every narrow slot encodes on every backend: x86 `disp32` and aarch64's scaled `imm12` (4,095 × 8 bytes).
+- The frame lays out the narrow classes (`Pointer`, `Integer`, `Opmask`, 8 bytes each) first, sized from their peak live count. So every narrow slot encodes on every backend: x86 `disp32` and aarch64's scaled `imm12` (4,096 slots of 8 bytes).
 - The vector region starts at `align_up(8·N, max(16, vector_bytes))`.
 - Therefore:
   - a narrow spill never needs a temporary;
@@ -221,7 +221,7 @@ allocate : machine function over values → machine function over registers and 
 
 **Allocation is total.**
 
-- It returns `Err(BudgetExceeded)` when the frame outgrows `MAX_FRAME`, or when the narrow region would pass 4,095 slots.
+- It returns `Err(BudgetExceeded)` when the frame outgrows `MAX_FRAME`, or when the narrow region would pass 4,096 slots.
 - It panics, naming the instruction, when the function cannot be allocated: for example, an instruction that holds more registers of a class than the class has. That is a selection bug, never a fact about a kernel.
 - It never picks a register outside its leases.
 
@@ -432,25 +432,24 @@ The typed guarantee is therefore: one lease per register per allocation, and eve
 /// port would change these files, because Win64 callee-saves `xmm6–15`.
 #[derive(Copy, Clone, Debug)]
 pub(in crate::emit) struct RegisterFile {
-    pub vector: &'static [u8],
-    pub general: &'static [u8],
-    pub opmask: &'static [u8],
-    pub flags: &'static [u8],
+    members: Members,            // { vector, general, opmask, flags: &'static [u8] }
     /// Members of `general` the three arguments arrive in. This is initial
     /// ownership, not a reservation: once a parameter is dead or spilled, its
     /// register is free.
-    pub entry: EntryRegisters,   // { ctx: u8, out: u8, pitch: u8 }
+    entry: EntryRegisters,       // { ctx: u8, out: u8, pitch: u8 }
     /// Bytes per `Vector` register and per vector frame slot: 16, 32 or 64.
-    pub vector_bytes: u64,
+    vector_bytes: u64,
 }
 impl RegisterFile {
-    /// Refuse a self-contradictory declaration at compile time:
+    /// The only constructor, so a `RegisterFile` that is not checked cannot
+    /// exist (the fields are private to `register_file.rs`). `const`, so a
+    /// contradictory `FILE` does not compile. Refuses:
     /// - no file names a member twice (the files are numbered separately, so
     ///   `rax` and `ymm0` are both 0);
     /// - `entry` names three distinct `general` members;
     /// - `flags` has at most one member;
     /// - `vector_bytes` a power of two, at least 16.
-    pub(in crate::emit) const fn checked(self) -> Self;
+    pub(in crate::emit) const fn new(members: Members, entry: EntryRegisters, vector_bytes: u64) -> Self;
 }
 ```
 
@@ -471,17 +470,16 @@ Notes on the table:
 These types live in `regalloc/resource.rs`.
 
 ```rust
-/// A frame slot: `bytes` at `offset` from the stack pointer. A resource like
+/// A frame slot: at `offset` from the stack pointer. A resource like
 /// `Reg`: not `Copy`, not `Clone`, minted only by `Frame`, at an offset fixed
 /// for its life.
-pub(in crate::emit) struct FrameSlot { name: SlotName, offset: u64, bytes: u64 }
+pub(in crate::emit) struct FrameSlot { name: SlotName, offset: u64 }
 impl FrameSlot {
     /// Bytes from the stack pointer. The control plane is 64-bit. Each
     /// encoder narrows this to its displacement field, and the backend's
     /// `spill`/`reload` turn an offset that does not fit into address
     /// arithmetic.
     pub(in crate::emit) fn offset(&self) -> u64;
-    pub(in crate::emit) fn bytes(&self) -> u64;
     pub(in crate::emit) fn name(&self) -> SlotName;
 }
 /// A slot's name: `Copy`, carried by selected-stage instructions the way
@@ -499,7 +497,7 @@ pub(super) struct SlotLease { name: SlotName }
 /// - **Layout.** The narrow region (`Pointer`, `Integer`, `Opmask`; 8 bytes
 ///   each) occupies `[0, 8·N)`, where `N` is the peak number of
 ///   simultaneously live narrow values, measured by the allocator before the
-///   scan. `N > 4095` is `BudgetExceeded`.
+///   scan. `N > 4096` is `BudgetExceeded` (`ldr x, [sp, #imm12·8]` reaches `imm12` 0 through 4095, which is 4096 slots).
 /// - The vector region starts at `align_up(8·N, max(16, vector_bytes))` and
 ///   grows as the scan mints slots, lowest free first.
 /// - The frame's size is the vector region's high-water mark, or the narrow
@@ -666,8 +664,9 @@ Named fields stop selection or encoding from swapping `a` and `b` of a `vsubps` 
 
 ```rust
 /// One operand, as the allocator and the CFG read it. Produced by
-/// `operands`, a fold over `IsaBackend::walk`. Computed once per instruction
-/// into the allocator's operand table, never per query.
+/// `operands`, a fold over `IsaBackend::walk`. Computed once per instruction,
+/// by `Builder::push`, and kept beside the instruction (`Pushed::operands`) for
+/// the allocator, never per query.
 pub(in crate::emit) enum Operand {
     Reg { value: ValueName, access: Access },
     /// A branch target and the arguments it passes. A block's successors are
@@ -766,8 +765,8 @@ impl Encoding<'_> {
 
 pub(in crate::emit) struct Assembled { pub code: Vec<u8>, addresses: Vec<usize> }
 impl Assembled { pub(in crate::emit) fn address(&self, label: Label) -> usize; }
-// A8 lands `assemble` returning the `Vec<u8>` alone. `Assembled` and
-// `falls_through` arrive with their first reader (B-series).
+// A8 landed `assemble` returning the `Vec<u8>` alone. `Assembled` and
+// `falls_through` arrived with their first reader, B3's `encode`.
 
 /// Lay out `text` then `data`, encode each instruction with `encode`, and
 /// patch every field.
@@ -786,6 +785,13 @@ pub(in crate::emit) fn assemble<I>(
 ### 2.9 Functions, blocks, the builder
 
 ```rust
+pub(in crate::emit) struct Pushed<I> {
+    pub inst: I,
+    /// `operands(&inst)`, computed once by `push`. An entry cannot hold an
+    /// instruction without its list, and `Block<Placed>` carries none.
+    pub operands: Vec<Operand>,
+}
+
 pub(in crate::emit) struct Block<I> {
     pub label: Label,
     /// Values defined on entry: what a phi is.
@@ -803,7 +809,8 @@ pub(in crate::emit) struct Target { pub label: Label, pub args: Vec<ValueName> }
 /// The ABI's three arguments: the entry block's parameters, with their classes.
 pub(in crate::emit) struct Entry { pub ctx: Value<Pointer>, pub out: Value<Pointer>, pub pitch: Value<Integer> }
 
-/// One surviving fold's loop.
+/// One surviving fold's loop. `trips` is how many times its body runs per
+/// call: its own trip count times its parent's.
 pub(in crate::emit) struct Loop { pub head: Label, pub parent: Option<usize>, pub trips: u64 }
 
 /// The pool section: its label, then each entry with its own label, in order.
@@ -839,7 +846,7 @@ pub(in crate::emit) struct Constant { pub label: Label, pub offset: u64 }
 ///   Join invariant 2 takes its location from the path that defines it.
 /// - No phase inserts a phi for it.
 pub(in crate::emit) struct Function<B: IsaBackend> {
-    pub blocks: Vec<Block<B::Inst<Selected>>>,
+    pub blocks: Vec<Block<Pushed<B::Inst<Selected>>>>,
     pub entry: Entry,
     pub loops: Vec<Loop>,
     pub constants: Constants<B::Constant>,
@@ -863,7 +870,9 @@ impl<B: IsaBackend> Builder<B> {
     /// # Panics
     /// - a write not minted by this builder, or already defined;
     /// - a read of a value not yet defined;
-    /// - a read of a value this same instruction defines.
+    /// - a read of a value this same instruction defines;
+    /// - an `Operand::Frame`: only the instructions the allocator inserts
+    ///   carry a slot.
     pub(in crate::emit) fn push(&mut self, inst: B::Inst<Selected>);
     /// A block to be entered later. Its label is minted now, with it.
     pub(in crate::emit) fn block(&mut self, params: &[ClassId], scope: Scope) -> Pending;
@@ -884,8 +893,9 @@ impl<B: IsaBackend> Builder<B> {
 #[must_use] pub(in crate::emit) struct Pending { label: Label, params: Vec<ValueName>, scope: Scope }
 impl Pending {
     pub(in crate::emit) fn label(&self) -> Label;
-    /// Parameter `i` as a `Value<C>`. Panics on the wrong class.
-    pub(in crate::emit) fn param<C: Class>(&self, i: usize) -> Value<C>;
+    /// The parameters, as the allocator names them; the backend's
+    /// `param_lane` types one.
+    pub(in crate::emit) fn params(&self) -> &[ValueName];
 }
 
 /// The rights the allocator's own verbs get. `def` mints only `Spill`
@@ -931,8 +941,9 @@ pub(in crate::emit) trait IsaBackend: Sized + 'static {
 
     // Selection. Operands are values; the driver resolved them.
     fn lane(b: &mut Builder<Self>, op: LaneOp<Self>) -> Result<Self::Lane, CompileError>;
-    /// The class of a block parameter that carries `lane`.
-    fn lane_class(lane: Self::Lane) -> ClassId;
+    /// The name of `lane`, for a branch to pass it and a block to take its
+    /// class.
+    fn lane_name(lane: Self::Lane) -> ValueName;
     /// A block parameter, read back as a lane.
     fn param_lane(param: ValueName) -> Self::Lane;
     fn context(b: &mut Builder<Self>, ctx: Value<Pointer>, slot: u64) -> Result<Value<Pointer>, CompileError>;
@@ -1049,7 +1060,7 @@ pub(in crate::emit) trait RegisterAllocator {
     /// binding hold, and binding `Enter`/`Ret`'s frame size.
     ///
     /// # Errors
-    /// `BudgetExceeded` when the narrow region passes 4,095 slots or the frame
+    /// `BudgetExceeded` when the narrow region passes 4,096 slots or the frame
     /// passes `MAX_FRAME`.
     ///
     /// # Panics
@@ -1069,18 +1080,26 @@ pub(in crate::emit) trait RegisterAllocator {
 /// An allocated kernel: every register a borrowed token, every slot a
 /// borrowed slot, every block argument a placed move.
 pub(in crate::emit) struct Allocated<'m, B: IsaBackend> {
-    pub blocks: Vec<Block<Placed<'m, B>>>,
+    pub blocks: Vec<Block<Emitted<'m, B>>>,   // no block has parameters: they are slots
     pub loops: Vec<Loop>,
     pub constants: Constants<B::Constant>,
-    pub labels: Labels,
+    labels: Labels,                           // the program takes them: `program()`
+    pub text_end: Label,                      // where the data section's padding begins
     pub frame_bytes: u64,
+    pub slots: u64,                           // `CompileResult::spill_count`
+    pub hoisted: u64,                         // `CompileResult::hoisted_values`
+    pub scheduled: Vec<u64>,                  // the driver's per-scope tally
 }
-pub(in crate::emit) struct Placed<'m, B: IsaBackend> { pub inst: B::Inst<Bound<'m, B>>, pub origin: Origin }
+/// `Placed` is taken: it is the encoder's stage trait.
+pub(in crate::emit) struct Emitted<'m, B: IsaBackend> { pub inst: B::Inst<Bound<'m, B>>, pub origin: Origin }
 /// Why an instruction is there. `EmitTraffic` counts these per scope and
-/// weights them by trips.
+/// weights them by trips. B4 has `Selected`, `Spill` and `Reload`; B5 adds
+/// `Copy` and B7 `Remat`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(in crate::emit) enum Origin { Selected, Spill, Reload, Remat, Copy }
 ```
+
+**B4 lands `allocate` as a function** (`regalloc/local.rs`), not the trait above: the trait has one implementation and no caller generic over it, so it is added when a second allocator exists. It lays the frame out from value intervals before it binds anything, because with every value slot-homed the slots do not depend on the registers. B5's retroactive stores need the frame mutable during the scan, so B5 moves binding after the scan, as step 7 describes.
 
 **The scan.** It is one pass in layout order, so a fold is scanned inside its parent (closure 17).
 
@@ -1114,9 +1133,9 @@ pub(in crate::emit) enum Origin { Selected, Spill, Reload, Remat, Copy }
 fn compile_on<B: IsaBackend>(scoped: &ScopedSchedule) -> Result<CompileResult, CompileError> {
     let function = select::<B>(scoped)?;
     let pool = Pool::<B>::mint();
-    let mut frame = Frame::empty(B::FILE.vector_bytes);
-    let allocated = LinearScan.allocate(function, &pool, &mut frame)?;
-    let program = allocated.to_asm();          // text: blocks; data: the pool
+    let mut frame = Frame::empty(B::FILE.vector_bytes());
+    let mut allocated = local::allocate(function, &pool, &mut frame)?;
+    let program = allocated.program();         // text: blocks; data: the pool
     let assembled = asm::assemble(&program, |i, out| B::encode(&i.inst, out));
     let traffic = EmitTraffic::of(&allocated, &assembled);
     CompileResult::new(&assembled.code, traffic, allocated.frame_bytes)
@@ -1141,7 +1160,7 @@ fn compile_on<B: IsaBackend>(scoped: &ScopedSchedule) -> Result<CompileResult, C
 | A dropped `Def` leaves a name with no definition | Rust is affine, not linear | `#[must_use]`; `Builder::finish` panics naming it |
 | A read before its definition; an instruction reading its own result | `Def::value` must be readable for selection to return it (closure 21, landing B4) | `Builder::push` panics |
 | A `Target`'s arguments match its block's parameters | A `Label` is a name, not a typed handle | `Builder::finish` |
-| A `Pending` parameter's class | Parameter lists are data | `Pending::param::<C>` panics |
+| A `Pending` parameter's class | Parameter lists are data | `B::param_lane`'s `ValueName::typed` panics |
 | Exclusivity inside the allocated program: an `Early`'s register is none of its instruction's reads | The allocated program holds shared borrows, by design (§2.2) | The scan's lease state, plus an assertion at binding |
 | No `Flags` live across a flags write or at a label | Liveness is a function property | The allocator panics. Spilling flags is a type error (`Spill`) |
 | A rematerialized instruction writes no `Flags` | A cloning walk must mint any class | The allocator asserts it at remat |
@@ -1173,7 +1192,7 @@ In the new pipeline, none of these is ever written. The legacy code is deleted i
 | H5 | `emit_fmov_imm`'s `w16` path (`aarch64.rs:466-477`) | `movz/movk w16; dup` | Every constant is selected: `movi`, `fmov`, or `ldr q, [p, #off]` | C4 |
 | H6 | `address_in_ip0` (`table.rs:530`), called by `StrQ` (`562`), `LdrQ` (`617`) and `LdrS` (`672`). `LdrS` also serves `emit_uniform_load` (`aarch64.rs:410`) and `index_into`'s slot read (`2269`). `StrX`/`LdrX` panic past `imm12` (`table.rs:589-594`, `644-648`), and `LdrX` serves `Context` (`aarch64.rs:2390-2401`), so a context slot of 4096 or more panics | IP0 as an address, and two panics | Spills: `spill`/`reload` emit `SlotAddr { dst: Write<Pointer>, slot }` (`add t, sp, #hi, lsl 12; add t, t, #lo`); narrow slots always encode. Non-frame loads (`Uniform`, `Context`): selection emits `t = AddImm(base, #hi, lsl 12)`, `ldr [t, #lo]`, and `movz/movk` plus a register `add` past 16 MiB. The binder read is an ordinary reload. One instruction replaces today's chain of `add #4080` | C4 |
 | H7 | `kortestw` bytes hardwiring `k1,k1` (`avx512.rs:647-653`) | An encoder that ignores its register | `KorTest { flags: Write<Flags>, k: Read<Opmask> }` encodes `k.number()` | A11b field; C2 value |
-| H8 | Gather mask `mov eax, 0xFFFF; kmovw k1, eax` (`avx512.rs:749`); `aaa = 001` (`789`); `gpr_temps_for(Gather) = 0` | `rax` and `k1` clobbered, undeclared | `k = KOnes` (`kxnorw k, k, k`: no general register), then `Gather { dst: Early<Vector>, mask: Tie<Opmask> }`. `kxnorw` reads its own operand, and `vgatherdps` writes the mask it gathers under, so a `KOnes` on the previous gather's mask chains each gather behind the last (the `mov`/`kmovw` pair only writes). C2 gives `KOnes` a source nothing writes, or measures the chain | C2 |
+| H8 | Gather mask `mov eax, 0xFFFF; kmovw k1, eax` (`avx512.rs:749`); `aaa = 001` (`789`); `gpr_temps_for(Gather) = 0` | `rax` and `k1` clobbered, undeclared. At HEAD (since P5 and P6): `k1` and `eax` are both declared, `gpr_temps_for(Gather) = 1` and `set_gather_mask` takes the `Gpr`; C2 deletes the sequence | `k = KOnes` (`kxnorw k, k, k`: no general register), then `Gather { dst: Early<Vector>, mask: Tie<Opmask> }`. `kxnorw` reads its own operand, and `vgatherdps` writes the mask it gathers under, so a `KOnes` on the previous gather's mask chains each gather behind the last (the `mov`/`kmovw` pair only writes). C2 gives `KOnes` a source nothing writes, or measures the chain | C2 |
 | H9 | Gather into `temp(1)`, then `vmovaps` (`avx512.rs:1368-1381`) | A temp plus a move standing in for an early def | `dst: S::Early<Vector>`; the move is gone | C2 |
 | H10 | Fold `t0`/`t1` (`mod.rs:1798`); seed through `t0` (`1825-1826`); `acc = if body_result == t0 {…}` (`1881`) | The driver aliasing registers by hand | Seeds are preheader `Target` arguments; the accumulate is `Binary(combine, acc, body)` | B3 |
 | H11 | `test_ge` borrowing the guard's `k` (`mod.rs:1855`; `avx512.rs:1604-1613`) | One mask register serving two roles | `done` is an ordinary compare; its `Opmask` value is its own | B3, C2 |
@@ -1232,7 +1251,7 @@ The narrowing already removes these, so they are not listed again here: `Item`, 
 - `WritePlan`, `MaskTest`;
 - the legacy trait (renamed `LegacyBackend` in B1) with every verb: `jump`, `register_file`, `begin`, `emit_plan`, `emit_mov`, `emit_store`, `ptr_store`, `ptr_load`, `ptr_mov`, `emit_resolve`, `branch_if_arm_is_dead`, `frame_alloc`, `anchor`, `finish`, `slot_store`, `slot_load`, `scope_begin`, `scope_end`, `add_scalar`, `load_const`, `alu`, `test_ge`, `emit_write`, `emit_ret`;
 - `compile_via_backend`, `AtFloor`'s legacy verbs, `Addressed`, and the legacy `GOLDEN` table;
-- the `Codegen` trait, the `Legacy` impl and the `PIXELFLOW_CODEGEN` knob.
+- the `PIXELFLOW_CODEGEN` knob (`Pipeline`, `pipeline()`, and `compile_native`'s match on it).
 
 `emit/storage.rs`: the whole file (`Slot`, `StackFrame`, `MAX_FRAME`, which moves to `regalloc/resource.rs`).
 
@@ -1281,7 +1300,7 @@ Tests deleted because the property is now a type, an invariant, or moot:
 | `Pointer`/`Integer` as distinct classes over `GeneralFile` | Merging today's pointer and scratch pools must not drop `Mem.base: PtrReg`'s guarantee (closure 8). |
 | `Origin` | `EmitTraffic` counted by decorating encoders (`Counting`). Counting allocated instructions by why they exist gives the same numbers with no decorator. |
 | `ScheduledOp::Outer(Class)` (A5, deleted in D2) | Selection reads the same scoped schedule the legacy pipeline does until D1. A placeholder must say what it is (CLAUDE.md, "extend its type"). |
-| The `Codegen` trait and `PIXELFLOW_CODEGEN`, decided once at startup (B4, deleted in D1) | This builds the new pipeline beside the old one, a backend at a time, with each commit live. Per CLAUDE.md, a second implementation of an existing category is a second `impl`. Like `PIXELFLOW_ISA`, an unbuilt choice is refused, never downgraded. |
+| `PIXELFLOW_CODEGEN`, decided once at startup (B4, deleted in D1) | This builds the new pipeline beside the old one, a backend at a time, with each commit live. It is one `match` in `compile_native` on the tier and the choice, where the case is settled once: a `Codegen` trait would have no caller generic over it. Like `PIXELFLOW_ISA`, an unbuilt choice is refused, never downgraded. |
 
 ### 4.3 Considered and refused
 
@@ -1527,7 +1546,7 @@ Every commit in this phase is live in production.
 
 - **Files:** `emit/regalloc/resource.rs` (§2.2, §2.4), `emit/mod.rs` (`File` and its four files, `FileId`, `RegisterFile`, `EntryRegisters`, `Spill`, `Stage::Slot`, `Bound`, `Operand::Frame`, `Rebind::slot`, the trait's `FILE`, `copy`, `spill`, `reload`), `emit/build.rs` (`Spiller`).
 - **Deferred from A9, whose first reader is here:** `File` and its four files, `FileId`, `Spill`, and `Stage::Slot` (the frame slot is a token). Moved here from B1: `Spiller`, `Operand::Frame`, `Rebind::slot`, and the trait's `FILE`, `copy`, `spill` and `reload`.
-- **Tests:** none of its own (§0.6). From B4, the leases and the frame are exercised through `compile`. The narrow region's `BudgetExceeded` is reached by a kernel with more than 4,095 live narrow values, if one can be built through the production API; if none can, the bound is an assertion, not a test.
+- **Tests:** none of its own (§0.6). From B4, the leases and the frame are exercised through `compile`. The narrow region's `BudgetExceeded` is reached by a kernel with more than 4,096 live narrow values, if one can be built through the production API; if none can, the bound is an assertion, not a test.
 - **Status:** `expect(dead_code)` until B4.
 - **Gate:** G.
 
@@ -1535,19 +1554,21 @@ Every commit in this phase is live in production.
 
 - **Files:** `emit/select.rs` (the driver of §2.10, with scoped `Bindings`), `avx2.rs`.
 - **Add to AVX2:**
-  - `lane` for `Const` (RIP-relative `LoadConst`; `Ones`; `vxorps` zero), `Lanes`, `Unary`, `Binary`, `MulAdd`, `Blend` and `Shift`;
+  - `lane` for `Const` (RIP-relative `LoadConst`; `Ones`; `vxorps` zero), `Lanes`, `Unary`, `Binary`, `MulAdd`, `Blend`, `Shift` and `Uniform`;
+  - `context` (`mov p, [ctx + 8·slot]`, refused past `disp32` as today);
   - `store` (`Cvtt`, `Imul`, `Add`, `Lea4`, then `vmovups` or the masked remainder);
   - `branch`, `jump`, `enter` and `ret`;
-  - `walk`, and `encode` at `Bound`, built through `asm::Encoding`: B3 is the first reader of `encode` at `Bound`, and A9's `Gp<Physical>` implements only the legacy `AsmInsn` until D1 deletes it.
-- **The driver covers:** the body, folds as blocks (§2.10), `Outer`/`Var`/`Reduce`/`Seq`/`Write`.
-- **The driver refuses**, through `unimplemented_op`, which names the op: `Context`, `Uniform`, `Gather`, `Broadcast`, and guarded `If` arms. These arrive in B8–B9.
+  - `copy`, `spill` and `reload` for the three classes AVX2 has, and `rematerializable` (false until B7);
+  - `walk`, and `encode` at `Bound`, built through `asm::Encoding` with `Encoding::falls_through` and `Assembled`. `Gp<S>` and `avx2::Inst<S>` encode once, generic over `Placed` stages, so `Physical` and `Bound` share their bytes until D1 deletes `Physical`; `avx2::Op<S>` is the instruction a block holds, a vector one or a general-register one.
+- **The driver covers:** the body, folds as blocks (§2.10), `Outer`/`Var`/`Reduce`/`Seq`/`Write`/`Context`/`Uniform`. Every kernel reads its origin through `Context` and `Uniform`, so K(avx2) in B4 cannot pass without them.
+- **The driver refuses**, through `unimplemented_op`, which names the op: `Gather`, `Broadcast`, and guarded `If` arms. These arrive in B8–B9.
 - **Tests:** none of its own (§0.6). `finish`'s invariants and one backward branch per fold are production assertions in the selected program, and B4 exercises them through `compile` under the knob.
 - **Status:** `expect(dead_code)` until B4.
 - **Gate:** G.
 
 #### B4: The local allocator, and the pipeline goes live behind a knob
 
-- **Files:** `emit/regalloc/mod.rs`, `emit/mod.rs` (`trait Codegen`, `Legacy<B>`, `Selection<B>`, `compile_on`), `emit/traffic.rs` (`EmitTraffic::of(&Allocated, &Assembled)`).
+- **Files:** `emit/regalloc/local.rs` (new, beside the legacy `mod.rs`, which D1 deletes), `emit/regalloc/resource.rs` (`Lent`), `emit/mod.rs` (`Pipeline`, `pipeline()`, `compile_on`, the `File::lease` dispatch, `CompileResult`), `emit/traffic.rs` (`EmitTraffic::of(&Allocated, &Assembled)`).
 - **The allocator** is the simplest correct one:
   - every value is stored at its definition;
   - every read is reloaded into a fresh value that dies at its instruction;
@@ -1560,7 +1581,8 @@ Every commit in this phase is live in production.
 - **The knob:** `PIXELFLOW_CODEGEN=legacy|selection`, read once at the first compile, like `isa::detect`.
   - The default is `legacy`.
   - `selection` on a tier without a selection backend panics, naming the tier. It is refused, never downgraded.
-- **`CompileResult`** fields are defined as in §2.12.
+  - It is one `match` in `compile_native` on the tier and the choice. There is no `Codegen` trait: nothing is generic over it.
+- **`CompileResult`** fields are defined as in §2.12. The legacy pipeline fills `frame_bytes` with its spill region, below the fold slots and parks it lays out above it, so its journal rows are unchanged; the selection pipeline fills it with the whole frame. D1 ends the difference.
 - **Bytes:** legacy identical.
 - **Gate:** G, plus K(avx2) on `a_surviving_reduce_compiles_and_runs`, `a_reduce_three_deep_compiles_and_runs`, `a_folds_spill_slots_do_not_alias_its_parents`, `sibling_folds_sharing_a_binder_node_read_their_own_counters`, `halve_fold_jit`, `muladd_rounding`, and `collapse_paths`' arithmetic kernels.
 
@@ -1600,8 +1622,6 @@ Every commit in this phase is live in production.
 
 - **Files:** `avx2.rs`, `select.rs`.
 - **Add:**
-  - `context`: `mov p, [ctx + 8·slot]`, refused past `disp32` as today;
-  - `Uniform`;
   - `Gather`: `vcvttps2dq`, `Ones` mask, then `Gather { dst: Early, mask: Tie }`;
   - `Broadcast`: `Cvtt`, then `vbroadcastss [base + idx·4]`.
 - **Gate:** K(avx2) plus `reduce_binder_reads_bound_buffer`, `glyph_*`, `freetype_oracle`.

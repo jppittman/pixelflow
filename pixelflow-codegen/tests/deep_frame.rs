@@ -45,9 +45,9 @@ fn a_spill_area_past_64_kib_holds_the_kernels_values() {
     let shape = LatticeShape::new([WIDTH as u32, ROWS as u32]);
     let compiled = compile(&arena, root, shape).expect("a deep frame compiles");
     assert!(
-        compiled.spill_bytes > REACH,
-        "the fixture no longer forces a frame past reach (spill_bytes = {})",
-        compiled.spill_bytes
+        compiled.frame_bytes > u64::from(REACH),
+        "the fixture no longer forces a frame past reach (frame_bytes = {})",
+        compiled.frame_bytes
     );
 
     let mut out = vec![f32::NAN; ROWS * WIDTH];
