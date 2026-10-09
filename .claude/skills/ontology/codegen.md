@@ -254,12 +254,10 @@
 - **Follows:** a rematerialization is a memory operation, so counted memory
   traffic rose honestly while bytes fell. The pool's anchor is a pointer
   value the allocator should place.
-- **Lives:** `CONST_POOL`, `CONST_POOL_ALIGN` (`pixelflow-codegen/src/emit/mod.rs`),
+- **Lives:** `CONST_POOL_ALIGN` (`pixelflow-codegen/src/emit/mod.rs`),
   `POOL_BASE` (`emit/x86_64.rs`), `X17` (`emit/aarch64.rs`);
   collapse-is-a-fold step 5½. Today the anchor is pinned to `r8`/`X17` by
-  convention (a-pointer-is-a-value §5, open) and the pool's label is the
-  string constant `CONST_POOL = "const_pool"`. Both contradict Register and
-  Label.
+  convention (a-pointer-is-a-value §5, open), which contradicts Register.
 
 ### Register
 
@@ -485,13 +483,12 @@
   sites to labels, and no label bound twice or bound nowhere. A loop header is
   its block's label. A label is a name, so it is `Copy`; it has no public
   constructor, so it cannot dangle; it is 64-bit, like every id.
-- **Lives:** `emit::Label` (`pixelflow-codegen/src/emit/mod.rs`) — today a
-  31-byte string built by `format!`, which contradicts this entry. Its names
-  are derived from the id of what they name (`format!("reduce{}_top",
-  vid.0)`, `format!("v{}_past_{side}", …)`), and `Label::new(&str)` is a
-  public constructor. Its doc says "There is nothing to mint, nothing to
-  keep, and no table to look a name up in". Clashes are prevented by naming
-  convention, not by type. History: R0 of
+- **Lives:** `emit::asm::Label` (`pixelflow-codegen/src/emit/asm.rs`) — a
+  `u64` minted by `Labels::mint`, its only constructor. `emit_scope` mints a
+  guard's `past` label where it makes the branch and carries it in
+  `PendingBranch` to its bind point; a fold mints `top` and `exit`, an `If`
+  its three, `compile_via_backend` the pool's and hands it to `anchor` and
+  `finish`. Nothing is derived from the id of what it names. History: R0 of
   `docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md` made a label an
   item and its reference an operand; "A label should be keyed by the node it
   names" in the same plan removed the site-to-label map by keying on the

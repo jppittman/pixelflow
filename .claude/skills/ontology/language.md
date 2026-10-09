@@ -564,20 +564,19 @@
     where `-> f32` is expected reads all-ones as NaN. Refusing bitwise roots
     does not close this, because `If` of numbers is in that domain. "The fix
     is a type, a mask kernel the host cannot pass as a `&Kernel`" (open).
-- **At the machine:** a mask is a predicate value, and the backend names the
-  register it lives in: `IsaBackend::Mask`, an associated type. On AVX-512 it
-  is `k`: `vcmpps` writes one, and a writemask (`vblendmps zmm{k}`), a masked
-  store or gather, `kand`/`kor` and `kortest` read one. On NEON and AVX2 it is
-  the vector register, an alias, because their compares write vectors and
-  their blends read them; those ISAs have no mask register, and their
-  instructions take none. An instruction that reads a predicate takes
-  `Self::Mask`, and the allocator allocates that class like any other. Where a
-  predicate is read as data on AVX-512, selection inserts the conversion
-  (`vpmovm2d`) at that use. A missing conversion is a type error there, and on
-  NEON and AVX2 no conversion exists, since the two types are one. None of
-  this needs an IR type. The alias does mean the machine cannot tell a mask
-  from a number on NEON or AVX2, so the domain question ("a mask is not a
-  number") is the IR's to answer, not the backend's.
+- **At the machine:** a mask is a lane value, and how a lane value is held
+  is the backend's associated type, `IsaBackend::Lane`. On AVX2 and NEON it is
+  a vector register: those ISAs have no mask register, and their instructions
+  take none. On AVX-512 a lane is in a vector register or in `k`: `vcmpps`
+  writes `k`, and a writemask (`vblendmps zmm{k}`), `kand`/`kor` and
+  `kortest` read it there. Only that backend knows a lane can be in `k`; the
+  driver passes lanes through without asking. Where a lane is read in the
+  other file, AVX-512's selection picks an instruction that reads it where it
+  is (`vpternlogd` for a blend on a vector condition, `vpmovm2d` before an
+  instruction with no `k` form). That is an ordinary instruction choice, not
+  a conversion, and it needs no IR type. The machine cannot tell a mask from
+  a number on NEON or AVX2, so the domain question ("a mask is not a number")
+  is the IR's to answer, not the backend's.
 - **Lives:** `OpKind::mask`, `OpKind::is_bitwise_domain`
   (`pixelflow-ir/src/kind.rs`); sema's `bool` (`pixelflow-compiler/src/sema.rs`);
   CLAUDE.md "Floating point at the edges"; the-language-is-kernel §1.3, D8,

@@ -753,7 +753,7 @@ fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Reg) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit::{Assembly, CONST_POOL};
+    use crate::emit::{Assembly, Labels};
 
     /// `code`'s instruction words.
     fn words(code: &[u8]) -> Vec<u32> {
@@ -928,7 +928,7 @@ mod tests {
         // under the old scheme's margin either.
         for gap in [0, 4, 0xFFC, 0x1000, 0x1004, 0x2000, 3 << 20] {
             let mut asm = Assembly::default();
-            let pool = Label::new(CONST_POOL);
+            let pool = Labels::new().mint();
             asm.push(AdrpAdd {
                 dst: Gpr(17),
                 target: pool,
@@ -954,7 +954,7 @@ mod tests {
     fn adrp_add_reaches_backwards() {
         for gap in [0usize, 4, 0x1000, 0x2004] {
             let mut asm = Assembly::default();
-            let pool = Label::new(CONST_POOL);
+            let pool = Labels::new().mint();
             asm.bind(pool);
             asm.code.resize(gap, 0);
             asm.push(AdrpAdd {
@@ -1572,30 +1572,30 @@ pub(super) mod driver {
 
         /// Every scope's constant loads are X17-relative, so the anchor has
         /// to be inside the emitted function, after the frame.
-        fn anchor(&mut self, asm: &mut Assembly) {
+        fn anchor(&mut self, asm: &mut Assembly, pool: Label) {
             asm.push(AdrpAdd {
                 dst: X17.into(),
-                target: Label::new(CONST_POOL),
+                target: pool,
             });
         }
 
         /// Append the constant pool after the final `RET`.
         ///
-        /// `anchor` branches to [`CONST_POOL`] unconditionally — whether
+        /// `anchor` branches to `pool` unconditionally — whether
         /// this compile needed the pool is not known until every constant
         /// has been emitted — so the name must be written here even when
         /// there is nothing to append: `Assembly::finish` panics on a name
         /// nobody wrote, and an unpatched `AdrpAdd` would leave X17 pointing
         /// at itself, same as the unpatched `ADR` this replaced.
-        fn finish(&mut self, asm: &mut Assembly) {
+        fn finish(&mut self, asm: &mut Assembly, pool: Label) {
             if self.consts.is_empty() {
-                asm.bind(CONST_POOL);
+                asm.bind(pool);
                 return;
             }
             while !asm.code.len().is_multiple_of(super::CONST_POOL_ALIGN) {
                 asm.code.push(0);
             }
-            asm.bind(CONST_POOL);
+            asm.bind(pool);
             for &entry in &self.consts.entries {
                 super::emit_pool_entry(&mut asm.code, entry);
             }
@@ -1851,19 +1851,6 @@ pub(super) mod driver {
                 // setup_mov already placed c into dst
                 AsmProgram::from([Inst::Fmla(*dst, *a, *b)]).assemble(code);
             }
-            ResolvedOp::DecomposedMulAdd {
-                dst,
-                a,
-                b,
-                c,
-                c_deferred,
-            } => {
-                AsmProgram::from([Inst::Fmul(*dst, *a, *b)]).assemble(code);
-                // c is loaded only after the FMUL has consumed b: its register may
-                // be the one that held b.
-                emit_deferred(code, *c, c_deferred.as_ref(), pool);
-                AsmProgram::from([Inst::Fadd(*dst, *dst, *c)]).assemble(code);
-            }
             ResolvedOp::If {
                 dst,
                 if_true,
@@ -1876,24 +1863,6 @@ pub(super) mod driver {
 
         Ok(())
     }
-    /// Emit a deferred reload: either from stack or rematerialized constant.
-    fn emit_deferred(
-        code: &mut Vec<u8>,
-        target: Reg,
-        deferred: Option<&DeferredReload>,
-        pool: &ConstPool,
-    ) {
-        match deferred {
-            Some(DeferredReload::FromStack(slot)) => {
-                AsmProgram::from([Inst::ldr_q(target, frame_slot(slot.offset()))]).assemble(code);
-            }
-            Some(DeferredReload::Const(val_bits)) => {
-                emit_const_load(code, target, *val_bits, pool);
-            }
-            None => {}
-        }
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -2163,7 +2132,7 @@ impl AsmInsn for BranchIfW16Zero {
 #[cfg(test)]
 mod label_tests {
     use super::*;
-    use crate::emit::{Assembly, IfArm, IsaBackend, Label, MaskTest};
+    use crate::emit::{Assembly, IfArm, IsaBackend, Labels, MaskTest};
 
     /// One known word, so a test can measure distances in instructions without
     /// depending on any real encoding.
@@ -2180,7 +2149,7 @@ mod label_tests {
 
     #[test]
     fn forward_branch_counts_instructions_not_bytes() {
-        let end = Label::new("end");
+        let end = Labels::new().mint();
         let mut asm = Assembly::default();
         asm.push(B { target: end });
         asm.push(NOP);
@@ -2193,7 +2162,7 @@ mod label_tests {
 
     #[test]
     fn a_back_edge_is_negative() {
-        let top = Label::new("end");
+        let top = Labels::new().mint();
         let mut asm = Assembly::default();
         asm.bind(top);
         asm.push(NOP);
@@ -2232,7 +2201,7 @@ mod label_tests {
 
     #[test]
     fn a_branch_on_w16_is_cbnz_over_b() {
-        let exit = Label::new("end");
+        let exit = Labels::new().mint();
         let mut asm = Assembly::default();
         asm.push(BranchIfW16Zero { target: exit });
         asm.push(NOP);
@@ -2257,7 +2226,7 @@ mod label_tests {
     fn guard_over_arm(arm: IfArm, filler: usize) -> Vec<u32> {
         let mut backend = driver::Aarch64Backend::new();
         let mut asm = Assembly::default();
-        let past_arm = Label::new("past_arm");
+        let past_arm = Labels::new().mint();
         let test = MaskTest {
             reg: Reg(0),
             scratch: Some(Reg(1)),
@@ -2333,7 +2302,7 @@ mod label_tests {
     /// a field on an instruction: there is nothing here to hang it on.
     #[test]
     fn a_label_can_end_the_program() {
-        let end = Label::new("end");
+        let end = Labels::new().mint();
         let mut asm = Assembly::default();
         asm.push(B { target: end });
         asm.bind(end);
@@ -2344,7 +2313,7 @@ mod label_tests {
 
     #[test]
     fn a_program_is_position_independent() {
-        let end = Label::new("end");
+        let end = Labels::new().mint();
         let program = |mut asm: Assembly| {
             asm.push(B { target: end });
             asm.push(NOP);

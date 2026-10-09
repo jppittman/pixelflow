@@ -15,7 +15,7 @@
 //! - Reaches it as `ResolvedOp::ShiftImm` (the RHS `Const` shift amount is
 //!   folded to an immediate by `program::lower::arena_to_schedule`, so only the op + LHS
 //!   survive to codegen) — [`REQUIRED_SHIFT_OPS`].
-//! - Reaches it as `ResolvedOp::FusedMulAdd`/`DecomposedMulAdd` or
+//! - Reaches it as `ResolvedOp::FusedMulAdd` or
 //!   `ResolvedOp::If` — [`REQUIRED_TERNARY_OPS`]. Not swept generically
 //!   like the arrays above (each has a distinct `ResolvedOp` shape and
 //!   `setup_mov` convention), so the per-backend tests construct these two
@@ -82,11 +82,9 @@ pub(super) const REQUIRED_BINARY_OPS: &[OpKind] = &[
 /// Ops that reach `IsaBackend::emit_plan` as `ResolvedOp::ShiftImm { op, .. }`.
 pub(super) const REQUIRED_SHIFT_OPS: &[OpKind] = &[OpKind::Shl, OpKind::Shr];
 
-/// Ops with a bespoke `ResolvedOp` shape (`FusedMulAdd`/`DecomposedMulAdd` for
-/// `MulAdd`, `If` for `If`). Listed for documentation; the per-backend
-/// tests build these plans explicitly rather than looping generically — four
-/// of them for `MulAdd` alone, since a backend owes both shapes and each
-/// `DeferredReload` spelling of the decomposed one is its own arm.
+/// Ops with a bespoke `ResolvedOp` shape (`FusedMulAdd` for `MulAdd`, `If`
+/// for `If`). Listed for documentation; the per-backend tests build these
+/// plans explicitly rather than looping generically.
 pub(super) const REQUIRED_TERNARY_OPS: &[OpKind] = &[OpKind::MulAdd, OpKind::If];
 
 /// Ops no `REQUIRED_*` list holds, each for the reason beside it. The test

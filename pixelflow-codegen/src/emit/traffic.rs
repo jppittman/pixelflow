@@ -296,12 +296,12 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.frame_free(code, bytes);
     }
 
-    fn anchor(&mut self, asm: &mut super::Assembly) {
-        self.inner.anchor(asm);
+    fn anchor(&mut self, asm: &mut super::Assembly, pool: super::Label) {
+        self.inner.anchor(asm, pool);
     }
 
-    fn finish(&mut self, asm: &mut super::Assembly) {
-        self.inner.finish(asm);
+    fn finish(&mut self, asm: &mut super::Assembly, pool: super::Label) {
+        self.inner.finish(asm, pool);
     }
 
     fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
@@ -390,8 +390,8 @@ mod tests {
     use super::super::regalloc::{self, Scope};
     use super::super::storage::Slot;
     use super::super::{
-        Assembly, Binding, InstructionPlan, IsaBackend, Label, Loc, MaskTest, PtrReg, Reg, Reload,
-        ResolvedOp, WritePlan,
+        Assembly, Binding, InstructionPlan, IsaBackend, Label, Labels, Loc, MaskTest, PtrReg, Reg,
+        Reload, ResolvedOp, WritePlan,
     };
     use super::{Counting, EmitTraffic, ScopeTraffic};
     use crate::error::CompileError;
@@ -468,11 +468,11 @@ mod tests {
 
         fn frame_free(&mut self, _code: &mut Vec<u8>, _bytes: u32) {}
 
-        fn anchor(&mut self, _asm: &mut Assembly) {
+        fn anchor(&mut self, _asm: &mut Assembly, _pool: Label) {
             self.anchor_calls += 1;
         }
 
-        fn finish(&mut self, _asm: &mut Assembly) {
+        fn finish(&mut self, _asm: &mut Assembly, _pool: Label) {
             self.finish_calls += 1;
         }
 
@@ -677,8 +677,9 @@ mod tests {
         let mut asm = Assembly::default();
         {
             let mut counting = Counting::new(&mut backend);
-            counting.anchor(&mut asm);
-            counting.finish(&mut asm);
+            let pool = Labels::new().mint();
+            counting.anchor(&mut asm, pool);
+            counting.finish(&mut asm, pool);
         }
 
         assert_eq!(backend.anchor_calls, 1);
