@@ -211,15 +211,21 @@
 
 ### Class
 
-- **Is:** `Vector` (one batch of `f32` lanes, in a `Reg`) or `Pointer` (an
+- **Is:** there are two, and the second replaces the first. `program::Class`
+  is an enum, `Vector` (one batch of `f32` lanes, in a `Reg`) or `Pointer` (an
   address, in a `PtrReg`), "a function of the defining op". Every consumer
   knows which class it expects by position. "The classes never compete for
-  a register."
+  a register." `emit::Class` (`emit/mod.rs`) is a trait with the markers
+  `Vector`, `Pointer`, `Integer` and `Flags`, the type an instruction's
+  operand field is declared with, so a base address cannot be handed a
+  `row * pitch` product. The flags are a class. D1 deletes
+  `program::Class` and keeps `emit::Class`.
 - **Is not:** a reason for a second algorithm ("One algorithm, two pools").
 - **Follows:** carry budgets are per class. Vector-only scratch (temps,
   guard registers, the result role) does not apply to pointers.
 - **Lives:** `program::Class`, `ScheduledOp::class`
-  (`pixelflow-codegen/src/program/mod.rs`); a-pointer-is-a-value §1–§2.
+  (`pixelflow-codegen/src/program/mod.rs`), `emit::Class`;
+  a-pointer-is-a-value §1–§2.
 
 ### Pointer (Context)
 
@@ -530,12 +536,12 @@
 - **Lives:** `AsmInsn` (`pixelflow-codegen/src/emit/mod.rs`), the backends'
   instruction enums: `Gp<S>`, x86's general-register instructions, generic
   over a `Stage` and with named fields typed by `Class` (`emit/x86_64.rs`);
-  `Inst<S>` in `emit/avx2.rs`, AVX2's VEX instructions, over the same
-  vocabulary; `Inst` in `emit/aarch64.rs`. Today most emission is
-  `IsaBackend` verbs writing bytes inline ("Instructions: bytes written inline
-  by ~236 functions, not values", denotational-diagnosis; e.g.
-  `emit_write(&mut self, code: &mut Vec<u8>, …)`), which contradicts this
-  entry.
+  `Inst<S>` in `emit/avx2.rs` and `emit/avx512.rs`, the VEX and EVEX
+  instructions, over the same vocabulary; `Inst` in `emit/aarch64.rs`. Today
+  most emission is `IsaBackend` verbs writing bytes inline ("Instructions:
+  bytes written inline by ~236 functions, not values", denotational-diagnosis;
+  e.g. `emit_write(&mut self, code: &mut Vec<u8>, …)`), which contradicts
+  this entry.
 
 ### Branch
 

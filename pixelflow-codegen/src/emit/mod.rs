@@ -129,14 +129,6 @@ struct AsmProgram<S> {
     insts: S,
 }
 
-impl<S> AsmProgram<S> {
-    /// Create a new assembly program wrapping an instruction sequence.
-    #[inline(always)]
-    const fn new(insts: S) -> Self {
-        Self { insts }
-    }
-}
-
 impl<I: AsmInsn, const N: usize> From<[I; N]> for AsmProgram<[I; N]> {
     #[inline(always)]
     fn from(insts: [I; N]) -> Self {
@@ -163,12 +155,6 @@ impl<I: AsmInsn, S: IntoIterator<Item = I>> AsmProgram<S> {
             inst.emit_into(code);
         }
     }
-}
-
-/// Free-function fold: assemble a declarative sequence directly into `code`.
-#[inline]
-fn assemble<I: AsmInsn>(code: &mut Vec<u8>, insts: impl IntoIterator<Item = I>) {
-    AsmProgram::new(insts).assemble(code);
 }
 
 // =============================================================================
@@ -282,8 +268,7 @@ impl Assembly {
     ///
     /// # Panics
     ///
-    /// As [`asm::assemble`]: a label bound twice, bound but never minted by
-    /// this program, or named and never bound.
+    /// As [`asm::assemble`].
     #[must_use]
     fn finish(mut self) -> Vec<u8> {
         self.end_run();
@@ -365,6 +350,10 @@ enum Integer {}
 #[derive(Copy, Clone)]
 enum Flags {}
 
+/// One batch of predicate bits, in AVX-512's mask file: a lane per bit.
+#[derive(Copy, Clone)]
+enum Opmask {}
+
 impl Class for Vector {
     type Physical = Reg;
 }
@@ -379,6 +368,10 @@ impl Class for Integer {
 
 impl Class for Flags {
     type Physical = ();
+}
+
+impl Class for Opmask {
+    type Physical = KReg;
 }
 
 /// What the operands of an instruction are. An instruction enum is generic

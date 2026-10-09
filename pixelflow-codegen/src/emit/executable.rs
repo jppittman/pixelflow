@@ -173,7 +173,7 @@ mod page_tests {
     /// Asked of the machine, not assumed from the OS.
     ///
     /// The lower bound and the power of two together are what aarch64's
-    /// [`AdrpAdd`](crate::emit::aarch64::AdrpAdd) rests on: they make every
+    /// [`AdrpAdd`](crate::emit::aarch64::Inst::AdrpAdd) rests on: they make every
     /// mapping a multiple of 4 KiB, which is the only reason masking a
     /// *buffer offset* finds the same page that masking the runtime address
     /// would. A 2 KiB page here and every `ADRP` this crate emits is off by
