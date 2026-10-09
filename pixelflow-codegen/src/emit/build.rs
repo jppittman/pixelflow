@@ -8,7 +8,7 @@
 
 use super::{
     Block, Class, ClassId, Constant, Constants, Entry, Function, IsaBackend, Label, Labels, Loop,
-    Operand, Scope, Selected, Target, Value, ValueName, operands,
+    Operand, Scope, Selected, Spill, Target, Value, ValueName, operands,
 };
 use crate::error::CompileError;
 use alloc::collections::BTreeMap;
@@ -214,12 +214,15 @@ impl<B: IsaBackend> Builder<B> {
                 Operand::Reg { value, access } if access.reads() => self.assert_defined(*value),
                 Operand::Reg { .. } => {}
                 Operand::Target(target) => target.args.iter().for_each(|&a| self.assert_defined(a)),
+                Operand::Frame(slot) => panic!(
+                    "selection named {slot:?}: only the instructions the allocator inserts carry a slot"
+                ),
             }
         }
         for operand in operands {
             match operand {
                 Operand::Reg { value, access } if !access.reads() => self.define(value),
-                Operand::Reg { .. } => {}
+                Operand::Reg { .. } | Operand::Frame(_) => {}
                 Operand::Target(target) => self.successors[open].push(target),
             }
         }
@@ -424,5 +427,32 @@ impl<B: IsaBackend> Builder<B> {
             constants: self.constants,
             labels: self.labels,
         }
+    }
+}
+
+/// The rights the allocator's own verbs get: to define a fresh value and to
+/// insert an instruction. `def` mints only [`Spill`] classes, so a copy, a
+/// spill or a reload cannot write the flags.
+pub(super) struct Spiller<'a, B: IsaBackend> {
+    /// The next value id: the allocator continues the function's numbering.
+    next: &'a mut u64,
+    insts: &'a mut Vec<B::Inst<Selected>>,
+}
+
+impl<'a, B: IsaBackend> Spiller<'a, B> {
+    pub(super) fn new(next: &'a mut u64, insts: &'a mut Vec<B::Inst<Selected>>) -> Self {
+        Self { next, insts }
+    }
+
+    pub(in crate::emit) fn def<C: Spill>(&mut self) -> Def<C> {
+        let id = *self.next;
+        *self.next += 1;
+        Def {
+            value: value(ValueName { id, class: C::ID }),
+        }
+    }
+
+    pub(in crate::emit) fn push(&mut self, inst: B::Inst<Selected>) {
+        self.insts.push(inst);
     }
 }

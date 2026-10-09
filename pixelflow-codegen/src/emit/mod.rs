@@ -84,6 +84,7 @@ pub use traffic::{EmitTraffic, ScopeTraffic};
 
 use asm::{Item, Label, Labels, Patch};
 use encoded::EncodedInst;
+use regalloc::resource::{FrameSlot, In, InOut, Out, SlotName};
 use storage::{Slot, StackFrame};
 
 use pixelflow_ir::kind::OpKind;
@@ -344,12 +345,167 @@ trait Class: sealed::Class + Copy + 'static {
     /// The register newtype a field of this class is at [`Physical`], until
     /// the allocator's tokens replace the newtypes.
     type Physical: Copy;
+    /// The register file a value of this class lives in.
+    type File: File;
     /// This class as data: the allocator's view of a [`Value`].
     const ID: ClassId;
 }
 
 mod sealed {
     pub trait Class {}
+    pub trait File {}
+}
+
+/// A physical register file of the machine. Sealed: these four are all any
+/// target here has. A backend whose machine lacks one declares it empty, and
+/// no instruction of that backend has a field in it.
+#[expect(dead_code, reason = "live from B4")]
+trait File: sealed::File + 'static {
+    const ID: FileId;
+}
+
+/// `ymm`, `zmm`, `v`.
+enum VectorFile {}
+/// The 64-bit general-purpose registers.
+enum GeneralFile {}
+/// AVX-512's `k1`-`k7`. `k0` is not a member: an EVEX `aaa` of 0 means "no
+/// mask".
+enum OpmaskFile {}
+/// x86 `EFLAGS`, aarch64 `NZCV`: one member.
+enum FlagsFile {}
+
+/// A [`File`] as data.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[expect(dead_code, reason = "live from B4")]
+enum FileId {
+    Vector,
+    General,
+    Opmask,
+    Flags,
+}
+
+impl sealed::File for VectorFile {}
+impl sealed::File for GeneralFile {}
+impl sealed::File for OpmaskFile {}
+impl sealed::File for FlagsFile {}
+
+impl File for VectorFile {
+    const ID: FileId = FileId::Vector;
+}
+impl File for GeneralFile {
+    const ID: FileId = FileId::General;
+}
+impl File for OpmaskFile {
+    const ID: FileId = FileId::Opmask;
+}
+impl File for FlagsFile {
+    const ID: FileId = FileId::Flags;
+}
+
+/// What a backend's register files *are*: the allocatable members of each, by
+/// hardware number, and where the ABI puts the three arguments. Numbers only;
+/// nothing here is a register until `Pool::mint`. It says nothing about what an
+/// instruction needs: selection runs first, so the allocator reads that off
+/// the function.
+///
+/// A register outside every list belongs to the platform or the caller:
+/// callee-saved registers, the stack pointer (the frame's), `x30`, and Apple's
+/// `x18`. None of them is a scratch reservation.
+///
+/// The calling convention is SysV on x86-64 and AAPCS64 on aarch64, because
+/// `executable.rs` builds only for Linux and macOS.
+#[derive(Copy, Clone, Debug)]
+#[expect(dead_code, reason = "live from B3")]
+struct RegisterFile {
+    vector: &'static [u8],
+    general: &'static [u8],
+    opmask: &'static [u8],
+    flags: &'static [u8],
+    /// The members of `general` the three arguments arrive in. This is initial
+    /// ownership, not a reservation: once a parameter is dead or spilled its
+    /// register is free.
+    entry: EntryRegisters,
+    /// Bytes per `Vector` register and per vector frame slot: 16, 32 or 64.
+    vector_bytes: u64,
+}
+
+/// Where the ABI puts the collapse's three arguments.
+#[derive(Copy, Clone, Debug)]
+#[expect(dead_code, reason = "live from B3")]
+struct EntryRegisters {
+    ctx: u8,
+    out: u8,
+    pitch: u8,
+}
+
+#[expect(dead_code, reason = "live from B3")]
+const fn contains(members: &[u8], number: u8) -> bool {
+    let mut i = 0;
+    while i < members.len() {
+        if members[i] == number {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+#[expect(dead_code, reason = "live from B3")]
+const fn distinct(members: &[u8]) -> bool {
+    let mut i = 0;
+    while i < members.len() {
+        let (_, rest) = members.split_at(i + 1);
+        if contains(rest, members[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+impl RegisterFile {
+    /// Refuse a self-contradictory declaration at compile time: a file that
+    /// names a register twice, two flags registers, an entry register outside
+    /// `general` or shared by two arguments, a vector narrower than 16 bytes
+    /// or not a power of two.
+    #[expect(dead_code, reason = "live from B3")]
+    const fn checked(self) -> Self {
+        assert!(
+            distinct(self.vector)
+                && distinct(self.general)
+                && distinct(self.opmask)
+                && distinct(self.flags),
+            "a register file names a member twice"
+        );
+        assert!(self.flags.len() <= 1, "there is one flags register");
+        let EntryRegisters { ctx, out, pitch } = self.entry;
+        assert!(
+            contains(self.general, ctx)
+                && contains(self.general, out)
+                && contains(self.general, pitch),
+            "an entry argument arrives in a register outside the general file"
+        );
+        assert!(
+            ctx != out && ctx != pitch && out != pitch,
+            "two entry arguments arrive in one register"
+        );
+        assert!(
+            self.vector_bytes >= 16 && self.vector_bytes.is_power_of_two(),
+            "a vector is a power of two bytes, at least 16"
+        );
+        self
+    }
+
+    /// The numbers of the members of `file`.
+    #[expect(dead_code, reason = "live from B4")]
+    fn members(&self, file: FileId) -> &'static [u8] {
+        match file {
+            FileId::Vector => self.vector,
+            FileId::General => self.general,
+            FileId::Opmask => self.opmask,
+            FileId::Flags => self.flags,
+        }
+    }
 }
 
 /// A [`Class`] as data.
@@ -391,28 +547,45 @@ impl sealed::Class for Opmask {}
 
 impl Class for Vector {
     type Physical = Reg;
+    type File = VectorFile;
     const ID: ClassId = ClassId::Vector;
 }
 
 impl Class for Pointer {
     type Physical = PtrReg;
+    type File = GeneralFile;
     const ID: ClassId = ClassId::Pointer;
 }
 
 impl Class for Integer {
     type Physical = Gpr;
+    type File = GeneralFile;
     const ID: ClassId = ClassId::Integer;
 }
 
 impl Class for Flags {
     type Physical = ();
+    type File = FlagsFile;
     const ID: ClassId = ClassId::Flags;
 }
 
 impl Class for Opmask {
     type Physical = KReg;
+    type File = OpmaskFile;
     const ID: ClassId = ClassId::Opmask;
 }
+
+/// The classes a frame slot can hold. `Flags` cannot be stored, so the
+/// allocator's own verbs ([`IsaBackend::copy`], [`spill`](IsaBackend::spill),
+/// [`reload`](IsaBackend::reload)) do not accept it: calling one with `Flags` is
+/// a type error.
+#[expect(dead_code, reason = "live from B3")]
+trait Spill: Class {}
+
+impl Spill for Vector {}
+impl Spill for Pointer {}
+impl Spill for Integer {}
+impl Spill for Opmask {}
 
 /// What the operands of an instruction are. An instruction enum is generic
 /// over a stage and declares each field by what it does to its register.
@@ -426,6 +599,8 @@ trait Stage {
     type Read<C: Class>;
     /// A register the instruction reads and overwrites in place.
     type Tie<C: Class>;
+    /// A frame slot, as the instructions the allocator builds name one.
+    type Slot;
     /// Where a branch goes.
     type Target;
     /// The frame's size, as `Enter` and `Ret` take it.
@@ -442,6 +617,8 @@ impl Stage for Physical {
     type Early<C: Class> = C::Physical;
     type Read<C: Class> = C::Physical;
     type Tie<C: Class> = C::Physical;
+    // The legacy drivers address their slots through `Mem`, not a field.
+    type Slot = ();
     type Target = Label;
     type FrameSize = u32;
 }
@@ -486,6 +663,8 @@ impl Stage for Selected {
     type Early<C: Class> = build::Early<C>;
     type Read<C: Class> = Value<C>;
     type Tie<C: Class> = build::Tie<C>;
+    // Only instructions the allocator builds carry one.
+    type Slot = SlotName;
     type Target = Target;
     type FrameSize = FrameSize;
 }
@@ -506,8 +685,24 @@ impl Stage for Observed {
     type Early<C: Class> = ();
     type Read<C: Class> = ();
     type Tie<C: Class> = ();
+    type Slot = ();
     type Target = ();
     type FrameSize = ();
+}
+
+/// The stage allocation builds: borrowed tokens, borrowed slots, block
+/// arguments already placed as moves, and the frame's size.
+#[expect(dead_code, reason = "live from B4")]
+struct Bound<'m, B>(core::convert::Infallible, PhantomData<&'m fn() -> B>);
+
+impl<'m, B: IsaBackend> Stage for Bound<'m, B> {
+    type Write<C: Class> = Out<'m, B, C>;
+    type Early<C: Class> = Out<'m, B, C>;
+    type Read<C: Class> = In<'m, B, C>;
+    type Tie<C: Class> = InOut<'m, B, C>;
+    type Slot = &'m FrameSlot;
+    type Target = Label;
+    type FrameSize = u64;
 }
 
 /// How an instruction is rebuilt at stage `T`, one operand at a time. Each
@@ -519,6 +714,7 @@ trait Rebind<T: Stage> {
     fn write<C: Class>(&mut self, d: &build::Def<C>) -> T::Write<C>;
     fn early<C: Class>(&mut self, d: &build::Early<C>) -> T::Early<C>;
     fn tie<C: Class>(&mut self, t: &build::Tie<C>) -> T::Tie<C>;
+    fn slot(&mut self, s: SlotName) -> T::Slot;
     fn target(&mut self, t: &Target) -> T::Target;
     fn frame_size(&mut self) -> T::FrameSize;
 }
@@ -558,6 +754,8 @@ enum Operand {
     /// A branch target and the arguments it passes. A block's successors are
     /// the `Target` operands of its last instruction.
     Target(Target),
+    /// A frame slot: only on instructions the allocator inserted.
+    Frame(SlotName),
 }
 
 /// Every operand of `inst`, in walk order: `walk` at a stage whose fields are
@@ -590,6 +788,9 @@ fn operands<B: IsaBackend>(inst: &B::Inst<Selected>) -> Vec<Operand> {
             let read = self.0.len();
             self.reg(t.read(), Access::Read);
             self.reg(t.write(), Access::Tied { read });
+        }
+        fn slot(&mut self, s: SlotName) {
+            self.0.push(Operand::Frame(s));
         }
         fn target(&mut self, t: &Target) {
             self.0.push(Operand::Target(t.clone()));
@@ -698,9 +899,7 @@ struct Function<B: IsaBackend> {
 /// and the assembler are generic over it, and none of them names a register,
 /// an opcode or an encoding.
 ///
-/// What it does not yet say arrives with the first reader of each: the
-/// register file and the allocator's verbs (`copy`, `spill`, `reload`) in
-/// B2, `encode` in B3.
+/// What it does not yet say arrives with its first reader: `encode`, in B3.
 #[expect(dead_code, reason = "live from B3")]
 trait IsaBackend: Sized + 'static {
     type Inst<S: Stage>;
@@ -712,6 +911,9 @@ trait IsaBackend: Sized + 'static {
     /// One IR lane value as this machine holds it: `Value<Vector>` on AVX2
     /// and NEON; a `Vector` or an `Opmask` value on AVX-512.
     type Lane: Copy;
+    /// The allocatable registers, by number, and where the ABI puts the
+    /// arguments.
+    const FILE: RegisterFile;
     /// How many pool entries an instruction can reach. aarch64:
     /// `ldr q, [p, #imm12·16]`, so 4096. x86: `i32::MAX / 4`.
     const POOL_REACH: u64;
@@ -737,6 +939,13 @@ trait IsaBackend: Sized + 'static {
     /// (aarch64's pool base).
     fn enter(b: &mut build::Builder<Self>);
     fn ret(b: &mut build::Builder<Self>);
+
+    // The allocator's own instructions.
+    fn copy<C: Spill>(b: &mut build::Spiller<'_, Self>, src: Value<C>) -> Value<C>;
+    /// Store `src` to `slot`. When `slot.offset()` does not encode: the slot's
+    /// address into a fresh `Pointer`, then the store through it.
+    fn spill<C: Spill>(b: &mut build::Spiller<'_, Self>, src: Value<C>, slot: &FrameSlot);
+    fn reload<C: Spill>(b: &mut build::Spiller<'_, Self>, slot: &FrameSlot) -> Value<C>;
 
     /// Whether the allocator may recompute this instruction's definition
     /// instead of storing it. It must read no value that is not itself

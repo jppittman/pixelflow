@@ -445,7 +445,8 @@ pub(in crate::emit) struct RegisterFile {
 }
 impl RegisterFile {
     /// Refuse a self-contradictory declaration at compile time:
-    /// - files disjoint;
+    /// - no file names a member twice (the files are numbered separately, so
+    ///   `rax` and `ymm0` are both 0);
     /// - `entry` names three distinct `general` members;
     /// - `flags` has at most one member;
     /// - `vector_bytes` a power of two, at least 16.
@@ -501,7 +502,8 @@ pub(super) struct SlotLease { name: SlotName }
 ///   scan. `N > 4095` is `BudgetExceeded`.
 /// - The vector region starts at `align_up(8·N, max(16, vector_bytes))` and
 ///   grows as the scan mints slots, lowest free first.
-/// - The frame's size is the vector region's high-water mark. Past
+/// - The frame's size is the vector region's high-water mark, or the narrow
+///   region alone (16-aligned) when no vector was spilled. Past
 ///   `MAX_FRAME` (2 MiB) it is `BudgetExceeded`.
 /// - **The stack pointer is the frame's.** Its only readers are frame-slot
 ///   operands and `SlotAddr` (§2.10). Its only writers are the function's
@@ -591,7 +593,7 @@ impl Stage for Selected {
 
 /// After allocation: borrowed tokens, borrowed slots, block arguments already
 /// placed as moves, and the frame's size.
-pub(in crate::emit) struct Bound<'m, B>(Infallible, PhantomData<(&'m (), fn() -> B)>);
+pub(in crate::emit) struct Bound<'m, B>(Infallible, PhantomData<&'m fn() -> B>);
 impl<'m, B: IsaBackend> Stage for Bound<'m, B> {
     type Write<C: Class> = Out<'m, B, C>;
     type Early<C: Class> = Out<'m, B, C>;
@@ -888,8 +890,11 @@ impl Pending {
 
 /// The rights the allocator's own verbs get. `def` mints only `Spill`
 /// classes, so a copy, spill or reload cannot write the flags.
-pub(in crate::emit) struct Spiller<'a, B: IsaBackend> { /* … */ }
-impl<B: IsaBackend> Spiller<'_, B> {
+pub(in crate::emit) struct Spiller<'a, B: IsaBackend> { /* the next value id, and the instruction list */ }
+impl<'a, B: IsaBackend> Spiller<'a, B> {
+    /// The allocator continues the function's value numbering, and appends to
+    /// the list it is building.
+    pub(super) fn new(next: &'a mut u64, insts: &'a mut Vec<B::Inst<Selected>>) -> Self;
     pub(in crate::emit) fn def<C: Spill>(&mut self) -> Def<C>;
     pub(in crate::emit) fn push(&mut self, inst: B::Inst<Selected>);
 }
@@ -1520,7 +1525,7 @@ Every commit in this phase is live in production.
 
 #### B2: Registers and frame slots are tokens
 
-- **Files:** `emit/regalloc/resource.rs` (§2.2, §2.4), the `Bound` stage in `mod.rs`.
+- **Files:** `emit/regalloc/resource.rs` (§2.2, §2.4), `emit/mod.rs` (`File` and its four files, `FileId`, `RegisterFile`, `EntryRegisters`, `Spill`, `Stage::Slot`, `Bound`, `Operand::Frame`, `Rebind::slot`, the trait's `FILE`, `copy`, `spill`, `reload`), `emit/build.rs` (`Spiller`).
 - **Deferred from A9, whose first reader is here:** `File` and its four files, `FileId`, `Spill`, and `Stage::Slot` (the frame slot is a token). Moved here from B1: `Spiller`, `Operand::Frame`, `Rebind::slot`, and the trait's `FILE`, `copy`, `spill` and `reload`.
 - **Tests:** none of its own (§0.6). From B4, the leases and the frame are exercised through `compile`. The narrow region's `BudgetExceeded` is reached by a kernel with more than 4,095 live narrow values, if one can be built through the production API; if none can, the bound is an assertion, not a test.
 - **Status:** `expect(dead_code)` until B4.
