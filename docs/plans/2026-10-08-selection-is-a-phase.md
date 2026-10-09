@@ -77,7 +77,7 @@ These are binding. Where a later section disagrees, this section wins, and the i
    - AVX-512: `enum { Vector(Value<Vector>), Opmask(Value<Opmask>) }`. A comparison selects `vcmpps k` and yields an `Opmask` lane; `BitAnd`/`BitOr` of two `Opmask` lanes select `kandw`/`korw`.
 
    Consequences:
-   - The driver binds each IR value to a `B::Lane` and hands lanes back to the backend. It never asks whether a value is a mask: only AVX-512 knows that a lane can live in `k`. A block parameter takes its lane's class (`IsaBackend::lane_class`).
+   - The driver binds each IR value to a `B::Lane` and hands lanes back to the backend. It never asks whether a value is a mask: only AVX-512 knows that a lane can live in `k`. A block parameter takes its lane's class (`IsaBackend::lane_name`).
    - There is no conversion, as a concept or as a trait method. Where an IR value is read in the other file, AVX-512's selection picks an instruction that reads it where it is:
      - an `If` whose condition is an `Opmask` lane is `vblendmps zmm{k}`; on a `Vector` lane it is `vpternlogd 0xCA`, today's blend;
      - a guard on an `Opmask` lane is `kortestw`; on a `Vector` lane it is `vptestmd`, then `kortestw`;
@@ -766,8 +766,8 @@ impl Encoding<'_> {
 
 pub(in crate::emit) struct Assembled { pub code: Vec<u8>, addresses: Vec<usize> }
 impl Assembled { pub(in crate::emit) fn address(&self, label: Label) -> usize; }
-// A8 lands `assemble` returning the `Vec<u8>` alone. `Assembled` and
-// `falls_through` arrive with their first reader (B-series).
+// A8 landed `assemble` returning the `Vec<u8>` alone. `Assembled` and
+// `falls_through` arrived with their first reader, B3's `encode`.
 
 /// Lay out `text` then `data`, encode each instruction with `encode`, and
 /// patch every field.
@@ -810,7 +810,8 @@ pub(in crate::emit) struct Target { pub label: Label, pub args: Vec<ValueName> }
 /// The ABI's three arguments: the entry block's parameters, with their classes.
 pub(in crate::emit) struct Entry { pub ctx: Value<Pointer>, pub out: Value<Pointer>, pub pitch: Value<Integer> }
 
-/// One surviving fold's loop.
+/// One surviving fold's loop. `trips` is how many times its body runs per
+/// call: its own trip count times its parent's.
 pub(in crate::emit) struct Loop { pub head: Label, pub parent: Option<usize>, pub trips: u64 }
 
 /// The pool section: its label, then each entry with its own label, in order.
@@ -940,8 +941,9 @@ pub(in crate::emit) trait IsaBackend: Sized + 'static {
 
     // Selection. Operands are values; the driver resolved them.
     fn lane(b: &mut Builder<Self>, op: LaneOp<Self>) -> Result<Self::Lane, CompileError>;
-    /// The class of a block parameter that carries `lane`.
-    fn lane_class(lane: Self::Lane) -> ClassId;
+    /// The name of `lane`, for a branch to pass it and a block to take its
+    /// class.
+    fn lane_name(lane: Self::Lane) -> ValueName;
     /// A block parameter, read back as a lane.
     fn param_lane(param: ValueName) -> Self::Lane;
     fn context(b: &mut Builder<Self>, ctx: Value<Pointer>, slot: u64) -> Result<Value<Pointer>, CompileError>;
@@ -1544,12 +1546,14 @@ Every commit in this phase is live in production.
 
 - **Files:** `emit/select.rs` (the driver of §2.10, with scoped `Bindings`), `avx2.rs`.
 - **Add to AVX2:**
-  - `lane` for `Const` (RIP-relative `LoadConst`; `Ones`; `vxorps` zero), `Lanes`, `Unary`, `Binary`, `MulAdd`, `Blend` and `Shift`;
+  - `lane` for `Const` (RIP-relative `LoadConst`; `Ones`; `vxorps` zero), `Lanes`, `Unary`, `Binary`, `MulAdd`, `Blend`, `Shift` and `Uniform`;
+  - `context` (`mov p, [ctx + 8·slot]`, refused past `disp32` as today);
   - `store` (`Cvtt`, `Imul`, `Add`, `Lea4`, then `vmovups` or the masked remainder);
   - `branch`, `jump`, `enter` and `ret`;
-  - `walk`, and `encode` at `Bound`, built through `asm::Encoding`: B3 is the first reader of `encode` at `Bound`, and A9's `Gp<Physical>` implements only the legacy `AsmInsn` until D1 deletes it.
-- **The driver covers:** the body, folds as blocks (§2.10), `Outer`/`Var`/`Reduce`/`Seq`/`Write`.
-- **The driver refuses**, through `unimplemented_op`, which names the op: `Context`, `Uniform`, `Gather`, `Broadcast`, and guarded `If` arms. These arrive in B8–B9.
+  - `copy`, `spill` and `reload` for the three classes AVX2 has, and `rematerializable` (false until B7);
+  - `walk`, and `encode` at `Bound`, built through `asm::Encoding` with `Encoding::falls_through` and `Assembled`. `Gp<S>` and `avx2::Inst<S>` encode once, generic over `Placed` stages, so `Physical` and `Bound` share their bytes until D1 deletes `Physical`; `avx2::Op<S>` is the instruction a block holds, a vector one or a general-register one.
+- **The driver covers:** the body, folds as blocks (§2.10), `Outer`/`Var`/`Reduce`/`Seq`/`Write`/`Context`/`Uniform`. Every kernel reads its origin through `Context` and `Uniform`, so K(avx2) in B4 cannot pass without them.
+- **The driver refuses**, through `unimplemented_op`, which names the op: `Gather`, `Broadcast`, and guarded `If` arms. These arrive in B8–B9.
 - **Tests:** none of its own (§0.6). `finish`'s invariants and one backward branch per fold are production assertions in the selected program, and B4 exercises them through `compile` under the knob.
 - **Status:** `expect(dead_code)` until B4.
 - **Gate:** G.
@@ -1609,8 +1613,6 @@ Every commit in this phase is live in production.
 
 - **Files:** `avx2.rs`, `select.rs`.
 - **Add:**
-  - `context`: `mov p, [ctx + 8·slot]`, refused past `disp32` as today;
-  - `Uniform`;
   - `Gather`: `vcvttps2dq`, `Ones` mask, then `Gather { dst: Early, mask: Tie }`;
   - `Broadcast`: `Cvtt`, then `vbroadcastss [base + idx·4]`.
 - **Gate:** K(avx2) plus `reduce_binder_reads_bound_buffer`, `glyph_*`, `freetype_oracle`.

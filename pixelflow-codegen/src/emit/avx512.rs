@@ -187,7 +187,7 @@ impl Evex {
             0x0F,
             1,
         );
-        x86_64::mem_operand_into(&mut inst, reg, addr);
+        x86_64::mem_operand_into(&mut inst, reg, addr.base.0, addr.disp);
         inst
     }
 
@@ -207,7 +207,7 @@ impl Evex {
             0x0F,
             1,
         );
-        x86_64::scaled4_operand_into(&mut inst, reg, base, index);
+        x86_64::scaled4_operand_into(&mut inst, reg, base.0, index.0);
         inst
     }
 
@@ -228,7 +228,7 @@ impl Evex {
             0x0F,
             vp,
         );
-        x86_64::vsib4_operand_into(&mut inst, reg, base, index);
+        x86_64::vsib4_operand_into(&mut inst, reg, base.0, index.0);
         inst
     }
 

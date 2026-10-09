@@ -13,7 +13,6 @@ use super::{
 use crate::error::CompileError;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::marker::PhantomData;
 
 /// The right to define one fresh value of class `C`.
 ///
@@ -78,34 +77,27 @@ impl Pending {
         self.label
     }
 
+    /// The parameters, as the allocator names them.
+    pub(super) fn params(&self) -> &[ValueName] {
+        &self.params
+    }
+
     /// Parameter `i` as a `Value<C>`.
     ///
     /// # Panics
     /// If the parameter is not of class `C`.
     pub(super) fn param<C: Class>(&self, i: usize) -> Value<C> {
-        value(self.params[i])
+        self.params[i].typed()
     }
 }
 
 impl Entry {
     fn of([ctx, out, pitch]: [ValueName; 3]) -> Self {
         Self {
-            ctx: value(ctx),
-            out: value(out),
-            pitch: value(pitch),
+            ctx: ctx.typed(),
+            out: out.typed(),
+            pitch: pitch.typed(),
         }
-    }
-}
-
-/// `name` as a `Value<C>`.
-///
-/// # Panics
-/// If `name` is not of class `C`.
-fn value<C: Class>(name: ValueName) -> Value<C> {
-    assert_eq!(name.class, C::ID, "{name:?} is not of the class asked for");
-    Value {
-        id: name.id,
-        _class: PhantomData,
     }
 }
 
@@ -176,7 +168,7 @@ impl<B: IsaBackend> Builder<B> {
     }
 
     fn fresh<C: Class>(&mut self) -> Value<C> {
-        value(self.mint(C::ID))
+        self.mint(C::ID).typed()
     }
 
     fn open(&mut self, label: Label, params: Vec<ValueName>, scope: Scope) {
@@ -470,7 +462,7 @@ impl<'a, B: IsaBackend> Spiller<'a, B> {
         let id = *self.next;
         *self.next += 1;
         Def {
-            value: value(ValueName { id, class: C::ID }),
+            value: ValueName { id, class: C::ID }.typed(),
         }
     }
 

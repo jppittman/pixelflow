@@ -54,7 +54,7 @@
 /// match arm instead of a `&'static str` surfacing three frames up.
 #[cold]
 #[inline(never)]
-fn unimplemented_op(backend: &str, op: pixelflow_ir::kind::OpKind) -> ! {
+fn unimplemented_op(backend: &str, op: impl core::fmt::Debug) -> ! {
     panic!(
         "{backend} has no encoding for {op:?} — `passes::legalize` leaves only \
          backend-legal ops, so this is a missing implementation or a bypassed \
@@ -73,6 +73,7 @@ mod encoded;
 mod executable;
 mod regalloc;
 mod register_file;
+mod select;
 mod storage;
 mod traffic;
 mod x86_64;
@@ -83,7 +84,7 @@ pub use crate::pipeline::compile;
 pub use executable::CompiledKernel;
 pub use traffic::{EmitTraffic, ScopeTraffic};
 
-use asm::{Item, Label, Labels, Patch};
+use asm::{Encoding, Item, Label, Labels, Patch};
 use encoded::EncodedInst;
 use regalloc::resource::{FrameSlot, In, InOut, Out, SlotName};
 use register_file::RegisterFile;
@@ -297,6 +298,7 @@ impl Assembly {
                 out.field(inst.field.at, inst.field.label, inst.field.patch);
             },
         )
+        .code
     }
 }
 
@@ -337,6 +339,44 @@ impl From<PtrReg> for Gpr {
     }
 }
 
+/// A register an encoder reads the hardware number of: the legacy newtypes,
+/// and the allocator's tokens ([`In`], [`Out`], [`InOut`]).
+trait Number {
+    fn number(&self) -> u8;
+}
+
+impl Number for Reg {
+    fn number(&self) -> u8 {
+        self.0
+    }
+}
+
+impl Number for Gpr {
+    fn number(&self) -> u8 {
+        self.0
+    }
+}
+
+impl Number for PtrReg {
+    fn number(&self) -> u8 {
+        self.0
+    }
+}
+
+impl Number for KReg {
+    fn number(&self) -> u8 {
+        self.0
+    }
+}
+
+/// The flags are not numbered: a `flags` field is `()` at [`Physical`], and no
+/// encoder asks it for a register.
+impl Number for () {
+    fn number(&self) -> u8 {
+        unreachable!("the flags register is a class with one member, and no encoding names it")
+    }
+}
+
 /// What a value is at the machine level: the type an instruction's operand
 /// field is declared with. `Pointer` and `Integer` live in the same file and
 /// are different classes, so a base address cannot be handed a `row * pitch`
@@ -346,7 +386,7 @@ impl From<PtrReg> for Gpr {
 trait Class: sealed::Class + Copy + 'static {
     /// The register newtype a field of this class is at [`Physical`], until
     /// the allocator's tokens replace the newtypes.
-    type Physical: Copy;
+    type Physical: Copy + Number;
     /// The register file a value of this class lives in.
     type File: File;
     /// This class as data: the allocator's view of a [`Value`].
@@ -519,6 +559,45 @@ impl Stage for Physical {
     type FrameSize = u32;
 }
 
+/// A stage whose operands are placed: registers an encoder reads the number
+/// of, a frame slot it reads the offset of, and the position a branch goes
+/// to. One encoder serves [`Physical`] and [`Bound`], until the legacy
+/// drivers are deleted and `Physical` goes with them.
+trait Placed: Stage {
+    fn read<C: Class>(operand: &Self::Read<C>) -> u8;
+    fn write<C: Class>(operand: &Self::Write<C>) -> u8;
+    fn early<C: Class>(operand: &Self::Early<C>) -> u8;
+    fn tie<C: Class>(operand: &Self::Tie<C>) -> u8;
+    /// Bytes from the stack pointer: a `disp32`.
+    fn slot(slot: &Self::Slot) -> i32;
+    fn target(target: &Self::Target) -> Label;
+    fn frame_size(size: &Self::FrameSize) -> u32;
+}
+
+impl Placed for Physical {
+    fn read<C: Class>(operand: &C::Physical) -> u8 {
+        operand.number()
+    }
+    fn write<C: Class>(operand: &C::Physical) -> u8 {
+        operand.number()
+    }
+    fn early<C: Class>(operand: &C::Physical) -> u8 {
+        operand.number()
+    }
+    fn tie<C: Class>(operand: &C::Physical) -> u8 {
+        operand.number()
+    }
+    fn slot(_: &()) -> i32 {
+        unreachable!("the legacy drivers address their slots through a `Mem`")
+    }
+    fn target(target: &Label) -> Label {
+        *target
+    }
+    fn frame_size(size: &u32) -> u32 {
+        *size
+    }
+}
+
 /// A name for something computed, of class `C`: one definition, any number
 /// of reads. A name, so `Copy`: names copy, resources move.
 ///
@@ -547,6 +626,20 @@ impl<C: Class> Value<C> {
 struct ValueName {
     id: u64,
     class: ClassId,
+}
+
+impl ValueName {
+    /// This name as a `Value<C>`.
+    ///
+    /// # Panics
+    /// If the name is not of class `C`.
+    fn typed<C: Class>(self) -> Value<C> {
+        assert_eq!(self.class, C::ID, "{self:?} is not of the class asked for");
+        Value {
+            id: self.id,
+            _class: PhantomData,
+        }
+    }
 }
 
 /// The stage selection builds at: operands are names, and the rights to
@@ -599,6 +692,30 @@ impl<'m, B: IsaBackend> Stage for Bound<'m, B> {
     type Slot = &'m FrameSlot;
     type Target = Label;
     type FrameSize = u64;
+}
+
+impl<'m, B: IsaBackend> Placed for Bound<'m, B> {
+    fn read<C: Class>(operand: &In<'m, B, C>) -> u8 {
+        operand.number()
+    }
+    fn write<C: Class>(operand: &Out<'m, B, C>) -> u8 {
+        operand.number()
+    }
+    fn early<C: Class>(operand: &Out<'m, B, C>) -> u8 {
+        operand.number()
+    }
+    fn tie<C: Class>(operand: &InOut<'m, B, C>) -> u8 {
+        operand.number()
+    }
+    fn slot(slot: &&'m FrameSlot) -> i32 {
+        i32::try_from(slot.offset()).expect("MAX_FRAME bounds every slot offset")
+    }
+    fn target(target: &Label) -> Label {
+        *target
+    }
+    fn frame_size(size: &u64) -> u32 {
+        u32::try_from(*size).expect("MAX_FRAME bounds the frame")
+    }
 }
 
 /// How an instruction is rebuilt at stage `T`, one operand at a time. Each
@@ -746,6 +863,8 @@ struct Loop {
     head: Label,
     /// The enclosing loop, as an index into [`Function::loops`].
     parent: Option<usize>,
+    /// How many times its body runs per call: its own trip count times its
+    /// parent's.
     trips: u64,
 }
 
@@ -804,8 +923,6 @@ struct Function<B: IsaBackend> {
 /// allocator are generic over it, and neither names a register, an opcode or an
 /// encoding. The assembler is not generic over it: it imports nothing, and
 /// takes the program a backend's `encode` produces.
-///
-/// What it does not yet say arrives with its first reader: `encode`, in B3.
 #[expect(dead_code, reason = "live from B4")]
 trait IsaBackend: Sized + 'static {
     type Inst<S: Stage>;
@@ -826,8 +943,9 @@ trait IsaBackend: Sized + 'static {
 
     // Selection. Operands are values; the driver resolved them.
     fn lane(b: &mut build::Builder<Self>, op: LaneOp<Self>) -> Result<Self::Lane, CompileError>;
-    /// The class of a block parameter that carries `lane`.
-    fn lane_class(lane: Self::Lane) -> ClassId;
+    /// The name of `lane`, for a branch to pass it and a block to take its
+    /// class.
+    fn lane_name(lane: Self::Lane) -> ValueName;
     /// A block parameter, read back as a lane.
     fn param_lane(param: ValueName) -> Self::Lane;
     fn context(
@@ -863,6 +981,10 @@ trait IsaBackend: Sized + 'static {
     /// Rebuild `inst` at stage `T`, visiting each operand once, in field
     /// order. The only per-instruction traversal.
     fn walk<T: Stage>(inst: &Self::Inst<Selected>, f: &mut impl Rebind<T>) -> Self::Inst<T>;
+
+    /// Encode one allocated instruction: its bytes, and the label fields in
+    /// them.
+    fn encode(inst: &Self::Inst<Bound<'_, Self>>, out: &mut Encoding<'_>);
 }
 
 /// An operation producing one lane value, with its operands already lanes.

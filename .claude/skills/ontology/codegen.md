@@ -451,7 +451,10 @@
   with no counter and no back edge.
 - **Lives:** decided in `docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md`
   (R1: "the accumulate is an ordinary `Binary` def … the allocator learns
-  nothing about folds"); today emitted by verbs in
+  nothing about folds"); selected as blocks by `Selector::fold`
+  (`pixelflow-codegen/src/emit/select.rs`, B3 of
+  `docs/plans/2026-10-08-selection-is-a-phase.md`, unused until B4), whose
+  `Loop::trips` is the body's runs per call; today emitted by verbs in
   `pixelflow-codegen/src/emit/mod.rs`'s `Reduce` arm ("seed, test, body,
   combine, step", with `Scratch::REDUCE_TEMPS`, labels
   `reduce{vid}_top`/`reduce{vid}_exit`), which contradicts it.
@@ -543,7 +546,10 @@
   instruction enums: `Gp<S>`, x86's general-register instructions, generic
   over a `Stage` and with named fields typed by `Class` (`emit/x86_64.rs`);
   `Inst<S>` in `emit/avx2.rs` and `emit/avx512.rs`, the VEX and EVEX
-  instructions, over the same vocabulary; `Inst` in `emit/aarch64.rs`. Today
+  instructions, over the same vocabulary, and `avx2::Op<S>`, the instruction
+  AVX2's selection puts in a block; `Inst` in `emit/aarch64.rs`. One encoder
+  serves the legacy `Physical` stage and the allocator's `Bound` one, through
+  `Placed` (`emit/mod.rs`), until D1. Today
   most emission is `LegacyBackend` verbs writing bytes inline ("Instructions:
   bytes written inline by ~236 functions, not values", denotational-diagnosis;
   e.g. `emit_write(&mut self, code: &mut Vec<u8>, …)`), which contradicts
