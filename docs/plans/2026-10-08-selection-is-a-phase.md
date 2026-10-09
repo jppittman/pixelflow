@@ -1406,7 +1406,7 @@ Every commit in this phase is live in production.
 
 #### A6: One `loads` count
 
-- **Files:** `emit/traffic.rs`, and in `pixelflow-pipeline`: `collapse_bench/{mod.rs, row.rs, predict.rs}`, `bin/corpus_gaps.rs`.
+- **Files:** `emit/traffic.rs`, and in `pixelflow-pipeline`: `collapse_bench/{mod.rs, row.rs, predict.rs}`. (`bin/corpus_gaps.rs` names neither field.)
 - **Change:**
   - `ScopeTraffic::{loads_transient, loads_kept}` become `loads`.
   - `memory_ops` is `loads + stores`.

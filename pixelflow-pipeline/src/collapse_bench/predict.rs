@@ -89,21 +89,13 @@ pub fn predictors() -> Vec<Predictor> {
             name: "dyn_traffic",
             gloss: "dyn_mem_ops + trip-weighted rematerializations — every value the code has to \
                     fetch or rebuild, whether or not it comes from memory",
-            eval: |r| {
-                dyn_of(r, |s| {
-                    s.loads_transient + s.loads_kept + s.remats + s.stores
-                })
-            },
+            eval: |r| dyn_of(r, |s| s.loads + s.remats + s.stores),
         },
         Predictor {
             name: "dyn_emitted_ops",
             gloss: "trip-weighted scheduled operations + every load, store and rematerialization \
                     around them",
-            eval: |r| {
-                dyn_of(r, |s| {
-                    s.instructions + s.loads_transient + s.loads_kept + s.remats + s.stores
-                })
-            },
+            eval: |r| dyn_of(r, |s| s.instructions + s.loads + s.remats + s.stores),
         },
         Predictor {
             name: "dyn_bytes",

@@ -300,8 +300,7 @@ pub fn features_of(result: &CompileResult) -> StaticFeatures {
     let scope = |s: &pixelflow_codegen::emit::ScopeTraffic| ScopeRow {
         bytes: s.bytes,
         instructions: s.instructions,
-        loads_transient: s.loads_transient,
-        loads_kept: s.loads_kept,
+        loads: s.loads,
         remats: s.remats,
         stores: s.stores,
     };
@@ -342,8 +341,7 @@ fn sum_scope_traffic(
         .iter()
         .fold(ScopeTraffic::default(), |acc, s| ScopeTraffic {
             instructions: acc.instructions + s.instructions,
-            loads_transient: acc.loads_transient + s.loads_transient,
-            loads_kept: acc.loads_kept + s.loads_kept,
+            loads: acc.loads + s.loads,
             remats: acc.remats + s.remats,
             stores: acc.stores + s.stores,
             bytes: acc.bytes + s.bytes,

@@ -49,11 +49,11 @@ fn report(label: &str, kernel: &Kernel, shape: LatticeShape) {
         result.hoisted_values,
         t.dynamic_memory_ops()
     );
-    println!("  scope    trips  bytes  instr  remats  loads_t  loads_k  stores");
+    println!("  scope    trips  bytes  instr  remats   loads  stores");
     for (i, (s, trips)) in t.scopes.iter().zip(&t.trips).enumerate() {
         println!(
-            "  {i:>5} {trips:>8} {:>6} {:>6} {:>7} {:>8} {:>8} {:>7}",
-            s.bytes, s.instructions, s.remats, s.loads_transient, s.loads_kept, s.stores
+            "  {i:>5} {trips:>8} {:>6} {:>6} {:>7} {:>7} {:>7}",
+            s.bytes, s.instructions, s.remats, s.loads, s.stores
         );
     }
 }
