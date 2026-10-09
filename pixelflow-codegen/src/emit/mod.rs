@@ -81,7 +81,7 @@ pub use crate::pipeline::compile;
 pub use executable::CompiledKernel;
 pub use traffic::{EmitTraffic, ScopeTraffic};
 
-use asm::{Label, Labels, Patch};
+use asm::{Item, Label, Labels, Patch};
 use encoded::EncodedInst;
 use storage::{Slot, StackFrame};
 
@@ -107,9 +107,9 @@ trait AsmInsn: Copy {
     ///
     /// Almost every instruction is position-independent and takes the default.
     /// A branch is not: it emits a placeholder displacement in `emit_into` and
-    /// says here which [`Label`] it is waiting on and how to fill the
-    /// placeholder in. That is the whole of what a branch adds — it is an
-    /// ordinary instruction that takes a name instead of a number.
+    /// says here which [`Label`] it is waiting on, where the placeholder is
+    /// and how to fill it in. That is the whole of what a branch adds — it is
+    /// an ordinary instruction that takes a name instead of a number.
     #[inline]
     fn label_ref(self) -> Option<LabelRef> {
         None
@@ -149,16 +149,19 @@ impl<I: AsmInsn, S: IntoIterator<Item = I>> AsmProgram<S> {
     ///
     /// # Panics
     ///
-    /// If a branch names a label that nothing bound. Only this crate writes
-    /// these programs, so that is a bug here rather than a fact about the
-    /// kernel being compiled.
+    /// If an instruction names a label. A name needs a program that binds it:
+    /// that is an [`Assembly`], not a sequence. Only this crate writes these
+    /// programs, so that is a bug here rather than a fact about the kernel
+    /// being compiled.
     #[inline]
     fn assemble(self, code: &mut Vec<u8>) {
-        let mut asm = Assembly::from_code(core::mem::take(code));
         for inst in self.insts {
-            asm.push(inst);
+            assert!(
+                inst.label_ref().is_none(),
+                "a label field needs an Assembly to bind its label"
+            );
+            inst.emit_into(code);
         }
-        *code = asm.finish();
     }
 }
 
@@ -179,50 +182,60 @@ fn assemble<I: AsmInsn>(code: &mut Vec<u8>, insts: impl IntoIterator<Item = I>) 
 /// known.
 #[derive(Copy, Clone)]
 struct LabelRef {
+    /// Bytes from the instruction's start to the field.
+    at: usize,
     /// The position this instruction is waiting on.
     label: Label,
     /// See [`Patch`].
     patch: Patch,
 }
 
-/// A program being assembled: its bytes, and the names in it.
+/// An instruction with a label field, as [`Assembly`] hands it to the
+/// assembler: the bytes its `emit_into` wrote, and the field in them.
+struct Fielded {
+    bytes: Vec<u8>,
+    field: LabelRef,
+}
+
+/// A program being written: the front end of [`asm::assemble`].
 ///
-/// The imperative face of the same assembler [`AsmProgram`] is the declarative
-/// face of. An emitter that walks a schedule cannot hand over a finished list
-/// of instructions and labels — it discovers them as it goes, calling `&mut
-/// self` backend verbs for each — so it pushes into one of these instead, and
-/// binds a label where one lands. Two passes: lay out, then patch.
+/// An emitter that walks a schedule cannot hand over a finished list of
+/// instructions and labels — it discovers them as it goes, calling `&mut
+/// self` backend verbs for each — so it appends to one of these instead. The
+/// bytes of a position-independent instruction go into `code`, the run being
+/// written; a label ends the run, and so does an instruction with a field in
+/// it, which becomes an item of its own. One kernel is one of these, however
+/// many scopes it has.
 #[derive(Default)]
 struct Assembly {
-    /// The bytes so far: what a backend verb emits into.
+    /// The run being written: what a backend verb emits into.
     code: Vec<u8>,
-    bound: alloc::collections::BTreeMap<Label, usize>,
-    pending: Vec<(usize, LabelRef)>,
+    text: Vec<Item<Fielded>>,
+    /// Bytes of `text` already ended, which `code` is not part of yet.
+    ended: usize,
+    data: Vec<Item<Fielded>>,
+    labels: Labels,
 }
 
 impl Assembly {
-    /// An empty program with room for `capacity` bytes.
-    #[must_use]
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            code: Vec::with_capacity(capacity),
-            ..Self::default()
-        }
+    /// A new label, named by the position it will be bound to.
+    fn mint(&mut self) -> Label {
+        self.labels.mint()
     }
 
-    /// Continue a program whose first bytes are already emitted.
-    ///
-    /// Positions are offsets into the whole buffer, not into the part this
-    /// program contributed. A displacement cannot tell the difference — it is
-    /// `target - at` either way — but a *page* can, and `AdrpAdd` asks for
-    /// one, so there is exactly one answer to what a position means here and
-    /// this is it.
-    #[must_use]
-    fn from_code(code: Vec<u8>) -> Self {
-        Self {
-            code,
-            ..Self::default()
+    /// Bytes of code so far: what [`Assembly::bind`] would bind a label to.
+    fn len(&self) -> usize {
+        self.ended + self.code.len()
+    }
+
+    /// End the run being written.
+    fn end_run(&mut self) {
+        if self.code.is_empty() {
+            return;
         }
+        self.ended += self.code.len();
+        self.text.push(Item::Bytes(self.code.clone()));
+        self.code.clear();
     }
 
     /// Write a label here — the name of this position.
@@ -231,42 +244,56 @@ impl Assembly {
     /// branch and the exit of every loop, so nothing here checks that anything
     /// refers to it. [`Assembly::finish`] is where a name nobody wrote is
     /// reported.
-    ///
-    /// # Panics
-    ///
-    /// If this name is already written elsewhere in the program. A name that
-    /// means two positions is not a name, and only this crate writes these
-    /// programs, so that is a bug here rather than anything about the kernel
-    /// being compiled.
     fn bind(&mut self, label: Label) {
-        let at = self.code.len();
-        let previously = self.bound.insert(label, at);
-        assert!(previously.is_none(), "{label:?} was written twice");
+        self.end_run();
+        self.text.push(Item::Bind(label));
     }
 
     /// Emit one instruction, recording the name it waits on if it has one.
     fn push(&mut self, inst: impl AsmInsn) {
         let at = self.code.len();
         inst.emit_into(&mut self.code);
-        if let Some(reference) = inst.label_ref() {
-            self.pending.push((at, reference));
-        }
+        let Some(field) = inst.label_ref() else {
+            return;
+        };
+        let bytes = self.code.split_off(at);
+        self.end_run();
+        self.ended += bytes.len();
+        self.text.push(Item::Inst(Fielded { bytes, field }));
     }
 
-    /// Fill in every deferred displacement and hand back the bytes.
+    /// The constant pool, trailing the code: the data section. It is aligned
+    /// when it holds anything, and `pool` is bound where it starts either way
+    /// — the anchor names it unconditionally.
+    fn pool(&mut self, pool: Label, entries: Vec<u8>) {
+        if !entries.is_empty() {
+            self.data.push(Item::Align(CONST_POOL_ALIGN as u64));
+        }
+        self.data.push(Item::Bind(pool));
+        self.data.push(Item::Bytes(entries));
+    }
+
+    /// Assemble the kernel.
     ///
     /// # Panics
     ///
-    /// If a branch names a label nothing bound.
+    /// If a branch names a label nothing bound, or a label is bound twice.
+    /// Only this crate writes these programs, so either is a bug here rather
+    /// than a fact about the kernel being compiled.
     #[must_use]
     fn finish(mut self) -> Vec<u8> {
-        for (at, reference) in core::mem::take(&mut self.pending) {
-            let Some(&target) = self.bound.get(&reference.label) else {
-                panic!("{:?} is branched to but never written", reference.label)
-            };
-            (reference.patch)(&mut self.code, at, target);
-        }
-        self.code
+        self.end_run();
+        asm::assemble(
+            &asm::AsmProgram {
+                text: self.text,
+                data: self.data,
+                labels: self.labels,
+            },
+            |inst, out| {
+                out.bytes(&inst.bytes);
+                out.field(inst.field.at, inst.field.label, inst.field.patch);
+            },
+        )
     }
 }
 
@@ -919,14 +946,16 @@ fn binding(
 /// decision that makes this tractable");
 /// [`regalloc::Allocation::binder_slot`] likewise for its binder.
 ///
-/// Returns the code and the register the scope's result is in — `None` when
-/// the root is an effect and not a value: a `Write`, a `Seq`, a fold over
-/// the unit monoid.
+/// Appends the scope's code to `asm` — the one program the kernel is, which
+/// every scope nested in this one appends to in turn — and returns the
+/// register the scope's result is in: `None` when the root is an effect and
+/// not a value: a `Write`, a `Seq`, a fold over the unit monoid.
 fn emit_scope<B: IsaBackend>(
     allocation: regalloc::Allocation<'_>,
     backend: &mut B,
-    labels: &mut Labels,
-) -> Result<(Vec<u8>, Option<Reg>), CompileError> {
+    asm: &mut Assembly,
+) -> Result<Option<Reg>, CompileError> {
+    let start = asm.len();
     backend.scope_begin();
     // Allocation happened before this call — once per scope, over the whole
     // nest, its frame included. The allocator chooses the evaluation order,
@@ -1020,7 +1049,7 @@ fn emit_scope<B: IsaBackend>(
         for arm in IfArm::ALL {
             let range = guard.range(arm);
             if range.0 != range.1 {
-                let past = labels.mint();
+                let past = asm.mint();
                 branch_starts[range.0].push(PendingBranch {
                     guard_idx: gi,
                     arm,
@@ -1103,9 +1132,6 @@ fn emit_scope<B: IsaBackend>(
     }
 
     backend.begin(schedule)?;
-
-    // No prologue here — the caller frames the body (see the fn doc).
-    let mut asm = Assembly::default();
 
     // Bring an address into pointer register `p` from wherever `locs` says
     // it is: its slot, or another pointer register. The pointer class's
@@ -1308,7 +1334,7 @@ fn emit_scope<B: IsaBackend>(
                 mask_scratch: mask_guard_temp,
                 arm,
             };
-            backend.branch_if_arm_is_dead(&mut asm, test, pb.past);
+            backend.branch_if_arm_is_dead(asm, test, pb.past);
         }
 
         // A parked value's placeholder def emits nothing — the enclosing
@@ -1433,7 +1459,7 @@ fn emit_scope<B: IsaBackend>(
             }
             seed(backend, binder_reg, fold.range().start as f32, binder_slot)?;
 
-            let (top, exit) = (labels.mint(), labels.mint());
+            let (top, exit) = (asm.mint(), asm.mint());
             asm.bind(top);
 
             // Trip test: exit once every lane agrees the binder has reached
@@ -1453,7 +1479,7 @@ fn emit_scope<B: IsaBackend>(
             backend.load_const(&mut asm.code, t1, fold.range().end as f32)?;
             backend.test_ge(&mut asm.code, t0, [binder_now, t1], scratch.mask_guard_temp);
             backend.branch_if_arm_is_dead(
-                &mut asm,
+                asm,
                 MaskTest {
                     reg: t0,
                     scratch: scratch.guard_temp,
@@ -1463,8 +1489,7 @@ fn emit_scope<B: IsaBackend>(
                 exit,
             );
 
-            let (fold_code, body_result) = emit_scope(fold_alloc, backend, labels)?;
-            asm.code.extend_from_slice(&fold_code);
+            let body_result = emit_scope(fold_alloc, backend, asm)?;
 
             // Combine: fold the body's result into the accumulator — an
             // ordinary two-register ALU op, outside the schedule (see
@@ -1496,7 +1521,7 @@ fn emit_scope<B: IsaBackend>(
                     backend.slot_store(&mut asm.code, t0, binder_slot);
                 }
             }
-            backend.jump(&mut asm, top);
+            backend.jump(asm, top);
             asm.bind(exit);
 
             // The result is read from the accumulator's slot — where this
@@ -1531,7 +1556,7 @@ fn emit_scope<B: IsaBackend>(
             let true_reg = in_reg(*true_vid);
             let false_reg = in_reg(*false_vid);
 
-            let (only_false, only_true, join) = (labels.mint(), labels.mint(), labels.mint());
+            let (only_false, only_true, join) = (asm.mint(), asm.mint(), asm.mint());
 
             // Both guards read `mask_reg`, which is why the reduction
             // scratch is a reservation of its own rather than whichever
@@ -1542,12 +1567,12 @@ fn emit_scope<B: IsaBackend>(
                 mask_scratch: mask_guard_temp,
                 arm,
             };
-            backend.branch_if_arm_is_dead(&mut asm, test(IfArm::True), only_false);
-            backend.branch_if_arm_is_dead(&mut asm, test(IfArm::False), only_true);
+            backend.branch_if_arm_is_dead(asm, test(IfArm::True), only_false);
+            backend.branch_if_arm_is_dead(asm, test(IfArm::False), only_true);
 
             // Mixed lanes: the blend, the path a lane-varying mask takes.
             backend.emit_plan(&mut asm.code, &plan)?;
-            backend.jump(&mut asm, join);
+            backend.jump(asm, join);
 
             asm.bind(only_false);
             if let Some(freg) = false_reg {
@@ -1555,7 +1580,7 @@ fn emit_scope<B: IsaBackend>(
             } else {
                 backend.emit_resolve(&mut asm.code, *false_vid, dst, &locs)?;
             }
-            backend.jump(&mut asm, join);
+            backend.jump(asm, join);
 
             asm.bind(only_true);
             if let Some(treg) = true_reg {
@@ -1616,9 +1641,8 @@ fn emit_scope<B: IsaBackend>(
         })
     };
 
-    let code = asm.finish();
-    backend.scope_end(allocation.scope(), code.len() as u64);
-    Ok((code, result_reg))
+    backend.scope_end(allocation.scope(), (asm.len() - start) as u64);
+    Ok(result_reg)
 }
 
 /// Resolve a scheduled operation into a concrete instruction plan.
@@ -1974,23 +1998,22 @@ fn compile_via_backend<B: IsaBackend>(
     // its placements (`regalloc::NestAllocation::new`): spill slots below
     // `spill_bytes`, each fold's two slots and the parks above, `frame_bytes`
     // in all. The body's emission reaches every fold nested in it.
-    let mut labels = Labels::new();
-    let (body, _) = emit_scope(nest.body(), &mut counting, &mut labels)?;
-
-    // The function around it: the frame, the anchor for whatever the body's
-    // constants are relative to, and what trails the return.
-    let mut asm = Assembly::with_capacity(body.len() + FRAME_HEADROOM);
+    //
+    // The function around the body is one program with it: the frame, the
+    // anchor for whatever the body's constants are relative to, the return,
+    // and what trails it.
+    let mut asm = Assembly::default();
     counting.frame_alloc(&mut asm.code, nest.frame_bytes());
-    let pool = labels.mint();
+    let pool = asm.mint();
     counting.anchor(&mut asm, pool);
-    asm.code.extend_from_slice(&body);
+    let body_start = asm.len();
+    emit_scope(nest.body(), &mut counting, &mut asm)?;
+    let body_bytes = asm.len() - body_start;
     counting.frame_free(&mut asm.code, nest.frame_bytes());
     counting.emit_ret(&mut asm.code);
-    let ret_end = asm.code.len();
+    let scaffold = counting.take((asm.len() - body_bytes) as u64);
     counting.finish(&mut asm, pool);
-    let trailing = (asm.code.len() - ret_end) as u64;
     let code = asm.finish();
-    let scaffold = counting.take(code.len() as u64 - body.len() as u64 - trailing);
     let scopes = counting.scopes();
 
     // How many times one call runs each scope: the body once, a fold its
@@ -2040,9 +2063,6 @@ fn compile_via_backend<B: IsaBackend>(
     })
 }
 
-/// Slack for the function's own instructions on top of the body it wraps.
-const FRAME_HEADROOM: usize = 64;
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -2083,8 +2103,12 @@ mod tests {
         backend: &mut B,
     ) -> Result<(Vec<u8>, Reg), CompileError> {
         let nest = allocate_nest(schedule, &backend.register_file());
-        let (code, result) = emit_scope(nest.body(), backend, &mut Labels::new())?;
-        Ok((code, result.expect("a value-rooted schedule has a result")))
+        let mut asm = Assembly::default();
+        let result = emit_scope(nest.body(), backend, &mut asm)?;
+        Ok((
+            asm.finish(),
+            result.expect("a value-rooted schedule has a result"),
+        ))
     }
 
     /// The register file of the backend [`compile_native`] instantiates on
@@ -3139,9 +3163,12 @@ mod tests {
             let mut prologue = Assembly::default();
             let mut probe = fresh();
             probe.frame_alloc(&mut prologue.code, 0);
-            let frame_end = prologue.code.len();
-            probe.anchor(&mut prologue, Labels::new().mint());
-            let anchor_end = prologue.code.len();
+            let frame_end = prologue.len();
+            let pool = prologue.mint();
+            probe.anchor(&mut prologue, pool);
+            let anchor_end = prologue.len();
+            prologue.bind(pool);
+            let prologue = prologue.finish();
             let lea = frame_end..anchor_end - REL32;
 
             for &(name, arena, root) in kernels {
@@ -3166,7 +3193,7 @@ mod tests {
 
                 assert_eq!(
                     code[lea.clone()],
-                    prologue.code[lea.clone()],
+                    prologue[lea.clone()],
                     "{tier}/{name}: the anchor is not where the frame ends"
                 );
                 let disp = i32::from_le_bytes(

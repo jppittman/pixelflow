@@ -376,7 +376,6 @@ fn try_encode_fmov_imm8(val: f32) -> Option<u8> {
 
 // The pool's alignment is every backend's, not this one's; its label is minted
 // once by `compile_via_backend` and handed to `anchor` and `finish`.
-use super::CONST_POOL_ALIGN;
 
 /// Returns true if the given f32 needs a constant pool entry (not zero, not FMOV-encodable).
 #[must_use]
@@ -426,9 +425,9 @@ fn needs_const_pool(val: f32) -> bool {
 /// writes the buffer at offset 0 of a mapping whose size — and therefore
 /// whose base — is a whole number of pages, pinned by
 /// `page_size_is_a_sane_power_of_two`; and an [`Assembly`](crate::emit::Assembly) position is an
-/// offset into the *whole* buffer rather than into the part one program
-/// contributed, which is why [`Assembly::from_code`](crate::emit::Assembly::from_code) keeps no base to
-/// subtract. A displacement cannot tell those two apart. A page can.
+/// offset into the *whole* kernel rather than into the scope that emitted it,
+/// because one kernel is one `Assembly`, so there is no base to subtract. A
+/// displacement cannot tell those two apart. A page can.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct AdrpAdd {
     /// Where the address is materialized.
@@ -451,6 +450,7 @@ impl AsmInsn for AdrpAdd {
     #[inline]
     fn label_ref(self) -> Option<LabelRef> {
         Some(LabelRef {
+            at: 0,
             label: self.target,
             // `at` is the ADRP word `emit_into` placed; the ADD it placed
             // right after sits at `at + 4`. Both words already carry their
@@ -753,7 +753,7 @@ fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Reg) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit::{Assembly, Labels};
+    use crate::emit::Assembly;
 
     /// `code`'s instruction words.
     fn words(code: &[u8]) -> Vec<u32> {
@@ -928,12 +928,12 @@ mod tests {
         // under the old scheme's margin either.
         for gap in [0, 4, 0xFFC, 0x1000, 0x1004, 0x2000, 3 << 20] {
             let mut asm = Assembly::default();
-            let pool = Labels::new().mint();
+            let pool = asm.mint();
             asm.push(AdrpAdd {
                 dst: Gpr(17),
                 target: pool,
             });
-            asm.code.resize(8 + gap, 0);
+            asm.code.resize(gap, 0);
             asm.bind(pool);
 
             let code = asm.finish();
@@ -954,7 +954,7 @@ mod tests {
     fn adrp_add_reaches_backwards() {
         for gap in [0usize, 4, 0x1000, 0x2004] {
             let mut asm = Assembly::default();
-            let pool = Labels::new().mint();
+            let pool = asm.mint();
             asm.bind(pool);
             asm.code.resize(gap, 0);
             asm.push(AdrpAdd {
@@ -1282,11 +1282,6 @@ pub(super) mod driver {
         fn offset_for(&self, entry: PoolEntry) -> Option<u16> {
             self.index.get(&entry).map(|&idx| idx * 16)
         }
-
-        /// Returns true if the pool has any entries.
-        fn is_empty(&self) -> bool {
-            self.entries.is_empty()
-        }
     }
     /// Emit a constant load, using the constant pool when available.
     ///
@@ -1583,22 +1578,16 @@ pub(super) mod driver {
         ///
         /// `anchor` branches to `pool` unconditionally — whether
         /// this compile needed the pool is not known until every constant
-        /// has been emitted — so the name must be written here even when
-        /// there is nothing to append: `Assembly::finish` panics on a name
-        /// nobody wrote, and an unpatched `AdrpAdd` would leave X17 pointing
-        /// at itself, same as the unpatched `ADR` this replaced.
+        /// has been emitted — so the name is bound even when there is nothing
+        /// to append: the assembler panics on a name nobody wrote, and an
+        /// unpatched `AdrpAdd` would leave X17 pointing at itself, same as
+        /// the unpatched `ADR` this replaced.
         fn finish(&mut self, asm: &mut Assembly, pool: Label) {
-            if self.consts.is_empty() {
-                asm.bind(pool);
-                return;
-            }
-            while !asm.code.len().is_multiple_of(super::CONST_POOL_ALIGN) {
-                asm.code.push(0);
-            }
-            asm.bind(pool);
+            let mut entries = Vec::new();
             for &entry in &self.consts.entries {
-                super::emit_pool_entry(&mut asm.code, entry);
+                super::emit_pool_entry(&mut entries, entry);
             }
+            asm.pool(pool, entries);
         }
 
         fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
@@ -2053,6 +2042,7 @@ impl AsmInsn for B {
     #[inline]
     fn label_ref(self) -> Option<LabelRef> {
         Some(LabelRef {
+            at: 0,
             label: self.target,
             patch: |code, at, target| DispField::IMM26.write(code, at, target),
         })
@@ -2121,10 +2111,12 @@ impl AsmInsn for BranchIfW16Zero {
     #[inline]
     fn label_ref(self) -> Option<LabelRef> {
         Some(LabelRef {
+            // The `CBNZ` is the first word; the `B` it steps over sits one
+            // word later, and a displacement is measured from the branch's
+            // own address.
+            at: WORD_BYTES,
             label: self.target,
-            // `at` is the `CBNZ`; the `B` it steps over sits one word later,
-            // and a displacement is measured from the branch's own address.
-            patch: |code, at, target| DispField::IMM26.write(code, at + WORD_BYTES, target),
+            patch: |code, at, target| DispField::IMM26.write(code, at, target),
         })
     }
 }
@@ -2132,7 +2124,7 @@ impl AsmInsn for BranchIfW16Zero {
 #[cfg(test)]
 mod label_tests {
     use super::*;
-    use crate::emit::{Assembly, IfArm, IsaBackend, Labels, MaskTest};
+    use crate::emit::{Assembly, IfArm, IsaBackend, MaskTest};
 
     /// One known word, so a test can measure distances in instructions without
     /// depending on any real encoding.
@@ -2149,8 +2141,8 @@ mod label_tests {
 
     #[test]
     fn forward_branch_counts_instructions_not_bytes() {
-        let end = Labels::new().mint();
         let mut asm = Assembly::default();
+        let end = asm.mint();
         asm.push(B { target: end });
         asm.push(NOP);
         asm.push(NOP);
@@ -2162,8 +2154,8 @@ mod label_tests {
 
     #[test]
     fn a_back_edge_is_negative() {
-        let top = Labels::new().mint();
         let mut asm = Assembly::default();
+        let top = asm.mint();
         asm.bind(top);
         asm.push(NOP);
         asm.push(NOP);
@@ -2201,8 +2193,8 @@ mod label_tests {
 
     #[test]
     fn a_branch_on_w16_is_cbnz_over_b() {
-        let exit = Labels::new().mint();
         let mut asm = Assembly::default();
+        let exit = asm.mint();
         asm.push(BranchIfW16Zero { target: exit });
         asm.push(NOP);
         asm.bind(exit);
@@ -2226,7 +2218,7 @@ mod label_tests {
     fn guard_over_arm(arm: IfArm, filler: usize) -> Vec<u32> {
         let mut backend = driver::Aarch64Backend::new();
         let mut asm = Assembly::default();
-        let past_arm = Labels::new().mint();
+        let past_arm = asm.mint();
         let test = MaskTest {
             reg: Reg(0),
             scratch: Some(Reg(1)),
@@ -2302,8 +2294,8 @@ mod label_tests {
     /// a field on an instruction: there is nothing here to hang it on.
     #[test]
     fn a_label_can_end_the_program() {
-        let end = Labels::new().mint();
         let mut asm = Assembly::default();
+        let end = asm.mint();
         asm.push(B { target: end });
         asm.bind(end);
         let code = asm.finish();
@@ -2313,15 +2305,17 @@ mod label_tests {
 
     #[test]
     fn a_program_is_position_independent() {
-        let end = Labels::new().mint();
-        let program = |mut asm: Assembly| {
+        let program = |prefix: &[u8]| {
+            let mut asm = Assembly::default();
+            asm.code.extend_from_slice(prefix);
+            let end = asm.mint();
             asm.push(B { target: end });
             asm.push(NOP);
             asm.bind(end);
             asm.finish()
         };
-        let offset = program(Assembly::from_code(alloc::vec![0xAAu8; 4]));
-        assert_eq!(&program(Assembly::default())[..], &offset[4..]);
+        let offset = program(&[0xAA; 4]);
+        assert_eq!(&program(&[])[..], &offset[4..]);
     }
 
     #[test]

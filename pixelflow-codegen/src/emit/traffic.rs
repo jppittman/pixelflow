@@ -375,8 +375,8 @@ mod tests {
     use super::super::regalloc::{self, Scope};
     use super::super::storage::Slot;
     use super::super::{
-        Assembly, Binding, InstructionPlan, IsaBackend, Label, Labels, Loc, MaskTest, PtrReg, Reg,
-        Reload, ResolvedOp, WritePlan,
+        Assembly, Binding, InstructionPlan, IsaBackend, Label, Loc, MaskTest, PtrReg, Reg, Reload,
+        ResolvedOp, WritePlan,
     };
     use super::{Counting, EmitTraffic, ScopeTraffic};
     use crate::error::CompileError;
@@ -661,7 +661,7 @@ mod tests {
         let mut asm = Assembly::default();
         {
             let mut counting = Counting::new(&mut backend);
-            let pool = Labels::new().mint();
+            let pool = asm.mint();
             counting.anchor(&mut asm, pool);
             counting.finish(&mut asm, pool);
         }

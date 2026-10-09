@@ -741,9 +741,11 @@ pub(in crate::emit) struct AsmProgram<I> {
     pub labels: Labels,
 }
 
-/// How a label field is filled once the label's address is known. The
-/// encoder that wrote the field supplies it. This is today's
-/// `LabelRef::patch` (`emit/mod.rs:310`), kept.
+/// How a label field is filled once the label's address is known: write the
+/// field at `at` (its own offset, not its instruction's) so that it reaches
+/// `target`. The encoder that wrote the field supplies it. This is today's
+/// `LabelRef::patch` (`emit/mod.rs:310`); A8 moved the field's offset out of
+/// the patch and into `Encoding::field`.
 pub(in crate::emit) type Patch = fn(code: &mut [u8], at: usize, target: usize);
 
 /// What an encoder writes into: one instruction's bytes and its label fields.
@@ -759,6 +761,8 @@ impl Encoding<'_> {
 
 pub(in crate::emit) struct Assembled { pub code: Vec<u8>, addresses: Vec<usize> }
 impl Assembled { pub(in crate::emit) fn address(&self, label: Label) -> usize; }
+// A8 lands `assemble` returning the `Vec<u8>` alone. `Assembled` and
+// `falls_through` arrive with their first reader (B-series).
 
 /// Lay out `text` then `data`, encode each instruction with `encode`, and
 /// patch every field.
@@ -1424,12 +1428,13 @@ Every commit in this phase is live in production.
 
 #### A8: The assembler stands alone, one program per kernel
 
-- **Files:** `emit/asm.rs` (`Item`, `AsmProgram`, `Encoding`, `Assembled`, `assemble`), `emit/mod.rs`, `x86_64.rs`, `aarch64.rs`.
+- **Files:** `emit/asm.rs` (`Item`, `AsmProgram`, `Encoding`, `assemble`), `emit/mod.rs`, `x86_64.rs`, `aarch64.rs`, the ontology's Assembly program and Assembler entries.
 - **Change:**
-  - The legacy `Assembly` becomes a front end that accumulates `asm::Item`s. Raw bytes become `Item::Bytes`, and a `LabelRef` becomes an `Encoding::field`.
-  - `emit_scope` returns its items, and the parent splices items, not bytes.
-  - The pool is the data section.
-  - `asm::assemble` produces the code.
+  - The legacy `Assembly` becomes a front end that accumulates `asm::Item`s. Raw bytes become `Item::Bytes`, and a `LabelRef` becomes an `Encoding::field`. It owns the kernel's `Labels`.
+  - There is one `Assembly` per kernel, threaded through `emit_scope(allocation, backend, &mut asm)` and every scope nested in it. Nothing is spliced, items or bytes. (Deviation from the first draft, "`emit_scope` returns its items": the body no longer has to be emitted before the frame around it, because the frame's size is known before it.)
+  - A `LabelRef` carries `at`, the field's offset in its instruction, and a `Patch` receives the field's own position.
+  - The pool is the data section (`Assembly::pool`: aligned when it holds anything, bound either way).
+  - `asm::assemble` produces the code, as a `Vec<u8>`.
   - `scripts/check_emit_boundary.py` gains the rule "`emit/asm.rs` imports nothing from the crate" (no `crate::`, `super::` or `pixelflow_` path), plus a self-test case that a violation is flagged.
 - **Bytes:** identical.
 - **Gate:** G.

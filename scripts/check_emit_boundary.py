@@ -25,6 +25,12 @@ The rules, over the non-test, non-comment, non-string text of each file:
       are not re-exports and are not exempt, and nothing else is exempt from
       anything else.
 
+  Rule A (`pixelflow-codegen/src/emit/asm.rs`, the assembler, which is also
+  scanned by rule E) may not name anything of the crate or its siblings: no
+  `crate::` or `super::` path and no `pixelflow_` crate. The assembler is a
+  function from a program to a binary, handed the encoder as a value, and
+  everything else depends on it, never the reverse.
+
   Rule P (every `pixelflow-codegen/src/program/**/*.rs`) may not name
     `crate::emit`, `crate::isa`, `crate::pipeline`, `crate::jit_cache`,
     `regalloc`, `executable` or `CompiledKernel`.
@@ -60,6 +66,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = REPO_ROOT / "pixelflow-codegen" / "src"
+ASSEMBLER = SRC / "emit" / "asm.rs"
 
 ITEM_KEYWORDS = (
     "fn", "mod", "impl", "struct", "enum", "trait", "type", "use", "const",
@@ -317,7 +324,11 @@ def rules(program_submodules):
         (r"\bexecutable\b", False),
         (r"\bCompiledKernel\b", False),
     ]
-    return {"E": emit, "P": program}
+    assembler = [
+        (r"\b(?:crate|super)\s*::", False),
+        (r"\bpixelflow_\w+", False),
+    ]
+    return {"E": emit, "P": program, "A": assembler}
 
 
 def scan(src, scope, program_submodules):
@@ -348,13 +359,16 @@ def check_tree():
             print(f"FAIL: {directory.relative_to(SRC)}/ holds no .rs files", file=sys.stderr)
             return 1
         for path in found:
+            # The assembler answers to rule A as well as to its directory's.
+            scopes = [scope] + (["A"] if path == ASSEMBLER else [])
             files += 1
-            for line, token in scan(path.read_text(), scope, subs):
-                failures += 1
-                print(
-                    f"FAIL: {path.relative_to(SRC)}:{line}: names {token} [rule {scope}]",
-                    file=sys.stderr,
-                )
+            for scope_name in scopes:
+                for line, token in scan(path.read_text(), scope_name, subs):
+                    failures += 1
+                    print(
+                        f"FAIL: {path.relative_to(SRC)}:{line}: names {token} [rule {scope_name}]",
+                        file=sys.stderr,
+                    )
     if failures:
         print(f"{failures} emit-boundary violation(s)", file=sys.stderr)
         return 1
@@ -488,6 +502,13 @@ def self_test():
     case("P: pipeline", "use crate::pipeline::compile;\n", 1, "P")
     case("P: pub use does not exempt the pipeline", "pub use crate::pipeline::compile;\n", 1, "P")
     case("P may name the search", token + "\n", 0, "P")
+    case("A: crate path", "use crate::emit::Label;\n", 1, "A")
+    case("A: super path", "use super::Gpr;\n", 1, "A")
+    case("A: grouped crate path", "use crate::{emit::Label, error};\n", 1, "A")
+    case("A: a sibling crate", "use pixelflow_ir::kind::OpKind;\n", 1, "A")
+    case("A: alloc is not the crate", "use alloc::vec::Vec;\n", 0, "A")
+    case("A: self is its own", "use self::inner::X;\n", 0, "A")
+    case("A: prose and tests may name the crate", "// use crate::x;\n#[cfg(test)]\nmod t { use super::*; }\n", 0, "A")
     case("P: a cfg(test) item may name the driver", "#[cfg(test)]\nmod tests {\n use crate::pipeline::schedule_for;\n}\n", 0, "P")
     case(
         "a lifetime is not a char literal",

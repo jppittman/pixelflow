@@ -12,8 +12,8 @@
 //! in this file is gone (docs/plans/2026-09-22-the-isa-is-decided-at-startup.md §7).
 
 use super::{
-    AsmInsn, AsmProgram, Assembly, Binding, CONST_POOL_ALIGN, EncodedInst, Gpr, Label, LabelRef,
-    Loc, PtrReg, Reg, WritePlan, regalloc,
+    AsmInsn, AsmProgram, Assembly, Binding, EncodedInst, Gpr, Label, LabelRef, Loc, PtrReg, Reg,
+    WritePlan, regalloc,
 };
 use crate::error::CompileError;
 use alloc::collections::BTreeMap;
@@ -80,20 +80,14 @@ impl ConstPool {
     }
 
     /// Append the pool after the return and bind `pool` where it lands.
-    ///
-    /// The label is written whether or not there is anything to append: the
-    /// anchor names it unconditionally, and `Assembly::finish` panics on a
-    /// name nobody wrote.
     pub(super) fn finish(&self, asm: &mut Assembly, pool: Label) {
-        if !self.entries.is_empty() {
-            while !asm.code.len().is_multiple_of(CONST_POOL_ALIGN) {
-                asm.code.push(0);
-            }
-        }
-        asm.bind(pool);
-        for &bits in &self.entries {
-            asm.code.extend_from_slice(&bits.to_le_bytes());
-        }
+        asm.pool(
+            pool,
+            self.entries
+                .iter()
+                .flat_map(|bits| bits.to_le_bytes())
+                .collect(),
+        );
     }
 }
 
@@ -125,8 +119,9 @@ impl AsmInsn for LeaRip {
     #[inline]
     fn label_ref(self) -> Option<LabelRef> {
         Some(LabelRef {
+            at: LEA_RIP_DISP,
             label: self.target,
-            patch: |code, at, target| patch_rel32(code, at + LEA_RIP_DISP, target),
+            patch: patch_rel32,
         })
     }
 }
@@ -250,14 +245,14 @@ pub(super) fn emit_test_eax(code: &mut Vec<u8>) {
 #[cfg(test)]
 mod label_tests {
     use super::{Cond, Inst, Jcc, Jmp};
-    use crate::emit::{Assembly, Labels};
+    use crate::emit::Assembly;
 
     /// The one thing a label does that a fixup token could not: name a
     /// position that does not exist yet.
     #[test]
     fn a_forward_branch_names_a_position_bound_later() {
-        let end = Labels::new().mint();
         let mut asm = Assembly::default();
+        let end = asm.mint();
         asm.push(Jmp { target: end });
         asm.push(Inst::Ret);
         asm.bind(end);
@@ -274,8 +269,8 @@ mod label_tests {
     /// resolution pass is separate from the layout pass.
     #[test]
     fn a_back_edge_resolves_to_a_negative_displacement() {
-        let top = Labels::new().mint();
         let mut asm = Assembly::default();
+        let top = asm.mint();
         asm.bind(top);
         asm.push(Inst::Ret);
         asm.push(Jmp { target: top });
@@ -293,8 +288,8 @@ mod label_tests {
     /// a field on an instruction: there is nothing here to hang it on.
     #[test]
     fn a_label_can_end_the_program() {
-        let end = Labels::new().mint();
         let mut asm = Assembly::default();
+        let end = asm.mint();
         asm.push(Jmp { target: end });
         asm.bind(end);
         let code = asm.finish();
@@ -305,9 +300,8 @@ mod label_tests {
     /// And two labels may name the same position, for the same reason.
     #[test]
     fn two_labels_can_share_a_position() {
-        let mut labels = Labels::new();
-        let (a, b) = (labels.mint(), labels.mint());
         let mut asm = Assembly::default();
+        let (a, b) = (asm.mint(), asm.mint());
         asm.push(Jcc {
             condition: Cond::E,
             target: a,
@@ -326,23 +320,24 @@ mod label_tests {
     /// be assembled after bytes that are already there.
     #[test]
     fn a_program_is_position_independent() {
-        let end = Labels::new().mint();
-        let program = |mut asm: Assembly| {
+        let program = |prefix: &[u8]| {
+            let mut asm = Assembly::default();
+            asm.code.extend_from_slice(prefix);
+            let end = asm.mint();
             asm.push(Jmp { target: end });
             asm.bind(end);
             asm.finish()
         };
-        let offset = program(Assembly::from_code(alloc::vec![0x90u8; 7]));
-        assert_eq!(&program(Assembly::default())[..], &offset[7..]);
+        let offset = program(&[0x90; 7]);
+        assert_eq!(&program(&[])[..], &offset[7..]);
     }
 
     #[test]
     #[should_panic(expected = "never written")]
     fn an_unbound_label_is_a_bug_and_not_a_jump_to_itself() {
         let mut asm = Assembly::default();
-        asm.push(Jmp {
-            target: Labels::new().mint(),
-        });
+        let target = asm.mint();
+        asm.push(Jmp { target });
         let code = asm.finish();
         unreachable!("assembled {} bytes around an unbound label", code.len());
     }
@@ -350,10 +345,12 @@ mod label_tests {
     #[test]
     #[should_panic(expected = "written twice")]
     fn a_label_bound_twice_is_a_bug() {
-        let twice = Labels::new().mint();
         let mut asm = Assembly::default();
+        let twice = asm.mint();
         asm.bind(twice);
         asm.bind(twice);
+        let code = asm.finish();
+        unreachable!("assembled {} bytes around a label bound twice", code.len());
     }
 }
 
@@ -562,8 +559,9 @@ impl AsmInsn for Jmp {
     #[inline]
     fn label_ref(self) -> Option<LabelRef> {
         Some(LabelRef {
+            at: JMP_DISP,
             label: self.target,
-            patch: |code, at, target| patch_rel32(code, at + JMP_DISP, target),
+            patch: patch_rel32,
         })
     }
 }
@@ -614,8 +612,9 @@ impl AsmInsn for Jcc {
     #[inline]
     fn label_ref(self) -> Option<LabelRef> {
         Some(LabelRef {
+            at: JCC_DISP,
             label: self.target,
-            patch: |code, at, target| patch_rel32(code, at + JCC_DISP, target),
+            patch: patch_rel32,
         })
     }
 }
@@ -994,10 +993,10 @@ mod gpr_tests {
     /// nothing.
     #[test]
     fn branches_patch_relative_to_the_next_instruction() {
-        use crate::emit::{Assembly, Labels};
+        use crate::emit::Assembly;
 
-        let end = Labels::new().mint();
         let mut asm = Assembly::default();
+        let end = asm.mint();
         asm.push(Jmp { target: end });
         // Eleven bytes of padding, so the label lands at 16.
         asm.push(EncodedInst::from_slice(&[0x90; 11]));
@@ -1011,8 +1010,8 @@ mod gpr_tests {
             "rel is from the next insn"
         );
 
-        let top = Labels::new().mint();
         let mut asm = Assembly::default();
+        let top = asm.mint();
         asm.bind(top);
         asm.push(Jcc::on(Cond::B, top));
         let c = asm.finish();

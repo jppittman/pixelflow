@@ -941,7 +941,7 @@ mod tests {
             zs: [f32; 16],
         ) -> [f32; 16] {
             let mut asm = crate::emit::Assembly::default();
-            let pool_label = crate::emit::Labels::new().mint();
+            let pool_label = asm.mint();
             x86_64::anchor(&mut asm, pool_label);
             asm.code.extend_from_slice(body);
             asm.code.push(RET);
@@ -1069,7 +1069,7 @@ mod tests {
             let r9 = Gpr(9);
             let mut pool = x86_64::ConstPool::default();
             let mut asm = crate::emit::Assembly::default();
-            let pool_label = crate::emit::Labels::new().mint();
+            let pool_label = asm.mint();
             x86_64::anchor(&mut asm, pool_label);
             let c = &mut asm.code;
             x86_64::mov(c, r9, x86_64::gpr::RDI);
