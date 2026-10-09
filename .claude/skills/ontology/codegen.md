@@ -211,15 +211,21 @@
 
 ### Class
 
-- **Is:** `Vector` (one batch of `f32` lanes, in a `Reg`) or `Pointer` (an
+- **Is:** there are two, and the second replaces the first. `program::Class`
+  is an enum, `Vector` (one batch of `f32` lanes, in a `Reg`) or `Pointer` (an
   address, in a `PtrReg`), "a function of the defining op". Every consumer
   knows which class it expects by position. "The classes never compete for
-  a register."
+  a register." `emit::Class` (`emit/mod.rs`) is a trait with the markers
+  `Vector`, `Pointer`, `Integer` and `Flags`, the type an instruction's
+  operand field is declared with, so a base address cannot be handed a
+  `row * pitch` product. The flags are a class. D1 deletes
+  `program::Class` and keeps `emit::Class`.
 - **Is not:** a reason for a second algorithm ("One algorithm, two pools").
 - **Follows:** carry budgets are per class. Vector-only scratch (temps,
   guard registers, the result role) does not apply to pointers.
 - **Lives:** `program::Class`, `ScheduledOp::class`
-  (`pixelflow-codegen/src/program/mod.rs`); a-pointer-is-a-value §1–§2.
+  (`pixelflow-codegen/src/program/mod.rs`), `emit::Class`;
+  a-pointer-is-a-value §1–§2.
 
 ### Pointer (Context)
 

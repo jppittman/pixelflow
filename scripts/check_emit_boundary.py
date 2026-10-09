@@ -58,7 +58,8 @@ reviewed edit to this script.
 
 Usage:
   check_emit_boundary.py             scan the tree
-  check_emit_boundary.py --self-test run the scanner over in-memory cases
+  check_emit_boundary.py --self-test run the scanner over in-memory cases and
+                                     two synthetic trees
 """
 import contextlib
 import io
@@ -526,14 +527,20 @@ def self_test():
     )
     case("a quote char literal", "const Q: char = '\"';\nuse pixelflow_search::x;\n", 1)
 
-    with tempfile.TemporaryDirectory() as root:
-        src = Path(root)
-        for name in ("emit/other.rs", "program/mod.rs"):
-            (src / name).parent.mkdir(parents=True, exist_ok=True)
-            (src / name).write_text("")
-        with contextlib.redirect_stderr(io.StringIO()):
-            moved = check_tree(src)
-        cases.append(("a tree without the assembler fails", moved, 1))
+    # The same synthetic tree with and without the assembler: the second is the
+    # positive control that makes the first's failure the assembler's absence.
+    for name, files, want in (
+        ("a tree without the assembler fails", ("emit/other.rs", "program/mod.rs"), 1),
+        ("a tree with the assembler passes", ("emit/other.rs", "emit/asm.rs", "program/mod.rs"), 0),
+    ):
+        with tempfile.TemporaryDirectory() as root:
+            src = Path(root)
+            for file in files:
+                (src / file).parent.mkdir(parents=True, exist_ok=True)
+                (src / file).write_text("")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                got = check_tree(src)
+        cases.append((name, got, want))
 
     failed = [c for c in cases if c[1] != c[2]]
     for name, got, want in failed:

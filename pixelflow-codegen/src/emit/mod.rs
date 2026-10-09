@@ -282,8 +282,7 @@ impl Assembly {
     ///
     /// # Panics
     ///
-    /// As [`asm::assemble`]: a label bound twice, bound but never minted by
-    /// this program, or named and never bound.
+    /// As [`asm::assemble`].
     #[must_use]
     fn finish(mut self) -> Vec<u8> {
         self.end_run();

@@ -654,24 +654,22 @@ fn emit_unary(
     let super::Unary { op, dst, src, temp } = unary;
     let lanewise = |op| Inst::Unary { op, dst, src };
     let round = |mode| Inst::Round { mode, dst, src };
+    let mut signed = |op, bits| {
+        let mask = super::declared_temp(temp);
+        emit_const(code, mask, f32::from_bits(bits), pool)?;
+        Ok::<_, CompileError>(Inst::Alu {
+            op,
+            dst,
+            a: src,
+            b: mask,
+        })
+    };
     let inst = match op {
         OpKind::Sqrt => lanewise(Lanewise::Sqrt),
         OpKind::Rsqrt => lanewise(Lanewise::Rsqrt),
         OpKind::Recip => lanewise(Lanewise::Recip),
-        OpKind::Neg | OpKind::Abs => {
-            let (op, bits) = match op {
-                OpKind::Neg => (Alu::Xor, 0x8000_0000),
-                _ => (Alu::And, 0x7FFF_FFFF),
-            };
-            let mask = super::declared_temp(temp);
-            emit_const(code, mask, f32::from_bits(bits), pool)?;
-            Inst::Alu {
-                op,
-                dst,
-                a: src,
-                b: mask,
-            }
-        }
+        OpKind::Neg => signed(Alu::Xor, 0x8000_0000)?,
+        OpKind::Abs => signed(Alu::And, 0x7FFF_FFFF)?,
         OpKind::Floor => round(Rounding::Floor),
         OpKind::Ceil => round(Rounding::Ceil),
         OpKind::Round => round(Rounding::Nearest),
