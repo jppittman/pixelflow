@@ -5877,7 +5877,7 @@ mod tests {
         /// fact about the target's lanes and so cannot be one number.
         #[derive(Clone, Copy)]
         enum Width {
-            /// One sample: all remainder, and the main column fold is empty.
+            /// One sample: all remainder, no main fold exists.
             One,
             /// Exactly one batch: all main, no remainder fold exists.
             OneBatch,

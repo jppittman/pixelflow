@@ -8,7 +8,7 @@
 //! them. `trips` is how many times one call runs the scope, so a count in a
 //! row with a large `trips` is the hot loop's. `remats` is constants brought
 //! into a register from outside the register file (from the pool, or before
-//! the pool, rebuilt inline); `loads_k` includes a root reloaded from its
+//! the pool, rebuilt inline); `loads` includes a root reloaded from its
 //! park at a scope's head.
 //!
 //! Fixtures:

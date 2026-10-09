@@ -76,7 +76,7 @@ pub struct Linked {
     pub uniforms: Vec<UniformDecl>,
 }
 
-/// Compile the kernel rooted at `root` to an executable [`CompiledKernel`] (2D collapse loop)
+/// Compile a [`Kernel`](pixelflow_ir::Kernel) to an executable [`CompiledKernel`]
 /// for a lattice of the given `shape`, sharing previously compiled code for
 /// canonically identical kernels at the same extents.
 ///
@@ -95,7 +95,6 @@ pub struct Linked {
 /// has a zero extent, which has no sample to compute. The assertions live one
 /// layer down, in [`emit::compile`], because that is the boundary every route
 /// to machine code passes through and this is only one of them.
-/// Compile a [`Kernel`](pixelflow_ir::Kernel) for a lattice of the given `shape`.
 pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Linked, CompileError> {
     let (arena, root) = kernel.parts();
     // The link tables, and the key, are read off the kernel with every

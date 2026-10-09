@@ -12,15 +12,16 @@
 //!                  Write(row=j, col=i, lane=l, f(x0 + i + l, y0 + j))
 //! pack(L)     = fold_j (   fold_{i∈[0,w−r) step L}   fold_{l∈[0,L)} Write(…)
 //!                        ; fold_{i∈[w−r,w−r+1)}      fold_{l∈[0,r)} Write(…) )
-//!                                                      (the `;` arm only when r > 0)
+//!                 (the first arm only when w − r > 0, the second only when r > 0,
+//!                  the `;` only when both exist)
 //! ```
 //!
 //! `w × h` is the extent, `q = w / L`, `r = w % L`; every fold is over
 //! [`Monoid::SEQ`], the unit monoid; `;` is [`OpKind::Seq`]. `collapse` builds
 //! a *degenerate* `[0,1)` lane fold rather than none at all, so `Write`
-//! always has all three binders and `pack` only ever reshapes the two inner
-//! folds' ranges — the body, the `Write` node itself, is shared and
-//! untouched. This is the monadic reading — a `SEQ` fold is `for_`, `Seq` is
+//! always has all three binders and `pack` only ever rebuilds the two inner
+//! folds around it, with new ranges, or drops one — the `Write` node itself
+//! is shared and untouched. This is the monadic reading — a `SEQ` fold is `for_`, `Seq` is
 //! `>>` — and `pack` is exactly the chunking law
 //! `for_ [0,w) f = for_ [0,w−r) step L (\i -> for_ [0,L) (\l -> f(i+l))) >>
 //! for_ [w−r] (\i -> for_ [0,r) (\l -> f(i+l)))`
@@ -175,13 +176,14 @@ fn reachable_taken_binders(arena: &ExprArena, root: ExprId) -> [bool; Binder::CO
     taken
 }
 
-/// Strip-mine [`collapse`]'s column fold by `lanes`: — only when `w − r` is
-/// nonzero — a main fold stepping by `lanes` over `[0, w−r)` with a full lane
-/// fold `[0, lanes)` inside it, then — only when `r = w mod lanes` is nonzero
-/// — the remainder `[w−r, w−r+1)` × `[0, r)`, sequenced after the main fold
-/// under the row fold with [`OpKind::Seq`]. The `Write` [`collapse`] built is the same
-/// `ExprId` in every arm: only the two inner folds' ranges move, never the
-/// body they wrap (module doc — the chunking law for `for_`).
+/// Strip-mine [`collapse`]'s column fold by `lanes`, under the row fold. Let
+/// `r = w mod lanes`. A main fold exists only when `w − r > 0`: it steps by
+/// `lanes` over `[0, w−r)` with a full lane fold `[0, lanes)` inside it. A
+/// remainder exists only when `r > 0`: `[w−r, w−r+1)` × `[0, r)`. When both
+/// exist the remainder is sequenced after the main fold with [`OpKind::Seq`].
+/// The `Write` [`collapse`] built is the same `ExprId` in every arm: only the
+/// two inner folds around it are rebuilt, never the body they wrap (module doc
+/// — the chunking law for `for_`).
 ///
 /// When `w < lanes` there is no full batch, so there is no main fold: the whole
 /// column is the remainder. A fold over nothing is not built to be skipped.

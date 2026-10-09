@@ -2555,7 +2555,10 @@ impl Pass {
             }
             // The enclosing scope's answer, from the first point of this one.
             at[k] = Some(*park);
-            const_bits[k] = None;
+            debug_assert!(
+                const_bits[k].is_none(),
+                "place_roots moves every Const to Outer"
+            );
         }
         let pool = file.pool(class);
         Self {
@@ -2625,20 +2628,23 @@ impl Pass {
     /// ([`ReadHere`]); a value not in it is not read here. Empty where the
     /// candidates already exclude everything the instruction reads.
     fn rank(&mut self, v: ValueId, from: usize, read_here: &[(ValueId, ReadHere)]) -> EvictionRank {
-        let k = v.0 as usize;
         let distance = self.next_read(v, from).map(|r| r - from);
         EvictionRank::new(
             read_here
                 .iter()
                 .find(|(r, _)| *r == v)
                 .map_or(ReadHere::No, |(_, tier)| *tier),
-            if self.in_slot[k] {
-                Store::NotNeeded
-            } else {
-                Store::Needed
-            },
+            self.store(v),
             distance,
         )
+    }
+
+    /// Whether giving up `v`'s register means writing it to its slot first.
+    fn store(&self, v: ValueId) -> Store {
+        match self.in_slot[v.0 as usize] {
+            true => Store::NotNeeded,
+            false => Store::Needed,
+        }
     }
 
     /// Record that `v` lives at `to` from `index` on.
@@ -3235,11 +3241,7 @@ impl LinearScan {
                         } else {
                             ReadHere::No
                         },
-                        if pass.in_slot[def.value.0 as usize] {
-                            Store::NotNeeded
-                        } else {
-                            Store::Needed
-                        },
+                        pass.store(def.value),
                         pass.next_read(def.value, i).map(|r| r - i),
                     );
                     let keeps = new_rank > pass.rank(occupant, i, &read_here);
@@ -3883,7 +3885,8 @@ pub(super) mod tests {
         let rank = pass.rank(ValueId(0), 1, &[]);
         assert!(
             rank == EvictionRank::new(ReadHere::No, Store::Needed, Some(2)),
-            "value 0's only read is at index 3, two steps ahead of index 1"
+            "value 0, asked about at index 1, is not read there, has no slot yet, \
+             and is next read at index 3, two steps ahead"
         );
     }
 

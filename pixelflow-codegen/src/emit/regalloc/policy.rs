@@ -23,9 +23,10 @@ pub(super) enum ReadHere {
     /// Not read by this instruction or by a guard emitted before it.
     No,
     /// Read here, and it is the operand the encoding consumes *from the
-    /// destination* ([`OperandSource::Destination`](super::OperandSource::Destination)): losing its register
-    /// means one reload — into `dst`, which is the register it is losing —
-    /// and no other register at all.
+    /// destination*
+    /// ([`OperandSource::Destination`](super::OperandSource::Destination)):
+    /// losing its register means one reload — into `dst`, which is the
+    /// register it is losing — and no other register at all.
     FromDst,
     /// Read here and needs a register of its own to be read from: a reload
     /// register the pool then has to find too, or a guard's mask register for

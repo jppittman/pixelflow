@@ -297,8 +297,6 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
     }
 
     fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
-        // A root a fold reloads from its slot is read for the whole iteration
-        // that follows it, not for one instruction.
         self.current().loads += 1;
         self.inner.slot_load(code, dst, offset);
     }
