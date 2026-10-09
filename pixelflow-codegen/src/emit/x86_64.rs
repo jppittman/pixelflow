@@ -1,19 +1,19 @@
 //! x86-64 leaf encoders: what the AVX2 and AVX-512 tiers share below the
 //! vector width.
 //!
-//! Every function here emits raw machine code for one instruction (or a
-//! small fixed sequence) of the *architecture*: the general-register
+//! What is here is the *architecture's*: [`Gp`], the general-register
 //! instructions the loop nest and the store's address arithmetic are made
-//! of, the branches, the memory-operand tail (`Mem`, `Disp`) every vector
-//! encoder's ModRM/SIB is built from, the pointer class's loads and stores,
-//! and the constant pool with its anchor. Nothing here names a vector
+//! of (branches, the pointer class's loads and stores and the frame among
+//! them), the memory-operand tail (`Mem`, `Disp`) every vector encoder's
+//! ModRM/SIB is built from, and the constant pool with its anchor. Nothing
+//! here names a vector
 //! width: the `ymm`/`zmm` encodings live in `avx2.rs` and `avx512.rs`, each
 //! with its own `IsaBackend` driver, and the 128-bit tier that used to sit
 //! in this file is gone (docs/plans/2026-09-22-the-isa-is-decided-at-startup.md §7).
 
 use super::{
-    AsmInsn, AsmProgram, Assembly, Binding, EncodedInst, Gpr, Label, LabelRef, Loc, PtrReg, Reg,
-    WritePlan, regalloc,
+    AsmInsn, Assembly, Binding, EncodedInst, Flags, Gpr, Integer, Label, LabelRef, Loc, Physical,
+    Pointer, PtrReg, Reg, Stage, WritePlan, regalloc,
 };
 use crate::error::CompileError;
 use alloc::collections::BTreeMap;
@@ -68,7 +68,7 @@ impl ConstPool {
     ///
     /// [`CompileError::BudgetExceeded`] when the entry lies past a `disp32`
     /// ([`block_element`]): a pool that cannot be addressed never grows.
-    pub(super) fn operand(&mut self, bits: u32) -> Result<Mem<Imm32>, CompileError> {
+    pub(super) fn operand(&mut self, bits: u32) -> Result<Mem<Physical, Imm32>, CompileError> {
         if let Some(&position) = self.index.get(&bits) {
             return block_element(POOL_BASE, position);
         }
@@ -91,131 +91,17 @@ impl ConstPool {
     }
 }
 
-/// `lea dst, [rip + target]` — a position's address, in one instruction.
-///
-/// `REX.W 8D /r` with the RIP-relative ModRM, the displacement patched once
-/// the label lands. What every x86 tier's [`anchor`] is made of.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct LeaRip {
-    /// Where the address is materialized.
-    dst: PtrReg,
-    /// The position it is the address of.
-    target: Label,
-}
-
-/// Bytes from a `LeaRip`'s start to its displacement field: REX, opcode,
-/// ModRM.
-const LEA_RIP_DISP: usize = 3;
-
-impl AsmInsn for LeaRip {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        code.push(0x48 | (((self.dst.0 >> 3) & 1) << 2));
-        code.push(0x8D);
-        code.push(((self.dst.0 & 7) << 3) | RM_RIP_AT_MOD0);
-        code.extend_from_slice(&[0, 0, 0, 0]);
-    }
-
-    #[inline]
-    fn label_ref(self) -> Option<LabelRef> {
-        Some(LabelRef {
-            at: LEA_RIP_DISP,
-            label: self.target,
-            patch: patch_rel32,
-        })
-    }
-}
-
 /// Every x86 tier's anchor: `POOL_BASE = &pool`, once, after the frame.
 pub(super) fn anchor(asm: &mut Assembly, pool: Label) {
-    asm.push(LeaRip {
+    asm.push(Gp::LeaRip {
         dst: POOL_BASE,
-        target: pool,
+        to: pool,
     });
-}
-
-/// Every x86 tier's return: `vzeroupper; ret`.
-///
-/// The caller is Rust built for baseline x86-64, so its floating point is
-/// legacy SSE, and Intel cores charge legacy-SSE code for vector registers
-/// whose upper halves a VEX or EVEX instruction left dirty — a state
-/// transition on older cores, a false dependency and a merge per
-/// instruction on Skylake and later — until something clears them, which
-/// nothing in a Rust caller does. So the kernel clears them on the way out.
-/// Nothing is lost: the collapse ABI returns nothing in a vector register,
-/// and every result is already stored.
-///
-/// Measured on an AVX-512 Xeon, with a 1×1 kernel whose Rust caller runs a
-/// 256-term scalar sum after each call: the call cost 190 ns over the sum on
-/// the AVX-512 tier and 88 ns on AVX2 without this, and 32 and 15 ns with
-/// it. The charge is not the call's: the same sum, run after one call and
-/// never calling again, took 482 ns rather than 266.
-pub(super) fn return_to_caller(code: &mut Vec<u8>) {
-    AsmProgram::from([Inst::Vzeroupper, Inst::Ret]).assemble(code);
 }
 
 // =============================================================================
 // The pointer class: an address between a general register and memory
 // =============================================================================
-
-/// 64-bit pointer load: `mov dst, [base + disp32]`
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) struct MovLoadPtr {
-    pub(super) dst: PtrReg,
-    pub(super) base: PtrReg,
-    pub(super) disp: i32,
-}
-
-impl MovLoadPtr {
-    /// `REX.W 8B /r` with a `disp32` memory operand: any of the sixteen
-    /// GPRs on either side, `rsp`'s SIB and `rbp`'s displacement form
-    /// included — the tail is [`mem_operand_into`]'s, the same as every
-    /// other memory operand here.
-    #[must_use]
-    #[inline]
-    pub(super) fn encode(self) -> EncodedInst {
-        let mut inst = EncodedInst::new();
-        inst.push(rex_w(self.dst.as_gpr(), self.base.as_gpr()));
-        inst.push(0x8B);
-        mem_operand_into(
-            &mut inst,
-            self.dst.0,
-            Mem {
-                base: self.base,
-                disp: Imm32(self.disp),
-            },
-        );
-        inst
-    }
-}
-
-/// `mov [base + disp32], src` — `REX.W 89 /r`: an address to a frame slot,
-/// the pointer class's spill store. [`MovLoadPtr`]'s mirror.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct MovStorePtr {
-    pub(super) src: PtrReg,
-    pub(super) base: PtrReg,
-    pub(super) disp: i32,
-}
-
-impl MovStorePtr {
-    #[must_use]
-    #[inline]
-    pub(super) fn encode(self) -> EncodedInst {
-        let mut inst = EncodedInst::new();
-        inst.push(rex_w(self.src.as_gpr(), self.base.as_gpr()));
-        inst.push(0x89);
-        mem_operand_into(
-            &mut inst,
-            self.src.0,
-            Mem {
-                base: self.base,
-                disp: Imm32(self.disp),
-            },
-        );
-        inst
-    }
-}
 
 /// Bytes per pointer in the context array.
 pub(super) const PTR_BYTES: i32 = 8;
@@ -233,19 +119,14 @@ pub(super) struct BroadcastGprs {
     pub(super) index: Gpr,
 }
 
-// =============================================================================
-// Branches — for the shared driver's If short-circuit guards.
-// =============================================================================
-
-/// TEST eax, eax (sets ZF iff eax == 0).
-pub(super) fn emit_test_eax(code: &mut Vec<u8>) {
-    code.extend_from_slice(&[0x85, 0xC0]);
-}
-
 #[cfg(test)]
 mod label_tests {
-    use super::{Cond, Inst, Jcc, Jmp};
-    use crate::emit::Assembly;
+    use super::Gp;
+    use crate::emit::{Assembly, EncodedInst};
+
+    fn ret() -> EncodedInst {
+        EncodedInst::from_slice(&[0xC3])
+    }
 
     /// The one thing a label does that a fixup token could not: name a
     /// position that does not exist yet.
@@ -253,8 +134,8 @@ mod label_tests {
     fn a_forward_branch_names_a_position_bound_later() {
         let mut asm = Assembly::default();
         let end = asm.mint();
-        asm.push(Jmp { target: end });
-        asm.push(Inst::Ret);
+        asm.push(Gp::Jmp { to: end });
+        asm.push(ret());
         asm.bind(end);
         let code = asm.finish();
 
@@ -272,8 +153,8 @@ mod label_tests {
         let mut asm = Assembly::default();
         let top = asm.mint();
         asm.bind(top);
-        asm.push(Inst::Ret);
-        asm.push(Jmp { target: top });
+        asm.push(ret());
+        asm.push(Gp::Jmp { to: top });
         let code = asm.finish();
 
         // `ret` at 0, `jmp` at 1..6. Target 0, origin 6, so the displacement
@@ -290,7 +171,7 @@ mod label_tests {
     fn a_label_can_end_the_program() {
         let mut asm = Assembly::default();
         let end = asm.mint();
-        asm.push(Jmp { target: end });
+        asm.push(Gp::Jmp { to: end });
         asm.bind(end);
         let code = asm.finish();
         assert_eq!(code.len(), 5);
@@ -302,11 +183,8 @@ mod label_tests {
     fn two_labels_can_share_a_position() {
         let mut asm = Assembly::default();
         let (a, b) = (asm.mint(), asm.mint());
-        asm.push(Jcc {
-            condition: Cond::E,
-            target: a,
-        });
-        asm.push(Jmp { target: b });
+        asm.push(Gp::je(a));
+        asm.push(Gp::Jmp { to: b });
         asm.bind(a);
         asm.bind(b);
         let code = asm.finish();
@@ -322,9 +200,9 @@ mod label_tests {
     fn a_program_is_position_independent() {
         let program = |prefix: &[u8]| {
             let mut asm = Assembly::default();
-            asm.code.extend_from_slice(prefix);
+            asm.run.extend_from_slice(prefix);
             let end = asm.mint();
-            asm.push(Jmp { target: end });
+            asm.push(Gp::Jmp { to: end });
             asm.bind(end);
             asm.finish()
         };
@@ -333,17 +211,17 @@ mod label_tests {
     }
 
     #[test]
-    #[should_panic(expected = "never written")]
+    #[should_panic(expected = "never bound")]
     fn an_unbound_label_is_a_bug_and_not_a_jump_to_itself() {
         let mut asm = Assembly::default();
         let target = asm.mint();
-        asm.push(Jmp { target });
+        asm.push(Gp::Jmp { to: target });
         let code = asm.finish();
         unreachable!("assembled {} bytes around an unbound label", code.len());
     }
 
     #[test]
-    #[should_panic(expected = "written twice")]
+    #[should_panic(expected = "bound twice")]
     fn a_label_bound_twice_is_a_bug() {
         let mut asm = Assembly::default();
         let twice = asm.mint();
@@ -389,8 +267,6 @@ pub(super) mod gpr {
     /// bases, then the uniform and origin blocks. Read-only for the whole
     /// kernel.
     pub(in crate::emit) const RDI: Gpr = Gpr(7);
-    /// The stack pointer.
-    pub(in crate::emit) const RSP: Gpr = Gpr(4);
     pub(in crate::emit) const R9: Gpr = Gpr(9);
     pub(in crate::emit) const R10: Gpr = Gpr(10);
     pub(in crate::emit) const R11: Gpr = Gpr(11);
@@ -404,32 +280,271 @@ pub(super) mod ptr {
     pub(in crate::emit) const RSP: PtrReg = PtrReg(4);
 }
 
-/// First-class x86-64 instruction.
+/// An x86-64 general-register instruction.
+///
+/// Generic over what its operands are ([`Stage`]); a field is declared by the
+/// class of what it holds, so `lea`'s base is a `Pointer` and its index an
+/// `Integer`, and `imul` cannot be handed an address. An instruction that
+/// writes `EFLAGS` says so with a `flags` field, `()` at [`Physical`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) enum Inst {
-    Add { dst: Gpr, src: Gpr },
-    AddImm32 { dst: Gpr, imm: Imm32 },
-    SubImm32 { dst: Gpr, imm: Imm32 },
-    Vzeroupper,
-    Ret,
+pub(super) enum Gp<S: Stage> {
+    /// `mov dst, src`
+    Mov {
+        dst: S::Write<Pointer>,
+        src: S::Read<Pointer>,
+    },
+    /// `mov r32, imm32`: zero-extended into the 64-bit register.
+    MovImm32 { dst: S::Write<Integer>, imm: u32 },
+    /// `movabs dst, imm64`
+    Movabs { dst: S::Write<Integer>, imm: u64 },
+    /// `imul dst, src`: the two-operand 64-bit multiply.
+    Imul {
+        dst: S::Tie<Integer>,
+        src: S::Read<Integer>,
+        flags: S::Write<Flags>,
+    },
+    /// `add dst, src`
+    Add {
+        dst: S::Tie<Integer>,
+        src: S::Read<Integer>,
+        flags: S::Write<Flags>,
+    },
+    /// `lea dst, [base + index*4]`: the element address of a plane of `f32`s.
+    Lea4 {
+        dst: S::Write<Pointer>,
+        base: S::Read<Pointer>,
+        index: S::Read<Integer>,
+    },
+    /// `mov dst, [base + disp32]`: a pointer from the context array or a
+    /// frame slot.
+    MovLoad {
+        dst: S::Write<Pointer>,
+        src: Mem<S, Imm32>,
+    },
+    /// `mov [base + disp32], src`: [`Gp::MovLoad`]'s mirror, a pointer to a
+    /// frame slot.
+    MovStore {
+        dst: Mem<S, Imm32>,
+        src: S::Read<Pointer>,
+    },
+    /// `test src32, src32`: ZF iff the low half is zero.
+    Test {
+        flags: S::Write<Flags>,
+        src: S::Read<Integer>,
+    },
+    /// `cmp src8, imm8`: ZF iff the low byte is `imm`. Unlike `cmp src32,
+    /// imm8` (sign-extending `83 /7`), it compares the raw byte, which is what
+    /// an 8-lane all-true check (`movmskps`'s `0xFF`) needs: the extension
+    /// would compare against `0xFFFFFFFF`, which a zero-extended mask can
+    /// never equal.
+    CmpByte {
+        flags: S::Write<Flags>,
+        src: S::Read<Integer>,
+        imm: u8,
+    },
+    /// `jcc rel32`.
+    Jcc {
+        cond: Cond,
+        flags: S::Read<Flags>,
+        taken: S::Target,
+    },
+    /// `jmp rel32`.
+    Jmp { to: S::Target },
+    /// `lea dst, [rip + to]`: a position's address, in one instruction.
+    LeaRip {
+        dst: S::Write<Pointer>,
+        to: S::Target,
+    },
+    /// `sub rsp, imm32`: the function's frame.
+    Enter {
+        size: S::FrameSize,
+        flags: S::Write<Flags>,
+    },
+    /// `add rsp, imm32; vzeroupper; ret`: the function's one exit.
+    ///
+    /// The caller is Rust built for baseline x86-64, so its floating point is
+    /// legacy SSE, and Intel cores charge legacy-SSE code for vector registers
+    /// whose upper halves a VEX or EVEX instruction left dirty — a state
+    /// transition on older cores, a false dependency and a merge per
+    /// instruction on Skylake and later — until something clears them, which
+    /// nothing in a Rust caller does. So the kernel clears them on the way
+    /// out. Nothing is lost: the collapse ABI returns nothing in a vector
+    /// register, and every result is already stored.
+    ///
+    /// Measured on an AVX-512 Xeon, with a 1×1 kernel whose Rust caller runs
+    /// a 256-term scalar sum after each call: the call cost 190 ns over the
+    /// sum on the AVX-512 tier and 88 ns on AVX2 without this, and 32 and 15
+    /// ns with it. The charge is not the call's: the same sum, run after one
+    /// call and never calling again, took 482 ns rather than 266.
+    Ret {
+        size: S::FrameSize,
+        flags: S::Write<Flags>,
+    },
 }
 
-impl AsmInsn for Inst {
+/// The stack pointer, as the operand of the frame's `sub` and `add`.
+const RSP: Gpr = ptr::RSP.as_gpr();
+
+impl Gp<Physical> {
+    /// `je target` — ZF set.
+    #[must_use]
+    pub(super) const fn je(taken: Label) -> Self {
+        Gp::Jcc {
+            cond: Cond::E,
+            flags: (),
+            taken,
+        }
+    }
+
+    /// `jb target` — CF set; unsigned `<`.
+    #[must_use]
+    pub(super) const fn jb(taken: Label) -> Self {
+        Gp::Jcc {
+            cond: Cond::B,
+            flags: (),
+            taken,
+        }
+    }
+
+    fn encode(self) -> EncodedInst {
+        let mut inst = EncodedInst::new();
+        match self {
+            Gp::Mov { dst, src } => inst.extend(&rr(0x89, dst.as_gpr(), src.as_gpr())),
+            Gp::MovImm32 { dst, imm } => {
+                if dst.0 >= 8 {
+                    inst.push(0x41);
+                }
+                inst.push(0xB8 | (dst.0 & 7));
+                inst.extend(&imm.to_le_bytes());
+            }
+            Gp::Movabs { dst, imm } => {
+                inst.push(0x48 | ((dst.0 >> 3) & 1));
+                inst.push(0xB8 | (dst.0 & 7));
+                inst.extend(&imm.to_le_bytes());
+            }
+            Gp::Imul {
+                dst,
+                src,
+                flags: (),
+            } => {
+                inst.extend(&[rex_w(dst, src), 0x0F, 0xAF, modrm_rr(dst.0, src)]);
+            }
+            Gp::Add {
+                dst,
+                src,
+                flags: (),
+            } => inst.extend(&rr(0x01, dst, src)),
+            // `rbp`/`r13` have no `mod = 00` form as a SIB base (that
+            // encoding means "no base"), so those two take `mod = 01` with a
+            // zero `disp8`.
+            Gp::Lea4 { dst, base, index } => {
+                debug_assert!(index.0 & 7 != RM_SIB, "rsp/r12 cannot index a SIB");
+                let disp8_form = base.0 & 7 == RM_RIP_AT_MOD0;
+                inst.push(
+                    0x48 | (((dst.0 >> 3) & 1) << 2)
+                        | (((index.0 >> 3) & 1) << 1)
+                        | ((base.0 >> 3) & 1),
+                );
+                inst.push(0x8D);
+                inst.push(if disp8_form { 0x40 } else { 0x00 } | ((dst.0 & 7) << 3) | RM_SIB);
+                inst.push((0b10 << 6) | ((index.0 & 7) << 3) | (base.0 & 7));
+                if disp8_form {
+                    inst.push(0);
+                }
+            }
+            Gp::MovLoad { dst, src } => {
+                inst.push(rex_w(dst.as_gpr(), src.base.as_gpr()));
+                inst.push(0x8B);
+                mem_operand_into(&mut inst, dst.0, src);
+            }
+            Gp::MovStore { dst, src } => {
+                inst.push(rex_w(src.as_gpr(), dst.base.as_gpr()));
+                inst.push(0x89);
+                mem_operand_into(&mut inst, src.0, dst);
+            }
+            Gp::Test { flags: (), src } => {
+                if src.0 >= 8 {
+                    inst.push(0x45);
+                }
+                inst.push(0x85);
+                inst.push(modrm_rr(src.0, src));
+            }
+            Gp::CmpByte {
+                flags: (),
+                src,
+                imm,
+            } => {
+                match src.0 {
+                    // The accumulator has a short form.
+                    0 => inst.push(0x3C),
+                    n => {
+                        // Without a REX prefix 4-7 name `ah`..`bh`, not `spl`..`dil`.
+                        if n >= 4 {
+                            inst.push(0x40 | ((n >> 3) & 1));
+                        }
+                        inst.push(0x80);
+                        inst.push(modrm_rr(7, src));
+                    }
+                }
+                inst.push(imm);
+            }
+            Gp::Jcc {
+                cond, flags: (), ..
+            } => inst.extend(&[0x0F, 0x80 | cond as u8, 0, 0, 0, 0]),
+            Gp::Jmp { .. } => inst.extend(&[0xE9, 0, 0, 0, 0]),
+            Gp::LeaRip { dst, .. } => {
+                inst.push(0x48 | (((dst.0 >> 3) & 1) << 2));
+                inst.push(0x8D);
+                inst.push(((dst.0 & 7) << 3) | RM_RIP_AT_MOD0);
+                inst.extend(&[0, 0, 0, 0]);
+            }
+            Gp::Enter { size, flags: () } => {
+                inst.extend(&[rex_w(Gpr(0), RSP), 0x81, modrm_rr(5, RSP)]);
+                inst.extend(&size.to_le_bytes());
+            }
+            Gp::Ret { size, flags: () } => {
+                inst.extend(&[rex_w(Gpr(0), RSP), 0x81, modrm_rr(0, RSP)]);
+                inst.extend(&size.to_le_bytes());
+                // `vzeroupper`: `VEX.128.0F.WIG 77`, zeroing bits 128 and up of
+                // vector registers 0–15, the sixteen a legacy-SSE instruction
+                // can name. The same three bytes on every tier.
+                inst.extend(&[0xC5, 0xF8, 0x77]);
+                inst.push(0xC3);
+            }
+        }
+        inst
+    }
+}
+
+impl AsmInsn for Gp<Physical> {
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
-        match self {
-            Inst::Add { dst, src } => add(code, dst, src),
-            Inst::AddImm32 { dst, imm } => add(code, dst, imm),
-            Inst::SubImm32 { dst, imm } => sub(code, dst, imm),
-            Inst::Vzeroupper => vzeroupper(code),
-            Inst::Ret => ret(code),
-        }
+        self.encode().emit_into(code);
+    }
+
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        let (at, label) = match self {
+            Gp::Jmp { to } => (JMP_DISP, to),
+            Gp::Jcc { taken, .. } => (JCC_DISP, taken),
+            Gp::LeaRip { to, .. } => (LEA_RIP_DISP, to),
+            _ => return None,
+        };
+        Some(LabelRef {
+            at,
+            label,
+            patch: patch_rel32,
+        })
     }
 }
 
 /// A sign-extended 8-bit immediate.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) struct Imm8(pub(super) i8);
+
+/// A 32-bit immediate: a displacement's width in the `mod = 10` form.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) struct Imm32(pub(super) i32);
 
 /// `REX.W` plus the extension bits for a two-register form.
 ///
@@ -446,81 +561,10 @@ const fn modrm_rr(reg: u8, rm: Gpr) -> u8 {
     0xC0 | ((reg & 7) << 3) | (rm.0 & 7)
 }
 
-/// Emit one `REX.W opcode /r` instruction with both operands in registers.
+/// `REX.W opcode /r` with both operands in registers.
 #[inline(always)]
-fn rr(code: &mut Vec<u8>, opcode: u8, dst: Gpr, src: Gpr) {
-    code.extend_from_slice(&[rex_w(src, dst), opcode, modrm_rr(src.0, dst)]);
-}
-
-/// `mov dst, src`
-#[inline(always)]
-pub(super) fn mov(code: &mut Vec<u8>, dst: Gpr, src: Gpr) {
-    rr(code, 0x89, dst, src);
-}
-
-/// What an [`add`] can add: another register, or a 32-bit immediate.
-///
-/// The operand's *type* picks the encoding, so callers write `add(c, RSP, R9)`
-/// and `add(c, RSP, Imm32(16))` rather than choosing between differently-named
-/// functions — which would put the operand kinds back in the name.
-trait AddSrc {
-    /// Emit `add dst, self`.
-    fn add_into(self, code: &mut Vec<u8>, dst: Gpr);
-}
-
-impl AddSrc for Gpr {
-    #[inline(always)]
-    fn add_into(self, code: &mut Vec<u8>, dst: Gpr) {
-        rr(code, 0x01, dst, self);
-    }
-}
-
-/// `add dst, src`
-#[inline(always)]
-fn add(code: &mut Vec<u8>, dst: Gpr, src: impl AddSrc) {
-    src.add_into(code, dst);
-}
-
-/// A 32-bit immediate.
-///
-/// The `81 /n id` immediate group's operand. The caller writes `add(c, RSP,
-/// Imm32(n))` and the operand type picks the encoding; nothing upstream has to
-/// know which opcode that implies.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) struct Imm32(pub(super) i32);
-
-/// `REX.W 81 /ext id` — the immediate group with a 32-bit operand.
-#[inline(always)]
-fn ri32(code: &mut Vec<u8>, ext: u8, dst: Gpr, imm: i32) {
-    code.extend_from_slice(&[rex_w(Gpr(0), dst), 0x81, modrm_rr(ext, dst)]);
-    code.extend_from_slice(&imm.to_le_bytes());
-}
-
-impl AddSrc for Imm32 {
-    #[inline(always)]
-    fn add_into(self, code: &mut Vec<u8>, dst: Gpr) {
-        ri32(code, 0, dst, self.0);
-    }
-}
-
-/// `sub dst, imm32`
-#[inline(always)]
-fn sub(code: &mut Vec<u8>, dst: Gpr, Imm32(imm): Imm32) {
-    ri32(code, 5, dst, imm);
-}
-
-/// `ret`
-#[inline(always)]
-fn ret(code: &mut Vec<u8>) {
-    code.push(0xC3);
-}
-
-/// `vzeroupper` — `VEX.128.0F.WIG 77`: zero bits 128 and up of vector
-/// registers 0–15, the sixteen a legacy-SSE instruction can name. The same
-/// three bytes on every tier, which is why it lives here.
-#[inline(always)]
-fn vzeroupper(code: &mut Vec<u8>) {
-    code.extend_from_slice(&[0xC5, 0xF8, 0x77]);
+const fn rr(opcode: u8, dst: Gpr, src: Gpr) -> [u8; 3] {
+    [rex_w(src, dst), opcode, modrm_rr(src.0, dst)]
 }
 
 /// The 4-bit condition an x86 `jcc` tests: the conditions the emitter
@@ -532,91 +576,11 @@ fn vzeroupper(code: &mut Vec<u8>) {
 /// their aliases, because that is what a reader checks against the manual.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
-enum Cond {
+pub(super) enum Cond {
     /// `jb` / `jc` / `jnae` — CF set; unsigned `<`.
     B = 0x2,
     /// `je` / `jz` — ZF set.
     E = 0x4,
-}
-
-/// `jmp rel32 target` — an unconditional branch to a [`Label`].
-///
-/// A struct, like every other instruction here, and its label is an operand
-/// like any other. It emits a zero displacement; the assembler writes the real
-/// one once the label lands, which is what [`AsmInsn::label_ref`] tells it.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) struct Jmp {
-    /// Where it goes.
-    pub(super) target: Label,
-}
-
-impl AsmInsn for Jmp {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        code.extend_from_slice(&[0xE9, 0, 0, 0, 0]);
-    }
-
-    #[inline]
-    fn label_ref(self) -> Option<LabelRef> {
-        Some(LabelRef {
-            at: JMP_DISP,
-            label: self.target,
-            patch: patch_rel32,
-        })
-    }
-}
-
-/// `jcc rel32 target` — a conditional branch to a [`Label`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) struct Jcc {
-    /// What must hold for the branch to be taken.
-    condition: Cond,
-    /// Where it goes.
-    target: Label,
-}
-
-impl Jcc {
-    /// One constructor per mnemonic, so a call site reads like the assembly it
-    /// is: `Jcc::je(exit)` for `je exit`.
-    ///
-    /// Sugar over the one encoder, not sixteen types: `0F 8x rel32` is a
-    /// single instruction whose low opcode nibble is [`Cond`], and sixteen
-    /// structs would be sixteen copies of one `emit_into` differing by a
-    /// constant. The mnemonics are the assembler's names for the field.
-    #[must_use]
-    #[inline(always)]
-    pub(super) const fn je(target: Label) -> Self {
-        Self::on(Cond::E, target)
-    }
-    /// `jb` / `jc` / `jnae` — unsigned `<`.
-    #[must_use]
-    #[inline(always)]
-    pub(super) const fn jb(target: Label) -> Self {
-        Self::on(Cond::B, target)
-    }
-
-    /// The branch on `condition`: what each mnemonic above spells.
-    #[must_use]
-    #[inline(always)]
-    const fn on(condition: Cond, target: Label) -> Self {
-        Self { condition, target }
-    }
-}
-
-impl AsmInsn for Jcc {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        code.extend_from_slice(&[0x0F, 0x80 | self.condition as u8, 0, 0, 0, 0]);
-    }
-
-    #[inline]
-    fn label_ref(self) -> Option<LabelRef> {
-        Some(LabelRef {
-            at: JCC_DISP,
-            label: self.target,
-            patch: patch_rel32,
-        })
-    }
 }
 
 /// Bytes from a `jmp`'s start to its displacement field: one opcode byte.
@@ -624,6 +588,8 @@ const JMP_DISP: usize = 1;
 /// Bytes from a `jcc`'s start to its displacement field: `0F` plus the
 /// condition byte.
 const JCC_DISP: usize = 2;
+/// Bytes from a `lea`'s start to its displacement field: REX, opcode, ModRM.
+const LEA_RIP_DISP: usize = 3;
 
 /// Write a `rel32` at `pos` so the instruction it belongs to reaches `target`.
 ///
@@ -636,55 +602,12 @@ fn patch_rel32(code: &mut [u8], pos: usize, target: usize) {
 }
 
 // =============================================================================
-// The store's address arithmetic and the iota, in the general file
+// The store's address arithmetic
 // =============================================================================
-
-/// `movabs dst, imm64` — `REX.W B8+rd io`.
-#[inline(always)]
-pub(super) fn movabs(code: &mut Vec<u8>, dst: Gpr, imm: u64) {
-    code.push(0x48 | ((dst.0 >> 3) & 1));
-    code.push(0xB8 | (dst.0 & 7));
-    code.extend_from_slice(&imm.to_le_bytes());
-}
-
-/// `mov r32, imm32` — `B8+rd id`, zero-extended into the 64-bit register.
-#[inline(always)]
-pub(super) fn mov_imm32(code: &mut Vec<u8>, dst: Gpr, imm: u32) {
-    if dst.0 >= 8 {
-        code.push(0x41);
-    }
-    code.push(0xB8 | (dst.0 & 7));
-    code.extend_from_slice(&imm.to_le_bytes());
-}
-
-/// `imul dst, src` — `REX.W 0F AF /r`, the two-operand 64-bit multiply.
-#[inline(always)]
-fn imul(code: &mut Vec<u8>, dst: Gpr, src: Gpr) {
-    code.extend_from_slice(&[rex_w(dst, src), 0x0F, 0xAF, modrm_rr(dst.0, src)]);
-}
-
-/// `lea dst, [base + index*4]` — `REX.W 8D /r` with a SIB: the element
-/// address of a plane of `f32`s, in one instruction.
-///
-/// `rbp`/`r13` have no `mod = 00` form as a SIB base (that encoding means
-/// "no base"), so those two take `mod = 01` with a zero `disp8`.
-#[inline(always)]
-fn lea_scaled4(code: &mut Vec<u8>, dst: Gpr, base: Gpr, index: Gpr) {
-    debug_assert!(index.0 & 7 != RM_SIB, "rsp/r12 cannot index a SIB");
-    let rex = 0x48 | (((dst.0 >> 3) & 1) << 2) | (((index.0 >> 3) & 1) << 1) | ((base.0 >> 3) & 1);
-    let disp8_form = base.0 & 7 == RM_RIP_AT_MOD0;
-    code.push(rex);
-    code.push(0x8D);
-    code.push(if disp8_form { 0x40 } else { 0x00 } | ((dst.0 & 7) << 3) | RM_SIB);
-    code.push((0b10 << 6) | ((index.0 & 7) << 3) | (base.0 & 7));
-    if disp8_form {
-        code.push(0);
-    }
-}
 
 /// A slot in the allocated spill frame. Kernels are leaves with no base
 /// pointer, so a slot *is* `rsp + offset`, on every x86 tier.
-pub(super) const fn frame_slot(offset: u32) -> Mem<Imm32> {
+pub(super) const fn frame_slot(offset: u32) -> Mem<Physical, Imm32> {
     Mem {
         base: ptr::RSP,
         disp: Imm32(offset as i32),
@@ -704,7 +627,10 @@ const F32_BYTES: u64 = 4;
 /// [`CompileError::BudgetExceeded`] when `4 * offset` does not fit a signed
 /// 32-bit displacement: an offset past the encoding is refused, never
 /// wrapped into an address that reads some other argument.
-pub(super) fn block_element(base: PtrReg, offset: u64) -> Result<Mem<Imm32>, CompileError> {
+pub(super) fn block_element(
+    base: PtrReg,
+    offset: u64,
+) -> Result<Mem<Physical, Imm32>, CompileError> {
     let disp = offset
         .checked_mul(F32_BYTES)
         .and_then(|bytes| i32::try_from(bytes).ok())
@@ -723,7 +649,7 @@ pub(super) fn block_element(base: PtrReg, offset: u64) -> Result<Mem<Imm32>, Com
 #[derive(Clone, Copy)]
 pub(super) struct Convert {
     pub(super) from_xmm: fn(&mut Vec<u8>, Gpr, Reg),
-    pub(super) from_mem: fn(&mut Vec<u8>, Gpr, Mem<Imm32>),
+    pub(super) from_mem: fn(&mut Vec<u8>, Gpr, Mem<Physical, Imm32>),
 }
 
 /// `dst = trunc(index)` as a 64-bit integer, wherever a fold keeps its
@@ -744,7 +670,7 @@ fn index_into(code: &mut Vec<u8>, dst: Gpr, at: Binding, convert: Convert) {
     }
 }
 
-/// The store's address into `scratch[0]`: `out + 4 · (row · pitch + col)`,
+/// The store's address: `out + 4 · (row · pitch + col)`, in `scratch[0]`,
 /// leaving `scratch[1]` free. The row and column indices are converted
 /// through `convert`, the tier's own `cvttss2si`.
 pub(super) fn write_address(
@@ -752,17 +678,33 @@ pub(super) fn write_address(
     file: &regalloc::RegisterFile,
     write: &WritePlan,
     convert: Convert,
-) -> Gpr {
+) -> PtrReg {
     let row = crate::emit::declared_gpr_temp(write.scratch.gpr_temp(0));
     let col = crate::emit::declared_gpr_temp(write.scratch.gpr_temp(1));
     let out = file.gpr_out.expect("x86's store needs the output pointer");
     let pitch = file.gpr_pitch.expect("x86's store needs the pitch");
     index_into(code, row, write.row, convert);
-    imul(code, row, pitch);
+    Gp::Imul {
+        dst: row,
+        src: pitch,
+        flags: (),
+    }
+    .emit_into(code);
     index_into(code, col, write.col, convert);
-    AsmProgram::from([Inst::Add { dst: row, src: col }]).assemble(code);
-    lea_scaled4(code, row, out, row);
-    row
+    Gp::Add {
+        dst: row,
+        src: col,
+        flags: (),
+    }
+    .emit_into(code);
+    let address = PtrReg(row.0);
+    Gp::Lea4 {
+        dst: address,
+        base: PtrReg(out.0),
+        index: row,
+    }
+    .emit_into(code);
+    address
 }
 
 // =============================================================================
@@ -775,9 +717,8 @@ pub(super) fn write_address(
 /// `mod = 00 / 01 / 10` are three modes rather than three spellings of one:
 /// they cost a different number of bytes, and `mod = 00` is not "a
 /// displacement of zero" (see [`NoDisp`]). So the width is picked by the
-/// operand's TYPE, exactly as [`AddSrc`] picks `add r/m64, r64` over `81 /0
-/// id` — never by the caller reaching for a differently-named function, which
-/// is where that choice used to live.
+/// operand's TYPE — never by the caller reaching for a differently-named
+/// function, which is where that choice used to live.
 pub(super) trait Disp: Copy {
     /// The ModRM `mod` field this displacement implies.
     const MOD: u8;
@@ -822,9 +763,9 @@ impl Disp for Imm32 {
 /// to be the `_rsp` and `_base` suffixes of five separate functions that all
 /// encoded the same `movups`, where nothing could check it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) struct Mem<D> {
+pub(super) struct Mem<S: Stage, D> {
     /// The register the displacement is measured from.
-    pub(super) base: PtrReg,
+    pub(super) base: S::Read<Pointer>,
     /// The displacement — and, through its type, the mode (see [`Disp`]).
     pub(super) disp: D,
 }
@@ -871,7 +812,7 @@ fn sib4_tail_into(inst: &mut EncodedInst, reg: u8, base: Gpr, index: u8) {
 }
 
 /// Write the ModRM/SIB/disp tail into an `EncodedInst`.
-pub(super) fn mem_operand_into<D: Disp>(inst: &mut EncodedInst, reg: u8, addr: Mem<D>) {
+pub(super) fn mem_operand_into<D: Disp>(inst: &mut EncodedInst, reg: u8, addr: Mem<Physical, D>) {
     let rm = addr.base.0 & 7;
     debug_assert!(
         D::MOD != NoDisp::MOD || rm != RM_RIP_AT_MOD0,
@@ -888,6 +829,7 @@ pub(super) fn mem_operand_into<D: Disp>(inst: &mut EncodedInst, reg: u8, addr: M
 mod gpr_tests {
     use super::gpr::*;
     use super::*;
+    use crate::emit::AsmProgram;
 
     fn asm(f: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
         let mut c = Vec::new();
@@ -899,11 +841,22 @@ mod gpr_tests {
         asm(|c| AsmProgram::from([inst]).assemble(c))
     }
 
+    fn gp(inst: Gp<Physical>) -> Vec<u8> {
+        asm(|c| AsmProgram::from([inst]).assemble(c))
+    }
+
+    fn mov(dst: u8, src: u8) -> Vec<u8> {
+        gp(Gp::Mov {
+            dst: PtrReg(dst),
+            src: PtrReg(src),
+        })
+    }
+
     /// A vehicle for the memory-operand tail: `movups [addr], xmm` (`0F 11
     /// /r`), the simplest legacy instruction that takes a [`Mem`]. Test-only
     /// — no tier emits it — so what is under test is [`mem_operand_into`]
     /// and the REX bits, not a 128-bit store.
-    fn movups_store<D: Disp>(src: Reg, addr: Mem<D>) -> EncodedInst {
+    fn movups_store<D: Disp>(src: Reg, addr: Mem<Physical, D>) -> EncodedInst {
         let mut inst = EncodedInst::new();
         let rex = 0x40 | (u8::from(src.0 >= 8) << 2) | u8::from(addr.base.0 >= 8);
         if rex != 0x40 {
@@ -919,54 +872,118 @@ mod gpr_tests {
     #[test]
     fn encodings_match_the_manual() {
         // REX.W 89 /r — MOV r/m64, r64
-        assert_eq!(asm(|c| mov(c, R10, RCX)), [0x49, 0x89, 0xCA]);
+        assert_eq!(mov(10, 1), [0x49, 0x89, 0xCA]);
         // REX.W 01 /r — ADD r/m64, r64
-        assert_eq!(asm(|c| add(c, RSI, Gpr(8))), [0x4C, 0x01, 0xC6]);
+        assert_eq!(
+            gp(Gp::Add {
+                dst: RSI,
+                src: Gpr(8),
+                flags: ()
+            }),
+            [0x4C, 0x01, 0xC6]
+        );
+        // REX.W 81 /5 id — SUB r/m64, imm32
+        assert_eq!(
+            gp(Gp::Enter {
+                size: 16,
+                flags: ()
+            }),
+            [0x48, 0x81, 0xEC, 16, 0, 0, 0]
+        );
+        // REX.W 81 /0 id — ADD r/m64, imm32; VEX.128.0F.WIG 77 — VZEROUPPER;
         // C3 — RET
-        assert_eq!(asm(ret), [0xC3]);
-        // VEX.128.0F.WIG 77 — VZEROUPPER
-        assert_eq!(asm(vzeroupper), [0xC5, 0xF8, 0x77]);
+        assert_eq!(
+            gp(Gp::Ret {
+                size: 16,
+                flags: ()
+            }),
+            [0x48, 0x81, 0xC4, 16, 0, 0, 0, 0xC5, 0xF8, 0x77, 0xC3]
+        );
+        // 85 /r — TEST r/m32, r32
+        assert_eq!(
+            gp(Gp::Test {
+                flags: (),
+                src: RAX
+            }),
+            [0x85, 0xC0]
+        );
+        assert_eq!(
+            gp(Gp::Test { flags: (), src: R9 }),
+            [0x45, 0x85, 0xC9],
+            "REX.R and REX.B"
+        );
+        // 3C ib — CMP AL, imm8; 80 /7 ib — CMP r/m8, imm8 (checked against
+        // `objdump -M intel`, binutils 2.42).
+        let cmp = |src| {
+            gp(Gp::CmpByte {
+                flags: (),
+                src,
+                imm: 0xFF,
+            })
+        };
+        assert_eq!(cmp(RAX), [0x3C, 0xFF], "the accumulator's short form");
+        assert_eq!(cmp(RCX), [0x80, 0xF9, 0xFF]);
+        assert_eq!(cmp(RSI), [0x40, 0x80, 0xFE, 0xFF], "REX names sil, not dh");
+        assert_eq!(cmp(R9), [0x41, 0x80, 0xF9, 0xFF], "REX.B");
         // REX.W B8+rd io — MOV r64, imm64
         assert_eq!(
-            asm(|c| movabs(c, RAX, 0x3F80_0000_0000_0000)),
+            gp(Gp::Movabs {
+                dst: RAX,
+                imm: 0x3F80_0000_0000_0000
+            }),
             [0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0x80, 0x3F]
         );
-        assert_eq!(asm(|c| movabs(c, R9, 1))[..2], [0x49, 0xB9]);
+        assert_eq!(gp(Gp::Movabs { dst: R9, imm: 1 })[..2], [0x49, 0xB9]);
         // B8+rd id — MOV r32, imm32
-        assert_eq!(asm(|c| mov_imm32(c, RCX, 7)), [0xB9, 7, 0, 0, 0]);
-        assert_eq!(asm(|c| mov_imm32(c, R9, 7)), [0x41, 0xB9, 7, 0, 0, 0]);
-        // REX.W 0F AF /r — IMUL r64, r/m64
-        assert_eq!(asm(|c| imul(c, RAX, RDX)), [0x48, 0x0F, 0xAF, 0xC2]);
-        // REX.W 8D /r — LEA r64, [base + index*4]
+        assert_eq!(gp(Gp::MovImm32 { dst: RCX, imm: 7 }), [0xB9, 7, 0, 0, 0]);
         assert_eq!(
-            asm(|c| lea_scaled4(c, RAX, RSI, RAX)),
-            [0x48, 0x8D, 0x04, 0x86]
+            gp(Gp::MovImm32 { dst: R9, imm: 7 }),
+            [0x41, 0xB9, 7, 0, 0, 0]
         );
+        // REX.W 0F AF /r — IMUL r64, r/m64
         assert_eq!(
-            asm(|c| lea_scaled4(c, RCX, Gpr(5), RCX)),
+            gp(Gp::Imul {
+                dst: RAX,
+                src: RDX,
+                flags: ()
+            }),
+            [0x48, 0x0F, 0xAF, 0xC2]
+        );
+        // REX.W 8D /r — LEA r64, [base + index*4]
+        let lea = |dst, base, index| {
+            gp(Gp::Lea4 {
+                dst: PtrReg(dst),
+                base: PtrReg(base),
+                index: Gpr(index),
+            })
+        };
+        assert_eq!(lea(0, 6, 0), [0x48, 0x8D, 0x04, 0x86]);
+        assert_eq!(
+            lea(1, 5, 1),
             [0x48, 0x8D, 0x4C, 0x8D, 0x00],
             "rbp as a base takes the disp8 form"
         );
-        assert_eq!(
-            asm(|c| lea_scaled4(c, R9, RSI, R10))[0],
-            0x4E,
-            "REX.R and REX.X"
-        );
+        assert_eq!(lea(9, 6, 10)[0], 0x4E, "REX.R and REX.X");
     }
 
     #[test]
     fn asm_program_declarative_array() {
         let mut buff = Vec::new();
-        AsmProgram::from([Inst::Add { dst: R9, src: R10 }]).assemble(&mut buff);
+        let add = Gp::Add {
+            dst: R9,
+            src: R10,
+            flags: (),
+        };
+        AsmProgram::from([add]).assemble(&mut buff);
         assert_eq!(buff, [0x4D, 0x01, 0xD1]);
 
         let mut seq = Vec::new();
-        AsmProgram::from([Inst::Add { dst: R9, src: R10 }, Inst::Vzeroupper, Inst::Ret])
-            .assemble(&mut seq);
+        AsmProgram::from([add, Gp::Ret { size: 0, flags: () }]).assemble(&mut seq);
         assert_eq!(
             seq,
             [
                 0x4D, 0x01, 0xD1, // add r9, r10
+                0x48, 0x81, 0xC4, 0, 0, 0, 0, // add rsp, 0
                 0xC5, 0xF8, 0x77, // vzeroupper
                 0xC3, // ret
             ]
@@ -977,14 +994,10 @@ mod gpr_tests {
     /// on either side must set its own bit and no other.
     #[test]
     fn rex_extends_each_operand_independently() {
-        assert_eq!(asm(|c| mov(c, RCX, RDX))[0], 0x48, "neither extended");
-        assert_eq!(
-            asm(|c| mov(c, R9, RDX))[0],
-            0x49,
-            "destination extended → B"
-        );
-        assert_eq!(asm(|c| mov(c, RCX, R9))[0], 0x4C, "source extended → R");
-        assert_eq!(asm(|c| mov(c, R9, R10))[0], 0x4D, "both extended");
+        assert_eq!(mov(1, 2)[0], 0x48, "neither extended");
+        assert_eq!(mov(9, 2)[0], 0x49, "destination extended → B");
+        assert_eq!(mov(1, 9)[0], 0x4C, "source extended → R");
+        assert_eq!(mov(9, 10)[0], 0x4D, "both extended");
     }
 
     /// A branch's displacement is measured from the *next* instruction, and a
@@ -997,7 +1010,7 @@ mod gpr_tests {
 
         let mut asm = Assembly::default();
         let end = asm.mint();
-        asm.push(Jmp { target: end });
+        asm.push(Gp::Jmp { to: end });
         // Eleven bytes of padding, so the label lands at 16.
         asm.push(EncodedInst::from_slice(&[0x90; 11]));
         asm.bind(end);
@@ -1013,7 +1026,7 @@ mod gpr_tests {
         let mut asm = Assembly::default();
         let top = asm.mint();
         asm.bind(top);
-        asm.push(Jcc::on(Cond::B, top));
+        asm.push(Gp::jb(top));
         let c = asm.finish();
         assert_eq!(c[..2], [0x0F, 0x82]);
         assert_eq!(&c[2..6], &(-6i32).to_le_bytes(), "a back edge is negative");
@@ -1024,12 +1037,13 @@ mod gpr_tests {
     #[test]
     fn a_context_pointer_is_read_by_one_mov() {
         let mut code = Vec::new();
-        AsmProgram::from([MovLoadPtr {
+        AsmProgram::from([Gp::MovLoad {
             dst: PtrReg(9),
-            base: PtrReg(7),
-            disp: 2 * PTR_BYTES,
-        }
-        .encode()])
+            src: Mem {
+                base: PtrReg(7),
+                disp: Imm32(2 * PTR_BYTES),
+            },
+        }])
         .assemble(&mut code);
         assert_eq!(code, [0x4C, 0x8B, 0x8F, 0x10, 0, 0, 0]);
     }
@@ -1040,25 +1054,26 @@ mod gpr_tests {
     #[test]
     fn pointer_loads_and_stores_encode_high_registers_and_the_frame() {
         let mut code = Vec::new();
+        let frame = |offset| Mem {
+            base: ptr::RSP,
+            disp: Imm32(offset),
+        };
         AsmProgram::from([
-            MovLoadPtr {
+            Gp::MovLoad {
                 dst: PtrReg(9),
-                base: PtrReg(7),
-                disp: 96,
-            }
-            .encode(),
-            MovLoadPtr {
+                src: Mem {
+                    base: PtrReg(7),
+                    disp: Imm32(96),
+                },
+            },
+            Gp::MovLoad {
                 dst: PtrReg(10),
-                base: ptr::RSP,
-                disp: 32,
-            }
-            .encode(),
-            MovStorePtr {
+                src: frame(32),
+            },
+            Gp::MovStore {
+                dst: frame(32),
                 src: PtrReg(11),
-                base: ptr::RSP,
-                disp: 32,
-            }
-            .encode(),
+            },
         ])
         .assemble(&mut code);
         assert_eq!(
@@ -1193,8 +1208,9 @@ mod gpr_tests {
     fn the_two_register_files_are_not_interchangeable() {
         // r10 and xmm10 share an index and nothing else.
         assert_eq!(R10.0, Reg(10).0);
-        // `mov` takes Gpr; passing Reg(10) would not compile. Encoding r10 as
-        // the destination sets REX.B, which a vector encoder never emits here.
-        assert_eq!(asm(|c| mov(c, R10, RAX))[0] & 1, 1);
+        // `Mov` takes registers of the general file; passing Reg(10) would
+        // not compile. Encoding r10 as the destination sets REX.B, which a
+        // vector encoder never emits here.
+        assert_eq!(mov(R10.0, RAX.0)[0] & 1, 1);
     }
 }

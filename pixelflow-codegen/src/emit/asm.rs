@@ -75,9 +75,11 @@ impl Encoding<'_> {
 ///
 /// # Panics
 ///
-/// If a label is bound twice, bound by a program that did not mint it, or
-/// named and never bound. Only this crate writes these programs, so each is a
-/// bug here rather than a fact about the kernel being compiled.
+/// If a label is bound twice, bound with an id at or above the count this
+/// program minted, or named and never bound. A foreign id below that count is
+/// indistinguishable from one of its own and binds silently. Only this crate
+/// writes these programs, so each is a bug here rather than a fact about the
+/// kernel being compiled.
 pub(super) fn assemble<I>(
     program: &AsmProgram<I>,
     encode: impl Fn(&I, &mut Encoding<'_>),
@@ -89,11 +91,11 @@ pub(super) fn assemble<I>(
         match item {
             Item::Bind(label) => {
                 let Some(address) = addresses.get_mut(label.0 as usize) else {
-                    panic!("{label:?} was not minted by this program")
+                    panic!("{label:?} is bound but was not minted by this program")
                 };
                 assert!(
                     address.replace(code.len()).is_none(),
-                    "{label:?} was written twice"
+                    "{label:?} is bound twice"
                 );
             }
             Item::Inst(inst) => {
@@ -113,7 +115,7 @@ pub(super) fn assemble<I>(
     }
     for (at, label, patch) in fields {
         let Some(&Some(target)) = addresses.get(label.0 as usize) else {
-            panic!("{label:?} is branched to but never written")
+            panic!("{label:?} is named but never bound")
         };
         patch(&mut code, at, target);
     }

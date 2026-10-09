@@ -90,7 +90,7 @@ These are binding. Where a later section disagrees, this section wins, and the i
    - "A mask is not a number" is the IR's question, not the backend's. On NEON and AVX2 the machine cannot tell the two apart.
    - So no `LaneMask` class over `VectorFile` is built (§6 keeps that refusal).
 3. **Labels:** an opaque `Label(u64)`, minted by the one program a kernel has. The program owns the mint (`Labels`): the `Builder` while selecting, then the `AsmProgram`. A thing *has* a label: a block, the pool section, a pool entry. There is no label enum, no scope and no key. This matches §2.8.
-4. **The assembler stands alone.** `emit/asm.rs` imports nothing from the crate, and `scripts/check_emit_boundary.py` gains that rule, with a self-test case (A8). It is a stateless function from program to binary. There is no per-scope splicing of bytes: A8's legacy front end splices items, and the selection pipeline builds one program.
+4. **The assembler stands alone.** `emit/asm.rs` imports nothing from the crate, and `scripts/check_emit_boundary.py` gains that rule, with a self-test case (A8). It is a stateless function from program to binary. There is no per-scope splicing of bytes: A8's front end threads one program through every scope, so nothing is spliced, and the selection pipeline builds one program.
 5. **Fixed registers: requirement versus choice.**
    - A register the machine or ABI requires (the entry arguments, `sp`) is a constraint on a value, and the allocator satisfies it.
    - A register the hardware would accept any member of the class for (`x16`, `x17`, `r8`, `w16`, `eax`, `k1`) is the allocator's choice. No exception.
@@ -726,9 +726,9 @@ pub(in crate::emit) struct Label(u64);
 /// A program's label namespace: the only mint. Owned by whoever is building
 /// the program (the `Builder`, then the `AsmProgram`), so minting needs
 /// `&mut` to it.
+#[derive(Default)] // `Labels::default()` is the empty namespace
 pub(in crate::emit) struct Labels { next: u64 }
 impl Labels {
-    pub(in crate::emit) fn new() -> Self;
     pub(in crate::emit) fn mint(&mut self) -> Label;
 }
 
@@ -1441,22 +1441,27 @@ Every commit in this phase is live in production.
 
 #### A9: x86's general-register instructions are values
 
-- **Files:** `emit/mod.rs`, `x86_64.rs`.
+- **Files:** `emit/mod.rs`, `x86_64.rs`, and the three `IsaBackend` implementations (`avx2.rs`, `avx512.rs`, `aarch64.rs`) and `traffic.rs` for the `emit_ret` change below.
 - **Add:**
-  - In `mod.rs`: `File`, `Class` and its markers, `ClassId`, `Stage`, and an interim stage `Physical` whose register types are the legacy newtypes (`Class` carries a `#[doc(hidden)] type Physical` until D1), with `Slot = u32`, `Target = Label`, `FrameSize = u32`.
-  - In `x86_64.rs`: `Gp<S>`, named-field variants `Mov`, `MovImm32`, `Movabs`, `Imul`, `Add`, `Lea4`, `MovLoad`, `MovStore`, `Test`, `Jcc { taken, next }`, `Jmp`, `Fallthrough`, `Enter`, `Ret`, `Cvtt`. Each one that writes `EFLAGS` has a `flags` field (`()` at `Physical`).
+  - In `mod.rs`: `Class` and its markers `Pointer`, `Integer` and `Flags`, `Stage`, and an interim stage `Physical` whose register types are the legacy newtypes (`Class` carries a `type Physical` until D1), with `Target = Label` and `FrameSize = u32`. The rest of §2.1's and §2.6's vocabulary arrives with its first reader and is not built here: `File`, `FileId`, `ClassId`, `Spill` and the `sealed` supertraits (B1, B2), the `Vector` marker and `Stage::Early` (A10a, A10b), the `Opmask` marker (A11b), `Stage::Slot` (B-series).
+  - In `x86_64.rs`: `Gp<S>`, with named-field variants `Mov`, `MovImm32`, `Movabs`, `Imul`, `Add`, `Lea4`, `MovLoad`, `MovStore`, `Test`, `Jcc { cond, flags, taken }`, `Jmp { to }`, `LeaRip { dst, to }`, `Enter` and `Ret`. Each one that writes `EFLAGS` has a `flags` field (`()` at `Physical`).
   - `Mem<S, D: Disp>` keeps `Disp` typed. Slots are always `disp32`, which matters for EVEX `disp8` scaling (allocation F13).
-  - `encode`, through `asm::Encoding`.
-- **Change:** today's x86 `Inst` (`x86_64.rs:439`) and every free GPR byte-writer become `Gp` arms. Each hardcoded register becomes a literal at its one construction site in the legacy driver, for example `MoveMask { dst: Gpr(0) }`.
+  - `Gp<Physical>` implements the legacy `AsmInsn` (`emit_into`, and `label_ref` for the three arms with a label field). The `Encoding` form of `encode` arrives when `AsmInsn` retires, because `Assembly::push` is the one caller and takes `AsmInsn`.
+- **Change:** today's x86 `Inst` and every free GPR byte-writer become `Gp` arms. Each hardcoded register becomes a literal at its one construction site in the legacy driver, for example `Test { src: gpr::RAX }`. `IsaBackend::frame_free` is merged into `emit_ret(code, bytes)`, which on x86 is the `Ret` arm (`add rsp, size; vzeroupper; ret`), and `Enter` is `frame_alloc`.
+- **Deviation from the first draft:**
+  - `Cvtt` is not a `Gp` arm. Its bytes are the tier's (VEX or EVEX), so it is A10a's and A11a's convert arm, and `Convert` stays until then.
+  - `Jcc` has no `next` field and there is no `Fallthrough` arm. The legacy driver has no next block to name; the block builder adds both (B1).
+  - `Test` is `test r32, r32` alone. `cmp al, 0xFF` is the guard sequence (A10b).
+  - `Mov` is a pointer copy (`Pointer`); the allocator's own copy verb is B's.
 - **Tests:** keep every SDM byte pin, rewritten to build a `Gp<Physical>`.
 - **Bytes:** identical.
-- **Gate:** G.
+- **Gate:** G, Q (the `emit_ret` change touches `aarch64.rs`).
 
 #### A10a / A10b: AVX2's VEX instructions are values
 
 - **Files:** `avx2.rs`.
-- **A10a:** `avx2::Inst<S>` arms for ALU, unary, compare, shift, blend and convert, and `Fma231`.
-- **A10b:** memory, broadcast, gather, masked store, `MoveMask` and the guard sequence.
+- **A10a:** `avx2::Inst<S>` arms for ALU, unary, round, compare, shift, convert (`Cvtt`, `Movq`), copy and `Ones`, and `Fma231`; the `Vector` marker (`Class::Physical = Reg`). A blend is three `Alu` arms, not an arm of its own: it is the and/andn/or sequence, and a `vblendvps` would move bytes.
+- **A10b:** memory (`Load`, `Store`, `CvttMem`, `ExtractLane`), broadcast, gather (the first reader of `Stage::Early`), `MoveMask` and the guard sequence (`MoveMask`, `Gp::CmpByte`, `Gp::Jcc`). The masked store is AVX-512's, so A11b's.
 - **Change:** each half deletes the byte-writers it replaces, and keeps their pins (for example `emit_movmskps_eax_gathers_…`, `avx2.rs:825`).
 - **Bytes:** identical.
 - **Gate:** G each.

@@ -374,9 +374,6 @@ fn try_encode_fmov_imm8(val: f32) -> Option<u8> {
 // Constant Pool Support
 // =============================================================================
 
-// The pool's alignment is every backend's, not this one's; its label is minted
-// once by `compile_via_backend` and handed to `anchor` and `finish`.
-
 /// Returns true if the given f32 needs a constant pool entry (not zero, not FMOV-encodable).
 #[must_use]
 fn needs_const_pool(val: f32) -> bool {
@@ -933,7 +930,7 @@ mod tests {
                 dst: Gpr(17),
                 target: pool,
             });
-            asm.code.resize(gap, 0);
+            asm.run.resize(gap, 0);
             asm.bind(pool);
 
             let code = asm.finish();
@@ -956,7 +953,7 @@ mod tests {
             let mut asm = Assembly::default();
             let pool = asm.mint();
             asm.bind(pool);
-            asm.code.resize(gap, 0);
+            asm.run.resize(gap, 0);
             asm.push(AdrpAdd {
                 dst: Gpr(17),
                 target: pool,
@@ -1518,7 +1515,7 @@ pub(super) mod driver {
             match test.arm {
                 IfArm::True => {
                     AsmProgram::from([Inst::Umaxv(scratch, test.reg), Inst::FmovToGp(scratch)])
-                        .assemble(&mut asm.code);
+                        .assemble(&mut asm.run);
                 }
                 IfArm::False => {
                     AsmProgram::from([
@@ -1526,7 +1523,7 @@ pub(super) mod driver {
                         Inst::FmovToGp(scratch),
                         Inst::mvn_w(X16, X16),
                     ])
-                    .assemble(&mut asm.code);
+                    .assemble(&mut asm.run);
                 }
             }
             asm.push(BranchIfW16Zero { target: label });
@@ -1542,20 +1539,6 @@ pub(super) mod driver {
             while remaining > 0 {
                 let chunk = remaining.min(table::MAX_ADD_IMM);
                 AsmProgram::from([table::SubI64::new(
-                    ptr::SP,
-                    ptr::SP,
-                    table::Imm12(chunk as u16),
-                )])
-                .assemble(code);
-                remaining -= chunk;
-            }
-        }
-
-        fn frame_free(&mut self, code: &mut Vec<u8>, bytes: u32) {
-            let mut remaining = bytes;
-            while remaining > 0 {
-                let chunk = remaining.min(table::MAX_ADD_IMM);
-                AsmProgram::from([table::AddI64::new(
                     ptr::SP,
                     ptr::SP,
                     table::Imm12(chunk as u16),
@@ -1683,7 +1666,18 @@ pub(super) mod driver {
             }
         }
 
-        fn emit_ret(&mut self, code: &mut Vec<u8>) {
+        fn emit_ret(&mut self, code: &mut Vec<u8>, bytes: u32) {
+            let mut remaining = bytes;
+            while remaining > 0 {
+                let chunk = remaining.min(table::MAX_ADD_IMM);
+                AsmProgram::from([table::AddI64::new(
+                    ptr::SP,
+                    ptr::SP,
+                    table::Imm12(chunk as u16),
+                )])
+                .assemble(code);
+                remaining -= chunk;
+            }
             AsmProgram::from([Inst::Ret]).assemble(code);
         }
     }
@@ -2307,7 +2301,7 @@ mod label_tests {
     fn a_program_is_position_independent() {
         let program = |prefix: &[u8]| {
             let mut asm = Assembly::default();
-            asm.code.extend_from_slice(prefix);
+            asm.run.extend_from_slice(prefix);
             let end = asm.mint();
             asm.push(B { target: end });
             asm.push(NOP);
