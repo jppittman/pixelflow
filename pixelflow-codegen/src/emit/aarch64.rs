@@ -1851,19 +1851,6 @@ pub(super) mod driver {
                 // setup_mov already placed c into dst
                 AsmProgram::from([Inst::Fmla(*dst, *a, *b)]).assemble(code);
             }
-            ResolvedOp::DecomposedMulAdd {
-                dst,
-                a,
-                b,
-                c,
-                c_deferred,
-            } => {
-                AsmProgram::from([Inst::Fmul(*dst, *a, *b)]).assemble(code);
-                // c is loaded only after the FMUL has consumed b: its register may
-                // be the one that held b.
-                emit_deferred(code, *c, c_deferred.as_ref(), pool);
-                AsmProgram::from([Inst::Fadd(*dst, *dst, *c)]).assemble(code);
-            }
             ResolvedOp::If {
                 dst,
                 if_true,
@@ -1876,24 +1863,6 @@ pub(super) mod driver {
 
         Ok(())
     }
-    /// Emit a deferred reload: either from stack or rematerialized constant.
-    fn emit_deferred(
-        code: &mut Vec<u8>,
-        target: Reg,
-        deferred: Option<&DeferredReload>,
-        pool: &ConstPool,
-    ) {
-        match deferred {
-            Some(DeferredReload::FromStack(slot)) => {
-                AsmProgram::from([Inst::ldr_q(target, frame_slot(slot.offset()))]).assemble(code);
-            }
-            Some(DeferredReload::Const(val_bits)) => {
-                emit_const_load(code, target, *val_bits, pool);
-            }
-            None => {}
-        }
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;

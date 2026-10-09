@@ -1517,26 +1517,6 @@ pub(super) mod driver {
                     // dst holds c (setup_mov); real FMA231: dst = a*b + dst.
                     super::emit_fmadd_c_in_dst(code, *dst, *a, *b);
                 }
-                ResolvedOp::DecomposedMulAdd {
-                    dst,
-                    a,
-                    b,
-                    c,
-                    c_deferred,
-                } => {
-                    super::emit_binary(code, OpKind::Mul, *dst, *a, *b);
-                    match c_deferred {
-                        Some(DeferredReload::FromStack(slot)) => {
-                            AsmProgram::from([Evex::m0f(0x10).rm(c.0, frame_slot(slot.offset()))])
-                                .assemble(code);
-                        }
-                        Some(DeferredReload::Const(bits)) => {
-                            super::emit_const(code, *c, f32::from_bits(*bits), &mut self.consts)?;
-                        }
-                        None => {}
-                    }
-                    super::emit_binary(code, OpKind::Add, *dst, *dst, *c);
-                }
                 ResolvedOp::If {
                     dst,
                     if_true,

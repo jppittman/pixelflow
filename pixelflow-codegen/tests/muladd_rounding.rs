@@ -1,26 +1,20 @@
 //! `MulAdd`'s rounding form, asserted through compiled code.
 //!
 //! CLAUDE.md's platform-divergence table has a `MulAdd` row: one rounding
-//! from the hardware's FMA — every tier has one, now that the floor is
-//! AVX2+FMA — and two when the emitter decomposes the op under register
-//! pressure, and the two disagree on inputs like
-//! `mul_add(1.0000001, 4097.0, 4097.0)`. That is a precision difference the
-//! language puts on the table, not a divergence — the folder rounds once and
-//! never refuses an input over it. It is still the entire reason the emitter
-//! carries two shapes for one op — `ResolvedOp::FusedMulAdd` and
-//! `ResolvedOp::DecomposedMulAdd` — and which one a node gets is decided by
-//! register pressure alone.
+//! from the hardware's FMA, on every tier — the floor is AVX2+FMA — whatever
+//! the register pressure. A multiply then an add rounds twice, and the two
+//! disagree on inputs like `mul_add(1.0000001, 4097.0, 4097.0)`. The folder
+//! rounds once too, so a node means the same value folded or emitted.
 //!
 //! Every other JIT-vs-reference test in this crate compares within a
 //! tolerance (`spill_pressure`'s 4 ULP, `oracle_reference`'s per-op
 //! `Tolerance`), and one-rounding vs. two is a last-bit difference: it fits
-//! inside all of them. So a backend that silently emitted the wrong shape —
-//! decomposing where it has an FMA, or fusing a decomposition — would keep
-//! every one of those tests green. These assert the *bits*, on inputs chosen
-//! so the two forms cannot agree.
+//! inside all of them. So a backend that emitted a multiply and an add would
+//! keep every one of those tests green. These assert the *bits*, on inputs
+//! chosen so the two forms cannot agree.
 //!
-//! x86-64 only, because it executes: the encodings themselves are pinned for
-//! all four backends from any host by `emit::tests::muladd_encoding`.
+//! x86-64 only, because it executes: the encoding itself is pinned for all
+//! three backends from any host by `emit::tests::muladd_encoding`.
 #![cfg(target_arch = "x86_64")]
 
 use pixelflow_codegen::emit::{CompiledKernel, compile};
@@ -120,9 +114,9 @@ fn the_reference_forms_disagree_on_these_inputs() {
     assert_eq!((HALF_B + HALF_B).to_bits(), B.to_bits());
 }
 
-/// An unspilled `MulAdd(X, Y, Z)` reaches the backend as `FusedMulAdd`, and
-/// what that compiles to is the hardware's FMA: one rounding, on every tier
-/// the JIT can select (AVX2 requires FMA3; AVX-512 has it; NEON has `FMLA`).
+/// An unspilled `MulAdd(X, Y, Z)` compiles to the hardware's FMA: one
+/// rounding, on every tier the JIT can select (AVX2 requires FMA3; AVX-512
+/// has it; NEON has `FMLA`).
 #[test]
 fn an_unspilled_muladd_rounds_once() {
     let mut a = ExprArena::new();
@@ -152,15 +146,12 @@ fn an_unspilled_muladd_rounds_once() {
 }
 
 /// Under enough register pressure that `a` and `b` cannot both stay in
-/// registers, the same node reaches the backend as `DecomposedMulAdd` — a
-/// multiply and an add, two roundings, on *every* target including the ones
-/// with an FMA.
+/// registers, the node still rounds once: both multiplicands are reloaded
+/// for the FMA, and the addend reloads into the destination.
 ///
-/// This is the arm AVX-512 had no test for at all: `spill_pressure.rs`'s
-/// scenarios were sized for the six-register SSE2 pool and stopped spilling
-/// against AVX-512's nineteen. The wall below is sized past every tier's
-/// whole pool instead, so the production compile reaches it at every width
-/// rather than at whichever one the scenario happened to suit.
+/// The wall below is sized past every tier's whole pool, so the production
+/// compile reaches the pressure at every width rather than at whichever one
+/// the scenario happened to suit.
 ///
 /// Three things the scenario has to get right, and each has been the reason
 /// an earlier version of it quietly tested the fused arm instead:
@@ -188,7 +179,7 @@ fn an_unspilled_muladd_rounds_once() {
 ///   overflows, and the multiplicands — read further ahead than any term —
 ///   are what it sheds. A value is brought back to a register and kept only
 ///   when it will be read again after that; the multiplicands have one read,
-///   so they are reloaded for the `MulAdd` alone, which is the decomposed arm.
+///   so they are reloaded for the `MulAdd` alone.
 ///   Each term is `(X + i) · U`, exactly +0.0 at `U = 0`, so the addend is
 ///   bit-for-bit `z` and the rounding under test is the `MulAdd`'s alone. It
 ///   is built from a uniform because the folder sees through any zero it can
@@ -199,7 +190,7 @@ fn an_unspilled_muladd_rounds_once() {
 /// value stored to the stack — not from `spill_count`, which counts the
 /// frame's slots and is nonzero for every kernel at a one-point lattice.
 #[test]
-fn a_spilled_muladd_rounds_twice_on_every_target() {
+fn a_spilled_muladd_rounds_once_on_every_target() {
     /// Terms in the wall: each is live from its first sum to its second, so
     /// this many outlast the widest tier's whole register pool (AVX-512's
     /// thirty-two `zmm`s).
@@ -241,5 +232,5 @@ fn a_spilled_muladd_rounds_twice_on_every_target() {
     let stores: u64 = result.traffic.scopes.iter().map(|s| s.stores).sum();
     assert!(stores > 0, "scenario failed to create register pressure");
     let got = eval_point(&result.code, HALF_A, HALF_B, &[C, 0.0]);
-    assert_bits("decomposed MulAdd", got, decomposed(A, B, C));
+    assert_bits("spilled MulAdd", got, fused(A, B, C));
 }

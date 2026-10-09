@@ -607,10 +607,7 @@ fn vfmadd231ps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
 /// (`libm::fmaf`); a software two-step mul-then-add would round twice and
 /// disagree in the last bit.
 ///
-/// The two-roundings case still exists, just not in *this* function: it is
-/// what `DecomposedMulAdd` does on every tier, this one included, whenever
-/// register pressure pulls `a` and `b` apart from `c`. Both are pinned as
-/// bytes by `emit::tests::muladd_encoding` and as values by
+/// Pinned as bytes by `emit::tests::muladd_encoding` and as values by
 /// `tests/muladd_rounding.rs`.
 fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
     vfmadd231ps(code, dst.0, a.0, b.0);
@@ -1402,26 +1399,6 @@ pub(super) mod driver {
                 }
                 ResolvedOp::FusedMulAdd { dst, a, b } => {
                     super::emit_fmadd_c_in_dst(code, *dst, *a, *b);
-                }
-                ResolvedOp::DecomposedMulAdd {
-                    dst,
-                    a,
-                    b,
-                    c,
-                    c_deferred,
-                } => {
-                    super::emit_binary(code, OpKind::Mul, *dst, *a, *b);
-                    match c_deferred {
-                        Some(DeferredReload::FromStack(slot)) => {
-                            AsmProgram::from([Vex::m0f(0x10).rm(c.0, frame_slot(slot.offset()))])
-                                .assemble(code);
-                        }
-                        Some(DeferredReload::Const(bits)) => {
-                            super::emit_const(code, *c, f32::from_bits(*bits), &mut self.consts)?;
-                        }
-                        None => {}
-                    }
-                    super::emit_binary(code, OpKind::Add, *dst, *dst, *c);
                 }
                 ResolvedOp::If {
                     dst,

@@ -419,16 +419,6 @@ enum ResolvedOp {
     /// Fused multiply-add via FMLA: dst = c + a*b.
     /// Requires dst to hold c before FMLA.
     FusedMulAdd { dst: Reg, a: Reg, b: Reg },
-    /// Decomposed multiply-add: FMUL(dst, a, b) then reload c, then FADD(dst, dst, c).
-    /// Used when a and b are both spilled (can't load both + c simultaneously).
-    /// `c_deferred`: if Some, c must be reloaded *after* FMUL.
-    DecomposedMulAdd {
-        dst: Reg,
-        a: Reg,
-        b: Reg,
-        c: Reg,
-        c_deferred: Option<DeferredReload>,
-    },
     /// BSL select: dst = mask ? if_true : if_false (mask pre-loaded into dst).
     If {
         dst: Reg,
@@ -464,15 +454,6 @@ enum ResolvedOp {
     /// that is not a broadcast, and the whole of what "executed by lanes"
     /// costs the body.
     Lanes { dst: Reg },
-}
-
-/// A deferred reload: value loaded mid-instruction (after a partial computation).
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum DeferredReload {
-    /// Load from stack slot.
-    FromStack(Slot),
-    /// Rematerialize a constant.
-    Const(u32),
 }
 
 /// Reload instruction: load a value into a register.
@@ -531,9 +512,8 @@ enum OperandSource {
     /// register it hands out (a displaced one is non-resident at this index
     /// and reloaded elsewhere). That is the whole guarantee: the encoders do
     /// **not** read every source before writing `dst` (`setup_mov` ahead of
-    /// an `If` or FMA on every ISA, the decomposed `MulAdd`'s multiply
-    /// before its add), so this is the one register-level alias any of them
-    /// tolerates.
+    /// an `If` or FMA on every ISA), so this is the one register-level alias
+    /// any of them tolerates.
     Destination,
     /// Not in a register, and reloaded into the `k`'th register the allocator
     /// reserved for this instruction (`regalloc::Scratch::reload`).
@@ -556,14 +536,9 @@ enum OperandSource {
 /// [`Reload`]: OperandSource::Reload
 #[must_use]
 fn operand_sources(op: &ScheduledOp, resident: [bool; 3]) -> [OperandSource; 3] {
-    // The operand an encoding wants in the destination, if any. `MulAdd`'s
-    // answer depends on which form the emitter will choose, and it chooses by
-    // residency — the decomposed `FMUL`/`FADD` when both multiplicands need
-    // reloading, the fused form otherwise — which is the same question this
-    // one is answering.
+    // The operand an encoding wants in the destination, if any.
     let into_dst = match op {
         ScheduledOp::Binary(..) => Some(0),
-        ScheduledOp::Ternary(OpKind::MulAdd, ..) if !resident[0] && !resident[1] => Some(0),
         ScheduledOp::Ternary(OpKind::MulAdd, ..) => Some(2),
         ScheduledOp::Ternary(OpKind::If, ..) => Some(0),
         _ => None,
@@ -1876,52 +1851,20 @@ fn resolve_operands(
             }
         }
         ScheduledOp::Ternary(op_kind, a, b, c) => {
-            let a_spilled = !in_register(a);
-            let b_spilled = !in_register(b);
-
             match op_kind {
                 OpKind::MulAdd => {
-                    if a_spilled && b_spilled {
-                        // Decompose: FMUL(dst, a, b) then FADD(dst, dst, c).
-                        // `a` lands in `dst`, which the multiply consumes it
-                        // from; `b` and `c` each take a reservation of their
-                        // own, so deferring `c` past the multiply no longer
-                        // depends on `b` having been consumed by then.
-                        let a_reg = operand(0, *a, &mut reloads);
-                        let b_reg = operand(1, *b, &mut reloads);
-                        let (c_reg, c_deferred) = match location_of(locs, *c) {
-                            Binding::Loc(Loc::Reg(reg)) => (reg, None),
-                            Binding::Remat(bits) => {
-                                (target_for(2), Some(DeferredReload::Const(bits)))
-                            }
-                            Binding::Loc(Loc::Slot(slot)) => {
-                                (target_for(2), Some(DeferredReload::FromStack(slot)))
-                            }
-                            Binding::Loc(Loc::Ptr(p)) => {
-                                panic!("{c:?} is read as a vector but is an address in {p:?}")
-                            }
-                        };
-                        ResolvedOp::DecomposedMulAdd {
-                            dst,
-                            a: a_reg,
-                            b: b_reg,
-                            c: c_reg,
-                            c_deferred,
-                        }
-                    } else {
-                        // FMLA path: dst += a * b, so dst must hold c first —
-                        // which is where `operand_sources` sends a spilled `c`.
-                        let c_reg = operand(2, *c, &mut reloads);
-                        if dst.0 != c_reg.0 {
-                            setup_mov = Some((dst, c_reg));
-                        }
-                        let a_reg = operand(0, *a, &mut reloads);
-                        let b_reg = operand(1, *b, &mut reloads);
-                        ResolvedOp::FusedMulAdd {
-                            dst,
-                            a: a_reg,
-                            b: b_reg,
-                        }
+                    // FMLA path: dst += a * b, so dst must hold c first —
+                    // which is where `operand_sources` sends a spilled `c`.
+                    let c_reg = operand(2, *c, &mut reloads);
+                    if dst.0 != c_reg.0 {
+                        setup_mov = Some((dst, c_reg));
+                    }
+                    let a_reg = operand(0, *a, &mut reloads);
+                    let b_reg = operand(1, *b, &mut reloads);
+                    ResolvedOp::FusedMulAdd {
+                        dst,
+                        a: a_reg,
+                        b: b_reg,
                     }
                 }
                 OpKind::If => {
@@ -3583,9 +3526,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_muladd_decomposed_both_ab_spilled() {
-        // a and b both spilled → decomposed FMUL+FADD path
-        // c in register
+    fn resolve_muladd_fuses_with_both_multiplicands_spilled() {
+        // a and b spilled, c in a register: each multiplicand takes a
+        // reservation of its own, and c moves into dst for the FMLA.
         let locs = make_locs(&[(2, 7), (3, 8)], &[(0, 0), (1, 16)]);
         let op = ScheduledOp::Ternary(
             OpKind::MulAdd,
@@ -3600,44 +3543,32 @@ mod tests {
             TEST_SCRATCH,
         );
 
-        // a → dst, b → tmp_op loaded upfront
-        assert_eq!(plan.reloads.len(), 2);
         assert_eq!(
-            plan.reloads[0],
-            Reload::FromStack {
-                target: Reg(8),
-                slot: Slot::new(0),
+            plan.reloads.as_slice(),
+            [
+                Reload::FromStack {
+                    target: RELOAD[0],
+                    slot: Slot::new(0),
+                },
+                Reload::FromStack {
+                    target: RELOAD[1],
+                    slot: Slot::new(16),
+                },
+            ]
+        );
+        assert_eq!(plan.setup_mov, Some((Reg(8), Reg(7))));
+        assert_eq!(
+            plan.op,
+            ResolvedOp::FusedMulAdd {
+                dst: Reg(8),
+                a: RELOAD[0],
+                b: RELOAD[1],
             }
         );
-        assert_eq!(
-            plan.reloads[1],
-            Reload::FromStack {
-                target: RELOAD[0],
-                slot: Slot::new(16),
-            }
-        );
-        // c is in a register, no deferred reload needed
-        match &plan.op {
-            ResolvedOp::DecomposedMulAdd {
-                dst,
-                a,
-                b,
-                c,
-                c_deferred,
-            } => {
-                assert_eq!(*dst, Reg(8));
-                assert_eq!(*a, Reg(8));
-                assert_eq!(*b, RELOAD[0]);
-                assert_eq!(*c, Reg(7));
-                assert_eq!(*c_deferred, None);
-            }
-            other => panic!("expected DecomposedMulAdd, got {:?}", other),
-        }
     }
 
     #[test]
-    fn resolve_muladd_decomposed_all_three_spilled() {
-        // a, b, c all spilled → decomposed with deferred c reload
+    fn resolve_muladd_reloads_a_spilled_addend_into_dst() {
         let locs = make_locs(&[(3, 8)], &[(0, 0), (1, 16), (2, 32)]);
         let op = ScheduledOp::Ternary(
             OpKind::MulAdd,
@@ -3652,15 +3583,15 @@ mod tests {
             TEST_SCRATCH,
         );
 
-        // Only a and b reloads upfront — c is deferred
-        assert_eq!(plan.reloads.len(), 2);
-        match &plan.op {
-            ResolvedOp::DecomposedMulAdd { c, c_deferred, .. } => {
-                assert_eq!(*c, RELOAD[1]); // its own reservation, deferred past the FMUL
-                assert_eq!(*c_deferred, Some(DeferredReload::FromStack(Slot::new(32))));
+        assert_eq!(plan.reloads.len(), 3);
+        assert_eq!(
+            plan.reloads[0],
+            Reload::FromStack {
+                target: Reg(8),
+                slot: Slot::new(32),
             }
-            other => panic!("expected DecomposedMulAdd, got {:?}", other),
-        }
+        );
+        assert_eq!(plan.setup_mov, None);
     }
 
     #[test]
@@ -5721,7 +5652,7 @@ mod tests {
             // constant, unrolled by hand (each needs its own `ResolvedOp`
             // shape, so they aren't worth a generic loop) — kept in sync
             // deliberately rather than by a shared loop. `MulAdd` unrolls to
-            // four: one fused plus one per `DecomposedMulAdd` spelling.
+            // one: `FusedMulAdd`.
             debug_assert_eq!(REQUIRED_TERNARY_OPS, &[OpKind::MulAdd, OpKind::If]);
             let mut missing = alloc::vec::Vec::new();
 
@@ -5771,34 +5702,7 @@ mod tests {
                     b: Reg(6),
                 },
             ) {
-                missing.push(alloc::string::String::from("ternary MulAdd (fused)"));
-            }
-            // `MulAdd` reaches a backend as EITHER shape depending only on how
-            // the allocator placed `a` and `b` (see `resolve_operands`), so a
-            // backend owes both. Each `c_deferred` spelling is its own arm.
-            for (tag, c_deferred) in [
-                ("c in a register", None),
-                (
-                    "c reloaded from the stack",
-                    Some(DeferredReload::FromStack(Slot::new(32))),
-                ),
-                (
-                    "c rematerialized",
-                    Some(DeferredReload::Const(1.0f32.to_bits())),
-                ),
-            ] {
-                if !try_emit(
-                    backend,
-                    ResolvedOp::DecomposedMulAdd {
-                        dst: Reg(4),
-                        a: Reg(5),
-                        b: Reg(6),
-                        c: Reg(7),
-                        c_deferred,
-                    },
-                ) {
-                    missing.push(alloc::format!("ternary MulAdd (decomposed, {tag})"));
-                }
+                missing.push(alloc::string::String::from("ternary MulAdd"));
             }
             if !try_emit(
                 backend,
@@ -5844,22 +5748,17 @@ mod tests {
     }
 
     // =========================================================================
-    // MulAdd: the encodings behind the two `ResolvedOp` shapes.
+    // MulAdd: the encoding behind `FusedMulAdd`.
     //
-    // `MulAdd` is the one row of CLAUDE.md's platform-divergence table whose
-    // two answers live inside a single build: `FusedMulAdd` rounds once where
-    // the hardware has an FMA, `DecomposedMulAdd` is architecturally a
-    // multiply then an add and rounds twice, and which one a node gets is
-    // decided by register pressure alone (`resolve_operands`). So the shapes
-    // are pinned as *bytes*, not just as "it emitted something": a backend
-    // that quietly encoded one where the driver asked for the other would
-    // still satisfy `backend_op_coverage`, still pass every ULP-tolerant
-    // equivalence test, and change the last bit of the answer.
+    // `FusedMulAdd` rounds once on every target: each has an FMA. The shape is
+    // pinned as *bytes*, not just as "it emitted something": a backend that
+    // quietly encoded a multiply and an add would still satisfy
+    // `backend_op_coverage`, still pass every ULP-tolerant equivalence test,
+    // and change the last bit of the answer.
     //
     // Ungated, like `backend_op_coverage`: encoding is a pure function into a
     // `Vec<u8>`, so all three backends are checked from whichever host runs
-    // the tests — including the two (aarch64, AVX-512 decomposed) that no
-    // execution test on any single host reaches.
+    // the tests.
     // =========================================================================
     mod muladd_encoding {
         use super::*;
@@ -5867,7 +5766,6 @@ mod tests {
         const DST: Reg = Reg(4);
         const SRC_A: Reg = Reg(5);
         const SRC_B: Reg = Reg(6);
-        const ADDEND: Reg = Reg(7);
 
         /// A bare plan: no reloads, no setup mov, no store, no temps — just
         /// the op, so the bytes below are the op's encoding and nothing
@@ -5896,16 +5794,6 @@ mod tests {
             }
         }
 
-        fn decomposed(c_deferred: Option<DeferredReload>) -> ResolvedOp {
-            ResolvedOp::DecomposedMulAdd {
-                dst: DST,
-                a: SRC_A,
-                b: SRC_B,
-                c: ADDEND,
-                c_deferred,
-            }
-        }
-
         /// `dst += a * b` in one instruction, one rounding, on every target:
         /// each of the three has an FMA.
         #[test]
@@ -5931,99 +5819,8 @@ mod tests {
             );
         }
 
-        /// The decomposed shape is a multiply and an add — never an FMA, on
-        /// any target. A backend that "optimized" it back into one instruction
-        /// would change the result's last bit while every tolerant test kept
-        /// passing.
-        #[test]
-        fn decomposed_encodes_to_a_multiply_and_an_add() {
-            assert_eq!(
-                encode(&mut avx2::driver::Avx2Backend::new(), decomposed(None)),
-                alloc::vec![
-                    0xc4, 0xe1, 0x54, 0x59, 0xe6, // vmulps ymm4, ymm5, ymm6
-                    0xc4, 0xe1, 0x5c, 0x58, 0xe7, // vaddps ymm4, ymm4, ymm7
-                ],
-                "AVX2 decomposed MulAdd"
-            );
-            assert_eq!(
-                encode(&mut avx512::driver::Avx512Backend::new(), decomposed(None)),
-                alloc::vec![
-                    0x62, 0xf1, 0x54, 0x48, 0x59, 0xe6, // vmulps zmm4, zmm5, zmm6
-                    0x62, 0xf1, 0x5c, 0x48, 0x58, 0xe7, // vaddps zmm4, zmm4, zmm7
-                ],
-                "AVX-512 decomposed MulAdd"
-            );
-            let neon = encode(
-                &mut aarch64::driver::Aarch64Backend::new(),
-                decomposed(None),
-            );
-            assert_eq!(
-                neon,
-                [
-                    0x6e26_dca4u32, // fmul v4.4s, v5.4s, v6.4s
-                    0x4e27_d484,    // fadd v4.4s, v4.4s, v7.4s
-                ]
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect::<Vec<u8>>(),
-                "aarch64 decomposed MulAdd"
-            );
-        }
-
-        /// A deferred `c` must be reloaded *between* the multiply and the add.
-        ///
-        /// That ordering is the whole reason `DeferredReload` exists: `c`'s
-        /// reload target is the same scratch register `b` was loaded into, so
-        /// hoisting it up with the other reloads would destroy `b` before the
-        /// multiply reads it. The invariant is checked structurally rather
-        /// than as another byte literal — the multiply and the add are already
-        /// pinned above, so what is left to prove is that the reload landed
-        /// strictly between them, on every backend.
-        #[test]
-        fn a_deferred_c_is_reloaded_between_the_multiply_and_the_add() {
-            fn check<B: IsaBackend>(name: &str, backend: &mut B) {
-                let undeferred = encode(backend, decomposed(None));
-                // `dst = a*b` is everything before the final add; on VEX the
-                // add is 5 bytes, on EVEX 6, on NEON 4 — so split by the
-                // tail rather than by a per-backend length.
-                let (mul, add) = undeferred.split_at(undeferred.len() - tail_len(name));
-                for deferred in [
-                    DeferredReload::FromStack(Slot::new(32)),
-                    DeferredReload::Const(1.0f32.to_bits()),
-                ] {
-                    let got = encode(backend, decomposed(Some(deferred.clone())));
-                    assert!(
-                        got.starts_with(mul),
-                        "{name}/{deferred:?}: the multiply is no longer first"
-                    );
-                    assert!(
-                        got.ends_with(add),
-                        "{name}/{deferred:?}: the add is no longer last"
-                    );
-                    assert!(
-                        got.len() > undeferred.len(),
-                        "{name}/{deferred:?}: nothing was emitted for the reload"
-                    );
-                }
-            }
-
-            /// Byte length of the trailing add in `decomposed(None)`.
-            fn tail_len(name: &str) -> usize {
-                match name {
-                    "AVX2" => 5,
-                    "AVX-512" => 6,
-                    "aarch64" => 4,
-                    other => panic!("unknown backend {other}"),
-                }
-            }
-
-            check("AVX2", &mut avx2::driver::Avx2Backend::new());
-            check("AVX-512", &mut avx512::driver::Avx512Backend::new());
-            check("aarch64", &mut aarch64::driver::Aarch64Backend::new());
-        }
-
         /// A `MulAdd` node really does reach a backend as `FusedMulAdd` when
-        /// nothing spills — the property the byte tests above assume, and the
+        /// nothing spills — the property the byte test above assumes, and the
         /// one an upstream change (a legalization pass that decomposed it, an
         /// arena builder that never emitted it) would silently take away.
         #[test]

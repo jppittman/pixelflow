@@ -943,12 +943,9 @@ impl OpKind {
     #[must_use]
     pub fn eval_ternary(self, x: f32, y: f32, z: f32) -> Option<f32> {
         match self {
-            // One rounding, always. `MulAdd` denotes `x*y + z`; whether a
-            // target spells it as one instruction (`vfmadd`, `FMLA`) or as a
-            // multiply and an add (any backend under register pressure —
-            // see `ResolvedOp::DecomposedMulAdd`) is a last-bit
-            // precision difference inside the contract, not a divergence, so
-            // it folds unconditionally. `libm::fmaf` rather than `x * y + z`
+            // One rounding, always. `MulAdd` denotes `x*y + z`, and every
+            // target spells it as one instruction (`vfmadd`, `FMLA`), so it
+            // folds unconditionally. `libm::fmaf` rather than `x * y + z`
             // because the latter is whatever the compiler that built THIS
             // crate chose to contract it into: under `-fp-contract=fast` a
             // fold's answer must not depend on the folder's build profile.

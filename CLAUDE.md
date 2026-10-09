@@ -78,7 +78,7 @@ Behavior that differs by target, because the instructions do:
 | `Round` (exact tie) | nearest-**even** (imm 0x00) → `round(2.5) == 2` | `FRINTA` ties-**away** → `3` |
 | `Round` (`-0.5 ≤ x ≤ -0.0`) | `-0.0` (sign preserved) | `-0.0` |
 | `Recip`, `Rsqrt` | `rcpps` ~12 bits; `vrcp14ps` ~14 | `FRECPE` + one `FRECPS` step |
-| `MulAdd` | **one** rounding (`vfmadd231ps`; every selectable tier has FMA3), **two** only where the emitter decomposes it under register pressure | one (`FMLA`) |
+| `MulAdd` | **one** rounding (`vfmadd231ps`; every selectable tier has FMA3), under any register pressure | one (`FMLA`) |
 | `TruncToInt` (NaN, or `x >= 2^31`) | `cvttps2dq` → **`i32::MIN`** (integer indefinite) | `FCVTZS` **saturates**; NaN → 0 |
 | `Shl`, `Shr` (count outside `0..32`) | count > 31 zeroes the **whole** destination | immediate carries into `immh` → decodes as **`.2D`**, crossing lanes |
 
@@ -91,10 +91,9 @@ differs between *ISA tiers of the same machine*, which is what
 `cargo xtask isa-matrix` exists to keep honest. `Recip`/`Rsqrt` are
 estimates — only ever guaranteed close, never equal — so no argument to them is
 ever foldable. `MulAdd` is the opposite case and is *not* fold-refused: an FMA
-instruction is on every selectable tier (the x86-64 floor requires FMA3), and
-one rounding versus two is a last-bit precision difference inside the contract
-(the emitter itself decomposes a `MulAdd` under register pressure). The folder
-and the oracle round once (`libm::fmaf`); a differential check bounds the
+instruction is on every selectable tier (the x86-64 floor requires FMA3),
+and the emitter always uses it, whatever the register pressure. The folder
+and the oracle round once too (`libm::fmaf`); a differential check bounds the
 product's rounding as tolerance rather than skipping the point.
 
 Unifying any row costs instructions — x86 has no ties-away rounding mode, and

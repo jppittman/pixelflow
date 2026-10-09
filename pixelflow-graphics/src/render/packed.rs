@@ -492,9 +492,9 @@ mod tests {
 
     /// The chrome sphere's code per tier.
     const CHROME_PINS: TierPins = [
-        ("avx2", 6192, 0x1503_af84_be6a_9e42),
-        ("avx512", 6224, 0x74b7_beb5_086e_6818),
-        ("neon", 3520, 0x296f_c552_9eba_0d85),
+        ("avx2", 6192, 0xb419_6e71_9c99_afb6),
+        ("avx512", 6224, 0x9e5c_99e8_27bc_546a),
+        ("neon", 3520, 0x8a30_5ff7_636f_e4fe),
     ];
 
     /// The silhouette's code per tier.

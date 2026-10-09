@@ -2783,9 +2783,8 @@ impl Pass {
     /// definition wrote — into `dst` for the operand the encoding consumes
     /// there, into a reserved reload register otherwise. That is the whole
     /// of what the encoders tolerate: no encoder reads every source before
-    /// writing `dst` (`setup_mov` ahead of an `If` or FMA on every ISA;
-    /// the decomposed `MulAdd`'s multiply before its add), so a *resident*
-    /// operand in `dst`'s register would be corrupted. A displaced one is
+    /// writing `dst` (`setup_mov` ahead of an `If` or FMA on every ISA),
+    /// so a *resident* operand in `dst`'s register would be corrupted. A displaced one is
     /// not resident, which is why the split is recorded at this index and
     /// not the next.
     /// [`EvictionRank`] prices it so it stays a last resort.
@@ -5201,8 +5200,8 @@ pub(super) mod tests {
     /// allocation, and what lets one operand be reloaded into `dst`.
     ///
     /// The encoders write `dst` before their last read — `setup_mov` ahead
-    /// of an `If` or FMA, the decomposed `MulAdd`'s multiply before its
-    /// add — so a *resident* operand in `dst`'s register would be corrupted.
+    /// of an `If` or FMA — so a *resident* operand in `dst`'s register would
+    /// be corrupted.
     /// The destination *may* take an operand's register — it is a priced
     /// candidate, not an excluded one — but when it does, the eviction is
     /// recorded at this very index, so that operand is no longer *resident*

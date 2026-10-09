@@ -1386,13 +1386,14 @@ Every commit in this phase is live in production.
 
 #### A4: `MulAdd` always fuses
 
-- **Files:** `emit/mod.rs`, the three backends, `tests/muladd_rounding.rs`, `emit/coverage.rs`, `CLAUDE.md`.
+- **Files:** `emit/mod.rs`, the three backends, `tests/muladd_rounding.rs`, `emit/coverage.rs`, `CLAUDE.md`, and the two comments in `pixelflow-ir` (`kind.rs`, `passes.rs`) that named the decomposed form.
 - **Change:** delete the decomposed form (§4.1, A4). The fused form already fits: `a` and `b` reload into the two reload reservations, and `c` reloads into the destination (`operand_sources`, `mod.rs:833-882`).
 - **Values:**
   - One rounding on every target, which matches the folder's `libm::fmaf`.
-  - `a_spilled_muladd_rounds_twice_on_every_target` becomes `…_rounds_once_on_every_target`.
+  - `a_spilled_muladd_rounds_twice_on_every_target` becomes `…_rounds_once_on_every_target`, asserting the fused bits.
+  - The two `resolve_muladd_decomposed_*` tests become `resolve_muladd_fuses_with_both_multiplicands_spilled` and `resolve_muladd_reloads_a_spilled_addend_into_dst`; `a_deferred_c_is_reloaded_between_the_multiply_and_the_add` goes with `DeferredReload`.
   - CLAUDE.md's `MulAdd` row loses "two only where the emitter decomposes it".
-- **Bytes:** only kernels where both multiplicands of a `MulAdd` were non-resident. The commit lists the cells that moved.
+- **Bytes:** only kernels where both multiplicands of a `MulAdd` were non-resident. GOLDEN and `glyph_branches` are identical; the chrome sphere in `the_scenes_emit_their_pinned_code` keeps its length on every tier and changes its digest (a different register holds the multiply's inputs).
 - **Gate:** V, plus a re-baseline of those cells.
 
 #### A5: A placeholder says what it is
