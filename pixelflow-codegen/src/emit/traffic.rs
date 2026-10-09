@@ -133,7 +133,7 @@ impl EmitTraffic {
             scope.bytes += (assembled.address(end) - assembled.address(block.label)) as u64;
             for emitted in &block.insts {
                 match emitted.origin {
-                    Origin::Selected => {}
+                    Origin::Selected | Origin::Copy => {}
                     Origin::Remat => scope.remats += 1,
                     Origin::Reload => scope.loads += 1,
                     Origin::Spill => scope.stores += 1,

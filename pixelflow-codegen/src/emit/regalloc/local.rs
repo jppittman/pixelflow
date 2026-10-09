@@ -1,34 +1,48 @@
-//! The local allocator: the simplest correct one.
+//! The local allocator: one pass over the instructions in layout order.
 //!
-//! Every value lives in a frame slot. It is stored when it is defined and
-//! reloaded into a register at every read, so no value is in a register
-//! across an instruction except a `Flags` value, which has no slot and is held
-//! from its definition to its read. What the later allocators add (residency,
-//! carried values, rematerialization) are optimizations of this one's output,
-//! and each is checked against it.
+//! A value stays in its register until something needs the register, and a
+//! value that is read while in none is reloaded into a fresh one that stays
+//! until it is needed in turn. What the scan gives up a register for is
+//! priced by [`EvictionRank`]: the value that costs no store, then the one
+//! read farthest out.
 //!
-//! The slots are the allocation. Liveness is intervals in layout order: a value
-//! lives from its definition to its last read, a value defined before a loop
-//! and read inside it lives to the loop's latch, and a block parameter lives
-//! from the first branch that passes it an argument. Two values with disjoint
-//! intervals share a slot. The frame is laid out first, so by the time any
-//! instruction is bound the frame is final and a slot is a borrowed offset.
+//! **A spilled value is stored right after its definition**, never at the
+//! eviction point, which a guard can skip. The scan only learns that a value
+//! must be stored when it first evicts it, so the store is inserted
+//! retroactively: it is kept beside the definition it follows and placed
+//! there when the blocks are bound.
 //!
-//! Block parameters live in their slots, and a branch's arguments are stored
-//! to them just before it.
+//! **Loop heads are flushed.** A value live into a loop head is stored and
+//! dropped from its register there, so inside the loop its home is its slot
+//! and the reloads are split values that are dead before the latch. Block
+//! parameters are slot-homed too: a branch stores its arguments to them.
+//!
+//! The slots are the second register file. Liveness is intervals in layout
+//! order: a value lives from its definition to its last read, a value defined
+//! before a loop and read inside it lives to the loop's latch, and a block
+//! parameter lives from the first branch that passes it an argument. The
+//! narrow slots are laid out before the scan, from the peak number of narrow
+//! values live at once; a vector slot is leased for one value's interval when
+//! the value is first stored.
+//!
+//! Registers are bound after the scan: it records which register every
+//! operand of every instruction held, and the frame is final by then, so a
+//! slot is a borrowed offset.
 
+use super::policy::{EvictionRank, ReadHere, Store};
 use super::resource::{Frame, In, InOut, Leases, Lent, Out, Pool, SlotLease, SlotName};
 use crate::emit::asm::{AsmProgram, Item, Label, Labels};
 use crate::emit::build::{self, Spiller};
 use crate::emit::{
-    Access, Block, Bound, CONST_POOL_ALIGN, Class, ClassId, Constants, File, FrameSlot, Function,
-    Integer, IsaBackend, Loop, Operand, Opmask, Pointer, Pushed, Rebind, Selected, Target, Value,
-    ValueName, Vector,
+    Access, Block, Bound, CONST_POOL_ALIGN, Class, ClassId, Constants, File, FileId, FrameSlot,
+    Function, Integer, IsaBackend, Loop, Operand, Opmask, Pointer, Pushed, Rebind, Selected,
+    Target, Value, ValueName, Vector,
 };
 use crate::error::CompileError;
-use alloc::collections::{BTreeMap, BinaryHeap};
+use alloc::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use alloc::vec::Vec;
 use core::cmp::Reverse;
+use core::ops::Range;
 
 /// Why an instruction is there. `EmitTraffic` counts them per scope.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -39,6 +53,9 @@ pub(in crate::emit) enum Origin {
     Remat,
     Spill,
     Reload,
+    /// A register copy ([`IsaBackend::copy`]): an operand the instruction
+    /// overwrites in place, which is read again later.
+    Copy,
 }
 
 /// An allocated instruction, and why it is there.
@@ -105,131 +122,158 @@ struct Life {
     /// The last position its slot is needed.
     last: usize,
     read: bool,
+    /// Where its positions are among the scan's, which are sorted by value.
+    reads: Range<usize>,
     /// Read inside a loop that does not contain its definition.
     hoisted: bool,
     slot: Option<SlotName>,
+    /// Whether the slot holds the value from here on: it has been stored, or
+    /// it is a parameter, which a branch fills.
+    stored: bool,
 }
 
-/// Every value's [`Life`], by id.
-fn lives<B: IsaBackend>(function: &Function<B>) -> Vec<Life> {
-    let mut lives: Vec<Life> = function
-        .classes
-        .iter()
-        .map(|&class| Life {
-            class,
-            def: 0,
-            from: 0,
-            last: 0,
-            read: false,
-            hoisted: false,
-            slot: None,
+/// Every value's [`Life`], and the positions that read it.
+struct Liveness {
+    lives: Vec<Life>,
+    /// `(value, position)` for every read, in layout order.
+    reads: Vec<(u64, usize)>,
+    /// Each loop's first and last position: from its head to its one backward
+    /// branch.
+    extents: Vec<(usize, usize)>,
+}
+
+impl Liveness {
+    fn of<B: IsaBackend>(function: &Function<B>) -> Self {
+        let lives = function
+            .classes
+            .iter()
+            .map(|&class| Life {
+                class,
+                def: 0,
+                from: 0,
+                last: 0,
+                read: false,
+                reads: 0..0,
+                hoisted: false,
+                slot: None,
+                stored: false,
+            })
+            .collect();
+
+        let mut starts = Vec::with_capacity(function.blocks.len());
+        let mut position = 0;
+        for block in &function.blocks {
+            starts.push(position);
+            position += block.insts.len();
+        }
+        let at: BTreeMap<Label, usize> = function
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, block)| (block.label, i))
+            .collect();
+        let mut live = Self {
+            lives,
+            reads: Vec::new(),
+            extents: function.loops.iter().map(|_| (0, 0)).collect(),
+        };
+        for (block, &start) in function.blocks.iter().zip(&starts) {
+            for param in &block.params {
+                let life = &mut live.lives[param.id as usize];
+                (life.def, life.from, life.last) = (start, start, start);
+            }
+        }
+
+        // A loop is the run of positions from its head to its one backward
+        // branch.
+        let mut position = 0;
+        for (i, block) in function.blocks.iter().enumerate() {
+            position += block.insts.len();
+            let targets = block.insts.last().into_iter().flat_map(|p| &p.operands);
+            for operand in targets {
+                let Operand::Target(target) = operand else {
+                    continue;
+                };
+                if at[&target.label] > i {
+                    continue;
+                }
+                let l = function
+                    .loops
+                    .iter()
+                    .position(|l| l.head == target.label)
+                    .expect("a backward branch targets a loop's head");
+                live.extents[l] = (starts[at[&target.label]], position - 1);
+            }
+        }
+
+        let mut position = 0;
+        for block in &function.blocks {
+            for pushed in &block.insts {
+                for operand in &pushed.operands {
+                    match operand {
+                        Operand::Reg { value, access } if access.reads() => {
+                            live.read(*value, position);
+                        }
+                        Operand::Reg { value, .. } => {
+                            let life = &mut live.lives[value.id as usize];
+                            (life.def, life.from, life.last) = (position, position, position);
+                        }
+                        Operand::Target(target) => {
+                            for &arg in &target.args {
+                                live.read(arg, position);
+                            }
+                            let params = &function.blocks[at[&target.label]].params;
+                            for param in params {
+                                let life = &mut live.lives[param.id as usize];
+                                life.from = life.from.min(position);
+                                life.last = life.last.max(position);
+                            }
+                        }
+                        Operand::Frame(_) => unreachable!("selection names no frame slot"),
+                    }
+                }
+                position += 1;
+            }
+        }
+        live
+    }
+
+    /// Value `v` is read at `position`.
+    fn read(&mut self, v: ValueName, position: usize) {
+        self.reads.push((v.id, position));
+        let life = &mut self.lives[v.id as usize];
+        life.read = true;
+        life.last = life.last.max(position);
+        for &(head, latch) in &self.extents {
+            if (head..=latch).contains(&position) && life.def < head {
+                life.last = life.last.max(latch);
+                life.hoisted = true;
+            }
+        }
+    }
+}
+
+/// Give every narrow value that is read a slot; lay the narrow region out for
+/// them. A vector value's slot is leased when it is first stored.
+fn layout(lives: &mut [Life], frame: &mut Frame) -> Result<(), CompileError> {
+    let mut narrow: Vec<usize> = (0..lives.len())
+        .filter(|&id| {
+            lives[id].read
+                && matches!(
+                    lives[id].class,
+                    ClassId::Pointer | ClassId::Integer | ClassId::Opmask
+                )
         })
         .collect();
-
-    let mut starts = Vec::with_capacity(function.blocks.len());
-    let mut position = 0;
-    for block in &function.blocks {
-        starts.push(position);
-        position += block.insts.len();
-    }
-    let at: BTreeMap<Label, usize> = function
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(i, block)| (block.label, i))
-        .collect();
-    for (block, &start) in function.blocks.iter().zip(&starts) {
-        for param in &block.params {
-            let life = &mut lives[param.id as usize];
-            (life.def, life.from, life.last) = (start, start, start);
-        }
-    }
-
-    // A loop is the run of positions from its head to its one backward branch.
-    let mut extents: Vec<(usize, usize)> = function.loops.iter().map(|_| (0, 0)).collect();
-    let mut position = 0;
-    for (i, block) in function.blocks.iter().enumerate() {
-        position += block.insts.len();
-        let targets = block.insts.last().into_iter().flat_map(|p| &p.operands);
-        for operand in targets {
-            let Operand::Target(target) = operand else {
-                continue;
-            };
-            if at[&target.label] > i {
-                continue;
-            }
-            let l = function
-                .loops
-                .iter()
-                .position(|l| l.head == target.label)
-                .expect("a backward branch targets a loop's head");
-            extents[l] = (starts[at[&target.label]], position - 1);
-        }
-    }
-
-    let mut position = 0;
-    for block in &function.blocks {
-        for pushed in &block.insts {
-            for operand in &pushed.operands {
-                match operand {
-                    Operand::Reg { value, access } if access.reads() => {
-                        read(&mut lives, &extents, *value, position);
-                    }
-                    Operand::Reg { value, .. } => {
-                        let life = &mut lives[value.id as usize];
-                        (life.def, life.from, life.last) = (position, position, position);
-                    }
-                    Operand::Target(target) => {
-                        for &arg in &target.args {
-                            read(&mut lives, &extents, arg, position);
-                        }
-                        let params = &function.blocks[at[&target.label]].params;
-                        for param in params {
-                            let life = &mut lives[param.id as usize];
-                            life.from = life.from.min(position);
-                            life.last = life.last.max(position);
-                        }
-                    }
-                    Operand::Frame(_) => unreachable!("selection names no frame slot"),
-                }
-            }
-            position += 1;
-        }
-    }
-    lives
-}
-
-/// Value `v` is read at `position`.
-fn read(lives: &mut [Life], extents: &[(usize, usize)], v: ValueName, position: usize) {
-    let life = &mut lives[v.id as usize];
-    life.read = true;
-    life.last = life.last.max(position);
-    for &(head, latch) in extents {
-        if (head..=latch).contains(&position) && life.def < head {
-            life.last = life.last.max(latch);
-            life.hoisted = true;
-        }
-    }
-}
-
-/// Give every value that is read, and can be stored, a slot; lay the frame
-/// out for them.
-fn layout(lives: &mut [Life], frame: &mut Frame) -> Result<(), CompileError> {
-    let mut stored: Vec<usize> = (0..lives.len())
-        .filter(|&id| lives[id].read && lives[id].class != ClassId::Flags)
-        .collect();
-    stored.sort_by_key(|&id| (lives[id].from, id));
+    narrow.sort_by_key(|&id| (lives[id].from, id));
 
     // The peak number of narrow values live at once, by a difference array
     // over positions.
     let end = lives.iter().map(|life| life.last).max().unwrap_or(0) + 2;
     let mut delta = alloc::vec![0i64; end];
-    for &id in &stored {
-        let life = &lives[id];
-        if life.class != ClassId::Vector {
-            delta[life.from] += 1;
-            delta[life.last + 1] -= 1;
-        }
+    for &id in &narrow {
+        delta[lives[id].from] += 1;
+        delta[lives[id].last + 1] -= 1;
     }
     let peak = delta
         .iter()
@@ -243,7 +287,7 @@ fn layout(lives: &mut [Life], frame: &mut Frame) -> Result<(), CompileError> {
 
     let mut leases: BTreeMap<usize, SlotLease> = BTreeMap::new();
     let mut active: BinaryHeap<Reverse<(usize, usize)>> = BinaryHeap::new();
-    for id in stored {
+    for id in narrow {
         while let Some(&Reverse((last, done))) = active.peek() {
             if last >= lives[id].from {
                 break;
@@ -251,7 +295,7 @@ fn layout(lives: &mut [Life], frame: &mut Frame) -> Result<(), CompileError> {
             active.pop();
             frame.release(leases.remove(&done).expect("an active value holds a slot"));
         }
-        let lease = frame.lease(lives[id].class)?;
+        let lease = frame.lease_narrow();
         lives[id].slot = Some(lease.name());
         leases.insert(id, lease);
         active.push(Reverse((lives[id].last, id)));
@@ -260,7 +304,8 @@ fn layout(lives: &mut [Life], frame: &mut Frame) -> Result<(), CompileError> {
 }
 
 /// Allocate `function`: bind every value to leases of `pool` and slots of
-/// `frame`, inserting the stores and reloads that make the binding hold.
+/// `frame`, inserting the stores, reloads and copies that make the binding
+/// hold.
 ///
 /// # Errors
 /// [`CompileError::BudgetExceeded`] when the narrow region passes 4,096 slots
@@ -271,18 +316,31 @@ fn layout(lives: &mut [Life], frame: &mut Frame) -> Result<(), CompileError> {
 /// registers of a file than the file has, a `Flags` value read after another
 /// flags write or held to the end of its block, a branch argument that is a
 /// parameter of one of the branch's targets (a move the allocator does not
-/// order), or an entry block whose first instruction does not make the frame.
+/// order), a forward branch past a block (a join), or an entry block whose
+/// first instruction does not make the frame.
 pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
     function: Function<B>,
     pool: &'m Pool<B>,
     frame: &'m mut Frame,
 ) -> Result<Allocated<'m, B>, CompileError> {
-    let mut lives = lives(&function);
+    let Liveness {
+        mut lives,
+        mut reads,
+        ..
+    } = Liveness::of(&function);
+    reads.sort_unstable();
+    let mut start = 0;
+    while let Some(&(value, _)) = reads.get(start) {
+        let len = reads[start..].partition_point(|&(v, _)| v == value);
+        lives[value as usize].reads = start..start + len;
+        start += len;
+    }
+    let reads = reads.into_iter().map(|(_, position)| position).collect();
     layout(&mut lives, frame)?;
-    let frame: &'m Frame = frame;
+    let hoisted = lives.iter().filter(|life| life.hoisted).count() as u64;
 
     let leases = Leases::new(pool);
-    let free = [
+    let mut free: [Vec<Lent<B>>; 4] = [
         leases.vector.into_iter().map(Lent::Vector).collect(),
         leases.general.into_iter().map(Lent::General).collect(),
         leases.opmask.into_iter().map(Lent::Opmask).collect(),
@@ -294,50 +352,119 @@ pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
         function.entry.out.name(),
         function.entry.pitch.name(),
     ];
-    let held = BTreeMap::from([
+    let mut held = BTreeMap::from([
         (entry[0].id, Lent::General(leases.entry.ctx)),
         (entry[1].id, Lent::General(leases.entry.out)),
         (entry[2].id, Lent::General(leases.entry.pitch)),
     ]);
+    // One nothing reads is dead on arrival, which the scan would find only
+    // after the first instruction.
+    for (_, lent) in held.extract_if(.., |&id, _| lives[id as usize].reads.is_empty()) {
+        free[lent.file() as usize].push(lent);
+    }
+    // The ABI registers are stored, if they ever are, right after the entry
+    // block's first instruction, which makes the frame.
+    let mut defined: Vec<Option<(usize, usize)>> = alloc::vec![None; lives.len()];
+    for value in entry {
+        defined[value.id as usize] = Some((0, 0));
+    }
 
     let mut labels = function.labels;
     let text_end = labels.mint();
-    let params = function
+    let blocks_at = function
         .blocks
         .iter()
-        .map(|block| (block.label, block.params.clone()))
+        .enumerate()
+        .map(|(i, block)| (block.label, (i, block.params.clone())))
         .collect();
+    let heads: BTreeSet<Label> = function.loops.iter().map(|l| l.head).collect();
     let mut scan = Scan {
-        frame,
-        lives: &lives,
-        params,
+        frame: &mut *frame,
+        reads,
+        lives,
+        blocks_at,
         free,
         held,
+        pinned: Vec::new(),
         next: function.classes.len() as u64,
-        out: Vec::new(),
-        framed: false,
+        defined,
+        records: Vec::new(),
+        late: BTreeMap::new(),
+        numbers: Vec::new(),
         at: function.blocks[0].label,
+        block: 0,
         position: 0,
     };
 
-    let mut blocks = Vec::with_capacity(function.blocks.len());
+    let mut shapes = Vec::with_capacity(function.blocks.len());
     for block in function.blocks {
         scan.at = block.label;
+        scan.records.push(Vec::new());
+        if heads.contains(&block.label) {
+            scan.flush()?;
+        }
         for pushed in block.insts {
-            scan.instruction(pushed, &entry);
+            scan.instruction(pushed)?;
             scan.position += 1;
         }
-        if let Some(&flags) = scan.held.keys().next() {
+        let flags = scan
+            .held
+            .iter()
+            .find_map(|(id, lent)| (lent.file() == FileId::Flags).then_some(id));
+        if let Some(flags) = flags {
             panic!(
                 "value {flags} is a flags value live at the end of {:?}, and no flags value is live at a label",
                 block.label
             );
         }
+        shapes.push((block.label, block.scope));
+        scan.block += 1;
+    }
+    assert!(
+        scan.held.is_empty(),
+        "values are held after the last instruction: {:?}",
+        scan.held.keys()
+    );
+    let Scan {
+        free,
+        records,
+        late,
+        numbers,
+        ..
+    } = scan;
+
+    let slots = frame.minted();
+    let frame: &'m Frame = frame;
+    let mut bank: [BTreeMap<u8, Lent<'m, B>>; 4] = Default::default();
+    for lent in free.into_iter().flatten() {
+        bank[lent.file() as usize].insert(lent.number(), lent);
+    }
+    let mut binding = Binding {
+        frame,
+        bank,
+        numbers: &numbers,
+        next: 0,
+        framed: false,
+    };
+    let mut late = late;
+    let mut blocks = Vec::with_capacity(records.len());
+    for (b, (block, (label, scope))) in records.into_iter().zip(shapes).enumerate() {
+        let mut insts = Vec::with_capacity(block.len());
+        for (k, record) in block.into_iter().enumerate() {
+            insts.push(binding.record(&record));
+            assert!(
+                (b, k) != (0, 0) || binding.framed,
+                "the entry block's first instruction does not make the frame, so the ABI registers have nowhere to be stored"
+            );
+            for stored in late.remove(&(b, k)).unwrap_or_default() {
+                insts.push(binding.record(&stored));
+            }
+        }
         blocks.push(Block {
-            label: block.label,
+            label,
             params: Vec::new(),
-            insts: core::mem::take(&mut scan.out),
-            scope: block.scope,
+            insts,
+            scope,
         });
     }
 
@@ -348,38 +475,84 @@ pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
         labels,
         text_end,
         frame_bytes: frame.bytes(),
-        slots: frame.minted(),
-        hoisted: lives.iter().filter(|life| life.hoisted).count() as u64,
+        slots,
+        hoisted,
         scheduled: function.scheduled,
     })
 }
 
+/// An instruction the scan has placed: what to bind, why it is there, and
+/// where in the scan's numbers its operands' registers begin.
+struct Record<B: IsaBackend> {
+    pushed: Pushed<B::Inst<Selected>>,
+    origin: Origin,
+    regs: usize,
+}
+
 /// The scan's state: which registers are free, which values are in one, and
-/// the instructions emitted so far in the open block.
-struct Scan<'a, 'm, B: IsaBackend> {
-    frame: &'m Frame,
-    lives: &'a [Life],
-    /// The parameters of every block, which a branch's arguments are stored to.
-    params: BTreeMap<Label, Vec<ValueName>>,
+/// the instructions placed so far.
+struct Scan<'f, 'm, B: IsaBackend> {
+    frame: &'f mut Frame,
+    lives: Vec<Life>,
+    /// The position of every read, by value and then by position.
+    reads: Vec<usize>,
+    /// Each block's index and parameters, by label: what a branch's arguments
+    /// are stored to.
+    blocks_at: BTreeMap<Label, (usize, Vec<ValueName>)>,
     /// The leases nothing holds, by file.
     free: [Vec<Lent<'m, B>>; 4],
     /// The values in a register, by id.
     held: BTreeMap<u64, Lent<'m, B>>,
+    /// The values the instruction being placed reads or defines: the ones
+    /// eviction leaves alone.
+    pinned: Vec<u64>,
     /// The next value id the allocator mints.
     next: u64,
-    out: Vec<Emitted<'m, B>>,
-    /// Whether an instruction placed so far asked for the frame's size, which
-    /// only `Enter` and `Ret` do.
-    framed: bool,
+    /// Where each value is defined: a block, and an index into its records.
+    defined: Vec<Option<(usize, usize)>>,
+    /// The instructions placed so far, by block.
+    records: Vec<Vec<Record<B>>>,
+    /// The stores of evicted values, by the block and index of the definition
+    /// each follows.
+    late: BTreeMap<(usize, usize), Vec<Record<B>>>,
+    /// The register number of every operand of every record, in operand order;
+    /// zero where the operand is not a register.
+    numbers: Vec<u8>,
     /// Where the scan is, for what it says when a function cannot be allocated.
     at: Label,
+    block: usize,
     position: usize,
 }
 
+/// `$body` with `$class` standing for the spillable class `$id` names.
+macro_rules! of_class {
+    ($id:expr, $class:ident => $body:expr) => {
+        match $id {
+            ClassId::Vector => {
+                type $class = Vector;
+                $body
+            }
+            ClassId::Pointer => {
+                type $class = Pointer;
+                $body
+            }
+            ClassId::Integer => {
+                type $class = Integer;
+                $body
+            }
+            ClassId::Opmask => {
+                type $class = Opmask;
+                $body
+            }
+            ClassId::Flags => unreachable!("the flags are not stored"),
+        }
+    };
+}
+
 impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
-    /// One selected instruction: its branch arguments stored, its reads
-    /// reloaded, itself, its writes stored.
-    fn instruction(&mut self, pushed: Pushed<B::Inst<Selected>>, entry: &[ValueName; 3]) {
+    /// One selected instruction: its reads in registers, its branch arguments
+    /// stored, itself, and the registers it is done with returned.
+    fn instruction(&mut self, pushed: Pushed<B::Inst<Selected>>) -> Result<(), CompileError> {
         let targets: Vec<&Target> = pushed
             .operands
             .iter()
@@ -389,41 +562,40 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
             })
             .collect();
         self.refuse_overlapping_moves(&targets);
-        for target in targets {
-            self.pass(target);
+        for target in &targets {
+            assert!(
+                self.blocks_at[&target.label].0 <= self.block + 1,
+                "{:?} branches to {:?}, past a block: a forward join, which arrives with B9",
+                self.at,
+                target.label
+            );
         }
-        for operand in &pushed.operands {
-            let Operand::Reg { value, access } = operand else {
-                continue;
-            };
-            if access.reads() && !self.held.contains_key(&value.id) {
-                self.reload_into(*value);
-            }
-        }
-        let mut written: Vec<ValueName> = pushed
+        let reads: Vec<ValueName> = pushed
             .operands
             .iter()
             .filter_map(|operand| match operand {
-                Operand::Reg { value, access } if !access.reads() => Some(*value),
+                Operand::Reg { value, access } if access.reads() => Some(*value),
                 Operand::Reg { .. } | Operand::Target(_) | Operand::Frame(_) => None,
             })
+            .chain(
+                targets
+                    .iter()
+                    .flat_map(|target| target.args.iter().copied()),
+            )
             .collect();
-        self.place(pushed, Origin::Selected);
-        if self.position == 0 {
-            // The ABI's registers are stored just after the frame exists, so
-            // the entry block's first instruction must be the one that makes it.
-            assert!(
-                self.framed,
-                "the entry block's first instruction does not make the frame, so the ABI registers have nowhere to be stored"
-            );
-            written.extend(entry);
-        }
-        for value in written {
-            if let Some(slot) = self.lives.get(value.id as usize).and_then(|l| l.slot) {
-                self.store(value, slot);
+        self.pinned.clear();
+        self.pinned.extend(reads.iter().map(|read| read.id));
+        for read in reads {
+            if !self.held.contains_key(&read.id) {
+                self.reload_into(read)?;
             }
         }
-        self.release();
+        for target in targets {
+            self.pass(target)?;
+        }
+        self.emit(pushed, Origin::Selected)?;
+        self.release_dead();
+        Ok(())
     }
 
     /// Arguments are moved one at a time, through the parameters' slots, which
@@ -435,7 +607,7 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
             for arg in &target.args {
                 if let Some(other) = targets
                     .iter()
-                    .find(|other| self.params[&other.label].contains(arg))
+                    .find(|other| self.blocks_at[&other.label].1.contains(arg))
                 {
                     panic!(
                         "{arg:?} is passed to {:?} and is a parameter of {:?}, whose slot an earlier move of the same branch overwrites",
@@ -446,26 +618,27 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
         }
     }
 
-    /// Store each of `target`'s arguments to its parameter's slot.
-    fn pass(&mut self, target: &Target) {
-        let params = self.params[&target.label].clone();
-        for (arg, param) in target.args.iter().zip(&params) {
-            let Some(home) = self.lives[param.id as usize].slot else {
+    /// Store each of `target`'s arguments, which are in registers, to its
+    /// parameter's slot. A parameter nothing reads has none.
+    fn pass(&mut self, target: &Target) -> Result<(), CompileError> {
+        let params = self.blocks_at[&target.label].1.clone();
+        for (&arg, param) in target.args.iter().zip(&params) {
+            if !self.lives[param.id as usize].read {
                 continue;
-            };
-            let from = self.lives[arg.id as usize]
-                .slot
-                .expect("an argument is read, so it has a slot");
-            let moved = self.reload(arg.class, from);
-            self.store(moved, home);
-            let lent = self.held.remove(&moved.id).expect("a reload is held");
-            self.free[lent.file() as usize].push(lent);
+            }
+            let slot = self.slot(*param)?;
+            self.lives[param.id as usize].stored = true;
+            for pushed in self.spill_of(arg, slot) {
+                self.emit(pushed, Origin::Spill)?;
+            }
         }
+        Ok(())
     }
 
     /// Make `value` resident: reload it from its slot, into the register the
-    /// instruction will read it from.
-    fn reload_into(&mut self, value: ValueName) {
+    /// instruction will read it from. It stays there until something needs
+    /// the register.
+    fn reload_into(&mut self, value: ValueName) -> Result<(), CompileError> {
         assert_ne!(
             value.class,
             ClassId::Flags,
@@ -473,100 +646,190 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
             self.position,
             self.at
         );
-        let slot = self.lives[value.id as usize]
+        let life = &self.lives[value.id as usize];
+        let slot = life
             .slot
-            .expect("a value that is read has a slot");
-        let reloaded = self.reload(value.class, slot);
-        let lent = self.held.remove(&reloaded.id).expect("a reload is held");
+            .filter(|_| life.stored)
+            .unwrap_or_else(|| panic!("{value:?} is read while in no register and in no slot"));
+        let mut insts = Vec::new();
+        let mut spiller = Spiller::<B>::new(&mut self.next, &mut insts);
+        let slot = self.frame.slot(slot);
+        let fresh = of_class!(value.class, C => B::reload::<C>(&mut spiller, slot).name());
+        for pushed in insts {
+            self.emit(pushed, Origin::Reload)?;
+        }
+        let lent = self.held.remove(&fresh.id).expect("a reload is held");
         self.held.insert(value.id, lent);
+        Ok(())
     }
 
-    /// Insert the load of `slot` into a fresh value of `class`, held.
-    fn reload(&mut self, class: ClassId, slot: SlotName) -> ValueName {
-        let frame = self.frame;
+    /// The instructions that store `value`, which is in a register, to `slot`.
+    fn spill_of(&mut self, value: ValueName, slot: SlotName) -> Vec<Pushed<B::Inst<Selected>>> {
         let mut insts = Vec::new();
         let mut spiller = Spiller::<B>::new(&mut self.next, &mut insts);
-        let slot = frame.slot(slot);
-        let fresh = match class {
-            ClassId::Vector => B::reload::<Vector>(&mut spiller, slot).name(),
-            ClassId::Pointer => B::reload::<Pointer>(&mut spiller, slot).name(),
-            ClassId::Integer => B::reload::<Integer>(&mut spiller, slot).name(),
-            ClassId::Opmask => B::reload::<Opmask>(&mut spiller, slot).name(),
-            ClassId::Flags => unreachable!("the flags are not stored"),
+        let slot = self.frame.slot(slot);
+        of_class!(value.class, C => B::spill::<C>(&mut spiller, value.typed(), slot));
+        insts
+    }
+
+    /// `value`'s slot, leasing a vector value's now.
+    fn slot(&mut self, value: ValueName) -> Result<SlotName, CompileError> {
+        let life = &mut self.lives[value.id as usize];
+        if let Some(slot) = life.slot {
+            return Ok(slot);
+        }
+        assert_eq!(
+            life.class,
+            ClassId::Vector,
+            "{value:?} is stored, and the narrow region was laid out for the values that are read"
+        );
+        assert!(
+            (life.from..=life.last).contains(&self.position),
+            "{value:?} is stored at {}, outside its span {}..={}",
+            self.position,
+            life.from,
+            life.last
+        );
+        let slot = self.frame.lease_vector(life.from..=life.last)?;
+        life.slot = Some(slot);
+        Ok(slot)
+    }
+
+    /// Store `value`, which is in its defining register, right after its
+    /// definition, unless that is done.
+    fn store_at_definition(&mut self, value: u64) -> Result<(), CompileError> {
+        let life = &self.lives[value as usize];
+        if life.stored {
+            return Ok(());
+        }
+        let name = ValueName {
+            id: value,
+            class: life.class,
         };
-        for pushed in insts {
-            self.place(pushed, Origin::Reload);
+        let slot = self.slot(name)?;
+        self.lives[value as usize].stored = true;
+        let at = self.defined[value as usize].expect("a value in a register was defined");
+        let number = self.held[&value].number();
+        for pushed in self.spill_of(name, slot) {
+            // The register `value` is in is the only one such a store may
+            // name: the point it follows is behind the scan.
+            let regs = self.numbers.len();
+            for operand in &pushed.operands {
+                self.numbers.push(match operand {
+                    Operand::Reg { value: read, .. } => {
+                        assert_eq!(
+                            read.id, value,
+                            "the store of {value} after its definition needs a register at a point the scan has left"
+                        );
+                        number
+                    }
+                    Operand::Target(_) | Operand::Frame(_) => 0,
+                });
+            }
+            self.late.entry(at).or_default().push(Record {
+                pushed,
+                origin: Origin::Spill,
+                regs,
+            });
         }
-        fresh
+        Ok(())
     }
 
-    /// Insert the store of `value`, which is held, to `slot`.
-    fn store(&mut self, value: ValueName, slot: SlotName) {
-        let frame = self.frame;
-        let mut insts = Vec::new();
-        let mut spiller = Spiller::<B>::new(&mut self.next, &mut insts);
-        let slot = frame.slot(slot);
-        match value.class {
-            ClassId::Vector => B::spill::<Vector>(&mut spiller, value.typed(), slot),
-            ClassId::Pointer => B::spill::<Pointer>(&mut spiller, value.typed(), slot),
-            ClassId::Integer => B::spill::<Integer>(&mut spiller, value.typed(), slot),
-            ClassId::Opmask => B::spill::<Opmask>(&mut spiller, value.typed(), slot),
-            ClassId::Flags => unreachable!("the flags are not stored"),
+    /// Drop every value from its register, storing the ones not yet stored:
+    /// what a loop head expects of the state it is entered in.
+    fn flush(&mut self) -> Result<(), CompileError> {
+        for id in self.held.keys().copied().collect::<Vec<_>>() {
+            self.store_at_definition(id)?;
+            let lent = self.held.remove(&id).expect("the key was just read");
+            self.free[lent.file() as usize].push(lent);
         }
-        for pushed in insts {
-            self.place(pushed, Origin::Spill);
-        }
+        Ok(())
     }
 
-    /// The free lease of the lowest number in `class`'s file.
-    fn take(&mut self, class: ClassId) -> Lent<'m, B> {
-        let bank = &mut self.free[class.file() as usize];
+    /// The first position after this one that reads `value`.
+    fn next_read(&self, value: u64) -> Option<usize> {
+        let own = &self.reads[self.lives.get(value as usize)?.reads.clone()];
+        own.get(own.partition_point(|&p| p <= self.position))
+            .copied()
+    }
+
+    /// A free lease of `class`'s file, the lowest-numbered; when there is none,
+    /// the one the cheapest value gives up.
+    fn acquire(&mut self, class: ClassId) -> Result<Lent<'m, B>, CompileError> {
+        let file = class.file();
+        if self.free[file as usize].is_empty() {
+            self.evict(file)?;
+        }
+        let bank = &mut self.free[file as usize];
         let lowest = bank
             .iter()
             .enumerate()
             .min_by_key(|(_, lent)| lent.number())
-            .map(|(i, _)| i);
-        let Some(i) = lowest else {
-            panic!(
-                "instruction {} of {:?} holds more {:?} registers than the file has",
-                self.position,
-                self.at,
-                class.file()
-            )
-        };
-        bank.swap_remove(i)
+            .map(|(i, _)| i)
+            .expect("eviction frees a register or panics");
+        Ok(bank.swap_remove(lowest))
     }
 
-    /// Bind `pushed`: its writes take free leases, its reads are already held,
-    /// and a tied write is left in its read's register.
-    fn place(&mut self, pushed: Pushed<B::Inst<Selected>>, origin: Origin) {
-        let Pushed { inst, operands } = pushed;
-        let origin = match origin {
-            Origin::Selected if B::rematerializable(&inst) => Origin::Remat,
-            other => other,
+    /// Free a register of `file`: the one whose value costs the least to give
+    /// up, which is stored first if the slot does not hold it.
+    ///
+    /// # Panics
+    /// When every register of the file holds a value the instruction needs, or
+    /// the file is the flags, which cannot be stored.
+    fn evict(&mut self, file: FileId) -> Result<(), CompileError> {
+        let rank = |id: u64| {
+            let store = match self.lives[id as usize].stored {
+                true => Store::NotNeeded,
+                false => Store::Needed,
+            };
+            let distance = self.next_read(id).map(|next| next - self.position);
+            (EvictionRank::new(ReadHere::No, store, distance), id)
         };
-        for operand in &operands {
+        let victim = self
+            .held
+            .iter()
+            .filter(|(id, lent)| {
+                lent.file() == file
+                    && file != FileId::Flags
+                    && (**id as usize) < self.lives.len()
+                    && !self.pinned.contains(id)
+            })
+            .map(|(&id, _)| rank(id))
+            .min();
+        let Some((_, victim)) = victim else {
+            panic!(
+                "instruction {} of {:?} holds more {file:?} registers than the file has",
+                self.position, self.at
+            )
+        };
+        self.store_at_definition(victim)?;
+        let lent = self.held.remove(&victim).expect("the victim is held");
+        self.free[file as usize].push(lent);
+        Ok(())
+    }
+
+    /// Place `pushed`, whose reads are in registers. A write takes a free
+    /// lease, or one an eviction frees; a plain write may take the lease of a
+    /// read that is dead after a selected instruction; a tied write takes its
+    /// read's, after a copy if the read is read again.
+    fn emit(
+        &mut self,
+        pushed: Pushed<B::Inst<Selected>>,
+        origin: Origin,
+    ) -> Result<(), CompileError> {
+        let first = self.numbers.len();
+        self.numbers.resize(first + pushed.operands.len(), 0);
+        let operands = &pushed.operands;
+        for (k, operand) in operands.iter().enumerate() {
             if let Operand::Reg {
                 value,
-                access: Access::Write | Access::Early,
+                access: Access::Read,
             } = operand
             {
-                let lent = self.take(value.class);
-                assert!(
-                    self.held.insert(value.id, lent).is_none(),
-                    "{value:?} is defined while in a register"
-                );
+                self.numbers[first + k] = self.held[&value.id].number();
             }
         }
-        let mut binding = Binding {
-            frame: self.frame,
-            held: &self.held,
-            size: self.frame.bytes(),
-            framed: false,
-        };
-        let inst = B::walk::<Bound<'m, B>>(&inst, &mut binding);
-        self.framed |= binding.framed;
-        for operand in &operands {
+        for (k, operand) in operands.iter().enumerate() {
             let Operand::Reg {
                 value,
                 access: Access::Tied { read },
@@ -574,72 +837,184 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
             else {
                 continue;
             };
-            let Operand::Reg { value: read, .. } = &operands[*read] else {
+            let Operand::Reg { value: tied, .. } = operands[*read] else {
                 unreachable!("a tie names a register operand")
             };
-            let lent = self.held.remove(&read.id).expect("a tied read is held");
+            let lent = match self.next_read(tied.id) {
+                None => self.held.remove(&tied.id).expect("a tied read is held"),
+                Some(_) => self.copy_of(tied)?,
+            };
+            self.numbers[first + read] = lent.number();
+            self.numbers[first + k] = lent.number();
+            self.pinned.push(value.id);
             self.held.insert(value.id, lent);
         }
-        self.out.push(Emitted { inst, origin });
-    }
-
-    /// Return the leases the instruction is done with. A flags value that is
-    /// read later keeps its lease.
-    fn release(&mut self) {
-        for (id, lent) in core::mem::take(&mut self.held) {
-            let pending = self
-                .lives
-                .get(id as usize)
-                .is_some_and(|life| life.class == ClassId::Flags && life.last > self.position);
-            match pending {
-                true => {
-                    self.held.insert(id, lent);
-                }
-                false => self.free[lent.file() as usize].push(lent),
+        for (k, operand) in operands.iter().enumerate() {
+            if let Operand::Reg {
+                value,
+                access: Access::Early,
+            } = operand
+            {
+                self.write(*value, first + k)?;
             }
         }
+        if origin == Origin::Selected {
+            for operand in operands {
+                let Operand::Reg {
+                    value,
+                    access: Access::Read,
+                } = operand
+                else {
+                    continue;
+                };
+                if self.next_read(value.id).is_some() {
+                    continue;
+                }
+                if let Some(lent) = self.held.remove(&value.id) {
+                    self.free[lent.file() as usize].push(lent);
+                }
+            }
+        }
+        for (k, operand) in operands.iter().enumerate() {
+            if let Operand::Reg {
+                value,
+                access: Access::Write,
+            } = operand
+            {
+                self.write(*value, first + k)?;
+            }
+        }
+        if origin == Origin::Selected {
+            let at = (self.block, self.records[self.block].len());
+            for operand in operands {
+                let Operand::Reg { value, access } = operand else {
+                    continue;
+                };
+                if !access.reads() {
+                    self.defined[value.id as usize] = Some(at);
+                }
+            }
+        }
+        let origin = match origin {
+            Origin::Selected if B::rematerializable(&pushed.inst) => Origin::Remat,
+            other => other,
+        };
+        self.records[self.block].push(Record {
+            pushed,
+            origin,
+            regs: first,
+        });
+        Ok(())
+    }
+
+    /// Define `value` in a register, recording its number at `at`.
+    fn write(&mut self, value: ValueName, at: usize) -> Result<(), CompileError> {
+        let lent = self.acquire(value.class)?;
+        self.numbers[at] = lent.number();
+        self.pinned.push(value.id);
+        assert!(
+            self.held.insert(value.id, lent).is_none(),
+            "{value:?} is defined while in a register"
+        );
+        Ok(())
+    }
+
+    /// A copy of `value` in a fresh register: the lease it holds.
+    fn copy_of(&mut self, value: ValueName) -> Result<Lent<'m, B>, CompileError> {
+        let mut insts = Vec::new();
+        let mut spiller = Spiller::<B>::new(&mut self.next, &mut insts);
+        let copy = of_class!(value.class, C => B::copy::<C>(&mut spiller, value.typed()).name());
+        for pushed in insts {
+            self.emit(pushed, Origin::Copy)?;
+        }
+        Ok(self.held.remove(&copy.id).expect("a copy is held"))
+    }
+
+    /// Return the leases of the values that nothing reads again. Only a value
+    /// the instruction read or defined can have just become one: the pinned.
+    fn release_dead(&mut self) {
+        for &id in &self.pinned {
+            if self.next_read(id).is_some() {
+                continue;
+            }
+            if let Some(lent) = self.held.remove(&id) {
+                self.free[lent.file() as usize].push(lent);
+            }
+        }
+        debug_assert!(
+            self.held.keys().all(|&id| self.next_read(id).is_some()),
+            "a value nothing reads again is held past the instruction that last touched it"
+        );
     }
 }
 
-/// How an instruction is bound: each operand becomes the token of the lease
-/// its value holds.
+/// How the records are bound once the scan is over: each operand becomes the
+/// token of the lease the scan recorded for it.
 struct Binding<'a, 'm, B: IsaBackend> {
     frame: &'m Frame,
-    held: &'a BTreeMap<u64, Lent<'m, B>>,
-    size: u64,
+    /// Every lease, by file and number.
+    bank: [BTreeMap<u8, Lent<'m, B>>; 4],
+    /// The register number of every operand of every record.
+    numbers: &'a [u8],
+    /// The operand being bound.
+    next: usize,
     /// Whether the instruction asked for the frame's size.
     framed: bool,
 }
 
-impl<'a, 'm, B: IsaBackend> Binding<'a, 'm, B> {
-    fn lent(&self, value: ValueName) -> &'a Lent<'m, B> {
-        self.held
-            .get(&value.id)
-            .unwrap_or_else(|| panic!("{value:?} is bound while in no register"))
+impl<'m, B: IsaBackend> Binding<'_, 'm, B> {
+    /// `record`, bound.
+    fn record(&mut self, record: &Record<B>) -> Emitted<'m, B> {
+        self.next = record.regs;
+        self.framed = false;
+        Emitted {
+            inst: B::walk::<Bound<'m, B>>(&record.pushed.inst, self),
+            origin: record.origin,
+        }
+    }
+
+    /// The lease of the next operand, a register of `C`'s file.
+    fn lent<C: Class>(&mut self) -> &Lent<'m, B> {
+        let number = self.numbers[self.next];
+        self.next += 1;
+        self.bank[C::File::ID as usize]
+            .get(&number)
+            .unwrap_or_else(|| panic!("register {number} is in no lease of {:?}", C::File::ID))
     }
 }
 
 impl<'m, B: IsaBackend> Rebind<Bound<'m, B>> for Binding<'_, 'm, B> {
-    fn read<C: Class>(&mut self, v: Value<C>) -> In<'m, B, C> {
-        C::File::lease(self.lent(v.name())).read()
+    fn read<C: Class>(&mut self, _: Value<C>) -> In<'m, B, C> {
+        C::File::lease(self.lent::<C>()).read()
     }
-    fn write<C: Class>(&mut self, d: &build::Def<C>) -> Out<'m, B, C> {
-        C::File::lease(self.lent(d.value().name())).write()
+    fn write<C: Class>(&mut self, _: &build::Def<C>) -> Out<'m, B, C> {
+        C::File::lease(self.lent::<C>()).write()
     }
-    fn early<C: Class>(&mut self, d: &build::Early<C>) -> Out<'m, B, C> {
-        C::File::lease(self.lent(d.value().name())).write()
+    fn early<C: Class>(&mut self, _: &build::Early<C>) -> Out<'m, B, C> {
+        C::File::lease(self.lent::<C>()).write()
     }
-    fn tie<C: Class>(&mut self, t: &build::Tie<C>) -> InOut<'m, B, C> {
-        C::File::lease(self.lent(t.read().name())).tie()
+    fn tie<C: Class>(&mut self, _: &build::Tie<C>) -> InOut<'m, B, C> {
+        let write = self.numbers[self.next + 1];
+        let lent = self.lent::<C>();
+        assert_eq!(
+            lent.number(),
+            write,
+            "a tie's write is in its read's register"
+        );
+        let tie = C::File::lease(lent).tie();
+        self.next += 1;
+        tie
     }
     fn slot(&mut self, s: SlotName) -> &'m FrameSlot {
+        self.next += 1;
         self.frame.slot(s)
     }
     fn target(&mut self, t: &Target) -> Label {
+        self.next += 1;
         t.label
     }
     fn frame_size(&mut self) -> u64 {
         self.framed = true;
-        self.size
+        self.frame.bytes()
     }
 }

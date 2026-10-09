@@ -332,10 +332,11 @@
   reload targets are per-instruction roles.
 - **Lives:** `Where::{Spilled, Remat}`, `LinearScan`
   (`pixelflow-codegen/src/emit/regalloc/mod.rs`); escape-hatches step 2 and the
-  2026-09-05 block. The selection pipeline's first allocator,
-  `regalloc::local::allocate`, is this taken to its limit: every value is
-  stored at its definition and reloaded at every read, so nothing is in a
-  register across an instruction but a `Flags` value.
+  2026-09-05 block. The selection pipeline's allocator,
+  `regalloc::local::allocate`, does this one value at a time: a value stays in
+  its register until the register is needed, the cheapest to give up by
+  `EvictionRank` goes, and its store is placed after its definition when it is
+  first evicted. A loop head still flushes every live value to its slot.
 
 ### Slot. Homonym
 

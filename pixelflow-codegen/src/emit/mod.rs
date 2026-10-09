@@ -988,7 +988,6 @@ trait IsaBackend: Sized + 'static {
     fn ret(b: &mut build::Builder<Self>);
 
     // The allocator's own instructions.
-    #[expect(dead_code, reason = "live from B5")]
     fn copy<C: Spill>(b: &mut build::Spiller<'_, Self>, src: Value<C>) -> Value<C>;
     /// Store `src` to `slot`. When `slot.offset()` does not encode: the slot's
     /// address into a fresh `Pointer`, then the store through it.
