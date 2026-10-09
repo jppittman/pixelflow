@@ -1489,12 +1489,12 @@ Every commit in this phase is live in production.
 #### A12a / A12b: aarch64's instructions are values
 
 - **Files:** `aarch64/table.rs`, `aarch64.rs`.
-- **A12a:** the `table.rs` encoding structs, which are already generic in their register types (`Binary<OPCODE, D, L, R>`, `table.rs:225`), are instantiated at `Physical`. A named-field `aarch64::Inst<S>` replaces the 41 positional variants (`aarch64.rs:41`).
+- **A12a:** a named-field `aarch64::Inst<S>` replaces the 41 positional variants (`aarch64.rs:41`) and the `table.rs` encoding structs, which were one const-generic struct per opcode (`Binary<OPCODE, D, L, R>`, `table.rs:225`). Instantiating each at `Physical` would have kept a type per instruction; the operation enums `Alu` and `Lanewise` (the opcode is the discriminant, as `x86_64::Alu`'s `vex()` is the bytes) and one arm per shape are smaller. `Mem<S>` and `MemIndexed<S>` take their registers by class. `SReg` is deleted: the `s` view of a vector register was a wrapper no instruction needed. `AddImm` and `SubImm` are A12a's, not A12b's: `frame_alloc`, `emit_ret` and `address_in_ip0` need them as single instructions already. The IP0 path stays inside `emit_into` (`Mem::near`) until A12b makes the driver call it.
 - **A12b:** the sequences:
   - `FmovToGp { dst: Write<Integer>, src }`;
   - `MvnW { dst: Tie<Integer> }`;
   - `CbzFar { test, taken, next }` (an `imm26` field);
-  - `AddImm`, `AdrpAdd`, `InsFirst`, `InsLane { v: Tie<Vector> }`, `St1Lane { base: Tie<Pointer> }`.
+  - `AdrpAdd`, `InsFirst`, `InsLane { v: Tie<Vector> }`, `St1Lane { base: Tie<Pointer> }`.
 
   `address_in_ip0` is called explicitly by the legacy driver, with `X16` written in.
 - **Bytes:** identical.
