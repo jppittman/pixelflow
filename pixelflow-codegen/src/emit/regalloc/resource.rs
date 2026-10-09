@@ -7,7 +7,6 @@
 //! these are resources and move.
 #![expect(dead_code, reason = "live from B4")]
 
-use crate::emit::storage::MAX_FRAME;
 use crate::emit::{
     Class, ClassId, File, FlagsFile, GeneralFile, IsaBackend, OpmaskFile, VectorFile,
 };
@@ -17,6 +16,14 @@ use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::ops::Deref;
+
+/// The largest frame a kernel may lay out. [`Frame::lease`] refuses a vector
+/// slot past it, and the nest's layout refuses the whole frame (spills, fold
+/// roots and parks) past it, so every slot offset is below it by construction.
+pub(in crate::emit) const MAX_FRAME: u32 = 2 * 1024 * 1024;
+
+/// Why a frame was refused for passing [`MAX_FRAME`].
+pub(in crate::emit) const FRAME_OVERFLOW: &str = "spill frame overflow: exceeds 2MB stack limit";
 
 /// A physical register of file `F` on backend `B`. A resource, not a name.
 ///
@@ -75,7 +82,7 @@ impl<B: IsaBackend> Pool<B> {
 pub(super) struct Lease<'m, B: IsaBackend, F: File>(&'m Reg<B, F>);
 
 impl<'m, B: IsaBackend, F: File> Lease<'m, B, F> {
-    pub(super) fn number(&self) -> u8 {
+    fn number(&self) -> u8 {
         self.0.number
     }
 
@@ -128,14 +135,15 @@ impl<'m, B: IsaBackend> Leases<'m, B> {
             let at = general
                 .iter()
                 .position(|lease| lease.number() == number)
-                .expect("RegisterFile::checked proves each entry register is a general member");
+                .expect("RegisterFile::new proves each entry register is a general member");
             general.remove(at)
         }
         let mut general = all(&pool.general);
+        let abi = B::FILE.entry();
         let entry = EntryLeases {
-            ctx: take(&mut general, B::FILE.entry.ctx),
-            out: take(&mut general, B::FILE.entry.out),
-            pitch: take(&mut general, B::FILE.entry.pitch),
+            ctx: take(&mut general, abi.ctx),
+            out: take(&mut general, abi.out),
+            pitch: take(&mut general, abi.pitch),
         };
         Self {
             vector: all(&pool.vector),
@@ -216,9 +224,10 @@ impl SlotLease {
 
 /// Bytes of a narrow slot: a `Pointer`, an `Integer` or an `Opmask`.
 const NARROW_BYTES: u64 = 8;
-/// The most narrow slots: an `ldr x, [sp, #imm12·8]` on aarch64 reaches slot
-/// 4095, and one bound serves every target.
-const MAX_NARROW_SLOTS: u64 = 4095;
+/// The most narrow slots: an `ldr x, [sp, #imm12·8]` on aarch64 reaches
+/// `imm12` 0 through 4095, which is 4096 slots, and one bound serves every
+/// target.
+const MAX_NARROW_SLOTS: u64 = 4096;
 /// The stack pointer's alignment, on both ABIs.
 const SP_ALIGN: u64 = 16;
 
@@ -317,9 +326,7 @@ impl Frame {
                 None => {
                     let offset = self.vector_end();
                     if offset + self.vector_bytes > u64::from(MAX_FRAME) {
-                        return Err(CompileError::BudgetExceeded(
-                            "spill frame overflow: exceeds 2MB stack limit",
-                        ));
+                        return Err(CompileError::BudgetExceeded(FRAME_OVERFLOW));
                     }
                     self.mint(offset, self.vector_bytes)
                 }

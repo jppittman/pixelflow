@@ -552,7 +552,7 @@
 ### Branch
 
 - **Is:** "A branch is an ordinary instruction": `Gp::Jmp { to }` and
-  `Gp::Jcc { cond, flags, taken, next }` and `Gp::Fallthrough` on x86; `B`, `BCond` and `CbzFar` on
+  `Gp::Jcc { cond, flags, taken, next }` and `Gp::Fallthrough` on x86; `B` and `CbzFar` on
   aarch64. The condition is the opcode's own field (`Cond`, whose
   discriminants are the manual's values).
 - **Is not:** something that returns a position. Not hand-picked mnemonics

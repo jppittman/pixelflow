@@ -209,7 +209,7 @@ allocate : machine function over values → machine function over registers and 
 **The allocator writes its own code.**
 
 - It asks the backend for a copy, a spill or a reload at the slot it chose. When the offset does not encode, the backend answers with address arithmetic over a fresh `Pointer` value, which the allocator allocates on the spot.
-- The frame lays out the narrow classes (`Pointer`, `Integer`, `Opmask`, 8 bytes each) first, sized from their peak live count. So every narrow slot encodes on every backend: x86 `disp32` and aarch64's scaled `imm12` (4,095 × 8 bytes).
+- The frame lays out the narrow classes (`Pointer`, `Integer`, `Opmask`, 8 bytes each) first, sized from their peak live count. So every narrow slot encodes on every backend: x86 `disp32` and aarch64's scaled `imm12` (4,096 slots of 8 bytes).
 - The vector region starts at `align_up(8·N, max(16, vector_bytes))`.
 - Therefore:
   - a narrow spill never needs a temporary;
@@ -221,7 +221,7 @@ allocate : machine function over values → machine function over registers and 
 
 **Allocation is total.**
 
-- It returns `Err(BudgetExceeded)` when the frame outgrows `MAX_FRAME`, or when the narrow region would pass 4,095 slots.
+- It returns `Err(BudgetExceeded)` when the frame outgrows `MAX_FRAME`, or when the narrow region would pass 4,096 slots.
 - It panics, naming the instruction, when the function cannot be allocated: for example, an instruction that holds more registers of a class than the class has. That is a selection bug, never a fact about a kernel.
 - It never picks a register outside its leases.
 
@@ -432,25 +432,24 @@ The typed guarantee is therefore: one lease per register per allocation, and eve
 /// port would change these files, because Win64 callee-saves `xmm6–15`.
 #[derive(Copy, Clone, Debug)]
 pub(in crate::emit) struct RegisterFile {
-    pub vector: &'static [u8],
-    pub general: &'static [u8],
-    pub opmask: &'static [u8],
-    pub flags: &'static [u8],
+    members: Members,            // { vector, general, opmask, flags: &'static [u8] }
     /// Members of `general` the three arguments arrive in. This is initial
     /// ownership, not a reservation: once a parameter is dead or spilled, its
     /// register is free.
-    pub entry: EntryRegisters,   // { ctx: u8, out: u8, pitch: u8 }
+    entry: EntryRegisters,       // { ctx: u8, out: u8, pitch: u8 }
     /// Bytes per `Vector` register and per vector frame slot: 16, 32 or 64.
-    pub vector_bytes: u64,
+    vector_bytes: u64,
 }
 impl RegisterFile {
-    /// Refuse a self-contradictory declaration at compile time:
+    /// The only constructor, so a `RegisterFile` that is not checked cannot
+    /// exist (the fields are private to `register_file.rs`). `const`, so a
+    /// contradictory `FILE` does not compile. Refuses:
     /// - no file names a member twice (the files are numbered separately, so
     ///   `rax` and `ymm0` are both 0);
     /// - `entry` names three distinct `general` members;
     /// - `flags` has at most one member;
     /// - `vector_bytes` a power of two, at least 16.
-    pub(in crate::emit) const fn checked(self) -> Self;
+    pub(in crate::emit) const fn new(members: Members, entry: EntryRegisters, vector_bytes: u64) -> Self;
 }
 ```
 
@@ -499,7 +498,7 @@ pub(super) struct SlotLease { name: SlotName }
 /// - **Layout.** The narrow region (`Pointer`, `Integer`, `Opmask`; 8 bytes
 ///   each) occupies `[0, 8·N)`, where `N` is the peak number of
 ///   simultaneously live narrow values, measured by the allocator before the
-///   scan. `N > 4095` is `BudgetExceeded`.
+///   scan. `N > 4096` is `BudgetExceeded` (`ldr x, [sp, #imm12·8]` reaches `imm12` 0 through 4095, which is 4096 slots).
 /// - The vector region starts at `align_up(8·N, max(16, vector_bytes))` and
 ///   grows as the scan mints slots, lowest free first.
 /// - The frame's size is the vector region's high-water mark, or the narrow
@@ -666,8 +665,9 @@ Named fields stop selection or encoding from swapping `a` and `b` of a `vsubps` 
 
 ```rust
 /// One operand, as the allocator and the CFG read it. Produced by
-/// `operands`, a fold over `IsaBackend::walk`. Computed once per instruction
-/// into the allocator's operand table, never per query.
+/// `operands`, a fold over `IsaBackend::walk`. Computed once per instruction,
+/// by `Builder::push`, and kept beside the instruction (`Pushed::operands`) for
+/// the allocator, never per query.
 pub(in crate::emit) enum Operand {
     Reg { value: ValueName, access: Access },
     /// A branch target and the arguments it passes. A block's successors are
@@ -786,6 +786,13 @@ pub(in crate::emit) fn assemble<I>(
 ### 2.9 Functions, blocks, the builder
 
 ```rust
+pub(in crate::emit) struct Pushed<I> {
+    pub inst: I,
+    /// `operands(&inst)`, computed once by `push`. An entry cannot hold an
+    /// instruction without its list, and `Block<Placed>` carries none.
+    pub operands: Vec<Operand>,
+}
+
 pub(in crate::emit) struct Block<I> {
     pub label: Label,
     /// Values defined on entry: what a phi is.
@@ -839,7 +846,7 @@ pub(in crate::emit) struct Constant { pub label: Label, pub offset: u64 }
 ///   Join invariant 2 takes its location from the path that defines it.
 /// - No phase inserts a phi for it.
 pub(in crate::emit) struct Function<B: IsaBackend> {
-    pub blocks: Vec<Block<B::Inst<Selected>>>,
+    pub blocks: Vec<Block<Pushed<B::Inst<Selected>>>>,
     pub entry: Entry,
     pub loops: Vec<Loop>,
     pub constants: Constants<B::Constant>,
@@ -863,7 +870,9 @@ impl<B: IsaBackend> Builder<B> {
     /// # Panics
     /// - a write not minted by this builder, or already defined;
     /// - a read of a value not yet defined;
-    /// - a read of a value this same instruction defines.
+    /// - a read of a value this same instruction defines;
+    /// - an `Operand::Frame`: only the instructions the allocator inserts
+    ///   carry a slot.
     pub(in crate::emit) fn push(&mut self, inst: B::Inst<Selected>);
     /// A block to be entered later. Its label is minted now, with it.
     pub(in crate::emit) fn block(&mut self, params: &[ClassId], scope: Scope) -> Pending;
@@ -1049,7 +1058,7 @@ pub(in crate::emit) trait RegisterAllocator {
     /// binding hold, and binding `Enter`/`Ret`'s frame size.
     ///
     /// # Errors
-    /// `BudgetExceeded` when the narrow region passes 4,095 slots or the frame
+    /// `BudgetExceeded` when the narrow region passes 4,096 slots or the frame
     /// passes `MAX_FRAME`.
     ///
     /// # Panics
@@ -1114,7 +1123,7 @@ pub(in crate::emit) enum Origin { Selected, Spill, Reload, Remat, Copy }
 fn compile_on<B: IsaBackend>(scoped: &ScopedSchedule) -> Result<CompileResult, CompileError> {
     let function = select::<B>(scoped)?;
     let pool = Pool::<B>::mint();
-    let mut frame = Frame::empty(B::FILE.vector_bytes);
+    let mut frame = Frame::empty(B::FILE.vector_bytes());
     let allocated = LinearScan.allocate(function, &pool, &mut frame)?;
     let program = allocated.to_asm();          // text: blocks; data: the pool
     let assembled = asm::assemble(&program, |i, out| B::encode(&i.inst, out));
@@ -1173,7 +1182,7 @@ In the new pipeline, none of these is ever written. The legacy code is deleted i
 | H5 | `emit_fmov_imm`'s `w16` path (`aarch64.rs:466-477`) | `movz/movk w16; dup` | Every constant is selected: `movi`, `fmov`, or `ldr q, [p, #off]` | C4 |
 | H6 | `address_in_ip0` (`table.rs:530`), called by `StrQ` (`562`), `LdrQ` (`617`) and `LdrS` (`672`). `LdrS` also serves `emit_uniform_load` (`aarch64.rs:410`) and `index_into`'s slot read (`2269`). `StrX`/`LdrX` panic past `imm12` (`table.rs:589-594`, `644-648`), and `LdrX` serves `Context` (`aarch64.rs:2390-2401`), so a context slot of 4096 or more panics | IP0 as an address, and two panics | Spills: `spill`/`reload` emit `SlotAddr { dst: Write<Pointer>, slot }` (`add t, sp, #hi, lsl 12; add t, t, #lo`); narrow slots always encode. Non-frame loads (`Uniform`, `Context`): selection emits `t = AddImm(base, #hi, lsl 12)`, `ldr [t, #lo]`, and `movz/movk` plus a register `add` past 16 MiB. The binder read is an ordinary reload. One instruction replaces today's chain of `add #4080` | C4 |
 | H7 | `kortestw` bytes hardwiring `k1,k1` (`avx512.rs:647-653`) | An encoder that ignores its register | `KorTest { flags: Write<Flags>, k: Read<Opmask> }` encodes `k.number()` | A11b field; C2 value |
-| H8 | Gather mask `mov eax, 0xFFFF; kmovw k1, eax` (`avx512.rs:749`); `aaa = 001` (`789`); `gpr_temps_for(Gather) = 0` | `rax` and `k1` clobbered, undeclared | `k = KOnes` (`kxnorw k, k, k`: no general register), then `Gather { dst: Early<Vector>, mask: Tie<Opmask> }`. `kxnorw` reads its own operand, and `vgatherdps` writes the mask it gathers under, so a `KOnes` on the previous gather's mask chains each gather behind the last (the `mov`/`kmovw` pair only writes). C2 gives `KOnes` a source nothing writes, or measures the chain | C2 |
+| H8 | Gather mask `mov eax, 0xFFFF; kmovw k1, eax` (`avx512.rs:749`); `aaa = 001` (`789`); `gpr_temps_for(Gather) = 0` | `rax` and `k1` clobbered, undeclared. At HEAD (since P5 and P6): `k1` and `eax` are both declared, `gpr_temps_for(Gather) = 1` and `set_gather_mask` takes the `Gpr`; C2 deletes the sequence | `k = KOnes` (`kxnorw k, k, k`: no general register), then `Gather { dst: Early<Vector>, mask: Tie<Opmask> }`. `kxnorw` reads its own operand, and `vgatherdps` writes the mask it gathers under, so a `KOnes` on the previous gather's mask chains each gather behind the last (the `mov`/`kmovw` pair only writes). C2 gives `KOnes` a source nothing writes, or measures the chain | C2 |
 | H9 | Gather into `temp(1)`, then `vmovaps` (`avx512.rs:1368-1381`) | A temp plus a move standing in for an early def | `dst: S::Early<Vector>`; the move is gone | C2 |
 | H10 | Fold `t0`/`t1` (`mod.rs:1798`); seed through `t0` (`1825-1826`); `acc = if body_result == t0 {…}` (`1881`) | The driver aliasing registers by hand | Seeds are preheader `Target` arguments; the accumulate is `Binary(combine, acc, body)` | B3 |
 | H11 | `test_ge` borrowing the guard's `k` (`mod.rs:1855`; `avx512.rs:1604-1613`) | One mask register serving two roles | `done` is an ordinary compare; its `Opmask` value is its own | B3, C2 |
@@ -1527,7 +1536,7 @@ Every commit in this phase is live in production.
 
 - **Files:** `emit/regalloc/resource.rs` (§2.2, §2.4), `emit/mod.rs` (`File` and its four files, `FileId`, `RegisterFile`, `EntryRegisters`, `Spill`, `Stage::Slot`, `Bound`, `Operand::Frame`, `Rebind::slot`, the trait's `FILE`, `copy`, `spill`, `reload`), `emit/build.rs` (`Spiller`).
 - **Deferred from A9, whose first reader is here:** `File` and its four files, `FileId`, `Spill`, and `Stage::Slot` (the frame slot is a token). Moved here from B1: `Spiller`, `Operand::Frame`, `Rebind::slot`, and the trait's `FILE`, `copy`, `spill` and `reload`.
-- **Tests:** none of its own (§0.6). From B4, the leases and the frame are exercised through `compile`. The narrow region's `BudgetExceeded` is reached by a kernel with more than 4,095 live narrow values, if one can be built through the production API; if none can, the bound is an assertion, not a test.
+- **Tests:** none of its own (§0.6). From B4, the leases and the frame are exercised through `compile`. The narrow region's `BudgetExceeded` is reached by a kernel with more than 4,096 live narrow values, if one can be built through the production API; if none can, the bound is an assertion, not a test.
 - **Status:** `expect(dead_code)` until B4.
 - **Gate:** G.
 

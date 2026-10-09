@@ -72,6 +72,7 @@ mod coverage;
 mod encoded;
 mod executable;
 mod regalloc;
+mod register_file;
 mod storage;
 mod traffic;
 mod x86_64;
@@ -85,6 +86,7 @@ pub use traffic::{EmitTraffic, ScopeTraffic};
 use asm::{Item, Label, Labels, Patch};
 use encoded::EncodedInst;
 use regalloc::resource::{FrameSlot, In, InOut, Out, SlotName};
+use register_file::RegisterFile;
 use storage::{Slot, StackFrame};
 
 use pixelflow_ir::kind::OpKind;
@@ -402,112 +404,6 @@ impl File for FlagsFile {
     const ID: FileId = FileId::Flags;
 }
 
-/// What a backend's register files *are*: the allocatable members of each, by
-/// hardware number, and where the ABI puts the three arguments. Numbers only;
-/// nothing here is a register until `Pool::mint`. It says nothing about what an
-/// instruction needs: selection runs first, so the allocator reads that off
-/// the function.
-///
-/// A register outside every list belongs to the platform or the caller:
-/// callee-saved registers, the stack pointer (the frame's), `x30`, and Apple's
-/// `x18`. None of them is a scratch reservation.
-///
-/// The calling convention is SysV on x86-64 and AAPCS64 on aarch64, because
-/// `executable.rs` builds only for Linux and macOS.
-#[derive(Copy, Clone, Debug)]
-#[expect(dead_code, reason = "live from B3")]
-struct RegisterFile {
-    vector: &'static [u8],
-    general: &'static [u8],
-    opmask: &'static [u8],
-    flags: &'static [u8],
-    /// The members of `general` the three arguments arrive in. This is initial
-    /// ownership, not a reservation: once a parameter is dead or spilled its
-    /// register is free.
-    entry: EntryRegisters,
-    /// Bytes per `Vector` register and per vector frame slot: 16, 32 or 64.
-    vector_bytes: u64,
-}
-
-/// Where the ABI puts the collapse's three arguments.
-#[derive(Copy, Clone, Debug)]
-#[expect(dead_code, reason = "live from B3")]
-struct EntryRegisters {
-    ctx: u8,
-    out: u8,
-    pitch: u8,
-}
-
-#[expect(dead_code, reason = "live from B3")]
-const fn contains(members: &[u8], number: u8) -> bool {
-    let mut i = 0;
-    while i < members.len() {
-        if members[i] == number {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
-
-#[expect(dead_code, reason = "live from B3")]
-const fn distinct(members: &[u8]) -> bool {
-    let mut i = 0;
-    while i < members.len() {
-        let (_, rest) = members.split_at(i + 1);
-        if contains(rest, members[i]) {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
-impl RegisterFile {
-    /// Refuse a self-contradictory declaration at compile time: a file that
-    /// names a register twice, two flags registers, an entry register outside
-    /// `general` or shared by two arguments, a vector narrower than 16 bytes
-    /// or not a power of two.
-    #[expect(dead_code, reason = "live from B3")]
-    const fn checked(self) -> Self {
-        assert!(
-            distinct(self.vector)
-                && distinct(self.general)
-                && distinct(self.opmask)
-                && distinct(self.flags),
-            "a register file names a member twice"
-        );
-        assert!(self.flags.len() <= 1, "there is one flags register");
-        let EntryRegisters { ctx, out, pitch } = self.entry;
-        assert!(
-            contains(self.general, ctx)
-                && contains(self.general, out)
-                && contains(self.general, pitch),
-            "an entry argument arrives in a register outside the general file"
-        );
-        assert!(
-            ctx != out && ctx != pitch && out != pitch,
-            "two entry arguments arrive in one register"
-        );
-        assert!(
-            self.vector_bytes >= 16 && self.vector_bytes.is_power_of_two(),
-            "a vector is a power of two bytes, at least 16"
-        );
-        self
-    }
-
-    /// The numbers of the members of `file`.
-    #[expect(dead_code, reason = "live from B4")]
-    fn members(&self, file: FileId) -> &'static [u8] {
-        match file {
-            FileId::Vector => self.vector,
-            FileId::General => self.general,
-            FileId::Opmask => self.opmask,
-            FileId::Flags => self.flags,
-        }
-    }
-}
-
 /// A [`Class`] as data.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ClassId {
@@ -579,7 +475,7 @@ impl Class for Opmask {
 /// allocator's own verbs ([`IsaBackend::copy`], [`spill`](IsaBackend::spill),
 /// [`reload`](IsaBackend::reload)) do not accept it: calling one with `Flags` is
 /// a type error.
-#[expect(dead_code, reason = "live from B3")]
+#[expect(dead_code, reason = "live from B4")]
 trait Spill: Class {}
 
 impl Spill for Vector {}
@@ -812,6 +708,15 @@ struct Target {
     args: Vec<ValueName>,
 }
 
+/// An instruction and its [`operands`], computed once when selection pushed
+/// it. The list is the instruction's own, so no entry holds one without the
+/// other.
+#[expect(dead_code, reason = "live from B4")]
+struct Pushed<I> {
+    inst: I,
+    operands: Vec<Operand>,
+}
+
 /// A label, the values defined on entry to it, and its instructions.
 #[expect(dead_code, reason = "live from B4")]
 struct Block<I> {
@@ -888,19 +793,20 @@ struct Constant {
 /// - No phase inserts a phi for it.
 #[expect(dead_code, reason = "live from B4")]
 struct Function<B: IsaBackend> {
-    blocks: Vec<Block<B::Inst<Selected>>>,
+    blocks: Vec<Block<Pushed<B::Inst<Selected>>>>,
     entry: Entry,
     loops: Vec<Loop>,
     constants: Constants<B::Constant>,
     labels: Labels,
 }
 
-/// Everything about a target that selection needs. The driver, the allocator
-/// and the assembler are generic over it, and none of them names a register,
-/// an opcode or an encoding.
+/// Everything about a target that selection needs. The driver and the
+/// allocator are generic over it, and neither names a register, an opcode or an
+/// encoding. The assembler is not generic over it: it imports nothing, and
+/// takes the program a backend's `encode` produces.
 ///
 /// What it does not yet say arrives with its first reader: `encode`, in B3.
-#[expect(dead_code, reason = "live from B3")]
+#[expect(dead_code, reason = "live from B4")]
 trait IsaBackend: Sized + 'static {
     type Inst<S: Stage>;
     /// One pool entry: x86 `u32` (each load broadcasts a scalar), aarch64
@@ -962,7 +868,7 @@ trait IsaBackend: Sized + 'static {
 /// An operation producing one lane value, with its operands already lanes.
 /// Comparisons and `BitAnd`/`BitOr` are `Binary`: which file their result
 /// lives in is the backend's choice.
-#[expect(dead_code, reason = "live from B3")]
+#[expect(dead_code, reason = "live from B4")]
 enum LaneOp<B: IsaBackend> {
     Const(f32),
     /// `[0, 1, …, L−1]`.
@@ -994,7 +900,7 @@ enum LaneOp<B: IsaBackend> {
 
 /// The lattice's effect: `value`'s first `lanes` lanes at
 /// `out + 4·(row·pitch + col)`.
-#[expect(dead_code, reason = "live from B3")]
+#[expect(dead_code, reason = "live from B4")]
 struct Store<B: IsaBackend> {
     out: Value<Pointer>,
     pitch: Value<Integer>,
@@ -1006,7 +912,7 @@ struct Store<B: IsaBackend> {
 
 /// A branch condition: the lane to test, and the arm that is dead when no
 /// lane of it is set.
-#[expect(dead_code, reason = "live from B3")]
+#[expect(dead_code, reason = "live from B4")]
 struct Test<B: IsaBackend> {
     cond: B::Lane,
     dead: IfArm,
@@ -1014,7 +920,7 @@ struct Test<B: IsaBackend> {
 
 /// Where a conditional branch goes: `taken`, or `next`, the block laid out
 /// right after.
-#[expect(dead_code, reason = "live from B3")]
+#[expect(dead_code, reason = "live from B4")]
 struct Edges {
     taken: Target,
     next: Label,

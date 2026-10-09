@@ -8,7 +8,7 @@
 
 use super::{
     Block, Class, ClassId, Constant, Constants, Entry, Function, IsaBackend, Label, Labels, Loop,
-    Operand, Scope, Selected, Spill, Target, Value, ValueName, operands,
+    Operand, Pushed, Scope, Selected, Spill, Target, Value, ValueName, operands,
 };
 use crate::error::CompileError;
 use alloc::collections::BTreeMap;
@@ -109,6 +109,24 @@ fn value<C: Class>(name: ValueName) -> Value<C> {
     }
 }
 
+/// A block's successors: the `Target` operands of its last instruction.
+fn targets<I>(block: &Block<Pushed<I>>) -> impl Iterator<Item = &Target> {
+    block
+        .insts
+        .last()
+        .into_iter()
+        .flat_map(|pushed| &pushed.operands)
+        .filter_map(|operand| match operand {
+            Operand::Target(target) => Some(target),
+            Operand::Reg { .. } | Operand::Frame(_) => None,
+        })
+}
+
+/// Whether the block's last instruction branches: nothing follows it.
+fn ended<I>(block: &Block<Pushed<I>>) -> bool {
+    targets(block).next().is_some()
+}
+
 /// How selection writes a function, one block at a time.
 pub(super) struct Builder<B: IsaBackend> {
     labels: Labels,
@@ -116,9 +134,7 @@ pub(super) struct Builder<B: IsaBackend> {
     /// A value's id is its index.
     defined: Vec<bool>,
     /// In layout order. The last is open.
-    blocks: Vec<Block<B::Inst<Selected>>>,
-    /// The targets of each block's last instruction; empty until it has one.
-    successors: Vec<Vec<Target>>,
+    blocks: Vec<Block<Pushed<B::Inst<Selected>>>>,
     loops: Vec<Loop>,
     constants: Constants<B::Constant>,
     interned: BTreeMap<B::Constant, Constant>,
@@ -140,7 +156,6 @@ impl<B: IsaBackend> Builder<B> {
             labels,
             defined: Vec::new(),
             blocks: Vec::new(),
-            successors: Vec::new(),
             loops: Vec::new(),
             constants,
             interned: BTreeMap::new(),
@@ -171,7 +186,6 @@ impl<B: IsaBackend> Builder<B> {
             insts: Vec::new(),
             scope,
         });
-        self.successors.push(Vec::new());
     }
 
     pub(super) fn def<C: Class>(&mut self) -> Def<C> {
@@ -200,14 +214,18 @@ impl<B: IsaBackend> Builder<B> {
     /// - the open block has ended;
     /// - a write not minted by this builder, or already defined;
     /// - a read of a value not yet defined, which includes a read of a value
-    ///   this same instruction defines.
+    ///   this same instruction defines;
+    /// - an [`Operand::Frame`]: only the instructions the allocator inserts
+    ///   carry a slot.
     pub(super) fn push(&mut self, inst: B::Inst<Selected>) {
         let open = self.blocks.len() - 1;
         assert!(
-            self.successors[open].is_empty(),
+            !ended(&self.blocks[open]),
             "{:?} has ended: nothing follows a branch in its block",
             self.blocks[open].label
         );
+        // The one walk of this instruction: the block keeps the list beside it,
+        // for the allocator.
         let operands = operands::<B>(&inst);
         for operand in &operands {
             match operand {
@@ -219,14 +237,13 @@ impl<B: IsaBackend> Builder<B> {
                 ),
             }
         }
-        for operand in operands {
+        for operand in &operands {
             match operand {
-                Operand::Reg { value, access } if !access.reads() => self.define(value),
-                Operand::Reg { .. } | Operand::Frame(_) => {}
-                Operand::Target(target) => self.successors[open].push(target),
+                Operand::Reg { value, access } if !access.reads() => self.define(*value),
+                Operand::Reg { .. } | Operand::Frame(_) | Operand::Target(_) => {}
             }
         }
-        self.blocks[open].insts.push(inst);
+        self.blocks[open].insts.push(Pushed { inst, operands });
     }
 
     fn assert_defined(&self, value: ValueName) {
@@ -262,7 +279,7 @@ impl<B: IsaBackend> Builder<B> {
     pub(super) fn enter(&mut self, block: Pending) {
         let open = self.blocks.len() - 1;
         assert!(
-            !self.successors[open].is_empty(),
+            ended(&self.blocks[open]),
             "{:?} ends without a branch, and {:?} follows it",
             self.blocks[open].label,
             block.label
@@ -317,14 +334,18 @@ impl<B: IsaBackend> Builder<B> {
     /// The finished function: its open block is the exit.
     ///
     /// # Panics
-    /// If any invariant of [`Function`] does not hold, or a block was minted
-    /// and never entered. Each is a selection bug, never a fact about a
-    /// kernel.
+    /// If any invariant of [`Function`] does not hold, a block was minted and
+    /// never entered, or a value was minted and never defined (a dropped
+    /// [`Def`], [`Early`] or [`Tie`]). Each is a selection bug, never a fact
+    /// about a kernel.
     pub(super) fn finish(self) -> Function<B> {
         assert_eq!(self.pending, 0, "a block was minted and never entered");
+        if let Some(id) = self.defined.iter().position(|&defined| !defined) {
+            panic!("value {id} was minted and its definition dropped: nothing writes it");
+        }
         let exit = self.blocks.len() - 1;
         assert!(
-            self.successors[exit].is_empty(),
+            !ended(&self.blocks[exit]),
             "{:?} ends in a branch, so the function has no exit",
             self.blocks[exit].label
         );
@@ -340,10 +361,11 @@ impl<B: IsaBackend> Builder<B> {
         };
 
         let mut latches: Vec<Option<usize>> = alloc::vec![None; self.loops.len()];
-        for (i, targets) in self.successors.iter().enumerate() {
-            let from = self.blocks[i].label;
+        for (i, block) in self.blocks.iter().enumerate() {
+            let from = block.label;
+            let targets: Vec<&Target> = targets(block).collect();
             assert!(targets.len() <= 2, "{from:?} has {} targets", targets.len());
-            for target in targets {
+            for &target in &targets {
                 let to = block_of(target.label);
                 let params = &self.blocks[to].params;
                 assert!(
@@ -371,7 +393,7 @@ impl<B: IsaBackend> Builder<B> {
                     target.label
                 );
             }
-            if let [_, next] = targets.as_slice() {
+            if let [_, next] = targets[..] {
                 assert!(
                     self.blocks
                         .get(i + 1)
@@ -394,9 +416,9 @@ impl<B: IsaBackend> Builder<B> {
                 (block_of(l.head), latch)
             })
             .collect();
-        for (i, targets) in self.successors.iter().enumerate() {
-            let from = self.blocks[i].label;
-            for target in targets {
+        for (i, block) in self.blocks.iter().enumerate() {
+            let from = block.label;
+            for target in targets(block) {
                 let to = block_of(target.label);
                 if to <= i + 1 {
                     continue;

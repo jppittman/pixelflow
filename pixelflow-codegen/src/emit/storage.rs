@@ -7,6 +7,8 @@
 //!
 //! This module models the slot, along with the [`StackFrame`] slot allocator.
 
+use super::regalloc::resource::{FRAME_OVERFLOW, MAX_FRAME};
+
 /// An aligned slot in the stack frame.
 ///
 /// A `Slot` represents a concrete stack address: it knows its byte displacement
@@ -31,11 +33,6 @@ impl Slot {
         self.offset
     }
 }
-
-/// The largest frame a kernel may lay out. [`StackFrame::alloc_slot`] refuses
-/// a spill past it and the nest's layout refuses the whole frame (spills, fold
-/// roots and parks) past it, so every slot offset is below it by construction.
-pub(super) const MAX_FRAME: u32 = 2 * 1024 * 1024;
 
 /// A stack frame slot allocator.
 ///
@@ -69,9 +66,7 @@ impl StackFrame {
     /// Allocate a slot in the frame.
     pub(super) fn alloc_slot(&mut self) -> Result<Slot, crate::error::CompileError> {
         if self.allocated_bytes > MAX_FRAME - self.vector_bytes {
-            return Err(crate::error::CompileError::BudgetExceeded(
-                "spill frame overflow: exceeds 2MB stack limit",
-            ));
+            return Err(crate::error::CompileError::BudgetExceeded(FRAME_OVERFLOW));
         }
         let offset = self.allocated_bytes;
         self.allocated_bytes += self.vector_bytes;
