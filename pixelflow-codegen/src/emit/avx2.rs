@@ -1321,7 +1321,7 @@ mod tests {
 }
 
 // =============================================================================
-// The AVX2 `IsaBackend` driver
+// The AVX2 `LegacyBackend` driver
 // =============================================================================
 
 /// The AVX2 half of code generation.
@@ -1418,7 +1418,7 @@ pub(super) mod driver {
         }
     }
 
-    impl IsaBackend for Avx2Backend {
+    impl LegacyBackend for Avx2Backend {
         fn jump(&mut self, asm: &mut Assembly, label: Label) {
             asm.push(x86::Gp::Jmp { to: label });
         }
@@ -1647,7 +1647,7 @@ pub(super) mod driver {
                     imm: 0xFF,
                 },
             });
-            asm.push(x86::Gp::je(label));
+            asm.push_branch(|next| x86::Gp::je(label, next));
         }
 
         fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {

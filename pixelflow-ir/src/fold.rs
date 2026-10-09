@@ -408,7 +408,7 @@ impl Fold {
     /// `Reduce` has survived extraction, the surviving loop's own combine
     /// instruction has to be *some* opcode, and this is the one narrow door
     /// for the one consumer past the e-graph that needs it (see
-    /// `pixelflow-codegen`'s `IsaBackend::alu`, and
+    /// `pixelflow-codegen`'s `LegacyBackend::alu`, and
     /// docs/plans/2026-09-10-a-surviving-reduce-is-a-loop.md's "2a″" for why
     /// the combine could not live in the arena instead).
     #[must_use]

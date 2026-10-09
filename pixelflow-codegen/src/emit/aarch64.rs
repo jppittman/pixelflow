@@ -274,9 +274,13 @@ enum Inst<S: Stage> {
     /// to a fixed point to save four bytes per guard. The pair's size is fixed
     /// before a single byte is laid out, like `AdrpAdd`'s, and there is nothing
     /// to relax.
+    ///
+    /// `next` is the position laid out right after the pair, where the branch
+    /// falls through to: it encodes to nothing.
     CbzFar {
         test: S::Read<Integer>,
         taken: S::Target,
+        next: S::Target,
     },
     /// `adrp dst, to; add dst, dst, :lo12:to`, sharing one label: materialize
     /// the constant pool's address in `dst`.
@@ -1416,10 +1420,10 @@ mod tests {
 }
 
 // =============================================================================
-// The NEON `IsaBackend` driver
+// The NEON `LegacyBackend` driver
 // =============================================================================
 
-/// The aarch64 half of code generation: the [`IsaBackend`](crate::emit::IsaBackend)
+/// The aarch64 half of code generation: the [`LegacyBackend`](crate::emit::LegacyBackend)
 /// implementation and the constant pool it needs.
 ///
 /// **This file is where aarch64-specific bugs live, and the only place they
@@ -1623,7 +1627,7 @@ pub(super) mod driver {
         }
     }
 
-    impl IsaBackend for Aarch64Backend {
+    impl LegacyBackend for Aarch64Backend {
         fn jump(&mut self, asm: &mut Assembly, label: Label) {
             asm.push(Inst::B { to: label });
         }
@@ -1757,9 +1761,10 @@ pub(super) mod driver {
                         .assemble(&mut asm.run);
                 }
             }
-            asm.push(Inst::CbzFar {
+            asm.push_branch(|next| Inst::CbzFar {
                 test: ip0,
                 taken: label,
+                next,
             });
         }
 
@@ -2271,7 +2276,7 @@ const CBNZ_SKIPS_B: u32 = 2;
 #[cfg(test)]
 mod label_tests {
     use super::*;
-    use crate::emit::{Assembly, IfArm, IsaBackend, MaskTest};
+    use crate::emit::{Assembly, IfArm, LegacyBackend, MaskTest};
 
     /// One known word, so a test can measure distances in instructions: a
     /// register copy that is not a no-op, and so is emitted.
@@ -2345,9 +2350,10 @@ mod label_tests {
     fn a_branch_on_w16_is_cbnz_over_b() {
         let mut asm = Assembly::default();
         let exit = asm.mint();
-        asm.push(Inst::CbzFar {
+        asm.push_branch(|next| Inst::CbzFar {
             test: Gpr(16),
             taken: exit,
+            next,
         });
         asm.push(NOP);
         asm.bind(exit);

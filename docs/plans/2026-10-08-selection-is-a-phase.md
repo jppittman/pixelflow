@@ -824,8 +824,8 @@ pub(in crate::emit) struct Constant { pub label: Label, pub offset: u64 }
 ///   has no parameters.
 /// - Every backward branch comes from the last block of a loop in `loops`
 ///   and targets that loop's head.
-/// - Every forward branch skips a contiguous run of blocks within one scope.
-/// - A conditional branch passes arguments on at most one target.
+/// - A forward branch that skips blocks joins two blocks of one scope and
+///   neither enters nor leaves a loop.
 ///
 /// **Dominance is relaxed in one way, and only one.**
 /// - A value an `If` arm defines is read by that `If`'s blend.
@@ -1220,7 +1220,7 @@ The narrowing already removes these, so they are not listed again here: `Item`, 
 
 `emit/mod.rs`:
 - the register newtypes `Reg`, `Gpr`, `PtrReg`, `KReg` (they were `pub u8`; the narrowing made the field private);
-- `AsmInsn` (every backend's `Inst<Physical>` and `EncodedInst` implement it) and `Class::Physical`, `Assembly::push` (its one caller, and the `label_tests` of `x86_64.rs` and `aarch64.rs`, which push through it and move to `asm::AsmProgram`), and the legacy `emit::AsmProgram<S>`, which leaves `asm::AsmProgram<I>` the only one;
+- `AsmInsn` (every backend's `Inst<Physical>` and `EncodedInst` implement it) and `Class::Physical`, `Assembly::push_branch` (B1: how the legacy drivers name a `Jcc`'s and `CbzFar`'s `next`), `Assembly::push` (its one caller, and the `label_tests` of `x86_64.rs` and `aarch64.rs`, which push through it and move to `asm::AsmProgram`), and the legacy `emit::AsmProgram<S>`, which leaves `asm::AsmProgram<I>` the only one;
 - `Loc`, `Binding`, `Unary`, `ResolvedOp`, `Reload`, `InstructionPlan`, `OperandSource`;
 - `operand_sources`, `reloads_wanted`, `declared_temp`, `declared_gpr_temp`, `declared_mask_temp`;
 - `emit_scope`, `resolve_operands`, `location_of`, `binding`;
@@ -1504,9 +1504,16 @@ Every commit in this phase is live in production.
 
 #### B1: The machine IR
 
-- **Files:** `emit/mod.rs` (`Value`, `ValueName`, `Selected`, `Rebind`, `Operand`, `Access`, `Target`, `Block`, `Function`, `Entry`, `Loop`, `Constants`, `Constant`, `LaneOp`, `Store`, `Test`, `Edges`, `IsaBackend`), `emit/build.rs` (§2.9).
+- **Files:** `emit/mod.rs` (`Value`, `ValueName`, `ClassId`, `Selected`, `Observed`, `Rebind`, `Operand`, `Access`, `operands`, `Target`, `Block`, `Function`, `Entry`, `Loop`, `Constants`, `Constant`, `LaneOp`, `Store`, `Test`, `Edges`, `IsaBackend`), `emit/build.rs` (§2.9: `Def`, `Early`, `Tie`, `Builder`, `Pending`).
 - **Change:** rename the legacy trait `IsaBackend` to `LegacyBackend` (mechanical), so that the contract's name is the new trait from the first commit.
-- **Deferred from A9, whose first reader is here:** the `sealed` supertraits of `Class`, `Jcc`'s and `CbzFar`'s `next` field and the `Fallthrough` arm of `Gp` (the block builder is the first thing with a next block to name).
+- **Deferred from A9, whose first reader is here:** the `sealed` supertraits of `Class`, `Jcc`'s and `CbzFar`'s `next` field and the `Fallthrough` arm of `Gp` (the block builder is the first thing with a next block to name). The legacy drivers have no block to name, so `Assembly::push_branch` mints the label, pushes the branch and binds the label right after it, which is true of a fall-through. D1 deletes it with the drivers.
+- **Moved here from B2:** `ClassId` (a `ValueName` carries its class), and `Class::ID`.
+- **Moved to B2:** `Spiller`, `Stage::Slot`, `Operand::Frame` and `Rebind::slot`, because each needs `Spill`, `SlotName` or `FrameSlot`. For the same reason the trait of §2.10 has no `FILE`, `copy`, `spill` or `reload` yet (B2), and no `encode` (B3, which first needs `Bound` and `Encoding::falls_through`).
+- **`operands`** is here, not in B4: `Builder::push` reads the operand list to check its definitions. It records through `Observed`, the stage whose fields are `()`.
+- **`Builder::finish`** asserts every invariant of `Function` (§2.9), with these readings of the ones that were loose:
+  - a conditional branch has two targets, and the second is `next`;
+  - a forward branch that skips blocks (its target is not the next block) joins two blocks of one scope and neither enters nor leaves a loop. Its skipped run may hold other scopes, as an arm that owns a fold does;
+  - a loop is the run of blocks from its head to its one backward branch.
 - **Tests:** none of its own (§0.6). `finish`'s and `push`'s checks are production assertions, and they are exercised by every kernel B3 onward selects.
 - **Status:** `expect(dead_code)` until B4.
 - **Gate:** G.
@@ -1514,7 +1521,7 @@ Every commit in this phase is live in production.
 #### B2: Registers and frame slots are tokens
 
 - **Files:** `emit/regalloc/resource.rs` (§2.2, §2.4), the `Bound` stage in `mod.rs`.
-- **Deferred from A9, whose first reader is here:** `File` and its four files, `FileId`, `ClassId`, `Spill`, and `Stage::Slot` (the frame slot is a token).
+- **Deferred from A9, whose first reader is here:** `File` and its four files, `FileId`, `Spill`, and `Stage::Slot` (the frame slot is a token). Moved here from B1: `Spiller`, `Operand::Frame`, `Rebind::slot`, and the trait's `FILE`, `copy`, `spill` and `reload`.
 - **Tests:** none of its own (§0.6). From B4, the leases and the frame are exercised through `compile`. The narrow region's `BudgetExceeded` is reached by a kernel with more than 4,095 live narrow values, if one can be built through the production API; if none can, the bound is an assertion, not a test.
 - **Status:** `expect(dead_code)` until B4.
 - **Gate:** G.

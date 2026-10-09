@@ -203,7 +203,9 @@
   of them. A reload result and an instruction temp are values the input DAG
   did not contain. A value live into a block from several predecessors is a
   block parameter.
-- **Lives:** `ValueId(pub u64)`, `Def` (`pixelflow-codegen/src/program/mod.rs`).
+- **Lives:** `ValueId(pub u64)`, `Def` (`pixelflow-codegen/src/program/mod.rs`);
+  `emit::Value<C>`, a typed name, and `build::Def<C>`, the right to define
+  one (`emit/{mod,build}.rs`, unused until B4).
   Today an effect (`Write`, `Seq`) is a `Def` with a `ValueId` that defines
   no value, and a leaf scheduled in two scopes is "two definitions of one
   name" (09-04). Both contradict "one definition", which is why lives are
@@ -215,8 +217,9 @@
   is an enum, `Vector` (one batch of `f32` lanes, in a `Reg`) or `Pointer` (an
   address, in a `PtrReg`), "a function of the defining op". Every consumer
   knows which class it expects by position. "The classes never compete for
-  a register." `emit::Class` (`emit/mod.rs`) is a trait with the markers
-  `Vector`, `Pointer`, `Integer` and `Flags`, the type an instruction's
+  a register." `emit::Class` (`emit/mod.rs`) is a sealed trait with the markers
+  `Vector`, `Pointer`, `Integer`, `Opmask` and `Flags` (`ClassId` is the same
+  set as data, on a `ValueName`), the type an instruction's
   operand field is declared with, so a base address cannot be handed a
   `row * pitch` product. The flags are a class. D2 deletes
   `program::Class`; D1 deletes only `emit::Class`'s `type Physical`.
@@ -463,9 +466,11 @@
 - **Follows:** a value live into a block from more than one predecessor is a
   block parameter; that is what a phi is. "Emit the arms as blocks and there
   is nothing to search for."
-- **Lives:** to be built at the assembly level. Today
-  `pixelflow-codegen/src/program/layout.rs`'s blocks have no label,
-  parameters or terminating instruction.
+- **Lives:** `Block`, `Function` and `build::Builder`
+  (`pixelflow-codegen/src/emit/{mod,build}.rs`), built by B1 of
+  `docs/plans/2026-10-08-selection-is-a-phase.md` and unused until B4.
+  `pixelflow-codegen/src/program/layout.rs`'s blocks, which the legacy
+  pipeline still uses, have no label, parameters or terminating instruction.
 
 ### Label. Homonym of the hindsight label and the cost label
 
@@ -518,8 +523,9 @@
   writes all of them. A block's successors are the label operands of its last
   instruction. `pin_shift_counts`, which re-pins a shift count's extraction
   choice to a `Const`, is the symptom of a missing operand-kind type.
-- **Lives:** to be built (`docs/plans/2026-10-08-selection-is-a-phase.md`,
-  named but not yet in the tree). Today `program::operands()` yields only
+- **Lives:** `Operand`, `Access` and `operands` (`emit/mod.rs`), built by B1
+  of `docs/plans/2026-10-08-selection-is-a-phase.md` and unused until B4.
+  The legacy pipeline still has the split below: `program::operands()` yields only
   vector reads, the base comes from a separate `pointer_operand()` (both in
   `pixelflow-codegen/src/program/mod.rs`), and branches expose their target
   through `AsmInsn::label_ref()` (`emit/mod.rs`). All three contradict this
@@ -538,7 +544,7 @@
   over a `Stage` and with named fields typed by `Class` (`emit/x86_64.rs`);
   `Inst<S>` in `emit/avx2.rs` and `emit/avx512.rs`, the VEX and EVEX
   instructions, over the same vocabulary; `Inst` in `emit/aarch64.rs`. Today
-  most emission is `IsaBackend` verbs writing bytes inline ("Instructions:
+  most emission is `LegacyBackend` verbs writing bytes inline ("Instructions:
   bytes written inline by ~236 functions, not values", denotational-diagnosis;
   e.g. `emit_write(&mut self, code: &mut Vec<u8>, …)`), which contradicts
   this entry.
@@ -546,7 +552,7 @@
 ### Branch
 
 - **Is:** "A branch is an ordinary instruction": `Gp::Jmp { to }` and
-  `Gp::Jcc { cond, flags, taken }` on x86; `B`, `BCond` and `BranchIfW16Zero` on
+  `Gp::Jcc { cond, flags, taken, next }` and `Gp::Fallthrough` on x86; `B`, `BCond` and `CbzFar` on
   aarch64. The condition is the opcode's own field (`Cond`, whose
   discriminants are the manual's values).
 - **Is not:** something that returns a position. Not hand-picked mnemonics
@@ -556,7 +562,7 @@
   differed only in which uniform mask lets an arm go, which is what `IfArm`
   already names". A fold's trip test reuses `IfArm::False`'s test.
 - **Lives:** `pixelflow-codegen/src/emit/{x86_64,aarch64}.rs` (the
-  instructions), `IsaBackend::branch_if_arm_is_dead` (`emit/mod.rs`,
+  instructions), `LegacyBackend::branch_if_arm_is_dead` (`emit/mod.rs`,
   implemented in `emit/{avx2,avx512,aarch64}.rs`), `IfArm`
   (`program/mod.rs`); a-surviving-reduce-is-a-loop R0.
 

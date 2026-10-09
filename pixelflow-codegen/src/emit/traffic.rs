@@ -15,14 +15,14 @@
 //! optimized this number is exactly the thing the measurements above refused.
 //!
 //! The counting is done by [`Counting`], a decorator over the private
-//! `IsaBackend` seam rather than a set of increments at the driver's emission
+//! `LegacyBackend` seam rather than a set of increments at the driver's emission
 //! sites. A decorator cannot miss a site: every byte the driver emits goes
 //! through one of these methods, so a new emission path is counted the day it
 //! is written, and a trait method that disappears is a compile error rather
 //! than a silently dropped term.
 
 use super::regalloc::{Scope, ValueId};
-use super::{Binding, InstructionPlan, IsaBackend, Loc, PtrReg, Reg, Reload, WritePlan};
+use super::{Binding, InstructionPlan, LegacyBackend, Loc, PtrReg, Reg, Reload, WritePlan};
 use crate::error::CompileError;
 use alloc::vec::Vec;
 
@@ -141,21 +141,21 @@ struct Open {
     nested_bytes: u64,
 }
 
-/// An `IsaBackend` that counts what it forwards.
+/// A `LegacyBackend` that counts what it forwards.
 ///
 /// Scopes nest, so the counts do: `scope_begin` opens a fresh count that
 /// everything emitted until the matching `scope_end` lands in, and closing it
 /// records the count under the scope's name. What is emitted outside every
 /// scope — the function's frame and trailer — accumulates at the base, read
 /// off by `take`.
-pub(super) struct Counting<'a, B: IsaBackend> {
+pub(super) struct Counting<'a, B: LegacyBackend> {
     inner: &'a mut B,
     base: ScopeTraffic,
     open: Vec<Open>,
     closed: Vec<(Scope, ScopeTraffic)>,
 }
 
-impl<'a, B: IsaBackend> Counting<'a, B> {
+impl<'a, B: LegacyBackend> Counting<'a, B> {
     pub(super) fn new(inner: &'a mut B) -> Self {
         Self {
             inner,
@@ -188,7 +188,7 @@ impl<'a, B: IsaBackend> Counting<'a, B> {
     }
 }
 
-impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
+impl<B: LegacyBackend> LegacyBackend for Counting<'_, B> {
     fn jump(&mut self, asm: &mut super::Assembly, label: super::Label) {
         self.inner.jump(asm, label);
     }
@@ -371,14 +371,14 @@ mod tests {
     use super::super::regalloc::{self, Scope};
     use super::super::storage::Slot;
     use super::super::{
-        Assembly, Binding, InstructionPlan, IsaBackend, Label, Loc, MaskTest, PtrReg, Reg, Reload,
-        ResolvedOp, WritePlan,
+        Assembly, Binding, InstructionPlan, Label, LegacyBackend, Loc, MaskTest, PtrReg, Reg,
+        Reload, ResolvedOp, WritePlan,
     };
     use super::{Counting, EmitTraffic, ScopeTraffic};
     use crate::error::CompileError;
     use pixelflow_ir::LatticeShape;
 
-    /// An [`IsaBackend`] that does nothing but hand back what a test told it
+    /// An [`LegacyBackend`] that does nothing but hand back what a test told it
     /// to, so [`Counting`]'s own counting and forwarding can be pinned
     /// without a real encoder or a compiled kernel.
     struct RecordingBackend {
@@ -397,7 +397,7 @@ mod tests {
         }
     }
 
-    impl IsaBackend for RecordingBackend {
+    impl LegacyBackend for RecordingBackend {
         fn jump(&mut self, _asm: &mut Assembly, _label: Label) {}
 
         fn register_file(&self) -> regalloc::RegisterFile {
@@ -780,7 +780,7 @@ mod tests {
     #[test]
     fn the_counted_bytes_end_at_the_return() {
         use crate::emit::tests::{AtFloor, compile_schedule};
-        use crate::emit::{IsaBackend, aarch64, avx2, avx512};
+        use crate::emit::{LegacyBackend, aarch64, avx2, avx512};
         use crate::pipeline::tests::{BYTES_PER_LANE, schedule_for};
 
         const X86_RETURN: [u8; 4] = [0xC5, 0xF8, 0x77, 0xC3];
@@ -788,7 +788,7 @@ mod tests {
 
         /// The stack stores `kernel` compiled by `backend` emits, once its
         /// counted bytes are checked to end at the return `ret`.
-        fn check<B: IsaBackend>(
+        fn check<B: LegacyBackend>(
             tier: &str,
             mut backend: B,
             ret: [u8; 4],
@@ -870,10 +870,14 @@ mod tests {
     #[test]
     fn the_scaffolds_traffic_does_not_move_with_the_pool() {
         use crate::emit::tests::{AtFloor, compile_schedule};
-        use crate::emit::{IsaBackend, aarch64, avx2, avx512};
+        use crate::emit::{LegacyBackend, aarch64, avx2, avx512};
         use crate::pipeline::tests::{BYTES_PER_LANE, schedule_for};
 
-        fn traffic<B: IsaBackend>(mut backend: B, arena: &ExprArena, root: ExprId) -> EmitTraffic {
+        fn traffic<B: LegacyBackend>(
+            mut backend: B,
+            arena: &ExprArena,
+            root: ExprId,
+        ) -> EmitTraffic {
             let lanes = backend.register_file().vector_bytes / BYTES_PER_LANE;
             let schedule = schedule_for(arena, root, SHAPE, lanes);
             compile_schedule(schedule, &mut backend)

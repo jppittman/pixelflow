@@ -1409,7 +1409,7 @@ mod tests {
 }
 
 // =============================================================================
-// The AVX-512 `IsaBackend` driver
+// The AVX-512 `LegacyBackend` driver
 // =============================================================================
 
 /// The AVX-512 half of code generation.
@@ -1508,7 +1508,7 @@ pub(super) mod driver {
         }
     }
 
-    impl IsaBackend for Avx512Backend {
+    impl LegacyBackend for Avx512Backend {
         fn jump(&mut self, asm: &mut Assembly, label: Label) {
             asm.push(x86::Gp::Jmp { to: label });
         }
@@ -1759,11 +1759,11 @@ pub(super) mod driver {
             asm.push(Inst::KorTest { flags: (), k });
             // One `kortest` sets both answers at once, so the arm picks the
             // condition rather than a different reduction.
-            asm.push(match test.arm {
+            asm.push_branch(|next| match test.arm {
                 // ZF set when k1 == 0: no lane is true, so the true arm is dead.
-                IfArm::True => x86::Gp::je(label),
+                IfArm::True => x86::Gp::je(label, next),
                 // CF set when k1 == 0xFFFF: every lane is, so the false arm is.
-                IfArm::False => x86::Gp::jb(label),
+                IfArm::False => x86::Gp::jb(label, next),
             });
         }
 
