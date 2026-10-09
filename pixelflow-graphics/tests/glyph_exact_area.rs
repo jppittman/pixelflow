@@ -4,9 +4,12 @@
 //! outline's control points, the area of each texel the glyph covers —
 //! `min(|∫∫_texel w|, 1)` for the non-zero winding number `w`, FreeType's
 //! coverage (see that module for why the clamp is the accepted meaning where
-//! contours overlap). This file measures the shipped renderer against it,
-//! through the path a frame draws from: [`GlyphAtlas`] tiles, baked at
-//! texel centres.
+//! contours overlap). This file measures two renderers against it: the
+//! path a frame draws from today, [`GlyphAtlas`] tiles baked at texel
+//! centres, and the one it will draw from, each glyph drawn by its piece
+//! count's program over its block ([`FontPrograms`],
+//! docs/plans/2026-09-25-the-language-is-kernel.md C1). Every check below
+//! runs on both.
 //!
 //! ## The statistic
 //!
@@ -87,7 +90,9 @@ mod exact_area;
 
 use exact_area::{coverage, screen_pieces, signed_area, Grid, Piece, Point};
 use pixelflow_core::{Kernel, Lattice, Manifold, Uniform};
-use pixelflow_graphics::fonts::{loop_blinn, Contour, Font, GlyphAtlas, Outline, Segment};
+use pixelflow_graphics::fonts::{
+    loop_blinn, Contour, Font, FontPrograms, GlyphAtlas, GlyphRows, Outline, Segment,
+};
 use std::sync::OnceLock;
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
@@ -209,23 +214,32 @@ fn measure(ours: &[f64], exact: &[f64], width: usize) -> Stat {
     stat
 }
 
-/// Every printable ASCII glyph at every size, measured once per process.
-fn measurements() -> &'static [(char, usize, Stat)] {
-    static MEASURED: OnceLock<Vec<(char, usize, Stat)>> = OnceLock::new();
-    MEASURED.get_or_init(|| {
+/// Who draws the tiles measured.
+#[derive(Clone, Copy, Debug)]
+enum Renderer {
+    /// [`GlyphAtlas`] tiles: what a frame draws from today.
+    Atlas,
+    /// Each glyph by its piece count's program over its block
+    /// ([`FontPrograms`]): what a frame will draw from.
+    Programs,
+}
+
+/// Every printable ASCII glyph at every size, as `renderer` draws it,
+/// measured once per process.
+fn measurements(renderer: Renderer) -> &'static [(char, usize, Stat)] {
+    static BY_THE_ATLAS: OnceLock<Vec<(char, usize, Stat)>> = OnceLock::new();
+    static BY_THE_PROGRAMS: OnceLock<Vec<(char, usize, Stat)>> = OnceLock::new();
+    let measured = match renderer {
+        Renderer::Atlas => &BY_THE_ATLAS,
+        Renderer::Programs => &BY_THE_PROGRAMS,
+    };
+    measured.get_or_init(|| {
         let font = Font::parse(FONT_DATA).expect("parse font");
         let mut out = Vec::new();
         for size in SIZES {
-            let mut atlas = GlyphAtlas::new(size as f32, 1.0, 128);
-            assert_eq!(atlas.tile_px(), size, "a tile is one texel per pixel");
-            atlas.warm(&font, ' '..='~');
-            let buffer = atlas.buffer();
+            let mut draw = tiles(renderer, &font, size);
             for ch in ' '..='~' {
-                let (u, v) = atlas.uv(&font, ch);
-                let (u, v) = (u as usize, v as usize);
-                let ours: Vec<f64> = (0..size * size)
-                    .map(|k| f64::from(buffer[(v + k / size) * atlas.width() + u + k % size]))
-                    .collect();
+                let ours = draw(ch);
                 let pieces = screen_pieces(&font, ch, size as f64);
                 let tile = Grid {
                     width: size,
@@ -241,6 +255,47 @@ fn measurements() -> &'static [(char, usize, Stat)] {
         }
         out
     })
+}
+
+/// `renderer`'s tile of each glyph at `size` px, in texel order.
+fn tiles<'f>(
+    renderer: Renderer,
+    font: &'f Font,
+    size: usize,
+) -> Box<dyn FnMut(char) -> Vec<f64> + 'f> {
+    match renderer {
+        Renderer::Atlas => {
+            let mut atlas = GlyphAtlas::new(size as f32, 1.0, 128);
+            assert_eq!(atlas.tile_px(), size, "a tile is one texel per pixel");
+            atlas.warm(font, ' '..='~');
+            let buffer = atlas.buffer();
+            Box::new(move |ch| {
+                let (u, v) = atlas.uv(font, ch);
+                let (u, v) = (u as usize, v as usize);
+                (0..size * size)
+                    .map(|k| f64::from(buffer[(v + k / size) * atlas.width() + u + k % size]))
+                    .collect()
+            })
+        }
+        Renderer::Programs => {
+            let side = u32::try_from(size).expect("a tile's side fits a u32");
+            let mut programs = FontPrograms::new([side, side]);
+            Box::new(move |ch| {
+                let id = font
+                    .cmap_lookup(ch)
+                    .unwrap_or_else(|| panic!("the font has no glyph for {ch:?}"));
+                let outline = font
+                    .outline_scaled_by_id(id, size as f32)
+                    .unwrap_or_else(|| panic!("the font has no outline for {ch:?}"));
+                programs
+                    .draw(&GlyphRows::of(&outline))
+                    .into_buffer()
+                    .into_iter()
+                    .map(f64::from)
+                    .collect()
+            })
+        }
+    }
 }
 
 /// The statistic is over the tile, so ink the tile clips would be error
@@ -532,9 +587,20 @@ fn the_renderer_and_the_reference_share_a_pixel() {
 /// 12% at 32 px, and no texel outside them misses its end.
 #[test]
 fn between_the_snaps_every_texel_is_its_area() {
+    assert_between_the_snaps_every_texel_is_its_area(Renderer::Atlas);
+}
+
+/// [`between_the_snaps_every_texel_is_its_area`], for the texels each
+/// glyph's program draws.
+#[test]
+fn between_the_snaps_every_texel_a_program_draws_is_its_area() {
+    assert_between_the_snaps_every_texel_is_its_area(Renderer::Programs);
+}
+
+fn assert_between_the_snaps_every_texel_is_its_area(renderer: Renderer) {
     let mut failures = Vec::new();
     let mut worst = SIZES.map(|size| (0.0f64, ' ', size));
-    for &(ch, size, stat) in measurements() {
+    for &(ch, size, stat) in measurements(renderer) {
         let at_size = worst
             .iter_mut()
             .find(|w| w.2 == size)
@@ -544,27 +610,30 @@ fn between_the_snaps_every_texel_is_its_area() {
         }
         if stat.between_snaps > 1.0 {
             failures.push(format!(
-                "{ch:?}@{size}: a texel between the snaps is off by {:.2}× the \
+                "{renderer:?}, {ch:?}@{size}: a texel between the snaps is off by {:.2}× the \
                  closed form's bound",
                 stat.between_snaps
             ));
         }
         if stat.unsnapped_ends > 0 {
             failures.push(format!(
-                "{ch:?}@{size}: {} texel(s) clear of a snap read neither 0 nor 1",
+                "{renderer:?}, {ch:?}@{size}: {} texel(s) clear of a snap read neither 0 nor 1",
                 stat.unsnapped_ends
             ));
         }
     }
     for (ratio, ch, size) in worst {
-        eprintln!("{size} px: worst texel between the snaps {ratio:.3}× the bound ({ch:?})");
+        eprintln!(
+            "{renderer:?}, {size} px: worst texel between the snaps {ratio:.3}× the bound ({ch:?})"
+        );
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// `glyphs` under a balanced tree of `if id < k` — the font program's id
-/// tree (docs/plans/2026-09-25-the-language-is-kernel.md §1.7), `first`
-/// being the id of `glyphs[0]`.
+/// `glyphs` under a balanced tree of `if id < k`, `first` being the id of
+/// `glyphs[0]`: a program of units to pin units by (§4 O1 of
+/// docs/plans/2026-09-25-the-language-is-kernel.md). The font itself is
+/// not one: it is one program per piece count ([`FontPrograms`]).
 fn id_tree(id: &Kernel, glyphs: &[Kernel], first: usize) -> Kernel {
     if glyphs.len() == 1 {
         return glyphs[0].clone();
@@ -576,7 +645,7 @@ fn id_tree(id: &Kernel, glyphs: &[Kernel], first: usize) -> Kernel {
     )
 }
 
-/// **A font program of units draws each of its glyphs.** Four glyphs under
+/// **A program of glyph units draws each of its glyphs.** Four glyphs under
 /// an `if id < k` tree, compiled once as one program, each glyph a *unit*
 /// (`Kernel::by_ref`) — saturated and extracted by itself, linked into the
 /// tree after extraction (docs/plans/2026-09-25-the-language-is-kernel.md
@@ -591,7 +660,7 @@ fn id_tree(id: &Kernel, glyphs: &[Kernel], first: usize) -> Kernel {
 ///   the shipped path: a unit's saturation and extraction *are* the glyph's,
 ///   one structure at one shape.
 #[test]
-fn a_font_program_of_units_draws_each_glyph() {
+fn a_program_of_glyph_units_draws_each_glyph() {
     const SIZE: usize = 16;
     const GLYPHS: [char; 4] = ['A', 'O', 'g', '@'];
     let font = Font::parse(FONT_DATA).expect("parse font");
@@ -663,7 +732,19 @@ fn a_font_program_of_units_draws_each_glyph() {
 /// The ratchet. See the module docs.
 #[test]
 fn todays_renderer_is_no_worse_than_its_baseline() {
-    let measured = measurements();
+    assert_no_worse_than_the_baseline(Renderer::Atlas);
+}
+
+/// The ratchet, for the font's programs: held to the same rows, since a
+/// glyph's program draws the builder's pixels to the closed form's bound
+/// (`fonts/loop_blinn/program/tests.rs`), far inside [`PLATFORM_NOISE`].
+#[test]
+fn the_programs_are_no_worse_than_the_baseline() {
+    assert_no_worse_than_the_baseline(Renderer::Programs);
+}
+
+fn assert_no_worse_than_the_baseline(renderer: Renderer) {
+    let measured = measurements(renderer);
     let mut worse = Vec::new();
     let mut table = String::new();
     for &(ch, size, stat) in measured {
@@ -693,10 +774,10 @@ fn todays_renderer_is_no_worse_than_its_baseline() {
             ));
         }
     }
-    eprintln!("measured (glyph, size, E_max, E_mean, N₀.₁):\n{table}");
+    eprintln!("{renderer:?}, measured (glyph, size, E_max, E_mean, N₀.₁):\n{table}");
     assert!(
         worse.is_empty(),
-        "coverage got worse against the exact area:\n{}",
+        "{renderer:?}: coverage got worse against the exact area:\n{}",
         worse.join("\n")
     );
 }
@@ -711,10 +792,21 @@ fn todays_renderer_is_no_worse_than_its_baseline() {
 /// thirty and ten times above the measurement: a half-texel slip reads 0.5.
 #[test]
 fn the_renderer_and_the_reference_agree_on_where_the_ink_is() {
+    assert_agree_on_where_the_ink_is(Renderer::Atlas);
+}
+
+/// [`the_renderer_and_the_reference_agree_on_where_the_ink_is`], for the
+/// font's programs.
+#[test]
+fn the_programs_and_the_reference_agree_on_where_the_ink_is() {
+    assert_agree_on_where_the_ink_is(Renderer::Programs);
+}
+
+fn assert_agree_on_where_the_ink_is(renderer: Renderer) {
     const SYSTEMATIC: f64 = 0.001;
     const ANY_GLYPH: f64 = 0.01;
     for size in SIZES {
-        let inked: Vec<Stat> = measurements()
+        let inked: Vec<Stat> = measurements(renderer)
             .iter()
             .filter(|(_, s, stat)| *s == size && stat.inked > 0)
             .map(|&(_, _, stat)| stat)
@@ -726,20 +818,20 @@ fn the_renderer_and_the_reference_agree_on_where_the_ink_is() {
             .iter()
             .map(|s| s.centroid_shift[0].abs().max(s.centroid_shift[1].abs()))
             .fold(0.0, f64::max);
-        eprintln!("{size} px: mean centroid shift {mean:?}, worst glyph {worst}");
+        eprintln!("{renderer:?}, {size} px: mean centroid shift {mean:?}, worst glyph {worst}");
         for (axis, mean) in mean.into_iter().enumerate() {
             assert!(
                 mean.abs() <= SYSTEMATIC,
-                "{size} px: ink sits {mean} px off the reference's on axis {axis}, on average"
+                "{renderer:?}, {size} px: ink sits {mean} px off the reference's on axis {axis}, on average"
             );
         }
-        for (ch, s, stat) in measurements() {
+        for (ch, s, stat) in measurements(renderer) {
             let shift = stat.centroid_shift[0]
                 .abs()
                 .max(stat.centroid_shift[1].abs());
             assert!(
                 *s != size || shift <= ANY_GLYPH,
-                "{ch:?}@{size}: ink sits {shift} px off the reference's"
+                "{renderer:?}, {ch:?}@{size}: ink sits {shift} px off the reference's"
             );
         }
     }

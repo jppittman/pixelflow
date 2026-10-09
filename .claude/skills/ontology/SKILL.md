@@ -169,7 +169,7 @@ index for the word first.
 - Host versus program
 - Cell and the cell grid
 - Frame (display)
-- Font program and id tree
+- Font programs
 - Glyph
 - Piece, band, box
 - Coverage and the closed form

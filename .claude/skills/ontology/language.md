@@ -152,9 +152,9 @@
   the docket".
 - **Follows:** every range is constant, so every read point's range is known
   at construction, so a new tile extent or zoom recompiles and is cached by
-  key. The id tree's threshold `k` is a count, but a font loaded at run time
-  cannot pass `k` as a const generic, so whether `k` becomes a uniform is
-  open (O3).
+  key. A font's glyphs are drawn by one program per piece count, chosen by
+  the count, a structural parameter (C1, 2026-10-09); the id tree whose
+  threshold `k` raised "structural or uniform" is superseded.
 - **Lives:** the-language-is-kernel §1.4–§1.5, §1.7, O2; one-pipeline
   decisions (JP, 2026-09-25). In code, a structural parameter read as a value
   (`N as f32`) is lowered to a `Param(k)` hole the host function fills
@@ -823,8 +823,8 @@
     panic ("a limit on how many symbols one program may name").
   - Choice is `if` plus bounding. "A fold's body reads nothing indexed by
     its binder except the binder's own arithmetic."
-  - Once the font program lands, the frame's cells and the atlas are the
-    last buffers.
+  - Once the frame draws from the font's programs (C2), the frame's cells
+    and the atlas are the last buffers.
   - Broadcast and Gather are split once, in `arena_to_schedule`, by the lane
     bit: "decided once, where the DAG is read, not flagged per backend". The
     base is a `Context` pointer operand.
@@ -843,8 +843,9 @@
   `DiscreteManifold` table (`DiscreteManifold::new(rows, PIECE_ROW_COLS, …)`
   in `pixelflow-graphics/src/fonts/loop_blinn.rs`), and a table can now
   travel inside the kernel itself (`Kernel::with_buffer_data`, held by
-  `Manifold`'s `carried` field). The table-free glyph exists only in
-  `fonts/loop_blinn/kernel_copy.rs` tests until C1.
+  `Manifold`'s `carried` field). The table-free glyph is production since
+  C1 (`FontPrograms`, `fonts/loop_blinn/program.rs`); the frame reads it from
+  C2.
 
 ### Library (vs primitive)
 

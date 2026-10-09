@@ -720,8 +720,7 @@ impl Rise {
 
     /// `τ(δ) = δ / max(step + √max(step² + bend·δ, 0), ROOT_FLOOR)`: the
     /// parameter at which the rise reaches `δ` — the one definition, which
-    /// `kernel!`'s copy of a piece's term writes out
-    /// (`pixelflow-compiler/tests/common/section_1_7.rs`).
+    /// the font's programs write out in `kernel!` (`loop_blinn/program.rs`).
     ///
     /// **Law.** `q(t) = δ` is `bend·t² + 2·step·t − δ = 0`, whose increasing
     /// root `(√(step² + bend·δ) − step)/bend` is, rationalized, `τ(δ)` — a
@@ -1038,8 +1037,8 @@ fn padding_row() -> [f32; PIECE_ROW_COLS] {
 #[cfg(test)]
 mod adversarial;
 
-#[cfg(test)]
-mod kernel_copy;
+mod program;
+pub use program::{FontPrograms, GlyphRows};
 
 #[cfg(test)]
 mod tests {

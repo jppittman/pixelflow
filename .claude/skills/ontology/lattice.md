@@ -211,7 +211,7 @@
   `eval` was deleted in S4b-2). Not identified by a hash of its bytes.
 - **Follows:** reading one is applying a kernel. Under "no tables",
   `CachedGlyph`, `CachedText`, the atlas and `BilinearSampler` become the
-  font program and are deleted (D10).
+  font's programs and are deleted (D10).
 - **Lives:** `DiscreteManifold`, `BilinearSampler`
   (`pixelflow-core/src/lattice/mod.rs`); kernel-with-a-lattice S4b-1;
   composition-is-linking §2. Today `CachedGlyph`, `CachedText`

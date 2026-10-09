@@ -38,7 +38,9 @@ mod exact_area;
 
 use exact_area::{coverage, screen_pieces, signed_area, Grid, Piece};
 use pixelflow_core::{Kernel, Lattice};
-use pixelflow_graphics::fonts::{loop_blinn, Contour, Font, Outline, Segment};
+use pixelflow_graphics::fonts::{
+    loop_blinn, Affine, Contour, Font, FontPrograms, GlyphRows, Outline, Segment,
+};
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
@@ -88,6 +90,19 @@ fn ours(outline: &Outline, grid: Grid, [ox, oy]: P) -> Vec<f32> {
         .into_buffer()
 }
 
+/// The same texels drawn by the outline's piece count's program over its
+/// block ([`FontPrograms`]): the outline moved by `-offset`, since a program
+/// samples `(i + ½, j + ½)` and geometry is placed on the host. Every offset
+/// here is exact in `f32`, so the move rounds nothing.
+fn by_its_program(outline: &Outline, grid: Grid, [ox, oy]: P) -> Vec<f32> {
+    let placed = outline.transformed(Affine::translation(-ox, -oy));
+    let extent = [grid.width, grid.height]
+        .map(|side| u32::try_from(side).expect("a tile's side fits a u32"));
+    FontPrograms::new(extent)
+        .draw(&GlyphRows::of(&placed))
+        .into_buffer()
+}
+
 /// The reference, over the same texels.
 fn exact(outline: &Outline, grid: Grid, [ox, oy]: P) -> Vec<f64> {
     let pieces = exact_area::pieces(outline, |[x, y]| {
@@ -102,14 +117,14 @@ fn exact(outline: &Outline, grid: Grid, [ox, oy]: P) -> Vec<f64> {
 /// A tile to judge: `grid`'s texel `(i, j)` is centred at
 /// `origin + (i + ½, j + ½)` in the outline's frame, and the outline's
 /// larger side is `extent` (both set the bound; see the module docs).
-struct Judged<'a> {
-    name: &'a str,
+struct Judged {
+    name: String,
     grid: Grid,
     origin: [f64; 2],
     extent: f64,
 }
 
-impl Judged<'_> {
+impl Judged {
     /// `ours` against `exact` over the tile, held to the module's contract.
     /// Returns the worst error between the snaps as a multiple of the bound.
     fn assert(&self, ours: &[f32], exact: &[f64]) -> f64 {
@@ -151,17 +166,22 @@ impl Judged<'_> {
 }
 
 /// Every texel of `outline` over `grid`, sampled at `offset` past the
-/// lattice's own centres, held to the module's contract. Returns the worst
-/// error between the snaps as a multiple of the bound.
+/// lattice's own centres, held to the module's contract, as the builder
+/// draws it and as its program does. Returns the worst error between the
+/// snaps as a multiple of the bound.
 fn assert_exact_at(name: &str, outline: &Outline, grid: Grid, offset: P) -> f64 {
     let [x0, y0, x1, y1] = outline.bounds().expect("the test's outline has points");
-    let judged = Judged {
+    let exact = exact(outline, grid, offset);
+    let judged = |name: String| Judged {
         name,
         grid,
         origin: offset.map(f64::from),
         extent: f64::from((x1 - x0).max(y1 - y0)),
     };
-    judged.assert(&ours(outline, grid, offset), &exact(outline, grid, offset))
+    let by_the_builder = judged(name.to_owned()).assert(&ours(outline, grid, offset), &exact);
+    let by_its_program = judged(format!("{name}, by its program"))
+        .assert(&by_its_program(outline, grid, offset), &exact);
+    by_the_builder.max(by_its_program)
 }
 
 fn assert_exact(name: &str, outline: &Outline, grid: Grid) {
@@ -453,13 +473,21 @@ fn font_glyphs_past_ascii_at_5_and_64_px() {
                 .map(coverage)
                 .collect();
             let [x0, y0, x1, y1] = glyph.support.bounds();
-            let judged = Judged {
-                name: &format!("{ch:?}@{size}"),
+            let judged = |name: &str| Judged {
+                name: format!("{ch:?}@{size}{name}"),
                 grid,
                 origin: [-f64::from(margin); 2],
                 extent: f64::from((x1 - x0).max(y1 - y0)),
             };
-            judged.assert(&ours, &exact);
+            judged("").assert(&ours, &exact);
+            let outline = font
+                .outline_scaled_by_id(
+                    font.cmap_lookup(ch).expect("a glyph the font has"),
+                    size as f32,
+                )
+                .expect("an outline the font has");
+            let by_its_program = by_its_program(&outline, grid, [-margin, -margin]);
+            judged(", by its program").assert(&by_its_program, &exact);
         }
     }
 }

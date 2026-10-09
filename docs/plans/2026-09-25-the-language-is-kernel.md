@@ -7,7 +7,9 @@
   points are uniforms, and `select` is renamed `if` (§1.6, §1.7). Revised
   again 2026-10-01: no arrays (below). Phases A and B are done (B7, the
   equivalence gate, 2026-10-08: every printable ASCII glyph at 7, 16 and
-  32 px); Phase C waits on O3–O4.
+  32 px). Revised 2026-10-09 (JP): a font at a zoom level is **one program
+  per piece count**, not one program under an id tree (§1.7). C1 is done:
+  the programs, behind the plan's gates; C2 waits on O4.
   2026-10-01: JP answered O1 and O2 "Yes and yes". Both are built: D-a,
   the O2 half (`feat(compiler): kernel-typed parameters, applied as
   contramap`), and O1, each glyph its own optimization unit in `P`
@@ -204,10 +206,9 @@ a mask. F: probe p16 gives 5. After this plan it is a type error.
   - **O3 reads off this order.** Where an instance's slots land is its
     position in the composition: for `glyph(ink, bounds)` with `ink` a
     balanced `sum2` tree of `one_piece` instances, the box is slots `0..4`
-    and piece `k` is slots `4 + 10k .. 14 + 10k` (F, pinned by
-    `kernel_copy.rs`). So the walk that composes the font can return each
-    instance's offset as a prefix sum over what it composed. Not built
-    (O3).
+    and piece `k` is slots `4 + 10k .. 14 + 10k` (F, B7). So a glyph's
+    block is its box, then ten values per piece, in piece order: built so
+    in C1 (`GlyphRows`, §1.7).
   - An entry that takes a kernel has no `Args` record: its block declares
     the argument's uniforms too, so a record of the entry's own would
     rebind only a program whose argument declares none. Binding a
@@ -423,11 +424,16 @@ kernel! {
 }
 ```
 
-**The atlas becomes the font program.** JP: *"The 'atlas' becomes the kernel
-for that number of control points, everything else is a uniform."* The atlas holds one font at one tile
-size (F, `atlas.rs:46-60`: "An atlas is bound to ONE font", rebuilt "on
-cell-size and density changes"). So the kernel that replaces it is the
-font's at one zoom level (I), which is what JP's Q1 answer says.
+**The atlas becomes the font's programs.** JP: *"The 'atlas' becomes the
+kernel for that number of control points, everything else is a uniform."*
+The atlas holds one font at one tile size (F, `atlas.rs:46-60`: "An atlas
+is bound to ONE font", rebuilt "on cell-size and density changes"). Read
+literally (JP, 2026-10-09: *"Just make the 94 programs 28 programs"*): the
+kernel for a number of control points is the program for that piece count,
+every value a glyph holds is a uniform, and so every glyph with that many
+pieces is the same program over a different block. A font at one zoom level
+is the program for each piece count its glyphs have: 28 for DejaVu's
+printable ASCII.
 
 **What the language defines** is the block: a piece's record and its term
 in closed form, a glyph's box test, and coverage. Nothing in it is a
@@ -439,54 +445,72 @@ font loaded at runtime), and the language has no collection to hold it
 - **a piece:** one instance of `one_piece` over its own ten uniforms;
 - **a glyph:** `glyph(ink, bounds)` over its box's four uniforms, with
   `ink` the sum of its pieces' instances, a balanced tree of `sum2`;
-- **the font:** its glyphs under a balanced tree of
-  `if id < k { lower } else { upper }`.
-  - **I:** the host numbers the font's glyphs `0..G`, halves the range, and
-    `k` is the first id of the upper half. `k` is a count, so it is
-    structural.
-  - `id` is one uniform, and every node reads it. That needs one id
-    instance read at every node: an entry instantiated per node with an
-    `id` parameter would mint one id per node (identity is by instance,
-    §1.4), and no document says how a composition reuses one (O3).
+- **the font:** for each piece count its glyphs have, that count's glyph
+  program: `n` `one_piece` instances under one `glyph`, every value a
+  uniform. A glyph is drawn by writing its box and rows into its count's
+  block and calling that program.
+  - Choosing a glyph's program is choosing by a structural parameter, the
+    piece count, which is what structural means (§1.4). There is still no
+    table: a glyph's rows are a block's values, written per call.
   - Composing instances is the host walking data, not unrolling: there is
     no fold over pieces, and each instance reads its own uniforms.
-
-That is the whole font program. The tree is the partition that `if` and
-bounding make (§1.6). It is not a table, and the host chooses no program.
+  - **Superseded (2026-10-09): the font as one program under a balanced
+    `if id < k` tree of its glyphs.** Measured before it was dropped
+    (DejaVu ASCII at 16 px, AVX-512, release): one call cost 1.1 ms
+    whatever glyph the id chose, against 0.8–13 µs for the glyph alone,
+    because the tree blended (an arm earns a block only if its mask is
+    computed in its own scope, and `id < k` reads only uniforms, so it is
+    hoisted to the body) and every call parked every glyph's uniform-only
+    work; the frame was 91% of `MAX_FRAME` and emission 10 s. A node can
+    be a `kernel!` entry with a kernel-typed `id` declared once (probed),
+    so the tree was spellable; it was not worth spelling.
 
 **The composition surface (O2) is built** (D-a, `f0599991`). The host
 composes a glyph from `kernel!` entries alone: one `one_piece` instance
 per piece, summed by `sum2` as a balanced tree, and `glyph(ink, bounds)`
 over the sum. Nothing of the builder is on that path (F,
-`kernel_copy.rs`): the rows are the font's data, and the box is the
-outline's own, which `inside` reaches half a pixel past. That reach was
-the builder's, in `Support`'s dilated box, until review found the test
+`fonts/loop_blinn/program.rs`): the rows are the font's data, and the box
+is the outline's own, which `inside` reaches half a pixel past. That reach
+was the builder's, in `Support`'s dilated box, until review found the test
 borrowing it. Measured: with the outline's box and no reach in the block,
-'A' at 16 px draws texel (3, 2) as 0 where the builder draws 0.19. The id
-tree is not built, and its shape is still the font's (C1).
+'A' at 16 px draws texel (3, 2) as 0 where the builder draws 0.19.
 
-**Two things about it are open:**
-- **The units (O1).** The font is too big for one e-graph or one emit
-  (§1.8). So each glyph is its own unit, and the id tree links them.
-  **Built** (O1): a glyph composed by name (`by_ref`) is saturated and
-  extracted by itself and linked into the tree after extraction. Emission
-  is still one program, and superlinear (§4, O1).
-- **Binding (O3).** The host writes each instance's uniforms into the
-  composed program's block. No document says how it finds their slots.
+**What the per-count programs settle:**
+- **The units (O1)** are not the font's: no program holds more than one
+  glyph, so no e-graph or emit sees the font at once. O1's units stay in
+  the language for whatever else composes by name.
+- **Binding (O3)** is positional: a glyph's block is its box, then ten
+  values per piece in piece order, the order the program declares them
+  (`glyph` declares its own parameter before its argument's, and the
+  balanced `sum2` tree keeps the pieces in order). C1 writes it with
+  `set_declared`; tying a block to its program by type is C2's, before the
+  frame writes one per cell.
 
-**Today's copy (F).** The block above is expanded from
-`pixelflow-compiler/tests/common/section_1_7.rs`, and
-`fonts/loop_blinn/kernel_copy.rs` pins it against the builder twice.
+**Today's programs (F, C1).** The block above is production, in
+`pixelflow-graphics/src/fonts/loop_blinn/program.rs`, beside
+`GlyphRows::of(outline)` (a glyph's block) and `FontPrograms` (one compiled
+program per piece count at a tile extent, `draw(&GlyphRows)` writing the
+block and calling it). Its tests, `fonts/loop_blinn/program/tests.rs`, pin
+it against the builder, which Phase D deletes:
 - `a_piece_is_one_term_through_either_definition`: `one_piece` and the
   builder's `piece_term` are one canonical key.
-- `every_ascii_glyph_composed_in_the_language_draws_the_builders_pixels`
-  (B7): every printable ASCII glyph of DejaVu at 7, 16 and 32 px, composed
-  as above, draws the builder `glyph`'s pixels to twice the closed form's
-  error bound, and the uniform order (O3) holds at every piece count the
-  font has. Measured on AVX-512 and on AVX2 alike: they differ by at most
-  6.9·10⁻⁷ at 7 px, 2.0·10⁻⁶ at 16 px and 1.4·10⁻⁶ at 32 px, against a
-  bound of 7.6·10⁻⁶, 1.6·10⁻⁵ and 3.1·10⁻⁵ at its smallest. One sweep, one
-  process: 57 s in a debug build, so it runs presubmit whole.
+- `every_ascii_glyph_drawn_by_its_count_s_program_draws_the_builders_pixels`
+  (B7, now through the path a frame will call): every printable ASCII glyph
+  of DejaVu at 7, 16 and 32 px, drawn by its count's program over its
+  block, draws the builder `glyph`'s pixels to twice the closed form's
+  error bound. Measured on AVX-512 and on AVX2 alike: they differ by at
+  most 6.9·10⁻⁷ at 7 px, 2.0·10⁻⁶ at 16 px and 1.4·10⁻⁶ at 32 px, against
+  a bound of 7.6·10⁻⁶, 1.6·10⁻⁵ and 3.1·10⁻⁵ at its smallest, the same
+  digits as the composition with the rows baked as defaults: writing the
+  block is that composition, bit for bit.
+- `every_count_s_program_optimizes_estimate_free`: every count's program
+  optimizes, with no reciprocal estimate and no `Dwrt`.
+- The plan's gates run on the programs as a second renderer beside the
+  shipped one: the exact-area ratchet and its two companions
+  (`glyph_exact_area.rs`), every edge case (`glyph_area_edge_cases.rs`,
+  the outline moved by the sampling offset, since a program samples texel
+  centres and geometry is placed on the host) and the FreeType subset
+  (`freetype_oracle.rs`).
 
 **A piece's term is its closed form, not an integral** (JP, 2026-09-29:
 *"delete all the integral stuff. other languages don't try this. probably
@@ -512,9 +536,9 @@ uniforms and the program's shape:
 - the walk over the parsed font that composes the program (above).
 
 **A cell is one call.**
-- A cell writes its glyph id, its origin `(x0, y0)` (collapse-is-a-fold
-  §2.1), `fg` and `bg`, about six uniforms (I), and calls the font program
-  over its tile.
+- A cell writes its glyph's block (its box and rows), its origin
+  `(x0, y0)` (collapse-is-a-fold §2.1), `fg` and `bg`, and calls its
+  glyph's count's program over its tile.
 - The control points stay as written for the zoom level.
 - The colour blend and the pack belong to the packed frame (Phase D-b).
 - The loop over cells is host schedule until scheduling moves into the
@@ -522,8 +546,9 @@ uniforms and the program's shape:
 - A call costs 6–9 ns once A2 lands (F, measured with `vzeroupper`), so
   12k cells is about 0.1 ms of calls.
 
-**A zoom level recompiles the font.**
-- The tile extent is structural, so a new pixel size is a new program.
+**A zoom level recompiles the font's programs.**
+- The tile extent is structural, so a new pixel size is a new program per
+  piece count.
 - **I:** the host rescales the outlines and rewrites the font's uniforms. A
   scaling `at` will not do: the closed form bakes in the pixel, so a glyph
   kernel is correct under translation only (CLAUDE.md, "Glyph coverage").
@@ -551,6 +576,9 @@ piece was its own integral, went with the integral (§1.5).
      links them**, as `10b76d53` had it. **Built** (O1). The largest Noto
      ASCII glyph is `@`, 56 pieces, and inserts 5,796 classes (F, O1); the
      189-piece glyph above is `U_band`, not an ASCII glyph.
+   - **Superseded for the font (2026-10-09):** the font is one program per
+     piece count (§1.7), so no program holds more than one glyph and the
+     size problem does not arise.
 2. **Zoom latency.** A zoom recompiles every glyph.
    - (I, measured on B3's family `glyph::<64>`) a 64-piece glyph bakes in 806–897 ms under the unpinned cap (C2),
      and one of 189 pieces emits in 4.4 s. So a zoom level takes seconds
@@ -592,8 +620,8 @@ The evidence and JP's rulings settle these. JP can overturn any.
 | D6 | functions across blocks or crates | inlined within a block; across blocks only as kernel-typed arguments at runtime (D-a, done). A proc macro sees only its own tokens |
 | D7 | records and tuples | flattened in the front end; record returns (`-> Rgba`) with one `if` on the packed word, as `packed.rs` relies on (Phase D) |
 | D8 | masks and bits | types in sema only |
-| D9 | the frame | one font program per zoom level (JP, Q1). A cell is one call writing its glyph id, origin, `fg` and `bg`; the glyph is chosen inside the program by the `if id < k` tree; a zoom recompiles; caching later (JP, §1.7) |
-| D10 | `CachedGlyph`, `CachedText`, the atlas, `BilinearSampler` | become the font program, and are deleted as the frame moves to per-cell calls, after C2's measurement (O4). Caching returns later as its own design (JP) |
+| D9 | the frame | the font's programs at a zoom level, one per piece count (JP, Q1; 2026-10-09). A cell is one call writing its glyph's block, origin, `fg` and `bg` into its glyph's count's program; a zoom recompiles; caching later (JP, §1.7) |
+| D10 | `CachedGlyph`, `CachedText`, the atlas, `BilinearSampler` | become the font's programs, and are deleted as the frame moves to per-cell calls, after C2's measurement (O4). Caching returns later as its own design (JP) |
 | D11 | loop-carried iteration | refused in the syntax. The two fractal benches (`shader_bench`) stay on the IR as compiler research |
 | D12 | binder-indexed immediates | refused; the packer names its four channels |
 | D13 | where production kernels live | above pixelflow-core. The cell grid is terminal-shaped and leaves core (CLAUDE.md: no terminal logic in PixelFlow) |
@@ -698,10 +726,34 @@ and no digests are committed (one-pipeline §5, gate policy).
 
 ### Phase C: the font is written in `kernel!`
 
-- **C1.** The §1.7 block and the host's walk: one font program per zoom
-  level. It is built first for Noto's ASCII at one size: per-glyph units
-  (O1), the id tree, and one call per cell.
-  - It waits on O1's link, and on D-a or O2's interim answer.
+- **C1.** The §1.7 block and the host's walk: the font's programs at a
+  zoom level, one per piece count. **Done** (2026-10-09): `FontPrograms`,
+  `GlyphRows`, the block in `fonts/loop_blinn/program.rs` (§1.7, "Today's
+  programs"). Unbucketed (JP): one program per count, not the builder's
+  bucketed trip counts padded with identity rows. One call per cell, the
+  cell's own values and the atlas's deletion are C2's (JP, 2026-10-09).
+  - **Measured** (F, 2026-10-09, release, DejaVu's printable ASCII: 95
+    glyphs, 1,213 pieces, 28 piece counts and the blank, so 29 programs).
+    "Zoom" is compiling every count's program at one tile size, the first
+    size in a process paying the saturations; "draw" is one glyph's call
+    from the host, block write and collapse included, the median of 200,
+    meaned over the 95 glyphs.
+
+    | tier | px | zoom | code | draw, mean | draw, slowest glyph |
+    |---|---|---|---|---|---|
+    | AVX-512 | 7 | 3.83 s (cold) | 1,153 KB | 2.9 µs | 9.6 µs (`%`, 40 pieces) |
+    | AVX-512 | 16 | 1.18 s | 811 KB | 4.9 µs | 14.2 µs (`%`) |
+    | AVX-512 | 32 | 1.25 s | 814 KB | 9.3 µs | 33.2 µs (`&`, 38) |
+    | AVX2 | 7 | 3.88 s (cold) | 1,080 KB | 1.6 µs | 4.3 µs (`%`) |
+    | AVX2 | 16 | 1.45 s | 754 KB | 2.9 µs | 8.7 µs (`&`) |
+    | AVX2 | 32 | 1.30 s | 754 KB | 6.4 µs | 17.8 µs (`%`) |
+
+    The slowest single program compiles in 0.1–0.4 s. At 16 px a mean draw
+    puts 80×24 cells at 9.4 ms (AVX-512) and 5.6 ms (AVX2) a frame on one
+    thread, 200×60 at 59 and 35 ms; O4 measures the frame itself in C2.
+    The one font program under an id tree it replaces cost 1,103 µs a draw
+    at 16 px on AVX-512 for any glyph. Noto's ASCII is not measured: its
+    asset is a Git LFS pointer in the measuring checkout.
   - The gates are `glyph_exact_area`, `glyph_area_edge_cases`,
     `freetype_oracle`, `glyph_optimizes_estimate_free` and the goldens.
     (`glyph_is_closed` also pinned that no glyph held an integral, which
@@ -709,9 +761,12 @@ and no digests are committed (one-pipeline §5, gate policy).
     `glyph_optimizes_estimate_free`.)
   - Re-baselined pins go in their own commit. The atlas's bilinear read
     goes, so pixels move wherever density ≠ 1 (one-pipeline §1.6).
-- **C2.** The frame calls the font program per cell. The atlas,
-  `CachedGlyph`/`CachedText` and `BilinearSampler` become the font program
-  and go (D10). A zoom recompiles.
+- **C2.** The frame calls its glyph's program per cell, writing the cell's
+  values with the glyph's block, a block tied to its program by type (O3).
+  The atlas, `CachedGlyph`/`CachedText` and `BilinearSampler` become the
+  font's programs and go (D10), with the bilinear read, so pixels move
+  wherever density ≠ 1 (pins re-baselined in their own commit). A zoom
+  recompiles.
   - **Gate: measure before deleting (O4).** Measure the frame against
     today's at 80×24 and 200×60, at 16 and 32 px, on both x86 tiers, and
     measure a zoom's compile. If 200×60 at 32 px misses 16.7 ms, that goes
@@ -1031,7 +1086,9 @@ and the builder never becomes the font's surface.
   - D-a fixes where an instance's slots land: the entry's own first, then
     each argument's, in parameter order (§1.4). So the walk can return
     offsets as prefix sums. A glyph's box is at `0..4` and piece `k` is at
-    `4 + 10k` (F, `kernel_copy.rs`).
+    `4 + 10k` (F, pinned by B7 in `kernel_copy.rs`, since moved to
+    `fonts/loop_blinn/program/tests.rs` and the order built into
+    `GlyphRows`, C1).
   - An entry's `Args` streams its values by position (`set_declared`), and
     the only check is the count (§1.4, "Which program is not yet a type").
   - A composed program's slots are the flattening of every instance's.

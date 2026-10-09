@@ -54,7 +54,7 @@
 #![cfg(feature = "freetype")]
 
 use freetype as ft;
-use pixelflow_graphics::fonts::Font;
+use pixelflow_graphics::fonts::{Font, FontPrograms, GlyphRows};
 
 /// Device samples per texel edge when rasterizing the reference.
 const SUPERSAMPLE: i64 = 16;
@@ -142,6 +142,34 @@ const TEXELS_WE_MISS_FULL: usize = 2;
 /// `{`@7 (2, 1), as above (it was 3, the same three).
 const TEXELS_WE_MISS_FAST: usize = 1;
 
+/// Our coverage of `ch` at `size` px over an `extent × extent` tile, texel
+/// `(i, j)` the pixel about `(i + ½, j + ½)`, as `renderer` draws it.
+fn draw(renderer: Renderer, font: &Font, ch: char, size: u32, extent: i64) -> Vec<f32> {
+    match renderer {
+        Renderer::Builder => {
+            let glyph = font.glyph_kernel_scaled(ch, size as f32).expect("glyph");
+            // The shipped path: `Glyph::bound` compiles through
+            // `optimize_runtime_arena` and binds the piece table the folds
+            // read, so this asks the JIT the same question a frame does.
+            // `eval_at` takes texel centres directly, which is why the
+            // manifold is compiled at a 1x1 extent rather than the glyph's.
+            let kernel = glyph.kernel();
+            let bound = glyph.bound(&kernel, [1, 1]);
+            (0..extent * extent)
+                .map(|n| bound.eval_at((n % extent) as f32 + 0.5, (n / extent) as f32 + 0.5))
+                .collect()
+        }
+        Renderer::Programs => {
+            let id = font.cmap_lookup(ch).expect("glyph");
+            let outline = font.outline_scaled_by_id(id, size as f32).expect("outline");
+            let side = u32::try_from(extent).expect("a tile's side fits a u32");
+            FontPrograms::new([side, side])
+                .draw(&GlyphRows::of(&outline))
+                .into_buffer()
+        }
+    }
+}
+
 fn font_path() -> String {
     format!(
         "{}/assets/DejaVuSansMono-Fallback.ttf",
@@ -179,18 +207,39 @@ const FULL: Corpus = Corpus {
 /// only thing there is to compare against an independent rasterizer.
 #[test]
 fn our_ink_is_never_more_than_a_texel_from_freetype_s() {
-    compare_against_freetype(&FAST);
+    compare_against_freetype(&FAST, Renderer::Builder);
 }
 
-/// The full corpus. `#[ignore]`d for cost — see [`GLYPHS`] for the
-/// measurement behind the split.
+/// The same check for the path a frame will draw from: each glyph drawn by
+/// its piece count's program over its block ([`FontPrograms`],
+/// docs/plans/2026-09-25-the-language-is-kernel.md C1), held to the same
+/// pins, since a glyph's program draws the builder's pixels to the closed
+/// form's bound (`fonts/loop_blinn/program/tests.rs`), far from any
+/// threshold this file counts at.
+#[test]
+fn the_programs_ink_is_never_more_than_a_texel_from_freetype_s() {
+    compare_against_freetype(&FAST, Renderer::Programs);
+}
+
+/// The full corpus, both renderers. `#[ignore]`d for cost — see [`GLYPHS`]
+/// for the measurement behind the split.
 #[test]
 #[ignore = "the full corpus: cargo test -p pixelflow-graphics --all-features --test freetype_oracle -- --ignored"]
 fn our_ink_matches_freetype_over_the_full_corpus() {
-    compare_against_freetype(&FULL);
+    compare_against_freetype(&FULL, Renderer::Builder);
+    compare_against_freetype(&FULL, Renderer::Programs);
 }
 
-fn compare_against_freetype(corpus: &Corpus) {
+/// Who draws our side.
+#[derive(Clone, Copy, Debug)]
+enum Renderer {
+    /// The builder's glyph through `Glyph::bound`: the shipped path today.
+    Builder,
+    /// Each glyph by its piece count's program over its block.
+    Programs,
+}
+
+fn compare_against_freetype(corpus: &Corpus, renderer: Renderer) {
     let Corpus {
         glyphs,
         sizes,
@@ -258,15 +307,6 @@ fn compare_against_freetype(corpus: &Corpus) {
                 acc as f32 / (255.0 * (SUPERSAMPLE * SUPERSAMPLE) as f32)
             };
 
-            let ours_glyph = ours.glyph_kernel_scaled(ch, size as f32).expect("glyph");
-            // The shipped path: `Glyph::bound` compiles through
-            // `optimize_runtime_arena` and binds the piece table the folds
-            // read, so this asks the JIT the same question a frame does.
-            // `eval_at` takes texel centres directly, which is why the
-            // manifold is compiled at a 1x1 extent rather than the glyph's.
-            let ours_kernel = ours_glyph.kernel();
-            let bound = ours_glyph.bound(&ours_kernel, [1, 1]);
-
             // Both grids once per (glyph, size), not per probe. `reference`
             // is a 16x16 supersample block, and each was being called up to
             // ten times per texel by the neighbourhood tests below — which
@@ -275,9 +315,7 @@ fn compare_against_freetype(corpus: &Corpus) {
             let reference_grid: Vec<f32> = (0..extent * extent)
                 .map(|n| reference(n % extent, n / extent))
                 .collect();
-            let ours_grid: Vec<f32> = (0..extent * extent)
-                .map(|n| bound.eval_at((n % extent) as f32 + 0.5, (n / extent) as f32 + 0.5))
-                .collect();
+            let ours_grid = draw(renderer, &ours, ch, size, extent);
             let reference = |i: i64, j: i64| reference_grid[(j * extent + i) as usize];
             let ours = |i: i64, j: i64| ours_grid[(j * extent + i) as usize];
             let inked: Vec<bool> = reference_grid
@@ -352,20 +390,20 @@ fn compare_against_freetype(corpus: &Corpus) {
     // corpus, bounded at 2% (`INK_RATIO_TOLERANCE`).
     let ratio = ink_ours / ink_reference;
     eprintln!(
-        "freetype_oracle: ink ratio {ratio:.5}, {} texels we miss, {} orphans\n{}",
+        "freetype_oracle, {renderer:?}: ink ratio {ratio:.5}, {} texels we miss, {} orphans\n{}",
         we_miss.len(),
         orphans.len(),
         we_miss.join("\n")
     );
     assert!(
         (ratio - 1.0).abs() < INK_RATIO_TOLERANCE,
-        "we lay down {ratio:.4}x FreeType's ink ({ink_ours:.1} vs \
+        "{renderer:?}: we lay down {ratio:.4}x FreeType's ink ({ink_ours:.1} vs \
          {ink_reference:.1}) — the outlines are not being filled the same way"
     );
     assert_eq!(
         we_miss.len(),
         texels_we_miss,
-        "FreeType inks {} texels we leave blank, pinned at {texels_we_miss} — \
+        "{renderer:?}: FreeType inks {} texels we leave blank, pinned at {texels_we_miss} — \
          up means a defect has spread, down means coverage has improved and \
          this number wants lowering:\n{}",
         we_miss.len(),
@@ -380,7 +418,7 @@ fn compare_against_freetype(corpus: &Corpus) {
     assert_eq!(
         orphans.len(),
         known_orphans,
-        "we put ink where an independent rasterizer finds none — expected the \
+        "{renderer:?}: we put ink where an independent rasterizer finds none — expected the \
          {known_orphans} known `'8'` texels, got {}:\n{}",
         orphans.len(),
         orphans.join("\n")

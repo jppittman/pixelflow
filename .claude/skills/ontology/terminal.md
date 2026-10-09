@@ -16,14 +16,16 @@ They are grouped here because the terminal is their consumer.
 
 ### Cell and the cell grid
 
-- **Is:** "A cell is one call." A cell writes its glyph id, origin, fg and bg
-  (about six uniforms) and calls the font program over its tile.
+- **Is:** "A cell is one call." A cell writes its glyph's block (box and
+  rows), its origin, fg and bg, and calls its glyph's piece count's program
+  over its tile.
 - **Is not:** a fold iteration, for now. One-pipeline §1.6's fold over cells
   invoking `P_N` is superseded. Not one fused program over the device frame
   gathering ten floats per cell from a buffer (the 2026-07-29 and 2026-09-06
   `CellGridProgram`, which is today's code), because buffers are leaving the
-  language. Not tree structure ("data beats structure"). The id tree is a
-  tree of `if`s that nobody builds as a structure.
+  language. Not tree structure ("data beats structure"). Not a glyph id
+  chosen by an `if id < k` tree inside one font program (superseded
+  2026-10-09; see "Font programs").
 - **Follows:** metric changes are uniform writes, and anything that moves an
   extent (window, column count, tile) recompiles. L4 measured this as
   "conditional, not general". Terminal-shaped kernels leave core (D13).
@@ -43,21 +45,28 @@ They are grouped here because the terminal is their consumer.
 - **Lives:** the-language-is-kernel §1.7, D9. Today a frame is one fused
   `CellGridProgram` collapse in stripes, not per-cell calls (see Cell).
 
-### Font program and id tree
+### Font programs
 
-- **Is:** one program per font per zoom level: the font's glyphs under a
-  balanced `if id < k` tree that the host composes. "The partition falls out
-  of `if` and bounding, and nobody builds it as a structure."
-- **Is not:** an atlas. Not a host lookup that chooses a program. Not a
-  table mapping id to glyph.
-- **Follows:** choosing a glyph costs about log₂ G uniform-mask jumps, so
-  arms as blocks are urgent for a program that is mostly `if`s. Each glyph
-  is a unit, so glyphs with the same structure saturate once (36
-  saturations for Noto's ASCII). Emitting the whole font is superlinear in
-  pieces, which is C1's problem. Whether `k` is a uniform is open.
-- **Lives:** the-language-is-kernel §1.6–§1.8, D9, O1–O3. Unbuilt: no font
-  program exists in the tree; glyphs are baked and cached one by one
-  (`pixelflow-graphics/src/fonts/{cache,atlas}.rs`).
+- **Is:** a font at a zoom level is one program per piece count: "the
+  'atlas' becomes the kernel for that number of control points, everything
+  else is a uniform" (JP, Q1), read literally on 2026-10-09 ("Just make the
+  94 programs 28 programs"). Every value a glyph holds is a uniform, so
+  every glyph with `n` pieces is the same program over a different block,
+  and a glyph is drawn by writing its block into its count's program.
+- **Is not:** an atlas. Not a table mapping id to glyph. Not one program
+  of every glyph under a balanced `if id < k` tree (superseded 2026-10-09:
+  measured, the tree blended because a mask computed in an enclosing scope
+  earns no block, and every call ran every glyph's uniform-only work, 1.1
+  ms a call for DejaVu's ASCII at 16 px against 0.8–13 µs for a glyph
+  alone).
+- **Follows:** choosing the program is choosing by a structural parameter,
+  the piece count, which is what structural means. No program holds more
+  than one glyph, so O1's units and the class limit are not the font's
+  concern. A zoom recompiles one program per count. Bucketing counts to
+  share programs is a cache policy, not adopted (JP: unbucketed).
+- **Lives:** `FontPrograms`, `GlyphRows`
+  (`pixelflow-graphics/src/fonts/loop_blinn/program.rs`); the-language-is-kernel
+  §1.7, D9, C1. The frame still draws from the atlas until C2.
 
 ### Glyph
 
@@ -68,7 +77,8 @@ They are grouped here because the terminal is their consumer.
   - An integral (deleted).
   - A winding sum plus a distance min, "two loops, chosen at authoring
     time".
-  - Its own program.
+  - Its own program: its piece count's program draws it, shared with every
+    glyph of that count.
   - Scale-invariant.
   - "One fold over a table": that is today's production code and CLAUDE.md's
     wording, superseded by JP's ruling.
@@ -77,13 +87,13 @@ They are grouped here because the terminal is their consumer.
     (09-09).
 - **Follows:** a glyph is correct under translation only. A box test that is
   uniform over a batch is a jump.
-- **Lives:** `pixelflow-graphics/src/fonts/loop_blinn.rs` (the production
-  builder glyph: `glyph`, `Glyph`, a fold over a `DiscreteManifold` piece
-  table masked to `Support`'s box, which contradicts this entry); the
-  language glyph's block (`one_piece`, `sum2`, `glyph`, `Row`, `Bounds`) is
-  `pixelflow-compiler/tests/common/section_1_7.rs`, included by
-  `fonts/loop_blinn/kernel_copy.rs` (`#[cfg(test)]`, test-only until C1);
-  the-language-is-kernel §1.7.
+- **Lives:** the language glyph's block (`one_piece`, `sum2`, `glyph`,
+  `Row`, `Bounds`) in `pixelflow-graphics/src/fonts/loop_blinn/program.rs`,
+  which the font's programs are written in; the builder glyph in
+  `pixelflow-graphics/src/fonts/loop_blinn.rs` (`glyph`, `Glyph`, a fold over
+  a `DiscreteManifold` piece table masked to `Support`'s box, which
+  contradicts this entry), still what the atlas bakes until C2 and deleted in
+  Phase D; the-language-is-kernel §1.7.
 
 ### Piece, band, box
 
@@ -103,8 +113,8 @@ They are grouped here because the terminal is their consumer.
   Pruning is exact or it is not pruning: `FLAT_ENOUGH` changed an integer by
   dropping a nearly flat curve.
 - **Lives:** the-language-is-kernel §1.6–§1.7; `Row`, `Bounds`, `piece_area`,
-  `one_piece` in `pixelflow-compiler/tests/common/section_1_7.rs` (test-only).
-  Today production `fonts/loop_blinn.rs` still reads each piece as a table
+  `one_piece` in `pixelflow-graphics/src/fonts/loop_blinn/program.rs`. The
+  builder in `fonts/loop_blinn.rs` still reads each piece as a table
   row (`PIECE_ROW_COLS`) at a binder index and masks with `Support`
   (`Support::around`, dilated by `RAMP_REACH`), which contradicts this
   entry.
