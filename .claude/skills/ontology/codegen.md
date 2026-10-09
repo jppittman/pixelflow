@@ -528,7 +528,9 @@
   including the ones it clobbers and the flags — so nothing about it is hidden
   from the allocator. A branch is an ordinary instruction.
 - **Lives:** `AsmInsn` (`pixelflow-codegen/src/emit/mod.rs`), the backends'
-  `Inst` enums (`emit/x86_64.rs`, `emit/aarch64.rs`). Today most emission is
+  instruction enums: `Gp<S>`, x86's general-register instructions, generic
+  over a `Stage` and with named fields typed by `Class` (`emit/x86_64.rs`);
+  `Inst` in `emit/aarch64.rs`. Today most emission is
   `IsaBackend` verbs writing bytes inline ("Instructions: bytes written inline
   by ~236 functions, not values", denotational-diagnosis; e.g.
   `emit_write(&mut self, code: &mut Vec<u8>, …)`), which contradicts this
@@ -536,13 +538,13 @@
 
 ### Branch
 
-- **Is:** "A branch is an ordinary instruction": `Jmp { target }` and
-  `Jcc { condition, target }` on x86; `B`, `BCond` and `BranchIfW16Zero` on
+- **Is:** "A branch is an ordinary instruction": `Gp::Jmp { to }` and
+  `Gp::Jcc { cond, flags, taken }` on x86; `B`, `BCond` and `BranchIfW16Zero` on
   aarch64. The condition is the opcode's own field (`Cond`, whose
   discriminants are the manual's values).
 - **Is not:** something that returns a position. Not hand-picked mnemonics
   over a private `jcc(code, cc: u8)`.
-- **Follows:** a loop's back edge is `push(Jmp { target: top })`. Arm skips
+- **Follows:** a loop's back edge is `push(Gp::Jmp { to: top })`. Arm skips
   are one verb, `branch_if_arm_is_dead(.., MaskTest, Label)`, "because they
   differed only in which uniform mask lets an arm go, which is what `IfArm`
   already names". A fold's trip test reuses `IfArm::False`'s test.

@@ -338,6 +338,68 @@ impl From<PtrReg> for Gpr {
     }
 }
 
+/// What a value is at the machine level: the type an instruction's operand
+/// field is declared with. `Pointer` and `Integer` live in the same file and
+/// are different classes, so a base address cannot be handed a `row * pitch`
+/// product.
+trait Class: Copy + 'static {
+    /// The register newtype a field of this class is at [`Physical`], until
+    /// the allocator's tokens replace the newtypes.
+    type Physical: Copy;
+}
+
+/// An address.
+#[derive(Copy, Clone)]
+enum Pointer {}
+
+/// An integer: an index, a product.
+#[derive(Copy, Clone)]
+enum Integer {}
+
+/// The condition flags.
+#[derive(Copy, Clone)]
+enum Flags {}
+
+impl Class for Pointer {
+    type Physical = PtrReg;
+}
+
+impl Class for Integer {
+    type Physical = Gpr;
+}
+
+impl Class for Flags {
+    type Physical = ();
+}
+
+/// What the operands of an instruction are. An instruction enum is generic
+/// over a stage and declares each field by what it does to its register.
+trait Stage {
+    /// A register the instruction defines.
+    type Write<C: Class>;
+    /// A register the instruction reads.
+    type Read<C: Class>;
+    /// A register the instruction reads and overwrites in place.
+    type Tie<C: Class>;
+    /// Where a branch goes.
+    type Target;
+    /// The frame's size, as `Enter` and `Ret` take it.
+    type FrameSize;
+}
+
+/// The stage the legacy driver builds at: operands are the register newtypes
+/// it has always chosen, and a flags field is `()`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Physical {}
+
+impl Stage for Physical {
+    type Write<C: Class> = C::Physical;
+    type Read<C: Class> = C::Physical;
+    type Tie<C: Class> = C::Physical;
+    type Target = Label;
+    type FrameSize = u32;
+}
+
 /// Physical mask/predicate register index (k0..k7 on AVX-512).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct KReg(u8);
@@ -755,9 +817,8 @@ trait IsaBackend {
     // The function around the nest: its frame and what trails it.
     // -------------------------------------------------------------------------
 
-    /// Reserve / release `bytes` of stack.
+    /// Reserve `bytes` of stack.
     fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32);
-    fn frame_free(&mut self, code: &mut Vec<u8>, bytes: u32);
 
     /// Anchor whatever the body's constant loads are relative to, once the
     /// frame exists: the register that holds the constant pool's address for
@@ -858,8 +919,8 @@ trait IsaBackend {
     /// does not.
     fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan);
 
-    /// Function return.
-    fn emit_ret(&mut self, code: &mut Vec<u8>);
+    /// Release the frame's `bytes` of stack and return.
+    fn emit_ret(&mut self, code: &mut Vec<u8>, bytes: u32);
 }
 
 /// One `Write`, resolved: the value's register, where the two address
@@ -2013,8 +2074,7 @@ fn compile_via_backend<B: IsaBackend>(
     let body_start = asm.len();
     emit_scope(nest.body(), &mut counting, &mut asm)?;
     let body_bytes = asm.len() - body_start;
-    counting.frame_free(&mut asm.run, nest.frame_bytes());
-    counting.emit_ret(&mut asm.run);
+    counting.emit_ret(&mut asm.run, nest.frame_bytes());
     let scaffold = counting.take((asm.len() - body_bytes) as u64);
     counting.finish(&mut asm, pool);
     let code = asm.finish();
@@ -2183,9 +2243,6 @@ mod tests {
         fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {
             self.0.frame_alloc(code, bytes);
         }
-        fn frame_free(&mut self, code: &mut Vec<u8>, bytes: u32) {
-            self.0.frame_free(code, bytes);
-        }
         fn anchor(&mut self, asm: &mut Assembly, pool: Label) {
             self.0.anchor(asm, pool);
         }
@@ -2236,8 +2293,8 @@ mod tests {
         fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan) {
             self.0.emit_write(code, write);
         }
-        fn emit_ret(&mut self, code: &mut Vec<u8>) {
-            self.0.emit_ret(code);
+        fn emit_ret(&mut self, code: &mut Vec<u8>, bytes: u32) {
+            self.0.emit_ret(code, bytes);
         }
     }
 
@@ -3129,9 +3186,9 @@ mod tests {
     ///
     /// The return is found from the driver's structure, not by scanning for
     /// `C3`, which a ModRM byte, an immediate or a pool entry holds just as
-    /// well. A program has one return — [`compile_via_backend`] emits it
-    /// after releasing the frame, and [`IsaBackend::emit_ret`] is the only
-    /// verb that emits one — and every byte before its end is counted by a
+    /// well. A program has one return — [`compile_via_backend`] emits it,
+    /// and [`IsaBackend::emit_ret`] is the only verb that does, releasing the
+    /// frame first — and every byte before its end is counted by a
     /// scope or by the scaffold, so the return ends where those counts do.
     ///
     /// The return grew in front of the constant pool, whose position two
@@ -6262,10 +6319,6 @@ mod tests {
                 self.inner.frame_alloc(code, bytes);
             }
 
-            fn frame_free(&mut self, code: &mut Vec<u8>, bytes: u32) {
-                self.inner.frame_free(code, bytes);
-            }
-
             fn anchor(&mut self, asm: &mut Assembly, pool: Label) {
                 self.inner.anchor(asm, pool);
             }
@@ -6336,8 +6389,8 @@ mod tests {
                 self.inner.emit_write(code, write);
             }
 
-            fn emit_ret(&mut self, code: &mut Vec<u8>) {
-                self.inner.emit_ret(code);
+            fn emit_ret(&mut self, code: &mut Vec<u8>, bytes: u32) {
+                self.inner.emit_ret(code, bytes);
             }
         }
 

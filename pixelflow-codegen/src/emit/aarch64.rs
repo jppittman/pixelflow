@@ -1548,20 +1548,6 @@ pub(super) mod driver {
             }
         }
 
-        fn frame_free(&mut self, code: &mut Vec<u8>, bytes: u32) {
-            let mut remaining = bytes;
-            while remaining > 0 {
-                let chunk = remaining.min(table::MAX_ADD_IMM);
-                AsmProgram::from([table::AddI64::new(
-                    ptr::SP,
-                    ptr::SP,
-                    table::Imm12(chunk as u16),
-                )])
-                .assemble(code);
-                remaining -= chunk;
-            }
-        }
-
         /// Every scope's constant loads are X17-relative, so the anchor has
         /// to be inside the emitted function, after the frame.
         fn anchor(&mut self, asm: &mut Assembly, pool: Label) {
@@ -1680,7 +1666,18 @@ pub(super) mod driver {
             }
         }
 
-        fn emit_ret(&mut self, code: &mut Vec<u8>) {
+        fn emit_ret(&mut self, code: &mut Vec<u8>, bytes: u32) {
+            let mut remaining = bytes;
+            while remaining > 0 {
+                let chunk = remaining.min(table::MAX_ADD_IMM);
+                AsmProgram::from([table::AddI64::new(
+                    ptr::SP,
+                    ptr::SP,
+                    table::Imm12(chunk as u16),
+                )])
+                .assemble(code);
+                remaining -= chunk;
+            }
             AsmProgram::from([Inst::Ret]).assemble(code);
         }
     }

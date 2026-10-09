@@ -26,7 +26,7 @@
 
 use super::x86_64;
 use super::x86_64::{Disp, Mem, NoDisp, frame_slot};
-use super::{AsmProgram, EncodedInst, Gpr, PtrReg, Reg, assemble, unimplemented_op};
+use super::{AsmProgram, EncodedInst, Gpr, Physical, PtrReg, Reg, assemble, unimplemented_op};
 use crate::error::CompileError;
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
@@ -152,7 +152,7 @@ impl Vex {
     /// `op reg, [addr]` — the memory-operand form, for any base and any
     /// displacement mode. The prefix is VEX's; the ModRM/SIB/displacement tail
     /// is the architecture's, so it comes from `x86_64::mem_operand`.
-    fn rm<D: Disp>(self, reg: u8, addr: Mem<D>) -> EncodedInst {
+    fn rm<D: Disp>(self, reg: u8, addr: Mem<Physical, D>) -> EncodedInst {
         let mut inst = EncodedInst::new();
         // R and B are stored inverted; X is unused (no index register).
         let rbit = if reg >= 8 { 0x00 } else { 0x80 };
@@ -218,7 +218,7 @@ impl VexImm {
         inst
     }
     /// Memory form with the imm8 appended.
-    fn rm<D: Disp>(self, reg: u8, addr: Mem<D>) -> EncodedInst {
+    fn rm<D: Disp>(self, reg: u8, addr: Mem<Physical, D>) -> EncodedInst {
         let mut inst = self.vex.rm(reg, addr);
         inst.push(self.imm);
         inst
@@ -523,7 +523,7 @@ fn vcvttss2si_xmm(dst: Gpr, src: Reg) -> EncodedInst {
 
 /// `vcvttss2si r64, m32` — the same, reading the first word of a slot.
 #[must_use]
-fn vcvttss2si_mem<D: Disp>(dst: Gpr, addr: Mem<D>) -> EncodedInst {
+fn vcvttss2si_mem<D: Disp>(dst: Gpr, addr: Mem<Physical, D>) -> EncodedInst {
     Vex::m0f_f3(0x2C).w1().rm(dst.0, addr)
 }
 
@@ -544,7 +544,7 @@ fn vpmovzxbd(dst: Reg, src: Reg) -> EncodedInst {
 /// `vextractps m32, xmm, lane` — `VEX.128.66.0F3A.WIG 17 /r ib`: one lane of
 /// the low half, stored.
 #[must_use]
-fn vextractps_store<D: Disp>(addr: Mem<D>, src: Reg, lane: u8) -> EncodedInst {
+fn vextractps_store<D: Disp>(addr: Mem<Physical, D>, src: Reg, lane: u8) -> EncodedInst {
     debug_assert!(lane < 4, "vextractps reads the low 128 bits");
     Vex::m0f3a_66(0x17).xmm().imm(lane).rm(src.0, addr)
 }
@@ -761,6 +761,7 @@ mod tests {
         /// returns its `__m256`/`__m512` in the vector register a
         /// `vzeroupper` would clear.
         const RET: u8 = 0xC3;
+        use crate::emit::AsmInsn;
         use crate::emit::executable::CompiledKernel;
         use core::arch::x86_64::*;
 
@@ -1040,20 +1041,20 @@ mod tests {
         fn emit_load_after_emit_store_recovers_the_spilled_value() {
             let (xs, ys, zs) = lanes();
             let mut c = Vec::new();
-            AsmProgram::from([crate::emit::x86_64::Inst::SubImm32 {
-                dst: crate::emit::x86_64::gpr::RSP,
-                imm: crate::emit::x86_64::Imm32(32),
-            }])
-            .assemble(&mut c);
+            crate::emit::x86_64::Gp::Enter {
+                size: 32,
+                flags: (),
+            }
+            .emit_into(&mut c);
             emit_binary(&mut c, OpKind::Mul, Reg(6), X, Y);
             AsmProgram::from([Vex::m0f(0x11).rm(6, frame_slot(0))]).assemble(&mut c);
             emit_binary(&mut c, OpKind::Add, Reg(6), X, X); // clobber
             AsmProgram::from([Vex::m0f(0x10).rm(X.0, frame_slot(0))]).assemble(&mut c);
-            AsmProgram::from([crate::emit::x86_64::Inst::AddImm32 {
-                dst: crate::emit::x86_64::gpr::RSP,
-                imm: crate::emit::x86_64::Imm32(32),
-            }])
-            .assemble(&mut c);
+            // `add rsp, 32` (REX.W 81 /0 id), not `Gp::Ret`: this kernel
+            // returns its answer in a ymm register, which a `vzeroupper`
+            // would clear.
+            AsmProgram::from([EncodedInst::from_slice(&[0x48, 0x81, 0xC4, 32, 0, 0, 0])])
+                .assemble(&mut c);
             check(run(&c, xs, ys, zs), |i| xs[i] * ys[i], "spill roundtrip");
         }
 
@@ -1289,7 +1290,7 @@ pub(super) mod driver {
 
     impl IsaBackend for Avx2Backend {
         fn jump(&mut self, asm: &mut Assembly, label: Label) {
-            asm.push(x86::Jmp { target: label });
+            asm.push(x86::Gp::Jmp { to: label });
         }
 
         fn register_file(&self) -> regalloc::RegisterFile {
@@ -1321,7 +1322,11 @@ pub(super) mod driver {
                 // dwords, converted. No vector temp — `dst` is every stage's.
                 ResolvedOp::Lanes { dst } => {
                     let gpr = crate::emit::declared_gpr_temp(plan.scratch.gpr_temp(0));
-                    x86::movabs(code, gpr, IOTA_BYTES);
+                    x86::Gp::Movabs {
+                        dst: gpr,
+                        imm: IOTA_BYTES,
+                    }
+                    .emit_into(code);
                     AsmProgram::from([
                         vmovq_xmm_r64(*dst, gpr),
                         vpmovzxbd(*dst, *dst),
@@ -1380,13 +1385,14 @@ pub(super) mod driver {
                     let ctx = AVX2_FILE
                         .gpr_ctx
                         .expect("x86's context read needs the GPR context input");
-                    AsmProgram::from([x86::MovLoadPtr {
+                    x86::Gp::MovLoad {
                         dst: *dst,
-                        base: PtrReg(ctx.0),
-                        disp: i32::from(*slot) * x86::PTR_BYTES,
+                        src: Mem {
+                            base: PtrReg(ctx.0),
+                            disp: x86::Imm32(i32::from(*slot) * x86::PTR_BYTES),
+                        },
                     }
-                    .encode()])
-                    .assemble(code);
+                    .emit_into(code);
                 }
                 ResolvedOp::Binary {
                     op,
@@ -1451,27 +1457,23 @@ pub(super) mod driver {
         }
 
         fn ptr_store(&mut self, code: &mut Vec<u8>, src: PtrReg, offset: u32) {
-            AsmProgram::from([x86::MovStorePtr {
+            x86::Gp::MovStore {
+                dst: frame_slot(offset),
                 src,
-                base: x86::ptr::RSP,
-                disp: offset as i32,
             }
-            .encode()])
-            .assemble(code);
+            .emit_into(code);
         }
 
         fn ptr_load(&mut self, code: &mut Vec<u8>, dst: PtrReg, offset: u32) {
-            AsmProgram::from([x86::MovLoadPtr {
+            x86::Gp::MovLoad {
                 dst,
-                base: x86::ptr::RSP,
-                disp: offset as i32,
+                src: frame_slot(offset),
             }
-            .encode()])
-            .assemble(code);
+            .emit_into(code);
         }
 
         fn ptr_mov(&mut self, code: &mut Vec<u8>, dst: PtrReg, src: PtrReg) {
-            x86::mov(code, dst.as_gpr(), src.as_gpr());
+            x86::Gp::Mov { dst, src }.emit_into(code);
         }
 
         fn anchor(&mut self, asm: &mut Assembly, pool: Label) {
@@ -1493,27 +1495,22 @@ pub(super) mod driver {
             super::emit_movmskps_eax(&mut asm.run, test.reg);
             match test.arm {
                 // ZF set when eax == 0: no lane is true, so the true arm is dead.
-                IfArm::True => x86_64::emit_test_eax(&mut asm.run),
+                IfArm::True => asm.push(x86::Gp::Test {
+                    flags: (),
+                    src: x86::gpr::RAX,
+                }),
                 // ZF set when al == 0xFF: every lane is true, so the false arm is.
                 IfArm::False => super::emit_cmp_al_imm8(&mut asm.run, 0xFF),
             }
-            asm.push(x86::Jcc::je(label));
+            asm.push(x86::Gp::je(label));
         }
 
         fn frame_alloc(&mut self, code: &mut Vec<u8>, bytes: u32) {
-            AsmProgram::from([x86::Inst::SubImm32 {
-                dst: x86::gpr::RSP,
-                imm: x86::Imm32(bytes as i32),
-            }])
-            .assemble(code);
-        }
-
-        fn frame_free(&mut self, code: &mut Vec<u8>, bytes: u32) {
-            AsmProgram::from([x86::Inst::AddImm32 {
-                dst: x86::gpr::RSP,
-                imm: x86::Imm32(bytes as i32),
-            }])
-            .assemble(code);
+            x86::Gp::Enter {
+                size: bytes,
+                flags: (),
+            }
+            .emit_into(code);
         }
 
         fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
@@ -1553,7 +1550,7 @@ pub(super) mod driver {
         /// lane: the low four straight out of the value, the rest out of its
         /// high half extracted into the reserved temp.
         fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan) {
-            let addr = write_address(
+            let base = write_address(
                 code,
                 &AVX2_FILE,
                 write,
@@ -1566,7 +1563,6 @@ pub(super) mod driver {
                     },
                 },
             );
-            let base = PtrReg(addr.0);
             let lanes = AVX2_FILE.vector_bytes / 4;
             if write.lanes == lanes {
                 AsmProgram::from([Vex::m0f(0x11).rm(write.value.0, Mem { base, disp: NoDisp })])
@@ -1591,8 +1587,12 @@ pub(super) mod driver {
             }
         }
 
-        fn emit_ret(&mut self, code: &mut Vec<u8>) {
-            x86::return_to_caller(code);
+        fn emit_ret(&mut self, code: &mut Vec<u8>, bytes: u32) {
+            x86::Gp::Ret {
+                size: bytes,
+                flags: (),
+            }
+            .emit_into(code);
         }
     }
 }

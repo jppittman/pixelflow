@@ -279,10 +279,6 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.frame_alloc(code, bytes);
     }
 
-    fn frame_free(&mut self, code: &mut Vec<u8>, bytes: u32) {
-        self.inner.frame_free(code, bytes);
-    }
-
     fn anchor(&mut self, asm: &mut super::Assembly, pool: super::Label) {
         self.inner.anchor(asm, pool);
     }
@@ -362,8 +358,8 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         self.inner.emit_write(code, write);
     }
 
-    fn emit_ret(&mut self, code: &mut Vec<u8>) {
-        self.inner.emit_ret(code);
+    fn emit_ret(&mut self, code: &mut Vec<u8>, bytes: u32) {
+        self.inner.emit_ret(code, bytes);
     }
 }
 
@@ -451,8 +447,6 @@ mod tests {
 
         fn frame_alloc(&mut self, _code: &mut Vec<u8>, _bytes: u32) {}
 
-        fn frame_free(&mut self, _code: &mut Vec<u8>, _bytes: u32) {}
-
         fn anchor(&mut self, _asm: &mut Assembly, _pool: Label) {
             self.anchor_calls += 1;
         }
@@ -488,7 +482,7 @@ mod tests {
 
         fn emit_write(&mut self, _code: &mut Vec<u8>, _write: &WritePlan) {}
 
-        fn emit_ret(&mut self, _code: &mut Vec<u8>) {}
+        fn emit_ret(&mut self, _code: &mut Vec<u8>, _bytes: u32) {}
     }
 
     /// `memory_ops` is read by a measurement harness, not by anything this
