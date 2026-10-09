@@ -1366,8 +1366,8 @@ Every commit in this phase is live in production.
 - **Change:**
   - `compile_via_backend` owns one `Labels` per function and passes `&mut Labels` into `emit_scope`.
   - Each `format!` site (`mod.rs:1439`, `1836-1837`, `1937`) mints at the point where the branch is created. The `Past` label travels in `PendingBranch` (`mod.rs:1398`) to its bind point.
-  - The pool's label is minted once, in `begin`.
-  - `LabelRef { label, patch }` keeps its patch function.
+  - The pool's label is minted once per function, in `compile_via_backend`, and handed to `IsaBackend::anchor` and `IsaBackend::finish`. (`begin` runs once per scope, not once per function, and a backend holding the label would need an `Option` to mint it on the first call.)
+  - `LabelRef { label, patch }` keeps its patch function, typed `asm::Patch`.
 - **Remove:** see §4.1, A2.
 - **Tests:** label tests mint their labels. `a_label_bound_twice_is_a_bug` binds one minted label twice.
 - **Bytes:** identical. Labels emit nothing, and fixups resolve in push order.

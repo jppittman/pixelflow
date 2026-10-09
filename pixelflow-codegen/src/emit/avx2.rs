@@ -788,10 +788,11 @@ mod tests {
             zs: [f32; 8],
         ) -> [f32; 8] {
             let mut asm = crate::emit::Assembly::default();
-            x86_64::anchor(&mut asm);
+            let pool_label = crate::emit::Labels::new().mint();
+            x86_64::anchor(&mut asm, pool_label);
             asm.code.extend_from_slice(body);
             asm.code.push(RET);
-            pool.finish(&mut asm);
+            pool.finish(&mut asm, pool_label);
             // SAFETY: every caller is a test that checked the host runs AVX2.
             unsafe { run_code(&asm.finish(), xs, ys, zs) }
         }
@@ -1496,12 +1497,12 @@ pub(super) mod driver {
             x86::mov(code, dst.as_gpr(), src.as_gpr());
         }
 
-        fn anchor(&mut self, asm: &mut Assembly) {
-            x86::anchor(asm);
+        fn anchor(&mut self, asm: &mut Assembly, pool: Label) {
+            x86::anchor(asm, pool);
         }
 
-        fn finish(&mut self, asm: &mut Assembly) {
-            self.consts.finish(asm);
+        fn finish(&mut self, asm: &mut Assembly, pool: Label) {
+            self.consts.finish(asm, pool);
         }
 
         // If short-circuit guards: vmovmskps -> eax[7:0], then a test

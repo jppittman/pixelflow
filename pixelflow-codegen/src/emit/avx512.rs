@@ -941,10 +941,11 @@ mod tests {
             zs: [f32; 16],
         ) -> [f32; 16] {
             let mut asm = crate::emit::Assembly::default();
-            x86_64::anchor(&mut asm);
+            let pool_label = crate::emit::Labels::new().mint();
+            x86_64::anchor(&mut asm, pool_label);
             asm.code.extend_from_slice(body);
             asm.code.push(RET);
-            pool.finish(&mut asm);
+            pool.finish(&mut asm, pool_label);
             // SAFETY: every caller is a test that checked the host runs AVX-512.
             unsafe { run_code(&asm.finish(), xs, ys, zs) }
         }
@@ -1068,7 +1069,8 @@ mod tests {
             let r9 = Gpr(9);
             let mut pool = x86_64::ConstPool::default();
             let mut asm = crate::emit::Assembly::default();
-            x86_64::anchor(&mut asm);
+            let pool_label = crate::emit::Labels::new().mint();
+            x86_64::anchor(&mut asm, pool_label);
             let c = &mut asm.code;
             x86_64::mov(c, r9, x86_64::gpr::RDI);
             let via_r9 = Mem {
@@ -1080,7 +1082,7 @@ mod tests {
             emit_binary(c, OpKind::Add, X, X, Reg(5));
             AsmProgram::from([Evex::m0f(0x11).rm(X.0, via_r9)]).assemble(c);
             AsmProgram::from([crate::emit::x86_64::Inst::Ret]).assemble(c);
-            pool.finish(&mut asm);
+            pool.finish(&mut asm, pool_label);
             let c = asm.finish();
 
             let mut buf = [0.0f32; 16];
@@ -1609,12 +1611,12 @@ pub(super) mod driver {
             x86::mov(code, dst.as_gpr(), src.as_gpr());
         }
 
-        fn anchor(&mut self, asm: &mut Assembly) {
-            x86::anchor(asm);
+        fn anchor(&mut self, asm: &mut Assembly, pool: Label) {
+            x86::anchor(asm, pool);
         }
 
-        fn finish(&mut self, asm: &mut Assembly) {
-            self.consts.finish(asm);
+        fn finish(&mut self, asm: &mut Assembly, pool: Label) {
+            self.consts.finish(asm, pool);
         }
 
         // If short-circuit guards: reduce the vector mask to flags (vptestmd +

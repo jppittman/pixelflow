@@ -12,8 +12,8 @@
 //! in this file is gone (docs/plans/2026-09-22-the-isa-is-decided-at-startup.md §7).
 
 use super::{
-    AsmInsn, AsmProgram, Assembly, Binding, CONST_POOL, CONST_POOL_ALIGN, EncodedInst, Gpr, Label,
-    LabelRef, Loc, PtrReg, Reg, WritePlan, regalloc,
+    AsmInsn, AsmProgram, Assembly, Binding, CONST_POOL_ALIGN, EncodedInst, Gpr, Label, LabelRef,
+    Loc, PtrReg, Reg, WritePlan, regalloc,
 };
 use crate::error::CompileError;
 use alloc::collections::BTreeMap;
@@ -79,19 +79,18 @@ impl ConstPool {
         Ok(element)
     }
 
-    /// Append the pool after the return and bind [`CONST_POOL`] where it
-    /// lands.
+    /// Append the pool after the return and bind `pool` where it lands.
     ///
     /// The label is written whether or not there is anything to append: the
     /// anchor names it unconditionally, and `Assembly::finish` panics on a
     /// name nobody wrote.
-    pub(super) fn finish(&self, asm: &mut Assembly) {
+    pub(super) fn finish(&self, asm: &mut Assembly, pool: Label) {
         if !self.entries.is_empty() {
             while !asm.code.len().is_multiple_of(CONST_POOL_ALIGN) {
                 asm.code.push(0);
             }
         }
-        asm.bind(CONST_POOL);
+        asm.bind(pool);
         for &bits in &self.entries {
             asm.code.extend_from_slice(&bits.to_le_bytes());
         }
@@ -133,10 +132,10 @@ impl AsmInsn for LeaRip {
 }
 
 /// Every x86 tier's anchor: `POOL_BASE = &pool`, once, after the frame.
-pub(super) fn anchor(asm: &mut Assembly) {
+pub(super) fn anchor(asm: &mut Assembly, pool: Label) {
     asm.push(LeaRip {
         dst: POOL_BASE,
-        target: Label::new(CONST_POOL),
+        target: pool,
     });
 }
 
@@ -251,13 +250,13 @@ pub(super) fn emit_test_eax(code: &mut Vec<u8>) {
 #[cfg(test)]
 mod label_tests {
     use super::{Cond, Inst, Jcc, Jmp};
-    use crate::emit::{Assembly, Label};
+    use crate::emit::{Assembly, Labels};
 
     /// The one thing a label does that a fixup token could not: name a
     /// position that does not exist yet.
     #[test]
     fn a_forward_branch_names_a_position_bound_later() {
-        let end = Label::new("end");
+        let end = Labels::new().mint();
         let mut asm = Assembly::default();
         asm.push(Jmp { target: end });
         asm.push(Inst::Ret);
@@ -275,7 +274,7 @@ mod label_tests {
     /// resolution pass is separate from the layout pass.
     #[test]
     fn a_back_edge_resolves_to_a_negative_displacement() {
-        let top = Label::new("end");
+        let top = Labels::new().mint();
         let mut asm = Assembly::default();
         asm.bind(top);
         asm.push(Inst::Ret);
@@ -294,7 +293,7 @@ mod label_tests {
     /// a field on an instruction: there is nothing here to hang it on.
     #[test]
     fn a_label_can_end_the_program() {
-        let end = Label::new("end");
+        let end = Labels::new().mint();
         let mut asm = Assembly::default();
         asm.push(Jmp { target: end });
         asm.bind(end);
@@ -306,7 +305,8 @@ mod label_tests {
     /// And two labels may name the same position, for the same reason.
     #[test]
     fn two_labels_can_share_a_position() {
-        let (a, b) = (Label::new("end"), Label::new("other"));
+        let mut labels = Labels::new();
+        let (a, b) = (labels.mint(), labels.mint());
         let mut asm = Assembly::default();
         asm.push(Jcc {
             condition: Cond::E,
@@ -326,7 +326,7 @@ mod label_tests {
     /// be assembled after bytes that are already there.
     #[test]
     fn a_program_is_position_independent() {
-        let end = Label::new("end");
+        let end = Labels::new().mint();
         let program = |mut asm: Assembly| {
             asm.push(Jmp { target: end });
             asm.bind(end);
@@ -341,7 +341,7 @@ mod label_tests {
     fn an_unbound_label_is_a_bug_and_not_a_jump_to_itself() {
         let mut asm = Assembly::default();
         asm.push(Jmp {
-            target: Label::new("end"),
+            target: Labels::new().mint(),
         });
         let code = asm.finish();
         unreachable!("assembled {} bytes around an unbound label", code.len());
@@ -350,7 +350,7 @@ mod label_tests {
     #[test]
     #[should_panic(expected = "written twice")]
     fn a_label_bound_twice_is_a_bug() {
-        let twice = Label::new("end");
+        let twice = Labels::new().mint();
         let mut asm = Assembly::default();
         asm.bind(twice);
         asm.bind(twice);
@@ -994,9 +994,9 @@ mod gpr_tests {
     /// nothing.
     #[test]
     fn branches_patch_relative_to_the_next_instruction() {
-        use crate::emit::{Assembly, Label};
+        use crate::emit::{Assembly, Labels};
 
-        let end = Label::new("end");
+        let end = Labels::new().mint();
         let mut asm = Assembly::default();
         asm.push(Jmp { target: end });
         // Eleven bytes of padding, so the label lands at 16.
@@ -1011,7 +1011,7 @@ mod gpr_tests {
             "rel is from the next insn"
         );
 
-        let top = Label::new("end");
+        let top = Labels::new().mint();
         let mut asm = Assembly::default();
         asm.bind(top);
         asm.push(Jcc::on(Cond::B, top));
