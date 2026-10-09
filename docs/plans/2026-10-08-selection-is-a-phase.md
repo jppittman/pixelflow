@@ -1246,7 +1246,7 @@ The narrowing already removes these, so they are not listed again here: `Item`, 
 The backends:
 - the `Physical` stage, `POOL_BASE`, `x86_64::anchor`, `LeaRip`'s fixed destination, `BroadcastGprs`, `write_address`, `index_into`, `Truncate`;
 - `temps_for`, `gpr_temps_for`, `mask_temps_for`, `GatherTemps`, `GatherGprs`;
-- `guard_scratch`, `address_in_ip0`, `X16`, `X17`, `CBNZ_W16_OVER_B`;
+- `guard_scratch`, `address_in_ip0`, `ldr_q`, `str_q`, `ldr_s`, `X16`, `X17`;
 - `emit_fmov_imm`'s general case, `BUILTIN_HEADROOM`.
 
 Tests deleted because the property is now a type, an invariant, or moot:
@@ -1490,13 +1490,13 @@ Every commit in this phase is live in production.
 
 - **Files:** `aarch64/table.rs`, `aarch64.rs`.
 - **A12a:** a named-field `aarch64::Inst<S>` replaces the 41 positional variants (`aarch64.rs:41`) and the `table.rs` encoding structs, which were one const-generic struct per opcode (`Binary<OPCODE, D, L, R>`, `table.rs:225`). Instantiating each at `Physical` would have kept a type per instruction; the operation enums `Alu` and `Lanewise` (the opcode is the discriminant, as `x86_64::Alu`'s `vex()` is the bytes) and one arm per shape are smaller. `Mem<S>` and `MemIndexed<S>` take their registers by class. `SReg` is deleted: the `s` view of a vector register was a wrapper no instruction needed. `AddImm` and `SubImm` are A12a's, not A12b's: `frame_alloc`, `emit_ret` and `address_in_ip0` need them as single instructions already. The IP0 path stays inside `emit_into` (`Mem::near`) until A12b makes the driver call it.
-- **A12b:** the sequences:
-  - `FmovToGp { dst: Write<Integer>, src }`;
-  - `MvnW { dst: Tie<Integer> }`;
-  - `CbzFar { test, taken, next }` (an `imm26` field);
-  - `AdrpAdd`, `InsFirst`, `InsLane { v: Tie<Vector> }`, `St1Lane { base: Tie<Pointer> }`.
+- **A12b:** the sequences, with the registers they use by convention written in at their one construction site, as A9 did for x86:
+  - `FmovToGp { dst: Write<Integer>, src }` and `MvnW { dst: Tie<Integer> }`, with `w16` literal in the guard;
+  - `CbzFar { test, taken }` (`cbnz w, .+8; b taken`, an `imm26` field), `B { to }` and `AdrpAdd { dst, to }`, whose label fields and patch functions (`patch_imm26`, `patch_adrp_add`) replace the `B`, `BranchIfW16Zero` and `AdrpAdd` structs. `CbzFar` has no `next`: like `Jcc`'s, it is B1's, with the block builder that has a next block to name;
+  - `InsFirst { dst: Write<Vector> }` and `InsLane { v: Tie<Vector> }` (the gather's four `ins`), `St1Lane { base: Tie<Pointer> }` (the remainder store), `Madd` and `AddLsl2` (the store's address);
+  - `Zero`, `FmovImm`, `Movz`, `MovkHigh` and `DupGp` (`emit_fmov_imm`'s three cases).
 
-  `address_in_ip0` is called explicitly by the legacy driver, with `X16` written in.
+  `Raw` is deleted: every word the driver wrote by hand is an arm. `address_in_ip0` takes its register, and the legacy driver calls it explicitly through `ldr_q`, `str_q` and `ldr_s`, with `x16` written in; the transfers' `emit_into` no longer reaches for it, and a displacement past `imm12` that arrives without it panics in `encode`.
 - **Bytes:** identical.
 - **Gate:** G and M, each.
 

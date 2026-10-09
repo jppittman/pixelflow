@@ -10,7 +10,7 @@
 //! `Inst::encode` whose words carry no operation to choose.
 
 use super::Inst;
-use crate::emit::{AsmInsn, Integer, Physical, Pointer, Stage};
+use crate::emit::{AsmInsn, Integer, Physical, Pointer, PtrReg, Stage};
 use alloc::vec::Vec;
 
 // =============================================================================
@@ -119,23 +119,26 @@ impl Mem<Physical> {
         self.offset / access
     }
 
-    /// `self`, or `[x16]` after the adds that compute it when the offset is
+    /// `self`, or `[ip0]` after the adds that compute it when the offset is
     /// past the 12-bit scaled immediate of an `access`-byte transfer.
-    pub(super) fn near(self, code: &mut Vec<u8>, access: u32) -> Self {
+    pub(super) fn near(self, code: &mut Vec<u8>, access: u32, ip0: PtrReg) -> Self {
         if self.scaled(access) > MAX_IMM12 {
-            return address_in_ip0(code, self);
+            return address_in_ip0(code, self, ip0);
         }
         self
     }
 }
 
-/// Rewrite `addr` as `[x16]`, computing `base + offset` into IP0 first.
+/// Rewrite `addr` as `[ip0]`, computing `base + offset` into `ip0` first.
 ///
 /// The fallback for a displacement past the 12-bit scaled immediate — a spill
 /// frame deeper than 64 KiB. `add`'s immediate is 12 bits too, so a large
 /// displacement takes several of them.
-fn address_in_ip0(code: &mut Vec<u8>, Mem { base, offset }: Mem<Physical>) -> Mem<Physical> {
-    let ip0 = super::ptr::X16;
+fn address_in_ip0(
+    code: &mut Vec<u8>,
+    Mem { base, offset }: Mem<Physical>,
+    ip0: PtrReg,
+) -> Mem<Physical> {
     let mut remaining = offset;
     let first = remaining.min(MAX_ADD_IMM);
     Inst::AddImm {
@@ -164,7 +167,6 @@ fn address_in_ip0(code: &mut Vec<u8>, Mem { base, offset }: Mem<Physical>) -> Me
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit::PtrReg;
 
     #[test]
     fn add_i64_encodes_an_immediate() {

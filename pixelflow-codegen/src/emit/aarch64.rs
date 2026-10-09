@@ -5,8 +5,8 @@
 //! from.
 
 use super::{
-    AsmInsn, AsmProgram, Gpr, Integer, Label, LabelRef, Physical, Pointer, PtrReg, Reg, Stage,
-    Vector, unimplemented_op,
+    AsmInsn, AsmProgram, Gpr, Integer, Label, LabelRef, Patch, Physical, Pointer, PtrReg, Reg,
+    Stage, Vector, unimplemented_op,
 };
 use crate::error::CompileError;
 use alloc::vec::Vec;
@@ -44,6 +44,11 @@ const fn rm(reg: u8) -> u32 {
     (reg as u32 & 0x1F) << 16
 }
 
+/// `Ra`: the addend field of a multiply-add, at bit 10.
+const fn ra(reg: u8) -> u32 {
+    (reg as u32 & 0x1F) << 10
+}
+
 /// The `imm5` of a 32-bit lane: the lane number above a `100` size marker.
 ///
 /// # Panics
@@ -57,6 +62,29 @@ fn imm5_lane(lane: u8) -> u32 {
         "Vn.S[{lane}]: a 128-bit register has four 32-bit lanes"
     );
     ((lane as u32) << 3) | 0b100
+}
+
+// =============================================================================
+// Loads and stores of a vector that may be far from their base
+// =============================================================================
+
+/// `ldr q<dst>, addr`. A displacement past the scaled immediate is first added
+/// into IP0, `x16`, which the adds write and the load reads.
+fn ldr_q(code: &mut Vec<u8>, dst: Reg, addr: Mem<Physical>) {
+    let addr = addr.near(code, Q_BYTES, ptr::X16);
+    AsmProgram::from([Inst::LdrQ { dst, addr }]).assemble(code);
+}
+
+/// `str q<src>, addr`, through IP0 as [`ldr_q`] is.
+fn str_q(code: &mut Vec<u8>, src: Reg, addr: Mem<Physical>) {
+    let addr = addr.near(code, Q_BYTES, ptr::X16);
+    AsmProgram::from([Inst::StrQ { src, addr }]).assemble(code);
+}
+
+/// `ldr s<dst>, addr`, through IP0 as [`ldr_q`] is.
+fn ldr_s(code: &mut Vec<u8>, dst: Reg, addr: Mem<Physical>) {
+    let addr = addr.near(code, S_BYTES, ptr::X16);
+    AsmProgram::from([Inst::LdrS { dst, addr }]).assemble(code);
 }
 
 // =============================================================================
@@ -126,16 +154,52 @@ enum Inst<S: Stage> {
         src: S::Read<Vector>,
         lane: u8,
     },
-    /// `ins dst.s[lane], src.w`
-    InsW {
-        dst: S::Tie<Vector>,
+    /// `ins dst.s[0], src.w`: the first lane of a vector the gather builds.
+    /// The other three lanes are not defined by it.
+    InsFirst {
+        dst: S::Write<Vector>,
+        src: S::Read<Integer>,
+    },
+    /// `ins v.s[lane], src.w`: one more lane of a vector under construction.
+    InsLane {
+        v: S::Tie<Vector>,
         lane: u8,
         src: S::Read<Integer>,
     },
-    /// `mvn dst.w, src.w`
-    MvnW {
-        dst: S::Write<Integer>,
+    /// `mvn w, w`: the register inverted in place.
+    MvnW { dst: S::Tie<Integer> },
+    /// `movi dst.4s, #0`
+    Zero { dst: S::Write<Vector> },
+    /// `fmov dst.4s, #imm8`: the 8-bit floating-point immediate.
+    FmovImm { dst: S::Write<Vector>, imm8: u8 },
+    /// `movz dst.w, #imm`
+    Movz { dst: S::Write<Integer>, imm: u16 },
+    /// `movk dst.w, #imm, lsl 16`: the high half of a 32-bit constant.
+    MovkHigh { dst: S::Tie<Integer>, imm: u16 },
+    /// `dup dst.4s, src.w`
+    DupGp {
+        dst: S::Write<Vector>,
         src: S::Read<Integer>,
+    },
+    /// `madd dst.x, a.x, b.x, addend.x`: `dst = a·b + addend`.
+    Madd {
+        dst: S::Write<Integer>,
+        a: S::Read<Integer>,
+        b: S::Read<Integer>,
+        addend: S::Read<Integer>,
+    },
+    /// `add dst.x, base.x, index.x, lsl 2`: the address of an `f32` element.
+    AddLsl2 {
+        dst: S::Write<Pointer>,
+        base: S::Read<Pointer>,
+        index: S::Read<Integer>,
+    },
+    /// `st1 {src.s}[lane], [base], #4`: one lane stored, the address moving
+    /// past it.
+    St1Lane {
+        base: S::Tie<Pointer>,
+        src: S::Read<Vector>,
+        lane: u8,
     },
     /// `fcvtzs dst.x, src.s`: lane 0, truncated to a 64-bit integer. How a
     /// fold's binder, or a broadcast load's index, becomes an address.
@@ -143,8 +207,11 @@ enum Inst<S: Stage> {
         dst: S::Write<Integer>,
         src: S::Read<Vector>,
     },
-    /// `fmov x16, src.d`: lane 0 to IP0, the guard's test register.
-    FmovToGp { src: S::Read<Vector> },
+    /// `fmov dst.x, src.d`: lane 0 to a general register, the guard's test.
+    FmovToGp {
+        dst: S::Write<Integer>,
+        src: S::Read<Vector>,
+    },
     /// `mov dst.x, src.x`: an address between pointer registers.
     MovX {
         dst: S::Write<Pointer>,
@@ -186,14 +253,87 @@ enum Inst<S: Stage> {
         dst: S::Write<Vector>,
         addr: MemIndexed<S>,
     },
+    /// `b to`: ±128 MiB.
+    B { to: S::Target },
+    /// `cbnz test.w, .+8; b taken`: branch to `taken` when `test` is zero,
+    /// from anywhere within `B`'s ±128 MiB.
+    ///
+    /// **Two instructions, because `CBZ` does not reach.** It spends 19 bits on
+    /// a word displacement, ±1 MiB, and an arm is as long as the code it owns,
+    /// a bound nothing here puts under 1 MiB: a text run's glyph kernels under
+    /// one guard are megabytes of NEON. `CBNZ` steps over the `B` when the
+    /// mask says the arm is live, and falls into the `B` when it says the arm
+    /// is dead, so this is exactly `cbz test, taken` at `B`'s reach.
+    ///
+    /// **Always both, never the one-word `CBZ` where it would reach.** Which
+    /// form fits depends on the arm's length, which depends on where every
+    /// instruction inside it landed, and this instruction's own size is one of
+    /// those, so choosing the short form is branch relaxation: layout iterated
+    /// to a fixed point to save four bytes per guard. The pair's size is fixed
+    /// before a single byte is laid out, like `AdrpAdd`'s, and there is nothing
+    /// to relax.
+    CbzFar {
+        test: S::Read<Integer>,
+        taken: S::Target,
+    },
+    /// `adrp dst, to; add dst, dst, :lo12:to`, sharing one label: materialize
+    /// the constant pool's address in `dst`.
+    ///
+    /// **Two instructions, because A64 is fixed 32-bit** — no single
+    /// instruction holds a 64-bit address. `ADR` reaches ±1 MiB by spending a
+    /// 21-bit *byte* displacement; `ADRP` spends the same 21 bits on 4 KiB
+    /// *pages* instead — `(PC & !0xFFF) + (imm21 << 12)`, ±4 GiB — and hands
+    /// back the base of the target's page, not the target itself. The `ADD`'s
+    /// 12-bit immediate is exactly one page wide, so it recovers the low bits
+    /// `ADRP` had to discard.
+    ///
+    /// **Always both, never the one-instruction `ADR`.** Which one is
+    /// reachable depends on the distance to the pool; the pool's position
+    /// depends on where every instruction ahead of it landed; and this
+    /// instruction's own size is one of those — so choosing the short form is
+    /// branch relaxation, and resolving it needs layout iterated to a fixed
+    /// point to save four bytes once per compiled function. The alternative
+    /// this replaced tried to dodge that fixed point instead of running it:
+    /// emit `ADR` optimistically, *estimate* the distance to the not-yet-emitted
+    /// pool with a magic margin, and — when the estimate crossed it — splice
+    /// four bytes into the middle of already-emitted code to widen it to
+    /// `ADRP`+`ADD` after the fact. That splice was sound only because the
+    /// anchor sits above the whole loop nest, so every branch in the body had
+    /// both endpoints on the same side of it; a branch spanning it would have
+    /// broken silently. `AdrpAdd` has no estimate and nothing to splice — its
+    /// size is fixed before a single byte is laid out, like every other
+    /// instruction here.
+    ///
+    /// # Alignment invariant
+    ///
+    /// [`patch_adrp_add`] computes pages by masking *buffer offsets* —
+    /// positions within the `Vec<u8>` this crate is building, not runtime
+    /// addresses. That is correct only because the executable mapping this
+    /// buffer is copied into starts on a 4 KiB boundary: `(map + pos) &
+    /// !0xFFF == map + (pos & !0xFFF)` for every `pos` exactly when `map` is a
+    /// multiple of 4 KiB, which is what lets a page found by masking an offset
+    /// stand in for the page a masked address would find. Copy these bytes to
+    /// an address that is not 4 KiB-aligned and every `ADRP` here is off by a
+    /// page.
+    ///
+    /// Two things hold it up, and both are checked rather than assumed:
+    /// `CodePage::from_code` writes the buffer at offset 0 of a mapping whose
+    /// size — and therefore whose base — is a whole number of pages, pinned by
+    /// `page_size_is_a_sane_power_of_two`; and an [`Assembly`](crate::emit::Assembly)
+    /// position is an offset into the *whole* kernel rather than into the
+    /// scope that emitted it, because one kernel is one `Assembly`, so there is
+    /// no base to subtract. A displacement cannot tell those two apart. A page
+    /// can.
+    AdrpAdd {
+        dst: S::Write<Pointer>,
+        to: S::Target,
+    },
     /// `ret`
     Ret,
-    /// One word, spelled out.
-    Raw { word: u32 },
 }
 
 impl Inst<Physical> {
-    /// The instruction's word.
+    /// The instruction's word; for a sequence, its first.
     ///
     /// # Panics
     ///
@@ -249,12 +389,39 @@ impl Inst<Physical> {
             Inst::UmovW { dst, src, lane } => {
                 0x0E00_3C00 | (imm5_lane(lane) << 16) | rn(src.0) | rd(dst.0)
             }
-            Inst::InsW { dst, lane, src } => {
-                0x4E00_1C00 | (imm5_lane(lane) << 16) | rn(src.0) | rd(dst.0)
+            Inst::InsFirst { dst, src } => {
+                0x4E00_1C00 | (imm5_lane(0) << 16) | rn(src.0) | rd(dst.0)
             }
-            Inst::MvnW { dst, src } => 0x2A20_03E0 | rm(src.0) | rd(dst.0),
+            Inst::InsLane { v, lane, src } => {
+                0x4E00_1C00 | (imm5_lane(lane) << 16) | rn(src.0) | rd(v.0)
+            }
+            Inst::MvnW { dst } => 0x2A20_03E0 | rm(dst.0) | rd(dst.0),
+            Inst::Zero { dst } => 0x4F00_0400 | rd(dst.0),
+            Inst::FmovImm { dst, imm8 } => {
+                let (abc, defgh) = (u32::from(imm8 >> 5), u32::from(imm8 & 0x1F));
+                0x4F00_F400 | (abc << 16) | (defgh << 5) | rd(dst.0)
+            }
+            Inst::Movz { dst, imm } => 0x5280_0000 | (u32::from(imm) << 5) | rd(dst.0),
+            Inst::MovkHigh { dst, imm } => 0x72A0_0000 | (u32::from(imm) << 5) | rd(dst.0),
+            Inst::DupGp { dst, src } => 0x4E04_0C00 | rn(src.0) | rd(dst.0),
+            Inst::Madd { dst, a, b, addend } => {
+                0x9B00_0000 | rm(b.0) | ra(addend.0) | rn(a.0) | rd(dst.0)
+            }
+            Inst::AddLsl2 { dst, base, index } => {
+                0x8B00_0000 | rm(index.0) | (2 << 10) | rn(base.0) | rd(dst.0)
+            }
+            // The lane is `Q:S`, the high bit in the instruction's `Q` and the
+            // low bit in `S`.
+            Inst::St1Lane { base, src, lane } => {
+                assert!(
+                    lane < 4,
+                    "ST1 {{Vt.S}}[{lane}]: a 128-bit register has four 32-bit lanes"
+                );
+                let (q, s) = (u32::from(lane >> 1), u32::from(lane & 1));
+                0x0D9F_8000 | (q << 30) | (s << 12) | rn(base.0) | rd(src.0)
+            }
             Inst::FcvtzsX { dst, src } => 0x9E38_0000 | rn(src.0) | rd(dst.0),
-            Inst::FmovToGp { src } => 0x1E26_0000 | rn(src.0) | rd(ptr::X16.0),
+            Inst::FmovToGp { dst, src } => 0x1E26_0000 | rn(src.0) | rd(dst.0),
             Inst::MovX { dst, src } => 0xAA00_03E0 | rm(src.0) | rd(dst.0),
             Inst::AddImm { dst, src, imm } => {
                 0x9100_0000 | ((u32::from(imm.0) & 0xFFF) << 10) | rn(src.0) | rd(dst.0)
@@ -273,8 +440,12 @@ impl Inst<Physical> {
             Inst::LdrSIndexed { dst, addr } => {
                 0xBC60_5800 | rm(addr.index.0) | rn(addr.base.0) | rd(dst.0)
             }
+            Inst::B { .. } => 0x1400_0000,
+            Inst::CbzFar { test, .. } => {
+                CBZ_W_OPCODE | CB_OP_NONZERO | (CBNZ_SKIPS_B << DispField::IMM19.shift) | rd(test.0)
+            }
+            Inst::AdrpAdd { dst, .. } => 0x9000_0000 | rd(dst.0),
             Inst::Ret => 0xD65F_03C0,
-            Inst::Raw { word } => word,
         }
     }
 }
@@ -282,24 +453,57 @@ impl Inst<Physical> {
 impl AsmInsn for Inst<Physical> {
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
-        let reachable = match self {
+        let second_word = match self {
             Inst::Mov { dst, src } if dst == src => return,
-            Inst::LdrQ { dst, addr } => Inst::LdrQ {
-                dst,
-                addr: addr.near(code, Q_BYTES),
-            },
-            Inst::StrQ { src, addr } => Inst::StrQ {
-                src,
-                addr: addr.near(code, Q_BYTES),
-            },
-            Inst::LdrS { dst, addr } => Inst::LdrS {
-                dst,
-                addr: addr.near(code, S_BYTES),
-            },
-            _ => self,
+            Inst::CbzFar { taken, .. } => Some(Inst::B { to: taken }.encode()),
+            Inst::AdrpAdd { dst, .. } => Some(0x9100_0000 | rn(dst.0) | rd(dst.0)),
+            _ => None,
         };
-        emit32(code, reachable.encode());
+        emit32(code, self.encode());
+        if let Some(word) = second_word {
+            emit32(code, word);
+        }
     }
+
+    #[inline]
+    fn label_ref(self) -> Option<LabelRef> {
+        let (at, label, patch): (usize, Label, Patch) = match self {
+            Inst::B { to } => (0, to, patch_imm26),
+            // The `CBNZ` is the first word; the `B` it steps over sits one
+            // word later, and a displacement is measured from the branch's
+            // own address.
+            Inst::CbzFar { taken, .. } => (WORD_BYTES, taken, patch_imm26),
+            Inst::AdrpAdd { to, .. } => (0, to, patch_adrp_add),
+            _ => return None,
+        };
+        Some(LabelRef { at, label, patch })
+    }
+}
+
+/// Fill a `B`'s `imm26` so it reaches `target`.
+fn patch_imm26(code: &mut [u8], at: usize, target: usize) {
+    DispField::IMM26.write(code, at, target);
+}
+
+/// Fill an `ADRP`+`ADD` pair, the `ADRP` at `at` and the `ADD` right after
+/// it, so the pair materializes `target`. Both words already carry their
+/// opcode and register fields, so this only ORs the immediates in.
+fn patch_adrp_add(code: &mut [u8], at: usize, target: usize) {
+    let page = |pos: usize| (pos as i64) & !0xFFF;
+    let pages = (page(target) - page(at)) >> 12;
+    assert!(
+        (-(1i64 << 20)..(1i64 << 20)).contains(&pages),
+        "ADRP page offset {pages} out of range (±4GiB)"
+    );
+    let imm = (pages as u32) & 0x1F_FFFF;
+    let immlo = imm & 0x3;
+    let immhi = (imm >> 2) & 0x7_FFFF;
+    let adrp = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+    code[at..at + 4].copy_from_slice(&(adrp | (immlo << 29) | (immhi << 5)).to_le_bytes());
+
+    let within_page = (target as u32) & 0xFFF;
+    let add = u32::from_le_bytes(code[at + 4..at + 8].try_into().unwrap());
+    code[at + 4..at + 8].copy_from_slice(&(add | (within_page << 10)).to_le_bytes());
 }
 
 // =============================================================================
@@ -331,17 +535,15 @@ fn emit_uniform_load(
         .ok_or(CompileError::BudgetExceeded(
             "uniform byte offset past the 32-bit offset `Mem` carries",
         ))?;
-    AsmProgram::from([
-        Inst::LdrS {
-            dst,
-            addr: Mem {
-                base,
-                offset: bytes,
-            },
+    ldr_s(
+        code,
+        dst,
+        Mem {
+            base,
+            offset: bytes,
         },
-        Inst::DupLane0 { dst, src: dst },
-    ])
-    .assemble(code);
+    );
+    AsmProgram::from([Inst::DupLane0 { dst, src: dst }]).assemble(code);
     Ok(())
 }
 
@@ -361,31 +563,31 @@ fn emit_fmov_imm(code: &mut Vec<u8>, dst: Reg, val: f32) {
     let bits = val.to_bits();
 
     if bits == 0 {
-        emit32(code, 0x4F000400 | (dst.0 as u32));
+        AsmProgram::from([Inst::Zero { dst }]).assemble(code);
         return;
     }
 
     if let Some(imm8) = try_encode_fmov_imm8(val) {
-        let abc = ((imm8 as u32) >> 5) & 0x7;
-        let defgh = (imm8 as u32) & 0x1F;
-        emit32(
-            code,
-            0x4F00_F400 | (abc << 16) | (defgh << 5) | (dst.0 as u32),
-        );
+        AsmProgram::from([Inst::FmovImm { dst, imm8 }]).assemble(code);
         return;
     }
 
     // General case: load via GP register (W16)
     // This is 3 instructions but works for any f32 value.
     // Use W16 (IP0) as scratch - it's caller-saved and not used for arguments
-    let lo16 = bits & 0xFFFF;
-    let hi16 = bits >> 16;
-
-    emit32(code, 0x52800010 | (lo16 << 5));
-
-    emit32(code, 0x72A00010 | (hi16 << 5));
-
-    emit32(code, 0x4E040C00 | (dst.0 as u32) | (16 << 5));
+    let ip0 = ptr::X16.as_gpr();
+    AsmProgram::from([
+        Inst::Movz {
+            dst: ip0,
+            imm: bits as u16,
+        },
+        Inst::MovkHigh {
+            dst: ip0,
+            imm: (bits >> 16) as u16,
+        },
+        Inst::DupGp { dst, src: ip0 },
+    ])
+    .assemble(code);
 }
 
 /// Try to encode an f32 as an ARM64 FMOV (vector, immediate) 8-bit value.
@@ -443,100 +645,6 @@ fn needs_const_pool(val: f32) -> bool {
     val.to_bits() != 0 && try_encode_fmov_imm8(val).is_none()
 }
 
-/// `adrp xd, #0` + `add xd, xd, #0`, sharing one [`Label`]: materialize the
-/// constant pool's address in `dst`.
-///
-/// **Two instructions, because A64 is fixed 32-bit** — no single instruction
-/// holds a 64-bit address. `ADR` reaches ±1 MiB by spending a 21-bit *byte*
-/// displacement; `ADRP` spends the same 21 bits on 4 KiB *pages* instead —
-/// `(PC & !0xFFF) + (imm21 << 12)`, ±4 GiB — and hands back the base of the
-/// target's page, not the target itself. The `ADD`'s 12-bit immediate is
-/// exactly one page wide, so it recovers the low bits `ADRP` had to discard.
-///
-/// **Always both, never the one-instruction `ADR`.** Which one is reachable
-/// depends on the distance to the pool; the pool's position depends on where
-/// every instruction ahead of it landed; and this instruction's own size is
-/// one of those — so choosing the short form is branch relaxation, and
-/// resolving it needs layout iterated to a fixed point to save four bytes
-/// once per compiled function. The alternative this replaced tried to dodge
-/// that fixed point instead of running it: emit `ADR` optimistically,
-/// *estimate* the distance to the not-yet-emitted pool with a magic margin,
-/// and — when the estimate crossed it — splice four bytes into the middle of
-/// already-emitted code to widen it to `ADRP`+`ADD` after the fact. That
-/// splice was sound only because the anchor sits above the whole loop nest,
-/// so every branch in the body had both endpoints on the same side of it; a
-/// branch spanning it would have broken silently. `AdrpAdd` has no estimate
-/// and nothing to splice — its size is fixed before a single byte is laid
-/// out, like every other instruction here.
-///
-/// # Alignment invariant
-///
-/// [`AsmInsn::label_ref`]'s patch below computes pages by masking *buffer
-/// offsets* — positions within the `Vec<u8>` this crate is building, not
-/// runtime addresses. That is correct only because the executable mapping
-/// this buffer is copied into starts on a 4 KiB boundary: `(map + pos) &
-/// !0xFFF == map + (pos & !0xFFF)` for every `pos` exactly when `map` is a
-/// multiple of 4 KiB, which is what lets a page found by masking an offset
-/// stand in for the page a masked address would find. Copy these bytes to an
-/// address that is not 4 KiB-aligned and every `ADRP` here is off by a page.
-///
-/// Two things hold it up, and both are checked rather than assumed:
-/// `CodePage::from_code`
-/// writes the buffer at offset 0 of a mapping whose size — and therefore
-/// whose base — is a whole number of pages, pinned by
-/// `page_size_is_a_sane_power_of_two`; and an [`Assembly`](crate::emit::Assembly) position is an
-/// offset into the *whole* kernel rather than into the scope that emitted it,
-/// because one kernel is one `Assembly`, so there is no base to subtract. A
-/// displacement cannot tell those two apart. A page can.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct AdrpAdd {
-    /// Where the address is materialized.
-    dst: Gpr,
-    /// The constant pool's position.
-    target: Label,
-}
-
-impl AsmInsn for AdrpAdd {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        let rd = u32::from(self.dst.0);
-        // ADRP Xd, #0 — page immediate patched by `label_ref` below.
-        emit32(code, 0x9000_0000 | rd);
-        // ADD Xd, Xd, #0 (64-bit immediate form) — within-page offset
-        // patched by `label_ref` below.
-        emit32(code, 0x9100_0000 | (rd << 5) | rd);
-    }
-
-    #[inline]
-    fn label_ref(self) -> Option<LabelRef> {
-        Some(LabelRef {
-            at: 0,
-            label: self.target,
-            // `at` is the ADRP word `emit_into` placed; the ADD it placed
-            // right after sits at `at + 4`. Both words already carry their
-            // opcode and register fields, so this only ORs the immediate in.
-            patch: |code, at, target| {
-                let page = |pos: usize| (pos as i64) & !0xFFF;
-                let pages = (page(target) - page(at)) >> 12;
-                assert!(
-                    (-(1i64 << 20)..(1i64 << 20)).contains(&pages),
-                    "ADRP page offset {pages} out of range (±4GiB)"
-                );
-                let imm = (pages as u32) & 0x1F_FFFF;
-                let immlo = imm & 0x3;
-                let immhi = (imm >> 2) & 0x7_FFFF;
-                let adrp = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
-                code[at..at + 4]
-                    .copy_from_slice(&(adrp | (immlo << 29) | (immhi << 5)).to_le_bytes());
-
-                let within_page = (target as u32) & 0xFFF;
-                let add = u32::from_le_bytes(code[at + 4..at + 8].try_into().unwrap());
-                code[at + 4..at + 8].copy_from_slice(&(add | (within_page << 10)).to_le_bytes());
-            },
-        })
-    }
-}
-
 /// One constant pool entry: the four words of a 128-bit NEON register, lane
 /// 0 first. A splat is the common one; the lattice's iota is the other.
 type PoolEntry = [u32; 4];
@@ -579,6 +687,14 @@ fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx_int: Reg, base: PtrReg, gprs: G
         index: gprs.idx,
     };
     for lane in 0..4 {
+        let insert = match lane {
+            0 => Inst::InsFirst { dst, src: gprs.val },
+            _ => Inst::InsLane {
+                v: dst,
+                lane,
+                src: gprs.val,
+            },
+        };
         AsmProgram::from([
             Inst::UmovW {
                 dst: gprs.idx,
@@ -589,11 +705,7 @@ fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx_int: Reg, base: PtrReg, gprs: G
                 dst: gprs.val,
                 addr,
             },
-            Inst::InsW {
-                dst,
-                lane,
-                src: gprs.val,
-            },
+            insert,
         ])
         .assemble(code);
     }
@@ -976,9 +1088,9 @@ mod tests {
         for gap in [0, 4, 0xFFC, 0x1000, 0x1004, 0x2000, 3 << 20] {
             let mut asm = Assembly::default();
             let pool = asm.mint();
-            asm.push(AdrpAdd {
-                dst: Gpr(17),
-                target: pool,
+            asm.push(Inst::AdrpAdd {
+                dst: PtrReg(17),
+                to: pool,
             });
             asm.run.resize(gap, 0);
             asm.bind(pool);
@@ -1004,9 +1116,9 @@ mod tests {
             let pool = asm.mint();
             asm.bind(pool);
             asm.run.resize(gap, 0);
-            asm.push(AdrpAdd {
-                dst: Gpr(17),
-                target: pool,
+            asm.push(Inst::AdrpAdd {
+                dst: PtrReg(17),
+                to: pool,
             });
 
             let code = asm.finish();
@@ -1175,17 +1287,16 @@ mod tests {
         );
         // ins v6.s[0..3], w11
         assert_eq!(
-            one(|c| AsmProgram::from([Inst::InsW {
+            one(|c| AsmProgram::from([Inst::InsFirst {
                 dst: Reg(6),
-                lane: 0,
                 src: Gpr(11)
             }])
             .assemble(c)),
             0x4E041D66
         );
         assert_eq!(
-            one(|c| AsmProgram::from([Inst::InsW {
-                dst: Reg(6),
+            one(|c| AsmProgram::from([Inst::InsLane {
+                v: Reg(6),
                 lane: 1,
                 src: Gpr(11)
             }])
@@ -1193,8 +1304,8 @@ mod tests {
             0x4E0C1D66
         );
         assert_eq!(
-            one(|c| AsmProgram::from([Inst::InsW {
-                dst: Reg(6),
+            one(|c| AsmProgram::from([Inst::InsLane {
+                v: Reg(6),
                 lane: 2,
                 src: Gpr(11)
             }])
@@ -1202,8 +1313,8 @@ mod tests {
             0x4E141D66
         );
         assert_eq!(
-            one(|c| AsmProgram::from([Inst::InsW {
-                dst: Reg(6),
+            one(|c| AsmProgram::from([Inst::InsLane {
+                v: Reg(6),
                 lane: 3,
                 src: Gpr(11)
             }])
@@ -1272,14 +1383,14 @@ mod tests {
     fn a_deep_frame_addresses_through_ip0() {
         let mut code = Vec::new();
         // 65536 = 16 * 4096, one slot past the largest encodable displacement.
-        AsmProgram::from([Inst::LdrQ {
-            dst: Reg(3),
-            addr: Mem {
+        ldr_q(
+            &mut code,
+            Reg(3),
+            Mem {
                 base: ptr::SP,
                 offset: 65536,
             },
-        }])
-        .assemble(&mut code);
+        );
         let words: Vec<u32> = code
             .as_chunks::<4>()
             .0
@@ -1504,7 +1615,7 @@ pub(super) mod driver {
 
     impl IsaBackend for Aarch64Backend {
         fn jump(&mut self, asm: &mut Assembly, label: Label) {
-            asm.push(B { target: label });
+            asm.push(Inst::B { to: label });
         }
 
         fn register_file(&self) -> regalloc::RegisterFile {
@@ -1560,11 +1671,7 @@ pub(super) mod driver {
             src: Reg,
             offset: u32,
         ) -> Result<(), CompileError> {
-            AsmProgram::from([Inst::StrQ {
-                src,
-                addr: frame_slot(offset),
-            }])
-            .assemble(code);
+            str_q(code, src, frame_slot(offset));
             Ok(())
         }
 
@@ -1582,11 +1689,7 @@ pub(super) mod driver {
                     Ok(target)
                 }
                 Binding::Loc(Loc::Slot(slot)) => {
-                    AsmProgram::from([Inst::LdrQ {
-                        dst: target,
-                        addr: frame_slot(slot.offset()),
-                    }])
-                    .assemble(code);
+                    ldr_q(code, target, frame_slot(slot.offset()));
                     Ok(target)
                 }
                 Binding::Loc(Loc::Ptr(p)) => {
@@ -1619,42 +1722,35 @@ pub(super) mod driver {
         /// instructions only — the allocator makes it because this backend's
         /// `guard_temps` asks for one.
         ///
-        /// Both polarities end in [`BranchIfW16Zero`] — `cbnz w16, .+8; b
-        /// label`, two words whatever the arm's length — so the arm chooses
-        /// the *reduction*: a horizontal max is zero exactly when no lane is
-        /// set, and an inverted horizontal min is zero exactly when every lane
-        /// is.
+        /// Both polarities end in [`Inst::CbzFar`] on `w16`, the register the
+        /// reduction lands in, so the arm chooses the *reduction*: a
+        /// horizontal max is zero exactly when no lane is set, and an inverted
+        /// horizontal min is zero exactly when every lane is.
         fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
             let scratch = guard_scratch(test.scratch, test.reg);
+            let ip0 = X16.as_gpr();
+            let reduce = |op| Inst::Unary {
+                op,
+                dst: scratch,
+                src: test.reg,
+            };
+            let fmov = Inst::FmovToGp {
+                dst: ip0,
+                src: scratch,
+            };
             match test.arm {
                 IfArm::True => {
-                    AsmProgram::from([
-                        Inst::Unary {
-                            op: Lanewise::Umaxv,
-                            dst: scratch,
-                            src: test.reg,
-                        },
-                        Inst::FmovToGp { src: scratch },
-                    ])
-                    .assemble(&mut asm.run);
+                    AsmProgram::from([reduce(Lanewise::Umaxv), fmov]).assemble(&mut asm.run);
                 }
                 IfArm::False => {
-                    AsmProgram::from([
-                        Inst::Unary {
-                            op: Lanewise::Uminv,
-                            dst: scratch,
-                            src: test.reg,
-                        },
-                        Inst::FmovToGp { src: scratch },
-                        Inst::MvnW {
-                            dst: X16.as_gpr(),
-                            src: X16.as_gpr(),
-                        },
-                    ])
-                    .assemble(&mut asm.run);
+                    AsmProgram::from([reduce(Lanewise::Uminv), fmov, Inst::MvnW { dst: ip0 }])
+                        .assemble(&mut asm.run);
                 }
             }
-            asm.push(BranchIfW16Zero { target: label });
+            asm.push(Inst::CbzFar {
+                test: ip0,
+                taken: label,
+            });
         }
 
         // AAPCS64: x0 = ctx (read-only in the body's gathers and uniform
@@ -1673,10 +1769,7 @@ pub(super) mod driver {
         /// Every scope's constant loads are X17-relative, so the anchor has
         /// to be inside the emitted function, after the frame.
         fn anchor(&mut self, asm: &mut Assembly, pool: Label) {
-            asm.push(AdrpAdd {
-                dst: X17.into(),
-                target: pool,
-            });
+            asm.push(Inst::AdrpAdd { dst: X17, to: pool });
         }
 
         /// Append the constant pool after the final `RET`.
@@ -1696,19 +1789,11 @@ pub(super) mod driver {
         }
 
         fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
-            AsmProgram::from([Inst::StrQ {
-                src,
-                addr: frame_slot(offset),
-            }])
-            .assemble(code);
+            str_q(code, src, frame_slot(offset));
         }
 
         fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
-            AsmProgram::from([Inst::LdrQ {
-                dst,
-                addr: frame_slot(offset),
-            }])
-            .assemble(code);
+            ldr_q(code, dst, frame_slot(offset));
         }
 
         fn add_scalar(
@@ -1757,22 +1842,18 @@ pub(super) mod driver {
                 .expect("NEON's store needs the pitch");
             index_into(code, row, write.row, via);
             index_into(code, col, write.col, via);
+            let address = PtrReg(row.0);
             AsmProgram::from([
-                // madd row, row, pitch, col
-                Inst::Raw {
-                    word: 0x9B00_0000
-                        | (u32::from(pitch.0) << 16)
-                        | (u32::from(col.0) << 10)
-                        | (u32::from(row.0) << 5)
-                        | u32::from(row.0),
+                Inst::Madd {
+                    dst: row,
+                    a: row,
+                    b: pitch,
+                    addend: col,
                 },
-                // add row, out, row, lsl #2
-                Inst::Raw {
-                    word: 0x8B00_0000
-                        | (u32::from(row.0) << 16)
-                        | (2 << 10)
-                        | (u32::from(out.0) << 5)
-                        | u32::from(row.0),
+                Inst::AddLsl2 {
+                    dst: address,
+                    base: PtrReg(out.0),
+                    index: row,
                 },
             ])
             .assemble(code);
@@ -1780,23 +1861,18 @@ pub(super) mod driver {
                 AsmProgram::from([Inst::StrQ {
                     src: write.value,
                     addr: Mem {
-                        base: PtrReg(row.0),
+                        base: address,
                         offset: 0,
                     },
                 }])
                 .assemble(code);
                 return;
             }
-            for lane in 0..write.lanes {
-                // st1 {value.s}[lane], [row], #4 — the lane index is Q:S.
-                let q = (lane >> 1) & 1;
-                let s_bit = lane & 1;
-                AsmProgram::from([Inst::Raw {
-                    word: 0x0D9F_8000
-                        | (q << 30)
-                        | (s_bit << 12)
-                        | (u32::from(row.0) << 5)
-                        | u32::from(write.value.0),
+            for lane in 0..write.lanes as u8 {
+                AsmProgram::from([Inst::St1Lane {
+                    base: address,
+                    src: write.value,
+                    lane,
                 }])
                 .assemble(code);
             }
@@ -1829,11 +1905,7 @@ pub(super) mod driver {
         let from = match at {
             Binding::Loc(Loc::Reg(r)) => r,
             Binding::Loc(Loc::Slot(slot)) => {
-                AsmProgram::from([Inst::LdrS {
-                    dst: via,
-                    addr: frame_slot(slot.offset()),
-                }])
-                .assemble(code);
+                ldr_s(code, via, frame_slot(slot.offset()));
                 via
             }
             Binding::Loc(Loc::Ptr(_)) => unreachable!("a fold's binder is a vector"),
@@ -1860,11 +1932,7 @@ pub(super) mod driver {
         for reload in &plan.reloads {
             match reload {
                 Reload::FromStack { target, slot } => {
-                    AsmProgram::from([Inst::LdrQ {
-                        dst: *target,
-                        addr: frame_slot(slot.offset()),
-                    }])
-                    .assemble(code);
+                    ldr_q(code, *target, frame_slot(slot.offset()));
                 }
                 Reload::Const { target, val_bits } => {
                     emit_const_load(code, *target, *val_bits, pool);
@@ -2158,7 +2226,7 @@ impl DispField {
     ///
     /// If the displacement is not a whole number of instructions, or does not
     /// fit. The first is a bug in this crate; the second is a real limit of the
-    /// encoding. A guard no longer meets it: [`BranchIfW16Zero`] jumps with a
+    /// encoding. A guard no longer meets it: [`Inst::CbzFar`] jumps with a
     /// `B`, ±128 MiB (2026-10-05; before that an arm past `CBZ`'s 262,144
     /// words panicked here), and no emitter verb branches with a `B.cond`.
     fn write(self, code: &mut [u8], at: usize, target: usize) {
@@ -2181,37 +2249,6 @@ impl DispField {
     }
 }
 
-/// `b target` — an unconditional branch to a [`Label`], ±128 MiB.
-///
-/// A struct, like every other instruction here, and its label is an operand
-/// like any other. It emits a zero displacement; the assembler writes the real
-/// one once the label lands, which is what [`AsmInsn::label_ref`] tells it.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct B {
-    /// Where it goes.
-    target: Label,
-}
-
-impl AsmInsn for B {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        emit32(code, 0x1400_0000);
-    }
-
-    #[inline]
-    fn label_ref(self) -> Option<LabelRef> {
-        Some(LabelRef {
-            at: 0,
-            label: self.target,
-            patch: |code, at, target| DispField::IMM26.write(code, at, target),
-        })
-    }
-}
-
-/// The branch-test scratch's register number — W16, which the guard path
-/// reduces a mask into with `umaxv`/`uminv` + `fmov`.
-const BRANCH_TEST_REG: u32 = 16;
-
 /// `CBZ Wt`'s opcode with the register and displacement fields clear:
 /// `sf = 0` (a W register) and `011010`, then `op` in bit 24.
 const CBZ_W_OPCODE: u32 = 0x3400_0000;
@@ -2219,66 +2256,9 @@ const CBZ_W_OPCODE: u32 = 0x3400_0000;
 /// whole difference between the two instructions.
 const CB_OP_NONZERO: u32 = 1 << 24;
 
-/// How far the `CBNZ` of a [`BranchIfW16Zero`] jumps, in words: over the `B`
+/// How far the `CBNZ` of a [`Inst::CbzFar`] jumps, in words: over the `B`
 /// that follows it, to the instruction after the pair.
 const CBNZ_SKIPS_B: u32 = 2;
-
-/// `cbnz w16, .+8` — the first word of a [`BranchIfW16Zero`]. Never patched:
-/// its displacement is the pair's own size, not a label's position.
-const CBNZ_W16_OVER_B: u32 =
-    CBZ_W_OPCODE | CB_OP_NONZERO | (CBNZ_SKIPS_B << DispField::IMM19.shift) | BRANCH_TEST_REG;
-
-/// `cbnz w16, .+8` + `b target`, sharing one [`Label`]: branch to `target`
-/// when W16 is zero, from anywhere within `B`'s ±128 MiB.
-///
-/// **Two instructions, because `CBZ` does not reach.** It spends 19 bits on a
-/// word displacement — ±1 MiB — and an arm is as long as the code it owns, a
-/// bound nothing here puts under 1 MiB: a text run's glyph kernels under one
-/// guard are megabytes of NEON. `CBNZ` steps over the `B` when the mask says
-/// the arm is live, and falls into the `B` when it says the arm is dead, so
-/// this is exactly `cbz w16, target` at `B`'s reach.
-///
-/// **Always both, never the one-word `CBZ` where it would reach.** Which form
-/// fits depends on the arm's length, which depends on where every instruction
-/// inside it landed, and this instruction's own size is one of those — so
-/// choosing the short form is branch relaxation, layout iterated to a fixed
-/// point to save four bytes per guard. The pair's size is fixed before a
-/// single byte is laid out, like `AdrpAdd`'s, and there is nothing to relax.
-///
-/// W16 rather than a register operand because W16 *is* the branch-test scratch
-/// in this backend's ABI: the guard path reduces a mask into it with
-/// `umaxv`/`uminv` + `fmov`, and nothing else may hold a value there. A
-/// register parameter would suggest a choice the ABI does not offer.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct BranchIfW16Zero {
-    /// Where it goes.
-    target: Label,
-}
-
-impl AsmInsn for BranchIfW16Zero {
-    #[inline]
-    fn emit_into(self, code: &mut Vec<u8>) {
-        emit32(code, CBNZ_W16_OVER_B);
-        // The jump is `B`'s own word, so there is one encoding of `B` here and
-        // `label_ref` below only says where its displacement lives.
-        B {
-            target: self.target,
-        }
-        .emit_into(code);
-    }
-
-    #[inline]
-    fn label_ref(self) -> Option<LabelRef> {
-        Some(LabelRef {
-            // The `CBNZ` is the first word; the `B` it steps over sits one
-            // word later, and a displacement is measured from the branch's
-            // own address.
-            at: WORD_BYTES,
-            label: self.target,
-            patch: |code, at, target| DispField::IMM26.write(code, at, target),
-        })
-    }
-}
 
 #[cfg(test)]
 mod label_tests {
@@ -2286,8 +2266,11 @@ mod label_tests {
     use crate::emit::{Assembly, IfArm, IsaBackend, MaskTest};
 
     /// One known word, so a test can measure distances in instructions without
-    /// depending on any real encoding.
-    const NOP: Inst<Physical> = Inst::Raw { word: 0xD503_201F };
+    /// depending on any real encoding: a register copy that is not a no-op.
+    const NOP: Inst<Physical> = Inst::Mov {
+        dst: Reg(0),
+        src: Reg(1),
+    };
 
     /// The one-word `cbz w16, .+0` that a guard used to end in: `Rt = 16`,
     /// `op = 0`. What the pair replaced, spelled out so the test can say what
@@ -2302,7 +2285,7 @@ mod label_tests {
     fn forward_branch_counts_instructions_not_bytes() {
         let mut asm = Assembly::default();
         let end = asm.mint();
-        asm.push(B { target: end });
+        asm.push(Inst::B { to: end });
         asm.push(NOP);
         asm.push(NOP);
         asm.bind(end);
@@ -2318,7 +2301,7 @@ mod label_tests {
         asm.bind(top);
         asm.push(NOP);
         asm.push(NOP);
-        asm.push(B { target: top });
+        asm.push(Inst::B { to: top });
         let code = asm.finish();
         // The branch sits two instructions past the label, so -2 words, in
         // imm26's two's complement.
@@ -2354,7 +2337,10 @@ mod label_tests {
     fn a_branch_on_w16_is_cbnz_over_b() {
         let mut asm = Assembly::default();
         let exit = asm.mint();
-        asm.push(BranchIfW16Zero { target: exit });
+        asm.push(Inst::CbzFar {
+            test: Gpr(16),
+            taken: exit,
+        });
         asm.push(NOP);
         asm.bind(exit);
         let code = asm.finish();
@@ -2417,7 +2403,8 @@ mod label_tests {
 
                 assert_eq!(imm19(words[cbnz_at]), 2, "{arm:?}/{filler}");
                 assert_eq!(
-                    words[cbnz_at], CBNZ_W16_OVER_B,
+                    words[cbnz_at],
+                    CBZ_W_OPCODE | CB_OP_NONZERO | (CBNZ_SKIPS_B << DispField::IMM19.shift) | 16,
                     "{arm:?}/{filler}: the CBNZ is never patched"
                 );
                 assert_eq!(words[b_at] & 0xFC00_0000, 0x1400_0000, "{arm:?}/{filler}");
@@ -2455,7 +2442,7 @@ mod label_tests {
     fn a_label_can_end_the_program() {
         let mut asm = Assembly::default();
         let end = asm.mint();
-        asm.push(B { target: end });
+        asm.push(Inst::B { to: end });
         asm.bind(end);
         let code = asm.finish();
         assert_eq!(code.len(), 4);
@@ -2468,7 +2455,7 @@ mod label_tests {
             let mut asm = Assembly::default();
             asm.run.extend_from_slice(prefix);
             let end = asm.mint();
-            asm.push(B { target: end });
+            asm.push(Inst::B { to: end });
             asm.push(NOP);
             asm.bind(end);
             asm.finish()
