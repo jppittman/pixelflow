@@ -1,6 +1,6 @@
 ---
 name: ontology
-description: What each thing in this project IS (kernel, kernel!, uniform, binding time, binder, fold, monoid, range, mask, If, arm, Var, Ref, identity, lattice, manifold, collapse, lane, pipeline P, stage vs tier, saturation, budget, extraction, cost, variance, demand, scope, placement, root, park, carry, slot, label, operand, instruction, register, value, temp, block, loop, phase, guard, priority lane, cell, glyph, font program), along with what it is not, what follows from it, and where it lives in the code. Read it before designing, reviewing or cleaning up code that touches one of these terms. Read it whenever a special case appears, because the deeper model is usually here.
+description: What each thing in this project IS (kernel, kernel!, uniform, binding time, binder, fold, monoid, range, mask, If, arm, Var, Ref, identity, lattice, manifold, collapse, lane, pipeline P, stage vs tier, saturation, budget, extraction, cost, variance, demand, scope, placement, root, park, carry, slot, label, operand, instruction, register, value, temp, block, loop, phase, guard, priority lane, cell, glyph, font programs), along with what it is not, what follows from it, and where it lives in the code. Read it before designing, reviewing or cleaning up code that touches one of these terms. Read it whenever a special case appears, because the deeper model is usually here.
 ---
 
 # Ontology

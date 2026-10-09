@@ -142,34 +142,6 @@ const TEXELS_WE_MISS_FULL: usize = 2;
 /// `{`@7 (2, 1), as above (it was 3, the same three).
 const TEXELS_WE_MISS_FAST: usize = 1;
 
-/// Our coverage of `ch` at `size` px over an `extent × extent` tile, texel
-/// `(i, j)` the pixel about `(i + ½, j + ½)`, as `renderer` draws it.
-fn draw(renderer: Renderer, font: &Font, ch: char, size: u32, extent: i64) -> Vec<f32> {
-    match renderer {
-        Renderer::Builder => {
-            let glyph = font.glyph_kernel_scaled(ch, size as f32).expect("glyph");
-            // The shipped path: `Glyph::bound` compiles through
-            // `optimize_runtime_arena` and binds the piece table the folds
-            // read, so this asks the JIT the same question a frame does.
-            // `eval_at` takes texel centres directly, which is why the
-            // manifold is compiled at a 1x1 extent rather than the glyph's.
-            let kernel = glyph.kernel();
-            let bound = glyph.bound(&kernel, [1, 1]);
-            (0..extent * extent)
-                .map(|n| bound.eval_at((n % extent) as f32 + 0.5, (n / extent) as f32 + 0.5))
-                .collect()
-        }
-        Renderer::Programs => {
-            let id = font.cmap_lookup(ch).expect("glyph");
-            let outline = font.outline_scaled_by_id(id, size as f32).expect("outline");
-            let side = u32::try_from(extent).expect("a tile's side fits a u32");
-            FontPrograms::new([side, side])
-                .draw(&GlyphRows::of(&outline))
-                .into_buffer()
-        }
-    }
-}
-
 fn font_path() -> String {
     format!(
         "{}/assets/DejaVuSansMono-Fallback.ttf",
@@ -239,6 +211,43 @@ enum Renderer {
     Programs,
 }
 
+/// The side, in texels, of the tile a glyph at `size` px is compared over.
+fn tile_side(size: u32) -> i64 {
+    i64::from(size + size / 2)
+}
+
+impl Renderer {
+    /// Our coverage of `ch` at `size` px over its tile ([`tile_side`]),
+    /// texel `(i, j)` the pixel about `(i + ½, j + ½)`, as this renderer
+    /// draws it.
+    fn draw(self, font: &Font, ch: char, size: u32) -> Vec<f32> {
+        let extent = tile_side(size);
+        match self {
+            Renderer::Builder => {
+                let glyph = font.glyph_kernel_scaled(ch, size as f32).expect("glyph");
+                // The shipped path: `Glyph::bound` compiles through
+                // `optimize_runtime_arena` and binds the piece table the folds
+                // read, so this asks the JIT the same question a frame does.
+                // `eval_at` takes texel centres directly, which is why the
+                // manifold is compiled at a 1x1 extent rather than the glyph's.
+                let kernel = glyph.kernel();
+                let bound = glyph.bound(&kernel, [1, 1]);
+                (0..extent * extent)
+                    .map(|n| bound.eval_at((n % extent) as f32 + 0.5, (n / extent) as f32 + 0.5))
+                    .collect()
+            }
+            Renderer::Programs => {
+                let id = font.cmap_lookup(ch).expect("glyph");
+                let outline = font.outline_scaled_by_id(id, size as f32).expect("outline");
+                let side = u32::try_from(extent).expect("a tile's side fits a u32");
+                FontPrograms::new([side, side])
+                    .draw(&GlyphRows::of(&outline))
+                    .into_buffer()
+            }
+        }
+    }
+}
+
 fn compare_against_freetype(corpus: &Corpus, renderer: Renderer) {
     let Corpus {
         glyphs,
@@ -272,7 +281,7 @@ fn compare_against_freetype(corpus: &Corpus, renderer: Renderer) {
         for &size in sizes {
             let scale = size as f32 / (ascender + descender.abs());
             let ascent_px = ascender * scale;
-            let extent = (size + size / 2) as i64;
+            let extent = tile_side(size);
 
             // Render the reference at SUPERSAMPLE device pixels per texel, in
             // our frame, so texel (i, j) is exactly one SUPERSAMPLE² block.
@@ -315,7 +324,7 @@ fn compare_against_freetype(corpus: &Corpus, renderer: Renderer) {
             let reference_grid: Vec<f32> = (0..extent * extent)
                 .map(|n| reference(n % extent, n / extent))
                 .collect();
-            let ours_grid = draw(renderer, &ours, ch, size, extent);
+            let ours_grid = renderer.draw(&ours, ch, size);
             let reference = |i: i64, j: i64| reference_grid[(j * extent + i) as usize];
             let ours = |i: i64, j: i64| ours_grid[(j * extent + i) as usize];
             let inked: Vec<bool> = reference_grid
