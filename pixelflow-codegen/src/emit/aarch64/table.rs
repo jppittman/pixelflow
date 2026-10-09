@@ -17,9 +17,28 @@ use alloc::vec::Vec;
 // Algebraic Instruction Shapes
 // =============================================================================
 
-/// 12-bit unsigned immediate for AArch64 arithmetic instructions.
+/// 12-bit unsigned immediate for AArch64 arithmetic instructions: a value the
+/// field holds, so [`Inst::encode`] needs no mask.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) struct Imm12(pub(super) u16);
+pub(super) struct Imm12(u16);
+
+impl Imm12 {
+    /// # Panics
+    ///
+    /// If `value` is past [`MAX_IMM12`]: the field would wrap into a
+    /// different instruction.
+    pub(super) fn new(value: u32) -> Self {
+        assert!(
+            value <= MAX_IMM12,
+            "a 12-bit immediate holds at most {MAX_IMM12}, not {value}"
+        );
+        Self(value as u16)
+    }
+
+    pub(super) fn bits(self) -> u32 {
+        u32::from(self.0)
+    }
+}
 
 /// Two-source vector operations: `dst = a ⊗ b` across all lanes. The
 /// discriminant is the opcode with its register fields clear.
@@ -144,7 +163,7 @@ fn address_in_ip0(
     Inst::AddImm {
         dst: ip0,
         src: base,
-        imm: Imm12(first as u16),
+        imm: Imm12::new(first),
     }
     .emit_into(code);
     remaining -= first;
@@ -153,7 +172,7 @@ fn address_in_ip0(
         Inst::AddImm {
             dst: ip0,
             src: ip0,
-            imm: Imm12(chunk as u16),
+            imm: Imm12::new(chunk),
         }
         .emit_into(code);
         remaining -= chunk;
@@ -174,7 +193,7 @@ mod tests {
         Inst::AddImm {
             dst: PtrReg(0),
             src: PtrReg(1),
-            imm: Imm12(42),
+            imm: Imm12::new(42),
         }
         .emit_into(&mut code_imm);
         assert_eq!(

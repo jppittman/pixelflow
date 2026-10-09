@@ -218,8 +218,8 @@
   a register." `emit::Class` (`emit/mod.rs`) is a trait with the markers
   `Vector`, `Pointer`, `Integer` and `Flags`, the type an instruction's
   operand field is declared with, so a base address cannot be handed a
-  `row * pitch` product. The flags are a class. D1 deletes
-  `program::Class` and keeps `emit::Class`.
+  `row * pitch` product. The flags are a class. D2 deletes
+  `program::Class`; D1 deletes only `emit::Class`'s `type Physical`.
 - **Is not:** a reason for a second algorithm ("One algorithm, two pools").
 - **Follows:** carry budgets are per class. Vector-only scratch (temps,
   guard registers, the result role) does not apply to pointers.

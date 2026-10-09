@@ -1163,8 +1163,8 @@ In the new pipeline, none of these is ever written. The legacy code is deleted i
 | P8 | `operand_sources` (`mod.rs:833`), `reloads_wanted` (`884`) | A prediction of which operands the emitter reloads | A reload is an inserted instruction defining a fresh value | B4 / D1 |
 | H1 | `POOL_BASE = PtrReg(8)` (`x86_64.rs:33`); `anchor` (`x86_64.rs:136`) | `r8` held for the whole kernel | `vbroadcastss y, [rip + entry]`; no base value. `r8` joins `General` | B3 |
 | H2 | aarch64 `X17` anchor (`aarch64.rs:2140-2145`); pool loads from `X17` (`1851`, `2330`); `X16`/`X17` (`2494-2496`) | IP1 held for the whole kernel | `p = AdrpAdd(pool)` in the entry block: a rematerializable `Pointer`. `x17` joins `General` | C4 |
-| H3 | AVX2 guard `avx2.rs`'s `branch_if_arm_is_dead`: `Inst::MoveMask`, `Gp::CmpByte` or `Gp::Test`, `Gp::Jcc` | `rax` clobbered between instructions | `g = MoveMask(m)`, then `f = Test(g)` (a dead `True` arm) or `f = CmpByte(g, 0xFF)` (a dead `False` arm), then `Jcc(f)`. The encoder picks the `cmp al` form | B9 |
-| H4 | `FmovToGp` with `Rd = 16` (`table.rs:425-439`); `mvn_w(X16, X16)` (`aarch64.rs:2097`); `CBNZ_W16_OVER_B` (`2745`), `BranchIfW16Zero` (`2770`) | IP0 written and tested by convention | `FmovToGp { dst: Write<Integer> }`, `MvnW { dst: Tie<Integer> }`, `CbzFar { test: Read<Integer>, taken, next }` (`cbnz w, .+8; b taken` with an `imm26` field) | A12b fields; C4 values |
+| H3 | (at HEAD) AVX2 guard `avx2.rs`'s `branch_if_arm_is_dead`: `Inst::MoveMask`, `Gp::CmpByte` or `Gp::Test`, `Gp::Jcc` | `rax` clobbered between instructions | `g = MoveMask(m)`, then `f = Test(g)` (a dead `True` arm) or `f = CmpByte(g, 0xFF)` (a dead `False` arm), then `Jcc(f)`. The encoder picks the `cmp al` form | B9 |
+| H4 | `FmovToGp` with `Rd = 16` (`table.rs:425-439`); `mvn_w(X16, X16)` (`aarch64.rs:2097`); `CBNZ_W16_OVER_B` (`2745`), `BranchIfW16Zero` (`2770`) | IP0 written and tested by convention | `FmovToGp { dst: Write<Integer> }`, `MvnW { dst: Tie<Integer> }`, `CbzFar { test: Read<Integer>, taken, next }` (`cbnz w, .+8; b taken` with an `imm26` field) | A12b fields (`next` at B1); C4 values |
 | H5 | `emit_fmov_imm`'s `w16` path (`aarch64.rs:466-477`) | `movz/movk w16; dup` | Every constant is selected: `movi`, `fmov`, or `ldr q, [p, #off]` | C4 |
 | H6 | `address_in_ip0` (`table.rs:530`), called by `StrQ` (`562`), `LdrQ` (`617`) and `LdrS` (`672`). `LdrS` also serves `emit_uniform_load` (`aarch64.rs:410`) and `index_into`'s slot read (`2269`). `StrX`/`LdrX` panic past `imm12` (`table.rs:589-594`, `644-648`), and `LdrX` serves `Context` (`aarch64.rs:2390-2401`), so a context slot of 4096 or more panics | IP0 as an address, and two panics | Spills: `spill`/`reload` emit `SlotAddr { dst: Write<Pointer>, slot }` (`add t, sp, #hi, lsl 12; add t, t, #lo`); narrow slots always encode. Non-frame loads (`Uniform`, `Context`): selection emits `t = AddImm(base, #hi, lsl 12)`, `ldr [t, #lo]`, and `movz/movk` plus a register `add` past 16 MiB. The binder read is an ordinary reload. One instruction replaces today's chain of `add #4080` | C4 |
 | H7 | `kortestw` bytes hardwiring `k1,k1` (`avx512.rs:647-653`) | An encoder that ignores its register | `KorTest { flags: Write<Flags>, k: Read<Opmask> }` encodes `k.number()` | A11b field; C2 value |
@@ -1185,7 +1185,7 @@ In the new pipeline, none of these is ever written. The legacy code is deleted i
 | H22 | About 227 signatures taking `code: &mut Vec<u8>` (`grep -c`, `bdee3900`) | Choice and encoding fused | Per-ISA `Inst<S>`; `encode(&Inst<Bound>)` | A9–A12 |
 | H23 | `Where::Ptr` (`regalloc.rs:647`); `pointers` (`370`) beside `gpr_scratch` (`352`) | One physical file split by role | One `GeneralFile`. `Pointer` and `Integer` are *types* of values in it | B3 / D1 |
 | H24 | `accumulator_slots`/`binder_slots` keyed by the `Reduce`'s `ValueId`, "the later fold wins" (`regalloc.rs:1050-1054`, pins `1216-1287`) | Two carved siblings sharing slots by accident | Each fold's parameters belong to its own `Head`, and slots are leases | B6 / D1 |
-| H25 | The stack pointer: written by `frame_alloc` and `emit_ret`, which frees (`avx2.rs:1465`, `avx512.rs:1552`, `aarch64.rs:2110-2136`), read by every slot (`x86_64.rs:796`, `aarch64.rs:1864`) | A register in no class, used by convention | Owned by `Frame`. Read only through slot operands and `SlotAddr`; written only by `Enter`/`Ret` | B3, C4 |
+| H25 | (at HEAD) The stack pointer: written by `frame_alloc` and `emit_ret`, which frees (`avx2.rs:1465`, `avx512.rs:1552`, `aarch64.rs:2110-2136`), read by every slot (`x86_64.rs:796`, `aarch64.rs:1864`) | A register in no class, used by convention | Owned by `Frame`. Read only through slot operands and `SlotAddr`; written only by `Enter`/`Ret` | B3, C4 |
 | H26 | Placeholder defs: `place_roots` rewrites a hoisted vector def to `Const(0.0)` (`program/scopes.rs:277`); a pointer one stays `Context`; `stays_put` (`scopes.rs:205`) | A def whose op lies about what it is. A selected placeholder is a silent 0.0 (the escape-hatches 2026-09-04 miscompile) | `ScheduledOp::Outer(Class)`, a typed read of an enclosing value (A5). D2 deletes the placeholders | A5, D2 |
 | H27 | `vzeroupper` and `ret` (`x86_64.rs:159`) | Implicit clobber and read | `Ret` is the exit terminator; nothing is live there (asserted) | B3 |
 | H28 | `Write`'s binder read chosen by residency: `vcvttss2si r64, m32` from a slot (`x86_64.rs:846-857`), NEON `ldr s via` (`aarch64.rs:2269-2278`) | A selection made by residency | The binder is a value. A slot-held binder gets a reload, then the register form | B3 (x86), C4 (NEON) |
@@ -1220,7 +1220,7 @@ The narrowing already removes these, so they are not listed again here: `Item`, 
 
 `emit/mod.rs`:
 - the register newtypes `Reg`, `Gpr`, `PtrReg`, `KReg` (they were `pub u8`; the narrowing made the field private);
-- `AsmInsn` (every backend's `Inst<Physical>` implements it) and `Class::Physical`, `Assembly::push` (its one caller), and the legacy `emit::AsmProgram<S>`, which leaves `asm::AsmProgram<I>` the only one;
+- `AsmInsn` (every backend's `Inst<Physical>` and `EncodedInst` implement it) and `Class::Physical`, `Assembly::push` (its one caller, and the `label_tests` of `x86_64.rs` and `aarch64.rs`, which push through it and move to `asm::AsmProgram`), and the legacy `emit::AsmProgram<S>`, which leaves `asm::AsmProgram<I>` the only one;
 - `Loc`, `Binding`, `Unary`, `ResolvedOp`, `Reload`, `InstructionPlan`, `OperandSource`;
 - `operand_sources`, `reloads_wanted`, `declared_temp`, `declared_gpr_temp`, `declared_mask_temp`;
 - `emit_scope`, `resolve_operands`, `location_of`, `binding`;
@@ -1506,7 +1506,7 @@ Every commit in this phase is live in production.
 
 - **Files:** `emit/mod.rs` (`Value`, `ValueName`, `Selected`, `Rebind`, `Operand`, `Access`, `Target`, `Block`, `Function`, `Entry`, `Loop`, `Constants`, `Constant`, `LaneOp`, `Store`, `Test`, `Edges`, `IsaBackend`), `emit/build.rs` (§2.9).
 - **Change:** rename the legacy trait `IsaBackend` to `LegacyBackend` (mechanical), so that the contract's name is the new trait from the first commit.
-- **Deferred from A9, whose first reader is here:** the `sealed` supertraits of `Class`, `Jcc`'s `next` field and the `Fallthrough` arm of `Gp` (the block builder is the first thing with a next block to name).
+- **Deferred from A9, whose first reader is here:** the `sealed` supertraits of `Class`, `Jcc`'s and `CbzFar`'s `next` field and the `Fallthrough` arm of `Gp` (the block builder is the first thing with a next block to name).
 - **Tests:** none of its own (§0.6). `finish`'s and `push`'s checks are production assertions, and they are exercised by every kernel B3 onward selects.
 - **Status:** `expect(dead_code)` until B4.
 - **Gate:** G.
@@ -1529,7 +1529,7 @@ Every commit in this phase is live in production.
   - `walk`, and `encode` at `Bound`, built through `asm::Encoding`: B3 is the first reader of `encode` at `Bound`, and A9's `Gp<Physical>` implements only the legacy `AsmInsn` until D1 deletes it.
 - **The driver covers:** the body, folds as blocks (§2.10), `Outer`/`Var`/`Reduce`/`Seq`/`Write`.
 - **The driver refuses**, through `unimplemented_op`, which names the op: `Context`, `Uniform`, `Gather`, `Broadcast`, and guarded `If` arms. These arrive in B8–B9.
-- **Tests:** select the `GOLDEN` rows that use only these ops, and assert `finish`'s invariants and the selected loop shape (one backward branch per fold).
+- **Tests:** none of its own (§0.6). `finish`'s invariants and one backward branch per fold are production assertions in the selected program, and B4 exercises them through `compile` under the knob.
 - **Status:** `expect(dead_code)` until B4.
 - **Gate:** G.
 
@@ -1716,7 +1716,7 @@ Every commit in this phase is live in production.
 3. **The join invariants are asserted, not built around.** No edge blocks are built. If invariant 1 or 2 fires, the remedy is an edge block on that edge: one `jmp` per trip.
 4. **Dominance is relaxed across uniform guards.** An allocator that "repaired" an undefined path with a phi would be wrong. The relaxation is documented on `Function`, and `guard_parked_reads` and `guard_sibling_fold` exercise it.
 5. **Affine is not linear.** A dropped `Def` is a panic at `finish`, not a compile error (§2.13).
-6. **x86 encodings depend on the register.** `cmp g8, imm8` is two bytes for `al`, three for `cl`/`dl`/`bl`, and four with REX for `sil`/`dil` (`40 80 FE FF`) and for `r8b`–`r11b`. A guard's length now depends on allocation, as every other instruction's already does.
+6. **x86 encodings depend on the register.** `cmp g8, imm8` is two bytes for `al`, three for `cl`/`dl`/`bl`, and four with REX for `sil`/`dil`/`bpl`/`spl` (`40 80 FE FF`) and for `r8b`–`r11b`. A guard's length now depends on allocation, as every other instruction's already does.
 7. **The knob is temporary production surface,** like `PIXELFLOW_ISA`. It is decided once and refuses unbuilt tiers. D1 deletes it. Until then, two pipelines answer for the same kernel, and the job and the ratchet hold both to V.
 8. **Instruction-enum size.** The largest variant (the gather) is about 48 bytes at `Selected`, and every `Bound` field is a reference. A glyph body is about 1,030 scheduled ops, which comes to about 2,000 instructions and about 100 KB per compile. That is noise next to saturation.
 

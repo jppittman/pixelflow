@@ -592,13 +592,14 @@ fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
 /// How many mask registers this backend's encoding of `op` needs.
 ///
 /// A comparison's `vcmpps` destination — `k1`, chosen by hand before this
-/// work and now a `RegisterFile::mask_scratch` reservation — and a remainder
-/// store's writemask. Every other op either has no mask (arithmetic) or
+/// work and now a `RegisterFile::mask_scratch` reservation — a gather's
+/// writemask, and a remainder store's writemask. Every other op either has no mask (arithmetic) or
 /// reads the mask as an ordinary vector (`If`).
 fn mask_temps_for(op: &super::ScheduledOp) -> u8 {
     use super::ScheduledOp;
     match op {
         ScheduledOp::Binary(op_kind, ..) if is_compare(*op_kind) => 1,
+        ScheduledOp::Gather(..) => 1,
         ScheduledOp::Write { lanes, .. } if *lanes < 16 => 1,
         _ => 0,
     }
@@ -608,20 +609,22 @@ fn mask_temps_for(op: &super::ScheduledOp) -> u8 {
 // The store, and the iota
 // =============================================================================
 
-/// Set the gather's writemask `k1` to all-ones: `mov eax, 0xFFFF`, then
-/// `kmovw k1, eax` in the two-byte VEX prefix, which [`Inst::Kmovw`] (the
+/// Set the gather's writemask `mask` to all-ones: `mov eax, 0xFFFF`, then
+/// `kmovw mask, eax` in the two-byte VEX prefix, which [`Inst::Kmovw`] (the
 /// three-byte form) does not encode. A gather clears the bits it completes, so
 /// this runs before each one, and it clobbers `eax`. A `kxnorw k1, k1, k1`
-/// would need neither `eax` nor a second instruction, but it reads the `k1`
+/// would need neither `eax` nor a second instruction, but it reads the mask
 /// the previous gather is still clearing, which chains each gather behind the
 /// last. C2 allocates the mask and picks.
-fn set_gather_mask(code: &mut Vec<u8>) {
+fn set_gather_mask(code: &mut Vec<u8>, mask: KReg) {
     x86_64::Gp::MovImm32 {
         dst: x86_64::gpr::RAX,
         imm: 0xFFFF,
     }
     .emit_into(code);
-    EncodedInst::from_slice(&[0xC5, 0xF8, 0x92, 0xC8]).emit_into(code);
+    // ModRM `11 mask eax`: the mask in the reg field, `eax` (0) in r/m.
+    let modrm = 0xC0 | (mask.0 << 3);
+    EncodedInst::from_slice(&[0xC5, 0xF8, 0x92, modrm]).emit_into(code);
 }
 
 /// The bytes `0..8` and `8..16`, little end first: what two `movabs` carry
@@ -1059,14 +1062,15 @@ mod tests {
         /// Set `k1` to all-ones and gather `dst = [base + index*4]` under it,
         /// as the driver does before every gather.
         fn gather_through_k1(c: &mut Vec<u8>, dst: Reg, base: PtrReg, index: Reg) {
-            set_gather_mask(c);
-            AsmProgram::from([Inst::Gather {
+            let mask = KReg(1);
+            set_gather_mask(c, mask);
+            Inst::Gather {
                 dst,
                 base,
                 index,
-                mask: KReg(1),
-            }])
-            .assemble(c);
+                mask,
+            }
+            .emit_into(c);
         }
 
         fn lanes() -> ([f32; 16], [f32; 16], [f32; 16]) {
@@ -1297,7 +1301,7 @@ mod tests {
         }
 
         #[test]
-        fn emit_gather_reads_the_value_at_each_lanes_index() {
+        fn a_gather_reads_the_value_at_each_lanes_index() {
             skip_unless_avx512_is_selected!();
             // JIT a function: fn(*const f32 base [rdi], __m512 idx_float [zmm0]) -> __m512
             // that truncates the float indices, sets the mask, and gathers
@@ -1331,11 +1335,11 @@ mod tests {
         }
 
         #[test]
-        fn emit_gather_addresses_high_numbered_vector_registers_and_gpr_base() {
+        fn a_gather_addresses_high_numbered_vector_registers_and_a_gpr_base() {
             skip_unless_avx512_is_selected!();
             // The production driver always gathers through rax (base_gpr=0)
             // with dst/idx below zmm16 in every kernel this test suite
-            // compiles, so `emit_gather_reads_the_value_at_each_lanes_index`
+            // compiles, so `a_gather_reads_the_value_at_each_lanes_index`
             // never sets the R'/B/V' extension bits this emitter also has to
             // encode. Move the base pointer into r9 (>= r8) and gather
             // into/from zmm registers >= 16 to pin them, mirroring
@@ -1584,28 +1588,29 @@ pub(super) mod driver {
                     super::emit_shift_imm(code, *op, *dst, *src, *amount);
                 }
                 ResolvedOp::Gather { dst, idx, base } => {
-                    // dst = base[idx]: `vgatherdps` through `k1`, `base`
+                    // dst = base[idx]: `vgatherdps` through the mask temp, `base`
                     // being the buffer's address wherever the allocator
                     // keeps it. The lowered index is a float, so it is
-                    // truncated to int32 lanes first, and `k1` is all-ones
+                    // truncated to int32 lanes first, and the mask is all-ones
                     // going in (the instruction clears the bits it
                     // completes), so it is reset before every gather.
                     let idx_int = crate::emit::declared_temp(plan.scratch.temp(0));
                     let gather_dst = crate::emit::declared_temp(plan.scratch.temp(1));
-                    AsmProgram::from([Inst::Unary {
+                    Inst::Unary {
                         op: Lanewise::ToInt,
                         dst: idx_int,
                         src: *idx,
-                    }])
-                    .assemble(code);
-                    super::set_gather_mask(code);
-                    AsmProgram::from([Inst::Gather {
+                    }
+                    .emit_into(code);
+                    let mask = crate::emit::declared_mask_temp(plan.scratch.mask_temp(0));
+                    super::set_gather_mask(code, mask);
+                    Inst::Gather {
                         dst: gather_dst,
                         base: *base,
                         index: idx_int,
-                        mask: KReg(1),
-                    }])
-                    .assemble(code);
+                        mask,
+                    }
+                    .emit_into(code);
                     super::emit_mov(code, *dst, gather_dst);
                 }
                 ResolvedOp::Broadcast { dst, idx, base } => {
