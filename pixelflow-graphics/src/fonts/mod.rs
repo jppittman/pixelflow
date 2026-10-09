@@ -124,7 +124,7 @@ pub mod ttf;
 pub(crate) const PIXEL_CENTER: f32 = 0.5;
 
 // Re-export font types (user-facing only)
-pub use loop_blinn::{Glyph, Support};
+pub use loop_blinn::{FontPrograms, Glyph, GlyphRows, Support};
 pub use outline::{Affine, Contour, ContourError, Outline, Segment};
 pub use ttf::Font;
 
