@@ -1418,7 +1418,7 @@ Every commit in this phase is live in production.
 #### A7: The allocator's policies stand alone
 
 - **Files:** `emit/regalloc.rs` becomes `emit/regalloc/mod.rs`; new `emit/regalloc/policy.rs`.
-- **Move:** `EvictionRank`, and the pure pricing inside `plan_carries` (`regalloc.rs:1940`): reads × trips, the latch copy, the budget order. The legacy pipeline calls them from their new home.
+- **Move:** `EvictionRank` with `ReadHere` (built by `EvictionRank::new`, its fields private), and the pure pricing inside `plan_carries`: `reads_saved` (reads × trips), `loop_state_saved` (a binder's or an accumulator's two accesses per trip), `Candidate` and `carried` (the budget order). The legacy pipeline calls them from their new home. B6's one latch copy per trip for a head parameter is a new pricing beside `loop_state_saved`, not a move.
 - **Bytes:** identical.
 - **Gate:** G.
 

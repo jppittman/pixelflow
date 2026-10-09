@@ -28,7 +28,7 @@
     `emit/aarch64.rs`).
   - `temps_for` (one per backend in `emit/{avx2,avx512,aarch64}.rs`, reached
     through the `RegisterFile::temps_for` field) and `Scratch::REDUCE_TEMPS`
-    (`emit/regalloc.rs`).
+    (`emit/regalloc/mod.rs`).
   - Effects (`Write`, `Seq`) as `Def`s that define no value.
   - The emitter's `Reduce` arm (`emit/mod.rs`) branching on
     `monoid != SEQ`, and `Fold::combine_op` (`pixelflow-ir/src/fold.rs`) as

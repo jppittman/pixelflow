@@ -9,7 +9,6 @@
   ],
   "exclude": [
     "**/tests/**",
-    "pixelflow-codegen/src/emit/regalloc.rs",
     "pixelflow-codegen/src/emit/regalloc/**"
   ],
   "question": "The project's goal is no register allocation outside the register allocator. Does this function choose which register holds something — a value, an instruction temp, a reload, a pointer, a loop counter, a mask, a constant-pool base — instead of encoding registers the allocator handed it?",

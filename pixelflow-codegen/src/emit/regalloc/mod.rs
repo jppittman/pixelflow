@@ -22,6 +22,9 @@ use crate::program::IfGuard;
 use crate::program::{Class, all_operands, pointer_operand};
 pub(super) use crate::program::{Def, Scope, ScopedSchedule, ValueId, operands};
 
+mod policy;
+use policy::{Budget, Candidate, EvictionRank, ReadHere, Store};
+
 /// The complete platform-dependent surface of register allocation.
 ///
 /// Allocation policy is target-independent; only these numbers are not. A
@@ -1733,20 +1736,6 @@ fn scope_ix(scope: Scope) -> usize {
     }
 }
 
-/// The two per-class budgets [`plan_carries`] fills, indexed by
-/// [`Class::ix`].
-type Budget = [usize; 2];
-
-impl Class {
-    /// This class's index into a per-class array.
-    const fn ix(self) -> usize {
-        match self {
-            Class::Vector => 0,
-            Class::Pointer => 1,
-        }
-    }
-}
-
 /// Where each root of one scope sits in that scope's sorted roots, by
 /// `ValueId`: a dense table over the id space, so whether a value some scope
 /// reads is a root is one index and not a search.
@@ -1885,7 +1874,7 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
                     .flat_map(|d| operands(&d.op))
                     .filter(|o| *o == bv)
                     .count();
-                reads * trips[k]
+                policy::reads_saved(reads, trips[k])
             })
             .sum()
     };
@@ -1895,13 +1884,7 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
         Binder(usize),
         Accumulator(usize),
     }
-    struct Candidate {
-        weight: usize,
-        class: Class,
-        live_across: Vec<usize>,
-        root: Root,
-    }
-    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut candidates: Vec<Candidate<Root>> = Vec::new();
 
     // A scope's root is read by the scopes inside it, each read costing a
     // reload every time that scope runs; the carry is live across all of
@@ -1931,7 +1914,7 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
             let trips = trips_of(*s);
             for read in schedule.iter().flat_map(|d| all_operands(&d.op)) {
                 if let Some(slot) = slots.of(read) {
-                    weights[slot] += trips;
+                    weights[slot] += policy::reads_saved(1, trips);
                 }
             }
         }
@@ -1962,49 +1945,32 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
             .filter(|&k| !chain_up_to(k, j).is_empty())
             .map(|k| scope_ix(Scope::Fold(k)))
             .collect();
-        // The trip test and the step read the binder once each per trip;
-        // the combine reloads and stores the accumulator once each — unless
-        // the fold is over the unit monoid, whose accumulator nothing ever
-        // reads or writes.
+        // A fold over the unit monoid has no accumulator to carry.
         let accumulates = meta_of(j).monoid() != pixelflow_ir::fold::Monoid::SEQ;
         candidates.push(Candidate {
-            weight: 2 * trips_j + binder_reads(j),
+            weight: policy::loop_state_saved(trips_j) + binder_reads(j),
             class: Class::Vector,
             live_across: live_across.clone(),
             root: Root::Binder(j),
         });
         if accumulates {
             candidates.push(Candidate {
-                weight: 2 * trips_j,
+                weight: policy::loop_state_saved(trips_j),
                 class: Class::Vector,
                 live_across,
                 root: Root::Accumulator(j),
             });
         }
     }
-    // Stable, so the order above breaks ties: outer scopes' roots before
-    // inner, a binder before its accumulator, lower ids first.
-    candidates.sort_by_key(|c| core::cmp::Reverse(c.weight));
-
-    let mut count: Vec<Budget> = vec![[0; 2]; 1 + folds];
+    // The order above breaks ties: outer scopes' roots before inner, a
+    // binder before its accumulator, lower ids first.
     let mut plan = CarryPlan {
         scope_roots: vec![Vec::new(); 1 + folds],
         fold_binder: vec![false; folds],
         fold_accumulator: vec![false; folds],
     };
-    for candidate in candidates {
-        let class = candidate.class.ix();
-        if candidate
-            .live_across
-            .iter()
-            .any(|&s| count[s][class] >= above_floor[class])
-        {
-            continue;
-        }
-        for &s in &candidate.live_across {
-            count[s][class] += 1;
-        }
-        match candidate.root {
+    for root in policy::carried(candidates, 1 + folds, above_floor) {
+        match root {
             Root::Scope(scope, v) => plan.scope_roots[scope_ix(scope)].push(v),
             Root::Binder(j) => plan.fold_binder[j] = true,
             Root::Accumulator(j) => plan.fold_accumulator[j] = true,
@@ -2390,58 +2356,6 @@ impl Scan {
     }
 }
 
-/// What it costs the instruction being placed to lose one of its own reads —
-/// the tier that outranks every kind of deferred traffic, and the reason an
-/// operand's register is a *priced* choice rather than a forbidden one.
-///
-/// Ordered cheapest first. The distinction between the two read-here cases is
-/// what makes the exhausted pool feasible: when every held register belongs to
-/// something this instruction reads, the loser has to be one of them, and only
-/// one kind of them costs no further register.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-enum ReadHere {
-    /// Not read by this instruction or by a guard emitted before it.
-    No,
-    /// Read here, and it is the operand the encoding consumes *from the
-    /// destination* ([`OperandSource::Destination`]): losing its register
-    /// means one reload — into `dst`, which is the register it is losing —
-    /// and no other register at all.
-    FromDst,
-    /// Read here and needs a register of its own to be read from: a reload
-    /// register the pool then has to find too, or a guard's mask register for
-    /// a branch emitted before the instruction.
-    NeedsRegister,
-}
-
-/// What giving up a register costs, cheapest first — the order eviction picks
-/// its loser in.
-///
-/// A value whose slot already holds it needs no store; anything else has to be
-/// written out. Belady's distance breaks ties *within* a tier and only within
-/// one: the traffic an eviction causes outweighs how long it waits to cause it.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct EvictionRank {
-    /// Read by the instruction being placed — see [`ReadHere`].
-    ///
-    /// The fields below price the traffic an eviction *defers*; for a value
-    /// read right here there is nothing to defer, so taking its register buys
-    /// a reload inside this very instruction. Without this, a value already in
-    /// its slot is the standing favourite — and at a read, the standing
-    /// favourite is whichever value the instruction is reading.
-    ///
-    /// Answered from the instruction's own read set, never from the read
-    /// cursor: the kept-reload step advances the cursor past the current index
-    /// (`next_read(operand, i + 1)`), so by the time the destination is
-    /// contested a just-kept operand would read as "not needed now".
-    read_here: ReadHere,
-    /// Whether losing the register costs a store: false once the slot holds
-    /// the value, which for a constant is from birth.
-    store: bool,
-    /// Nearest next read *last*, so the cheapest loser is the one used
-    /// farthest out.
-    nearest: core::cmp::Reverse<usize>,
-}
-
 /// The pool slots one instruction has already claimed, in the order it claimed
 /// them.
 ///
@@ -2712,15 +2626,19 @@ impl Pass {
     /// candidates already exclude everything the instruction reads.
     fn rank(&mut self, v: ValueId, from: usize, read_here: &[(ValueId, ReadHere)]) -> EvictionRank {
         let k = v.0 as usize;
-        let distance = self.next_read(v, from).map_or(usize::MAX, |r| r - from);
-        EvictionRank {
-            read_here: read_here
+        let distance = self.next_read(v, from).map(|r| r - from);
+        EvictionRank::new(
+            read_here
                 .iter()
                 .find(|(r, _)| *r == v)
                 .map_or(ReadHere::No, |(_, tier)| *tier),
-            store: !self.in_slot[k],
-            nearest: core::cmp::Reverse(distance),
-        }
+            if self.in_slot[k] {
+                Store::NotNeeded
+            } else {
+                Store::Needed
+            },
+            distance,
+        )
     }
 
     /// Record that `v` lives at `to` from `index` on.
@@ -3307,21 +3225,23 @@ impl LinearScan {
                     // rank against the occupant's. A definition has written
                     // nothing yet, so its slot is valid only if it is a
                     // constant's.
-                    let new_rank = EvictionRank {
+                    let new_rank = EvictionRank::new(
                         // A definition is a write; nothing reads it here as
                         // an operand. A root's hand-off does read it here,
                         // from the register it is written into, and that is
                         // the one read a definition cannot serve from a slot.
-                        read_here: if pass.read_at(def.value, i) {
+                        if pass.read_at(def.value, i) {
                             ReadHere::NeedsRegister
                         } else {
                             ReadHere::No
                         },
-                        store: !pass.in_slot[def.value.0 as usize],
-                        nearest: core::cmp::Reverse(
-                            pass.next_read(def.value, i).map_or(usize::MAX, |r| r - i),
-                        ),
-                    };
+                        if pass.in_slot[def.value.0 as usize] {
+                            Store::NotNeeded
+                        } else {
+                            Store::Needed
+                        },
+                        pass.next_read(def.value, i).map(|r| r - i),
+                    );
                     let keeps = new_rank > pass.rank(occupant, i, &read_here);
                     if !keeps && pass.in_slot[def.value.0 as usize] {
                         // Nothing to write: a value whose slot is valid before
@@ -3961,8 +3881,8 @@ pub(super) mod tests {
         let sites = vec![Vec::new(); dag.len()];
         let mut pass = Pass::new(&dag, &TEST_FILE, no_reads(&sites), Class::Vector);
         let rank = pass.rank(ValueId(0), 1, &[]);
-        assert_eq!(
-            rank.nearest.0, 2,
+        assert!(
+            rank == EvictionRank::new(ReadHere::No, Store::Needed, Some(2)),
             "value 0's only read is at index 3, two steps ahead of index 1"
         );
     }

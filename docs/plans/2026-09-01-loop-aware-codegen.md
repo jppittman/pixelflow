@@ -523,7 +523,7 @@ smaller, second win, not a prerequisite.
 
 ### The conflation this fixes
 
-`RegisterAllocator::allocate` (`pixelflow-codegen/src/emit/regalloc.rs:410`)
+`RegisterAllocator::allocate` (`pixelflow-codegen/src/emit/regalloc/mod.rs`)
 takes `Vec<Def>` — one flat, loop-free, SSA schedule — and so does the
 e-graph extractor. That single type currently serves two different
 requirements at once, and the escape-hatches plan already names the
@@ -872,7 +872,7 @@ itself. Two genuinely different things currently share one Rust type:
 2. **The register-sized ABI unit.** "One machine batch" — the literal bit
    pattern an `xmm`/`ymm`/`zmm`/NEON `v` register holds, the thing whose
    byte count `JIT_VECTOR_BYTES` names and `Reg`/`RegisterFile`
-   (`pixelflow-codegen/src/emit/regalloc.rs`) place into physical registers.
+   (`pixelflow-codegen/src/emit/regalloc/mod.rs`) place into physical registers.
 
 `Field<A: FieldStorage>(pub(crate) A::Storage)` is asked to be both at once,
 and the seam where that fusion is paid for is visible in the code: every
