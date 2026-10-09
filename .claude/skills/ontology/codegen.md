@@ -484,7 +484,8 @@
   its block's label. A label is a name, so it is `Copy`; it has no public
   constructor, so it cannot dangle; it is 64-bit, like every id.
 - **Lives:** `emit::asm::Label` (`pixelflow-codegen/src/emit/asm.rs`) — a
-  `u64` minted by `Labels::mint`, its only constructor. `emit_scope` mints a
+  `u64` minted by `Labels::mint`, its only constructor, owned by the program
+  (`Assembly::mint`). `emit_scope` mints a
   guard's `past` label where it makes the branch and carries it in
   `PendingBranch` to its bind point; a fold mints `top` and `exit`, an `If`
   its three, `compile_via_backend` the pool's and hands it to `anchor` and
@@ -558,14 +559,19 @@
   AST — assembly is not context-sensitive."
 - **Is not:** a buffer of bytes; split per scope and spliced together (one
   program, one namespace — a scope is the allocator's concept, not the
-  assembler's). Superseded: R0's "two front ends, one mechanism" (a value
-  `AsmProgram` beside a push/bind/finish `Assembly`).
+  assembler's). R0's "two front ends, one mechanism" (a value `AsmProgram`
+  beside a push/bind/finish `Assembly`) is what this is now: the builder
+  accumulates the value.
 - **Follows:** whatever builds the program — instruction selection, then the
   allocator inserting its own code — builds a value; nothing writes bytes.
-- **Lives:** to be built. Today `emit_scope`
-  (`pixelflow-codegen/src/emit/mod.rs`) returns each scope's bytes as a
-  `Vec<u8>` and the parent splices them in
-  (`asm.code.extend_from_slice(&fold_code)`), which contradicts this entry.
+- **Lives:** `asm::AsmProgram` (`pixelflow-codegen/src/emit/asm.rs`) is the
+  value: `text` and `data` sections of `Item`s, and the `Labels` that minted
+  every label in it. Today `emit::Assembly` (`emit/mod.rs`) is the front end
+  that accumulates it as the legacy driver walks a schedule: one per kernel,
+  threaded through every scope (`emit_scope(allocation, backend, &mut asm)`),
+  so no scope's bytes are spliced into another's. The constant pool is its
+  data section (`Assembly::pool`). The selection pipeline builds the value
+  directly.
 
 ### Assembler
 
@@ -582,11 +588,13 @@
   it is the IR's job.
 - **Follows:** it stands alone — its module imports nothing from the rest of
   the crate, and everything above it depends on it, never the reverse.
-- **Lives:** `emit::Assembly` (a push/bind/finish builder with a public `code`
-  field the driver writes into) and `AsmProgram`/`assemble` in
-  `pixelflow-codegen/src/emit/mod.rs` — two front ends where the program is
-  the value and `assemble` the function; today's builder contradicts this
-  entry. `docs/designs/assembler-as-functor.md`.
+- **Lives:** `asm::assemble` (`pixelflow-codegen/src/emit/asm.rs`), which
+  imports nothing from the crate (`scripts/check_emit_boundary.py` rule A) and
+  is handed the encoder as a closure, so it names no instruction type. Its
+  front end is `emit::Assembly`, a push/bind/finish builder whose `code` field
+  the legacy driver writes position-independent bytes into; `finish` is
+  `assemble`. The front end goes with the legacy pipeline.
+  `docs/designs/assembler-as-functor.md`.
 
 ### Emitter
 

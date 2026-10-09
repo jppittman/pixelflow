@@ -297,8 +297,6 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
     }
 
     fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
-        // A root a fold reloads from its slot is read for the whole iteration
-        // that follows it, not for one instruction.
         self.current().loads += 1;
         self.inner.slot_load(code, dst, offset);
     }
@@ -377,8 +375,8 @@ mod tests {
     use super::super::regalloc::{self, Scope};
     use super::super::storage::Slot;
     use super::super::{
-        Assembly, Binding, InstructionPlan, IsaBackend, Label, Labels, Loc, MaskTest, PtrReg, Reg,
-        Reload, ResolvedOp, WritePlan,
+        Assembly, Binding, InstructionPlan, IsaBackend, Label, Loc, MaskTest, PtrReg, Reg, Reload,
+        ResolvedOp, WritePlan,
     };
     use super::{Counting, EmitTraffic, ScopeTraffic};
     use crate::error::CompileError;
@@ -663,7 +661,7 @@ mod tests {
         let mut asm = Assembly::default();
         {
             let mut counting = Counting::new(&mut backend);
-            let pool = Labels::new().mint();
+            let pool = asm.mint();
             counting.anchor(&mut asm, pool);
             counting.finish(&mut asm, pool);
         }

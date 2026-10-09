@@ -5,8 +5,8 @@
 //! kernel at width 1 has two scopes fewer (the main column fold and the sum
 //! inside it) than the same kernel at a width that has a main batch, and
 //! still computes the same samples. A fold the kernel itself writes over
-//! nothing is not compiled either, and lowers to its identity; the last test
-//! fails when `arena_to_schedule`'s arm for it is reverted.
+//! nothing is not compiled either, and lowers to its identity;
+//! `a_fold_the_kernel_writes_over_nothing_is_its_identity` fails when `arena_to_schedule`'s arm for it is reverted.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 

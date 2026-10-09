@@ -741,9 +741,11 @@ pub(in crate::emit) struct AsmProgram<I> {
     pub labels: Labels,
 }
 
-/// How a label field is filled once the label's address is known. The
-/// encoder that wrote the field supplies it. This is today's
-/// `LabelRef::patch` (`emit/mod.rs:310`), kept.
+/// How a label field is filled once the label's address is known: write the
+/// field at `at` (its own offset, not its instruction's) so that it reaches
+/// `target`. The encoder that wrote the field supplies it. This is today's
+/// `LabelRef::patch` (`emit/mod.rs:310`); A8 moved the field's offset out of
+/// the patch and into `Encoding::field`.
 pub(in crate::emit) type Patch = fn(code: &mut [u8], at: usize, target: usize);
 
 /// What an encoder writes into: one instruction's bytes and its label fields.
@@ -759,6 +761,8 @@ impl Encoding<'_> {
 
 pub(in crate::emit) struct Assembled { pub code: Vec<u8>, addresses: Vec<usize> }
 impl Assembled { pub(in crate::emit) fn address(&self, label: Label) -> usize; }
+// A8 lands `assemble` returning the `Vec<u8>` alone. `Assembled` and
+// `falls_through` arrive with their first reader (B-series).
 
 /// Lay out `text` then `data`, encode each instruction with `encode`, and
 /// patch every field.
@@ -1381,7 +1385,7 @@ Every commit in this phase is live in production.
   - The `Reduce` arm (`lower.rs:293`) lowers that fold to `Const(fold.monoid().identity())`.
   - A `SEQ` fold is the exception, and the identity constant is not "never read": a `Seq` that names it keeps it live, and the schedule stores a dead `0.0` in the root scope (measured: one store and one instruction more at `POINT`). A `SEQ` fold over nothing has no def, and a `Seq` with such an operand is its other operand (two of them, no def at all). (P1 moved this to `pack`: the only empty `SEQ` folds that reached lowering were its empty main column fold, so `pack` no longer builds one and lowering has no `SEQ` case.)
 - **Bytes:** row 0 (`glyph_like_w1`) shrinks on all three backends (1016/984/592 to 724/676/400). It is the only row with an empty main column fold. Any other row moving is a bug in this commit.
-- **Tests:** `tests/empty_fold.rs`: through `compile`, a kernel with a surviving `SUM` at width 1 has two scopes fewer than at width 37 (the main column fold and the sum inside it), and its samples are the wide lattice's first column; a lattice with no column is refused (`should_panic`, "degenerate extent"). (An empty-`SUM` test through the optimizer would be vacuous: the e-graph's `EmptyFold`, `fold_rules.rs:447-453`, already rewrites it. P1 added one through `emit::compile`, which does not optimize.)
+- **Tests:** `tests/empty_fold.rs`: through `compile`, a kernel with a surviving `SUM` at width 1 has two scopes fewer than at width 37 (the main column fold and the sum inside it), and its samples, at both widths, equal the closed form; a lattice with no column is refused (`should_panic`, "degenerate extent"). (An empty-`SUM` test through the optimizer would be vacuous: the e-graph's `EmptyFold`, `fold_rules.rs:447-453`, already rewrites it. P1 added one through `emit::compile`, which does not optimize.)
 - **Gate:** V, plus a row-0 re-baseline.
 
 #### A4: `MulAdd` always fuses
@@ -1424,12 +1428,13 @@ Every commit in this phase is live in production.
 
 #### A8: The assembler stands alone, one program per kernel
 
-- **Files:** `emit/asm.rs` (`Item`, `AsmProgram`, `Encoding`, `Assembled`, `assemble`), `emit/mod.rs`, `x86_64.rs`, `aarch64.rs`.
+- **Files:** `emit/asm.rs` (`Item`, `AsmProgram`, `Encoding`, `assemble`), `emit/mod.rs`, `x86_64.rs`, `aarch64.rs`, the ontology's Assembly program and Assembler entries.
 - **Change:**
-  - The legacy `Assembly` becomes a front end that accumulates `asm::Item`s. Raw bytes become `Item::Bytes`, and a `LabelRef` becomes an `Encoding::field`.
-  - `emit_scope` returns its items, and the parent splices items, not bytes.
-  - The pool is the data section.
-  - `asm::assemble` produces the code.
+  - The legacy `Assembly` becomes a front end that accumulates `asm::Item`s. Raw bytes become `Item::Bytes`, and a `LabelRef` becomes an `Encoding::field`. It owns the kernel's `Labels`.
+  - There is one `Assembly` per kernel, threaded through `emit_scope(allocation, backend, &mut asm)` and every scope nested in it. Nothing is spliced, items or bytes. (Deviation from the first draft, "`emit_scope` returns its items": the body no longer has to be emitted before the frame around it, because the frame's size is known before it.)
+  - A `LabelRef` carries `at`, the field's offset in its instruction, and a `Patch` receives the field's own position.
+  - The pool is the data section (`Assembly::pool`: aligned when it holds anything, bound either way).
+  - `asm::assemble` produces the code, as a `Vec<u8>`.
   - `scripts/check_emit_boundary.py` gains the rule "`emit/asm.rs` imports nothing from the crate" (no `crate::`, `super::` or `pixelflow_` path), plus a self-test case that a violation is flagged.
 - **Bytes:** identical.
 - **Gate:** G.

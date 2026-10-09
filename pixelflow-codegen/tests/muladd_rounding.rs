@@ -6,12 +6,11 @@
 //! disagree on inputs like `mul_add(1.0000001, 4097.0, 4097.0)`. The folder
 //! rounds once too, so a node means the same value folded or emitted.
 //!
-//! Every other JIT-vs-reference test in this crate compares within a
-//! tolerance (`spill_pressure`'s 4 ULP, `oracle_reference`'s per-op
-//! `Tolerance`), and one-rounding vs. two is a last-bit difference: it fits
-//! inside all of them. So a backend that emitted a multiply and an add would
-//! keep every one of those tests green. These assert the *bits*, on inputs
-//! chosen so the two forms cannot agree.
+//! A JIT-vs-reference test that compares within a tolerance cannot see this:
+//! one-rounding vs. two is a last-bit difference, and fits inside any ULP
+//! budget. So a backend that emitted a multiply and an add would keep such a
+//! test green. These assert the *bits*, on inputs chosen so the two forms
+//! cannot agree.
 //!
 //! x86-64 only, because it executes: the encoding itself is pinned for all
 //! three backends from any host by `emit::tests::muladd_encoding`.
@@ -59,9 +58,8 @@ fn fused(a: f32, b: f32, c: f32) -> f32 {
 /// `a*b + c` with **two** roundings — a multiply, rounded, then an add.
 ///
 /// `black_box` is load-bearing: under `+fma` LLVM contracts a plain `a*b + c`
-/// into a single `fma` instruction (which is exactly why `eval_scalar`'s
-/// oracle agrees with the fused form on those builds), and this function's
-/// whole job is to be the answer that contraction destroys.
+/// into a single `fma` instruction, and this function's whole job is to be the
+/// answer that contraction destroys.
 fn decomposed(a: f32, b: f32, c: f32) -> f32 {
     core::hint::black_box(a * b) + c
 }
@@ -127,16 +125,8 @@ fn an_unspilled_muladd_rounds_once() {
 
     let result =
         compile(&a, root, pixelflow_ir::LatticeShape::POINT).expect("compile MulAdd(X, Y, U)");
-    // Not asserted: `result.spill_count`. Every kernel this file has compiled
-    // at `LatticeShape::POINT` reports one nominal spill, independent of
-    // content — a bare `Const(1.0)` and `X + Y` report the same
-    // `spill_count == 1, spill_bytes == 80` this scenario does, with zero
-    // corresponding store or load in `result.traffic`'s per-scope counts, so
-    // it is not a register genuinely forced to memory. That looks like the
-    // lattice's own row/col/lane folds (`pixelflow_ir::passes::lattice::collapse`
-    // wraps every kernel in them, even a one-point one) costing a nominal
-    // slot the emitted code never touches, not register pressure from this
-    // scenario's operands — see this file's final report for the finding.
+    // `result.spill_count` is not asserted: it counts the frame's slots, and is
+    // nonzero for every kernel at a one-point lattice.
     // Only the fused, single-rounding form produces `fused(A, B, C)`.
     let got = eval_point(&result.code, A, B, &[C]);
     assert_bits("fused MulAdd", got, fused(A, B, C));
@@ -205,9 +195,9 @@ fn a_spilled_muladd_rounds_once_on_every_target() {
             .fold(terms[0], |acc, &t| a.push_binary(OpKind::Add, acc, t))
     }
 
-    /// The wall and the multiplicands, as one arena, rooted at the `MulAdd`
-    /// or, for the baseline, at the addend alone.
-    fn scenario(root_is_muladd: bool) -> (ExprArena, ExprId) {
+    /// The wall and the multiplicands, as one arena: the `MulAdd`, and the
+    /// addend alone as the baseline root.
+    fn scenario() -> (ExprArena, ExprId, ExprId) {
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let y = a.push_var(1);
@@ -231,18 +221,14 @@ fn a_spilled_muladd_rounds_once_on_every_target() {
         let backward = chain(&mut a, &reversed);
         let addend = a.push_binary(OpKind::Add, z, forward);
         let addend = a.push_binary(OpKind::Add, addend, backward);
-        let root = match root_is_muladd {
-            true => a.push_ternary(OpKind::MulAdd, ma, mb, addend),
-            false => addend,
-        };
-        (a, root)
+        let muladd = a.push_ternary(OpKind::MulAdd, ma, mb, addend);
+        (a, muladd, addend)
     }
 
     let shape = pixelflow_ir::LatticeShape::POINT;
-    let (a, root) = scenario(true);
-    let result = compile(&a, root, shape).expect("compile spilled MulAdd");
-    let (wall_only, wall_root) = scenario(false);
-    let wall = compile(&wall_only, wall_root, shape).expect("compile the wall alone");
+    let (a, muladd, addend) = scenario();
+    let result = compile(&a, muladd, shape).expect("compile spilled MulAdd");
+    let wall = compile(&a, addend, shape).expect("compile the wall alone");
     assert!(
         result.traffic.dynamic_memory_ops()
             >= wall.traffic.dynamic_memory_ops() + MULTIPLICAND_TRAFFIC,

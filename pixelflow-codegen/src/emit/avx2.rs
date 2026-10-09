@@ -785,7 +785,7 @@ mod tests {
             zs: [f32; 8],
         ) -> [f32; 8] {
             let mut asm = crate::emit::Assembly::default();
-            let pool_label = crate::emit::Labels::new().mint();
+            let pool_label = asm.mint();
             x86_64::anchor(&mut asm, pool_label);
             asm.code.extend_from_slice(body);
             asm.code.push(RET);
