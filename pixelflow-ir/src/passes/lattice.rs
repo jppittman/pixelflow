@@ -175,16 +175,16 @@ fn reachable_taken_binders(arena: &ExprArena, root: ExprId) -> [bool; Binder::CO
     taken
 }
 
-/// Strip-mine [`collapse`]'s column fold by `lanes`: a main fold stepping by
-/// `lanes` over `[0, w−r)` with a full lane fold `[0, lanes)` inside it, then
-/// — only when `r = w mod lanes` is nonzero — the remainder
-/// `[w−r, w−r+1)` × `[0, r)`, sequenced after the main fold under the row
-/// fold with [`OpKind::Seq`]. The `Write` [`collapse`] built is the same
+/// Strip-mine [`collapse`]'s column fold by `lanes`: — only when `w − r` is
+/// nonzero — a main fold stepping by `lanes` over `[0, w−r)` with a full lane
+/// fold `[0, lanes)` inside it, then — only when `r = w mod lanes` is nonzero
+/// — the remainder `[w−r, w−r+1)` × `[0, r)`, sequenced after the main fold
+/// under the row fold with [`OpKind::Seq`]. The `Write` [`collapse`] built is the same
 /// `ExprId` in every arm: only the two inner folds' ranges move, never the
 /// body they wrap (module doc — the chunking law for `for_`).
 ///
-/// When `w < lanes` this still holds: the main fold becomes the empty strided
-/// fold `[0,0)`, and the whole column is the remainder. No special case.
+/// When `w < lanes` there is no full batch, so there is no main fold: the whole
+/// column is the remainder. A fold over nothing is not built to be skipped.
 ///
 /// # Panics
 ///
@@ -193,7 +193,7 @@ fn reachable_taken_binders(arena: &ExprArena, root: ExprId) -> [bool; Binder::CO
 ///   `[0,1)`) wrapping a `Write` whose `row`/`col`/`lane` equal the three
 ///   folds' binders, in that order. Naming a pipeline-order bug: `pack` must
 ///   run directly on `collapse`'s own output.
-/// - If `lanes == 0`.
+/// - If `lanes == 0`, or the column fold is empty.
 pub fn pack(arena: &mut ExprArena, root: ExprId, lanes: u32) -> ExprId {
     assert!(lanes != 0, "pack: lanes must be nonzero");
 
@@ -206,19 +206,21 @@ pub fn pack(arena: &mut ExprArena, root: ExprId, lanes: u32) -> ExprId {
     let h = row_fold.range().end;
     let r = w % lanes;
 
-    let lane_main = arena.push_reduce(Fold::new(Monoid::SEQ, lane, 0..lanes), write);
-    let col_main = arena.push_reduce(
-        Fold::strided(Monoid::SEQ, col, 0..(w - r), lanes),
-        lane_main,
-    );
-
-    let body = if r > 0 {
+    let main = (w > r).then(|| {
+        let lane_main = arena.push_reduce(Fold::new(Monoid::SEQ, lane, 0..lanes), write);
+        arena.push_reduce(
+            Fold::strided(Monoid::SEQ, col, 0..(w - r), lanes),
+            lane_main,
+        )
+    });
+    let remainder = (r > 0).then(|| {
         let lane_rem = arena.push_reduce(Fold::new(Monoid::SEQ, lane, 0..r), write);
-        let col_rem =
-            arena.push_reduce(Fold::new(Monoid::SEQ, col, (w - r)..(w - r + 1)), lane_rem);
-        arena.push_binary(OpKind::Seq, col_main, col_rem)
-    } else {
-        col_main
+        arena.push_reduce(Fold::new(Monoid::SEQ, col, (w - r)..(w - r + 1)), lane_rem)
+    });
+    let body = match (main, remainder) {
+        (Some(main), Some(remainder)) => arena.push_binary(OpKind::Seq, main, remainder),
+        (Some(only), None) | (None, Some(only)) => only,
+        (None, None) => panic!("pack: the lattice has no column"),
     };
 
     arena.push_reduce(Fold::new(Monoid::SEQ, row, 0..h), body)
@@ -719,9 +721,8 @@ mod tests {
         assert_eq!(v[packed.0 as usize], Variance::CONST);
     }
 
-    /// `w = 3`, `L = 4`: a row narrower than one batch. The main fold is the
-    /// empty strided fold `[0,0)` — no special case — and the whole row is
-    /// the remainder, `[0,1) × [0,3)`.
+    /// `w = 3`, `L = 4`: a row narrower than one batch. There is no main fold
+    /// to build, and the whole row is the remainder, `[0,1) × [0,3)`.
     #[test]
     fn pack_of_a_row_narrower_than_a_batch_is_all_remainder() {
         let k = Kernel::x().add(&Kernel::y());
@@ -739,23 +740,12 @@ mod tests {
             panic!("packed root must be the row fold");
         };
 
-        let ExprNode::Binary(OpKind::Seq, main, rem) = arena.node(row_body) else {
-            panic!("even an all-remainder row sequences main then remainder");
-        };
-
-        let ExprNode::Reduce { fold: main_col, .. } = arena.node(main) else {
-            panic!("main must be a Reduce");
-        };
-        assert!(main_col.is_empty());
-        assert_eq!(main_col.range(), 0..0);
-        assert_eq!(main_col.stride(), 4);
-
         let ExprNode::Reduce {
             fold: rem_col,
             body: rem_lane_id,
-        } = arena.node(rem)
+        } = arena.node(row_body)
         else {
-            panic!("rem must be a Reduce");
+            panic!("the row fold's body must be the remainder, with no main fold");
         };
         assert_eq!(rem_col.range(), 0..1);
         let ExprNode::Reduce { fold: rem_lane, .. } = arena.node(rem_lane_id) else {

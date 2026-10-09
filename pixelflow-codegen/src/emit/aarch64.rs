@@ -374,8 +374,8 @@ fn try_encode_fmov_imm8(val: f32) -> Option<u8> {
 // Constant Pool Support
 // =============================================================================
 
-// The pool's name and alignment are every backend's, not this one's: x86
-// anchors `r8` to a pool of the same name the same way `X17` is anchored here.
+// The pool's alignment is every backend's, not this one's; its label is minted
+// once by `compile_via_backend` and handed to `anchor` and `finish`.
 use super::CONST_POOL_ALIGN;
 
 /// Returns true if the given f32 needs a constant pool entry (not zero, not FMOV-encodable).

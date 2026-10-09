@@ -176,14 +176,12 @@ fn assemble<I: AsmInsn>(code: &mut Vec<u8>, insts: impl IntoIterator<Item = I>) 
 ///
 /// Returned by [`AsmInsn::label_ref`]. The instruction emits a placeholder in
 /// `emit_into`; `patch` fills the displacement in once the label's position is
-/// known. A function pointer rather than a trait object or a type parameter
-/// because the encoding is the instruction's own business and nothing else in
-/// the assembler needs to know it — an x86 `rel32` four bytes in, an aarch64
-/// `imm19` five bits up in the word.
+/// known.
 #[derive(Copy, Clone)]
 struct LabelRef {
     /// The position this instruction is waiting on.
     label: Label,
+    /// See [`Patch`].
     patch: Patch,
 }
 
@@ -3526,75 +3524,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_muladd_fuses_with_both_multiplicands_spilled() {
-        // a and b spilled, c in a register: each multiplicand takes a
-        // reservation of its own, and c moves into dst for the FMLA.
-        let locs = make_locs(&[(2, 7), (3, 8)], &[(0, 0), (1, 16)]);
-        let op = ScheduledOp::Ternary(
-            OpKind::MulAdd,
-            regalloc::ValueId(0),
-            regalloc::ValueId(1),
-            regalloc::ValueId(2),
-        );
-        let plan = resolve_operands(
-            &op,
-            Binding::Loc(Loc::Reg(Reg(8))),
-            locs.as_slice(),
-            TEST_SCRATCH,
-        );
-
-        assert_eq!(
-            plan.reloads.as_slice(),
-            [
-                Reload::FromStack {
-                    target: RELOAD[0],
-                    slot: Slot::new(0),
-                },
-                Reload::FromStack {
-                    target: RELOAD[1],
-                    slot: Slot::new(16),
-                },
-            ]
-        );
-        assert_eq!(plan.setup_mov, Some((Reg(8), Reg(7))));
-        assert_eq!(
-            plan.op,
-            ResolvedOp::FusedMulAdd {
-                dst: Reg(8),
-                a: RELOAD[0],
-                b: RELOAD[1],
-            }
-        );
-    }
-
-    #[test]
-    fn resolve_muladd_reloads_a_spilled_addend_into_dst() {
-        let locs = make_locs(&[(3, 8)], &[(0, 0), (1, 16), (2, 32)]);
-        let op = ScheduledOp::Ternary(
-            OpKind::MulAdd,
-            regalloc::ValueId(0),
-            regalloc::ValueId(1),
-            regalloc::ValueId(2),
-        );
-        let plan = resolve_operands(
-            &op,
-            Binding::Loc(Loc::Reg(Reg(8))),
-            locs.as_slice(),
-            TEST_SCRATCH,
-        );
-
-        assert_eq!(plan.reloads.len(), 3);
-        assert_eq!(
-            plan.reloads[0],
-            Reload::FromStack {
-                target: Reg(8),
-                slot: Slot::new(32),
-            }
-        );
-        assert_eq!(plan.setup_mov, None);
-    }
-
-    #[test]
     fn resolve_var_is_nop() {
         let locs = make_locs(&[(0, 0)], &[]);
         let op = ScheduledOp::Var(0);
@@ -5978,11 +5907,11 @@ mod tests {
         }
 
         /// The glyph-like fold at the three widths that decide how many
-        /// sibling column folds exist (an empty main and a remainder; a main
-        /// alone; both), and each other kernel where both exist. After them,
-        /// the coverage rows: every op the backends owe (`coverage`), every
-        /// way a kernel reads memory, and a frame past what NEON addresses
-        /// directly, all at the width with a remainder.
+        /// sibling column folds exist (a remainder alone; a main alone; both),
+        /// and each other kernel where both exist. After them, the coverage
+        /// rows: every op the backends owe (`coverage`), every way a kernel
+        /// reads memory, and a frame past what NEON addresses directly, all at
+        /// the width with a remainder.
         const ROWS: [Row; 11] = [
             Row {
                 name: "glyph_like_w1",

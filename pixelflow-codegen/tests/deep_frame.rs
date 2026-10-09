@@ -22,6 +22,9 @@ const REACH: u32 = 64 * 1024;
 const WIDTH: usize = 11;
 const ROWS: usize = 3;
 const ORIGIN: [f32; 2] = [2.0, 5.0];
+/// A balanced `f32` sum of this many positive terms errs about `1e-6`
+/// relative, and one misaddressed far slot moves it by `4e-4`.
+const TOLERANCE: f64 = 1e-5;
 
 /// `(Σ tₖ)²`, `tₖ = x·c_{k mod s} + y·d_{k div s}`, in `f64`.
 fn reference(terms: usize, x: f32, y: f32) -> f64 {
@@ -59,7 +62,7 @@ fn a_spill_area_past_64_kib_holds_the_kernels_values() {
             let got = f64::from(out[row * WIDTH + col]);
             let want = reference(rows::DEEP_FRAME_TERMS, x, y);
             assert!(
-                (got - want).abs() <= 1e-3 * want.abs(),
+                (got - want).abs() <= TOLERANCE * want.abs(),
                 "row {row} col {col} (x={x}, y={y}): got {got}, want {want}"
             );
         }

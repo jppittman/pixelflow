@@ -91,10 +91,10 @@ pub struct Linked {
 /// # Panics
 ///
 /// Panics if the arena — as handed in, or as saturation leaves it — names a
-/// retired coordinate axis (`Var(2)`/`Var(3)`, the old Z and W). The
-/// assertion itself lives one layer down, in
-/// [`emit::compile`], because that is the boundary
-/// every route to machine code passes through and this is only one of them.
+/// retired coordinate axis (`Var(2)`/`Var(3)`, the old Z and W), or if `shape`
+/// has a zero extent, which has no sample to compute. The assertions live one
+/// layer down, in [`emit::compile`], because that is the boundary every route
+/// to machine code passes through and this is only one of them.
 /// Compile a [`Kernel`](pixelflow_ir::Kernel) for a lattice of the given `shape`.
 pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Linked, CompileError> {
     let (arena, root) = kernel.parts();

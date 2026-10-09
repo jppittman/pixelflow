@@ -2783,11 +2783,10 @@ impl Pass {
     /// definition wrote — into `dst` for the operand the encoding consumes
     /// there, into a reserved reload register otherwise. That is the whole
     /// of what the encoders tolerate: no encoder reads every source before
-    /// writing `dst` (`setup_mov` ahead of an `If` or FMA on every ISA),
-    /// so a *resident* operand in `dst`'s register would be corrupted. A displaced one is
-    /// not resident, which is why the split is recorded at this index and
-    /// not the next.
-    /// [`EvictionRank`] prices it so it stays a last resort.
+    /// writing `dst` (`setup_mov` ahead of an `If` or FMA on every ISA), so a
+    /// *resident* operand in `dst`'s register would be corrupted. A displaced
+    /// one is not resident, which is why the split is recorded at this index
+    /// and not the next. [`EvictionRank`] prices it so it stays a last resort.
     fn open(&self, taken: &Reservations) -> Vec<usize> {
         (0..self.owner.len()).filter(|k| !taken.holds(*k)).collect()
     }
