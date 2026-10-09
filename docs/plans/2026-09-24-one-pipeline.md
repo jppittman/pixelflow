@@ -9,18 +9,24 @@
   uniforms, this plan's tables backed by uniforms are superseded too: §1.3,
   A8, CL8 and Q2, and the fold over pieces they fed. The frame (§1.6, Q3) is
   superseded: a cell is one call.
-- **Per-`N` programs and uniform families are superseded** (2026-10-01).
+- **Per-`N` programs and uniform families are superseded** (2026-10-01;
+  per-`N` is the ruling again, 2026-10-09, last bullet below).
   JP's Q1 ruling is one program per font per zoom level, and on 2026-10-01:
   *"No arrays at all."* So this plan's "One program per control-point
   count" (below) and Q5's uniform families are superseded.
   - A font is one program per zoom level: each piece is an instance of one
     entry over its own ten scalar uniforms, a glyph is its pieces summed
     under its box, and the font is its glyphs under an `if id < k` tree
-    (the-language-is-kernel §1.6–§1.8).
+    (the-language-is-kernel §1.6–§1.8). The id tree is superseded
+    2026-10-09, last bullet below.
   - **I:** the measured `U_band` is one glyph of it.
   - An earlier revision of this note said a glyph's program is the kernel
     for its `N`. The language plan's metadata says where that came from
     (`75b7e8f3`).
+  - **2026-10-09:** per-`N` is the ruling again. JP: a font at a zoom level
+    is one program per piece count, exact N and unbucketed, over scalar
+    uniforms, with no families and no arrays (the-language-is-kernel §1.7).
+    The families' supersession above stands.
 - **The closing phase is superseded** (2026-09-29): `closing_R`, the
   integration family `saturate_bounded` ran to a fixpoint before the rest
   of the rule set, is deleted with the integral it closed, and with it
@@ -118,6 +124,8 @@ at `8b7b75a`. **I** marks an inference.
   for that number of control points"). *Superseded* (2026-10-01): this
   reading predates JP's Q1 ruling, one program per font per zoom level.
   There is no per-`N` program and no bucket (the-language-is-kernel §1.7).
+  *Ruled again* (2026-10-09): exact N, unbucketed, over scalar uniforms
+  with no families (the-language-is-kernel §1.7).
 - **A bundled glyph's control points are uniforms** (rodata at build time),
   not constants ("everything else is a uniform").
 - **The build-time entry is the macro.** An earlier revision said a build

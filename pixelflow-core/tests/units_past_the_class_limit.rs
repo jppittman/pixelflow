@@ -8,7 +8,9 @@
 //! extraction. This builds a program of that kind — units over fresh
 //! uniforms, under an `if id < k` tree, more classes inlined than the limit —
 //! and pins that it compiles, that every saturation it pays is a unit's or the
-//! tree's and runs under its own cap, and that every id draws its unit.
+//! tree's and runs under its own cap, and that every id draws its unit. It is
+//! a program of units under an id tree, not the font: the font is one program
+//! per piece count (that plan's §1.7).
 //!
 //! Its own binary, because it points the process-global telemetry sink at a
 //! file and reads every record the process writes.
@@ -70,7 +72,7 @@ fn scale_of(index: usize) -> f32 {
     index as f32 + 0.25
 }
 
-/// `units` under a balanced tree of `if id < k`, the font's id tree.
+/// `units` under a balanced tree of `if id < k`: an id tree over units.
 fn id_tree(id: &Kernel, units: &[Kernel], first: usize) -> Kernel {
     if units.len() == 1 {
         return units[0].clone();

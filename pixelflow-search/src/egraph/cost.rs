@@ -335,8 +335,8 @@ impl CostModel {
             // fold body it does not read, say — which this table then decides
             // by the ops around the unit rather than by the unit's own cost.
             // Law U (`crate::runtime`) holds regardless; the outer term's
-            // choice among such forms is not cost-optimal, and a font's outer
-            // term (an `if id < k` tree) offers none.
+            // choice among such forms is not cost-optimal, and the outer term
+            // of a program of units (an `if id < k` tree) offers none.
             ENode::Var(_)
             | ENode::Const(_)
             | ENode::Buffer(_)

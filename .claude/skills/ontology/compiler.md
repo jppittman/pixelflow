@@ -67,14 +67,20 @@
   `⟦P(k, s, t)⟧ : f32^m → (L_s → f32)`. Lowering produces a **template**,
   "a replay of `ExprArena` pushes", and instantiating it with structural
   values gives a program. An **instance** is one instantiation, with
-  identity by instance. "A font is one program per zoom level."
-- **Is not:** per glyph (95), per bucket (6), or per exact N. JP's Q1 ruling
-  (2026-09-25, restated 2026-10-01) supersedes all three. Not chosen by the
-  host. Not unrolling: "Composing instances is the host walking data."
+  identity by instance. A font at a zoom level is one program per piece
+  count: exact N, unbucketed (JP, 2026-10-09; see terminal.md, "Font
+  programs").
+- **Is not:** per glyph (95), per bucket (6; JP: unbucketed), or one program
+  holding every glyph under an `if id < k` tree (superseded 2026-10-09). Not
+  unrolling: "Composing instances is the host walking data."
 - **Follows:** structural parameters and the shape key the program, and
-  uniforms bind through its block. Sharing one `id` instance across a tree
-  walk is a convention of the host walk, not a type (O3). Before extracting
-  in a template, give template inputs a meaning of their own (B6).
+  uniforms bind through its block. The host chooses a program by its
+  structural parameters, for the font the glyph's piece count, and then
+  writes the glyph's block into it. Sharing one `id` instance across a tree
+  walk was a convention of the host walk, not a type (O3); superseded
+  2026-10-09, since no program holds more than one glyph (terminal.md, "Font
+  programs"). Before extracting in a template, give template inputs a
+  meaning of their own (B6).
 - **Lives:** the-language-is-kernel §1.1, §1.4, §1.7–§1.8, D9. Templates are
   `Staged` and the `Param` holes of `pixelflow-compiler/src/{emit,lower}.rs`.
 
