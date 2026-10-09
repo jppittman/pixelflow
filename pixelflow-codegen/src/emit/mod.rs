@@ -386,6 +386,9 @@ impl Class for Flags {
 trait Stage {
     /// A register the instruction defines.
     type Write<C: Class>;
+    /// A register the instruction defines before it is done reading, so no
+    /// operand may share it.
+    type Early<C: Class>;
     /// A register the instruction reads.
     type Read<C: Class>;
     /// A register the instruction reads and overwrites in place.
@@ -403,6 +406,7 @@ enum Physical {}
 
 impl Stage for Physical {
     type Write<C: Class> = C::Physical;
+    type Early<C: Class> = C::Physical;
     type Read<C: Class> = C::Physical;
     type Tie<C: Class> = C::Physical;
     type Target = Label;

@@ -332,6 +332,16 @@ pub(super) enum Gp<S: Stage> {
         flags: S::Write<Flags>,
         src: S::Read<Integer>,
     },
+    /// `cmp src8, imm8`: ZF iff the low byte is `imm`. Unlike `cmp src32,
+    /// imm8` (sign-extending `83 /7`), it compares the raw byte, which is what
+    /// an 8-lane all-true check (`movmskps`'s `0xFF`) needs: the extension
+    /// would compare against `0xFFFFFFFF`, which a zero-extended mask can
+    /// never equal.
+    CmpByte {
+        flags: S::Write<Flags>,
+        src: S::Read<Integer>,
+        imm: u8,
+    },
     /// `jcc rel32`.
     Jcc {
         cond: Cond,
@@ -458,6 +468,25 @@ impl Gp<Physical> {
                 }
                 inst.push(0x85);
                 inst.push(modrm_rr(src.0, src));
+            }
+            Gp::CmpByte {
+                flags: (),
+                src,
+                imm,
+            } => {
+                match src.0 {
+                    // The accumulator has a short form.
+                    0 => inst.push(0x3C),
+                    n => {
+                        // Without a REX prefix 4-7 name `ah`..`bh`, not `spl`..`dil`.
+                        if n >= 4 {
+                            inst.push(0x40 | ((n >> 3) & 1));
+                        }
+                        inst.push(0x80);
+                        inst.push(modrm_rr(7, src));
+                    }
+                }
+                inst.push(imm);
             }
             Gp::Jcc {
                 cond, flags: (), ..
@@ -883,6 +912,19 @@ mod gpr_tests {
             [0x45, 0x85, 0xC9],
             "REX.R and REX.B"
         );
+        // 3C ib — CMP AL, imm8; 80 /7 ib — CMP r/m8, imm8 (checked against
+        // `objdump -M intel`, binutils 2.42).
+        let cmp = |src| {
+            gp(Gp::CmpByte {
+                flags: (),
+                src,
+                imm: 0xFF,
+            })
+        };
+        assert_eq!(cmp(RAX), [0x3C, 0xFF], "the accumulator's short form");
+        assert_eq!(cmp(RCX), [0x80, 0xF9, 0xFF]);
+        assert_eq!(cmp(RSI), [0x40, 0x80, 0xFE, 0xFF], "REX names sil, not dh");
+        assert_eq!(cmp(R9), [0x41, 0x80, 0xF9, 0xFF], "REX.B");
         // REX.W B8+rd io — MOV r64, imm64
         assert_eq!(
             gp(Gp::Movabs {

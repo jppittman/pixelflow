@@ -25,9 +25,9 @@
 //! AVX-512 tier resets `k1`.
 
 use super::x86_64;
-use super::x86_64::{Disp, Mem, NoDisp, frame_slot};
+use super::x86_64::{Disp, Imm8, Imm32, Mem, NoDisp, frame_slot};
 use super::{
-    AsmInsn, AsmProgram, EncodedInst, Gpr, Integer, Physical, PtrReg, Reg, Stage, Vector, assemble,
+    AsmInsn, AsmProgram, EncodedInst, Gpr, Integer, Physical, Pointer, PtrReg, Reg, Stage, Vector,
     unimplemented_op,
 };
 use crate::error::CompileError;
@@ -386,6 +386,65 @@ enum Inst<S: Stage> {
         dst: S::Write<Vector>,
         src: S::Read<Integer>,
     },
+    /// `vmovups dst, [src]`: a slot.
+    Load {
+        dst: S::Write<Vector>,
+        src: Mem<S, Imm32>,
+    },
+    /// `vmovups [dst], src`: a slot.
+    Store {
+        dst: Mem<S, Imm32>,
+        src: S::Read<Vector>,
+    },
+    /// `vmovups [dst], src` with no displacement: a whole batch to the
+    /// address the store's arithmetic computed.
+    StoreBatch {
+        dst: Mem<S, NoDisp>,
+        src: S::Read<Vector>,
+    },
+    /// `vbroadcastss dst, [src]`: one `f32`, a pool entry or a uniform, into
+    /// every lane.
+    Broadcast {
+        dst: S::Write<Vector>,
+        src: Mem<S, Imm32>,
+    },
+    /// `vbroadcastss dst, [base + index*4]`: one element of a plane.
+    BroadcastIndexed {
+        dst: S::Write<Vector>,
+        base: S::Read<Pointer>,
+        index: S::Read<Integer>,
+    },
+    /// `vgatherdps dst, [base + index*4], mask`: one `f32` per lane, for
+    /// every lane whose `mask` sign bit is set. The instruction clears the
+    /// mask as it completes lanes, and `#UD`s unless `dst`, `index` and `mask`
+    /// are three registers.
+    Gather {
+        dst: S::Early<Vector>,
+        base: S::Read<Pointer>,
+        index: S::Read<Vector>,
+        mask: S::Tie<Vector>,
+    },
+    /// `vmovmskps dst, src`: the lane sign bits, in the low bits of `dst`.
+    MoveMask {
+        dst: S::Write<Integer>,
+        src: S::Read<Vector>,
+    },
+    /// `vcvttss2si dst, [src]`: the first word of a slot.
+    CvttMem {
+        dst: S::Write<Integer>,
+        src: Mem<S, Imm32>,
+    },
+    /// `vextractf128 dst, src, 1`: the high 128 bits.
+    ExtractHigh {
+        dst: S::Write<Vector>,
+        src: S::Read<Vector>,
+    },
+    /// `vextractps [dst], src, lane`: one lane of the low half, stored.
+    ExtractLane {
+        dst: Mem<S, Imm8>,
+        src: S::Read<Vector>,
+        lane: u8,
+    },
 }
 
 impl Inst<Physical> {
@@ -413,6 +472,38 @@ impl Inst<Physical> {
             Inst::Mov { dst, src } => Vex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0),
             Inst::Cvtt { dst, src } => Vex::m0f_f3(0x2C).w1().rrr(dst.0, UNUSED_VVVV, src.0),
             Inst::Movq { dst, src } => Vex::m0f_66(0x6E).w1().xmm().rrr(dst.0, UNUSED_VVVV, src.0),
+            Inst::Load { dst, src } => Vex::m0f(0x10).rm(dst.0, src),
+            Inst::Store { dst, src } => Vex::m0f(0x11).rm(src.0, dst),
+            Inst::StoreBatch { dst, src } => Vex::m0f(0x11).rm(src.0, dst),
+            Inst::Broadcast { dst, src } => Vex::m0f38_66(0x18).rm(dst.0, src),
+            Inst::BroadcastIndexed { dst, base, index } => {
+                Vex::m0f38_66(0x18).rm_scaled4(dst.0, base.as_gpr(), index)
+            }
+            Inst::Gather {
+                dst,
+                base,
+                index,
+                mask,
+            } => {
+                debug_assert!(
+                    dst != index && dst != mask && index != mask,
+                    "vgatherdps: dst, index and mask must be three registers"
+                );
+                // `base` is never `rbp`/`r13` (the pointer pool is `r9`-`r11`),
+                // so the SIB's no-base encoding is unreachable.
+                Vex::m0f38_66(0x92).vsib_scaled4(dst.0, mask.0, base.as_gpr(), index)
+            }
+            Inst::MoveMask { dst, src } => Vex::m0f(0x50).rrr(dst.0, UNUSED_VVVV, src.0),
+            Inst::CvttMem { dst, src } => Vex::m0f_f3(0x2C).w1().rm(dst.0, src),
+            // The destination is the `rm` operand here, the reverse of the
+            // usual direction.
+            Inst::ExtractHigh { dst, src } => {
+                Vex::m0f3a_66(0x19).imm(1).rrr(src.0, UNUSED_VVVV, dst.0)
+            }
+            Inst::ExtractLane { dst, src, lane } => {
+                debug_assert!(lane < 4, "vextractps reads the low 128 bits");
+                Vex::m0f3a_66(0x17).xmm().imm(lane).rm(src.0, dst)
+            }
         }
     }
 }
@@ -434,15 +525,6 @@ fn cmp_pred(op: OpKind) -> Option<Pred> {
         OpKind::Ge => Pred::Ge,
         _ => return None,
     })
-}
-
-// --- lane extract from 256-bit to 128-bit (0F3A, 66 prefix, W0) ---
-/// `vextractf128 xmmDST, ymmSRC, imm8[0]` — extract the low (`imm=0`) or high
-/// (`imm=1`) 128 bits of `src` into `dst`.
-fn vextractf128(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
-    // VEX.256.66.0F3A.W0 19 /r ib — note dst is the ModRM.rm operand here
-    // (the reverse of the usual direction: register source, register/mem dest).
-    assemble(c, [Vex::m0f3a_66(0x19).imm(imm).rrr(s, UNUSED_VVVV, d)]);
 }
 
 /// `vmovaps ymmDST, ymmSRC` — register copy.
@@ -477,7 +559,11 @@ fn emit_const(
         .emit_into(code);
         return Ok(());
     }
-    assemble(code, [Vex::m0f38_66(0x18).rm(dst.0, pool.operand(bits)?)]);
+    Inst::Broadcast {
+        dst,
+        src: pool.operand(bits)?,
+    }
+    .emit_into(code);
     Ok(())
 }
 
@@ -496,7 +582,7 @@ fn emit_uniform_load(
     offset: u64,
 ) -> Result<(), CompileError> {
     let element = x86_64::block_element(base, offset)?;
-    AsmProgram::from([Vex::m0f38_66(0x18).rm(dst.0, element)]).assemble(code);
+    Inst::Broadcast { dst, src: element }.emit_into(code);
     Ok(())
 }
 
@@ -511,8 +597,12 @@ fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64::Bro
         src: idx,
     }
     .emit_into(code);
-    AsmProgram::from([Vex::m0f38_66(0x18).rm_scaled4(dst.0, gprs.base.as_gpr(), gprs.index)])
-        .assemble(code);
+    Inst::BroadcastIndexed {
+        dst,
+        base: gprs.base,
+        index: gprs.index,
+    }
+    .emit_into(code);
 }
 
 // =============================================================================
@@ -641,20 +731,6 @@ fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
 // The store, and the iota
 // =============================================================================
 
-/// `vcvttss2si r64, m32` — the same, reading the first word of a slot.
-#[must_use]
-fn vcvttss2si_mem<D: Disp>(dst: Gpr, addr: Mem<Physical, D>) -> EncodedInst {
-    Vex::m0f_f3(0x2C).w1().rm(dst.0, addr)
-}
-
-/// `vextractps m32, xmm, lane` — `VEX.128.66.0F3A.WIG 17 /r ib`: one lane of
-/// the low half, stored.
-#[must_use]
-fn vextractps_store<D: Disp>(addr: Mem<Physical, D>, src: Reg, lane: u8) -> EncodedInst {
-    debug_assert!(lane < 4, "vextractps reads the low 128 bits");
-    Vex::m0f3a_66(0x17).xmm().imm(lane).rm(src.0, addr)
-}
-
 /// The bytes `0..8`, little end first: what one `movabs` carries in for
 /// `vpmovzxbd` to widen into the iota.
 const IOTA_BYTES: u64 = 0x0706_0504_0302_0100;
@@ -693,20 +769,6 @@ fn emit_if(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg, tmp: Optio
     .assemble(code);
 }
 
-/// `vmovmskps eax, ymmSRC` — gather the 8 lane sign bits into `eax[7:0]`.
-fn emit_movmskps_eax(code: &mut Vec<u8>, src: Reg) {
-    assemble(code, [Vex::m0f(0x50).rrr(0, UNUSED_VVVV, src.0)]);
-}
-
-/// `cmp al, imm8` — unlike `cmp eax, imm8` (sign-extending `0x83`), this
-/// compares the raw byte pattern, which is what an 8-lane all-true check
-/// (`eax == 0xFF`) needs (`0x83`'s sign-extension would compare against
-/// `0xFFFFFFFF`, which `vmovmskps`'s zero-extended result can never equal).
-fn emit_cmp_al_imm8(code: &mut Vec<u8>, imm: u8) {
-    code.push(0x3C);
-    code.push(imm);
-}
-
 /// Fused multiply-add: `dst` already holds `c`; computes `dst = a*b + dst`.
 ///
 /// Always real hardware FMA: the AVX2 tier requires FMA3 (`crate::isa`
@@ -743,21 +805,6 @@ struct GatherTemps {
     mask: Reg,
 }
 
-/// `vgatherdps ymmDST, [baseGPR + ymmINDEX*4], ymmMASK` —
-/// `VEX.256.66.0F38.W0 92 /r /vsib`, scale 4: one f32 per lane at
-/// `base + index_lane*4`, for every lane whose `mask` sign bit is set. The
-/// caller has truncated the indices and set the mask; `base` is never
-/// `rbp`/`r13` (the pointer pool is `r9`–`r11`, so the SIB's no-base
-/// encoding is unreachable).
-#[must_use]
-fn gather(dst: Reg, base: PtrReg, index: Reg, mask: Reg) -> EncodedInst {
-    debug_assert!(
-        dst != index && dst != mask && index != mask,
-        "vgatherdps: dst, index and mask must be three registers"
-    );
-    Vex::m0f38_66(0x92).vsib_scaled4(dst.0, mask.0, base.as_gpr(), index)
-}
-
 /// `dst = base[idx_lane]` for 8 lanes — the whole gather sequence. `idx`
 /// holds the *float* indices (the lowering already clamped them in range);
 /// `base` the buffer's address. `dst` may alias `idx`: the indices are
@@ -772,10 +819,14 @@ fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx: Reg, base: PtrReg, t: GatherTe
             op: Lanewise::ToInt,
             dst: t.idx_int,
             src: idx,
-        }
-        .encode(),
-        Inst::Ones { dst: t.mask }.encode(),
-        gather(dst, base, t.idx_int, t.mask),
+        },
+        Inst::Ones { dst: t.mask },
+        Inst::Gather {
+            dst,
+            base,
+            index: t.idx_int,
+            mask: t.mask,
+        },
     ])
     .assemble(code);
 }
@@ -1029,7 +1080,11 @@ mod tests {
             let ys = [9.0, 9.0, 9.0, 9.0, -9.0, -9.0, -9.0, -9.0];
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Lt, X, X, Y);
-            emit_movmskps_eax(&mut c, X);
+            Inst::MoveMask {
+                dst: x86_64::gpr::RAX,
+                src: X,
+            }
+            .emit_into(&mut c);
             // SAFETY: the host runs AVX2, checked at the top of this test.
             let got = unsafe { run_mask(&c, xs, ys) };
             assert_eq!(got, 0b0000_1111, "lt mask, lanes 0-3 true");
@@ -1038,7 +1093,11 @@ mod tests {
             // independently of the first assertion.
             let mut c = Vec::new();
             emit_binary(&mut c, OpKind::Gt, X, X, Y);
-            emit_movmskps_eax(&mut c, X);
+            Inst::MoveMask {
+                dst: x86_64::gpr::RAX,
+                src: X,
+            }
+            .emit_into(&mut c);
             // SAFETY: as above.
             let got = unsafe { run_mask(&c, xs, ys) };
             assert_eq!(got, 0b1111_0000, "gt mask, lanes 4-7 true");
@@ -1160,9 +1219,17 @@ mod tests {
             }
             .emit_into(&mut c);
             emit_binary(&mut c, OpKind::Mul, Reg(6), X, Y);
-            AsmProgram::from([Vex::m0f(0x11).rm(6, frame_slot(0))]).assemble(&mut c);
+            Inst::Store {
+                dst: frame_slot(0),
+                src: Reg(6),
+            }
+            .emit_into(&mut c);
             emit_binary(&mut c, OpKind::Add, Reg(6), X, X); // clobber
-            AsmProgram::from([Vex::m0f(0x10).rm(X.0, frame_slot(0))]).assemble(&mut c);
+            Inst::Load {
+                dst: X,
+                src: frame_slot(0),
+            }
+            .emit_into(&mut c);
             // `add rsp, 32` (REX.W 81 /0 id), not `Gp::Ret`: this kernel
             // returns its answer in a ymm register, which a `vzeroupper`
             // would clear.
@@ -1261,11 +1328,13 @@ mod tests {
             ]
         );
         let mut c = Vec::new();
-        AsmProgram::from([
-            gather(Reg(13), PtrReg(11), Reg(14), Reg(15)),
-            gather(Reg(0), PtrReg(7), Reg(13), Reg(14)),
-        ])
-        .assemble(&mut c);
+        let gather = |dst, base, index, mask| Inst::Gather {
+            dst: Reg(dst),
+            base: PtrReg(base),
+            index: Reg(index),
+            mask: Reg(mask),
+        };
+        AsmProgram::from([gather(13, 11, 14, 15), gather(0, 7, 13, 14)]).assemble(&mut c);
         assert_eq!(
             c,
             [
@@ -1284,11 +1353,13 @@ mod tests {
     #[test]
     fn a_vsib_index_may_be_the_fourth_or_twelfth_register() {
         let mut c = Vec::new();
-        AsmProgram::from([
-            gather(Reg(5), PtrReg(9), Reg(4), Reg(7)),
-            gather(Reg(5), PtrReg(9), Reg(12), Reg(7)),
-        ])
-        .assemble(&mut c);
+        let gather = |index| Inst::Gather {
+            dst: Reg(5),
+            base: PtrReg(9),
+            index: Reg(index),
+            mask: Reg(7),
+        };
+        AsmProgram::from([gather(4), gather(12)]).assemble(&mut c);
         assert_eq!(
             c,
             [
@@ -1318,10 +1389,7 @@ mod tests {
 /// construction.
 pub(super) mod driver {
     use super::super::*;
-    use super::{
-        AsmProgram, IOTA_BYTES, Inst, Lanewise, Mem, NoDisp, Vex, frame_slot, vcvttss2si_mem,
-        vextractf128, vextractps_store,
-    };
+    use super::{AsmProgram, IOTA_BYTES, Inst, Lanewise, Mem, NoDisp, frame_slot};
     use crate::emit::x86_64 as x86;
     use crate::emit::x86_64::{Convert, write_address};
     use crate::error::CompileError;
@@ -1389,8 +1457,7 @@ pub(super) mod driver {
         fn reload(&mut self, code: &mut Vec<u8>, reload: &Reload) -> Result<(), CompileError> {
             match reload {
                 Reload::FromStack { target, slot } => {
-                    AsmProgram::from([Vex::m0f(0x10).rm(target.0, frame_slot(slot.offset()))])
-                        .assemble(code);
+                    self.slot_load(code, *target, slot.offset());
                 }
                 Reload::Const { target, val_bits } => {
                     super::emit_const(code, *target, f32::from_bits(*val_bits), &mut self.consts)?;
@@ -1550,7 +1617,7 @@ pub(super) mod driver {
             src: Reg,
             offset: u32,
         ) -> Result<(), CompileError> {
-            AsmProgram::from([Vex::m0f(0x11).rm(src.0, frame_slot(offset))]).assemble(code);
+            self.slot_store(code, src, offset);
             Ok(())
         }
 
@@ -1568,8 +1635,7 @@ pub(super) mod driver {
                     Ok(target)
                 }
                 Binding::Loc(Loc::Slot(slot)) => {
-                    AsmProgram::from([Vex::m0f(0x10).rm(target.0, frame_slot(slot.offset()))])
-                        .assemble(code);
+                    self.slot_load(code, target, slot.offset());
                     Ok(target)
                 }
                 Binding::Loc(Loc::Ptr(p)) => {
@@ -1607,23 +1673,30 @@ pub(super) mod driver {
         }
 
         // If short-circuit guards: vmovmskps -> eax[7:0], then a test
-        // of the low byte (al == 0xFF for all-true — see
-        // `super::emit_cmp_al_imm8`'s doc for why the sign-extending
-        // `cmp eax, imm8` would not do).
+        // of the low byte (al == 0xFF for all-true — see [`x86::Gp::CmpByte`]
+        // for why the sign-extending `cmp eax, imm8` would not do).
         /// [`MaskTest::scratch`] and [`MaskTest::mask_scratch`] are both
         /// unused: this tier reduces the mask with `movmskps` into the
         /// flags, needing neither a vector nor a mask register.
         fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
-            super::emit_movmskps_eax(&mut asm.run, test.reg);
-            match test.arm {
+            let mask = x86::gpr::RAX;
+            asm.push(Inst::MoveMask {
+                dst: mask,
+                src: test.reg,
+            });
+            asm.push(match test.arm {
                 // ZF set when eax == 0: no lane is true, so the true arm is dead.
-                IfArm::True => asm.push(x86::Gp::Test {
+                IfArm::True => x86::Gp::Test {
                     flags: (),
-                    src: x86::gpr::RAX,
-                }),
+                    src: mask,
+                },
                 // ZF set when al == 0xFF: every lane is true, so the false arm is.
-                IfArm::False => super::emit_cmp_al_imm8(&mut asm.run, 0xFF),
-            }
+                IfArm::False => x86::Gp::CmpByte {
+                    flags: (),
+                    src: mask,
+                    imm: 0xFF,
+                },
+            });
             asm.push(x86::Gp::je(label));
         }
 
@@ -1636,11 +1709,19 @@ pub(super) mod driver {
         }
 
         fn slot_store(&mut self, code: &mut Vec<u8>, src: Reg, offset: u32) {
-            AsmProgram::from([Vex::m0f(0x11).rm(src.0, frame_slot(offset))]).assemble(code);
+            Inst::Store {
+                dst: frame_slot(offset),
+                src,
+            }
+            .emit_into(code);
         }
 
         fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
-            AsmProgram::from([Vex::m0f(0x10).rm(dst.0, frame_slot(offset))]).assemble(code);
+            Inst::Load {
+                dst,
+                src: frame_slot(offset),
+            }
+            .emit_into(code);
         }
 
         fn add_scalar(
@@ -1678,32 +1759,37 @@ pub(super) mod driver {
                 write,
                 Convert {
                     from_xmm: |code, dst, src| Inst::Cvtt { dst, src }.emit_into(code),
-                    from_mem: |code, dst, addr| {
-                        AsmProgram::from([vcvttss2si_mem(dst, addr)]).assemble(code)
-                    },
+                    from_mem: |code, dst, src| Inst::CvttMem { dst, src }.emit_into(code),
                 },
             );
             let lanes = AVX2_FILE.vector_bytes / 4;
             if write.lanes == lanes {
-                AsmProgram::from([Vex::m0f(0x11).rm(write.value.0, Mem { base, disp: NoDisp })])
-                    .assemble(code);
+                Inst::StoreBatch {
+                    dst: Mem { base, disp: NoDisp },
+                    src: write.value,
+                }
+                .emit_into(code);
                 return;
             }
             let mut half = write.value;
             for lane in 0..write.lanes {
                 if lane == 4 {
                     half = crate::emit::declared_temp(write.scratch.temp(0));
-                    vextractf128(code, half.0, write.value.0, 1);
+                    Inst::ExtractHigh {
+                        dst: half,
+                        src: write.value,
+                    }
+                    .emit_into(code);
                 }
-                AsmProgram::from([vextractps_store(
-                    Mem {
+                Inst::ExtractLane {
+                    dst: Mem {
                         base,
                         disp: x86::Imm8((lane * 4) as i8),
                     },
-                    half,
-                    (lane % 4) as u8,
-                )])
-                .assemble(code);
+                    src: half,
+                    lane: (lane % 4) as u8,
+                }
+                .emit_into(code);
             }
         }
 
