@@ -591,7 +591,7 @@
 - **Lives:** `asm::assemble` (`pixelflow-codegen/src/emit/asm.rs`), which
   imports nothing from the crate (`scripts/check_emit_boundary.py` rule A) and
   is handed the encoder as a closure, so it names no instruction type. Its
-  front end is `emit::Assembly`, a push/bind/finish builder whose `code` field
+  front end is `emit::Assembly`, a push/bind/finish builder whose `run` field
   the legacy driver writes position-independent bytes into; `finish` is
   `assemble`. The front end goes with the legacy pipeline.
   `docs/designs/assembler-as-functor.md`.

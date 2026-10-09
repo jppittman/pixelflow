@@ -90,7 +90,7 @@ These are binding. Where a later section disagrees, this section wins, and the i
    - "A mask is not a number" is the IR's question, not the backend's. On NEON and AVX2 the machine cannot tell the two apart.
    - So no `LaneMask` class over `VectorFile` is built (§6 keeps that refusal).
 3. **Labels:** an opaque `Label(u64)`, minted by the one program a kernel has. The program owns the mint (`Labels`): the `Builder` while selecting, then the `AsmProgram`. A thing *has* a label: a block, the pool section, a pool entry. There is no label enum, no scope and no key. This matches §2.8.
-4. **The assembler stands alone.** `emit/asm.rs` imports nothing from the crate, and `scripts/check_emit_boundary.py` gains that rule, with a self-test case (A8). It is a stateless function from program to binary. There is no per-scope splicing of bytes: A8's legacy front end splices items, and the selection pipeline builds one program.
+4. **The assembler stands alone.** `emit/asm.rs` imports nothing from the crate, and `scripts/check_emit_boundary.py` gains that rule, with a self-test case (A8). It is a stateless function from program to binary. There is no per-scope splicing of bytes: A8's front end threads one program through every scope, so nothing is spliced, and the selection pipeline builds one program.
 5. **Fixed registers: requirement versus choice.**
    - A register the machine or ABI requires (the entry arguments, `sp`) is a constraint on a value, and the allocator satisfies it.
    - A register the hardware would accept any member of the class for (`x16`, `x17`, `r8`, `w16`, `eax`, `k1`) is the allocator's choice. No exception.
@@ -726,9 +726,9 @@ pub(in crate::emit) struct Label(u64);
 /// A program's label namespace: the only mint. Owned by whoever is building
 /// the program (the `Builder`, then the `AsmProgram`), so minting needs
 /// `&mut` to it.
+#[derive(Default)] // `Labels::default()` is the empty namespace
 pub(in crate::emit) struct Labels { next: u64 }
 impl Labels {
-    pub(in crate::emit) fn new() -> Self;
     pub(in crate::emit) fn mint(&mut self) -> Label;
 }
 

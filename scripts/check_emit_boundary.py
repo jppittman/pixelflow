@@ -60,13 +60,16 @@ Usage:
   check_emit_boundary.py             scan the tree
   check_emit_boundary.py --self-test run the scanner over in-memory cases
 """
+import contextlib
+import io
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = REPO_ROOT / "pixelflow-codegen" / "src"
-ASSEMBLER = SRC / "emit" / "asm.rs"
+ASSEMBLER = Path("emit") / "asm.rs"
 
 ITEM_KEYWORDS = (
     "fn", "mod", "impl", "struct", "enum", "trait", "type", "use", "const",
@@ -349,26 +352,32 @@ def program_submodules(program_dir):
     return mods | {p.name for p in program_dir.iterdir() if p.is_dir()}
 
 
-def check_tree():
-    subs = program_submodules(SRC / "program")
-    failures, files = 0, 0
-    for scope, directory in (("E", SRC / "emit"), ("P", SRC / "program")):
+def check_tree(src=SRC):
+    subs = program_submodules(src / "program")
+    failures, files, assembler = 0, 0, False
+    for scope, directory in (("E", src / "emit"), ("P", src / "program")):
         found = sorted(directory.rglob("*.rs"))
         if not found:
             # A renamed or emptied scope would otherwise scan nothing and say OK.
-            print(f"FAIL: {directory.relative_to(SRC)}/ holds no .rs files", file=sys.stderr)
+            print(f"FAIL: {directory.relative_to(src)}/ holds no .rs files", file=sys.stderr)
             return 1
         for path in found:
             # The assembler answers to rule A as well as to its directory's.
-            scopes = [scope] + (["A"] if path == ASSEMBLER else [])
+            is_assembler = path == src / ASSEMBLER
+            assembler |= is_assembler
+            scopes = [scope] + (["A"] if is_assembler else [])
             files += 1
             for scope_name in scopes:
                 for line, token in scan(path.read_text(), scope_name, subs):
                     failures += 1
                     print(
-                        f"FAIL: {path.relative_to(SRC)}:{line}: names {token} [rule {scope_name}]",
+                        f"FAIL: {path.relative_to(src)}:{line}: names {token} [rule {scope_name}]",
                         file=sys.stderr,
                     )
+    if not assembler:
+        # A renamed or moved assembler would otherwise escape rule A and say OK.
+        print(f"FAIL: the assembler {ASSEMBLER} was not found", file=sys.stderr)
+        return 1
     if failures:
         print(f"{failures} emit-boundary violation(s)", file=sys.stderr)
         return 1
@@ -516,6 +525,15 @@ def self_test():
         1,
     )
     case("a quote char literal", "const Q: char = '\"';\nuse pixelflow_search::x;\n", 1)
+
+    with tempfile.TemporaryDirectory() as root:
+        src = Path(root)
+        for name in ("emit/other.rs", "program/mod.rs"):
+            (src / name).parent.mkdir(parents=True, exist_ok=True)
+            (src / name).write_text("")
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = check_tree(src)
+        cases.append(("a tree without the assembler fails", moved, 1))
 
     failed = [c for c in cases if c[1] != c[2]]
     for name, got, want in failed:

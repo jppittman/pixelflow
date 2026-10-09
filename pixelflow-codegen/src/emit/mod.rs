@@ -202,16 +202,18 @@ struct Fielded {
 /// An emitter that walks a schedule cannot hand over a finished list of
 /// instructions and labels — it discovers them as it goes, calling `&mut
 /// self` backend verbs for each — so it appends to one of these instead. The
-/// bytes of a position-independent instruction go into `code`, the run being
+/// bytes of a position-independent instruction go into `run`, the run being
 /// written; a label ends the run, and so does an instruction with a field in
 /// it, which becomes an item of its own. One kernel is one of these, however
 /// many scopes it has.
 #[derive(Default)]
 struct Assembly {
-    /// The run being written: what a backend verb emits into.
-    code: Vec<u8>,
+    /// The run being written: what a backend verb emits into. Its length is
+    /// not a position, since a bind or a fielded instruction ends the run;
+    /// [`Assembly::len`] is.
+    run: Vec<u8>,
     text: Vec<Item<Fielded>>,
-    /// Bytes of `text` already ended, which `code` is not part of yet.
+    /// Bytes of `text` already ended, which `run` is not part of yet.
     ended: usize,
     data: Vec<Item<Fielded>>,
     labels: Labels,
@@ -225,17 +227,20 @@ impl Assembly {
 
     /// Bytes of code so far: what [`Assembly::bind`] would bind a label to.
     fn len(&self) -> usize {
-        self.ended + self.code.len()
+        self.ended + self.run.len()
     }
 
     /// End the run being written.
     fn end_run(&mut self) {
-        if self.code.is_empty() {
+        if self.run.is_empty() {
             return;
         }
-        self.ended += self.code.len();
-        self.text.push(Item::Bytes(self.code.clone()));
-        self.code.clear();
+        self.ended += self.run.len();
+        // Moved, not cloned; the next run starts as large as this one rather
+        // than regrowing from empty.
+        let next = Vec::with_capacity(self.run.len());
+        self.text
+            .push(Item::Bytes(core::mem::replace(&mut self.run, next)));
     }
 
     /// Write a label here — the name of this position.
@@ -251,12 +256,12 @@ impl Assembly {
 
     /// Emit one instruction, recording the name it waits on if it has one.
     fn push(&mut self, inst: impl AsmInsn) {
-        let at = self.code.len();
-        inst.emit_into(&mut self.code);
+        let at = self.run.len();
+        inst.emit_into(&mut self.run);
         let Some(field) = inst.label_ref() else {
             return;
         };
-        let bytes = self.code.split_off(at);
+        let bytes = self.run.split_off(at);
         self.end_run();
         self.ended += bytes.len();
         self.text.push(Item::Inst(Fielded { bytes, field }));
@@ -277,9 +282,8 @@ impl Assembly {
     ///
     /// # Panics
     ///
-    /// If a branch names a label nothing bound, or a label is bound twice.
-    /// Only this crate writes these programs, so either is a bug here rather
-    /// than a fact about the kernel being compiled.
+    /// As [`asm::assemble`]: a label bound twice, bound but never minted by
+    /// this program, or named and never bound.
     #[must_use]
     fn finish(mut self) -> Vec<u8> {
         self.end_run();
@@ -759,7 +763,7 @@ trait IsaBackend {
     /// frame exists: the register that holds the constant pool's address for
     /// the rest of the function.
     ///
-    /// Takes the whole [`Assembly`], not just its `code`, because the anchor
+    /// Takes the whole [`Assembly`], not just its `run`, because the anchor
     /// names `pool` — the constant pool's not-yet-known position — rather
     /// than a `code.len()` read off and carried by hand. One function has one
     /// pool, so the driver mints its label once and hands it to both this and
@@ -1190,7 +1194,7 @@ fn emit_scope<B: IsaBackend>(
                             )
                         });
                     locs[vid.0 as usize] = Some(binding(allocation, vid, from_memory));
-                    let got = backend.emit_resolve(&mut asm.code, vid, r, &locs)?;
+                    let got = backend.emit_resolve(&mut asm.run, vid, r, &locs)?;
                     debug_assert_eq!(got, r, "a value out of a register reloads into the target");
                 }
                 Binding::Loc(Loc::Ptr(p)) => {
@@ -1203,7 +1207,7 @@ fn emit_scope<B: IsaBackend>(
                             )
                         });
                     locs[vid.0 as usize] = Some(binding(allocation, vid, from_memory));
-                    ptr_into(backend, &mut asm.code, vid, p, &locs);
+                    ptr_into(backend, &mut asm.run, vid, p, &locs);
                 }
                 Binding::Loc(Loc::Slot(_)) | Binding::Remat(_) => {}
             }
@@ -1296,12 +1300,12 @@ fn emit_scope<B: IsaBackend>(
         for (v, to) in core::mem::take(&mut moves[sched_idx]) {
             match to {
                 Binding::Loc(Loc::Reg(r)) => {
-                    let src = backend.emit_resolve(&mut asm.code, v, r, &locs)?;
+                    let src = backend.emit_resolve(&mut asm.run, v, r, &locs)?;
                     if src != r {
-                        backend.emit_mov(&mut asm.code, r, src);
+                        backend.emit_mov(&mut asm.run, r, src);
                     }
                 }
-                Binding::Loc(Loc::Ptr(p)) => ptr_into(backend, &mut asm.code, v, p, &locs),
+                Binding::Loc(Loc::Ptr(p)) => ptr_into(backend, &mut asm.run, v, p, &locs),
                 Binding::Loc(Loc::Slot(_)) | Binding::Remat(_) => {}
             }
             locs[v.0 as usize] = Some(to);
@@ -1326,7 +1330,7 @@ fn emit_scope<B: IsaBackend>(
             let guard = &if_guards[guard_idx];
             let mask_reg = match location_of(&locs, guard.mask_vid) {
                 Binding::Loc(Loc::Reg(r)) => r,
-                _ => backend.emit_resolve(&mut asm.code, guard.mask_vid, guard_mask(), &locs)?,
+                _ => backend.emit_resolve(&mut asm.run, guard.mask_vid, guard_mask(), &locs)?,
             };
             let test = MaskTest {
                 reg: mask_reg,
@@ -1377,11 +1381,11 @@ fn emit_scope<B: IsaBackend>(
                     let target = scratch
                         .reload(0)
                         .expect("a Write's value is not resident and no reload was reserved");
-                    backend.emit_resolve(&mut asm.code, *value, target, &locs)?
+                    backend.emit_resolve(&mut asm.run, *value, target, &locs)?
                 }
             };
             backend.emit_write(
-                &mut asm.code,
+                &mut asm.run,
                 &WritePlan {
                     value: value_reg,
                     row: binder_at(*row),
@@ -1446,10 +1450,10 @@ fn emit_scope<B: IsaBackend>(
                             slot: u32|
              -> Result<(), CompileError> {
                 match at {
-                    Some(r) => backend.load_const(&mut asm.code, r, value),
+                    Some(r) => backend.load_const(&mut asm.run, r, value),
                     None => {
-                        backend.load_const(&mut asm.code, t0, value)?;
-                        backend.slot_store(&mut asm.code, t0, slot);
+                        backend.load_const(&mut asm.run, t0, value)?;
+                        backend.slot_store(&mut asm.run, t0, slot);
                         Ok(())
                     }
                 }
@@ -1472,12 +1476,12 @@ fn emit_scope<B: IsaBackend>(
             let binder_now = match binder_reg {
                 Some(b) => b,
                 None => {
-                    backend.slot_load(&mut asm.code, t0, binder_slot);
+                    backend.slot_load(&mut asm.run, t0, binder_slot);
                     t0
                 }
             };
-            backend.load_const(&mut asm.code, t1, fold.range().end as f32)?;
-            backend.test_ge(&mut asm.code, t0, [binder_now, t1], scratch.mask_guard_temp);
+            backend.load_const(&mut asm.run, t1, fold.range().end as f32)?;
+            backend.test_ge(&mut asm.run, t0, [binder_now, t1], scratch.mask_guard_temp);
             backend.branch_if_arm_is_dead(
                 asm,
                 MaskTest {
@@ -1500,12 +1504,12 @@ fn emit_scope<B: IsaBackend>(
                 let body_result =
                     body_result.expect("a fold over a value monoid has a value to combine");
                 match acc_reg {
-                    Some(a) => backend.alu(&mut asm.code, fold.combine_op(), a, [a, body_result]),
+                    Some(a) => backend.alu(&mut asm.run, fold.combine_op(), a, [a, body_result]),
                     None => {
                         let acc = if body_result == t0 { t1 } else { t0 };
-                        backend.slot_load(&mut asm.code, acc, acc_slot);
-                        backend.alu(&mut asm.code, fold.combine_op(), acc, [acc, body_result]);
-                        backend.slot_store(&mut asm.code, acc, acc_slot);
+                        backend.slot_load(&mut asm.run, acc, acc_slot);
+                        backend.alu(&mut asm.run, fold.combine_op(), acc, [acc, body_result]);
+                        backend.slot_store(&mut asm.run, acc, acc_slot);
                     }
                 }
             }
@@ -1514,11 +1518,11 @@ fn emit_scope<B: IsaBackend>(
             // the whole of "advance the loop".
             let stride = fold.stride() as f32;
             match binder_reg {
-                Some(b) => backend.add_scalar(&mut asm.code, b, t0, stride)?,
+                Some(b) => backend.add_scalar(&mut asm.run, b, t0, stride)?,
                 None => {
-                    backend.slot_load(&mut asm.code, t0, binder_slot);
-                    backend.add_scalar(&mut asm.code, t0, t1, stride)?;
-                    backend.slot_store(&mut asm.code, t0, binder_slot);
+                    backend.slot_load(&mut asm.run, t0, binder_slot);
+                    backend.add_scalar(&mut asm.run, t0, t1, stride)?;
+                    backend.slot_store(&mut asm.run, t0, binder_slot);
                 }
             }
             backend.jump(asm, top);
@@ -1532,7 +1536,7 @@ fn emit_scope<B: IsaBackend>(
             if let Some(a) = acc_reg
                 && accumulates
             {
-                backend.slot_store(&mut asm.code, a, acc_slot);
+                backend.slot_store(&mut asm.run, a, acc_slot);
             }
             continue;
         }
@@ -1546,7 +1550,7 @@ fn emit_scope<B: IsaBackend>(
         {
             let mask_reg = match location_of(&locs, *mask_vid) {
                 Binding::Loc(Loc::Reg(r)) => r,
-                _ => backend.emit_resolve(&mut asm.code, *mask_vid, guard_mask(), &locs)?,
+                _ => backend.emit_resolve(&mut asm.run, *mask_vid, guard_mask(), &locs)?,
             };
             let dst = dst_loc.reg();
             let in_reg = |v: regalloc::ValueId| match location_of(&locs, v) {
@@ -1571,34 +1575,34 @@ fn emit_scope<B: IsaBackend>(
             backend.branch_if_arm_is_dead(asm, test(IfArm::False), only_true);
 
             // Mixed lanes: the blend, the path a lane-varying mask takes.
-            backend.emit_plan(&mut asm.code, &plan)?;
+            backend.emit_plan(&mut asm.run, &plan)?;
             backend.jump(asm, join);
 
             asm.bind(only_false);
             if let Some(freg) = false_reg {
-                backend.emit_mov(&mut asm.code, dst, freg);
+                backend.emit_mov(&mut asm.run, dst, freg);
             } else {
-                backend.emit_resolve(&mut asm.code, *false_vid, dst, &locs)?;
+                backend.emit_resolve(&mut asm.run, *false_vid, dst, &locs)?;
             }
             backend.jump(asm, join);
 
             asm.bind(only_true);
             if let Some(treg) = true_reg {
-                backend.emit_mov(&mut asm.code, dst, treg);
+                backend.emit_mov(&mut asm.run, dst, treg);
             } else {
-                backend.emit_resolve(&mut asm.code, *true_vid, dst, &locs)?;
+                backend.emit_resolve(&mut asm.run, *true_vid, dst, &locs)?;
             }
 
             asm.bind(join);
 
             if let Some(offset) = store_after_def[sched_idx] {
-                backend.emit_store(&mut asm.code, dst, offset)?;
+                backend.emit_store(&mut asm.run, dst, offset)?;
             }
-            hand_off(backend, &mut asm.code, *vid, Loc::Reg(dst))?;
+            hand_off(backend, &mut asm.run, *vid, Loc::Reg(dst))?;
             continue;
         }
 
-        backend.emit_plan(&mut asm.code, &plan)?;
+        backend.emit_plan(&mut asm.run, &plan)?;
 
         // The register the definition wrote, of whichever class: a `Context`
         // def's is a pointer register, everything else's a vector one.
@@ -1608,8 +1612,8 @@ fn emit_scope<B: IsaBackend>(
         };
         if let Some(offset) = store_after_def[sched_idx] {
             match written {
-                Loc::Reg(r) => backend.emit_store(&mut asm.code, r, offset)?,
-                Loc::Ptr(p) => backend.ptr_store(&mut asm.code, p, offset),
+                Loc::Reg(r) => backend.emit_store(&mut asm.run, r, offset)?,
+                Loc::Ptr(p) => backend.ptr_store(&mut asm.run, p, offset),
                 Loc::Slot(_) => unreachable!("a definition writes a register"),
             }
         }
@@ -1617,7 +1621,7 @@ fn emit_scope<B: IsaBackend>(
         // Resident by construction: the hand-off is a read at the definition
         // (`regalloc::Pass::new`), so the allocator gave it a register — a
         // constant's definition included, which otherwise emits nothing.
-        hand_off(backend, &mut asm.code, *vid, written)?;
+        hand_off(backend, &mut asm.run, *vid, written)?;
     }
 
     // The scope's result, in a register for the fold around it to combine.
@@ -1636,7 +1640,7 @@ fn emit_scope<B: IsaBackend>(
                 let target = allocation.scratch(sched_len - 1).result.expect(
                     "the allocator reserves a result target on every scope's last instruction",
                 );
-                backend.emit_resolve(&mut asm.code, root, target, &locs)?
+                backend.emit_resolve(&mut asm.run, root, target, &locs)?
             }
         })
     };
@@ -2003,14 +2007,14 @@ fn compile_via_backend<B: IsaBackend>(
     // anchor for whatever the body's constants are relative to, the return,
     // and what trails it.
     let mut asm = Assembly::default();
-    counting.frame_alloc(&mut asm.code, nest.frame_bytes());
+    counting.frame_alloc(&mut asm.run, nest.frame_bytes());
     let pool = asm.mint();
     counting.anchor(&mut asm, pool);
     let body_start = asm.len();
     emit_scope(nest.body(), &mut counting, &mut asm)?;
     let body_bytes = asm.len() - body_start;
-    counting.frame_free(&mut asm.code, nest.frame_bytes());
-    counting.emit_ret(&mut asm.code);
+    counting.frame_free(&mut asm.run, nest.frame_bytes());
+    counting.emit_ret(&mut asm.run);
     let scaffold = counting.take((asm.len() - body_bytes) as u64);
     counting.finish(&mut asm, pool);
     let code = asm.finish();
@@ -3162,7 +3166,7 @@ mod tests {
             // an empty frame measures the same bytes.
             let mut prologue = Assembly::default();
             let mut probe = fresh();
-            probe.frame_alloc(&mut prologue.code, 0);
+            probe.frame_alloc(&mut prologue.run, 0);
             let frame_end = prologue.len();
             let pool = prologue.mint();
             probe.anchor(&mut prologue, pool);

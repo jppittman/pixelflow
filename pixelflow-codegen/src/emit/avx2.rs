@@ -787,8 +787,8 @@ mod tests {
             let mut asm = crate::emit::Assembly::default();
             let pool_label = asm.mint();
             x86_64::anchor(&mut asm, pool_label);
-            asm.code.extend_from_slice(body);
-            asm.code.push(RET);
+            asm.run.extend_from_slice(body);
+            asm.run.push(RET);
             pool.finish(&mut asm, pool_label);
             // SAFETY: every caller is a test that checked the host runs AVX2.
             unsafe { run_code(&asm.finish(), xs, ys, zs) }
@@ -1490,12 +1490,12 @@ pub(super) mod driver {
         /// unused: this tier reduces the mask with `movmskps` into the
         /// flags, needing neither a vector nor a mask register.
         fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
-            super::emit_movmskps_eax(&mut asm.code, test.reg);
+            super::emit_movmskps_eax(&mut asm.run, test.reg);
             match test.arm {
                 // ZF set when eax == 0: no lane is true, so the true arm is dead.
-                IfArm::True => x86_64::emit_test_eax(&mut asm.code),
+                IfArm::True => x86_64::emit_test_eax(&mut asm.run),
                 // ZF set when al == 0xFF: every lane is true, so the false arm is.
-                IfArm::False => super::emit_cmp_al_imm8(&mut asm.code, 0xFF),
+                IfArm::False => super::emit_cmp_al_imm8(&mut asm.run, 0xFF),
             }
             asm.push(x86::Jcc::je(label));
         }

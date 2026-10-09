@@ -943,8 +943,8 @@ mod tests {
             let mut asm = crate::emit::Assembly::default();
             let pool_label = asm.mint();
             x86_64::anchor(&mut asm, pool_label);
-            asm.code.extend_from_slice(body);
-            asm.code.push(RET);
+            asm.run.extend_from_slice(body);
+            asm.run.push(RET);
             pool.finish(&mut asm, pool_label);
             // SAFETY: every caller is a test that checked the host runs AVX-512.
             unsafe { run_code(&asm.finish(), xs, ys, zs) }
@@ -1071,7 +1071,7 @@ mod tests {
             let mut asm = crate::emit::Assembly::default();
             let pool_label = asm.mint();
             x86_64::anchor(&mut asm, pool_label);
-            let c = &mut asm.code;
+            let c = &mut asm.run;
             x86_64::mov(c, r9, x86_64::gpr::RDI);
             let via_r9 = Mem {
                 base: PtrReg(9),
@@ -1608,7 +1608,7 @@ pub(super) mod driver {
         /// lands in a `k`-register before `kortestw` can read it.
         fn branch_if_arm_is_dead(&mut self, asm: &mut Assembly, test: MaskTest, label: Label) {
             let k = crate::emit::declared_mask_temp(test.mask_scratch);
-            super::emit_mask_flags(&mut asm.code, test.reg, k);
+            super::emit_mask_flags(&mut asm.run, test.reg, k);
             // One `kortest` sets both answers at once, so the arm picks the
             // condition rather than a different reduction.
             asm.push(match test.arm {

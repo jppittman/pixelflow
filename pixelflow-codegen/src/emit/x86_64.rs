@@ -322,7 +322,7 @@ mod label_tests {
     fn a_program_is_position_independent() {
         let program = |prefix: &[u8]| {
             let mut asm = Assembly::default();
-            asm.code.extend_from_slice(prefix);
+            asm.run.extend_from_slice(prefix);
             let end = asm.mint();
             asm.push(Jmp { target: end });
             asm.bind(end);
@@ -333,7 +333,7 @@ mod label_tests {
     }
 
     #[test]
-    #[should_panic(expected = "never written")]
+    #[should_panic(expected = "never bound")]
     fn an_unbound_label_is_a_bug_and_not_a_jump_to_itself() {
         let mut asm = Assembly::default();
         let target = asm.mint();
@@ -343,7 +343,7 @@ mod label_tests {
     }
 
     #[test]
-    #[should_panic(expected = "written twice")]
+    #[should_panic(expected = "bound twice")]
     fn a_label_bound_twice_is_a_bug() {
         let mut asm = Assembly::default();
         let twice = asm.mint();
