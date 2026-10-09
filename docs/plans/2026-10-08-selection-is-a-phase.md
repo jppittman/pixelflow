@@ -1334,7 +1334,7 @@ cargo test --target aarch64-unknown-linux-gnu -p pixelflow-codegen   # + the V s
 > *"a refactor does not edit this table; an intentional byte change does, in a commit of its own that says why."*
 
 - Each byte-moving commit below is its change, plus the re-baselined rows, plus the reason, and nothing else.
-- Each re-baseline also updates the commit hash in `GOLDEN`'s doc (`6649`, today `28ddbeaf`).
+- A row's provenance is `git log -L` on it. `GOLDEN`'s doc names no commit hash: a commit cannot name itself.
 - A row moving outside the commit's predicted set is a finding, explained in that commit.
 - `GOLDEN_SELECTED` is the new pipeline's table. It is born in B10 for AVX2, and gains AVX-512 in C2 and NEON in C4. It obeys the same rule from birth. In D1 it replaces `GOLDEN`.
 
@@ -1378,9 +1378,10 @@ Every commit in this phase is live in production.
 - **Files:** `program/lower.rs`.
 - **Change:**
   - `mark_reachable` (`lower.rs:21`) does not descend into a `Reduce` whose fold `is_empty()`.
-  - The `Reduce` arm (`lower.rs:293`) lowers that fold to `Const(fold.monoid().identity())`. For `SEQ`, the constant is never read: `Seq` reads no register.
-- **Bytes:** row 0 (`glyph_like_w1`) moves on all three backends. It is the only row with an empty main column fold. Any other row moving is a bug in this commit.
-- **Tests:** at width 1, `traffic.scopes.len()` is one less than at width 37. (An empty-`SUM` test would be vacuous: the e-graph's `EmptyFold`, `fold_rules.rs:447-453`, already rewrites it.)
+  - The `Reduce` arm (`lower.rs:293`) lowers that fold to `Const(fold.monoid().identity())`.
+  - A `SEQ` fold is the exception, and the identity constant is not "never read": a `Seq` that names it keeps it live, and the schedule stores a dead `0.0` in the root scope (measured: one store and one instruction more at `POINT`). A `SEQ` fold over nothing has no def, and a `Seq` with such an operand is its other operand (two of them, no def at all).
+- **Bytes:** row 0 (`glyph_like_w1`) shrinks on all three backends (1016/984/592 to 724/676/400). It is the only row with an empty main column fold. Any other row moving is a bug in this commit.
+- **Tests:** `tests/empty_fold.rs`: through `compile`, a kernel with a surviving `SUM` at width 1 has two scopes fewer than at width 37 (the empty main column fold and the sum inside it), and its samples are the wide lattice's first column. (An empty-`SUM` test would be vacuous: the e-graph's `EmptyFold`, `fold_rules.rs:447-453`, already rewrites it.)
 - **Gate:** V, plus a row-0 re-baseline.
 
 #### A4: `MulAdd` always fuses

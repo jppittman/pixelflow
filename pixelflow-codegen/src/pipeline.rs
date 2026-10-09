@@ -76,7 +76,8 @@ fn origin_slots(arena: &pixelflow_ir::arena::ExprArena) -> [UniformId; 2] {
 /// tools and several tests come straight here. `collapse` substitutes only
 /// `X` and `Y`, so a retired axis would survive into the schedule as a `Var`
 /// no fold binds, and the allocator's refusal there names a binder, not an
-/// axis; this one names the axis.
+/// axis; this one names the axis. Also panics on a zero extent, which has
+/// no sample to compute.
 pub fn compile(
     arena: &pixelflow_ir::arena::ExprArena,
     root: pixelflow_ir::arena::ExprId,
@@ -87,6 +88,11 @@ pub fn compile(
         "emit::compile: the arena names Var({:?}), a coordinate axis a \
          lattice no longer has; a per-call scalar is a Uniform",
         arena.retired_axis(root)
+    );
+    assert!(
+        shape.extent().iter().all(|&e| e > 0),
+        "emit::compile: degenerate extent {:?}",
+        shape.extent()
     );
     let lanes = (crate::jit_vector_bytes() as u32) / BYTES_PER_LANE;
     let schedule = lower(arena, root, shape, lanes)?;

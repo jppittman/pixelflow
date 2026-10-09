@@ -6249,8 +6249,9 @@ mod tests {
         type Bytes = (usize, u64);
 
         /// `ROWS`' bytes, per target in [`Target::ALL`]'s order (AVX2,
-        /// AVX-512, aarch64): the first six at `28ddbeaf`, the coverage rows
-        /// after them at `2e490cfe`, where they were first compiled.
+        /// AVX-512, aarch64). A row's provenance is `git log -L` on it: a
+        /// hash written here would be the hash of the commit that wrote it,
+        /// which no commit can know.
         ///
         /// **A refactor does not edit this table; an intentional byte change
         /// does, in a commit of its own that says why.** A commit that edits
@@ -6259,9 +6260,9 @@ mod tests {
         /// fails, the failure prints the whole recomputed table.
         const GOLDEN: [[Bytes; 3]; 11] = [
             [
-                (1016, 0x46ec89671d0d59d7),
-                (984, 0x04d391d2df13c4d6),
-                (592, 0x9eb350d1994f17af),
+                (724, 0x23fc2ea3c955d064),
+                (676, 0xb2ca1015afc4ecf7),
+                (400, 0x78f1164693fe0da6),
             ],
             [
                 (728, 0x4379d55663a9294e),
