@@ -8,7 +8,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::program::Class;
+use crate::emit::FileId;
 
 /// What it costs the instruction being placed to lose one of its own reads —
 /// the tier that outranks every kind of deferred traffic, and the reason an
@@ -84,18 +84,32 @@ impl EvictionRank {
     }
 }
 
-/// The two per-class budgets [`carried`] fills, indexed by [`Class::ix`].
-pub(super) type Budget = [usize; 2];
+/// The per-file budgets [`carried`] fills, indexed by `FileId as usize`. A
+/// carry holds one register of one file from before a loop to its latch;
+/// `Flags` is never carried, and the Opmask budget is zero: a predicate live
+/// into a loop head is stored there.
+pub(super) type Budget = [usize; 4];
 
-impl Class {
-    /// This class's index into a per-class array.
-    const fn ix(self) -> usize {
-        match self {
-            Class::Vector => 0,
-            Class::Pointer => 1,
-        }
-    }
-}
+/// The vector registers a loop's body keeps for itself when it carries as many
+/// as it can: a file's carry budget is its members minus this.
+///
+/// Seven is the floor the legacy allocator reserved, `MIN_SCRATCH`
+/// (`Scratch::MAX_TEMPS + 3`), and the constant the carry pricing was fitted
+/// with (escape-hatches, 2026-09-04 and 05, where three principled
+/// replacements lost to it). It is kept so that the switch to selection
+/// changes how a carry is represented and not how many there are: 16 vector
+/// registers carry 9, as they do today. What the body needs from the seven is
+/// the widest instruction's operands (a `MulAdd` reads three and writes one)
+/// and the reloads and copies the allocator inserts beside it.
+pub(super) const CARRY_RESERVE: usize = 7;
+
+/// The same for the general file. Five leaves x86's nine members four carries:
+/// legacy's two pointer carries (its pool was `r9`-`r11`, one of them its
+/// floor), plus `out` and `pitch`, which legacy kept outside the pool and
+/// selection leases like any other value; the pool base that was a fifth is
+/// gone (constants are RIP-relative). aarch64 keeps the same reserve, and the
+/// difference from its legacy carries is attributed where that backend switches.
+pub(super) const GENERAL_CARRY_RESERVE: usize = 5;
 
 /// What carrying a root saves, per call, when `reads` reads of it sit in a
 /// scope that runs `trips` times: one reload per read per run.
@@ -115,7 +129,7 @@ pub(super) const fn loop_state_saved(trips: usize) -> usize {
 /// live across.
 pub(super) struct Candidate<R> {
     pub(super) weight: usize,
-    pub(super) class: Class,
+    pub(super) class: FileId,
     /// The scopes the carry is live across, by index.
     pub(super) live_across: Vec<usize>,
     pub(super) root: R,
@@ -134,10 +148,10 @@ pub(super) fn carried<R>(
 ) -> Vec<R> {
     candidates.sort_by_key(|c| core::cmp::Reverse(c.weight));
 
-    let mut count: Vec<Budget> = vec![[0; 2]; scopes];
+    let mut count: Vec<Budget> = vec![[0; 4]; scopes];
     let mut taken = Vec::new();
     for candidate in candidates {
-        let class = candidate.class.ix();
+        let class = candidate.class as usize;
         if candidate
             .live_across
             .iter()

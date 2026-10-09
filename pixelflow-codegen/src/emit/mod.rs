@@ -886,7 +886,6 @@ struct Entry {
 struct Loop {
     head: Label,
     /// The enclosing loop, as an index into [`Function::loops`].
-    #[expect(dead_code, reason = "live from B6")]
     parent: Option<usize>,
     /// How many times its body runs per call: its own trip count times its
     /// parent's.
@@ -3635,52 +3634,98 @@ mod tests {
         })
     }
 
-    /// A fold's binder and accumulator are roots the allocator places under
-    /// its budget, not registers reserved across the body.
+    /// The values a fold's body reads and its enclosing scopes computed are
+    /// its roots. The allocator carries them in registers across the loop
+    /// while a budget lasts, so the loop reloads nothing; past it, every trip
+    /// reloads the roots that did not fit, and the reloads grow with the roots
+    /// the fold reads.
     ///
-    /// Two pools, the same three-deep contraction. At the floor
-    /// (`MIN_SCRATCH`) the budget is zero at every depth, so every fold's
-    /// roots go to slots and the loops step and test them from memory —
-    /// the case a reserved binder could not serve past one level, since each
-    /// level took a register from the pool below until an instruction there
-    /// had nowhere to put its scratch. With headroom the ranking spends it,
-    /// deepest loop first, because that is what a carry saves most per call.
-    /// Both compile and run.
+    /// `Σ_{i<5} Σ_k (x·c_k + y)·i`, with `k` over the roots. Both counts
+    /// compile and run.
     #[test]
     fn a_folds_roots_are_placed_by_the_budget() {
-        let (a, root) = three_deep_contraction();
-        let carried = |file: &regalloc::RegisterFile| -> usize {
-            let nest = allocate_nest(native_schedule(&a, root, POINT), file);
-            (0..nest.fold_count())
-                .flat_map(|j| regalloc::tests::fold_roots(&nest, j))
-                .filter(|at| matches!(at, regalloc::Where::Reg(_)))
-                .count()
-        };
-        let floor = regalloc::tests::FLOOR;
-        let mut previous = None;
-        for above in [0, 5] {
-            let file = regalloc::tests::at_floor(native_file(), above);
-            assert_eq!(
-                file.scratch.len(),
-                floor + above,
-                "the pool did not cap where the test expects"
+        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        /// The fold's trips, which no lattice loop shares at a point.
+        const TRIPS: u32 = 5;
+        /// Roots within every tier's carry budget, and roots past the widest
+        /// vector file, which AVX-512 and NEON share.
+        const FEW: usize = 2;
+        const WIDEST_FILE: usize = 32;
+        const MANY: usize = WIDEST_FILE + 16;
+        /// AVX2's 16 vector registers less the reserve of 7 carry 9: the roots
+        /// below, the binder, the accumulator and one more the fold reads.
+        const AVX2_ROOTS_THAT_FIT: usize = 6;
+        const AVX2_VECTOR_BYTES: usize = 32;
+
+        let reloads_per_trip = |roots: usize| -> u64 {
+            let mut a = ExprArena::new();
+            let (x, y) = (a.push_var(0), a.push_var(1));
+            let b = Binder::from_slot(0).expect("slot 0 exists");
+            let i = a.push_var(b.var());
+            let terms: Vec<ExprId> = (0..roots)
+                .map(|k| {
+                    let c = a.push_const(1.0 + 0.5 * k as f32);
+                    let xc = a.push_binary(OpKind::Mul, x, c);
+                    let root = a.push_binary(OpKind::Add, xc, y);
+                    a.push_binary(OpKind::Mul, root, i)
+                })
+                .collect();
+            let body = terms[1..]
+                .iter()
+                .fold(terms[0], |acc, &t| a.push_binary(OpKind::Add, acc, t));
+            let sum = a.push_reduce(Fold::new(Monoid::SUM, b, 0..TRIPS), body);
+            let code = compile(&a, sum, POINT).expect("a fold over roots compiles");
+
+            let (px, py) = (0.5f32, 1.5f32);
+            let want: f32 = (0..TRIPS)
+                .map(|i| {
+                    (0..roots)
+                        .map(|k| (px * (1.0 + 0.5 * k as f32) + py) * i as f32)
+                        .sum::<f32>()
+                })
+                .sum();
+            let got = eval_point(&code.code, px, py);
+            assert!(
+                (got - want).abs() <= want.abs() * 1e-5,
+                "{roots} roots: {got} against {want}"
             );
-            let count = carried(&file);
-            if above == 0 {
-                assert_eq!(
-                    count, 0,
-                    "at the floor the budget is zero, so every fold root is in a slot"
-                );
-            }
-            if let Some(fewer) = previous {
-                assert!(
-                    count > fewer,
-                    "{above} registers above the floor carried {count} fold \
-                     roots, no more than the smaller pool's {fewer}"
-                );
-            }
-            previous = Some(count);
-            assert_three_deep(&compile_above_floor(&a, root, POINT, above));
+
+            let traffic = &code.traffic;
+            traffic
+                .scopes
+                .iter()
+                .zip(&traffic.trips)
+                .filter(|(_, trips)| **trips == u64::from(TRIPS))
+                .map(|(scope, _)| scope.loads)
+                .sum()
+        };
+
+        assert_eq!(
+            reloads_per_trip(FEW),
+            0,
+            "{FEW} roots are within the budget, so the loop reads them from registers"
+        );
+        let past = reloads_per_trip(MANY);
+        assert!(
+            past >= (MANY - WIDEST_FILE) as u64,
+            "{MANY} roots are more than any vector file holds, and the loop reloads \
+             only {past} of them a trip"
+        );
+
+        // The budget's own edge, where the tier's file is known: the last root
+        // that fits reloads nothing, and each one past it reloads once a trip.
+        if crate::jit_vector_bytes() == AVX2_VECTOR_BYTES {
+            const PAST: usize = 3;
+            assert_eq!(
+                reloads_per_trip(AVX2_ROOTS_THAT_FIT),
+                0,
+                "{AVX2_ROOTS_THAT_FIT} roots are the most the budget carries"
+            );
+            let edge = reloads_per_trip(AVX2_ROOTS_THAT_FIT + PAST);
+            assert!(
+                edge >= PAST as u64,
+                "{PAST} roots past the budget reload only {edge} a trip"
+            );
         }
     }
 

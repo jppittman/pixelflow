@@ -24,6 +24,7 @@ pub(super) use crate::program::{Def, Scope, ScopedSchedule, ValueId, operands};
 pub(super) mod local;
 mod policy;
 pub(super) mod resource;
+use crate::emit::FileId;
 use policy::{Budget, Candidate, EvictionRank, ReadHere, Store};
 use resource::MAX_FRAME;
 
@@ -1936,7 +1937,10 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
                 .unwrap_or_else(|| panic!("{v:?} is a root of {scope:?} but not in its schedule"));
             candidates.push(Candidate {
                 weight: weights[slot],
-                class,
+                class: match class {
+                    Class::Vector => FileId::Vector,
+                    Class::Pointer => FileId::General,
+                },
                 live_across: live_across.clone(),
                 root: Root::Scope(scope, v),
             });
@@ -1951,14 +1955,14 @@ fn plan_carries(nest: &ScopedSchedule, above_floor: Budget) -> CarryPlan {
         let accumulates = meta_of(j).monoid() != pixelflow_ir::fold::Monoid::SEQ;
         candidates.push(Candidate {
             weight: policy::loop_state_saved(trips_j) + binder_reads(j),
-            class: Class::Vector,
+            class: FileId::Vector,
             live_across: live_across.clone(),
             root: Root::Binder(j),
         });
         if accumulates {
             candidates.push(Candidate {
                 weight: policy::loop_state_saved(trips_j),
-                class: Class::Vector,
+                class: FileId::Vector,
                 live_across,
                 root: Root::Accumulator(j),
             });
@@ -2022,6 +2026,8 @@ impl RegisterAllocator for LinearScan {
             file.pointers
                 .len()
                 .saturating_sub(RegisterFile::MIN_POINTERS) as usize,
+            0,
+            0,
         ];
         let plan = plan_carries(&nest, above_floor);
 
@@ -3422,11 +3428,6 @@ pub(super) mod tests {
         p.spans().map(|s| (s.from.index, s.at)).collect()
     }
 
-    /// Where fold `j`'s binder and accumulator live across its loop.
-    pub(in crate::emit) fn fold_roots(nest: &NestAllocation, j: usize) -> [Where; 2] {
-        let roots = nest.fold_roots(j);
-        [roots.binder, roots.accumulator]
-    }
     use crate::program::{IfArm, ScopeFold, ScopeRegion};
     use pixelflow_ir::kind::OpKind;
 
@@ -5335,7 +5336,7 @@ pub(super) mod tests {
     fn planning_carries_ranks_the_fold_before_the_roots_it_reads() {
         const BUDGET: usize = 6;
         let nest = a_fold_reading_every_root(16);
-        let plan = plan_carries(&nest, [BUDGET, 0]);
+        let plan = plan_carries(&nest, [BUDGET, 0, 0, 0]);
 
         assert!(plan.fold_binder[0], "the binder is read twice a trip");
         assert!(plan.fold_accumulator[0], "and the combine reloads the sum");
@@ -5352,7 +5353,7 @@ pub(super) mod tests {
     #[test]
     fn an_unbounded_budget_carries_every_root() {
         const ROOTS: u64 = 64;
-        let plan = plan_carries(&a_fold_reading_every_root(ROOTS), [usize::MAX, 0]);
+        let plan = plan_carries(&a_fold_reading_every_root(ROOTS), [usize::MAX, 0, 0, 0]);
         assert_eq!(
             plan.scope_roots[0].len(),
             ROOTS as usize,
