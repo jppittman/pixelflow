@@ -348,6 +348,11 @@ trait Class: Copy + 'static {
     type Physical: Copy;
 }
 
+/// One batch of `f32` lanes, which on a machine with one lane file is also a
+/// mask.
+#[derive(Copy, Clone)]
+enum Vector {}
+
 /// An address.
 #[derive(Copy, Clone)]
 enum Pointer {}
@@ -359,6 +364,10 @@ enum Integer {}
 /// The condition flags.
 #[derive(Copy, Clone)]
 enum Flags {}
+
+impl Class for Vector {
+    type Physical = Reg;
+}
 
 impl Class for Pointer {
     type Physical = PtrReg;

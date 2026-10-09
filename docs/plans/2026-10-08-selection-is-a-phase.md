@@ -1460,8 +1460,8 @@ Every commit in this phase is live in production.
 #### A10a / A10b: AVX2's VEX instructions are values
 
 - **Files:** `avx2.rs`.
-- **A10a:** `avx2::Inst<S>` arms for ALU, unary, compare, shift, blend and convert, and `Fma231`.
-- **A10b:** memory, broadcast, gather, masked store, `MoveMask` and the guard sequence.
+- **A10a:** `avx2::Inst<S>` arms for ALU, unary, round, compare, shift, convert (`Cvtt`, `Movq`), copy and `Ones`, and `Fma231`; the `Vector` marker (`Class::Physical = Reg`). A blend is three `Alu` arms, not an arm of its own: it is the and/andn/or sequence, and a `vblendvps` would move bytes.
+- **A10b:** memory (`Load`, `Store`, `CvttMem`, `ExtractLane`), broadcast, gather (the first reader of `Stage::Early`), `MoveMask` and the guard sequence (`MoveMask`, `Gp::CmpByte`, `Gp::Jcc`). The masked store is AVX-512's, so A11b's.
 - **Change:** each half deletes the byte-writers it replaces, and keeps their pins (for example `emit_movmskps_eax_gathers_…`, `avx2.rs:825`).
 - **Bytes:** identical.
 - **Gate:** G each.

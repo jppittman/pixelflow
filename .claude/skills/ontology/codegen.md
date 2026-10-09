@@ -530,7 +530,8 @@
 - **Lives:** `AsmInsn` (`pixelflow-codegen/src/emit/mod.rs`), the backends'
   instruction enums: `Gp<S>`, x86's general-register instructions, generic
   over a `Stage` and with named fields typed by `Class` (`emit/x86_64.rs`);
-  `Inst` in `emit/aarch64.rs`. Today most emission is
+  `Inst<S>` in `emit/avx2.rs`, AVX2's VEX instructions, over the same
+  vocabulary; `Inst` in `emit/aarch64.rs`. Today most emission is
   `IsaBackend` verbs writing bytes inline ("Instructions: bytes written inline
   by ~236 functions, not values", denotational-diagnosis; e.g.
   `emit_write(&mut self, code: &mut Vec<u8>, …)`), which contradicts this

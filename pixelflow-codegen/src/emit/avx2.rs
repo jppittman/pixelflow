@@ -26,7 +26,10 @@
 
 use super::x86_64;
 use super::x86_64::{Disp, Mem, NoDisp, frame_slot};
-use super::{AsmProgram, EncodedInst, Gpr, Physical, PtrReg, Reg, assemble, unimplemented_op};
+use super::{
+    AsmInsn, AsmProgram, EncodedInst, Gpr, Integer, Physical, PtrReg, Reg, Stage, Vector, assemble,
+    unimplemented_op,
+};
 use crate::error::CompileError;
 use alloc::vec::Vec;
 use pixelflow_ir::OpKind;
@@ -225,102 +228,212 @@ impl VexImm {
     }
 }
 
-// --- packed-single arithmetic (0F, no prefix, W0) ---
-fn vaddps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    assemble(c, [Vex::m0f(0x58).rrr(d, s1, s2)]);
-}
-fn vsubps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    assemble(c, [Vex::m0f(0x5C).rrr(d, s1, s2)]);
-}
-fn vmulps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    assemble(c, [Vex::m0f(0x59).rrr(d, s1, s2)]);
-}
-fn vdivps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    assemble(c, [Vex::m0f(0x5E).rrr(d, s1, s2)]);
-}
-fn vminps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    assemble(c, [Vex::m0f(0x5D).rrr(d, s1, s2)]);
-}
-fn vmaxps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    assemble(c, [Vex::m0f(0x5F).rrr(d, s1, s2)]);
-}
-fn vsqrtps(c: &mut Vec<u8>, d: u8, s: u8) {
-    assemble(c, [Vex::m0f(0x51).rrr(d, UNUSED_VVVV, s)]);
-}
-fn vrsqrtps(c: &mut Vec<u8>, d: u8, s: u8) {
-    assemble(c, [Vex::m0f(0x52).rrr(d, UNUSED_VVVV, s)]);
-}
-fn vrcpps(c: &mut Vec<u8>, d: u8, s: u8) {
-    assemble(c, [Vex::m0f(0x53).rrr(d, UNUSED_VVVV, s)]);
+/// A three-operand arithmetic or bitwise instruction: `op dst, a, b`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Alu {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+    And,
+    /// `!a & b`
+    AndNot,
+    Or,
+    Xor,
+    /// `vpaddd`: the integer-domain add.
+    IAdd,
 }
 
-// --- bitwise (0F, no prefix, W0) ---
-fn vandps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    assemble(c, [Vex::m0f(0x54).rrr(d, s1, s2)]);
-}
-fn vandnps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    assemble(c, [Vex::m0f(0x55).rrr(d, s1, s2)]);
-}
-fn vorps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    assemble(c, [Vex::m0f(0x56).rrr(d, s1, s2)]);
-}
-fn vxorps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    assemble(c, [Vex::m0f(0x57).rrr(d, s1, s2)]);
-}
-
-// --- comparisons (0F, no prefix, W0; imm8 predicate) ---
-const CMP_EQ: u8 = 0;
-const CMP_LT: u8 = 1;
-const CMP_LE: u8 = 2;
-const CMP_NEQ: u8 = 4;
-const CMP_GE: u8 = 5;
-const CMP_NLE: u8 = 6; // > (unordered-safe "not less-or-equal")
-
-fn vcmpps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8, pred: u8) {
-    assemble(c, [Vex::m0f(0xC2).imm(pred).rrr(d, s1, s2)]);
+impl Alu {
+    const fn vex(self) -> Vex {
+        match self {
+            Alu::Add => Vex::m0f(0x58),
+            Alu::Sub => Vex::m0f(0x5C),
+            Alu::Mul => Vex::m0f(0x59),
+            Alu::Div => Vex::m0f(0x5E),
+            Alu::Min => Vex::m0f(0x5D),
+            Alu::Max => Vex::m0f(0x5F),
+            Alu::And => Vex::m0f(0x54),
+            Alu::AndNot => Vex::m0f(0x55),
+            Alu::Or => Vex::m0f(0x56),
+            Alu::Xor => Vex::m0f(0x57),
+            Alu::IAdd => Vex::m0f_66(0xFE),
+        }
+    }
 }
 
-fn cmp_pred(op: OpKind) -> Option<u8> {
+/// The predicate of a `vcmpps`: its imm8.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Pred {
+    Eq = 0,
+    Lt = 1,
+    Le = 2,
+    Ne = 4,
+    Ge = 5,
+    /// `>`: the unordered-safe "not less-or-equal".
+    Nle = 6,
+}
+
+/// A one-source instruction: `op dst, src`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Lanewise {
+    Sqrt,
+    Rsqrt,
+    Recip,
+    /// `vcvttps2dq`
+    ToInt,
+    /// `vcvtdq2ps`
+    FromInt,
+    /// `vpmovzxbd`: eight bytes widened to eight dword lanes.
+    WidenBytes,
+}
+
+impl Lanewise {
+    const fn vex(self) -> Vex {
+        match self {
+            Lanewise::Sqrt => Vex::m0f(0x51),
+            Lanewise::Rsqrt => Vex::m0f(0x52),
+            Lanewise::Recip => Vex::m0f(0x53),
+            Lanewise::ToInt => Vex::m0f_f3(0x5B),
+            Lanewise::FromInt => Vex::m0f(0x5B),
+            Lanewise::WidenBytes => Vex::m0f38_66(0x31),
+        }
+    }
+}
+
+/// The rounding mode of a `vroundps`: its imm8.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Rounding {
+    Nearest = 0,
+    Floor = 1,
+    Ceil = 2,
+}
+
+/// The direction of an integer shift by an immediate: the `/digit` of its
+/// opcode.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Direction {
+    Left = 6,
+    Right = 2,
+}
+
+/// An AVX2 (VEX.256) vector instruction.
+///
+/// Generic over what its operands are ([`Stage`]), like [`x86_64::Gp`]. VEX is
+/// three-operand and non-destructive, so no destination here is tied to a
+/// source, and an operand may be the register the result is written to.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Inst<S: Stage> {
+    /// `op dst, a, b`
+    Alu {
+        op: Alu,
+        dst: S::Write<Vector>,
+        a: S::Read<Vector>,
+        b: S::Read<Vector>,
+    },
+    /// `vcmpps dst, a, b, pred`: an all-ones lane where it holds, all-zero
+    /// where it does not.
+    Cmp {
+        pred: Pred,
+        dst: S::Write<Vector>,
+        a: S::Read<Vector>,
+        b: S::Read<Vector>,
+    },
+    /// `op dst, src`
+    Unary {
+        op: Lanewise,
+        dst: S::Write<Vector>,
+        src: S::Read<Vector>,
+    },
+    /// `vroundps dst, src, mode`
+    Round {
+        mode: Rounding,
+        dst: S::Write<Vector>,
+        src: S::Read<Vector>,
+    },
+    /// `vpslld`/`vpsrld dst, src, amount`
+    Shift {
+        direction: Direction,
+        dst: S::Write<Vector>,
+        src: S::Read<Vector>,
+        amount: u8,
+    },
+    /// `vfmadd231ps acc, a, b`: `acc = a·b + acc`, one rounding. FMA3 is not
+    /// implied by AVX2 in CPUID, which is why `crate::isa`'s x86-64 probe asks
+    /// for both before this backend can be selected.
+    Fma231 {
+        acc: S::Tie<Vector>,
+        a: S::Read<Vector>,
+        b: S::Read<Vector>,
+    },
+    /// `vpcmpeqd dst, dst, dst`: all-ones, whatever `dst` held. Its reads are
+    /// not operands, because the result does not depend on them.
+    Ones { dst: S::Write<Vector> },
+    /// `vmovaps dst, src`
+    Mov {
+        dst: S::Write<Vector>,
+        src: S::Read<Vector>,
+    },
+    /// `vcvttss2si dst, src`: lane 0, truncated to a 64-bit integer.
+    Cvtt {
+        dst: S::Write<Integer>,
+        src: S::Read<Vector>,
+    },
+    /// `vmovq dst, src`: eight bytes into the low lanes, the rest zeroed.
+    Movq {
+        dst: S::Write<Vector>,
+        src: S::Read<Integer>,
+    },
+}
+
+impl Inst<Physical> {
+    fn encode(self) -> EncodedInst {
+        match self {
+            Inst::Alu { op, dst, a, b } => op.vex().rrr(dst.0, a.0, b.0),
+            Inst::Cmp { pred, dst, a, b } => Vex::m0f(0xC2).imm(pred as u8).rrr(dst.0, a.0, b.0),
+            Inst::Unary { op, dst, src } => op.vex().rrr(dst.0, UNUSED_VVVV, src.0),
+            Inst::Round { mode, dst, src } => {
+                Vex::m0f3a_66(0x08)
+                    .imm(mode as u8)
+                    .rrr(dst.0, UNUSED_VVVV, src.0)
+            }
+            // The destination is `vvvv` and the `/digit` is `reg`.
+            Inst::Shift {
+                direction,
+                dst,
+                src,
+                amount,
+            } => Vex::m0f_66(0x72)
+                .imm(amount)
+                .rrr(direction as u8, dst.0, src.0),
+            Inst::Fma231 { acc, a, b } => Vex::m0f38_66(0xB8).rrr(acc.0, a.0, b.0),
+            Inst::Ones { dst } => Vex::m0f_66(0x76).rrr(dst.0, dst.0, dst.0),
+            Inst::Mov { dst, src } => Vex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0),
+            Inst::Cvtt { dst, src } => Vex::m0f_f3(0x2C).w1().rrr(dst.0, UNUSED_VVVV, src.0),
+            Inst::Movq { dst, src } => Vex::m0f_66(0x6E).w1().xmm().rrr(dst.0, UNUSED_VVVV, src.0),
+        }
+    }
+}
+
+impl AsmInsn for Inst<Physical> {
+    #[inline]
+    fn emit_into(self, code: &mut Vec<u8>) {
+        self.encode().emit_into(code);
+    }
+}
+
+fn cmp_pred(op: OpKind) -> Option<Pred> {
     Some(match op {
-        OpKind::Eq => CMP_EQ,
-        OpKind::Ne => CMP_NEQ,
-        OpKind::Lt => CMP_LT,
-        OpKind::Le => CMP_LE,
-        OpKind::Gt => CMP_NLE,
-        OpKind::Ge => CMP_GE,
+        OpKind::Eq => Pred::Eq,
+        OpKind::Ne => Pred::Ne,
+        OpKind::Lt => Pred::Lt,
+        OpKind::Le => Pred::Le,
+        OpKind::Gt => Pred::Nle,
+        OpKind::Ge => Pred::Ge,
         _ => return None,
     })
-}
-
-// --- rounding (0F3A, 66 prefix, W0; imm8) ---
-fn vroundps(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
-    assemble(c, [Vex::m0f3a_66(0x08).imm(imm).rrr(d, UNUSED_VVVV, s)]);
-}
-
-// --- int/float convert (0F, W0) ---
-fn vcvttps2dq(c: &mut Vec<u8>, d: u8, s: u8) {
-    assemble(c, [Vex::m0f_f3(0x5B).rrr(d, UNUSED_VVVV, s)]);
-}
-fn vcvtdq2ps(c: &mut Vec<u8>, d: u8, s: u8) {
-    assemble(c, [Vex::m0f(0x5B).rrr(d, UNUSED_VVVV, s)]);
-}
-
-// --- integer-domain (66 prefix, 0F, W0) ---
-fn vpaddd(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    assemble(c, [Vex::m0f_66(0xFE).rrr(d, s1, s2)]);
-}
-fn vpslld_imm(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
-    assemble(c, [Vex::m0f_66(0x72).imm(imm).rrr(6, d, s)]); // /6, dst=vvvv, src=rm
-}
-fn vpsrld_imm(c: &mut Vec<u8>, d: u8, s: u8, imm: u8) {
-    assemble(c, [Vex::m0f_66(0x72).imm(imm).rrr(2, d, s)]); // /2
-}
-/// `vpcmpeqd ymmD, ymmS1, ymmS2` — `VEX.256.66.0F.WIG 76 /r`. With every
-/// operand the same register it is the idiom for all-ones: what a gather's
-/// mask has to be before the gather.
-#[must_use]
-fn vpcmpeqd(d: Reg, s1: Reg, s2: Reg) -> EncodedInst {
-    Vex::m0f_66(0x76).rrr(d.0, s1.0, s2.0)
 }
 
 // --- lane extract from 256-bit to 128-bit (0F3A, 66 prefix, W0) ---
@@ -337,7 +450,7 @@ fn emit_mov(code: &mut Vec<u8>, dst: Reg, src: Reg) {
     if dst.0 == src.0 {
         return;
     }
-    assemble(code, [Vex::m0f(0x28).rrr(dst.0, UNUSED_VVVV, src.0)]);
+    Inst::Mov { dst, src }.emit_into(code);
 }
 
 /// `dst = splat(val)`: `vbroadcastss ymm, [pool]` (VEX.256.66.0F38.W0 18 /r),
@@ -355,7 +468,13 @@ fn emit_const(
 ) -> Result<(), CompileError> {
     let bits = val.to_bits();
     if bits == 0 {
-        vxorps(code, dst.0, dst.0, dst.0);
+        Inst::Alu {
+            op: Alu::Xor,
+            dst,
+            a: dst,
+            b: dst,
+        }
+        .emit_into(code);
         return Ok(());
     }
     assemble(code, [Vex::m0f38_66(0x18).rm(dst.0, pool.operand(bits)?)]);
@@ -387,11 +506,13 @@ fn emit_uniform_load(
 /// [`x86_64::BroadcastGprs`] for the register contract; `dst` may alias
 /// `idx`, since the index is in a GPR before `dst` is written.
 fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64::BroadcastGprs) {
-    AsmProgram::from([
-        vcvttss2si_xmm(gprs.index, idx),
-        Vex::m0f38_66(0x18).rm_scaled4(dst.0, gprs.base.as_gpr(), gprs.index),
-    ])
-    .assemble(code);
+    Inst::Cvtt {
+        dst: gprs.index,
+        src: idx,
+    }
+    .emit_into(code);
+    AsmProgram::from([Vex::m0f38_66(0x18).rm_scaled4(dst.0, gprs.base.as_gpr(), gprs.index)])
+        .assemble(code);
 }
 
 // =============================================================================
@@ -405,24 +526,24 @@ fn emit_broadcast_load(code: &mut Vec<u8>, dst: Reg, idx: Reg, gprs: x86_64::Bro
 /// `dst = op(src1, src2)`. VEX is 3-operand/non-destructive: operands are
 /// never clobbered and may alias `dst`. Comparisons produce an ordinary
 /// all-ones/all-zeros vector directly (no k-register step, unlike AVX-512).
-fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, src1: Reg, src2: Reg) {
-    let (d, s1, s2) = (dst.0, src1.0, src2.0);
+fn emit_binary(code: &mut Vec<u8>, op: OpKind, dst: Reg, a: Reg, b: Reg) {
     if let Some(pred) = cmp_pred(op) {
-        vcmpps(code, d, s1, s2, pred);
+        Inst::Cmp { pred, dst, a, b }.emit_into(code);
         return;
     }
-    match op {
-        OpKind::Add => vaddps(code, d, s1, s2),
-        OpKind::Sub => vsubps(code, d, s1, s2),
-        OpKind::Mul => vmulps(code, d, s1, s2),
-        OpKind::Div => vdivps(code, d, s1, s2),
-        OpKind::Min => vminps(code, d, s1, s2),
-        OpKind::Max => vmaxps(code, d, s1, s2),
-        OpKind::BitAnd => vandps(code, d, s1, s2),
-        OpKind::BitOr => vorps(code, d, s1, s2),
-        OpKind::IAdd => vpaddd(code, d, s1, s2),
+    let op = match op {
+        OpKind::Add => Alu::Add,
+        OpKind::Sub => Alu::Sub,
+        OpKind::Mul => Alu::Mul,
+        OpKind::Div => Alu::Div,
+        OpKind::Min => Alu::Min,
+        OpKind::Max => Alu::Max,
+        OpKind::BitAnd => Alu::And,
+        OpKind::BitOr => Alu::Or,
+        OpKind::IAdd => Alu::IAdd,
         _ => unimplemented_op("avx2", op),
-    }
+    };
+    Inst::Alu { op, dst, a, b }.emit_into(code);
 }
 
 /// `dst = op(src)`.
@@ -441,28 +562,34 @@ fn emit_unary(
     pool: &mut x86_64::ConstPool,
 ) -> Result<(), CompileError> {
     let super::Unary { op, dst, src, temp } = unary;
-    match op {
-        OpKind::Sqrt => vsqrtps(code, dst.0, src.0),
-        OpKind::Rsqrt => vrsqrtps(code, dst.0, src.0),
-        OpKind::Recip => vrcpps(code, dst.0, src.0),
-        OpKind::Neg => {
+    let lanewise = |op| Inst::Unary { op, dst, src };
+    let round = |mode| Inst::Round { mode, dst, src };
+    let inst = match op {
+        OpKind::Sqrt => lanewise(Lanewise::Sqrt),
+        OpKind::Rsqrt => lanewise(Lanewise::Rsqrt),
+        OpKind::Recip => lanewise(Lanewise::Recip),
+        OpKind::Neg | OpKind::Abs => {
+            let (op, bits) = match op {
+                OpKind::Neg => (Alu::Xor, 0x8000_0000),
+                _ => (Alu::And, 0x7FFF_FFFF),
+            };
             let mask = super::declared_temp(temp);
-            emit_const(code, mask, f32::from_bits(0x8000_0000), pool)?;
-            vxorps(code, dst.0, src.0, mask.0);
+            emit_const(code, mask, f32::from_bits(bits), pool)?;
+            Inst::Alu {
+                op,
+                dst,
+                a: src,
+                b: mask,
+            }
         }
-        OpKind::Abs => {
-            let mask = super::declared_temp(temp);
-            emit_const(code, mask, f32::from_bits(0x7FFF_FFFF), pool)?;
-            vandps(code, dst.0, src.0, mask.0);
-        }
-        // imm8: bits[3:0] = rounding mode (0=nearest, 1=floor, 2=ceil).
-        OpKind::Floor => vroundps(code, dst.0, src.0, 0x01),
-        OpKind::Ceil => vroundps(code, dst.0, src.0, 0x02),
-        OpKind::Round => vroundps(code, dst.0, src.0, 0x00),
-        OpKind::TruncToInt => vcvttps2dq(code, dst.0, src.0),
-        OpKind::IntToFloat => vcvtdq2ps(code, dst.0, src.0),
+        OpKind::Floor => round(Rounding::Floor),
+        OpKind::Ceil => round(Rounding::Ceil),
+        OpKind::Round => round(Rounding::Nearest),
+        OpKind::TruncToInt => lanewise(Lanewise::ToInt),
+        OpKind::IntToFloat => lanewise(Lanewise::FromInt),
         _ => unimplemented_op("avx2", op),
-    }
+    };
+    inst.emit_into(code);
     Ok(())
 }
 
@@ -514,31 +641,10 @@ fn gpr_temps_for(op: &super::ScheduledOp) -> u8 {
 // The store, and the iota
 // =============================================================================
 
-/// `vcvttss2si r64, xmm` — `VEX.LIG.F3.0F.W1 2C /r`: lane 0, truncated to a
-/// 64-bit integer.
-#[must_use]
-fn vcvttss2si_xmm(dst: Gpr, src: Reg) -> EncodedInst {
-    Vex::m0f_f3(0x2C).w1().rrr(dst.0, UNUSED_VVVV, src.0)
-}
-
 /// `vcvttss2si r64, m32` — the same, reading the first word of a slot.
 #[must_use]
 fn vcvttss2si_mem<D: Disp>(dst: Gpr, addr: Mem<Physical, D>) -> EncodedInst {
     Vex::m0f_f3(0x2C).w1().rm(dst.0, addr)
-}
-
-/// `vmovq xmm, r64` — `VEX.128.66.0F.W1 6E /r`: eight bytes into the low
-/// lanes, the rest zeroed.
-#[must_use]
-fn vmovq_xmm_r64(dst: Reg, src: Gpr) -> EncodedInst {
-    Vex::m0f_66(0x6E).w1().xmm().rrr(dst.0, UNUSED_VVVV, src.0)
-}
-
-/// `vpmovzxbd ymm, xmm` — `VEX.256.66.0F38.WIG 31 /r`: eight bytes widened
-/// to eight dword lanes.
-#[must_use]
-fn vpmovzxbd(dst: Reg, src: Reg) -> EncodedInst {
-    Vex::m0f38_66(0x31).rrr(dst.0, UNUSED_VVVV, src.0)
 }
 
 /// `vextractps m32, xmm, lane` — `VEX.128.66.0F3A.WIG 17 /r ib`: one lane of
@@ -555,11 +661,18 @@ const IOTA_BYTES: u64 = 0x0706_0504_0302_0100;
 
 /// Emit a shift of i32 lanes by a compile-time immediate.
 fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount: u8) {
-    match op {
-        OpKind::Shl => vpslld_imm(code, dst.0, src.0, amount),
-        OpKind::Shr => vpsrld_imm(code, dst.0, src.0, amount),
+    let direction = match op {
+        OpKind::Shl => Direction::Left,
+        OpKind::Shr => Direction::Right,
         _ => unimplemented_op("avx2", op),
+    };
+    Inst::Shift {
+        direction,
+        dst,
+        src,
+        amount,
     }
+    .emit_into(code);
 }
 
 /// `dst = mask ? if_true : if_false` (bit-select; mask already in `dst`, same
@@ -571,9 +684,13 @@ fn emit_shift_imm(code: &mut Vec<u8>, op: OpKind, dst: Reg, src: Reg, amount: u8
 fn emit_if(code: &mut Vec<u8>, dst: Reg, if_true: Reg, if_false: Reg, tmp: Option<Reg>) {
     let tmp = super::declared_temp(tmp);
     debug_assert!(tmp.0 != dst.0 && tmp.0 != if_true.0 && tmp.0 != if_false.0);
-    vandps(code, tmp.0, dst.0, if_true.0);
-    vandnps(code, dst.0, dst.0, if_false.0);
-    vorps(code, dst.0, tmp.0, dst.0);
+    let alu = |op, dst, a, b| Inst::Alu { op, dst, a, b };
+    AsmProgram::from([
+        alu(Alu::And, tmp, dst, if_true),
+        alu(Alu::AndNot, dst, dst, if_false),
+        alu(Alu::Or, dst, tmp, dst),
+    ])
+    .assemble(code);
 }
 
 /// `vmovmskps eax, ymmSRC` — gather the 8 lane sign bits into `eax[7:0]`.
@@ -590,15 +707,6 @@ fn emit_cmp_al_imm8(code: &mut Vec<u8>, imm: u8) {
     code.push(imm);
 }
 
-/// `vfmadd231ps ymmD, ymmA, ymmB` — `dst = a*b + dst` (231 form: dst is the
-/// addend going in, `a`/`b` the product). VEX.256.66.0F38.W0 B8 /r, same
-/// opcode as `avx512.rs`'s EVEX form, just VEX-encoded at 256 bits. FMA3 is
-/// not implied by AVX2 in CPUID, which is why `crate::isa`'s x86-64 probe
-/// asks for both before this backend can be selected.
-fn vfmadd231ps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
-    assemble(c, [Vex::m0f38_66(0xB8).rrr(d, s1, s2)]);
-}
-
 /// Fused multiply-add: `dst` already holds `c`; computes `dst = a*b + dst`.
 ///
 /// Always real hardware FMA: the AVX2 tier requires FMA3 (`crate::isa`
@@ -610,7 +718,7 @@ fn vfmadd231ps(c: &mut Vec<u8>, d: u8, s1: u8, s2: u8) {
 /// Pinned as bytes by `emit::tests::muladd_encoding` and as values by
 /// `tests/muladd_rounding.rs`.
 fn emit_fmadd_c_in_dst(code: &mut Vec<u8>, dst: Reg, a: Reg, b: Reg) {
-    vfmadd231ps(code, dst.0, a.0, b.0);
+    Inst::Fma231 { acc: dst, a, b }.emit_into(code);
 }
 
 // =============================================================================
@@ -660,8 +768,13 @@ fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx: Reg, base: PtrReg, t: GatherTe
         "the truncated indices must not overwrite the float ones"
     );
     AsmProgram::from([
-        Vex::m0f_f3(0x5B).rrr(t.idx_int.0, UNUSED_VVVV, idx.0),
-        vpcmpeqd(t.mask, t.mask, t.mask),
+        Inst::Unary {
+            op: Lanewise::ToInt,
+            dst: t.idx_int,
+            src: idx,
+        }
+        .encode(),
+        Inst::Ones { dst: t.mask }.encode(),
         gather(dst, base, t.idx_int, t.mask),
     ])
     .assemble(code);
@@ -1206,8 +1319,8 @@ mod tests {
 pub(super) mod driver {
     use super::super::*;
     use super::{
-        AsmProgram, IOTA_BYTES, Mem, NoDisp, UNUSED_VVVV, Vex, frame_slot, vcvttss2si_mem,
-        vcvttss2si_xmm, vextractf128, vextractps_store, vmovq_xmm_r64, vpmovzxbd,
+        AsmProgram, IOTA_BYTES, Inst, Lanewise, Mem, NoDisp, Vex, frame_slot, vcvttss2si_mem,
+        vextractf128, vextractps_store,
     };
     use crate::emit::x86_64 as x86;
     use crate::emit::x86_64::{Convert, write_address};
@@ -1327,10 +1440,19 @@ pub(super) mod driver {
                         imm: IOTA_BYTES,
                     }
                     .emit_into(code);
+                    let (dst, src) = (*dst, gpr);
                     AsmProgram::from([
-                        vmovq_xmm_r64(*dst, gpr),
-                        vpmovzxbd(*dst, *dst),
-                        Vex::m0f(0x5B).rrr(dst.0, UNUSED_VVVV, dst.0),
+                        Inst::Movq { dst, src },
+                        Inst::Unary {
+                            op: Lanewise::WidenBytes,
+                            dst,
+                            src: dst,
+                        },
+                        Inst::Unary {
+                            op: Lanewise::FromInt,
+                            dst,
+                            src: dst,
+                        },
                     ])
                     .assemble(code);
                 }
@@ -1555,9 +1677,7 @@ pub(super) mod driver {
                 &AVX2_FILE,
                 write,
                 Convert {
-                    from_xmm: |code, dst, src| {
-                        AsmProgram::from([vcvttss2si_xmm(dst, src)]).assemble(code)
-                    },
+                    from_xmm: |code, dst, src| Inst::Cvtt { dst, src }.emit_into(code),
                     from_mem: |code, dst, addr| {
                         AsmProgram::from([vcvttss2si_mem(dst, addr)]).assemble(code)
                     },
