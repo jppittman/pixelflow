@@ -899,13 +899,10 @@ struct Constants<K> {
     entries: Vec<(Label, K)>,
 }
 
-/// One pool entry: its label (x86 reads it RIP-relative) and its byte offset
-/// in the section (aarch64 reads `[pool base, #offset]`).
+/// One pool entry: its label (x86 reads it RIP-relative).
 #[derive(Copy, Clone, Debug)]
 struct Constant {
     label: Label,
-    #[expect(dead_code, reason = "live from C4")]
-    offset: u64,
 }
 
 /// A whole kernel, in layout order.
@@ -957,8 +954,6 @@ trait IsaBackend: Sized + 'static {
     /// One pool entry: x86 `u32` (each load broadcasts a scalar), aarch64
     /// `[u32; 4]`. It occupies `size_of` bytes of the pool section.
     type Constant: Copy + Ord;
-    /// Per-function selection state: aarch64's pool-base value; `()` on x86.
-    type Anchors: Default;
     /// One IR lane value as this machine holds it: `Value<Vector>` on AVX2
     /// and NEON; a `Vector` or an `Opmask` value on AVX-512.
     type Lane: Copy;
@@ -1005,7 +1000,6 @@ trait IsaBackend: Sized + 'static {
     /// rematerializable, have no effect, and write no `Flags`: pool loads,
     /// `movi`/`fmov` immediates, `adrp+add` of a label, the zero and all-ones
     /// idioms.
-    #[expect(dead_code, reason = "live from B7")]
     fn rematerializable(inst: &Self::Inst<Selected>) -> bool;
 
     /// Rebuild `inst` at stage `T`, visiting each operand once, in field

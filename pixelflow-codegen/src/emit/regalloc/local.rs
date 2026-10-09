@@ -34,6 +34,9 @@ use core::cmp::Reverse;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(in crate::emit) enum Origin {
     Selected,
+    /// A selected constant the backend can recompute rather than store
+    /// ([`IsaBackend::rematerializable`]): `EmitTraffic`'s remats.
+    Remat,
     Spill,
     Reload,
 }
@@ -50,7 +53,7 @@ pub(in crate::emit) struct Emitted<'m, B: IsaBackend> {
 pub(in crate::emit) struct Allocated<'m, B: IsaBackend> {
     pub(in crate::emit) blocks: Vec<Block<Emitted<'m, B>>>,
     pub(in crate::emit) loops: Vec<Loop>,
-    pub(in crate::emit) constants: Constants<B::Constant>,
+    constants: Constants<B::Constant>,
     labels: Labels,
     /// The position after the last instruction, where the data section's
     /// padding begins.
@@ -266,7 +269,9 @@ fn layout(lives: &mut [Life], frame: &mut Frame) -> Result<(), CompileError> {
 /// # Panics
 /// A selection bug, never a fact about a kernel: an instruction holding more
 /// registers of a file than the file has, a `Flags` value read after another
-/// flags write, or a flags value read in another block.
+/// flags write or held to the end of its block, a branch argument that is a
+/// parameter of one of the branch's targets (a move the allocator does not
+/// order), or an entry block whose first instruction does not make the frame.
 pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
     function: Function<B>,
     pool: &'m Pool<B>,
@@ -310,6 +315,7 @@ pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
         held,
         next: function.classes.len() as u64,
         out: Vec::new(),
+        framed: false,
         at: function.blocks[0].label,
         position: 0,
     };
@@ -320,6 +326,12 @@ pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
         for pushed in block.insts {
             scan.instruction(pushed, &entry);
             scan.position += 1;
+        }
+        if let Some(&flags) = scan.held.keys().next() {
+            panic!(
+                "value {flags} is a flags value live at the end of {:?}, and no flags value is live at a label",
+                block.label
+            );
         }
         blocks.push(Block {
             label: block.label,
@@ -356,6 +368,9 @@ struct Scan<'a, 'm, B: IsaBackend> {
     /// The next value id the allocator mints.
     next: u64,
     out: Vec<Emitted<'m, B>>,
+    /// Whether an instruction placed so far asked for the frame's size, which
+    /// only `Enter` and `Ret` do.
+    framed: bool,
     /// Where the scan is, for what it says when a function cannot be allocated.
     at: Label,
     position: usize,
@@ -365,10 +380,17 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
     /// One selected instruction: its branch arguments stored, its reads
     /// reloaded, itself, its writes stored.
     fn instruction(&mut self, pushed: Pushed<B::Inst<Selected>>, entry: &[ValueName; 3]) {
-        for operand in &pushed.operands {
-            if let Operand::Target(target) = operand {
-                self.pass(target);
-            }
+        let targets: Vec<&Target> = pushed
+            .operands
+            .iter()
+            .filter_map(|operand| match operand {
+                Operand::Target(target) => Some(target),
+                Operand::Reg { .. } | Operand::Frame(_) => None,
+            })
+            .collect();
+        self.refuse_overlapping_moves(&targets);
+        for target in targets {
+            self.pass(target);
         }
         for operand in &pushed.operands {
             let Operand::Reg { value, access } = operand else {
@@ -386,18 +408,42 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
                 Operand::Reg { .. } | Operand::Target(_) | Operand::Frame(_) => None,
             })
             .collect();
+        self.place(pushed, Origin::Selected);
         if self.position == 0 {
-            // The entry block's first instruction makes the frame, so the
-            // ABI's registers are stored just after it.
+            // The ABI's registers are stored just after the frame exists, so
+            // the entry block's first instruction must be the one that makes it.
+            assert!(
+                self.framed,
+                "the entry block's first instruction does not make the frame, so the ABI registers have nowhere to be stored"
+            );
             written.extend(entry);
         }
-        self.place(pushed, Origin::Selected);
         for value in written {
             if let Some(slot) = self.lives.get(value.id as usize).and_then(|l| l.slot) {
                 self.store(value, slot);
             }
         }
         self.release();
+    }
+
+    /// Arguments are moved one at a time, through the parameters' slots, which
+    /// is a parallel move only if no argument is a parameter an earlier store
+    /// overwrote. Ordering one that is (a swap needs a cycle broken through a
+    /// fresh value) is the loops commit's; until then it is refused.
+    fn refuse_overlapping_moves(&self, targets: &[&Target]) {
+        for target in targets {
+            for arg in &target.args {
+                if let Some(other) = targets
+                    .iter()
+                    .find(|other| self.params[&other.label].contains(arg))
+                {
+                    panic!(
+                        "{arg:?} is passed to {:?} and is a parameter of {:?}, whose slot an earlier move of the same branch overwrites",
+                        target.label, other.label
+                    );
+                }
+            }
+        }
     }
 
     /// Store each of `target`'s arguments to its parameter's slot.
@@ -495,6 +541,10 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
     /// and a tied write is left in its read's register.
     fn place(&mut self, pushed: Pushed<B::Inst<Selected>>, origin: Origin) {
         let Pushed { inst, operands } = pushed;
+        let origin = match origin {
+            Origin::Selected if B::rematerializable(&inst) => Origin::Remat,
+            other => other,
+        };
         for operand in &operands {
             if let Operand::Reg {
                 value,
@@ -508,15 +558,14 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
                 );
             }
         }
-        let size = self.frame.bytes();
-        let inst = B::walk::<Bound<'m, B>>(
-            &inst,
-            &mut Binding {
-                frame: self.frame,
-                held: &self.held,
-                size,
-            },
-        );
+        let mut binding = Binding {
+            frame: self.frame,
+            held: &self.held,
+            size: self.frame.bytes(),
+            framed: false,
+        };
+        let inst = B::walk::<Bound<'m, B>>(&inst, &mut binding);
+        self.framed |= binding.framed;
         for operand in &operands {
             let Operand::Reg {
                 value,
@@ -558,6 +607,8 @@ struct Binding<'a, 'm, B: IsaBackend> {
     frame: &'m Frame,
     held: &'a BTreeMap<u64, Lent<'m, B>>,
     size: u64,
+    /// Whether the instruction asked for the frame's size.
+    framed: bool,
 }
 
 impl<'a, 'm, B: IsaBackend> Binding<'a, 'm, B> {
@@ -588,6 +639,7 @@ impl<'m, B: IsaBackend> Rebind<Bound<'m, B>> for Binding<'_, 'm, B> {
         t.label
     }
     fn frame_size(&mut self) -> u64 {
+        self.framed = true;
         self.size
     }
 }

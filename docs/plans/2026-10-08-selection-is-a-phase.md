@@ -279,8 +279,10 @@ Encoding is total and makes no choices.
 | `emit/asm.rs` | `Label`, `Labels`, `AsmProgram`, `Item`, `Encoding`, `assemble`. Imports nothing from the crate | yes |
 | `emit/build.rs` | `Def`, `Early`, `Tie`, `Builder`, `Pending`, `Spiller` | yes |
 | `emit/select.rs` | the generic selection driver, with its scoped `Bindings` | — |
-| `emit/regalloc/mod.rs` | `RegisterAllocator`, `LinearScan`, `Allocated` | — |
-| `emit/regalloc/resource.rs` | `Reg`, `Pool`, `Lease`, `In`/`Out`/`InOut`, `FrameSlot`, `Frame`, `SlotLease` | yes |
+| `emit/register_file.rs` | `RegisterFile`, `Members`, `EntryRegisters`: the declaration, with private fields and one checking constructor | yes |
+| `emit/regalloc/mod.rs` | the legacy `RegisterAllocator` and `LinearScan` (D1 deletes it) | — |
+| `emit/regalloc/local.rs` | `allocate`, `Allocated`, `Emitted`, `Origin` | — |
+| `emit/regalloc/resource.rs` | `Reg`, `Pool`, `Lease`, `Lent`, `In`/`Out`/`InOut`, `FrameSlot`, `Frame`, `SlotLease`, `MAX_FRAME`, `FRAME_OVERFLOW` | yes |
 | `emit/regalloc/policy.rs` | `EvictionRank`, carry pricing (retargeted from today's `LinearScan`) | — |
 | `emit/{x86_64,avx2,avx512,aarch64}.rs`, `emit/aarch64/table.rs` | the backends | — |
 
@@ -1082,7 +1084,7 @@ pub(in crate::emit) trait RegisterAllocator {
 pub(in crate::emit) struct Allocated<'m, B: IsaBackend> {
     pub blocks: Vec<Block<Emitted<'m, B>>>,   // no block has parameters: they are slots
     pub loops: Vec<Loop>,
-    pub constants: Constants<B::Constant>,
+    constants: Constants<B::Constant>,        // the program lays them out: `program()`
     labels: Labels,                           // the program takes them: `program()`
     pub text_end: Label,                      // where the data section's padding begins
     pub frame_bytes: u64,
@@ -1093,8 +1095,9 @@ pub(in crate::emit) struct Allocated<'m, B: IsaBackend> {
 /// `Placed` is taken: it is the encoder's stage trait.
 pub(in crate::emit) struct Emitted<'m, B: IsaBackend> { pub inst: B::Inst<Bound<'m, B>>, pub origin: Origin }
 /// Why an instruction is there. `EmitTraffic` counts these per scope and
-/// weights them by trips. B4 has `Selected`, `Spill` and `Reload`; B5 adds
-/// `Copy` and B7 `Remat`.
+/// weights them by trips. B4 has `Selected`, `Spill` and `Reload`; P7 adds
+/// `Remat`, which marks a selected `rematerializable` instruction so that the
+/// remats are true under the knob, B5 adds `Copy`, and B7 inserts `Remat`s.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(in crate::emit) enum Origin { Selected, Spill, Reload, Remat, Copy }
 ```
@@ -1120,7 +1123,7 @@ pub(in crate::emit) enum Origin { Selected, Spill, Reload, Remat, Copy }
    5. A plain write may take the lease of a read that dies at `i`. It prefers the register of the block parameter it flows to (a hint), so a latch value usually needs no back-edge copy.
    6. A write nobody reads releases its lease after `i`.
 5. **Block arguments** become a parallel move into the parameters' locations, placed before the terminator. The moves are flags-safe by type.
-   - They are sequentialized.
+   - They are sequentialized. Until B6, `allocate` stores them one at a time and refuses (panics on) an argument that is a parameter of any target of the same branch, which that order would overwrite.
    - A register cycle is broken through a fresh value, allocated like any other (closure 21, landing B6).
    - They are sound because no target parameter is live into the other successor (asserted).
 6. **Joins** are checked against §1.3's three invariants. Forward joins take the intersection of their predecessors' states, taken from snapshots recorded at each forward branch.
@@ -1588,7 +1591,7 @@ Every commit in this phase is live in production.
 
 #### B5: Residency
 
-- **Files:** `emit/regalloc/mod.rs`.
+- **Files:** `emit/regalloc/local.rs`.
 - **Change:**
   - Values stay in registers between instructions.
   - Eviction by `EvictionRank` (`policy.rs`).
@@ -1601,7 +1604,7 @@ Every commit in this phase is live in production.
 
 #### B6: Loops
 
-- **Files:** `emit/regalloc/mod.rs`, `policy.rs`.
+- **Files:** `emit/regalloc/local.rs`, `policy.rs`.
 - **Change:**
   - The carry plan (§2.11), with `CARRY_RESERVE = 7` and `GENERAL_CARRY_RESERVE = 5` as named constants documented with their derivation.
   - Head parameters live in registers or slots.
@@ -1612,7 +1615,7 @@ Every commit in this phase is live in production.
 
 #### B7: Rematerialization
 
-- **Files:** `emit/regalloc/mod.rs`, `avx2.rs` (`rematerializable`).
+- **Files:** `emit/regalloc/local.rs`, `avx2.rs` (`rematerializable`, real since P7 for `LoadConst`, `Zero` and `Ones`).
 - **Change:**
   - A rematerializable definition is placed only before a read that needs it in a register, by re-emitting it with a fresh `Def` (`Origin::Remat`). One nobody reads is never placed.
   - Its eviction is free, the remat tier of `EvictionRank`.

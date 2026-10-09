@@ -112,7 +112,7 @@ pub(in crate::emit) enum Lent<'m, B: IsaBackend> {
 }
 
 impl<B: IsaBackend> Lent<'_, B> {
-    pub(in crate::emit) fn file(&self) -> FileId {
+    pub(super) fn file(&self) -> FileId {
         match self {
             Lent::Vector(_) => FileId::Vector,
             Lent::General(_) => FileId::General,
@@ -122,7 +122,7 @@ impl<B: IsaBackend> Lent<'_, B> {
     }
 
     /// The register's hardware number, the scan's tie-break: lowest first.
-    pub(in crate::emit) fn number(&self) -> u8 {
+    pub(super) fn number(&self) -> u8 {
         match self {
             Lent::Vector(lease) => lease.number(),
             Lent::General(lease) => lease.number(),
@@ -379,7 +379,7 @@ impl Frame {
 
     /// How many slots the frame has minted: the narrow region's, then the
     /// vector region's.
-    pub(in crate::emit) fn minted(&self) -> u64 {
+    pub(super) fn minted(&self) -> u64 {
         self.slots.len() as u64
     }
 
