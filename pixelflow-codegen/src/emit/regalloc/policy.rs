@@ -1,0 +1,153 @@
+//! What the allocator prefers, apart from how it finds the registers.
+//!
+//! Two policies, both pure: what giving up a register costs
+//! ([`EvictionRank`]), and what carrying a root across a loop saves (the
+//! `*_saved` prices and [`carried`]). Neither looks at a schedule or a
+//! register, so whatever finds the registers asks them the same questions.
+
+use alloc::vec;
+use alloc::vec::Vec;
+
+use crate::program::Class;
+
+/// What it costs the instruction being placed to lose one of its own reads —
+/// the tier that outranks every kind of deferred traffic, and the reason an
+/// operand's register is a *priced* choice rather than a forbidden one.
+///
+/// Ordered cheapest first. The distinction between the two read-here cases is
+/// what makes the exhausted pool feasible: when every held register belongs to
+/// something this instruction reads, the loser has to be one of them, and only
+/// one kind of them costs no further register.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(super) enum ReadHere {
+    /// Not read by this instruction or by a guard emitted before it.
+    No,
+    /// Read here, and it is the operand the encoding consumes *from the
+    /// destination* ([`OperandSource::Destination`](super::OperandSource::Destination)): losing its register
+    /// means one reload — into `dst`, which is the register it is losing —
+    /// and no other register at all.
+    FromDst,
+    /// Read here and needs a register of its own to be read from: a reload
+    /// register the pool then has to find too, or a guard's mask register for
+    /// a branch emitted before the instruction.
+    NeedsRegister,
+}
+
+/// Whether giving up a value's register costs a store, cheapest first.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(super) enum Store {
+    /// The slot already holds the value.
+    NotNeeded,
+    /// The register holds the only copy.
+    Needed,
+}
+
+/// What giving up a register costs, cheapest first — the order eviction picks
+/// its loser in.
+///
+/// A value whose slot already holds it needs no store; anything else has to be
+/// written out. Belady's distance breaks ties *within* a tier and only within
+/// one: the traffic an eviction causes outweighs how long it waits to cause it.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct EvictionRank {
+    /// Read by the instruction being placed — see [`ReadHere`].
+    ///
+    /// The fields below price the traffic an eviction *defers*; for a value
+    /// read right here there is nothing to defer, so taking its register buys
+    /// a reload inside this very instruction. Without this, a value already in
+    /// its slot is the standing favourite — and at a read, the standing
+    /// favourite is whichever value the instruction is reading.
+    ///
+    /// Answered from the instruction's own read set, never from the read
+    /// cursor: the kept-reload step advances the cursor past the current index
+    /// (`next_read(operand, i + 1)`), so by the time the destination is
+    /// contested a just-kept operand would read as "not needed now".
+    read_here: ReadHere,
+    /// Whether losing the register costs a store: not once the slot holds
+    /// the value, which for a constant is from birth.
+    store: Store,
+    /// Nearest next read *last*, so the cheapest loser is the one used
+    /// farthest out.
+    nearest: core::cmp::Reverse<usize>,
+}
+
+impl EvictionRank {
+    /// The rank of a value read here as `read_here`, whose next read is
+    /// `distance` instructions away if it has one.
+    pub(super) fn new(read_here: ReadHere, store: Store, distance: Option<usize>) -> Self {
+        Self {
+            read_here,
+            store,
+            nearest: core::cmp::Reverse(distance.unwrap_or(usize::MAX)),
+        }
+    }
+}
+
+/// The two per-class budgets [`carried`] fills, indexed by [`Class::ix`].
+pub(super) type Budget = [usize; 2];
+
+impl Class {
+    /// This class's index into a per-class array.
+    const fn ix(self) -> usize {
+        match self {
+            Class::Vector => 0,
+            Class::Pointer => 1,
+        }
+    }
+}
+
+/// What carrying a root saves, per call, when `reads` reads of it sit in a
+/// scope that runs `trips` times: one reload per read per run.
+pub(super) const fn reads_saved(reads: usize, trips: usize) -> usize {
+    reads * trips
+}
+
+/// What carrying a loop's own binder, or its accumulator, saves per call: the
+/// trip test and the step read the binder once each per trip, and the combine
+/// reloads and stores the accumulator once each. (A `SEQ` fold's accumulator
+/// is never read or written, so it is never priced.)
+pub(super) const fn loop_state_saved(trips: usize) -> usize {
+    2 * trips
+}
+
+/// A root that could be carried, and what it would cost the scopes it is
+/// live across.
+pub(super) struct Candidate<R> {
+    pub(super) weight: usize,
+    pub(super) class: Class,
+    /// The scopes the carry is live across, by index.
+    pub(super) live_across: Vec<usize>,
+    pub(super) root: R,
+}
+
+/// The roots to carry, hottest first: the candidates by weight, then taken
+/// greedily while no scope they are live across has more of their class
+/// carried than `above_floor` allows.
+///
+/// `scopes` is how many scopes `live_across` indexes into. The sort is
+/// stable, so the order the candidates arrive in breaks ties.
+pub(super) fn carried<R>(
+    mut candidates: Vec<Candidate<R>>,
+    scopes: usize,
+    above_floor: Budget,
+) -> Vec<R> {
+    candidates.sort_by_key(|c| core::cmp::Reverse(c.weight));
+
+    let mut count: Vec<Budget> = vec![[0; 2]; scopes];
+    let mut taken = Vec::new();
+    for candidate in candidates {
+        let class = candidate.class.ix();
+        if candidate
+            .live_across
+            .iter()
+            .any(|&s| count[s][class] >= above_floor[class])
+        {
+            continue;
+        }
+        for &s in &candidate.live_across {
+            count[s][class] += 1;
+        }
+        taken.push(candidate.root);
+    }
+    taken
+}

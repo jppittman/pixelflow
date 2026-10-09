@@ -310,8 +310,8 @@ fn sibling_cases() -> Vec<SiblingRow> {
 /// One scope's counts, in a fixed order.
 fn counts(t: &ScopeTraffic) -> String {
     format!(
-        "instructions={} loads_transient={} loads_kept={} remats={} stores={} bytes={}",
-        t.instructions, t.loads_transient, t.loads_kept, t.remats, t.stores, t.bytes
+        "instructions={} loads={} remats={} stores={} bytes={}",
+        t.instructions, t.loads, t.remats, t.stores, t.bytes
     )
 }
 

@@ -10,8 +10,9 @@ use pixelflow_ir::{ExprArena, ExprId, OpKind};
 
 /// `deep_frame`'s term count: past 64 KiB of spill area on NEON, the reach of
 /// `ldr q`'s scaled 12-bit displacement (`4095 · 16`), so a vector slot's
-/// address is computed into IP0 first. The spill area alone is past it, so the
-/// whole frame is. `tests/deep_frame.rs` asserts the property, not the constant.
+/// address is computed into a register first. The spill area alone is past it,
+/// so the whole frame is. `tests/deep_frame.rs` asserts the property, not the
+/// constant.
 pub const DEEP_FRAME_TERMS: usize = 3760;
 
 /// A balanced sum: depth `log2(terms.len())`, so a thousand terms is not a

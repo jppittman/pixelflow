@@ -743,7 +743,7 @@ The regions stay a chain — they are the collapse nest, and a `Reduce` does not
 reorder them. What becomes a tree is the whole: folds hang off spine nodes, and
 off each other.
 
-**Exactly two functions carry the tree**, both in `emit/regalloc.rs`, and both
+**Exactly two functions carry the tree**, both in `emit/regalloc/mod.rs`, and both
 are today's chain assumption written down:
 
 | | today | with folds |

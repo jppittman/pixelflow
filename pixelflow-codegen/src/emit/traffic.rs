@@ -36,22 +36,10 @@ use alloc::vec::Vec;
 pub struct ScopeTraffic {
     /// Scheduled operations emitted (one per `InstructionPlan`).
     pub instructions: u64,
-    /// Stack loads emitted as part of one instruction's operand resolution:
-    /// the value is fetched into a register that instruction reserved, used,
-    /// and forgotten.
-    pub loads_transient: u64,
-    /// Stack loads the driver emits *between* instructions — a range the
-    /// allocator chose to bring back into a register the value then keeps, a
-    /// scope head's reconciliation, a guard's mask, a fold's slot-held root.
-    ///
-    /// The split is by *which emission path*, not by which register the load
-    /// targets. It used to be the latter, and that stopped being derivable
-    /// when reload targets became per-instruction reservations drawn from the
-    /// pool (#1158): every load now lands in a pool register, so the register
-    /// number no longer says what the load bought. The call site does, and it
-    /// always did — an `InstructionPlan`'s reloads serve one instruction by
-    /// definition.
-    pub loads_kept: u64,
+    /// Stack loads emitted: an instruction's operand reloads, a range brought
+    /// back into a register, a scope head's reconciliation, a guard's mask, a
+    /// fold's slot-held root.
+    pub loads: u64,
     /// Constants brought into a register from the kernel's constant pool (or
     /// an immediate, where the ISA encodes one) rather than from the frame:
     /// a load, but not of a slot this kernel wrote, which is why it is
@@ -69,7 +57,7 @@ impl ScopeTraffic {
     /// the 2026-09-04 measurements found does not predict AVX-512 time.
     #[must_use]
     const fn memory_ops(&self) -> u64 {
-        self.loads_transient + self.loads_kept + self.stores
+        self.loads + self.stores
     }
 }
 
@@ -222,7 +210,7 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         current.instructions += 1;
         for reload in &plan.reloads {
             match reload {
-                Reload::FromStack { .. } | Reload::Ptr { .. } => current.loads_transient += 1,
+                Reload::FromStack { .. } | Reload::Ptr { .. } => current.loads += 1,
                 Reload::Const { .. } => current.remats += 1,
             }
         }
@@ -254,7 +242,7 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
         locs: &[Option<Binding>],
     ) -> Result<Reg, CompileError> {
         match locs.get(vid.0 as usize).copied().flatten() {
-            Some(Binding::Loc(Loc::Slot(_))) => self.current().loads_kept += 1,
+            Some(Binding::Loc(Loc::Slot(_))) => self.current().loads += 1,
             Some(Binding::Remat(_)) => self.current().remats += 1,
             // Already in a register, or not placed at all: nothing is emitted.
             Some(Binding::Loc(Loc::Reg(_) | Loc::Ptr(_))) | None => {}
@@ -263,15 +251,14 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
     }
 
     // The pointer class's traffic is traffic: a stored address is a store, a
-    // reloaded one a kept load (it is read for the whole scope that follows,
-    // like a vector root's), a copy between registers nothing.
+    // reloaded one a load, a copy between registers nothing.
     fn ptr_store(&mut self, code: &mut Vec<u8>, src: PtrReg, offset: u32) {
         self.current().stores += 1;
         self.inner.ptr_store(code, src, offset);
     }
 
     fn ptr_load(&mut self, code: &mut Vec<u8>, dst: PtrReg, offset: u32) {
-        self.current().loads_kept += 1;
+        self.current().loads += 1;
         self.inner.ptr_load(code, dst, offset);
     }
 
@@ -312,7 +299,7 @@ impl<B: IsaBackend> IsaBackend for Counting<'_, B> {
     fn slot_load(&mut self, code: &mut Vec<u8>, dst: Reg, offset: u32) {
         // A root a fold reloads from its slot is read for the whole iteration
         // that follows it, not for one instruction.
-        self.current().loads_kept += 1;
+        self.current().loads += 1;
         self.inner.slot_load(code, dst, offset);
     }
 
@@ -511,10 +498,9 @@ mod tests {
     /// unless a test pins the exact arithmetic against values that cannot
     /// agree by coincidence.
     #[test]
-    fn memory_ops_sums_transient_loads_kept_loads_and_stores() {
+    fn memory_ops_sums_loads_and_stores() {
         let traffic = ScopeTraffic {
-            loads_transient: 3,
-            loads_kept: 5,
+            loads: 8,
             stores: 7,
             ..ScopeTraffic::default()
         };
@@ -527,16 +513,16 @@ mod tests {
     #[test]
     fn dynamic_memory_ops_weights_each_scope_by_its_trip_count() {
         let body = ScopeTraffic {
-            loads_transient: 1,
+            loads: 1,
             ..ScopeTraffic::default()
         };
         let rows = ScopeTraffic {
-            loads_transient: 2,
+            loads: 2,
             stores: 1,
             ..ScopeTraffic::default()
         };
         let cols = ScopeTraffic {
-            loads_transient: 4,
+            loads: 4,
             stores: 1,
             ..ScopeTraffic::default()
         };
@@ -599,7 +585,7 @@ mod tests {
 
         assert_eq!(traffic.instructions, 1);
         assert_eq!(
-            traffic.loads_transient, 1,
+            traffic.loads, 1,
             "a stack reload was not counted: {traffic:?}"
         );
         assert_eq!(
@@ -608,11 +594,11 @@ mod tests {
         );
     }
 
-    /// A value resolved from its spilled slot is a kept load, not a remat —
-    /// the two counters back different rows of the cost model and must not
-    /// bleed into each other.
+    /// A value resolved from its spilled slot is a load, not a remat — the two
+    /// counters back different rows of the cost model and must not bleed into
+    /// each other.
     #[test]
-    fn emit_resolve_counts_a_spilled_value_as_a_kept_load() {
+    fn emit_resolve_counts_a_spilled_value_as_a_load() {
         let mut backend = RecordingBackend::new();
         let mut counting = Counting::new(&mut backend);
         let mut code = Vec::new();
@@ -624,8 +610,8 @@ mod tests {
         let traffic = counting.take(0);
 
         assert_eq!(
-            traffic.loads_kept, 1,
-            "a value resolved from a stack slot was not counted as a kept load: {traffic:?}"
+            traffic.loads, 1,
+            "a value resolved from a stack slot was not counted as a load: {traffic:?}"
         );
         assert_eq!(traffic.remats, 0);
     }
@@ -648,7 +634,7 @@ mod tests {
             traffic.remats, 1,
             "a rematerialized constant was not counted: {traffic:?}"
         );
-        assert_eq!(traffic.loads_kept, 0);
+        assert_eq!(traffic.loads, 0);
     }
 
     /// A value already resident in a register costs nothing to resolve, so
@@ -704,8 +690,8 @@ mod tests {
             "slot_store did not count as a store: {traffic:?}"
         );
         assert_eq!(
-            traffic.loads_kept, 1,
-            "slot_load did not count as a kept load: {traffic:?}"
+            traffic.loads, 1,
+            "slot_load did not count as a load: {traffic:?}"
         );
     }
 
@@ -727,7 +713,7 @@ mod tests {
         let scopes = counting.scopes();
         assert_eq!(scopes.len(), 2);
         assert_eq!(
-            (scopes[0].0, scopes[0].1.bytes, scopes[0].1.loads_kept),
+            (scopes[0].0, scopes[0].1.bytes, scopes[0].1.loads),
             (Scope::Fold(0), 4, 1)
         );
         assert_eq!(
@@ -776,11 +762,7 @@ mod tests {
         );
         let t = &result.traffic;
         let stores: u64 = t.scopes.iter().map(|s| s.stores).sum();
-        let loads: u64 = t
-            .scopes
-            .iter()
-            .map(|s| s.loads_transient + s.loads_kept)
-            .sum();
+        let loads: u64 = t.scopes.iter().map(|s| s.loads).sum();
         let instructions: u64 = t.scopes.iter().map(|s| s.instructions).sum();
         assert!(
             stores > 0,

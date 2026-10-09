@@ -483,7 +483,7 @@
   `Reduce` arm calls (`backend.alu(…, fold.combine_op(), …)` in
   `pixelflow-codegen/src/emit/mod.rs`), and its doc cites 2a″, which decided
   the opposite. The arm also branches on `monoid != SEQ` to skip seed and
-  combine (as does `emit/regalloc.rs`). Both contradict this entry.
+  combine (as does `emit/regalloc/mod.rs`). Both contradict this entry.
 
 ### Range (trip count)
 

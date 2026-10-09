@@ -10,15 +10,14 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever a field's meaning changes, so a stale file is rejected
 /// rather than silently mixed into an analysis.
-pub const SCHEMA: &str = "collapse-cost-v1";
+pub const SCHEMA: &str = "collapse-cost-v2";
 
 /// Emitted traffic in one scope of the collapse nest.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopeRow {
     pub bytes: u64,
     pub instructions: u64,
-    pub loads_transient: u64,
-    pub loads_kept: u64,
+    pub loads: u64,
     pub remats: u64,
     pub stores: u64,
 }
@@ -28,7 +27,7 @@ impl ScopeRow {
     /// optimized.
     #[must_use]
     pub const fn memory_ops(&self) -> u64 {
-        self.loads_transient + self.loads_kept + self.stores
+        self.loads + self.stores
     }
 }
 

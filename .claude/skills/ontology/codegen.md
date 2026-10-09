@@ -49,7 +49,7 @@
   "Nothing else moves". Schedule choices make cost non-additive.
 - **Lives:** `pixelflow-codegen/src/program/mod.rs` (`Def`, `ScheduledOp`,
   `ScopedSchedule`), `program/layout.rs`. Today `ScopeCode`
-  (`emit/regalloc.rs`) says "The schedule is an *output* because choosing it
+  (`emit/regalloc/mod.rs`) says "The schedule is an *output* because choosing it
   is part of allocating", and `emit_scope` says "The allocator chooses the
   evaluation order", while `RegisterAllocator::allocate_nest` says "The nest
   is handed over finished … returns it unchanged". The docs disagree.
@@ -92,7 +92,7 @@
   placement is known. Today `place_roots` always takes the outer bound and
   reads no demand, which lifted each piece's row work above its band select
   (79% of executed instructions). Placement that reads demand is D1.
-- **Lives:** `pixelflow-codegen/src/emit/regalloc.rs` (`Placement`, `Span`,
+- **Lives:** `pixelflow-codegen/src/emit/regalloc/mod.rs` (`Placement`, `Span`,
   `Point`, `Where`), `pixelflow-codegen/src/program/scopes.rs`
   (`place_roots`); a-surviving-reduce-is-a-loop §4b; an-integral-is-a-fold
   §4.
@@ -112,7 +112,7 @@
   "still needed" by an-integral §6.6).
 - **Lives:** `ScopeRegion::roots`, `ScopeFold::roots`
   (`pixelflow-codegen/src/program/mod.rs`), `FoldRoots`
-  (`emit/regalloc.rs`), `place_roots` (`program/scopes.rs`). Today
+  (`emit/regalloc/mod.rs`), `place_roots` (`program/scopes.rs`). Today
   `program/ownership.rs` says "A scope's root is read by the scope itself,
   so no arm owns it", which contradicts the arm rule.
 
@@ -154,7 +154,7 @@
   If arms come to own roots (see Root), the zero-park rule comes back with
   them.
 - **Lives:** `NestAllocation::parks`, `Allocation::park`
-  (`pixelflow-codegen/src/emit/regalloc.rs`), `place_roots`
+  (`pixelflow-codegen/src/emit/regalloc/mod.rs`), `place_roots`
   (`program/scopes.rs`); a-surviving-reduce-is-a-loop §3a (JP: "Register
   allocation is the job of the register allocator"), R1; demand §2 "Parks";
   one-conditional §4.
@@ -174,9 +174,9 @@
   (`file.inside(carried)`). Anything inside a loop that writes a carried
   register is a miscompile visible only in pixels. The coldest root, the
   outermost accumulator, goes to a slot first.
-- **Lives:** `plan_carries`, `CarryPlan`, `Carried`, `RegisterFile::inside`,
-  the per-class `type Budget = [usize; 2]`
-  (`pixelflow-codegen/src/emit/regalloc.rs`); escape-hatches step 4;
+- **Lives:** `plan_carries`, `CarryPlan`, `Carried`, `RegisterFile::inside`
+  (`pixelflow-codegen/src/emit/regalloc/mod.rs`), the per-class
+  `type Budget = [usize; 2]` (`.../regalloc/policy.rs`); escape-hatches step 4;
   collapse-is-a-fold step 2½; a-pointer-is-a-value §2.
 
 ### Back edge (head reconciliation)
@@ -190,7 +190,7 @@
 - **Follows:** "Unexercised code that has been correct for months is not
   evidence." Either reach it with a test or show it is unneeded and delete
   it.
-- **Lives:** `pixelflow-codegen/src/emit/regalloc.rs` (`Point::TAIL`);
+- **Lives:** `pixelflow-codegen/src/emit/regalloc/mod.rs` (`Point::TAIL`);
   a-surviving-reduce-is-a-loop §4b.
 
 ### Value
@@ -237,7 +237,7 @@
   address". Loads fell from 45 per batch to 3 per call. Open: fold binders
   as integers in GPRs, the pool anchor as a value, and callee-saved GPRs.
 - **Lives:** `ScheduledOp::Context(u16)` (`pixelflow-codegen/src/program/mod.rs`),
-  `Where::Ptr`, `RegisterFile::pointers` (`emit/regalloc.rs`);
+  `Where::Ptr`, `RegisterFile::pointers` (`emit/regalloc/mod.rs`);
   `docs/plans/2026-09-22-a-pointer-is-a-value.md`.
 
 ### Constant pool (constants in codegen)
@@ -287,7 +287,7 @@
   (`pixelflow-codegen/src/emit/mod.rs`), all `Copy` with public fields, so
   any code can construct one (`POOL_BASE: PtrReg = PtrReg(8)`,
   `X17: PtrReg = PtrReg(17)`), which contradicts this entry; `RegisterFile`,
-  `RegSet`, `GprSet`, `MaskSet` (`emit/regalloc.rs`). Escape hatches:
+  `RegSet`, `GprSet`, `MaskSet` (`emit/regalloc/mod.rs`). Escape hatches:
   `docs/plans/2026-09-01-register-allocation-escape-hatches.md`. `fixed` is
   empty on every backend. The live hatch is `POOL_BASE`.
 
@@ -306,7 +306,7 @@
   fields, filled by each backend's `temps_for` in
   `pixelflow-codegen/src/emit/{avx2,avx512,aarch64}.rs`;
   `Scratch::{REDUCE_TEMPS, MAX_TEMPS}` and `RegisterFile::MIN_SCRATCH`
-  (`emit/regalloc.rs`). Today `MAX_TEMPS` is still sized for the deleted
+  (`emit/regalloc/mod.rs`). Today `MAX_TEMPS` is still sized for the deleted
   scalar-insert gather ("No encoding asks for more than two now").
   escape-hatches §A, §C, step 2.
 
@@ -322,7 +322,7 @@
   lowering traffic. Residency is final once the reader is allocated, so
   reload targets are per-instruction roles.
 - **Lives:** `Where::{Spilled, Remat}`, `LinearScan`
-  (`pixelflow-codegen/src/emit/regalloc.rs`); escape-hatches step 2 and the
+  (`pixelflow-codegen/src/emit/regalloc/mod.rs`); escape-hatches step 2 and the
   2026-09-05 block.
 
 ### Slot. Homonym
@@ -346,7 +346,7 @@
   (`pixelflow-ir/src/arena.rs`), `Binder(u8)` (`pixelflow-ir/src/fold.rs`),
   `emit::storage::Slot` (`pixelflow-codegen/src/emit/storage.rs`),
   `NestAllocation::{parks, accumulator_slots, binder_slots}`
-  (`emit/regalloc.rs`). Today `Slot::new` is a public `const fn` on a `Copy`
+  (`emit/regalloc/mod.rs`). Today `Slot::new` is a public `const fn` on a `Copy`
   type, which contradicts denotational-diagnosis step 8. `FrameLayout` was
   deleted 2026-10-06 ("The allocator lays the frame out itself").
 
@@ -361,7 +361,7 @@
   reads them and computes none").
 - **Follows:** "The frame prologue is never guarded." No per-frame heap
   allocation.
-- **Lives:** `NestAllocation::new` (`pixelflow-codegen/src/emit/regalloc.rs`),
+- **Lives:** `NestAllocation::new` (`pixelflow-codegen/src/emit/regalloc/mod.rs`),
   `StackFrame` (`emit/storage.rs`); the
   `a_folds_spill_slots_do_not_alias_its_parents` guard (`emit/mod.rs`).
 

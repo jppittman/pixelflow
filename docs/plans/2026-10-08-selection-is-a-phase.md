@@ -744,7 +744,7 @@ pub(in crate::emit) struct AsmProgram<I> {
 /// How a label field is filled once the label's address is known. The
 /// encoder that wrote the field supplies it. This is today's
 /// `LabelRef::patch` (`emit/mod.rs:310`), kept.
-pub(in crate::emit) type Patch = fn(code: &mut [u8], field: usize, target: usize);
+pub(in crate::emit) type Patch = fn(code: &mut [u8], at: usize, target: usize);
 
 /// What an encoder writes into: one instruction's bytes and its label fields.
 pub(in crate::emit) struct Encoding<'a> { /* the assembler's */ }
@@ -1200,7 +1200,7 @@ The narrowing already removes these, so they are not listed again here: `Item`, 
 **A4.**
 - `ResolvedOp::DecomposedMulAdd`, `DeferredReload`, and `operand_sources`' both-spilled `MulAdd` arm.
 - Each backend's decomposed arm.
-- The tests `decomposed_encodes_to_a_multiply_and_an_add` and `fused_encodes_to_the_targets_fma`. The latter is rewritten against the one fused form.
+- The tests `decomposed_encodes_to_a_multiply_and_an_add` and `resolve_muladd_decomposed_*`, and `a_deferred_c_is_reloaded_between_the_multiply_and_the_add`. `fused_encodes_to_the_targets_fma` is rewritten against the one fused form.
 
 **A6.** `ScopeTraffic::{loads_transient, loads_kept}`, replaced by `loads`.
 
@@ -1322,7 +1322,7 @@ cargo test --target aarch64-unknown-linux-gnu -p pixelflow-codegen   # + the V s
 
 | Crate | Suites |
 |---|---|
-| `pixelflow-codegen/tests/` | `collapse_paths`, `collapse_abi_smoke`, `halve_fold_jit`, `prod_kernel_jit`, `transcendental_jit`, `trig_range_jit`, `muladd_rounding`, `one_compile_per_shape` |
+| `pixelflow-codegen/tests/` | `collapse_paths`, `collapse_abi_smoke`, `halve_fold_jit`, `prod_kernel_jit`, `transcendental_jit`, `trig_range_jit`, `muladd_rounding`, `one_compile_per_shape`, `deep_frame`, `empty_fold` |
 | `pixelflow-core/tests/` | `fold_factoring`, `guard_fold_price`, `guard_parked_reads`, `guard_sibling_fold`, `reduce_binder_reads_bound_buffer`, `kernel_bake`, `mask_support_of_a_built_kernel` |
 | `pixelflow-graphics/tests/` | `glyph_exact_area`, `glyph_area_edge_cases`, `glyph_atlas_golden`, `freetype_oracle`, `loop_blinn_winding`, `rendering_contract`, `pixel_contract` |
 | `emit/mod.rs` | `a_surviving_reduce_compiles_and_runs` (`2624`), `a_folds_spill_slots_do_not_alias_its_parents` (`2783`), `a_reduce_three_deep_compiles_and_runs` (`2910`), `sibling_folds_sharing_a_binder_node_read_their_own_counters` (`2962`), `a_folds_roots_are_placed_by_the_budget` (`3055`), `a_fold_owned_by_an_arm_is_guarded` (`4355`), `a_deep_spill_frame_compiles_correctly` (`4797`), `a_uniform_past_the_old_u16_width_loads_on_every_backend` (`5699`) |
@@ -1362,7 +1362,7 @@ Every commit in this phase is live in production.
 
 #### A2: A label is minted with what it names
 
-- **Files:** `emit/mod.rs`, `emit/asm.rs` (new: `Label`, `Labels`, `Patch`), `x86_64.rs`, `aarch64.rs`.
+- **Files:** `emit/mod.rs`, `emit/asm.rs` (new: `Label`, `Labels`, `Patch`), `x86_64.rs`, `avx2.rs`, `avx512.rs`, `aarch64.rs`, `traffic.rs`.
 - **Change:**
   - `compile_via_backend` owns one `Labels` per function and passes `&mut Labels` into `emit_scope`.
   - Each `format!` site (`mod.rs:1439`, `1836-1837`, `1937`) mints at the point where the branch is created. The `Past` label travels in `PendingBranch` (`mod.rs:1398`) to its bind point.
@@ -1375,13 +1375,13 @@ Every commit in this phase is live in production.
 
 #### A3: An empty fold is its identity
 
-- **Files:** `program/lower.rs`.
+- **Files:** `program/lower.rs`, `pipeline.rs` (`emit::compile` refuses a zero extent: a zero-width fold reaches `lower.rs` as a body that was never mapped), `emit/mod.rs` (`GOLDEN`'s doc loses its commit hash).
 - **Change:**
   - `mark_reachable` (`lower.rs:21`) does not descend into a `Reduce` whose fold `is_empty()`.
   - The `Reduce` arm (`lower.rs:293`) lowers that fold to `Const(fold.monoid().identity())`.
-  - A `SEQ` fold is the exception, and the identity constant is not "never read": a `Seq` that names it keeps it live, and the schedule stores a dead `0.0` in the root scope (measured: one store and one instruction more at `POINT`). A `SEQ` fold over nothing has no def, and a `Seq` with such an operand is its other operand (two of them, no def at all).
+  - A `SEQ` fold is the exception, and the identity constant is not "never read": a `Seq` that names it keeps it live, and the schedule stores a dead `0.0` in the root scope (measured: one store and one instruction more at `POINT`). A `SEQ` fold over nothing has no def, and a `Seq` with such an operand is its other operand (two of them, no def at all). (P1 moved this to `pack`: the only empty `SEQ` folds that reached lowering were its empty main column fold, so `pack` no longer builds one and lowering has no `SEQ` case.)
 - **Bytes:** row 0 (`glyph_like_w1`) shrinks on all three backends (1016/984/592 to 724/676/400). It is the only row with an empty main column fold. Any other row moving is a bug in this commit.
-- **Tests:** `tests/empty_fold.rs`: through `compile`, a kernel with a surviving `SUM` at width 1 has two scopes fewer than at width 37 (the empty main column fold and the sum inside it), and its samples are the wide lattice's first column. (An empty-`SUM` test would be vacuous: the e-graph's `EmptyFold`, `fold_rules.rs:447-453`, already rewrites it.)
+- **Tests:** `tests/empty_fold.rs`: through `compile`, a kernel with a surviving `SUM` at width 1 has two scopes fewer than at width 37 (the main column fold and the sum inside it), and its samples are the wide lattice's first column; a lattice with no column is refused (`should_panic`, "degenerate extent"). (An empty-`SUM` test through the optimizer would be vacuous: the e-graph's `EmptyFold`, `fold_rules.rs:447-453`, already rewrites it. P1 added one through `emit::compile`, which does not optimize.)
 - **Gate:** V, plus a row-0 re-baseline.
 
 #### A4: `MulAdd` always fuses
@@ -1391,7 +1391,7 @@ Every commit in this phase is live in production.
 - **Values:**
   - One rounding on every target, which matches the folder's `libm::fmaf`.
   - `a_spilled_muladd_rounds_twice_on_every_target` becomes `…_rounds_once_on_every_target`, asserting the fused bits.
-  - The two `resolve_muladd_decomposed_*` tests become `resolve_muladd_fuses_with_both_multiplicands_spilled` and `resolve_muladd_reloads_a_spilled_addend_into_dst`; `a_deferred_c_is_reloaded_between_the_multiply_and_the_add` goes with `DeferredReload`.
+  - The two `resolve_muladd_decomposed_*` tests become `resolve_muladd_fuses_with_both_multiplicands_spilled` and `resolve_muladd_reloads_a_spilled_addend_into_dst`; `a_deferred_c_is_reloaded_between_the_multiply_and_the_add` goes with `DeferredReload`. (P1 deleted the two in-file tests: they called crate-private `resolve_operands`, and `a_spilled_muladd_rounds_once_on_every_target` now shows the multiplicands' store and reload through `EmitTraffic`.)
   - CLAUDE.md's `MulAdd` row loses "two only where the emitter decomposes it".
 - **Bytes:** only kernels where both multiplicands of a `MulAdd` were non-resident. GOLDEN and `glyph_branches` are identical; the chrome sphere in `the_scenes_emit_their_pinned_code` keeps its length on every tier and changes its digest (a different register holds the multiply's inputs).
 - **Gate:** V, plus a re-baseline of those cells.
@@ -1406,7 +1406,7 @@ Every commit in this phase is live in production.
 
 #### A6: One `loads` count
 
-- **Files:** `emit/traffic.rs`, and in `pixelflow-pipeline`: `collapse_bench/{mod.rs, row.rs, predict.rs}`, `bin/corpus_gaps.rs`.
+- **Files:** `emit/traffic.rs`, and in `pixelflow-pipeline`: `collapse_bench/{mod.rs, row.rs, predict.rs}`. (`bin/corpus_gaps.rs` names neither field.)
 - **Change:**
   - `ScopeTraffic::{loads_transient, loads_kept}` become `loads`.
   - `memory_ops` is `loads + stores`.
@@ -1418,7 +1418,7 @@ Every commit in this phase is live in production.
 #### A7: The allocator's policies stand alone
 
 - **Files:** `emit/regalloc.rs` becomes `emit/regalloc/mod.rs`; new `emit/regalloc/policy.rs`.
-- **Move:** `EvictionRank`, and the pure pricing inside `plan_carries` (`regalloc.rs:1940`): reads × trips, the latch copy, the budget order. The legacy pipeline calls them from their new home.
+- **Move:** `EvictionRank` with `ReadHere` (built by `EvictionRank::new`, its fields private), and the pure pricing inside `plan_carries`: `reads_saved` (reads × trips), `loop_state_saved` (a binder's or an accumulator's two accesses per trip), `Candidate` and `carried` (the budget order). The legacy pipeline calls them from their new home. B6's one latch copy per trip for a head parameter is a new pricing beside `loop_state_saved`, not a move.
 - **Bytes:** identical.
 - **Gate:** G.
 

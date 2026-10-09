@@ -137,24 +137,22 @@ fn an_unspilled_muladd_rounds_once() {
     // wraps every kernel in them, even a one-point one) costing a nominal
     // slot the emitted code never touches, not register pressure from this
     // scenario's operands — see this file's final report for the finding.
-    // The property this test actually needs — that the multiplicands reach
-    // the backend live in registers rather than reloaded — is what the bit
-    // check below proves: only the fused, single-rounding form produces
-    // `fused(A, B, C)`.
+    // Only the fused, single-rounding form produces `fused(A, B, C)`.
     let got = eval_point(&result.code, A, B, &[C]);
     assert_bits("fused MulAdd", got, fused(A, B, C));
 }
 
 /// Under enough register pressure that `a` and `b` cannot both stay in
 /// registers, the node still rounds once: both multiplicands are reloaded
-/// for the FMA, and the addend reloads into the destination.
+/// for the FMA.
 ///
 /// The wall below is sized past every tier's whole pool, so the production
 /// compile reaches the pressure at every width rather than at whichever one
 /// the scenario happened to suit.
 ///
 /// Three things the scenario has to get right, and each has been the reason
-/// an earlier version of it quietly tested the fused arm instead:
+/// an earlier version of it quietly tested a `MulAdd` whose multiplicands were
+/// in registers instead:
 ///
 /// - **Both multiplicands vary along the column.** A value the lattice's
 ///   column fold does not vary — `Y + Y`, a uniform — is a root the emitter
@@ -186,15 +184,20 @@ fn an_unspilled_muladd_rounds_once() {
 ///   evaluate: `(l − r) − (l − r)` was folded to one constant and left no
 ///   wall at all.
 ///
-/// That pressure was actually created is read from the emitted traffic — a
-/// value stored to the stack — not from `spill_count`, which counts the
-/// frame's slots and is nonzero for every kernel at a one-point lattice.
+/// That the multiplicands were spilled and reloaded is read from the emitted
+/// traffic, not from `spill_count`, which counts the frame's slots and is
+/// nonzero for every kernel at a one-point lattice: the same wall without the
+/// `MulAdd` is compiled too, and the `MulAdd`'s kernel does at least the
+/// multiplicands' store and reload more.
 #[test]
 fn a_spilled_muladd_rounds_once_on_every_target() {
     /// Terms in the wall: each is live from its first sum to its second, so
     /// this many outlast the widest tier's whole register pool (AVX-512's
     /// thirty-two `zmm`s).
     const WALL_TERMS: u32 = 48;
+    /// What the two multiplicands cost the wall's own traffic: a store each,
+    /// where they are defined, and a reload each, at the `MulAdd`.
+    const MULTIPLICAND_TRAFFIC: u64 = 4;
 
     fn chain(a: &mut ExprArena, terms: &[ExprId]) -> ExprId {
         terms[1..]
@@ -202,35 +205,52 @@ fn a_spilled_muladd_rounds_once_on_every_target() {
             .fold(terms[0], |acc, &t| a.push_binary(OpKind::Add, acc, t))
     }
 
-    let mut a = ExprArena::new();
-    let x = a.push_var(0);
-    let y = a.push_var(1);
-    let z = arg_leaf(&mut a);
-    let w = arg_leaf(&mut a);
+    /// The wall and the multiplicands, as one arena, rooted at the `MulAdd`
+    /// or, for the baseline, at the addend alone.
+    fn scenario(root_is_muladd: bool) -> (ExprArena, ExprId) {
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let y = a.push_var(1);
+        let z = arg_leaf(&mut a);
+        let w = arg_leaf(&mut a);
 
-    let ma = a.push_binary(OpKind::Add, x, x);
-    let yy = a.push_binary(OpKind::Add, y, y);
-    let xw = a.push_binary(OpKind::Mul, x, w);
-    let mb = a.push_binary(OpKind::Add, yy, xw);
+        let ma = a.push_binary(OpKind::Add, x, x);
+        let yy = a.push_binary(OpKind::Add, y, y);
+        let xw = a.push_binary(OpKind::Mul, x, w);
+        let mb = a.push_binary(OpKind::Add, yy, xw);
 
-    let wall: Vec<ExprId> = (1..=WALL_TERMS)
-        .map(|i| {
-            let c = a.push_const(i as f32);
-            let xi = a.push_binary(OpKind::Add, x, c);
-            a.push_binary(OpKind::Mul, xi, w)
-        })
-        .collect();
-    let forward = chain(&mut a, &wall);
-    let reversed: Vec<ExprId> = wall.iter().rev().copied().collect();
-    let backward = chain(&mut a, &reversed);
-    let addend = a.push_binary(OpKind::Add, z, forward);
-    let addend = a.push_binary(OpKind::Add, addend, backward);
-    let root = a.push_ternary(OpKind::MulAdd, ma, mb, addend);
+        let wall: Vec<ExprId> = (1..=WALL_TERMS)
+            .map(|i| {
+                let c = a.push_const(i as f32);
+                let xi = a.push_binary(OpKind::Add, x, c);
+                a.push_binary(OpKind::Mul, xi, w)
+            })
+            .collect();
+        let forward = chain(&mut a, &wall);
+        let reversed: Vec<ExprId> = wall.iter().rev().copied().collect();
+        let backward = chain(&mut a, &reversed);
+        let addend = a.push_binary(OpKind::Add, z, forward);
+        let addend = a.push_binary(OpKind::Add, addend, backward);
+        let root = match root_is_muladd {
+            true => a.push_ternary(OpKind::MulAdd, ma, mb, addend),
+            false => addend,
+        };
+        (a, root)
+    }
 
-    let result =
-        compile(&a, root, pixelflow_ir::LatticeShape::POINT).expect("compile spilled MulAdd");
-    let stores: u64 = result.traffic.scopes.iter().map(|s| s.stores).sum();
-    assert!(stores > 0, "scenario failed to create register pressure");
+    let shape = pixelflow_ir::LatticeShape::POINT;
+    let (a, root) = scenario(true);
+    let result = compile(&a, root, shape).expect("compile spilled MulAdd");
+    let (wall_only, wall_root) = scenario(false);
+    let wall = compile(&wall_only, wall_root, shape).expect("compile the wall alone");
+    assert!(
+        result.traffic.dynamic_memory_ops()
+            >= wall.traffic.dynamic_memory_ops() + MULTIPLICAND_TRAFFIC,
+        "the multiplicands were not spilled and reloaded: {} memory operations \
+         with the MulAdd, {} for the wall alone",
+        result.traffic.dynamic_memory_ops(),
+        wall.traffic.dynamic_memory_ops()
+    );
     let got = eval_point(&result.code, HALF_A, HALF_B, &[C, 0.0]);
     assert_bits("spilled MulAdd", got, fused(A, B, C));
 }

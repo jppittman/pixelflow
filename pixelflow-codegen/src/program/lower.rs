@@ -9,7 +9,7 @@
 use alloc::vec::Vec;
 
 use pixelflow_ir::arena::UniformId;
-use pixelflow_ir::fold::{Binder, Monoid};
+use pixelflow_ir::fold::Binder;
 use pixelflow_ir::kind::OpKind;
 
 use super::{Def, ScheduledOp, ValueId};
@@ -136,7 +136,6 @@ pub(crate) fn arena_to_schedule(
     let mut id_map = alloc::vec![ValueId(u64::MAX); len];
     let mut schedule = Vec::new();
     let mut next_id = 0;
-    let mut nothing = alloc::vec![false; len];
 
     let buffers = u16::try_from(arena.buffers().len())
         .expect("buffer table index fits the context slot immediate");
@@ -153,18 +152,6 @@ pub(crate) fn arena_to_schedule(
         let expr_id = ExprId(idx as u32);
         let node = arena.node(expr_id);
         if let ExprNode::Write { .. } = node {
-            continue;
-        }
-        // A `SEQ` fold over nothing is no effect and has no def; a `Seq` of
-        // it is its other operand. (As a constant it would be a value nothing
-        // reads, stored all the same.)
-        let does_nothing = match node {
-            ExprNode::Reduce { fold, .. } => fold.is_empty() && fold.monoid() == Monoid::SEQ,
-            ExprNode::Binary(OpKind::Seq, a, b) => nothing[a.0 as usize] && nothing[b.0 as usize],
-            _ => false,
-        };
-        if does_nothing {
-            nothing[idx] = true;
             continue;
         }
 
@@ -266,12 +253,6 @@ pub(crate) fn arena_to_schedule(
                  either eliminates Dwrt or refuses to compile, so a survivor \
                  means this schedule was built without the lowering pipeline."
             ),
-            ExprNode::Binary(OpKind::Seq, a, b)
-                if nothing[a.0 as usize] || nothing[b.0 as usize] =>
-            {
-                id_map[idx] = map_child(if nothing[a.0 as usize] { b } else { a });
-                continue;
-            }
             ExprNode::Binary(OpKind::Seq, a, b) => ScheduledOp::Seq(map_child(a), map_child(b)),
             ExprNode::Binary(op, a, b) => ScheduledOp::Binary(op, map_child(a), map_child(b)),
             ExprNode::Ternary(op, a, b, c) => {

@@ -150,6 +150,7 @@ pub(super) fn def_cycles(def: &Def, folds: &FoldReads, cycles: &CostModel) -> us
         ScheduledOp::Var(_)
         | ScheduledOp::Lanes(_)
         | ScheduledOp::Const(_)
+        | ScheduledOp::Outer(_)
         | ScheduledOp::Seq(..) => 0,
         // One store, priced as the load a gather is.
         ScheduledOp::Write { .. } => cycles.cost(OpKind::RawGather),

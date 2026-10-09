@@ -280,7 +280,7 @@ fn a_path_scoped_rule_reads_only_the_paths_it_names_from_the_repository_root() {
         ]
     );
     assert_eq!(
-        reads("pixelflow-codegen/src/emit/regalloc.rs"),
+        reads("pixelflow-codegen/src/emit/regalloc/mod.rs"),
         ["no-terminal-logic-in-pixelflow"]
     );
     assert!(reads("core-term/src/main.rs").is_empty());

@@ -268,7 +268,7 @@
   (`pixelflow-search/src/egraph/saturate.rs`); `Budget`
   (`pixelflow-search/src/egraph/optimizer.rs`) — not the allocator's
   unrelated `type Budget = [usize; 2]`, the carry budget per register class
-  in `pixelflow-codegen/src/emit/regalloc.rs`;
+  in `pixelflow-codegen/src/emit/regalloc/policy.rs`;
   `2026-09-01-production-budget-determinism.md` (revised 2026-09-08,
   unpinned 2026-09-29); CLAUDE.md "A kernel built differently on two
   machines?".
