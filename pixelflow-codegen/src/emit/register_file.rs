@@ -3,7 +3,6 @@
 //! A leaf module: [`RegisterFile`]'s fields are private to it and its one
 //! constructor checks, so a declaration that contradicts itself does not
 //! exist for `Pool::mint` or `Leases::new` to trust.
-#![expect(dead_code, reason = "live from B4")]
 
 use super::FileId;
 

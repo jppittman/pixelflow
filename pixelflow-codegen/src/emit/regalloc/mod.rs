@@ -21,6 +21,7 @@ use crate::program::IfGuard;
 use crate::program::{Class, all_operands, pointer_operand};
 pub(super) use crate::program::{Def, Scope, ScopedSchedule, ValueId, operands};
 
+pub(super) mod local;
 mod policy;
 pub(super) mod resource;
 use policy::{Budget, Candidate, EvictionRank, ReadHere, Store};

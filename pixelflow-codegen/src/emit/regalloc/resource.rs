@@ -5,10 +5,9 @@
 //! [`Out`] or [`InOut`] only from a lease, so a register chosen anywhere but
 //! the allocator does not compile. Values and labels are names and copy;
 //! these are resources and move.
-#![expect(dead_code, reason = "live from B4")]
 
 use crate::emit::{
-    Class, ClassId, File, FlagsFile, GeneralFile, IsaBackend, OpmaskFile, VectorFile,
+    Class, ClassId, File, FileId, FlagsFile, GeneralFile, IsaBackend, OpmaskFile, VectorFile,
 };
 use crate::error::CompileError;
 use alloc::boxed::Box;
@@ -79,7 +78,7 @@ impl<B: IsaBackend> Pool<B> {
 /// owns a lease, binding a value moves the lease into the value's state, and
 /// eviction and death move it back. So two live values in one register is
 /// unrepresentable in the scan's state.
-pub(super) struct Lease<'m, B: IsaBackend, F: File>(&'m Reg<B, F>);
+pub(in crate::emit) struct Lease<'m, B: IsaBackend, F: File>(&'m Reg<B, F>);
 
 impl<'m, B: IsaBackend, F: File> Lease<'m, B, F> {
     fn number(&self) -> u8 {
@@ -99,6 +98,43 @@ impl<'m, B: IsaBackend, F: File> Lease<'m, B, F> {
     /// The register as a read the instruction overwrites in place.
     pub(super) fn tie<C: Class<File = F>>(&self) -> InOut<'m, B, C> {
         InOut(self.0, PhantomData)
+    }
+}
+
+/// A lease whose file is a run-time fact: what the scan, which meets values of
+/// every class, holds. [`File::lease`] gets the typed lease back where an
+/// instruction field has a class.
+pub(in crate::emit) enum Lent<'m, B: IsaBackend> {
+    Vector(Lease<'m, B, VectorFile>),
+    General(Lease<'m, B, GeneralFile>),
+    Opmask(Lease<'m, B, OpmaskFile>),
+    Flags(Lease<'m, B, FlagsFile>),
+}
+
+impl<B: IsaBackend> Lent<'_, B> {
+    pub(in crate::emit) fn file(&self) -> FileId {
+        match self {
+            Lent::Vector(_) => FileId::Vector,
+            Lent::General(_) => FileId::General,
+            Lent::Opmask(_) => FileId::Opmask,
+            Lent::Flags(_) => FileId::Flags,
+        }
+    }
+
+    /// The register's hardware number, the scan's tie-break: lowest first.
+    pub(in crate::emit) fn number(&self) -> u8 {
+        match self {
+            Lent::Vector(lease) => lease.number(),
+            Lent::General(lease) => lease.number(),
+            Lent::Opmask(lease) => lease.number(),
+            Lent::Flags(lease) => lease.number(),
+        }
+    }
+}
+
+impl<B: IsaBackend> core::fmt::Debug for Lent<'_, B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?} register {}", self.file(), self.number())
     }
 }
 
@@ -183,13 +219,12 @@ deref_to_reg!(In, Out, InOut);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(in crate::emit) struct SlotName(u64);
 
-/// A frame slot: `bytes` at `offset` from the stack pointer. A resource like
+/// A frame slot: at `offset` from the stack pointer. A resource like
 /// [`Reg`]: not `Copy`, not `Clone`, minted only by [`Frame`], at an offset
 /// fixed for its life.
 pub(in crate::emit) struct FrameSlot {
     name: SlotName,
     offset: u64,
-    bytes: u64,
 }
 
 impl FrameSlot {
@@ -198,10 +233,6 @@ impl FrameSlot {
     /// `reload` turn an offset that does not fit into address arithmetic.
     pub(in crate::emit) fn offset(&self) -> u64 {
         self.offset
-    }
-
-    pub(in crate::emit) fn bytes(&self) -> u64 {
-        self.bytes
     }
 
     pub(in crate::emit) fn name(&self) -> SlotName {
@@ -288,19 +319,15 @@ impl Frame {
         self.narrow = peak;
         self.vector_start = align_up(peak * NARROW_BYTES, SP_ALIGN.max(self.vector_bytes));
         for offset in (0..peak).map(|i| i * NARROW_BYTES) {
-            self.mint(offset, NARROW_BYTES);
+            self.mint(offset);
         }
         self.free_narrow = self.slots.iter().map(FrameSlot::name).collect();
         Ok(())
     }
 
-    fn mint(&mut self, offset: u64, bytes: u64) -> SlotName {
+    fn mint(&mut self, offset: u64) -> SlotName {
         let name = SlotName(self.slots.len() as u64);
-        self.slots.push(FrameSlot {
-            name,
-            offset,
-            bytes,
-        });
+        self.slots.push(FrameSlot { name, offset });
         name
     }
 
@@ -328,7 +355,7 @@ impl Frame {
                     if offset + self.vector_bytes > u64::from(MAX_FRAME) {
                         return Err(CompileError::BudgetExceeded(FRAME_OVERFLOW));
                     }
-                    self.mint(offset, self.vector_bytes)
+                    self.mint(offset)
                 }
             },
         };
@@ -348,6 +375,12 @@ impl Frame {
             &mut self.free_vector
         };
         free.insert(slot.name);
+    }
+
+    /// How many slots the frame has minted: the narrow region's, then the
+    /// vector region's.
+    pub(in crate::emit) fn minted(&self) -> u64 {
+        self.slots.len() as u64
     }
 
     pub(in crate::emit) fn slot(&self, name: SlotName) -> &FrameSlot {

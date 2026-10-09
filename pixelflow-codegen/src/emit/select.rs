@@ -5,9 +5,9 @@
 //! backend's [`IsaBackend::Lane`] and hands lanes back, never looking inside
 //! one. What it owns is the shape: the body, each surviving fold as a loop of
 //! blocks, and the lattice's store.
-#![expect(dead_code, reason = "live from B4")]
 
 use super::build::Builder;
+use super::traffic::scope_ix;
 use super::{
     Edges, Entry, Function, IsaBackend, LaneOp, Pointer, Store, Target, Test, Value,
     unimplemented_op,
@@ -38,10 +38,13 @@ pub(super) fn select<B: IsaBackend>(scoped: &ScopedSchedule) -> Result<Function<
         frames: Vec::new(),
         binders: Vec::new(),
         loops: Vec::new(),
+        scheduled: alloc::vec![0; scoped.folds.len() + 1],
     };
     selector.scope(Scope::Body)?;
     B::ret(&mut selector.b);
-    Ok(selector.b.finish())
+    let mut function = selector.b.finish();
+    function.scheduled = selector.scheduled;
+    Ok(function)
 }
 
 /// The loop nest as it is entered: one binding frame per open scope, and the
@@ -60,6 +63,8 @@ struct Selector<'s, B: IsaBackend> {
     /// Each open loop's index in the function's loops, and how many times its
     /// body runs per call.
     loops: Vec<(usize, u64)>,
+    /// Scheduled ops selected, per scope.
+    scheduled: Vec<u64>,
 }
 
 /// What one scope has defined. An operand knows by position which class it
@@ -92,6 +97,17 @@ impl<B: IsaBackend> Selector<'_, B> {
         };
         self.frames.push(Frame::new());
         for (at, def) in schedule.iter().enumerate() {
+            // A placeholder, a sequence and a binder's alias select nothing;
+            // a `Reduce` counts once it is known to open a loop.
+            if !matches!(
+                def.op,
+                ScheduledOp::Outer(_)
+                    | ScheduledOp::Seq(..)
+                    | ScheduledOp::Var(_)
+                    | ScheduledOp::Reduce(..)
+            ) {
+                self.scheduled[scope_ix(scope)] += 1;
+            }
             let value = match &def.op {
                 // Computed by an enclosing scope, which bound it there.
                 ScheduledOp::Outer(_) => continue,
@@ -124,6 +140,7 @@ impl<B: IsaBackend> Selector<'_, B> {
                     else {
                         continue;
                     };
+                    self.scheduled[scope_ix(scope)] += 1;
                     match self.fold(scope, j, *fold)? {
                         Some(result) => result,
                         None => continue,

@@ -332,7 +332,10 @@
   reload targets are per-instruction roles.
 - **Lives:** `Where::{Spilled, Remat}`, `LinearScan`
   (`pixelflow-codegen/src/emit/regalloc/mod.rs`); escape-hatches step 2 and the
-  2026-09-05 block.
+  2026-09-05 block. The selection pipeline's first allocator,
+  `regalloc::local::allocate`, is this taken to its limit: every value is
+  stored at its definition and reloaded at every read, so nothing is in a
+  register across an instruction but a `Flags` value.
 
 ### Slot. Homonym
 
@@ -372,7 +375,10 @@
   allocation.
 - **Lives:** `NestAllocation::new` (`pixelflow-codegen/src/emit/regalloc/mod.rs`),
   `StackFrame` (`emit/storage.rs`); the
-  `a_folds_spill_slots_do_not_alias_its_parents` guard (`emit/mod.rs`).
+  `a_folds_spill_slots_do_not_alias_its_parents` guard (`emit/mod.rs`). The
+  selection pipeline's is `regalloc::resource::Frame`, laid out by
+  `regalloc::local::allocate` from value intervals before any instruction is
+  bound.
 
 ### Arm ownership. Homonym of Arm
 
@@ -664,4 +670,7 @@
   (`pixelflow-codegen/src/isa/mod.rs`), `emit::compile_native`
   (`pub(crate)`, `emit/mod.rs`, which calls `detect()` itself);
   `2026-09-22-the-isa-is-decided-at-startup.md`; CLAUDE.md "SIMD Backend
-  Selection".
+  Selection". While the selection series is in flight, `PIXELFLOW_CODEGEN=
+  legacy|selection` (default `legacy`, read once like `detect`) picks the
+  pipeline per process, and `selection` on a tier with no selection backend is
+  refused, never downgraded (`emit::pipeline`).

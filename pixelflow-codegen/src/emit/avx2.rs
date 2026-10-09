@@ -1447,6 +1447,10 @@ impl IsaBackend for Avx2 {
     fn encode(inst: &Op<Bound<'_, Self>>, out: &mut Encoding<'_>) {
         inst.assemble(out);
     }
+
+    fn constant_bytes(constant: u32) -> Vec<u8> {
+        constant.to_le_bytes().to_vec()
+    }
 }
 
 #[cfg(test)]

@@ -86,7 +86,7 @@ pub use traffic::{EmitTraffic, ScopeTraffic};
 
 use asm::{Encoding, Item, Label, Labels, Patch};
 use encoded::EncodedInst;
-use regalloc::resource::{FrameSlot, In, InOut, Out, SlotName};
+use regalloc::resource::{FrameSlot, In, InOut, Lease, Lent, Out, SlotName};
 use register_file::RegisterFile;
 use storage::{Slot, StackFrame};
 
@@ -401,9 +401,14 @@ mod sealed {
 /// A physical register file of the machine. Sealed: these four are all any
 /// target here has. A backend whose machine lacks one declares it empty, and
 /// no instruction of that backend has a field in it.
-#[expect(dead_code, reason = "live from B4")]
-trait File: sealed::File + 'static {
+trait File: sealed::File + Sized + 'static {
     const ID: FileId;
+    /// The lease of this file that `lent` is, whose file was chosen at run
+    /// time.
+    ///
+    /// # Panics
+    /// If `lent` is a lease of another file.
+    fn lease<'a, 'm, B: IsaBackend>(lent: &'a Lent<'m, B>) -> &'a Lease<'m, B, Self>;
 }
 
 /// `ymm`, `zmm`, `v`.
@@ -418,7 +423,6 @@ enum FlagsFile {}
 
 /// A [`File`] as data.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[expect(dead_code, reason = "live from B4")]
 enum FileId {
     Vector,
     General,
@@ -433,15 +437,39 @@ impl sealed::File for FlagsFile {}
 
 impl File for VectorFile {
     const ID: FileId = FileId::Vector;
+    fn lease<'a, 'm, B: IsaBackend>(lent: &'a Lent<'m, B>) -> &'a Lease<'m, B, Self> {
+        match lent {
+            Lent::Vector(lease) => lease,
+            other => panic!("{other:?} is not a lease of the vector file"),
+        }
+    }
 }
 impl File for GeneralFile {
     const ID: FileId = FileId::General;
+    fn lease<'a, 'm, B: IsaBackend>(lent: &'a Lent<'m, B>) -> &'a Lease<'m, B, Self> {
+        match lent {
+            Lent::General(lease) => lease,
+            other => panic!("{other:?} is not a lease of the general file"),
+        }
+    }
 }
 impl File for OpmaskFile {
     const ID: FileId = FileId::Opmask;
+    fn lease<'a, 'm, B: IsaBackend>(lent: &'a Lent<'m, B>) -> &'a Lease<'m, B, Self> {
+        match lent {
+            Lent::Opmask(lease) => lease,
+            other => panic!("{other:?} is not a lease of the opmask file"),
+        }
+    }
 }
 impl File for FlagsFile {
     const ID: FileId = FileId::Flags;
+    fn lease<'a, 'm, B: IsaBackend>(lent: &'a Lent<'m, B>) -> &'a Lease<'m, B, Self> {
+        match lent {
+            Lent::Flags(lease) => lease,
+            other => panic!("{other:?} is not a lease of the flags file"),
+        }
+    }
 }
 
 /// A [`Class`] as data.
@@ -452,6 +480,18 @@ enum ClassId {
     Integer,
     Opmask,
     Flags,
+}
+
+impl ClassId {
+    /// The register file a value of this class lives in.
+    fn file(self) -> FileId {
+        match self {
+            ClassId::Vector => FileId::Vector,
+            ClassId::Pointer | ClassId::Integer => FileId::General,
+            ClassId::Opmask => FileId::Opmask,
+            ClassId::Flags => FileId::Flags,
+        }
+    }
 }
 
 /// One batch of `f32` lanes, which on a machine with one lane file is also a
@@ -515,7 +555,6 @@ impl Class for Opmask {
 /// allocator's own verbs ([`IsaBackend::copy`], [`spill`](IsaBackend::spill),
 /// [`reload`](IsaBackend::reload)) do not accept it: calling one with `Flags` is
 /// a type error.
-#[expect(dead_code, reason = "live from B4")]
 trait Spill: Class {}
 
 impl Spill for Vector {}
@@ -603,7 +642,6 @@ impl Placed for Physical {
 ///
 /// Minted by [`build::Builder`], whose `Def` is the right to define one.
 #[derive(Copy, Clone, Debug)]
-#[expect(dead_code, reason = "live from B4")]
 struct Value<C: Class> {
     id: u64,
     _class: PhantomData<C>,
@@ -611,7 +649,6 @@ struct Value<C: Class> {
 
 impl<C: Class> Value<C> {
     /// The same name with its class as data.
-    #[expect(dead_code, reason = "live from B4")]
     fn name(self) -> ValueName {
         ValueName {
             id: self.id,
@@ -622,7 +659,6 @@ impl<C: Class> Value<C> {
 
 /// The same name with its class as data: the allocator's view.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[expect(dead_code, reason = "live from B4")]
 struct ValueName {
     id: u64,
     class: ClassId,
@@ -644,7 +680,6 @@ impl ValueName {
 
 /// The stage selection builds at: operands are names, and the rights to
 /// define them.
-#[expect(dead_code, reason = "live from B4")]
 enum Selected {}
 
 impl Stage for Selected {
@@ -661,12 +696,10 @@ impl Stage for Selected {
 /// The frame's size, as an operand of `Enter` and `Ret`: not known until the
 /// allocator has laid the frame out.
 #[derive(Copy, Clone, Debug)]
-#[expect(dead_code, reason = "live from B4")]
 struct FrameSize;
 
 /// A stage whose fields hold nothing: what [`IsaBackend::walk`] builds when
 /// only the traversal matters.
-#[expect(dead_code, reason = "live from B4")]
 enum Observed {}
 
 impl Stage for Observed {
@@ -681,7 +714,6 @@ impl Stage for Observed {
 
 /// The stage allocation builds: borrowed tokens, borrowed slots, block
 /// arguments already placed as moves, and the frame's size.
-#[expect(dead_code, reason = "live from B4")]
 struct Bound<'m, B>(core::convert::Infallible, PhantomData<&'m fn() -> B>);
 
 impl<'m, B: IsaBackend> Stage for Bound<'m, B> {
@@ -721,7 +753,6 @@ impl<'m, B: IsaBackend> Placed for Bound<'m, B> {
 /// How an instruction is rebuilt at stage `T`, one operand at a time. Each
 /// method is the only way to turn its kind of field into `T`'s, so `walk` can
 /// neither misreport an access nor skip a register.
-#[expect(dead_code, reason = "live from B4")]
 trait Rebind<T: Stage> {
     fn read<C: Class>(&mut self, v: Value<C>) -> T::Read<C>;
     fn write<C: Class>(&mut self, d: &build::Def<C>) -> T::Write<C>;
@@ -735,7 +766,6 @@ trait Rebind<T: Stage> {
 /// How an instruction touches a register operand. A `Tie` yields two
 /// entries: `Read`, and a `Tied` write naming that read's entry.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[expect(dead_code, reason = "live from B4")]
 enum Access {
     Read,
     Write,
@@ -758,7 +788,7 @@ impl Access {
 /// One operand, as the allocator and the CFG read it. Immediates are typed
 /// fields no phase before encoding reads, and an address is a composite
 /// whose registers are listed here as reads.
-#[expect(dead_code, reason = "live from B4")]
+#[derive(Debug)]
 enum Operand {
     Reg {
         value: ValueName,
@@ -774,7 +804,6 @@ enum Operand {
 /// Every operand of `inst`, in walk order: `walk` at a stage whose fields are
 /// `()`, recording as it goes. The operand list and the binding are one
 /// traversal, so they cannot disagree.
-#[expect(dead_code, reason = "live from B4")]
 fn operands<B: IsaBackend>(inst: &B::Inst<Selected>) -> Vec<Operand> {
     struct Recorder(Vec<Operand>);
 
@@ -819,7 +848,6 @@ fn operands<B: IsaBackend>(inst: &B::Inst<Selected>) -> Vec<Operand> {
 /// A label operand before allocation: where to go, and the values for the
 /// target's parameters, in order.
 #[derive(Clone, Debug)]
-#[expect(dead_code, reason = "live from B4")]
 struct Target {
     label: Label,
     args: Vec<ValueName>,
@@ -828,14 +856,12 @@ struct Target {
 /// An instruction and its [`operands`], computed once when selection pushed
 /// it. The list is the instruction's own, so no entry holds one without the
 /// other.
-#[expect(dead_code, reason = "live from B4")]
 struct Pushed<I> {
     inst: I,
     operands: Vec<Operand>,
 }
 
 /// A label, the values defined on entry to it, and its instructions.
-#[expect(dead_code, reason = "live from B4")]
 struct Block<I> {
     label: Label,
     /// Values defined on entry: what a phi is.
@@ -849,7 +875,6 @@ struct Block<I> {
 /// The ABI's three arguments: the entry block's parameters, with their
 /// classes.
 #[derive(Copy, Clone, Debug)]
-#[expect(dead_code, reason = "live from B4")]
 struct Entry {
     ctx: Value<Pointer>,
     out: Value<Pointer>,
@@ -858,10 +883,10 @@ struct Entry {
 
 /// One surviving fold's loop: a contiguous run of blocks from `head` to the
 /// one block that branches back to it.
-#[expect(dead_code, reason = "live from B4")]
 struct Loop {
     head: Label,
     /// The enclosing loop, as an index into [`Function::loops`].
+    #[expect(dead_code, reason = "live from B6")]
     parent: Option<usize>,
     /// How many times its body runs per call: its own trip count times its
     /// parent's.
@@ -869,7 +894,6 @@ struct Loop {
 }
 
 /// The pool section: its label, then each entry with its own label, in order.
-#[expect(dead_code, reason = "live from B4")]
 struct Constants<K> {
     label: Label,
     entries: Vec<(Label, K)>,
@@ -878,9 +902,9 @@ struct Constants<K> {
 /// One pool entry: its label (x86 reads it RIP-relative) and its byte offset
 /// in the section (aarch64 reads `[pool base, #offset]`).
 #[derive(Copy, Clone, Debug)]
-#[expect(dead_code, reason = "live from B4")]
 struct Constant {
     label: Label,
+    #[expect(dead_code, reason = "live from C4")]
     offset: u64,
 }
 
@@ -910,20 +934,24 @@ struct Constant {
 /// - Interval liveness never carries the value above its definition, and join
 ///   invariant 2 takes its location from the path that defines it.
 /// - No phase inserts a phi for it.
-#[expect(dead_code, reason = "live from B4")]
 struct Function<B: IsaBackend> {
     blocks: Vec<Block<Pushed<B::Inst<Selected>>>>,
     entry: Entry,
     loops: Vec<Loop>,
     constants: Constants<B::Constant>,
     labels: Labels,
+    /// The class of every value, by id: the allocator numbers the values it
+    /// mints from where this ends.
+    classes: Vec<ClassId>,
+    /// Scheduled ops the driver selected, per scope (the body, then the folds):
+    /// what [`EmitTraffic`] reports as a scope's `instructions`.
+    scheduled: Vec<u64>,
 }
 
 /// Everything about a target that selection needs. The driver and the
 /// allocator are generic over it, and neither names a register, an opcode or an
 /// encoding. The assembler is not generic over it: it imports nothing, and
 /// takes the program a backend's `encode` produces.
-#[expect(dead_code, reason = "live from B4")]
 trait IsaBackend: Sized + 'static {
     type Inst<S: Stage>;
     /// One pool entry: x86 `u32` (each load broadcasts a scalar), aarch64
@@ -965,6 +993,7 @@ trait IsaBackend: Sized + 'static {
     fn ret(b: &mut build::Builder<Self>);
 
     // The allocator's own instructions.
+    #[expect(dead_code, reason = "live from B5")]
     fn copy<C: Spill>(b: &mut build::Spiller<'_, Self>, src: Value<C>) -> Value<C>;
     /// Store `src` to `slot`. When `slot.offset()` does not encode: the slot's
     /// address into a fresh `Pointer`, then the store through it.
@@ -976,6 +1005,7 @@ trait IsaBackend: Sized + 'static {
     /// rematerializable, have no effect, and write no `Flags`: pool loads,
     /// `movi`/`fmov` immediates, `adrp+add` of a label, the zero and all-ones
     /// idioms.
+    #[expect(dead_code, reason = "live from B7")]
     fn rematerializable(inst: &Self::Inst<Selected>) -> bool;
 
     /// Rebuild `inst` at stage `T`, visiting each operand once, in field
@@ -985,12 +1015,14 @@ trait IsaBackend: Sized + 'static {
     /// Encode one allocated instruction: its bytes, and the label fields in
     /// them.
     fn encode(inst: &Self::Inst<Bound<'_, Self>>, out: &mut Encoding<'_>);
+
+    /// A pool entry as the bytes the data section holds.
+    fn constant_bytes(constant: Self::Constant) -> Vec<u8>;
 }
 
 /// An operation producing one lane value, with its operands already lanes.
 /// Comparisons and `BitAnd`/`BitOr` are `Binary`: which file their result
 /// lives in is the backend's choice.
-#[expect(dead_code, reason = "live from B4")]
 enum LaneOp<B: IsaBackend> {
     Const(f32),
     /// `[0, 1, …, L−1]`.
@@ -1006,10 +1038,12 @@ enum LaneOp<B: IsaBackend> {
         if_false: B::Lane,
     },
     Shift(OpKind, B::Lane, u8),
+    #[expect(dead_code, reason = "live from B8")]
     Gather {
         base: Value<Pointer>,
         index: B::Lane,
     },
+    #[expect(dead_code, reason = "live from B8")]
     Broadcast {
         base: Value<Pointer>,
         index: B::Lane,
@@ -1022,7 +1056,6 @@ enum LaneOp<B: IsaBackend> {
 
 /// The lattice's effect: `value`'s first `lanes` lanes at
 /// `out + 4·(row·pitch + col)`.
-#[expect(dead_code, reason = "live from B4")]
 struct Store<B: IsaBackend> {
     out: Value<Pointer>,
     pitch: Value<Integer>,
@@ -1034,7 +1067,6 @@ struct Store<B: IsaBackend> {
 
 /// A branch condition: the lane to test, and the arm that is dead when no
 /// lane of it is set.
-#[expect(dead_code, reason = "live from B4")]
 struct Test<B: IsaBackend> {
     cond: B::Lane,
     dead: IfArm,
@@ -1042,7 +1074,6 @@ struct Test<B: IsaBackend> {
 
 /// Where a conditional branch goes: `taken`, or `next`, the block laid out
 /// right after.
-#[expect(dead_code, reason = "live from B4")]
 struct Edges {
     taken: Target,
     next: Label,
@@ -1362,15 +1393,17 @@ fn declared_mask_temp(temp: Option<KReg>) -> KReg {
 pub struct CompileResult {
     /// The executable code.
     pub code: CompiledKernel,
-    /// Number of spills performed.
+    /// Frame slots minted: the legacy pipeline's are the body's spills, the
+    /// selection pipeline's every slot a value or block parameter lives in.
     pub spill_count: u64,
-    /// Total stack space used for spills (bytes). A frame offset, not a
-    /// program count: `StackFrame` refuses a frame past 2 MiB and the
-    /// encoders address a slot through a disp32 / imm12, so the width is the
-    /// encoding's.
-    pub spill_bytes: u32,
-    /// Values one scope computes for the scopes inside it and parks in a
-    /// slot of their own — the loop-invariant code motion, counted.
+    /// The frame's size in bytes, capped at 2 MiB: the encoders address a slot
+    /// through a disp32 / imm12. The legacy pipeline counts the spill slots,
+    /// below the fold slots and parks it lays out above them; the selection
+    /// pipeline counts the whole frame.
+    pub frame_bytes: u64,
+    /// Values computed outside a loop and read inside it: the legacy
+    /// pipeline's are parked in a slot of their own, the selection
+    /// pipeline's are the values that live to a loop's latch.
     pub hoisted_values: u64,
     /// What was emitted, per scope of the nest — the static half of a cost
     /// model's inputs. Counted, never optimized: see [`EmitTraffic`].
@@ -2684,11 +2717,78 @@ fn location_of(locs: &[Option<Binding>], vid: regalloc::ValueId) -> Binding {
 pub(crate) fn compile_native(
     program: regalloc::ScopedSchedule,
 ) -> Result<CompileResult, CompileError> {
-    match crate::isa::detect() {
-        Isa::Avx2 => compile_via_backend(program, &mut avx2::driver::Avx2Backend::new()),
-        Isa::Avx512 => compile_via_backend(program, &mut avx512::driver::Avx512Backend::new()),
-        Isa::Neon => compile_via_backend(program, &mut aarch64::driver::Aarch64Backend::new()),
+    match (crate::isa::detect(), pipeline()) {
+        (Isa::Avx2, Pipeline::Legacy) => {
+            compile_via_backend(program, &mut avx2::driver::Avx2Backend::new())
+        }
+        (Isa::Avx512, Pipeline::Legacy) => {
+            compile_via_backend(program, &mut avx512::driver::Avx512Backend::new())
+        }
+        (Isa::Neon, Pipeline::Legacy) => {
+            compile_via_backend(program, &mut aarch64::driver::Aarch64Backend::new())
+        }
+        (Isa::Avx2, Pipeline::Selection) => compile_on::<avx2::Avx2>(&program),
+        (isa @ (Isa::Avx512 | Isa::Neon), Pipeline::Selection) => panic!(
+            "{PIPELINE_VAR}=selection has no `{}` backend yet; it is refused rather than \
+             downgraded, so a run emits exactly the pipeline it was asked for",
+            isa.name()
+        ),
     }
+}
+
+/// The environment switch between the two pipelines, for the series that
+/// replaces the first with the second. See [`pipeline`].
+const PIPELINE_VAR: &str = "PIXELFLOW_CODEGEN";
+
+/// How a schedule becomes machine code.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Pipeline {
+    /// The scheduled-op emitters ([`compile_via_backend`]).
+    Legacy,
+    /// Select, allocate, assemble ([`compile_on`]).
+    Selection,
+}
+
+/// The pipeline this process compiles with: `PIXELFLOW_CODEGEN=legacy` (the
+/// default when unset) or `selection`, read once at the first compile like
+/// [`crate::isa::detect`], because a compile cache keyed on shape assumes the
+/// choice does not change under it.
+///
+/// # Panics
+/// On any other value, quoting it.
+fn pipeline() -> Pipeline {
+    static PIPELINE: std::sync::OnceLock<Pipeline> = std::sync::OnceLock::new();
+    *PIPELINE.get_or_init(|| {
+        let Some(raw) = std::env::var_os(PIPELINE_VAR) else {
+            return Pipeline::Legacy;
+        };
+        match raw.to_str().map(|name| name.trim().to_ascii_lowercase()) {
+            Some(name) if name == "legacy" => Pipeline::Legacy,
+            Some(name) if name == "selection" => Pipeline::Selection,
+            _ => panic!("{PIPELINE_VAR}={raw:?} is not `legacy` or `selection`"),
+        }
+    })
+}
+
+/// The selection pipeline: select, allocate, assemble.
+fn compile_on<B: IsaBackend>(
+    program: &regalloc::ScopedSchedule,
+) -> Result<CompileResult, CompileError> {
+    let function = select::select::<B>(program)?;
+    let pool = regalloc::resource::Pool::<B>::mint();
+    let mut frame = regalloc::resource::Frame::empty(B::FILE.vector_bytes());
+    let mut allocated = regalloc::local::allocate(function, &pool, &mut frame)?;
+    let program = allocated.program();
+    let assembled = asm::assemble(&program, |emitted, out| B::encode(&emitted.inst, out));
+    let traffic = EmitTraffic::of(&allocated, &assembled);
+    let code = unsafe { executable::CompiledKernel::from_code(&assembled.code)? };
+    Ok(CompileResult {
+        code,
+        spill_count: allocated.slots,
+        frame_bytes: allocated.frame_bytes,
+        hoisted_values: allocated.hoisted,
+        traffic,
+    })
 }
 
 /// Drive a schedule to a complete collapse kernel via a [`LegacyBackend`]: the
@@ -2762,7 +2862,7 @@ fn compile_via_backend<B: LegacyBackend>(
     Ok(CompileResult {
         code: exec,
         spill_count: nest.body().spill_slots(),
-        spill_bytes: nest.spill_bytes(),
+        frame_bytes: u64::from(nest.spill_bytes()),
         hoisted_values: nest.parks().count() as u64,
         traffic: EmitTraffic {
             scopes: EmitTraffic::by_index(scopes, trips.len()),
@@ -5222,9 +5322,9 @@ mod tests {
 
         let result = compile(&a, root, POINT).expect("large spill frame must compile");
         assert!(
-            result.spill_bytes > 128,
-            "test did not force a deep frame (spill_bytes = {})",
-            result.spill_bytes
+            result.frame_bytes > 128,
+            "test did not force a deep frame (frame_bytes = {})",
+            result.frame_bytes
         );
 
         for (px, py) in [(1.5f32, -2.0f32), (0.0, 0.0), (3.0, 4.0)] {
@@ -7138,9 +7238,9 @@ mod tests {
                     &mut recorder,
                 )
                 .expect("the glyph-like row compiles");
-                // `spill_bytes` is the frame's `m`, where the fold slots begin.
+                // `frame_bytes` is the frame's `m`, where the fold slots begin.
                 let root_slot = |j: usize, root: u32| {
-                    result.spill_bytes + (2 * j as u32 + root) * file.vector_bytes
+                    result.frame_bytes as u32 + (2 * j as u32 + root) * file.vector_bytes
                 };
                 let (own, shared_acc, shared_binder) = (
                     [root_slot(earlier, 0), root_slot(earlier, 1)],

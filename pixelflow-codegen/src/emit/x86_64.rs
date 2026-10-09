@@ -383,7 +383,6 @@ pub(super) enum Gp<S: Stage> {
     Jmp { to: S::Target },
     /// Go to the position laid out right after this instruction: encodes to
     /// nothing, and is what a transfer to the next block is.
-    #[expect(dead_code, reason = "live from B4")]
     Fallthrough { to: S::Target },
     /// `lea dst, [rip + to]`: a position's address, in one instruction.
     LeaRip {

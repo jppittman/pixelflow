@@ -89,7 +89,6 @@ impl Assembled {
     ///
     /// # Panics
     /// If the program never bound it.
-    #[expect(dead_code, reason = "live from B4")]
     pub(super) fn address(&self, label: Label) -> usize {
         self.addresses[label.0 as usize].unwrap_or_else(|| panic!("{label:?} was never bound"))
     }

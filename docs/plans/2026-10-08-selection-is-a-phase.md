@@ -470,17 +470,16 @@ Notes on the table:
 These types live in `regalloc/resource.rs`.
 
 ```rust
-/// A frame slot: `bytes` at `offset` from the stack pointer. A resource like
+/// A frame slot: at `offset` from the stack pointer. A resource like
 /// `Reg`: not `Copy`, not `Clone`, minted only by `Frame`, at an offset fixed
 /// for its life.
-pub(in crate::emit) struct FrameSlot { name: SlotName, offset: u64, bytes: u64 }
+pub(in crate::emit) struct FrameSlot { name: SlotName, offset: u64 }
 impl FrameSlot {
     /// Bytes from the stack pointer. The control plane is 64-bit. Each
     /// encoder narrows this to its displacement field, and the backend's
     /// `spill`/`reload` turn an offset that does not fit into address
     /// arithmetic.
     pub(in crate::emit) fn offset(&self) -> u64;
-    pub(in crate::emit) fn bytes(&self) -> u64;
     pub(in crate::emit) fn name(&self) -> SlotName;
 }
 /// A slot's name: `Copy`, carried by selected-stage instructions the way
@@ -894,8 +893,9 @@ impl<B: IsaBackend> Builder<B> {
 #[must_use] pub(in crate::emit) struct Pending { label: Label, params: Vec<ValueName>, scope: Scope }
 impl Pending {
     pub(in crate::emit) fn label(&self) -> Label;
-    /// Parameter `i` as a `Value<C>`. Panics on the wrong class.
-    pub(in crate::emit) fn param<C: Class>(&self, i: usize) -> Value<C>;
+    /// The parameters, as the allocator names them; the backend's
+    /// `param_lane` types one.
+    pub(in crate::emit) fn params(&self) -> &[ValueName];
 }
 
 /// The rights the allocator's own verbs get. `def` mints only `Spill`
@@ -1080,18 +1080,26 @@ pub(in crate::emit) trait RegisterAllocator {
 /// An allocated kernel: every register a borrowed token, every slot a
 /// borrowed slot, every block argument a placed move.
 pub(in crate::emit) struct Allocated<'m, B: IsaBackend> {
-    pub blocks: Vec<Block<Placed<'m, B>>>,
+    pub blocks: Vec<Block<Emitted<'m, B>>>,   // no block has parameters: they are slots
     pub loops: Vec<Loop>,
     pub constants: Constants<B::Constant>,
-    pub labels: Labels,
+    labels: Labels,                           // the program takes them: `program()`
+    pub text_end: Label,                      // where the data section's padding begins
     pub frame_bytes: u64,
+    pub slots: u64,                           // `CompileResult::spill_count`
+    pub hoisted: u64,                         // `CompileResult::hoisted_values`
+    pub scheduled: Vec<u64>,                  // the driver's per-scope tally
 }
-pub(in crate::emit) struct Placed<'m, B: IsaBackend> { pub inst: B::Inst<Bound<'m, B>>, pub origin: Origin }
+/// `Placed` is taken: it is the encoder's stage trait.
+pub(in crate::emit) struct Emitted<'m, B: IsaBackend> { pub inst: B::Inst<Bound<'m, B>>, pub origin: Origin }
 /// Why an instruction is there. `EmitTraffic` counts these per scope and
-/// weights them by trips.
+/// weights them by trips. B4 has `Selected`, `Spill` and `Reload`; B5 adds
+/// `Copy` and B7 `Remat`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(in crate::emit) enum Origin { Selected, Spill, Reload, Remat, Copy }
 ```
+
+**B4 lands `allocate` as a function** (`regalloc/local.rs`), not the trait above: the trait has one implementation and no caller generic over it, so it is added when a second allocator exists. It lays the frame out from value intervals before it binds anything, because with every value slot-homed the slots do not depend on the registers. B5's retroactive stores need the frame mutable during the scan, so B5 moves binding after the scan, as step 7 describes.
 
 **The scan.** It is one pass in layout order, so a fold is scanned inside its parent (closure 17).
 
@@ -1126,8 +1134,8 @@ fn compile_on<B: IsaBackend>(scoped: &ScopedSchedule) -> Result<CompileResult, C
     let function = select::<B>(scoped)?;
     let pool = Pool::<B>::mint();
     let mut frame = Frame::empty(B::FILE.vector_bytes());
-    let allocated = LinearScan.allocate(function, &pool, &mut frame)?;
-    let program = allocated.to_asm();          // text: blocks; data: the pool
+    let mut allocated = local::allocate(function, &pool, &mut frame)?;
+    let program = allocated.program();         // text: blocks; data: the pool
     let assembled = asm::assemble(&program, |i, out| B::encode(&i.inst, out));
     let traffic = EmitTraffic::of(&allocated, &assembled);
     CompileResult::new(&assembled.code, traffic, allocated.frame_bytes)
@@ -1152,7 +1160,7 @@ fn compile_on<B: IsaBackend>(scoped: &ScopedSchedule) -> Result<CompileResult, C
 | A dropped `Def` leaves a name with no definition | Rust is affine, not linear | `#[must_use]`; `Builder::finish` panics naming it |
 | A read before its definition; an instruction reading its own result | `Def::value` must be readable for selection to return it (closure 21, landing B4) | `Builder::push` panics |
 | A `Target`'s arguments match its block's parameters | A `Label` is a name, not a typed handle | `Builder::finish` |
-| A `Pending` parameter's class | Parameter lists are data | `Pending::param::<C>` panics |
+| A `Pending` parameter's class | Parameter lists are data | `B::param_lane`'s `ValueName::typed` panics |
 | Exclusivity inside the allocated program: an `Early`'s register is none of its instruction's reads | The allocated program holds shared borrows, by design (§2.2) | The scan's lease state, plus an assertion at binding |
 | No `Flags` live across a flags write or at a label | Liveness is a function property | The allocator panics. Spilling flags is a type error (`Spill`) |
 | A rematerialized instruction writes no `Flags` | A cloning walk must mint any class | The allocator asserts it at remat |
@@ -1243,7 +1251,7 @@ The narrowing already removes these, so they are not listed again here: `Item`, 
 - `WritePlan`, `MaskTest`;
 - the legacy trait (renamed `LegacyBackend` in B1) with every verb: `jump`, `register_file`, `begin`, `emit_plan`, `emit_mov`, `emit_store`, `ptr_store`, `ptr_load`, `ptr_mov`, `emit_resolve`, `branch_if_arm_is_dead`, `frame_alloc`, `anchor`, `finish`, `slot_store`, `slot_load`, `scope_begin`, `scope_end`, `add_scalar`, `load_const`, `alu`, `test_ge`, `emit_write`, `emit_ret`;
 - `compile_via_backend`, `AtFloor`'s legacy verbs, `Addressed`, and the legacy `GOLDEN` table;
-- the `Codegen` trait, the `Legacy` impl and the `PIXELFLOW_CODEGEN` knob.
+- the `PIXELFLOW_CODEGEN` knob (`Pipeline`, `pipeline()`, and `compile_native`'s match on it).
 
 `emit/storage.rs`: the whole file (`Slot`, `StackFrame`, `MAX_FRAME`, which moves to `regalloc/resource.rs`).
 
@@ -1292,7 +1300,7 @@ Tests deleted because the property is now a type, an invariant, or moot:
 | `Pointer`/`Integer` as distinct classes over `GeneralFile` | Merging today's pointer and scratch pools must not drop `Mem.base: PtrReg`'s guarantee (closure 8). |
 | `Origin` | `EmitTraffic` counted by decorating encoders (`Counting`). Counting allocated instructions by why they exist gives the same numbers with no decorator. |
 | `ScheduledOp::Outer(Class)` (A5, deleted in D2) | Selection reads the same scoped schedule the legacy pipeline does until D1. A placeholder must say what it is (CLAUDE.md, "extend its type"). |
-| The `Codegen` trait and `PIXELFLOW_CODEGEN`, decided once at startup (B4, deleted in D1) | This builds the new pipeline beside the old one, a backend at a time, with each commit live. Per CLAUDE.md, a second implementation of an existing category is a second `impl`. Like `PIXELFLOW_ISA`, an unbuilt choice is refused, never downgraded. |
+| `PIXELFLOW_CODEGEN`, decided once at startup (B4, deleted in D1) | This builds the new pipeline beside the old one, a backend at a time, with each commit live. It is one `match` in `compile_native` on the tier and the choice, where the case is settled once: a `Codegen` trait would have no caller generic over it. Like `PIXELFLOW_ISA`, an unbuilt choice is refused, never downgraded. |
 
 ### 4.3 Considered and refused
 
@@ -1560,7 +1568,7 @@ Every commit in this phase is live in production.
 
 #### B4: The local allocator, and the pipeline goes live behind a knob
 
-- **Files:** `emit/regalloc/mod.rs`, `emit/mod.rs` (`trait Codegen`, `Legacy<B>`, `Selection<B>`, `compile_on`), `emit/traffic.rs` (`EmitTraffic::of(&Allocated, &Assembled)`).
+- **Files:** `emit/regalloc/local.rs` (new, beside the legacy `mod.rs`, which D1 deletes), `emit/regalloc/resource.rs` (`Lent`), `emit/mod.rs` (`Pipeline`, `pipeline()`, `compile_on`, the `File::lease` dispatch, `CompileResult`), `emit/traffic.rs` (`EmitTraffic::of(&Allocated, &Assembled)`).
 - **The allocator** is the simplest correct one:
   - every value is stored at its definition;
   - every read is reloaded into a fresh value that dies at its instruction;
@@ -1573,7 +1581,8 @@ Every commit in this phase is live in production.
 - **The knob:** `PIXELFLOW_CODEGEN=legacy|selection`, read once at the first compile, like `isa::detect`.
   - The default is `legacy`.
   - `selection` on a tier without a selection backend panics, naming the tier. It is refused, never downgraded.
-- **`CompileResult`** fields are defined as in §2.12.
+  - It is one `match` in `compile_native` on the tier and the choice. There is no `Codegen` trait: nothing is generic over it.
+- **`CompileResult`** fields are defined as in §2.12. The legacy pipeline fills `frame_bytes` with its spill region, below the fold slots and parks it lays out above it, so its journal rows are unchanged; the selection pipeline fills it with the whole frame. D1 ends the difference.
 - **Bytes:** legacy identical.
 - **Gate:** G, plus K(avx2) on `a_surviving_reduce_compiles_and_runs`, `a_reduce_three_deep_compiles_and_runs`, `a_folds_spill_slots_do_not_alias_its_parents`, `sibling_folds_sharing_a_binder_node_read_their_own_counters`, `halve_fold_jit`, `muladd_rounding`, and `collapse_paths`' arithmetic kernels.
 
