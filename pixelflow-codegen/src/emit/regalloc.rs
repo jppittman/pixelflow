@@ -2633,10 +2633,8 @@ impl Pass {
             // A park of either class marks its placeholder as not a
             // definition here: it emits nothing, and a `Reduce` placeholder
             // opens no loop for either pass to evict around. Its location is
-            // this pass's answer only for a value of this pass's class — a
-            // vector's `Const(0.0)` placeholder is not the value, and a
-            // pointer's placeholder is its own op, both of which say the
-            // class.
+            // this pass's answer only for a value of this pass's class,
+            // which the placeholder (`Outer`) carries.
             is_live_in[k] = true;
             if !mine[k] {
                 continue;
@@ -6160,7 +6158,7 @@ pub(super) mod tests {
                             // The enclosing park's own placeholder, last in the
                             // schedule — the live_in value this final check
                             // answers for.
-                            def(5, ScheduledOp::Const(0.0)),
+                            def(5, ScheduledOp::Outer(Class::Vector)),
                         ],
                     }],
                 },

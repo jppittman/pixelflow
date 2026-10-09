@@ -550,6 +550,7 @@ fn operand_sources(op: &ScheduledOp, resident: [bool; 3]) -> [OperandSource; 3] 
         // `resolve_operands` from the pointer class, never a vector reload.
         | ScheduledOp::Uniform(..)
         | ScheduledOp::Reduce(..)
+        | ScheduledOp::Outer(_)
         | ScheduledOp::Seq(..) => 0,
         ScheduledOp::Unary(..)
         | ScheduledOp::ShiftImm(..)
@@ -1826,6 +1827,10 @@ fn resolve_operands(
             offset: *offset,
         },
         ScheduledOp::Context(_) => unreachable!("resolved above, before the vector destination"),
+        ScheduledOp::Outer(_) => unreachable!(
+            "resolve_operands: an Outer def reached the generic resolver -- \
+             an enclosing scope parks its value, and emit_scope skips it"
+        ),
         // Unreachable precondition: a surviving `Reduce`'s def is forced to
         // `Where::Spilled` at scan time (never a register — the `dst` match
         // above already panics on that), and `emit_dag_body_hoisted` special-

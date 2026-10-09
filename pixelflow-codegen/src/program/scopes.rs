@@ -9,7 +9,7 @@
 use alloc::vec::Vec;
 
 use super::{
-    Class, Def, ScheduledOp, Scope, ScopeFold, ScopeRegion, ScopedSchedule, ValueId, guards,
+    Def, ScheduledOp, Scope, ScopeFold, ScopeRegion, ScopedSchedule, ValueId, guards,
     layout::Layout, structural_children,
 };
 
@@ -43,6 +43,8 @@ fn schedule_variance(schedule: &[Def]) -> Vec<pixelflow_ir::variance::Variance> 
             ScheduledOp::Const(_) | ScheduledOp::Context(_) | ScheduledOp::Uniform(..) => {
                 Variance::CONST
             }
+            // Written by `place_roots`, which runs once this has.
+            ScheduledOp::Outer(_) => unreachable!("{vid:?} is an Outer before placement"),
             ScheduledOp::Unary(_, a)
             | ScheduledOp::ShiftImm(_, a, _)
             // A gather reads from a bound buffer, whose contents are fixed for
@@ -269,13 +271,8 @@ fn place_roots(scoped: &mut ScopedSchedule, variance: &[pixelflow_ir::variance::
                 .find(|(_, binds)| deps.bits() & binds.bits() != 0)
                 .map_or(Scope::Body, |(scope, _)| *scope);
             moved.push((computing, def.value));
-            // The placeholder; never emitted, located at the park. A vector's
-            // says nothing about the value it stands for; a pointer's stays
-            // its own op, which is operand-free already, so the scope inside
-            // still reads the class off it.
-            if def.op.class() == Class::Vector {
-                def.op = ScheduledOp::Const(0.0);
-            }
+            // The placeholder; never emitted, located at the park.
+            def.op = ScheduledOp::Outer(def.op.class());
         }
         for (computing, vid) in moved {
             let roots = match computing {
@@ -572,6 +569,7 @@ fn attach_fold(scoped: &mut ScopedSchedule, fold: PendingFold, parent: Scope, at
 mod tests {
     use super::*;
     use crate::pipeline::tests::schedule_for;
+    use crate::program::Class;
     use pixelflow_ir::LatticeShape;
     use pixelflow_ir::arena::{ExprArena, ExprId, UniformDecl, UniformIdentity};
     use pixelflow_ir::kind::OpKind;
@@ -650,7 +648,7 @@ mod tests {
             !inner.is_empty()
                 && inner
                     .iter()
-                    .all(|op| matches!(op, ScheduledOp::Const(v) if *v == 0.0)),
+                    .all(|op| matches!(op, ScheduledOp::Outer(Class::Vector))),
             "the fold reads it through a placeholder, never its own copy: {inner:?}"
         );
     }

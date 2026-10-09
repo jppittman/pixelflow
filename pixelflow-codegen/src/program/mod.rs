@@ -142,16 +142,23 @@ pub(crate) enum ScheduledOp {
     /// naming the [`Scope::Fold`] this def opens, not from this
     /// `ValueId`.
     Reduce(Fold, ValueId),
+    /// A read of a value an enclosing scope computes: what `scopes::place_roots`
+    /// leaves in a fold's schedule where the def it moved out used to be, and
+    /// the class of the value it stands for. Emits nothing and reads nothing;
+    /// the value is where the enclosing scope parked it.
+    Outer(Class),
 }
 
 impl ScheduledOp {
     /// Which register file the value this op defines lives in: a
-    /// [`ScheduledOp::Context`] is an address, everything else is a vector
-    /// (an effect's "value" included, which is never placed anywhere).
+    /// [`ScheduledOp::Context`] is an address, an [`ScheduledOp::Outer`] is
+    /// whatever it stands for, everything else is a vector (an effect's
+    /// "value" included, which is never placed anywhere).
     #[must_use]
     pub(super) fn class(&self) -> Class {
         match self {
             ScheduledOp::Context(_) => Class::Pointer,
+            ScheduledOp::Outer(class) => *class,
             _ => Class::Vector,
         }
     }
@@ -338,6 +345,7 @@ pub(crate) fn operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use
         | ScheduledOp::Context(_)
         | ScheduledOp::Uniform(..)
         | ScheduledOp::Reduce(..)
+        | ScheduledOp::Outer(_)
         | ScheduledOp::Seq(..) => (None, None, None),
         // A gather's base is a pointer, read through `pointer_operand`; the
         // index is its one vector operand.
