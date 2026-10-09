@@ -104,8 +104,10 @@ kernel! {
     }
 
     /// Whether the pixel about (x, y) can meet the outline: its centre
-    /// within half a pixel of the outline's box. Every piece's term is
-    /// exactly 0 farther out.
+    /// within half a pixel of the outline's box. Farther out the ink is 0:
+    /// above, below and right of the box every piece's term is exactly 0,
+    /// and left of it the terms are not, but sum to the pixel's area under
+    /// ink, 0 up to rounding, which this test and the snap make exact.
     fn inside(b: Bounds, x: f32, y: f32) -> bool {
         (x >= b.x0 - PIXEL_HALF) & (x <= b.x1 + PIXEL_HALF)
             & (y >= b.y0 - PIXEL_HALF) & (y <= b.y1 + PIXEL_HALF)
@@ -141,9 +143,9 @@ kernel! {
 /// One glyph's block: what a call writes into its piece count's program.
 ///
 /// The outline's box, then one row of ten per piece, in piece order — the
-/// order the program declares them in: [`glyph`] declares its own parameter
-/// before its argument's, and [`ink`]'s balanced tree keeps the pieces in
-/// order. A glyph with no pieces has an empty block, since [`blank`] reads
+/// order the program declares them in: `glyph` declares its own parameter
+/// before its argument's, and `ink`'s balanced tree keeps the pieces in
+/// order. A glyph with no pieces has an empty block, since `blank` reads
 /// nothing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GlyphRows {
@@ -153,7 +155,7 @@ pub struct GlyphRows {
 
 impl GlyphRows {
     /// `outline`'s block: its pieces split and oriented as the builder's are
-    /// ([`pieces`]), each rounded to its row ([`piece_row`]), under its box.
+    /// (`pieces`), each rounded to its row (`piece_row`), under its box.
     #[must_use]
     pub fn of(outline: &Outline) -> Self {
         let rows: Vec<[f32; PIECE_ROW_COLS]> = pieces(outline).into_iter().map(piece_row).collect();
@@ -191,8 +193,17 @@ pub struct FontPrograms {
 
 impl FontPrograms {
     /// No programs yet, at `extent` (texels across, texels down).
+    ///
+    /// # Panics
+    ///
+    /// If either side of `extent` is 0: a tile with no texels has no
+    /// program to compile.
     #[must_use]
     pub fn new(extent: [u32; 2]) -> Self {
+        assert!(
+            extent.iter().all(|&side| side > 0),
+            "FontPrograms::new: a tile of {extent:?} texels has none to draw"
+        );
         Self {
             extent,
             programs: BTreeMap::new(),
@@ -205,8 +216,10 @@ impl FontPrograms {
     ///
     /// # Panics
     ///
-    /// Never for a [`GlyphRows`] from [`GlyphRows::of`]: its block is its
-    /// count's program's arguments by construction.
+    /// If its count's program fails to compile, which is a compiler bug:
+    /// every count's program is pinned to optimize. Never over the block,
+    /// since a [`GlyphRows`] only comes from [`GlyphRows::of`], whose block
+    /// is its count's program's arguments by construction.
     pub fn draw(&mut self, glyph: &GlyphRows) -> DiscreteManifold {
         let extent = self.extent;
         let program = self
@@ -217,8 +230,7 @@ impl FontPrograms {
         block
             .set_declared(glyph.block.iter().copied())
             .expect("a glyph's block is its count's arguments: the box, then ten per piece");
-        let [width, height] = extent.map(|texels| texels as usize);
-        Lattice::frame(width, height).collapse(&program.bind(&[]).with_uniforms(&block))
+        Lattice { extent }.collapse(&program.bind(&[]).with_uniforms(&block))
     }
 }
 
@@ -230,18 +242,23 @@ fn program(pieces: usize) -> Kernel {
         return blank();
     }
     let instances: Vec<Kernel> = (0..pieces)
-        .map(|_| one_piece(record([0.0; PIECE_ROW_COLS])))
+        .map(|_| one_piece(record([UNWRITTEN; PIECE_ROW_COLS])))
         .collect();
     glyph(
         &ink(&instances),
         Bounds {
-            x0: 0.0,
-            y0: 0.0,
-            x1: 0.0,
-            y1: 0.0,
+            x0: UNWRITTEN,
+            y0: UNWRITTEN,
+            x1: UNWRITTEN,
+            y1: UNWRITTEN,
         },
     )
 }
+
+/// What a count's program declares each uniform with. Any value would do:
+/// every call writes its glyph's block over all of them, and a uniform's
+/// default is not part of the compile key.
+const UNWRITTEN: f32 = 0.0;
 
 /// `row` as the block's record: the columns, in declaration order.
 fn record(row: [f32; PIECE_ROW_COLS]) -> Row {

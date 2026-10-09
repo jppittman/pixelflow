@@ -8,8 +8,10 @@
 //! path a frame draws from today, [`GlyphAtlas`] tiles baked at texel
 //! centres, and the one it will draw from, each glyph drawn by its piece
 //! count's program over its block ([`FontPrograms`],
-//! docs/plans/2026-09-25-the-language-is-kernel.md C1). Every check below
-//! runs on both.
+//! docs/plans/2026-09-25-the-language-is-kernel.md C1). Every check of a
+//! renderer below runs on both. The units test
+//! ([`a_program_of_glyph_units_draws_each_glyph`]) checks neither: it pins
+//! the optimizer's units through a program of glyphs that is not a font.
 //!
 //! ## The statistic
 //!
@@ -526,7 +528,7 @@ fn reversing_every_contour_negates_every_texel() {
 // ─────────────────────────── the renderer against it ─────────────────────────
 
 /// An integer-aligned square: every texel is wholly in or wholly out, so
-/// both sides must read exactly 0 or 1 — the renderer too, since its
+/// both sides must read exactly 0 or 1 — each renderer too, since its
 /// coverage is the area and snaps its ends. A half-texel slip between the
 /// two conventions would read ½ along every edge.
 #[test]
@@ -553,20 +555,28 @@ fn the_renderer_and_the_reference_share_a_pixel() {
     let ours = glyph
         .bake(&centred, Lattice::frame(width, height))
         .into_buffer();
+    let by_its_program = FontPrograms::new(
+        [width, height].map(|side| u32::try_from(side).expect("a tile's side fits a u32")),
+    )
+    .draw(&GlyphRows::of(&outline))
+    .into_buffer();
     let exact = signed_area(
         &exact_area::pieces(&outline, |[x, y]| [f64::from(x), f64::from(y)]),
         Grid { width, height },
     );
-    for (k, (&o, &e)) in ours.iter().zip(&exact).enumerate() {
+    for (k, ((&o, &p), &e)) in ours.iter().zip(&by_its_program).zip(&exact).enumerate() {
+        let (i, j) = (k % width, k / width);
         assert!(
             e == 0.0 || e == 1.0,
             "texel {k}: the square's exact area is {e}"
         );
         assert!(
             f64::from(o) == e,
-            "texel ({}, {}): renderer {o}, exact {e}",
-            k % width,
-            k / width
+            "texel ({i}, {j}): renderer {o}, exact {e}"
+        );
+        assert!(
+            f64::from(p) == e,
+            "texel ({i}, {j}): its program {p}, exact {e}"
         );
     }
 }

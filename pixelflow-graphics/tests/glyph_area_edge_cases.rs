@@ -92,8 +92,14 @@ fn ours(outline: &Outline, grid: Grid, [ox, oy]: P) -> Vec<f32> {
 
 /// The same texels drawn by the outline's piece count's program over its
 /// block ([`FontPrograms`]): the outline moved by `-offset`, since a program
-/// samples `(i + ½, j + ½)` and geometry is placed on the host. Every offset
-/// here is exact in `f32`, so the move rounds nothing.
+/// samples `(i + ½, j + ½)` and geometry is placed on the host. Most moves
+/// round nothing: the named shapes are not moved, and the shapes far from
+/// the origin sit within a factor of two of their offset, so subtracting it
+/// is exact (Sterbenz). The font's glyphs past ASCII are the exception: their
+/// move by `+margin` rounds each coordinate by half an ulp of the result,
+/// and the program then computes `margin` farther from the origin than the
+/// frame its bound is judged in, so it is held to a bound tighter than its
+/// own by `2⁻²²·2·margin`, and meets it.
 fn by_its_program(outline: &Outline, grid: Grid, [ox, oy]: P) -> Vec<f32> {
     let placed = outline.transformed(Affine::translation(-ox, -oy));
     let extent = [grid.width, grid.height]

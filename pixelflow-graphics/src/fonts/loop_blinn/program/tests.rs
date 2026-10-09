@@ -1,6 +1,6 @@
 //! **The font's programs draw the builder's glyphs.**
 //!
-//! Phase C of docs/plans/2026-09-25-the-language-is-kernel.md deletes the
+//! Phase D of docs/plans/2026-09-25-the-language-is-kernel.md deletes the
 //! builder ([`crate::fonts::loop_blinn::glyph`]); until then there are two
 //! definitions of a glyph, the builder's and the `kernel!` block the font's
 //! programs are written in, and a copy is a future divergence. So the two
@@ -17,7 +17,10 @@
 //!   of the builder is on that path: the pieces' rows are the font's data
 //!   ([`pieces`], [`piece_row`]), the box is the outline's own
 //!   ([`Outline::bounds`]), and how far past it coverage reaches is the
-//!   block's `inside`, not the builder's [`Support`](super::super::Support);
+//!   block's `inside`, not the builder's [`Support`](super::super::Support).
+//!   And slot by slot: the program composed over a glyph's rows declares
+//!   its uniforms with exactly the block [`GlyphRows::of`] writes, so a
+//!   column the block and [`Row`] order differently fails by name;
 //! - **as optimized terms**: every count's program optimizes, and to exact
 //!   arithmetic — no reciprocal estimate, no `Dwrt` — the claim
 //!   `tests/glyph_optimizes_estimate_free.rs` makes for the builder's glyph.
@@ -95,7 +98,7 @@ fn a_piece_is_one_term_through_either_definition() {
 /// block, draws the builder's pixels at 7, 16 and 32 px, to twice the closed
 /// form's error bound, which every coverage is held to against the exact
 /// area (`tests/glyph_exact_area.rs`). The equivalence the builder's
-/// deletion (Phase C) stands on: the plan's B7, now through the path a frame
+/// deletion (Phase D) stands on: the plan's B7, now through the path a frame
 /// will call.
 ///
 /// Not to the bit. A piece is one term through either definition (above),
@@ -145,6 +148,21 @@ fn every_ascii_glyph_drawn_by_its_count_s_program_draws_the_builders_pixels() {
                 empties.push(ch);
                 continue;
             }
+
+            let [x0, y0, x1, y1] = outline.bounds().expect("a glyph with pieces has a box");
+            let instances: Vec<Kernel> = pieces(&outline)
+                .into_iter()
+                .map(|piece| one_piece(record(piece_row(piece))))
+                .collect();
+            let declared: Vec<f32> = glyph(&ink(&instances), Bounds { x0, y0, x1, y1 })
+                .uniforms()
+                .iter()
+                .map(|uniform| uniform.default)
+                .collect();
+            assert_eq!(
+                declared, rows.block,
+                "{ch:?} at {size} px: composed over its rows, the program declares the box, then each piece's row, the order its block is written in"
+            );
 
             assert!(
                 by_the_builder.iter().any(|&v| v > 0.0),
