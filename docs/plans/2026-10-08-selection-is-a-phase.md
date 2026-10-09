@@ -1244,7 +1244,7 @@ The narrowing already removes these, so they are not listed again here: `Item`, 
 `emit/traffic.rs`: `Counting`.
 
 The backends:
-- the `Physical` stage, `POOL_BASE`, `x86_64::anchor`, `LeaRip`'s fixed destination, `BroadcastGprs`, `write_address`, `index_into`, `Convert`;
+- the `Physical` stage, `POOL_BASE`, `x86_64::anchor`, `LeaRip`'s fixed destination, `BroadcastGprs`, `write_address`, `index_into`, `Truncate`;
 - `temps_for`, `gpr_temps_for`, `mask_temps_for`, `GatherTemps`, `GatherGprs`;
 - `guard_scratch`, `address_in_ip0`, `X16`, `X17`, `CBNZ_W16_OVER_B`;
 - `emit_fmov_imm`'s general case, `BUILTIN_HEADROOM`.
@@ -1453,7 +1453,7 @@ Every commit in this phase is live in production.
   - `Gp<Physical>` implements the legacy `AsmInsn` (`emit_into`, and `label_ref` for the three arms with a label field). The `Encoding` form of `encode` arrives when `AsmInsn` retires, because `Assembly::push` is the one caller and takes `AsmInsn`.
 - **Change:** today's x86 `Inst` and every free GPR byte-writer become `Gp` arms. Each hardcoded register becomes a literal at its one construction site in the legacy driver, for example `Test { src: gpr::RAX }`. `IsaBackend::frame_free` is merged into `emit_ret(code, bytes)`, which on x86 is the `Ret` arm (`add rsp, size; vzeroupper; ret`), and `Enter` is `frame_alloc`.
 - **Deviation from the first draft:**
-  - `Cvtt` is not a `Gp` arm. Its bytes are the tier's (VEX or EVEX), so it is A10a's and A11a's convert arm, and `Convert` stays until then.
+  - `Cvtt` is not a `Gp` arm. Its bytes are the tier's (VEX or EVEX), so it is A10a's and A11a's convert arm. `Convert` survived A10 only because AVX-512's closures still built byte-writers; A11a replaces it with the `Truncate` trait, which D1 deletes with `write_address` and `index_into`.
   - `Jcc` has no `next` field and there is no `Fallthrough` arm. The legacy driver has no next block to name; the block builder adds both (B1).
   - `Test` is `test r32, r32` alone. `cmp al, 0xFF` is the guard sequence (A10b).
   - `Mov` is a pointer copy (`Pointer`); the allocator's own copy verb is B's.
@@ -1473,7 +1473,7 @@ Every commit in this phase is live in production.
 #### A11a / A11b: AVX-512's EVEX and mask instructions are values
 
 - **Files:** `avx512.rs`.
-- **A11a:** EVEX ALU, unary and convert.
+- **A11a:** `avx512::Inst<S>` arms for every EVEX instruction that does not name a `k` register: ALU, unary, round, shift, `Fma231`, the `If` blend (`Blend`, one `vpternlogd` with the select table), copy, convert (`Cvtt`, `CvttMem`, `Movq`, `InsertHigh`), and memory (`Load`, `Store`, `StoreBatch`, `Broadcast`, `BroadcastIndexed`). The operation enums both x86 tiers name (`Alu`, `Lanewise`, `Rounding`, `Direction`) move to `x86_64.rs`, each tier giving them its own `vex()` or `evex()`; `x86_64::Convert` and `index_into`'s function-pointer pair give way to a `Truncate` trait that the two `Inst`s implement, so `write_address` is generic over the tier.
 - **A11b:** the `Opmask`-file fields:
   - `CmpK { dst: Write<Opmask> }`, `Movm2d`, `Ptestm`, `Kand`, `Kor`;
   - `BlendK { dst, mask: Read<Opmask>, a, b }` (`vblendmps zmm{k}`);

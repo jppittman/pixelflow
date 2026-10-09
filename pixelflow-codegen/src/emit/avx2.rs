@@ -25,7 +25,9 @@
 //! AVX-512 tier resets `k1`.
 
 use super::x86_64;
-use super::x86_64::{Disp, Imm8, Imm32, Mem, NoDisp, frame_slot};
+use super::x86_64::{
+    Alu, Direction, Disp, Imm8, Imm32, Lanewise, Mem, NoDisp, Rounding, Truncate, frame_slot,
+};
 use super::{
     AsmInsn, AsmProgram, EncodedInst, Gpr, Integer, Physical, Pointer, PtrReg, Reg, Stage, Vector,
     unimplemented_op,
@@ -228,24 +230,6 @@ impl VexImm {
     }
 }
 
-/// A three-operand arithmetic or bitwise instruction: `op dst, a, b`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Alu {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Min,
-    Max,
-    And,
-    /// `!a & b`
-    AndNot,
-    Or,
-    Xor,
-    /// `vpaddd`: the integer-domain add.
-    IAdd,
-}
-
 impl Alu {
     const fn vex(self) -> Vex {
         match self {
@@ -276,20 +260,6 @@ enum Pred {
     Nle = 6,
 }
 
-/// A one-source instruction: `op dst, src`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Lanewise {
-    Sqrt,
-    Rsqrt,
-    Recip,
-    /// `vcvttps2dq`
-    ToInt,
-    /// `vcvtdq2ps`
-    FromInt,
-    /// `vpmovzxbd`: eight bytes widened to eight dword lanes.
-    WidenBytes,
-}
-
 impl Lanewise {
     const fn vex(self) -> Vex {
         match self {
@@ -301,22 +271,6 @@ impl Lanewise {
             Lanewise::WidenBytes => Vex::m0f38_66(0x31),
         }
     }
-}
-
-/// The rounding mode of a `vroundps`: its imm8.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Rounding {
-    Nearest = 0,
-    Floor = 1,
-    Ceil = 2,
-}
-
-/// The direction of an integer shift by an immediate: the `/digit` of its
-/// opcode.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Direction {
-    Left = 6,
-    Right = 2,
 }
 
 /// An AVX2 (VEX.256) vector instruction.
@@ -512,6 +466,16 @@ impl AsmInsn for Inst<Physical> {
     #[inline]
     fn emit_into(self, code: &mut Vec<u8>) {
         self.encode().emit_into(code);
+    }
+}
+
+impl Truncate for Inst<Physical> {
+    fn from_xmm(dst: Gpr, src: Reg) -> Self {
+        Inst::Cvtt { dst, src }
+    }
+
+    fn from_slot(dst: Gpr, src: Mem<Physical, Imm32>) -> Self {
+        Inst::CvttMem { dst, src }
     }
 }
 
@@ -1389,7 +1353,7 @@ pub(super) mod driver {
     use super::super::*;
     use super::{AsmProgram, IOTA_BYTES, Inst, Lanewise, Mem, NoDisp, frame_slot};
     use crate::emit::x86_64 as x86;
-    use crate::emit::x86_64::{Convert, write_address};
+    use crate::emit::x86_64::write_address;
     use crate::error::CompileError;
     use alloc::vec::Vec;
     use pixelflow_ir::kind::OpKind;
@@ -1751,15 +1715,7 @@ pub(super) mod driver {
         /// lane: the low four straight out of the value, the rest out of its
         /// high half extracted into the reserved temp.
         fn emit_write(&mut self, code: &mut Vec<u8>, write: &WritePlan) {
-            let base = write_address(
-                code,
-                &AVX2_FILE,
-                write,
-                Convert {
-                    from_xmm: |code, dst, src| Inst::Cvtt { dst, src }.emit_into(code),
-                    from_mem: |code, dst, src| Inst::CvttMem { dst, src }.emit_into(code),
-                },
-            );
+            let base = write_address::<Inst<Physical>>(code, &AVX2_FILE, write);
             let lanes = AVX2_FILE.vector_bytes / 4;
             if write.lanes == lanes {
                 Inst::StoreBatch {

@@ -5,11 +5,12 @@
 //! instructions the loop nest and the store's address arithmetic are made
 //! of (branches, the pointer class's loads and stores and the frame among
 //! them), the memory-operand tail (`Mem`, `Disp`) every vector encoder's
-//! ModRM/SIB is built from, and the constant pool with its anchor. Nothing
-//! here names a vector
-//! width: the `ymm`/`zmm` encodings live in `avx2.rs` and `avx512.rs`, each
-//! with its own `IsaBackend` driver, and the 128-bit tier that used to sit
-//! in this file is gone (docs/plans/2026-09-22-the-isa-is-decided-at-startup.md §7).
+//! ModRM/SIB is built from, the vector operations both tiers name ([`Alu`] and
+//! its kin, whose bytes are each tier's), and the constant pool with its
+//! anchor. Nothing here names a vector width: the `ymm`/`zmm` encodings live
+//! in `avx2.rs` and `avx512.rs`, each with its own `IsaBackend` driver, and
+//! the 128-bit tier that used to sit in this file is gone
+//! (docs/plans/2026-09-22-the-isa-is-decided-at-startup.md §7).
 
 use super::{
     AsmInsn, Assembly, Binding, EncodedInst, Flags, Gpr, Integer, Label, LabelRef, Loc, Physical,
@@ -602,6 +603,71 @@ fn patch_rel32(code: &mut [u8], pos: usize, target: usize) {
 }
 
 // =============================================================================
+// The vector operations both tiers encode
+// =============================================================================
+
+// What an operation *is* is the architecture's; the bytes that say it are the
+// tier's, so `avx2.rs` and `avx512.rs` each give these a `vex()` or `evex()`.
+
+/// A three-operand arithmetic or bitwise instruction: `op dst, a, b`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum Alu {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+    And,
+    /// `!a & b`
+    AndNot,
+    Or,
+    Xor,
+    /// `vpaddd`: the integer-domain add.
+    IAdd,
+}
+
+/// A one-source instruction: `op dst, src`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum Lanewise {
+    Sqrt,
+    Rsqrt,
+    Recip,
+    /// `vcvttps2dq`
+    ToInt,
+    /// `vcvtdq2ps`
+    FromInt,
+    /// `vpmovzxbd`: bytes widened to dword lanes.
+    WidenBytes,
+}
+
+/// The rounding mode of a `vroundps` or `vrndscaleps`: its imm8.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum Rounding {
+    Nearest = 0,
+    Floor = 1,
+    Ceil = 2,
+}
+
+/// The direction of an integer shift by an immediate: the `/digit` of its
+/// opcode.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum Direction {
+    Left = 6,
+    Right = 2,
+}
+
+/// A tier's `cvttss2si`, the one instruction the store's address arithmetic
+/// needs a vector encoding for: lane 0 of a register, or the first word of a
+/// slot, truncated into a general register.
+pub(super) trait Truncate: AsmInsn {
+    /// `cvttss2si dst, src`
+    fn from_xmm(dst: Gpr, src: Reg) -> Self;
+    /// `cvttss2si dst, [src]`
+    fn from_slot(dst: Gpr, src: Mem<Physical, Imm32>) -> Self;
+}
+
+// =============================================================================
 // The store's address arithmetic
 // =============================================================================
 
@@ -643,24 +709,17 @@ pub(super) fn block_element(
     })
 }
 
-/// One tier's `cvttss2si` pair — the VEX or EVEX spelling of the same
-/// instruction, which is the only thing that varies between the tiers'
-/// address arithmetic.
-#[derive(Clone, Copy)]
-pub(super) struct Convert {
-    pub(super) from_xmm: fn(&mut Vec<u8>, Gpr, Reg),
-    pub(super) from_mem: fn(&mut Vec<u8>, Gpr, Mem<Physical, Imm32>),
-}
-
 /// `dst = trunc(index)` as a 64-bit integer, wherever a fold keeps its
 /// binder: a broadcast, so lane 0 of a register or the first word of a
 /// slot is the index. Shared by the x86 tiers, which differ only in the
 /// *vector* encoding this reads through — the GPR half is the
 /// architecture's.
-fn index_into(code: &mut Vec<u8>, dst: Gpr, at: Binding, convert: Convert) {
+fn index_into<I: Truncate>(code: &mut Vec<u8>, dst: Gpr, at: Binding) {
     match at {
-        Binding::Loc(Loc::Reg(r)) => (convert.from_xmm)(code, dst, r),
-        Binding::Loc(Loc::Slot(slot)) => (convert.from_mem)(code, dst, frame_slot(slot.offset())),
+        Binding::Loc(Loc::Reg(r)) => I::from_xmm(dst, r).emit_into(code),
+        Binding::Loc(Loc::Slot(slot)) => {
+            I::from_slot(dst, frame_slot(slot.offset())).emit_into(code)
+        }
         Binding::Loc(Loc::Ptr(_)) => unreachable!("a fold's binder is a vector"),
         // `emit_scope` hands a rematerialized binder over as its slot, so the
         // only caller, `write_address`, never holds a constant here.
@@ -672,25 +731,24 @@ fn index_into(code: &mut Vec<u8>, dst: Gpr, at: Binding, convert: Convert) {
 
 /// The store's address: `out + 4 · (row · pitch + col)`, in `scratch[0]`,
 /// leaving `scratch[1]` free. The row and column indices are converted
-/// through `convert`, the tier's own `cvttss2si`.
-pub(super) fn write_address(
+/// through `I`, the tier's own `cvttss2si`.
+pub(super) fn write_address<I: Truncate>(
     code: &mut Vec<u8>,
     file: &regalloc::RegisterFile,
     write: &WritePlan,
-    convert: Convert,
 ) -> PtrReg {
     let row = crate::emit::declared_gpr_temp(write.scratch.gpr_temp(0));
     let col = crate::emit::declared_gpr_temp(write.scratch.gpr_temp(1));
     let out = file.gpr_out.expect("x86's store needs the output pointer");
     let pitch = file.gpr_pitch.expect("x86's store needs the pitch");
-    index_into(code, row, write.row, convert);
+    index_into::<I>(code, row, write.row);
     Gp::Imul {
         dst: row,
         src: pitch,
         flags: (),
     }
     .emit_into(code);
-    index_into(code, col, write.col, convert);
+    index_into::<I>(code, col, write.col);
     Gp::Add {
         dst: row,
         src: col,
