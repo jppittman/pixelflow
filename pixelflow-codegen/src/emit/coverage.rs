@@ -1,4 +1,4 @@
-//! The op-coverage completeness contract every [`super::IsaBackend`] must satisfy.
+//! The op-coverage completeness contract every [`super::LegacyBackend`] must satisfy.
 //!
 //! This is test-only infrastructure (see `emit/mod.rs`'s `backend_op_coverage`
 //! tests), not a production API. It exists because nothing previously enumerated "the ops a
@@ -8,9 +8,9 @@
 //! actually compiled with `-C target-feature=+avx512f`. These lists turn that
 //! into a named, itemized test failure instead of a silent hole.
 //!
-//! Every `OpKind` an `IsaBackend` might see falls into exactly one bucket:
+//! Every `OpKind` a `LegacyBackend` might see falls into exactly one bucket:
 //!
-//! - Reaches `IsaBackend::emit_plan` as `ResolvedOp::Unary` — [`REQUIRED_UNARY_OPS`].
+//! - Reaches `LegacyBackend::emit_plan` as `ResolvedOp::Unary` — [`REQUIRED_UNARY_OPS`].
 //! - Reaches it as `ResolvedOp::Binary` — [`REQUIRED_BINARY_OPS`].
 //! - Reaches it as `ResolvedOp::ShiftImm` (the RHS `Const` shift amount is
 //!   folded to an immediate by `program::lower::arena_to_schedule`, so only the op + LHS
@@ -46,7 +46,7 @@
 
 use pixelflow_ir::kind::OpKind;
 
-/// Ops that reach `IsaBackend::emit_plan` as `ResolvedOp::Unary { op, .. }`.
+/// Ops that reach `LegacyBackend::emit_plan` as `ResolvedOp::Unary { op, .. }`.
 pub(super) const REQUIRED_UNARY_OPS: &[OpKind] = &[
     OpKind::Neg,
     OpKind::Sqrt,
@@ -60,7 +60,7 @@ pub(super) const REQUIRED_UNARY_OPS: &[OpKind] = &[
     OpKind::IntToFloat,
 ];
 
-/// Ops that reach `IsaBackend::emit_plan` as `ResolvedOp::Binary { op, .. }`.
+/// Ops that reach `LegacyBackend::emit_plan` as `ResolvedOp::Binary { op, .. }`.
 pub(super) const REQUIRED_BINARY_OPS: &[OpKind] = &[
     OpKind::Add,
     OpKind::Sub,
@@ -79,7 +79,7 @@ pub(super) const REQUIRED_BINARY_OPS: &[OpKind] = &[
     OpKind::BitOr,
 ];
 
-/// Ops that reach `IsaBackend::emit_plan` as `ResolvedOp::ShiftImm { op, .. }`.
+/// Ops that reach `LegacyBackend::emit_plan` as `ResolvedOp::ShiftImm { op, .. }`.
 pub(super) const REQUIRED_SHIFT_OPS: &[OpKind] = &[OpKind::Shl, OpKind::Shr];
 
 /// Ops with a bespoke `ResolvedOp` shape (`FusedMulAdd` for `MulAdd`, `If`

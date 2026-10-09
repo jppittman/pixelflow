@@ -9,7 +9,7 @@
 //! a DAG schedule rather than a tree.
 //!
 //! All three backends run that same allocator behind the same driver
-//! (`IsaBackend`). What a backend contributes is its `RegisterFile` — the
+//! (`LegacyBackend`). What a backend contributes is its `RegisterFile` — the
 //! allocatable pool, how many registers its encodings and its guards
 //! destroy, vector width, the ABI's three pointer registers — and its
 //! instruction encodings. Nothing else about a target reaches the
@@ -66,6 +66,7 @@ mod aarch64;
 mod asm;
 mod avx2;
 mod avx512;
+mod build;
 #[cfg(test)]
 mod coverage;
 mod encoded;
@@ -83,6 +84,7 @@ pub use traffic::{EmitTraffic, ScopeTraffic};
 
 use asm::{Item, Label, Labels, Patch};
 use encoded::EncodedInst;
+use regalloc::resource::{FrameSlot, In, InOut, Out, SlotName};
 use storage::{Slot, StackFrame};
 
 use pixelflow_ir::kind::OpKind;
@@ -90,9 +92,11 @@ use pixelflow_ir::kind::OpKind;
 use crate::program::IfArm;
 use crate::program::IfGuard;
 use crate::program::ScheduledOp;
+use crate::program::Scope;
 use traffic::Counting;
 
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 
 use crate::error::CompileError;
 use crate::isa::Isa;
@@ -240,6 +244,14 @@ impl Assembly {
         self.text.push(Item::Bind(label));
     }
 
+    /// Emit a branch that falls through, handed the label of the position it
+    /// falls through to: bound right after it.
+    fn push_branch<I: AsmInsn>(&mut self, branch: impl FnOnce(Label) -> I) {
+        let next = self.mint();
+        self.push(branch(next));
+        self.bind(next);
+    }
+
     /// Emit one instruction, recording the name it waits on if it has one.
     fn push(&mut self, inst: impl AsmInsn) {
         let at = self.run.len();
@@ -327,52 +339,253 @@ impl From<PtrReg> for Gpr {
 /// field is declared with. `Pointer` and `Integer` live in the same file and
 /// are different classes, so a base address cannot be handed a `row * pitch`
 /// product.
-trait Class: Copy + 'static {
+///
+/// Sealed: these five are all there are.
+trait Class: sealed::Class + Copy + 'static {
     /// The register newtype a field of this class is at [`Physical`], until
     /// the allocator's tokens replace the newtypes.
     type Physical: Copy;
+    /// The register file a value of this class lives in.
+    type File: File;
+    /// This class as data: the allocator's view of a [`Value`].
+    const ID: ClassId;
+}
+
+mod sealed {
+    pub trait Class {}
+    pub trait File {}
+}
+
+/// A physical register file of the machine. Sealed: these four are all any
+/// target here has. A backend whose machine lacks one declares it empty, and
+/// no instruction of that backend has a field in it.
+#[expect(dead_code, reason = "live from B4")]
+trait File: sealed::File + 'static {
+    const ID: FileId;
+}
+
+/// `ymm`, `zmm`, `v`.
+enum VectorFile {}
+/// The 64-bit general-purpose registers.
+enum GeneralFile {}
+/// AVX-512's `k1`-`k7`. `k0` is not a member: an EVEX `aaa` of 0 means "no
+/// mask".
+enum OpmaskFile {}
+/// x86 `EFLAGS`, aarch64 `NZCV`: one member.
+enum FlagsFile {}
+
+/// A [`File`] as data.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[expect(dead_code, reason = "live from B4")]
+enum FileId {
+    Vector,
+    General,
+    Opmask,
+    Flags,
+}
+
+impl sealed::File for VectorFile {}
+impl sealed::File for GeneralFile {}
+impl sealed::File for OpmaskFile {}
+impl sealed::File for FlagsFile {}
+
+impl File for VectorFile {
+    const ID: FileId = FileId::Vector;
+}
+impl File for GeneralFile {
+    const ID: FileId = FileId::General;
+}
+impl File for OpmaskFile {
+    const ID: FileId = FileId::Opmask;
+}
+impl File for FlagsFile {
+    const ID: FileId = FileId::Flags;
+}
+
+/// What a backend's register files *are*: the allocatable members of each, by
+/// hardware number, and where the ABI puts the three arguments. Numbers only;
+/// nothing here is a register until `Pool::mint`. It says nothing about what an
+/// instruction needs: selection runs first, so the allocator reads that off
+/// the function.
+///
+/// A register outside every list belongs to the platform or the caller:
+/// callee-saved registers, the stack pointer (the frame's), `x30`, and Apple's
+/// `x18`. None of them is a scratch reservation.
+///
+/// The calling convention is SysV on x86-64 and AAPCS64 on aarch64, because
+/// `executable.rs` builds only for Linux and macOS.
+#[derive(Copy, Clone, Debug)]
+#[expect(dead_code, reason = "live from B3")]
+struct RegisterFile {
+    vector: &'static [u8],
+    general: &'static [u8],
+    opmask: &'static [u8],
+    flags: &'static [u8],
+    /// The members of `general` the three arguments arrive in. This is initial
+    /// ownership, not a reservation: once a parameter is dead or spilled its
+    /// register is free.
+    entry: EntryRegisters,
+    /// Bytes per `Vector` register and per vector frame slot: 16, 32 or 64.
+    vector_bytes: u64,
+}
+
+/// Where the ABI puts the collapse's three arguments.
+#[derive(Copy, Clone, Debug)]
+#[expect(dead_code, reason = "live from B3")]
+struct EntryRegisters {
+    ctx: u8,
+    out: u8,
+    pitch: u8,
+}
+
+#[expect(dead_code, reason = "live from B3")]
+const fn contains(members: &[u8], number: u8) -> bool {
+    let mut i = 0;
+    while i < members.len() {
+        if members[i] == number {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+#[expect(dead_code, reason = "live from B3")]
+const fn distinct(members: &[u8]) -> bool {
+    let mut i = 0;
+    while i < members.len() {
+        let (_, rest) = members.split_at(i + 1);
+        if contains(rest, members[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+impl RegisterFile {
+    /// Refuse a self-contradictory declaration at compile time: a file that
+    /// names a register twice, two flags registers, an entry register outside
+    /// `general` or shared by two arguments, a vector narrower than 16 bytes
+    /// or not a power of two.
+    #[expect(dead_code, reason = "live from B3")]
+    const fn checked(self) -> Self {
+        assert!(
+            distinct(self.vector)
+                && distinct(self.general)
+                && distinct(self.opmask)
+                && distinct(self.flags),
+            "a register file names a member twice"
+        );
+        assert!(self.flags.len() <= 1, "there is one flags register");
+        let EntryRegisters { ctx, out, pitch } = self.entry;
+        assert!(
+            contains(self.general, ctx)
+                && contains(self.general, out)
+                && contains(self.general, pitch),
+            "an entry argument arrives in a register outside the general file"
+        );
+        assert!(
+            ctx != out && ctx != pitch && out != pitch,
+            "two entry arguments arrive in one register"
+        );
+        assert!(
+            self.vector_bytes >= 16 && self.vector_bytes.is_power_of_two(),
+            "a vector is a power of two bytes, at least 16"
+        );
+        self
+    }
+
+    /// The numbers of the members of `file`.
+    #[expect(dead_code, reason = "live from B4")]
+    fn members(&self, file: FileId) -> &'static [u8] {
+        match file {
+            FileId::Vector => self.vector,
+            FileId::General => self.general,
+            FileId::Opmask => self.opmask,
+            FileId::Flags => self.flags,
+        }
+    }
+}
+
+/// A [`Class`] as data.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ClassId {
+    Vector,
+    Pointer,
+    Integer,
+    Opmask,
+    Flags,
 }
 
 /// One batch of `f32` lanes, which on a machine with one lane file is also a
 /// mask.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 enum Vector {}
 
 /// An address.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 enum Pointer {}
 
 /// An integer: an index, a product.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 enum Integer {}
 
 /// The condition flags.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 enum Flags {}
 
 /// One batch of predicate bits, in AVX-512's mask file: a lane per bit.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 enum Opmask {}
+
+impl sealed::Class for Vector {}
+impl sealed::Class for Pointer {}
+impl sealed::Class for Integer {}
+impl sealed::Class for Flags {}
+impl sealed::Class for Opmask {}
 
 impl Class for Vector {
     type Physical = Reg;
+    type File = VectorFile;
+    const ID: ClassId = ClassId::Vector;
 }
 
 impl Class for Pointer {
     type Physical = PtrReg;
+    type File = GeneralFile;
+    const ID: ClassId = ClassId::Pointer;
 }
 
 impl Class for Integer {
     type Physical = Gpr;
+    type File = GeneralFile;
+    const ID: ClassId = ClassId::Integer;
 }
 
 impl Class for Flags {
     type Physical = ();
+    type File = FlagsFile;
+    const ID: ClassId = ClassId::Flags;
 }
 
 impl Class for Opmask {
     type Physical = KReg;
+    type File = OpmaskFile;
+    const ID: ClassId = ClassId::Opmask;
 }
+
+/// The classes a frame slot can hold. `Flags` cannot be stored, so the
+/// allocator's own verbs ([`IsaBackend::copy`], [`spill`](IsaBackend::spill),
+/// [`reload`](IsaBackend::reload)) do not accept it: calling one with `Flags` is
+/// a type error.
+#[expect(dead_code, reason = "live from B3")]
+trait Spill: Class {}
+
+impl Spill for Vector {}
+impl Spill for Pointer {}
+impl Spill for Integer {}
+impl Spill for Opmask {}
 
 /// What the operands of an instruction are. An instruction enum is generic
 /// over a stage and declares each field by what it does to its register.
@@ -386,6 +599,8 @@ trait Stage {
     type Read<C: Class>;
     /// A register the instruction reads and overwrites in place.
     type Tie<C: Class>;
+    /// A frame slot, as the instructions the allocator builds name one.
+    type Slot;
     /// Where a branch goes.
     type Target;
     /// The frame's size, as `Enter` and `Ret` take it.
@@ -402,8 +617,407 @@ impl Stage for Physical {
     type Early<C: Class> = C::Physical;
     type Read<C: Class> = C::Physical;
     type Tie<C: Class> = C::Physical;
+    // The legacy drivers address their slots through `Mem`, not a field.
+    type Slot = ();
     type Target = Label;
     type FrameSize = u32;
+}
+
+/// A name for something computed, of class `C`: one definition, any number
+/// of reads. A name, so `Copy`: names copy, resources move.
+///
+/// Minted by [`build::Builder`], whose `Def` is the right to define one.
+#[derive(Copy, Clone, Debug)]
+#[expect(dead_code, reason = "live from B4")]
+struct Value<C: Class> {
+    id: u64,
+    _class: PhantomData<C>,
+}
+
+impl<C: Class> Value<C> {
+    /// The same name with its class as data.
+    #[expect(dead_code, reason = "live from B4")]
+    fn name(self) -> ValueName {
+        ValueName {
+            id: self.id,
+            class: C::ID,
+        }
+    }
+}
+
+/// The same name with its class as data: the allocator's view.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[expect(dead_code, reason = "live from B4")]
+struct ValueName {
+    id: u64,
+    class: ClassId,
+}
+
+/// The stage selection builds at: operands are names, and the rights to
+/// define them.
+#[expect(dead_code, reason = "live from B4")]
+enum Selected {}
+
+impl Stage for Selected {
+    type Write<C: Class> = build::Def<C>;
+    type Early<C: Class> = build::Early<C>;
+    type Read<C: Class> = Value<C>;
+    type Tie<C: Class> = build::Tie<C>;
+    // Only instructions the allocator builds carry one.
+    type Slot = SlotName;
+    type Target = Target;
+    type FrameSize = FrameSize;
+}
+
+/// The frame's size, as an operand of `Enter` and `Ret`: not known until the
+/// allocator has laid the frame out.
+#[derive(Copy, Clone, Debug)]
+#[expect(dead_code, reason = "live from B4")]
+struct FrameSize;
+
+/// A stage whose fields hold nothing: what [`IsaBackend::walk`] builds when
+/// only the traversal matters.
+#[expect(dead_code, reason = "live from B4")]
+enum Observed {}
+
+impl Stage for Observed {
+    type Write<C: Class> = ();
+    type Early<C: Class> = ();
+    type Read<C: Class> = ();
+    type Tie<C: Class> = ();
+    type Slot = ();
+    type Target = ();
+    type FrameSize = ();
+}
+
+/// The stage allocation builds: borrowed tokens, borrowed slots, block
+/// arguments already placed as moves, and the frame's size.
+#[expect(dead_code, reason = "live from B4")]
+struct Bound<'m, B>(core::convert::Infallible, PhantomData<&'m fn() -> B>);
+
+impl<'m, B: IsaBackend> Stage for Bound<'m, B> {
+    type Write<C: Class> = Out<'m, B, C>;
+    type Early<C: Class> = Out<'m, B, C>;
+    type Read<C: Class> = In<'m, B, C>;
+    type Tie<C: Class> = InOut<'m, B, C>;
+    type Slot = &'m FrameSlot;
+    type Target = Label;
+    type FrameSize = u64;
+}
+
+/// How an instruction is rebuilt at stage `T`, one operand at a time. Each
+/// method is the only way to turn its kind of field into `T`'s, so `walk` can
+/// neither misreport an access nor skip a register.
+#[expect(dead_code, reason = "live from B4")]
+trait Rebind<T: Stage> {
+    fn read<C: Class>(&mut self, v: Value<C>) -> T::Read<C>;
+    fn write<C: Class>(&mut self, d: &build::Def<C>) -> T::Write<C>;
+    fn early<C: Class>(&mut self, d: &build::Early<C>) -> T::Early<C>;
+    fn tie<C: Class>(&mut self, t: &build::Tie<C>) -> T::Tie<C>;
+    fn slot(&mut self, s: SlotName) -> T::Slot;
+    fn target(&mut self, t: &Target) -> T::Target;
+    fn frame_size(&mut self) -> T::FrameSize;
+}
+
+/// How an instruction touches a register operand. A `Tie` yields two
+/// entries: `Read`, and a `Tied` write naming that read's entry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[expect(dead_code, reason = "live from B4")]
+enum Access {
+    Read,
+    Write,
+    /// Written before the instruction is done reading: no read shares its
+    /// register.
+    Early,
+    /// Overwrites the read at this index of the operand list, in place.
+    Tied {
+        read: usize,
+    },
+}
+
+impl Access {
+    /// Whether the operand's value must already be defined.
+    fn reads(self) -> bool {
+        matches!(self, Access::Read)
+    }
+}
+
+/// One operand, as the allocator and the CFG read it. Immediates are typed
+/// fields no phase before encoding reads, and an address is a composite
+/// whose registers are listed here as reads.
+#[expect(dead_code, reason = "live from B4")]
+enum Operand {
+    Reg {
+        value: ValueName,
+        access: Access,
+    },
+    /// A branch target and the arguments it passes. A block's successors are
+    /// the `Target` operands of its last instruction.
+    Target(Target),
+    /// A frame slot: only on instructions the allocator inserted.
+    Frame(SlotName),
+}
+
+/// Every operand of `inst`, in walk order: `walk` at a stage whose fields are
+/// `()`, recording as it goes. The operand list and the binding are one
+/// traversal, so they cannot disagree.
+#[expect(dead_code, reason = "live from B4")]
+fn operands<B: IsaBackend>(inst: &B::Inst<Selected>) -> Vec<Operand> {
+    struct Recorder(Vec<Operand>);
+
+    impl Recorder {
+        fn reg<C: Class>(&mut self, value: Value<C>, access: Access) {
+            self.0.push(Operand::Reg {
+                value: value.name(),
+                access,
+            });
+        }
+    }
+
+    impl Rebind<Observed> for Recorder {
+        fn read<C: Class>(&mut self, v: Value<C>) {
+            self.reg(v, Access::Read);
+        }
+        fn write<C: Class>(&mut self, d: &build::Def<C>) {
+            self.reg(d.value(), Access::Write);
+        }
+        fn early<C: Class>(&mut self, d: &build::Early<C>) {
+            self.reg(d.value(), Access::Early);
+        }
+        fn tie<C: Class>(&mut self, t: &build::Tie<C>) {
+            let read = self.0.len();
+            self.reg(t.read(), Access::Read);
+            self.reg(t.write(), Access::Tied { read });
+        }
+        fn slot(&mut self, s: SlotName) {
+            self.0.push(Operand::Frame(s));
+        }
+        fn target(&mut self, t: &Target) {
+            self.0.push(Operand::Target(t.clone()));
+        }
+        fn frame_size(&mut self) {}
+    }
+
+    let mut recorder = Recorder(Vec::new());
+    let _ = B::walk(inst, &mut recorder);
+    recorder.0
+}
+
+/// A label operand before allocation: where to go, and the values for the
+/// target's parameters, in order.
+#[derive(Clone, Debug)]
+#[expect(dead_code, reason = "live from B4")]
+struct Target {
+    label: Label,
+    args: Vec<ValueName>,
+}
+
+/// A label, the values defined on entry to it, and its instructions.
+#[expect(dead_code, reason = "live from B4")]
+struct Block<I> {
+    label: Label,
+    /// Values defined on entry: what a phi is.
+    params: Vec<ValueName>,
+    insts: Vec<I>,
+    /// The nest scope this block's code belongs to, for traffic and trip
+    /// weighting.
+    scope: Scope,
+}
+
+/// The ABI's three arguments: the entry block's parameters, with their
+/// classes.
+#[derive(Copy, Clone, Debug)]
+#[expect(dead_code, reason = "live from B4")]
+struct Entry {
+    ctx: Value<Pointer>,
+    out: Value<Pointer>,
+    pitch: Value<Integer>,
+}
+
+/// One surviving fold's loop: a contiguous run of blocks from `head` to the
+/// one block that branches back to it.
+#[expect(dead_code, reason = "live from B4")]
+struct Loop {
+    head: Label,
+    /// The enclosing loop, as an index into [`Function::loops`].
+    parent: Option<usize>,
+    trips: u64,
+}
+
+/// The pool section: its label, then each entry with its own label, in order.
+#[expect(dead_code, reason = "live from B4")]
+struct Constants<K> {
+    label: Label,
+    entries: Vec<(Label, K)>,
+}
+
+/// One pool entry: its label (x86 reads it RIP-relative) and its byte offset
+/// in the section (aarch64 reads `[pool base, #offset]`).
+#[derive(Copy, Clone, Debug)]
+#[expect(dead_code, reason = "live from B4")]
+struct Constant {
+    label: Label,
+    offset: u64,
+}
+
+/// A whole kernel, in layout order.
+///
+/// Invariants, established by selection and asserted by
+/// [`build::Builder::finish`]:
+/// - `blocks[0]` is the entry. Its parameters are `entry`'s three.
+/// - Every minted label is bound by exactly one block or data item.
+/// - Only a block's last instruction has `Target` operands.
+/// - Exactly one block has none: the last.
+/// - Every `Target`'s arguments match its block's parameters in arity and
+///   class.
+/// - A conditional branch has two targets, `taken` then `next`. `next` is the
+///   following block and has no parameters.
+/// - Every backward branch comes from the last block of a loop in `loops`
+///   and targets that loop's head, and a loop has one.
+/// - A forward branch that skips blocks stays in one scope and does not enter
+///   or leave a loop.
+///
+/// **Dominance is relaxed in one way, and only one.**
+/// - A value an `If` arm defines is read by that `If`'s blend.
+/// - On the path where a uniform mask skipped the arm, the wrapper goes to
+///   that `If`'s single-arm block, and the blend does not run.
+/// - So a definition dominates every read that *executes*, not every
+///   syntactic read.
+/// - Interval liveness never carries the value above its definition, and join
+///   invariant 2 takes its location from the path that defines it.
+/// - No phase inserts a phi for it.
+#[expect(dead_code, reason = "live from B4")]
+struct Function<B: IsaBackend> {
+    blocks: Vec<Block<B::Inst<Selected>>>,
+    entry: Entry,
+    loops: Vec<Loop>,
+    constants: Constants<B::Constant>,
+    labels: Labels,
+}
+
+/// Everything about a target that selection needs. The driver, the allocator
+/// and the assembler are generic over it, and none of them names a register,
+/// an opcode or an encoding.
+///
+/// What it does not yet say arrives with its first reader: `encode`, in B3.
+#[expect(dead_code, reason = "live from B3")]
+trait IsaBackend: Sized + 'static {
+    type Inst<S: Stage>;
+    /// One pool entry: x86 `u32` (each load broadcasts a scalar), aarch64
+    /// `[u32; 4]`. It occupies `size_of` bytes of the pool section.
+    type Constant: Copy + Ord;
+    /// Per-function selection state: aarch64's pool-base value; `()` on x86.
+    type Anchors: Default;
+    /// One IR lane value as this machine holds it: `Value<Vector>` on AVX2
+    /// and NEON; a `Vector` or an `Opmask` value on AVX-512.
+    type Lane: Copy;
+    /// The allocatable registers, by number, and where the ABI puts the
+    /// arguments.
+    const FILE: RegisterFile;
+    /// How many pool entries an instruction can reach. aarch64:
+    /// `ldr q, [p, #imm12·16]`, so 4096. x86: `i32::MAX / 4`.
+    const POOL_REACH: u64;
+
+    // Selection. Operands are values; the driver resolved them.
+    fn lane(b: &mut build::Builder<Self>, op: LaneOp<Self>) -> Result<Self::Lane, CompileError>;
+    /// The class of a block parameter that carries `lane`.
+    fn lane_class(lane: Self::Lane) -> ClassId;
+    /// A block parameter, read back as a lane.
+    fn param_lane(param: ValueName) -> Self::Lane;
+    fn context(
+        b: &mut build::Builder<Self>,
+        ctx: Value<Pointer>,
+        slot: u64,
+    ) -> Result<Value<Pointer>, CompileError>;
+    fn store(b: &mut build::Builder<Self>, store: Store<Self>);
+    /// End the block: go to `edges.taken` when no lane of `test.cond` selects
+    /// `test.dead`'s arm; otherwise fall through to `edges.next`.
+    fn branch(b: &mut build::Builder<Self>, test: Test<Self>, edges: Edges);
+    /// End the block: go to `to`. A `Fallthrough` when `to` is `next`.
+    fn jump(b: &mut build::Builder<Self>, to: Target, next: Label);
+    /// The entry block's `Enter`, and the backend's per-function values
+    /// (aarch64's pool base).
+    fn enter(b: &mut build::Builder<Self>);
+    fn ret(b: &mut build::Builder<Self>);
+
+    // The allocator's own instructions.
+    fn copy<C: Spill>(b: &mut build::Spiller<'_, Self>, src: Value<C>) -> Value<C>;
+    /// Store `src` to `slot`. When `slot.offset()` does not encode: the slot's
+    /// address into a fresh `Pointer`, then the store through it.
+    fn spill<C: Spill>(b: &mut build::Spiller<'_, Self>, src: Value<C>, slot: &FrameSlot);
+    fn reload<C: Spill>(b: &mut build::Spiller<'_, Self>, slot: &FrameSlot) -> Value<C>;
+
+    /// Whether the allocator may recompute this instruction's definition
+    /// instead of storing it. It must read no value that is not itself
+    /// rematerializable, have no effect, and write no `Flags`: pool loads,
+    /// `movi`/`fmov` immediates, `adrp+add` of a label, the zero and all-ones
+    /// idioms.
+    fn rematerializable(inst: &Self::Inst<Selected>) -> bool;
+
+    /// Rebuild `inst` at stage `T`, visiting each operand once, in field
+    /// order. The only per-instruction traversal.
+    fn walk<T: Stage>(inst: &Self::Inst<Selected>, f: &mut impl Rebind<T>) -> Self::Inst<T>;
+}
+
+/// An operation producing one lane value, with its operands already lanes.
+/// Comparisons and `BitAnd`/`BitOr` are `Binary`: which file their result
+/// lives in is the backend's choice.
+#[expect(dead_code, reason = "live from B3")]
+enum LaneOp<B: IsaBackend> {
+    Const(f32),
+    /// `[0, 1, …, L−1]`.
+    Lanes,
+    Unary(OpKind, B::Lane),
+    Binary(OpKind, B::Lane, B::Lane),
+    /// `a·b + c`: one rounding, every target.
+    MulAdd(B::Lane, B::Lane, B::Lane),
+    /// The `If`'s lane-varying path.
+    Blend {
+        cond: B::Lane,
+        if_true: B::Lane,
+        if_false: B::Lane,
+    },
+    Shift(OpKind, B::Lane, u8),
+    Gather {
+        base: Value<Pointer>,
+        index: B::Lane,
+    },
+    Broadcast {
+        base: Value<Pointer>,
+        index: B::Lane,
+    },
+    Uniform {
+        base: Value<Pointer>,
+        element: u64,
+    },
+}
+
+/// The lattice's effect: `value`'s first `lanes` lanes at
+/// `out + 4·(row·pitch + col)`.
+#[expect(dead_code, reason = "live from B3")]
+struct Store<B: IsaBackend> {
+    out: Value<Pointer>,
+    pitch: Value<Integer>,
+    row: B::Lane,
+    col: B::Lane,
+    value: B::Lane,
+    lanes: u32,
+}
+
+/// A branch condition: the lane to test, and the arm that is dead when no
+/// lane of it is set.
+#[expect(dead_code, reason = "live from B3")]
+struct Test<B: IsaBackend> {
+    cond: B::Lane,
+    dead: IfArm,
+}
+
+/// Where a conditional branch goes: `taken`, or `next`, the block laid out
+/// right after.
+#[expect(dead_code, reason = "live from B3")]
+struct Edges {
+    taken: Target,
+    next: Label,
 }
 
 /// Physical mask/predicate register index (k0..k7 on AVX-512).
@@ -739,7 +1353,7 @@ pub struct CompileResult {
 ///
 /// [`compile_via_backend`] owns the architecture-INDEPENDENT logic —
 /// register allocation, frame layout, the fold loops and the If
-/// short-circuit control flow — and calls an `IsaBackend` for the leaf
+/// short-circuit control flow — and calls a `LegacyBackend` for the leaf
 /// operations that actually differ between x86-64 and aarch64 (instruction
 /// encoding, branch encoding, and any arch-specific finalization such as
 /// aarch64's constant pool). Both backends therefore run the *same* driver:
@@ -750,7 +1364,7 @@ pub struct CompileResult {
 /// cross as an opaque per-backend fixup token that the driver placed with
 /// `emit_jump` and later handed back to `patch_branch` along with an offset it
 /// had tracked itself — which is a label, minus the name.
-trait IsaBackend {
+trait LegacyBackend {
     /// Jump to `label`, unconditionally.
     fn jump(&mut self, asm: &mut Assembly, label: Label);
 
@@ -834,7 +1448,7 @@ trait IsaBackend {
     /// names `pool` — the constant pool's not-yet-known position — rather
     /// than a `code.len()` read off and carried by hand. One function has one
     /// pool, so the driver mints its label once and hands it to both this and
-    /// [`IsaBackend::finish`].
+    /// [`LegacyBackend::finish`].
     fn anchor(&mut self, asm: &mut Assembly, pool: Label);
 
     /// Append whatever must trail the emitted function — the constant pool —
@@ -893,7 +1507,7 @@ trait IsaBackend {
     /// `dst = (srcs[0] >= srcs[1]) ? all-ones : 0` — the fold loop's trip
     /// test.
     ///
-    /// A default over [`IsaBackend::alu`]: every backend but AVX-512 computes
+    /// A default over [`LegacyBackend::alu`]: every backend but AVX-512 computes
     /// a comparison exactly like any other binary op. AVX-512 represents a
     /// comparison's result as a k-register before it is widened to an
     /// ordinary vector mask ([`RegisterFile::mask_guard_temps`](regalloc::RegisterFile::mask_guard_temps)), which
@@ -1021,7 +1635,7 @@ fn binding(
 /// every scope nested in this one appends to in turn — and returns the
 /// register the scope's result is in: `None` when the root is an effect and
 /// not a value: a `Write`, a `Seq`, a fold over the unit monoid.
-fn emit_scope<B: IsaBackend>(
+fn emit_scope<B: LegacyBackend>(
     allocation: regalloc::Allocation<'_>,
     backend: &mut B,
     asm: &mut Assembly,
@@ -1564,7 +2178,7 @@ fn emit_scope<B: IsaBackend>(
 
             // Combine: fold the body's result into the accumulator — an
             // ordinary two-register ALU op, outside the schedule (see
-            // `IsaBackend::alu`'s doc) — where the accumulator lives. The
+            // `LegacyBackend::alu`'s doc) — where the accumulator lives. The
             // body's result may be in either temp, since its pool had both;
             // a slot-held accumulator round-trips through the other one.
             if accumulates {
@@ -2021,7 +2635,7 @@ fn location_of(locs: &[Option<Binding>], vid: regalloc::ValueId) -> Binding {
 
 /// Drive `schedule` to a kernel on the backend the host's CPU selected.
 ///
-/// Every [`IsaBackend`] compiles on every host — emission is a pure function of
+/// Every [`LegacyBackend`] compiles on every host — emission is a pure function of
 /// `(schedule, RegisterFile)` into a `Vec<u8>`, and an x86 machine is perfectly
 /// capable of computing NEON instruction words. So the target does not decide
 /// which backends *exist*; it decides which one is *instantiated*, here, from
@@ -2049,10 +2663,10 @@ pub(crate) fn compile_native(
     }
 }
 
-/// Drive a schedule to a complete collapse kernel via an [`IsaBackend`]: the
+/// Drive a schedule to a complete collapse kernel via a [`LegacyBackend`]: the
 /// body from [`emit_scope`], which emits every fold nested in it, framed by
 /// the function's own frame.
-fn compile_via_backend<B: IsaBackend>(
+fn compile_via_backend<B: LegacyBackend>(
     program: regalloc::ScopedSchedule,
     backend: &mut B,
 ) -> Result<CompileResult, CompileError> {
@@ -2159,7 +2773,7 @@ mod tests {
 
     /// [`compile_via_backend`] on a lowered schedule: what a test that compiles
     /// for a chosen backend hands it, scoped the way a compile scopes it.
-    pub(super) fn compile_schedule<B: IsaBackend>(
+    pub(super) fn compile_schedule<B: LegacyBackend>(
         schedule: Vec<regalloc::Def>,
         backend: &mut B,
     ) -> Result<CompileResult, CompileError> {
@@ -2168,7 +2782,7 @@ mod tests {
 
     /// Allocate a straight-line schedule and emit it as one scope's body: the
     /// one-scope view the emitter's own tests are written against.
-    pub(super) fn emit_dag_body<B: IsaBackend>(
+    pub(super) fn emit_dag_body<B: LegacyBackend>(
         schedule: Vec<regalloc::Def>,
         backend: &mut B,
     ) -> Result<(Vec<u8>, Reg), CompileError> {
@@ -2194,10 +2808,10 @@ mod tests {
     /// A backend whose scratch pool is `.1` registers above the floor
     /// ([`regalloc::tests::at_floor`]): how a test reaches, on a kernel small enough to reason
     /// about, the allocation a kernel too wide for the whole pool gets. Every
-    /// verb but [`IsaBackend::register_file`] is the wrapped backend's own.
+    /// verb but [`LegacyBackend::register_file`] is the wrapped backend's own.
     pub(super) struct AtFloor<B>(pub(super) B, pub(super) u8);
 
-    impl<B: IsaBackend> IsaBackend for AtFloor<B> {
+    impl<B: LegacyBackend> LegacyBackend for AtFloor<B> {
         fn jump(&mut self, asm: &mut Assembly, label: Label) {
             self.0.jump(asm, label);
         }
@@ -3193,7 +3807,7 @@ mod tests {
     /// The return is found from the driver's structure, not by scanning for
     /// `C3`, which a ModRM byte, an immediate or a pool entry holds just as
     /// well. A program has one return — [`compile_via_backend`] emits it,
-    /// and [`IsaBackend::emit_ret`] is the only verb that does, releasing the
+    /// and [`LegacyBackend::emit_ret`] is the only verb that does, releasing the
     /// frame first — and every byte before its end is counted by a
     /// scope or by the scaffold, so the return ends where those counts do.
     ///
@@ -3223,7 +3837,7 @@ mod tests {
         /// A kernel to compile, by name.
         type Case<'a> = (&'static str, &'a ExprArena, ExprId);
 
-        fn check<B: IsaBackend>(tier: &str, fresh: impl Fn() -> B, kernels: &[Case<'_>]) {
+        fn check<B: LegacyBackend>(tier: &str, fresh: impl Fn() -> B, kernels: &[Case<'_>]) {
             // The anchor follows the frame's allocation, each as the backend
             // emits them. The frame's size is an imm32 whatever its value, so
             // an empty frame measures the same bytes.
@@ -5643,7 +6257,7 @@ mod tests {
         /// kernel. `catch_unwind` is what lets this test report *which* ops a
         /// backend owes, by name and all of them, instead of dying on the
         /// first one.
-        fn try_emit<B: IsaBackend>(backend: &mut B, op: ResolvedOp) -> bool {
+        fn try_emit<B: LegacyBackend>(backend: &mut B, op: ResolvedOp) -> bool {
             let plan = InstructionPlan {
                 reloads: alloc::vec::Vec::new(),
                 op,
@@ -5675,7 +6289,7 @@ mod tests {
         /// collecting every failure instead of stopping at the first one —
         /// a completeness gap is much cheaper to fix as an itemized list
         /// than rediscovered one `cargo test` run per missing op.
-        fn assert_covers_required_ops<B: IsaBackend>(backend_name: &str, backend: &mut B) {
+        fn assert_covers_required_ops<B: LegacyBackend>(backend_name: &str, backend: &mut B) {
             // The explicit `try_emit` calls below for MulAdd/If are this
             // constant, unrolled by hand (each needs its own `ResolvedOp`
             // shape, so they aren't worth a generic loop) — kept in sync
@@ -5808,7 +6422,7 @@ mod tests {
             }
         }
 
-        fn encode<B: IsaBackend>(backend: &mut B, op: ResolvedOp) -> Vec<u8> {
+        fn encode<B: LegacyBackend>(backend: &mut B, op: ResolvedOp) -> Vec<u8> {
             let mut code = Vec::new();
             backend.emit_plan(&mut code, &plan(op)).expect("emit_plan");
             code
@@ -5952,7 +6566,7 @@ mod tests {
 
         /// `subject` legalized for `lanes` lanes, scheduled, scoped and emitted
         /// by `backend`, which must be the width `lanes` says.
-        fn compile_on<B: IsaBackend>(
+        fn compile_on<B: LegacyBackend>(
             mut backend: B,
             lanes: u32,
             subject: Subject<'_>,
@@ -6201,13 +6815,13 @@ mod tests {
         /// the frame the emitted code addresses. Seen are the fold loop's own
         /// slot traffic, the reloads and resolves of a value that lives in a
         /// slot, and a `Write`'s binders.
-        struct Addressed<'a, B: IsaBackend> {
+        struct Addressed<'a, B: LegacyBackend> {
             inner: &'a mut B,
             open: Vec<Vec<u32>>,
             closed: Vec<(regalloc::Scope, Vec<u32>)>,
         }
 
-        impl<'a, B: IsaBackend> Addressed<'a, B> {
+        impl<'a, B: LegacyBackend> Addressed<'a, B> {
             fn new(inner: &'a mut B) -> Self {
                 Self {
                     inner,
@@ -6249,7 +6863,7 @@ mod tests {
             }
         }
 
-        impl<B: IsaBackend> IsaBackend for Addressed<'_, B> {
+        impl<B: LegacyBackend> LegacyBackend for Addressed<'_, B> {
             fn jump(&mut self, asm: &mut Assembly, label: Label) {
                 self.inner.jump(asm, label);
             }

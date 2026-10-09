@@ -96,8 +96,10 @@ fn ldr_s(code: &mut Vec<u8>, dst: Reg, addr: Mem<Physical>) {
 /// Generic over what its operands are ([`Stage`]); a field is declared by the
 /// class of what it holds and by what the instruction does to it, so
 /// `ldr w`'s index is an `Integer` and its base a `Pointer`. Every
-/// instruction is one 32-bit word, except where a displacement past the
-/// scaled immediate is addressed through IP0 first ([`Mem::near`]).
+/// instruction is one 32-bit word, except [`Inst::CbzFar`] and
+/// [`Inst::AdrpAdd`], which are two. A displacement past the scaled immediate
+/// is added into IP0 before the instruction, by [`ldr_q`], [`str_q`] and
+/// [`ldr_s`] ([`Mem::near`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Inst<S: Stage> {
     /// `op dst.4s, a.4s, b.4s`
@@ -207,7 +209,7 @@ enum Inst<S: Stage> {
         dst: S::Write<Integer>,
         src: S::Read<Vector>,
     },
-    /// `fmov dst.x, src.d`: lane 0 to a general register, the guard's test.
+    /// `fmov dst.w, src.s`: lane 0 to a general register, the guard's test.
     FmovToGp {
         dst: S::Write<Integer>,
         src: S::Read<Vector>,
@@ -272,9 +274,13 @@ enum Inst<S: Stage> {
     /// to a fixed point to save four bytes per guard. The pair's size is fixed
     /// before a single byte is laid out, like `AdrpAdd`'s, and there is nothing
     /// to relax.
+    ///
+    /// `next` is the position laid out right after the pair, where the branch
+    /// falls through to: it encodes to nothing.
     CbzFar {
         test: S::Read<Integer>,
         taken: S::Target,
+        next: S::Target,
     },
     /// `adrp dst, to; add dst, dst, :lo12:to`, sharing one label: materialize
     /// the constant pool's address in `dst`.
@@ -424,10 +430,10 @@ impl Inst<Physical> {
             Inst::FmovToGp { dst, src } => 0x1E26_0000 | rn(src.0) | rd(dst.0),
             Inst::MovX { dst, src } => 0xAA00_03E0 | rm(src.0) | rd(dst.0),
             Inst::AddImm { dst, src, imm } => {
-                0x9100_0000 | ((u32::from(imm.0) & 0xFFF) << 10) | rn(src.0) | rd(dst.0)
+                0x9100_0000 | (imm.bits() << 10) | rn(src.0) | rd(dst.0)
             }
             Inst::SubImm { dst, src, imm } => {
-                0xD100_0000 | ((u32::from(imm.0) & 0xFFF) << 10) | rn(src.0) | rd(dst.0)
+                0xD100_0000 | (imm.bits() << 10) | rn(src.0) | rd(dst.0)
             }
             Inst::LdrQ { dst, addr } => transfer(0x3DC0_0000, dst.0, addr, Q_BYTES),
             Inst::StrQ { src, addr } => transfer(0x3D80_0000, src.0, addr, Q_BYTES),
@@ -456,7 +462,15 @@ impl AsmInsn for Inst<Physical> {
         let second_word = match self {
             Inst::Mov { dst, src } if dst == src => return,
             Inst::CbzFar { taken, .. } => Some(Inst::B { to: taken }.encode()),
-            Inst::AdrpAdd { dst, .. } => Some(0x9100_0000 | rn(dst.0) | rd(dst.0)),
+            // `add dst, dst, #0`, whose immediate `patch_adrp_add` fills in.
+            Inst::AdrpAdd { dst, .. } => Some(
+                Inst::AddImm {
+                    dst,
+                    src: dst,
+                    imm: Imm12::new(0),
+                }
+                .encode(),
+            ),
             _ => None,
         };
         emit32(code, self.encode());
@@ -1406,10 +1420,10 @@ mod tests {
 }
 
 // =============================================================================
-// The NEON `IsaBackend` driver
+// The NEON `LegacyBackend` driver
 // =============================================================================
 
-/// The aarch64 half of code generation: the [`IsaBackend`](crate::emit::IsaBackend)
+/// The aarch64 half of code generation: the [`LegacyBackend`](crate::emit::LegacyBackend)
 /// implementation and the constant pool it needs.
 ///
 /// **This file is where aarch64-specific bugs live, and the only place they
@@ -1613,7 +1627,7 @@ pub(super) mod driver {
         }
     }
 
-    impl IsaBackend for Aarch64Backend {
+    impl LegacyBackend for Aarch64Backend {
         fn jump(&mut self, asm: &mut Assembly, label: Label) {
             asm.push(Inst::B { to: label });
         }
@@ -1747,9 +1761,10 @@ pub(super) mod driver {
                         .assemble(&mut asm.run);
                 }
             }
-            asm.push(Inst::CbzFar {
+            asm.push_branch(|next| Inst::CbzFar {
                 test: ip0,
                 taken: label,
+                next,
             });
         }
 
@@ -1893,7 +1908,7 @@ pub(super) mod driver {
         let mut remaining = bytes;
         while remaining > 0 {
             let chunk = remaining.min(MAX_ADD_IMM);
-            AsmProgram::from([step(Imm12(chunk as u16))]).assemble(code);
+            AsmProgram::from([step(Imm12::new(chunk))]).assemble(code);
             remaining -= chunk;
         }
     }
@@ -1971,8 +1986,6 @@ pub(super) mod driver {
                 .assemble(code);
             }
             ResolvedOp::Unary { op, dst, src } => {
-                // The shared driver's `Unary`, not `table::Unary` (an
-                // encoding row), which this module also sees.
                 emit_unary(
                     code,
                     crate::emit::Unary {
@@ -2263,10 +2276,10 @@ const CBNZ_SKIPS_B: u32 = 2;
 #[cfg(test)]
 mod label_tests {
     use super::*;
-    use crate::emit::{Assembly, IfArm, IsaBackend, MaskTest};
+    use crate::emit::{Assembly, IfArm, LegacyBackend, MaskTest};
 
-    /// One known word, so a test can measure distances in instructions without
-    /// depending on any real encoding: a register copy that is not a no-op.
+    /// One known word, so a test can measure distances in instructions: a
+    /// register copy that is not a no-op, and so is emitted.
     const NOP: Inst<Physical> = Inst::Mov {
         dst: Reg(0),
         src: Reg(1),
@@ -2337,9 +2350,10 @@ mod label_tests {
     fn a_branch_on_w16_is_cbnz_over_b() {
         let mut asm = Assembly::default();
         let exit = asm.mint();
-        asm.push(Inst::CbzFar {
+        asm.push_branch(|next| Inst::CbzFar {
             test: Gpr(16),
             taken: exit,
+            next,
         });
         asm.push(NOP);
         asm.bind(exit);
@@ -2504,7 +2518,7 @@ mod xr_tests {
                 AsmProgram::from([Inst::AddImm {
                     dst,
                     src,
-                    imm: Imm12(imm),
+                    imm: Imm12::new(imm),
                 }])
                 .assemble(c)
             })
@@ -2548,14 +2562,14 @@ mod xr_tests {
         );
     }
 
-    /// `Gpr` and `Reg` name different files; the same index is a different
+    /// `PtrReg` and `Reg` name different files; the same index is a different
     /// register in each, which is why they are different types.
     #[test]
     fn the_two_register_files_are_not_interchangeable() {
         assert_eq!(X1.0, Reg(1).0);
-        // `Inst::str_q` takes both, in their own positions: the vector operand
+        // `Inst::StrQ` takes both, in their own positions: the vector operand
         // lands in Rt and the address's base in Rn, so swapping them cannot
-        // typecheck. `Inst::ldr_x` is the mirror — an `Xr` destination, because
+        // typecheck. `Inst::LdrX` is the mirror — a `PtrReg` destination, because
         // it is a load on the general file, not the vector one.
         assert_eq!(
             word(|c| AsmProgram::from([Inst::StrQ {

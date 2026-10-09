@@ -8,7 +8,7 @@
 //! ModRM/SIB is built from, the vector operations both tiers name ([`Alu`] and
 //! its kin, whose bytes are each tier's), and the constant pool with its
 //! anchor. Nothing here names a vector width: the `ymm`/`zmm` encodings live
-//! in `avx2.rs` and `avx512.rs`, each with its own `IsaBackend` driver, and
+//! in `avx2.rs` and `avx512.rs`, each with its own `LegacyBackend` driver, and
 //! the 128-bit tier that used to sit in this file is gone
 //! (docs/plans/2026-09-22-the-isa-is-decided-at-startup.md §7).
 
@@ -184,7 +184,7 @@ mod label_tests {
     fn two_labels_can_share_a_position() {
         let mut asm = Assembly::default();
         let (a, b) = (asm.mint(), asm.mint());
-        asm.push(Gp::je(a));
+        asm.push_branch(|next| Gp::je(a, next));
         asm.push(Gp::Jmp { to: b });
         asm.bind(a);
         asm.bind(b);
@@ -343,14 +343,20 @@ pub(super) enum Gp<S: Stage> {
         src: S::Read<Integer>,
         imm: u8,
     },
-    /// `jcc rel32`.
+    /// `jcc rel32`. `next` is the position laid out right after it, where the
+    /// branch falls through to: it encodes to nothing.
     Jcc {
         cond: Cond,
         flags: S::Read<Flags>,
         taken: S::Target,
+        next: S::Target,
     },
     /// `jmp rel32`.
     Jmp { to: S::Target },
+    /// Go to the position laid out right after this instruction: encodes to
+    /// nothing, and is what a transfer to the next block is.
+    #[expect(dead_code, reason = "live from B3")]
+    Fallthrough { to: S::Target },
     /// `lea dst, [rip + to]`: a position's address, in one instruction.
     LeaRip {
         dst: S::Write<Pointer>,
@@ -387,23 +393,25 @@ pub(super) enum Gp<S: Stage> {
 const RSP: Gpr = ptr::RSP.as_gpr();
 
 impl Gp<Physical> {
-    /// `je target` — ZF set.
+    /// `je taken` — ZF set.
     #[must_use]
-    pub(super) const fn je(taken: Label) -> Self {
+    pub(super) const fn je(taken: Label, next: Label) -> Self {
         Gp::Jcc {
             cond: Cond::E,
             flags: (),
             taken,
+            next,
         }
     }
 
-    /// `jb target` — CF set; unsigned `<`.
+    /// `jb taken` — CF set; unsigned `<`.
     #[must_use]
-    pub(super) const fn jb(taken: Label) -> Self {
+    pub(super) const fn jb(taken: Label, next: Label) -> Self {
         Gp::Jcc {
             cond: Cond::B,
             flags: (),
             taken,
+            next,
         }
     }
 
@@ -493,6 +501,7 @@ impl Gp<Physical> {
                 cond, flags: (), ..
             } => inst.extend(&[0x0F, 0x80 | cond as u8, 0, 0, 0, 0]),
             Gp::Jmp { .. } => inst.extend(&[0xE9, 0, 0, 0, 0]),
+            Gp::Fallthrough { .. } => {}
             Gp::LeaRip { dst, .. } => {
                 inst.push(0x48 | (((dst.0 >> 3) & 1) << 2));
                 inst.push(0x8D);
@@ -1096,7 +1105,7 @@ mod gpr_tests {
         let mut asm = Assembly::default();
         let top = asm.mint();
         asm.bind(top);
-        asm.push(Gp::jb(top));
+        asm.push_branch(|next| Gp::jb(top, next));
         let c = asm.finish();
         assert_eq!(c[..2], [0x0F, 0x82]);
         assert_eq!(&c[2..6], &(-6i32).to_le_bytes(), "a back edge is negative");

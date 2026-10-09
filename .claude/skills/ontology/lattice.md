@@ -146,7 +146,7 @@
   substitution rewrites them (L3, open).
 - **Lives:** `ExprNode::Write`, `push_write` (`pixelflow-ir/src/arena.rs`),
   `ScheduledOp::{Write, Seq}` (`pixelflow-codegen/src/program/mod.rs`),
-  `IsaBackend::emit_write` (`pixelflow-codegen/src/emit/mod.rs`);
+  `LegacyBackend::emit_write` (`pixelflow-codegen/src/emit/mod.rs`);
   collapse-is-a-fold §2.4, step 3.
 
 ### Lane, batch, width (SIMD). Homonym of the actor lane
