@@ -178,7 +178,6 @@ impl<B: IsaBackend> Builder<B> {
         }
     }
 
-    #[expect(dead_code, reason = "live from B8")]
     pub(super) fn early<C: Class>(&mut self) -> Early<C> {
         Early {
             value: self.fresh(),

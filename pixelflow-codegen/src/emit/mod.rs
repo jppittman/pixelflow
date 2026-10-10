@@ -1032,12 +1032,12 @@ enum LaneOp<B: IsaBackend> {
         if_false: B::Lane,
     },
     Shift(OpKind, B::Lane, u8),
-    #[expect(dead_code, reason = "live from B8")]
+    /// `base[index]`, one element per lane.
     Gather {
         base: Value<Pointer>,
         index: B::Lane,
     },
-    #[expect(dead_code, reason = "live from B8")]
+    /// `base[index]` for lane 0's index, in every lane.
     Broadcast {
         base: Value<Pointer>,
         index: B::Lane,

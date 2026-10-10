@@ -1646,8 +1646,9 @@ Every commit in this phase is live in production.
 
 - **Files:** `avx2.rs`, `select.rs`.
 - **Add:**
-  - `Gather`: `vcvttps2dq`, `Ones` mask, then `Gather { dst: Early, mask: Tie }`;
-  - `Broadcast`: `Cvtt`, then `vbroadcastss [base + idx·4]`.
+  - `Gather`: `vcvttps2dq`, `Ones` mask, then `Gather { dst: Early, mask: Tie }`; the tie's write (the cleared mask) is a definition nobody reads;
+  - `Broadcast`: `Cvtt`, then `vbroadcastss [base + idx·4]`;
+  - the driver selects both from `ScheduledOp::Gather(index, base)` and `Broadcast(index, base)`, the base being a pointer value bound by `Context`.
 - **Gate:** K(avx2) plus `reduce_binder_reads_bound_buffer`, `glyph_*`, `freetype_oracle`.
 
 #### B9: An `If` is blocks
@@ -1667,7 +1668,7 @@ Every commit in this phase is live in production.
   - **A quality ratchet,** `selection_moves_no_more_memory_than_legacy`. Per row, trip-weighted `loads + stores + remats` of the selection pipeline must be at most 1.25 × legacy's + 8, and the sum over rows at most legacy's. This is the static predictor escape-hatches found tracks wall clock 98–99% of the time.
   - **A compile-size bound,** `selection_stays_linear`. Per row, selected instructions are at most 4 × scheduled ops, and inserted instructions at most 2 × selected. The scan is O(instructions × file size) by construction, so this bounds its `n`.
   - **Register coverage through the production API** (§0.6), in `tests/`: per tier, a pressure kernel whose live vectors outnumber `VectorFile`, and whose live pointers and integers (bound buffers, uniforms, carries) outnumber `GeneralFile`, checked by its values against a scalar reference computed in the test. This is what reaches `cmp sil`/`cmp r9b`'s REX forms (allocation F16). No `samples()` table, no test-only constructor.
-  - **CI, in jobs that are already required** (§0.7): the `isa-matrix` job runs V, `tests/residency.rs` and `tests/loops.rs`, with `PIXELFLOW_CODEGEN=selection PIXELFLOW_ISA=avx2`.
+  - **CI, in jobs that are already required** (§0.7): the `isa-matrix` job runs V, `tests/residency.rs`, `tests/loops.rs` and `tests/emit_traffic.rs`, with `PIXELFLOW_CODEGEN=selection PIXELFLOW_ISA=avx2`.
   - **The ratchet compares against a pinned table.** The knob is read once per process, so `selection_moves_no_more_memory_than_legacy` reads legacy's per-row numbers from a table generated once in this commit, and says how to regenerate it.
 - **Gate:** G, plus the new steps.
 
@@ -1690,6 +1691,7 @@ Every commit in this phase is live in production.
   - `branch` as `KorTest(k)` → `Jcc` on an `Opmask` condition, with `Ptestm` first on a `Vector` one;
   - the masked remainder store through `MovImm32` → `Kmovw`;
   - a pin that a zmm slot at offset 64 encodes `disp32 = 0x40` (EVEX `disp8` scaling).
+  - the `Tied` arm of `Scan::place` takes `write_plain`'s steal: a tied write whose tied read is a carried parameter that is read no more takes the parameter's lease and its `carried_until`, where it copies the parameter now and the latch moves the value back (two moves a trip). AVX2's loop path never reaches it (the step and the combine are plain VEX writes); `Tie` operands on AVX-512 and NEON do.
 - **`GOLDEN_SELECTED[avx512]`.** The `isa-matrix` step adds `PIXELFLOW_ISA=avx512` V.
 - **Gate:** G plus the steps.
 

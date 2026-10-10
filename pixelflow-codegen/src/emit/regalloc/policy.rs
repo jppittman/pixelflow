@@ -50,8 +50,9 @@ pub(super) enum Store {
 /// its loser in.
 ///
 /// A value defined again where it is read needs no store, nor does one whose
-/// slot already holds it; anything else has to be written out. Belady's distance breaks ties *within* a tier and only within
-/// one: the traffic an eviction causes outweighs how long it waits to cause it.
+/// slot already holds it; anything else has to be written out. Belady's
+/// distance breaks ties *within* a tier and only within one: the traffic an
+/// eviction causes outweighs how long it waits to cause it.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct EvictionRank {
     /// Read by the instruction being placed — see [`ReadHere`].

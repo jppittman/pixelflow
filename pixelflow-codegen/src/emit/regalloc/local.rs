@@ -470,8 +470,10 @@ fn plan_carries(live: &Liveness, reads: &[usize], budget: Budget) -> Vec<Vec<u64
 /// registers of a file than the file has, a `Flags` value read after another
 /// flags write or held to the end of its block, a carried value that is not in
 /// its register at its loop's latch, a loop parameter read past the latch, a
-/// forward branch past a block (a join), or an entry block whose first
-/// instruction does not make the frame.
+/// backward branch whose moves form a register cycle (no producer before a loop
+/// passes one parameter to another), a latch move into a register that a value
+/// other than the loop's parameters and the moved arguments holds, a forward branch past a block (a join), or an entry block
+/// whose first instruction does not make the frame.
 pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
     function: Function<B>,
     pool: &'m Pool<B>,
@@ -589,8 +591,9 @@ pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
     }
     assert!(
         scan.held.is_empty() && scan.active.is_empty(),
-        "values are held after the last instruction: {:?}",
-        scan.held.keys()
+        "values are held after the last instruction: {:?}, and loops are open: {}",
+        scan.held.keys(),
+        scan.active.len()
     );
     let Scan {
         free,
@@ -983,8 +986,9 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
     ///
     /// # Panics
     /// When a carried value is not in the register it had at the head, a
-    /// parameter is read past the latch, or a move's destination holds a value
-    /// the exit reads, or the moves form a register cycle.
+    /// parameter is read past the latch, a move's destination holds a value
+    /// other than the loop's own parameters and the arguments being moved, or
+    /// the moves form a register cycle.
     fn latch(&mut self, l: usize, moves: &[(ValueName, ValueName)]) {
         let active = self.active.pop().expect("a latch is inside its loop");
         assert_eq!(active.index, l, "{:?} closes a loop it is not in", self.at);

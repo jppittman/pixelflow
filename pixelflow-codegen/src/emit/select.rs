@@ -98,10 +98,12 @@ impl<B: IsaBackend> Selector<'_, B> {
         self.frames.push(Frame::new());
         for (at, def) in schedule.iter().enumerate() {
             // A placeholder, a sequence and a binder's alias select nothing;
-            // a `Reduce` counts once it is known to open a loop.
+            // a `Reduce` counts once it is known to open a loop; a constant is
+            // defined where it is read, and counted there, as a remat.
             if !matches!(
                 def.op,
-                ScheduledOp::Outer(_)
+                ScheduledOp::Const(_)
+                    | ScheduledOp::Outer(_)
                     | ScheduledOp::Seq(..)
                     | ScheduledOp::Var(_)
                     | ScheduledOp::Reduce(..)
@@ -197,8 +199,13 @@ impl<B: IsaBackend> Selector<'_, B> {
                         element: *element,
                     })?
                 }
-                ScheduledOp::Gather(..) | ScheduledOp::Broadcast(..) => {
-                    unimplemented_op(DRIVER, &def.op)
+                ScheduledOp::Gather(index, base) => {
+                    let (base, index) = (self.pointer(*base), self.lookup(*index));
+                    self.lane(LaneOp::Gather { base, index })?
+                }
+                ScheduledOp::Broadcast(index, base) => {
+                    let (base, index) = (self.pointer(*base), self.lookup(*index));
+                    self.lane(LaneOp::Broadcast { base, index })?
                 }
             };
             self.bind(def.value, value);
