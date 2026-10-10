@@ -338,3 +338,105 @@ pub fn memory() -> (ExprArena, ExprId) {
     let root = sum_tree(&mut a, &[gathered, broadcast, first, far]);
     (a, root)
 }
+
+/// The width a row is compiled at, which for two of the three is a fact about
+/// the target's lanes and so cannot be one number.
+#[derive(Clone, Copy)]
+pub enum Width {
+    /// One sample: all remainder, no main fold exists.
+    One,
+    /// Exactly one batch: all main, no remainder fold exists.
+    OneBatch,
+    /// [`REMAINDER_WIDTH`]: a main fold and a remainder fold.
+    Remainder,
+}
+
+impl Width {
+    /// The columns of the lattice, for a target of `lanes` lanes.
+    pub fn columns(self, lanes: u32) -> u32 {
+        match self {
+            Self::One => 1,
+            Self::OneBatch => lanes,
+            Self::Remainder => REMAINDER_WIDTH,
+        }
+    }
+}
+
+/// A kernel and the width it is compiled at.
+pub struct Row {
+    pub name: &'static str,
+    pub build: fn() -> (ExprArena, ExprId),
+    pub width: Width,
+}
+
+fn parked() -> (ExprArena, ExprId) {
+    parked_roots(PARKED_TERMS)
+}
+
+fn deep() -> (ExprArena, ExprId) {
+    deep_frame(DEEP_FRAME_TERMS)
+}
+
+/// The glyph-like fold at the three widths that decide how many sibling column
+/// folds exist (a remainder alone; a main alone; both), and each other kernel
+/// where both exist. After them, the coverage rows: every op the backends owe,
+/// every way a kernel reads memory, and a frame past what NEON addresses
+/// directly, all at the width with a remainder. The names are the byte pins',
+/// and the traffic pins'.
+pub const TABLE: [Row; 11] = [
+    Row {
+        name: "glyph_like_w1",
+        build: glyph_like,
+        width: Width::One,
+    },
+    Row {
+        name: "glyph_like_wL",
+        build: glyph_like,
+        width: Width::OneBatch,
+    },
+    Row {
+        name: "glyph_like_w37",
+        build: glyph_like,
+        width: Width::Remainder,
+    },
+    Row {
+        name: "two_sibling_folds_w37",
+        build: two_sibling_folds,
+        width: Width::Remainder,
+    },
+    Row {
+        name: "parked_roots_w37",
+        build: parked,
+        width: Width::Remainder,
+    },
+    Row {
+        name: "guarded_if_in_fold_w37",
+        build: guarded_if_in_fold,
+        width: Width::Remainder,
+    },
+    Row {
+        name: "unary_ops_w37",
+        build: unary_ops,
+        width: Width::Remainder,
+    },
+    Row {
+        name: "binary_ops_w37",
+        build: binary_ops,
+        width: Width::Remainder,
+    },
+    Row {
+        name: "shift_muladd_blend_w37",
+        build: shift_muladd_blend,
+        width: Width::Remainder,
+    },
+    Row {
+        name: "memory_w37",
+        build: memory,
+        width: Width::Remainder,
+    },
+    Row {
+        name: "deep_frame_w37",
+        build: deep,
+        width: Width::Remainder,
+    },
+];

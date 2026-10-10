@@ -1636,6 +1636,10 @@ pub(super) mod driver {
             AARCH64_FILE
         }
 
+        fn reads_pool(&self, val_bits: u32) -> bool {
+            super::needs_const_pool(f32::from_bits(val_bits))
+        }
+
         fn begin(&mut self, schedule: &[regalloc::Def]) -> Result<(), CompileError> {
             // Seed by APPENDING into the existing pool, never replacing it: a
             // compile emits every scope of the nest through one backend, and

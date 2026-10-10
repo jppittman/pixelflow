@@ -254,57 +254,21 @@ struct SiblingRow {
 /// bytes; the names do not.
 fn sibling_cases() -> Vec<SiblingRow> {
     use pixelflow_codegen::jit_vector_bytes;
-    use sibling_rows::{REMAINDER_WIDTH, ROWS};
     const BYTES_PER_LANE: usize = 4;
 
-    let one_batch = (jit_vector_bytes() / BYTES_PER_LANE) as u32;
-    let row = |name, (arena, root): (ExprArena, ExprId), columns| SiblingRow {
-        name,
-        arena,
-        root,
-        shape: LatticeShape::new([columns, ROWS]),
-    };
-    vec![
-        row("glyph_like_w1", sibling_rows::glyph_like(), 1),
-        row("glyph_like_wL", sibling_rows::glyph_like(), one_batch),
-        row(
-            "glyph_like_w37",
-            sibling_rows::glyph_like(),
-            REMAINDER_WIDTH,
-        ),
-        row(
-            "two_sibling_folds_w37",
-            sibling_rows::two_sibling_folds(),
-            REMAINDER_WIDTH,
-        ),
-        row(
-            "parked_roots_w37",
-            sibling_rows::parked_roots(sibling_rows::PARKED_TERMS),
-            REMAINDER_WIDTH,
-        ),
-        row(
-            "guarded_if_in_fold_w37",
-            sibling_rows::guarded_if_in_fold(),
-            REMAINDER_WIDTH,
-        ),
-        row("unary_ops_w37", sibling_rows::unary_ops(), REMAINDER_WIDTH),
-        row(
-            "binary_ops_w37",
-            sibling_rows::binary_ops(),
-            REMAINDER_WIDTH,
-        ),
-        row(
-            "shift_muladd_blend_w37",
-            sibling_rows::shift_muladd_blend(),
-            REMAINDER_WIDTH,
-        ),
-        row("memory_w37", sibling_rows::memory(), REMAINDER_WIDTH),
-        row(
-            "deep_frame_w37",
-            sibling_rows::deep_frame(sibling_rows::DEEP_FRAME_TERMS),
-            REMAINDER_WIDTH,
-        ),
-    ]
+    let lanes = (jit_vector_bytes() / BYTES_PER_LANE) as u32;
+    sibling_rows::TABLE
+        .iter()
+        .map(|row| {
+            let (arena, root) = (row.build)();
+            SiblingRow {
+                name: row.name,
+                arena,
+                root,
+                shape: LatticeShape::new([row.width.columns(lanes), sibling_rows::ROWS]),
+            }
+        })
+        .collect()
 }
 
 /// One scope's counts, in a fixed order.
