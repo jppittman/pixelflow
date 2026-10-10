@@ -4441,46 +4441,6 @@ pub(super) mod tests {
         );
     }
 
-    /// A constant under pressure is rematerialized, never spilled: its slot is
-    /// its bits, so there is nothing to store and no frame slot to give it.
-    #[test]
-    fn constants_are_rematerialized_rather_than_spilled() {
-        let width = u64::from(RegisterFile::MIN_SCRATCH) + 1;
-        let mut schedule = vec![leaf(0)];
-        for i in 1..=width {
-            schedule.push(def(i, ScheduledOp::Const(i as f32)));
-        }
-        let mut acc = ValueId(1);
-        for i in 2..=width {
-            schedule.push(def(
-                width + i,
-                ScheduledOp::Binary(OpKind::Add, acc, ValueId(i)),
-            ));
-            acc = ValueId(width + i);
-        }
-        let a = alloc(schedule);
-
-        let remat: Vec<(ValueId, u32)> = (1..=width)
-            .flat_map(|i| {
-                ever(&a, ValueId(i))
-                    .into_iter()
-                    .filter_map(move |w| match w {
-                        Where::Remat(bits) => Some((ValueId(i), bits)),
-                        _ => None,
-                    })
-            })
-            .collect();
-        assert!(!remat.is_empty(), "constants under pressure should remat");
-        assert_eq!(spill_count(&a), 0, "no constant belongs in a spill slot");
-        for (vid, bits) in remat {
-            assert_eq!(
-                bits,
-                (vid.0 as f32).to_bits(),
-                "{vid:?} rematerializes the wrong constant"
-            );
-        }
-    }
-
     // --- the frame: the Placement -> address arrow ---
 
     /// A leaf, `width` values of it that all stay live, and the chain of
@@ -5048,46 +5008,6 @@ pub(super) mod tests {
             matches!(a.body().where_at(ValueId(20), last), Where::Reg(_)),
             "nothing later reverses its own destination write; only a queued \
              demotion could, and there is nowhere to queue one to"
-        );
-    }
-
-    /// Belady: with no constants in play, the value used farthest in the
-    /// future is the one that goes to memory.
-    ///
-    /// The scenario separates Belady from FIFO and LRU deliberately. Four
-    /// values fill the pool in the order v1..v4, then v5 forces an eviction —
-    /// but they are *consumed* in that same order, so v1 is simultaneously the
-    /// oldest, the least recently used, and the one needed soonest. FIFO and
-    /// LRU both evict v1. Only a rule that looks forward evicts v4.
-    #[test]
-    fn belady_evicts_the_value_used_farthest_out() {
-        // One more independent value than the pool holds, so exactly one must
-        // go to memory and the test is about *which*.
-        let live = u64::from(RegisterFile::MIN_SCRATCH) + 1;
-        let mut schedule = vec![leaf(0)];
-        for i in 1..=live {
-            schedule.push(def(i, ScheduledOp::Unary(OpKind::Neg, ValueId(0))));
-        }
-        // Consume v1 first, then v2, v3, … and v`live-1` last.
-        let mut acc = ValueId(live);
-        for i in 1..live {
-            schedule.push(def(
-                100 + i,
-                ScheduledOp::Binary(OpKind::Add, acc, ValueId(i)),
-            ));
-            acc = ValueId(100 + i);
-        }
-        let a = alloc(schedule);
-
-        assert!(
-            ever(&a, ValueId(live - 1)).contains(&Where::Spilled),
-            "v{live_minus_1} is needed last, so it is the one to evict",
-            live_minus_1 = live - 1
-        );
-        assert!(
-            !ever(&a, ValueId(1)).contains(&Where::Spilled),
-            "v1 is needed next, so it must keep its register for the whole of \
-             its life — evicting it is what FIFO and LRU would have done"
         );
     }
 

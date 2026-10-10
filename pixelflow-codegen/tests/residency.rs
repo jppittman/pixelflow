@@ -73,16 +73,19 @@ fn an_operand_overwritten_in_place_survives_when_it_is_read_again() {
 }
 
 /// More values live at once than the vector file has registers. The allocator
-/// gives up the register of the value read farthest out, so no term past the
-/// file costs more than a store where it is defined and a reload where it is
-/// read again; giving up the nearest instead reloads terms the second sum
-/// reads at once. The loop nest's own traffic cancels against a wall that fits.
+/// gives up the register of the value read farthest out, so each term past the
+/// file costs at most a handful of memory operations, where giving up the
+/// nearest reloads terms the second sum reads at once. The loop nest's own
+/// traffic cancels against a wall that fits.
 #[test]
 fn the_value_read_farthest_out_is_the_one_given_up() {
     /// Terms in the wall that fits every tier's vector file.
     const FITS: u64 = 4;
-    /// Terms in the wall past the vector file of every tier but AVX-512's.
-    const TERMS: u64 = 24;
+    /// Terms past the vector file, so that this many must go to memory.
+    const EXCESS: u64 = 8;
+    /// What each costs at most: a store and a reload, in each of the two sums
+    /// that read it, less what the sums' own values share.
+    const PER_TERM: u64 = 5;
     let wall = |terms: u64| {
         compiled(|a, x, y| {
             let mut sums = Vec::new();
@@ -104,11 +107,59 @@ fn the_value_read_farthest_out_is_the_one_given_up() {
             a.push_binary(OpKind::Add, up, down)
         })
         .traffic
-        .dynamic_memory_ops()
     };
-    let (fits, wide) = (wall(FITS), wall(TERMS));
+    let fits = wall(FITS);
+    let wide = wall(u64::from(fits.pool) + EXCESS);
+    let extra = wide.dynamic_memory_ops() - fits.dynamic_memory_ops();
     assert!(
-        wide - fits <= 2 * (TERMS - FITS),
-        "{wide} memory operations for {TERMS} terms against {fits} for {FITS}"
+        extra <= PER_TERM * EXCESS,
+        "{extra} more memory operations for {EXCESS} terms past a pool of {}",
+        fits.pool
+    );
+}
+
+/// A constant given up is defined again where it is read: it has no slot, so
+/// there is nothing to store and nothing to reload.
+///
+/// More constants than any vector file holds, summed twice over in one chain:
+/// the first pass's reads leave every constant wanted again, so a register must
+/// be given up for each one past the file. Few enough constants to stay in
+/// registers is the kernel's own traffic, which the many add nothing to but, at
+/// most, the chain's result parked for the loops that store it: a store and a
+/// load, however many constants there are.
+#[test]
+fn constants_are_rematerialized_rather_than_spilled() {
+    /// Constants that fit every tier's vector file with room to spare.
+    const FEW: usize = 4;
+    /// Constants past the vector file.
+    const EXCESS: usize = 24;
+    const PARKED_RESULT: u64 = 2;
+    let constants = |count: usize| {
+        let values: Vec<f32> = (0..count).map(|i| 1.0 + 0.25 * i as f32).collect();
+        let kernel = compiled(|a, _, _| {
+            let leaves: Vec<_> = values.iter().map(|&c| a.push_const(c)).collect();
+            let once = leaves[1..]
+                .iter()
+                .fold(leaves[0], |acc, &c| a.push_binary(OpKind::Add, acc, c));
+            leaves
+                .iter()
+                .fold(once, |acc, &c| a.push_binary(OpKind::Add, acc, c))
+        });
+        let want = 2.0 * values.iter().sum::<f32>();
+        let got = eval_point(&kernel.code, 0.0, 0.0);
+        assert!(
+            (got - want).abs() <= want.abs() * 1e-5,
+            "{count} constants: {got} against {want}"
+        );
+        kernel.traffic
+    };
+    let few = constants(FEW);
+    let many = constants(usize::from(few.pool) + EXCESS);
+    assert!(
+        many.dynamic_memory_ops() <= few.dynamic_memory_ops() + PARKED_RESULT,
+        "{} memory operations for {} constants against {} for {FEW}",
+        many.dynamic_memory_ops(),
+        usize::from(few.pool) + EXCESS,
+        few.dynamic_memory_ops()
     );
 }

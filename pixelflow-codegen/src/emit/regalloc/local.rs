@@ -3,8 +3,14 @@
 //! A value stays in its register until something needs the register, and a
 //! value that is read while in none is reloaded into a fresh one that stays
 //! until it is needed in turn. What the scan gives up a register for is
-//! priced by [`EvictionRank`]: the value that costs no store, then the one
-//! read farthest out.
+//! priced by [`EvictionRank`]: the value that is defined again rather than
+//! stored, then the one that costs no store, then the one read farthest out.
+//!
+//! **A constant is defined where it is read.** An instruction the backend can
+//! recompute ([`IsaBackend::rematerializable`]: a pool load, a zero, an
+//! all-ones) is not placed where it is selected. It is held until a read finds
+//! its value in no register, and is placed again before that read, as often as
+//! that happens. It has no slot and no store; one nothing reads is never placed.
 //!
 //! **A spilled value is stored right after its definition**, never at the
 //! eviction point, which a guard can skip. The scan only learns that a value
@@ -58,8 +64,9 @@ use core::ops::Range;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(in crate::emit) enum Origin {
     Selected,
-    /// A selected constant the backend can recompute rather than store
-    /// ([`IsaBackend::rematerializable`]): `EmitTraffic`'s remats.
+    /// A definition the backend can recompute, placed again where a read needs
+    /// its value in a register ([`IsaBackend::rematerializable`]):
+    /// `EmitTraffic`'s remats.
     Remat,
     Spill,
     Reload,
@@ -548,6 +555,8 @@ pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
         pinned: Vec::new(),
         next: function.classes.len() as u64,
         defined,
+        insts: Vec::new(),
+        remats: BTreeMap::new(),
         records: Vec::new(),
         late: BTreeMap::new(),
         numbers: Vec::new(),
@@ -585,6 +594,7 @@ pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
     );
     let Scan {
         free,
+        insts,
         records,
         late,
         numbers,
@@ -599,6 +609,7 @@ pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
     }
     let mut binding = Binding {
         frame,
+        insts: &insts,
         bank,
         numbers: &numbers,
         next: 0,
@@ -642,10 +653,12 @@ pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
     })
 }
 
-/// An instruction the scan has placed: what to bind, why it is there, and
-/// where in the scan's numbers its operands' registers begin.
-struct Record<B: IsaBackend> {
-    pushed: Pushed<B::Inst<Selected>>,
+/// An instruction the scan has placed: which of the scan's instructions to
+/// bind, why it is there, and where in the scan's numbers its operands'
+/// registers begin. Placing one instruction twice (a rematerialization) is two
+/// records of one instruction.
+struct Record {
+    inst: usize,
     origin: Origin,
     regs: usize,
 }
@@ -709,10 +722,16 @@ struct Scan<'f, 'm, B: IsaBackend> {
     next: u64,
     /// Where each value is defined: a block, and an index into its records.
     defined: Vec<Option<(usize, usize)>>,
+    /// Every instruction the scan has been given or has inserted, in the order
+    /// it met them; a record names one by its index.
+    insts: Vec<B::Inst<Selected>>,
+    /// The selected instructions that are placed only where a read needs the
+    /// value, by the value each defines: an index into `insts`.
+    remats: BTreeMap<u64, usize>,
     /// The instructions placed so far, by block.
-    records: Vec<Vec<Record<B>>>,
+    records: Vec<Vec<Record>>,
     /// The stores of evicted values, by where each goes.
-    late: BTreeMap<StorePoint, Vec<Record<B>>>,
+    late: BTreeMap<StorePoint, Vec<Record>>,
     /// The register number of every operand of every record, in operand order;
     /// zero where the operand is not a register.
     numbers: Vec<u8>,
@@ -752,6 +771,10 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
     /// carrying theirs, its branch arguments passed, itself, and the registers
     /// it is done with returned.
     fn instruction(&mut self, pushed: Pushed<B::Inst<Selected>>) -> Result<(), CompileError> {
+        if B::rematerializable(&pushed.inst) {
+            self.defer(pushed);
+            return Ok(());
+        }
         let targets: Vec<&Target> = pushed
             .operands
             .iter()
@@ -799,6 +822,32 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
         self.emit(pushed, Origin::Selected)?;
         self.release_dead();
         Ok(())
+    }
+
+    /// Hold `pushed`, a definition the backend can recompute, until a read
+    /// needs its value in a register ([`Self::reload_into`]). One nothing reads
+    /// is never placed.
+    ///
+    /// # Panics
+    /// When the instruction does more than define one value, or defines flags,
+    /// which a placement elsewhere could clobber.
+    fn defer(&mut self, pushed: Pushed<B::Inst<Selected>>) {
+        let [
+            Operand::Reg {
+                value,
+                access: Access::Write,
+            },
+        ] = pushed.operands[..]
+        else {
+            panic!("a rematerializable instruction defines one value and reads none")
+        };
+        assert_ne!(
+            value.class,
+            ClassId::Flags,
+            "{value:?} is rematerializable, and a rematerialization would clobber the flags"
+        );
+        let inst = self.keep(pushed.inst);
+        self.remats.insert(value.id, inst);
     }
 
     /// The loop `target` is the way into: a forward branch to its head.
@@ -1032,17 +1081,18 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
                     Operand::Target(_) | Operand::Frame(_) => 0,
                 });
             }
+            let inst = self.keep(pushed.inst);
             self.records[self.block].push(Record {
-                pushed,
+                inst,
                 origin: Origin::Copy,
                 regs,
             });
         }
     }
 
-    /// Make `value` resident: reload it from its slot, into the register the
-    /// instruction will read it from. It stays there until something needs
-    /// the register.
+    /// Make `value` resident: define it again if it is rematerializable, and
+    /// otherwise reload it from its slot, into the register the instruction
+    /// will read it from. It stays there until something needs the register.
     fn reload_into(&mut self, value: ValueName) -> Result<(), CompileError> {
         assert_ne!(
             value.class,
@@ -1051,6 +1101,13 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
             self.position,
             self.at
         );
+        if let Some(&inst) = self.remats.get(&value.id) {
+            let define = [Operand::Reg {
+                value,
+                access: Access::Write,
+            }];
+            return self.place(inst, &define, Origin::Remat);
+        }
         let life = &self.lives[value.id as usize];
         let slot = life
             .slot
@@ -1122,10 +1179,10 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
     }
 
     /// Store `value`, which is in its defining register, right after its
-    /// definition, unless that is done.
+    /// definition, unless that is done, or it can be defined again instead.
     fn store_at_definition(&mut self, value: u64) -> Result<(), CompileError> {
         let life = &self.lives[value as usize];
-        if life.stored {
+        if life.stored || self.remats.contains_key(&value) {
             return Ok(());
         }
         let name = ValueName {
@@ -1152,8 +1209,9 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
                     Operand::Target(_) | Operand::Frame(_) => 0,
                 });
             }
+            let inst = self.keep(pushed.inst);
             self.late.entry(at).or_default().push(Record {
-                pushed,
+                inst,
                 origin: Origin::Spill,
                 regs,
             });
@@ -1225,9 +1283,13 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
     /// the file is the flags, which cannot be stored.
     fn evict(&mut self, file: FileId) -> Result<(), CompileError> {
         let rank = |id: u64| {
-            let store = match self.lives[id as usize].stored {
-                true => Store::NotNeeded,
-                false => Store::Needed,
+            let store = match (
+                self.remats.contains_key(&id),
+                self.lives[id as usize].stored,
+            ) {
+                (true, _) => Store::Never,
+                (false, true) => Store::NotNeeded,
+                (false, false) => Store::Needed,
             };
             let distance = self.next_read(id).map(|next| next - self.position);
             (EvictionRank::new(ReadHere::No, store, distance), id)
@@ -1265,9 +1327,20 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
         pushed: Pushed<B::Inst<Selected>>,
         origin: Origin,
     ) -> Result<(), CompileError> {
+        let inst = self.keep(pushed.inst);
+        self.place(inst, &pushed.operands, origin)
+    }
+
+    /// Place instruction `inst`, whose operands are `operands`, as
+    /// [`Self::emit`] does.
+    fn place(
+        &mut self,
+        inst: usize,
+        operands: &[Operand],
+        origin: Origin,
+    ) -> Result<(), CompileError> {
         let first = self.numbers.len();
-        self.numbers.resize(first + pushed.operands.len(), 0);
-        let operands = &pushed.operands;
+        self.numbers.resize(first + operands.len(), 0);
         for (k, operand) in operands.iter().enumerate() {
             if let Operand::Reg {
                 value,
@@ -1343,16 +1416,18 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
                 }
             }
         }
-        let origin = match origin {
-            Origin::Selected if B::rematerializable(&pushed.inst) => Origin::Remat,
-            other => other,
-        };
         self.records[self.block].push(Record {
-            pushed,
+            inst,
             origin,
             regs: first,
         });
         Ok(())
+    }
+
+    /// `inst`, now one of the scan's.
+    fn keep(&mut self, inst: B::Inst<Selected>) -> usize {
+        self.insts.push(inst);
+        self.insts.len() - 1
     }
 
     /// Define `value` in a register, recording its number at `at`.
@@ -1421,6 +1496,8 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
 /// token of the lease the scan recorded for it.
 struct Binding<'a, 'm, B: IsaBackend> {
     frame: &'m Frame,
+    /// Every instruction the scan placed, which the records name.
+    insts: &'a [B::Inst<Selected>],
     /// Every lease, by file and number.
     bank: [BTreeMap<u8, Lent<'m, B>>; 4],
     /// The register number of every operand of every record.
@@ -1433,11 +1510,11 @@ struct Binding<'a, 'm, B: IsaBackend> {
 
 impl<'m, B: IsaBackend> Binding<'_, 'm, B> {
     /// `record`, bound.
-    fn record(&mut self, record: &Record<B>) -> Emitted<'m, B> {
+    fn record(&mut self, record: &Record) -> Emitted<'m, B> {
         self.next = record.regs;
         self.framed = false;
         Emitted {
-            inst: B::walk::<Bound<'m, B>>(&record.pushed.inst, self),
+            inst: B::walk::<Bound<'m, B>>(&self.insts[record.inst], self),
             origin: record.origin,
         }
     }
