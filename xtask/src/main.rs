@@ -612,12 +612,13 @@ const ISA_LEVELS: &[IsaLevel] = &[
         pipeline: None,
         suites: &[],
     },
-    // The selection pipeline (docs/plans/2026-10-08-selection-is-a-phase.md),
-    // at the one tier it has a backend for. Not a tier, but decided the same
-    // way (the environment, once, at startup) and run the same way: the tests
-    // that pin its code and its traffic do nothing under the default
-    // pipeline, so this is the only leg that runs them. It runs every suite
-    // that compiles a kernel and checks it, in the three crates that do; the
+    // The pipelines (docs/plans/2026-10-08-selection-is-a-phase.md), at the one
+    // tier with a selection backend. Not tiers, but decided the same way (the
+    // environment, once, at startup) and run the same way. The selection leg is
+    // the pipeline AVX2 ships: every suite that compiles a kernel and checks
+    // it, in the three crates that do, so the pins that mean something under it
+    // (the glyph and scene byte pins, the V suites) run presubmit under the code
+    // that ships, whatever tier the `test` job's runner happens to have. The
     // workspace's other crates are not held to it yet.
     IsaLevel {
         name: "avx2+fma, selection",
@@ -634,6 +635,40 @@ const ISA_LEVELS: &[IsaLevel] = &[
             "pixelflow-graphics",
             "--no-fail-fast",
         ]],
+    },
+    // The legacy pipeline, until it is deleted, runs only what means something
+    // under it: the memory table it is held to, and the byte pins keyed to it.
+    // Everything else is checked by the values it computes, which the leg above
+    // checks under the pipeline that ships.
+    IsaLevel {
+        name: "avx2+fma, legacy",
+        isa: "avx2",
+        requires: &["avx2", "fma"],
+        pipeline: Some("legacy"),
+        suites: &[
+            &[
+                "test",
+                "-p",
+                "pixelflow-codegen",
+                "--test",
+                "memory_ratchet",
+            ],
+            &[
+                "test",
+                "-p",
+                "pixelflow-graphics",
+                "--test",
+                "glyph_branches",
+            ],
+            &[
+                "test",
+                "-p",
+                "pixelflow-graphics",
+                "--lib",
+                "--",
+                "render::packed::",
+            ],
+        ],
     },
 ];
 
@@ -927,7 +962,7 @@ fn isa_matrix(with_clippy: bool, mode: IsaExecutionMode) {
             }
             let scope = match level.suites {
                 [] => mode.scope(),
-                _ => "codegen, core and graphics suites",
+                _ => "the pipeline's own suites",
             };
             println!("isa-matrix: {} — {scope} tests passed", level.name);
 

@@ -1,10 +1,10 @@
 //! A loop keeps what it reads in registers and pays for what leaves it once.
 //!
-//! Run under `PIXELFLOW_CODEGEN=selection`, these fail on an allocator that
-//! drops every register at a loop's head, and on one that stores a value at
-//! its definition when the definition runs every trip. They are written
-//! against what a kernel emits: its traffic per scope, and the numbers it
-//! computes.
+//! Run on the selection pipeline (AVX2's own, or `PIXELFLOW_CODEGEN=selection`),
+//! these fail on an allocator that drops every register at a loop's head, and
+//! on one that stores a value at its definition when the definition runs every
+//! trip. They are written against what a kernel emits: its traffic per scope,
+//! and the numbers it computes.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 

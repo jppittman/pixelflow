@@ -264,6 +264,7 @@ impl PackedFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pixelflow_codegen::isa::Isa;
     use pixelflow_core::Lattice;
 
     const RGBA: [u32; 4] = [0, 8, 16, 24];
@@ -468,13 +469,19 @@ mod tests {
             ("chrome", chrome(), CHROME_PINS),
             ("silhouette", silhouette(), SILHOUETTE_PINS),
         ];
-        // The selection pipeline (`PIXELFLOW_CODEGEN=selection`) has a tier of
-        // its own: the same scenes, other code.
-        let selection = std::env::var("PIXELFLOW_CODEGEN")
-            .is_ok_and(|name| name.trim().eq_ignore_ascii_case("selection"));
-        let tier = match selection {
-            true => format!("{}+selection", pixelflow_codegen::isa::detect().name()),
-            false => pixelflow_codegen::isa::detect().name().to_string(),
+        // A tier is pinned under the pipeline it compiles with by default; one
+        // `PIXELFLOW_CODEGEN` asks for instead has a tier of its own, `avx2+legacy`:
+        // the same scenes, other code.
+        let isa = pixelflow_codegen::isa::detect();
+        let default = match isa {
+            Isa::Avx2 => "selection",
+            Isa::Avx512 | Isa::Neon => "legacy",
+        };
+        let tier = match std::env::var("PIXELFLOW_CODEGEN") {
+            Ok(knob) if !knob.trim().eq_ignore_ascii_case(default) => {
+                format!("{}+{}", isa.name(), knob.trim().to_ascii_lowercase())
+            }
+            _ => isa.name().to_string(),
         };
         let mut moved = Vec::new();
         for (name, scene, pins) in scenes {
@@ -496,23 +503,24 @@ mod tests {
         assert!(moved.is_empty(), "scene code moved:\n{}", moved.join("\n"));
     }
 
-    /// One kernel's code on each tier, `(tier, bytes, fnv1a64)`; `+selection` after
-    /// the ISA's name is the selection pipeline, which has AVX2 alone so far.
+    /// One kernel's code on each tier, `(tier, bytes, fnv1a64)`; `+legacy` after
+    /// the ISA's name is the legacy pipeline, which AVX2 no longer compiles with
+    /// by default.
     type TierPins = [(&'static str, usize, u64); 4];
 
     /// The chrome sphere's code per tier.
     const CHROME_PINS: TierPins = [
-        ("avx2", 6192, 0xb419_6e71_9c99_afb6),
+        ("avx2", 5296, 0x8c12_dcf8_c29d_98b0),
         ("avx512", 6224, 0x9e5c_99e8_27bc_546a),
         ("neon", 3520, 0x8a30_5ff7_636f_e4fe),
-        ("avx2+selection", 5296, 0x8c12_dcf8_c29d_98b0),
+        ("avx2+legacy", 6192, 0xb419_6e71_9c99_afb6),
     ];
 
     /// The silhouette's code per tier.
     const SILHOUETTE_PINS: TierPins = [
-        ("avx2", 1276, 0x1d42_97fa_4eec_b1f4),
+        ("avx2", 956, 0xf671_c139_7e06_ee59),
         ("avx512", 1196, 0x1080_ada6_22ad_f852),
         ("neon", 976, 0xd6f5_70fd_e78e_6f74),
-        ("avx2+selection", 956, 0xf671_c139_7e06_ee59),
+        ("avx2+legacy", 1276, 0x1d42_97fa_4eec_b1f4),
     ];
 }
