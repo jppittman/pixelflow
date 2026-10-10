@@ -6,16 +6,17 @@
 //! one. What it owns is the shape: the body, each surviving fold as a loop of
 //! blocks, and the lattice's store.
 
-use super::build::Builder;
+use super::build::{Builder, Pending};
 use super::traffic::scope_ix;
 use super::{
     Edges, Entry, Function, IsaBackend, LaneOp, Pointer, Store, Target, Test, Value,
     unimplemented_op,
 };
 use crate::error::CompileError;
-use crate::program::{IfArm, ScheduledOp, Scope, ScopedSchedule, ValueId};
+use crate::program::{IfArm, IfGuard, ScheduledOp, Scope, ScopedSchedule, ValueId};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::cmp::Reverse;
 use pixelflow_ir::fold::{Binder, Fold, Monoid};
 use pixelflow_ir::kind::OpKind;
 
@@ -45,6 +46,36 @@ pub(super) fn select<B: IsaBackend>(scoped: &ScopedSchedule) -> Result<Function<
     let mut function = selector.b.finish();
     function.scheduled = selector.scheduled;
     Ok(function)
+}
+
+/// A guarded arm: skipped when no lane of the mask selects it.
+struct Arm {
+    arm: IfArm,
+    mask: ValueId,
+    /// The schedule position its run ends at.
+    end: usize,
+}
+
+/// The arms of `guards` by the schedule position each begins at, outer arms
+/// before the arms nested in them.
+fn arms_by_start(guards: &[IfGuard]) -> BTreeMap<usize, Vec<Arm>> {
+    let mut starts: BTreeMap<usize, Vec<Arm>> = BTreeMap::new();
+    for guard in guards {
+        for arm in IfArm::ALL {
+            let (start, end) = guard.range(arm);
+            if start != end {
+                let mask = guard.mask_vid;
+                starts
+                    .entry(start)
+                    .or_default()
+                    .push(Arm { arm, mask, end });
+            }
+        }
+    }
+    starts
+        .values_mut()
+        .for_each(|arms| arms.sort_by_key(|arm| Reverse(arm.end)));
+    starts
 }
 
 /// The loop nest as it is entered: one binding frame per open scope, and the
@@ -96,7 +127,19 @@ impl<B: IsaBackend> Selector<'_, B> {
             Scope::Fold(j) => (&scoped.folds[j].schedule, &scoped.folds[j].guards),
         };
         self.frames.push(Frame::new());
+        let mut starts = arms_by_start(guards);
+        // The arms open at this point of the schedule, innermost last, each
+        // with the block that follows it.
+        let mut open: Vec<(usize, Pending)> = Vec::new();
         for (at, def) in schedule.iter().enumerate() {
+            while let Some((_, past)) = open.pop_if(|(end, _)| *end == at) {
+                self.close_arm(past);
+            }
+            for arm in starts.remove(&at).unwrap_or_default() {
+                let cond = self.lookup(arm.mask);
+                let past = self.open_arm(scope, cond, arm.arm);
+                open.push((arm.end, past));
+            }
             // A placeholder, a sequence and a binder's alias select nothing;
             // a `Reduce` counts once it is known to open a loop; a constant is
             // defined where it is read, and counted there, as a remat.
@@ -168,22 +211,22 @@ impl<B: IsaBackend> Selector<'_, B> {
                     self.lane(LaneOp::MulAdd(a, b, c))?
                 }
                 ScheduledOp::Ternary(OpKind::If, cond, if_true, if_false) => {
-                    if guards
+                    let guarded = guards
                         .iter()
-                        .any(|guard| guard.if_idx == at && guard.has_guarded_arm())
-                    {
-                        unimplemented_op(DRIVER, &def.op);
-                    }
+                        .any(|guard| guard.if_idx == at && guard.has_guarded_arm());
                     let (cond, if_true, if_false) = (
                         self.lookup(*cond),
                         self.lookup(*if_true),
                         self.lookup(*if_false),
                     );
-                    self.lane(LaneOp::Blend {
-                        cond,
-                        if_true,
-                        if_false,
-                    })?
+                    match guarded {
+                        true => self.guarded_if(scope, cond, (if_true, if_false))?,
+                        false => self.lane(LaneOp::Blend {
+                            cond,
+                            if_true,
+                            if_false,
+                        })?,
+                    }
                 }
                 ScheduledOp::Ternary(op, ..) => unimplemented_op(DRIVER, op),
                 ScheduledOp::Context(slot) => {
@@ -210,6 +253,10 @@ impl<B: IsaBackend> Selector<'_, B> {
             };
             self.bind(def.value, value);
         }
+        assert!(
+            open.is_empty() && starts.is_empty(),
+            "an arm is open at the end of its scope, or begins past it"
+        );
         let root = schedule.last().expect("a scope's schedule is not empty");
         let is_unit = match &root.op {
             ScheduledOp::Write { .. } | ScheduledOp::Seq(..) => true,
@@ -308,6 +355,91 @@ impl<B: IsaBackend> Selector<'_, B> {
         );
         self.b.enter(exit);
         Ok(accumulated)
+    }
+
+    /// Open the arm `dead` names: skipped, to the block after it, when no lane
+    /// of `cond` selects it. It returns that block, to be entered where the
+    /// arm ends.
+    fn open_arm(&mut self, scope: Scope, cond: B::Lane, dead: IfArm) -> Pending {
+        let (arm, past) = (self.b.block(&[], scope), self.b.block(&[], scope));
+        let taken = Target {
+            label: past.label(),
+            args: Vec::new(),
+        };
+        let edges = Edges {
+            taken,
+            next: arm.label(),
+        };
+        B::branch(&mut self.b, Test { cond, dead }, edges);
+        self.b.enter(arm);
+        past
+    }
+
+    /// End the arm in the open block and enter the block after it.
+    fn close_arm(&mut self, past: Pending) {
+        let label = past.label();
+        let to = Target {
+            label,
+            args: Vec::new(),
+        };
+        B::jump(&mut self.b, to, label);
+        self.b.enter(past);
+    }
+
+    /// An `If` with a guarded arm, as blocks:
+    ///
+    /// ```text
+    /// no lane true:   only_false
+    /// no lane false:  only_true
+    /// blend:          the lane-varying path
+    /// join(result)
+    /// ```
+    ///
+    /// An arm a uniform mask skipped did not run, and its value is read only
+    /// on the paths where it did, so each path passes the `If`'s value to the
+    /// join.
+    fn guarded_if(
+        &mut self,
+        scope: Scope,
+        cond: B::Lane,
+        (if_true, if_false): (B::Lane, B::Lane),
+    ) -> Result<B::Lane, CompileError> {
+        let [only_false, only_true, second, blend] = [(); 4].map(|()| self.b.block(&[], scope));
+        let to = |block: &Pending| Target {
+            label: block.label(),
+            args: Vec::new(),
+        };
+        let first = Edges {
+            taken: to(&only_false),
+            next: second.label(),
+        };
+        let dead = |dead| Test { cond, dead };
+        B::branch(&mut self.b, dead(IfArm::True), first);
+        self.b.enter(second);
+        let second = Edges {
+            taken: to(&only_true),
+            next: blend.label(),
+        };
+        B::branch(&mut self.b, dead(IfArm::False), second);
+        self.b.enter(blend);
+        let blended = self.lane(LaneOp::Blend {
+            cond,
+            if_true,
+            if_false,
+        })?;
+        let join = self.b.block(&[B::lane_name(blended).class], scope);
+        let result = B::param_lane(join.params()[0]);
+        let into = |lane| Target {
+            label: join.label(),
+            args: alloc::vec![B::lane_name(lane)],
+        };
+        B::jump(&mut self.b, into(blended), only_false.label());
+        self.b.enter(only_false);
+        B::jump(&mut self.b, into(if_false), only_true.label());
+        self.b.enter(only_true);
+        B::jump(&mut self.b, into(if_true), join.label());
+        self.b.enter(join);
+        Ok(result)
     }
 
     fn lane(&mut self, op: LaneOp<B>) -> Result<B::Lane, CompileError> {

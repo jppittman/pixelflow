@@ -473,10 +473,19 @@ mod tests {
         for (name, scene, pins) in scenes {
             let code = code_of(&scene);
             let emitted = (code.len(), pixelflow_codegen::fnv1a64(&code));
-            let &(_, len, fnv) = pins
-                .iter()
-                .find(|(t, _, _)| *t == tier)
-                .unwrap_or_else(|| panic!("{name} has no pin for the {tier} tier"));
+            let pinned = match selection() {
+                true => SELECTED_AVX2_PINS
+                    .iter()
+                    .find(|&&(n, ..)| n == name)
+                    .map(|&(_, len, fnv)| (len, fnv))
+                    .filter(|_| tier == "avx2"),
+                false => pins
+                    .iter()
+                    .find(|(t, _, _)| *t == tier)
+                    .map(|&(_, len, fnv)| (len, fnv)),
+            };
+            let (len, fnv) =
+                pinned.unwrap_or_else(|| panic!("{name} has no pin for the {tier} tier"));
             if emitted != (len, fnv) {
                 moved.push(format!(
                     "{name} on {tier}: pinned ({len}, {fnv:#018x}), emitted ({}, {:#018x})",
@@ -485,6 +494,20 @@ mod tests {
             }
         }
         assert!(moved.is_empty(), "scene code moved:\n{}", moved.join("\n"));
+    }
+
+    /// The same scenes compiled by the selection pipeline
+    /// (`PIXELFLOW_CODEGEN=selection`), `(scene, bytes, fnv1a64)`. It has the
+    /// AVX2 tier alone so far, and a run on any other refuses to compile.
+    const SELECTED_AVX2_PINS: [(&str, usize, u64); 2] = [
+        ("chrome", 5296, 0x8c12_dcf8_c29d_98b0),
+        ("silhouette", 956, 0xf671_c139_7e06_ee59),
+    ];
+
+    /// Whether this process compiles with the selection pipeline.
+    fn selection() -> bool {
+        std::env::var("PIXELFLOW_CODEGEN")
+            .is_ok_and(|name| name.trim().eq_ignore_ascii_case("selection"))
     }
 
     /// One kernel's code on each tier, `(tier, bytes, fnv1a64)`.

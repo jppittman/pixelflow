@@ -164,3 +164,44 @@ fn constants_are_rematerialized_rather_than_spilled() {
         few.dynamic_memory_ops()
     );
 }
+
+/// `if x < 14 { sin(x) * y } else { exp(y / 8) + sqrt(x) }`, with both arms
+/// worth a branch, joins its value in a register: it costs the memory its two
+/// arms' sum does. An `If` whose result went through the frame would store it
+/// on each path and load it after the join.
+///
+/// The legacy pipeline reserves registers for its guards and spends more on
+/// this kernel, so the comparison is made on the selection pipeline only.
+#[test]
+fn a_guarded_if_joins_in_a_register() {
+    let selection = std::env::var("PIXELFLOW_CODEGEN")
+        .is_ok_and(|name| name.trim().eq_ignore_ascii_case("selection"));
+    if !selection {
+        return;
+    }
+    let arms = |a: &mut ExprArena, x, y| {
+        let sine = a.push_unary(OpKind::Sin, x);
+        let hot = a.push_binary(OpKind::Mul, sine, y);
+        let eighth = a.push_const(0.125);
+        let scaled = a.push_binary(OpKind::Mul, y, eighth);
+        let grown = a.push_unary(OpKind::Exp, scaled);
+        let root = a.push_unary(OpKind::Sqrt, x);
+        (hot, a.push_binary(OpKind::Add, grown, root))
+    };
+    let guarded = compiled(|a, x, y| {
+        let edge = a.push_const(14.0);
+        let before = a.push_binary(OpKind::Lt, x, edge);
+        let (hot, cold) = arms(a, x, y);
+        a.push_ternary(OpKind::If, before, hot, cold)
+    });
+    let summed = compiled(|a, x, y| {
+        let (hot, cold) = arms(a, x, y);
+        a.push_binary(OpKind::Add, hot, cold)
+    });
+    assert!(
+        guarded.traffic.dynamic_memory_ops() <= summed.traffic.dynamic_memory_ops(),
+        "the guarded If moved {} memory operations, where its arms sum moves {}",
+        guarded.traffic.dynamic_memory_ops(),
+        summed.traffic.dynamic_memory_ops()
+    );
+}

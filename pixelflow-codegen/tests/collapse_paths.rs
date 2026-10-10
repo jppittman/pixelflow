@@ -190,6 +190,63 @@ fn an_if_blends_and_branches() {
     check(&out, |x, y| if x < y { x * x } else { y * y });
 }
 
+/// `if x < 14 { sin(x) * y } else { exp(y / 8) + sqrt(x) }`: both arms are
+/// worth a branch. A batch whose mask is uniform runs the one arm, and a batch
+/// whose mask varies runs both and blends them, so the three ways through an
+/// `If` all execute, a column of them at a time.
+#[test]
+fn a_guarded_if_runs_the_arm_that_ran() {
+    let mut a = ExprArena::new();
+    let x = a.push_var(0);
+    let y = a.push_var(1);
+    let edge = a.push_const(14.0);
+    let eighth = a.push_const(0.125);
+    let before = a.push_binary(OpKind::Lt, x, edge);
+    let sine = a.push_unary(OpKind::Sin, x);
+    let hot = a.push_binary(OpKind::Mul, sine, y);
+    let scaled = a.push_binary(OpKind::Mul, y, eighth);
+    let grown = a.push_unary(OpKind::Exp, scaled);
+    let root_x = a.push_unary(OpKind::Sqrt, x);
+    let cold = a.push_binary(OpKind::Add, grown, root_x);
+    let root = a.push_ternary(OpKind::If, before, hot, cold);
+
+    let out = collapse(&a, root, &[], &[]);
+    check(&out, |x, y| {
+        if x < 14.0 {
+            x.sin() * y
+        } else {
+            (y * 0.125).exp() + x.sqrt()
+        }
+    });
+}
+
+/// A guarded `If` inside the arm of another, and the outer's value used by
+/// both: the join of the inner is read after the outer's arm ends.
+#[test]
+fn a_guarded_if_nests_in_the_arm_of_another() {
+    let mut a = ExprArena::new();
+    let x = a.push_var(0);
+    let y = a.push_var(1);
+    let [outer_edge, inner_edge] = [14.0, 7.0].map(|c| a.push_const(c));
+    let outer = a.push_binary(OpKind::Lt, x, outer_edge);
+    let inner = a.push_binary(OpKind::Lt, y, inner_edge);
+    let sine = a.push_unary(OpKind::Sin, x);
+    let cosine = a.push_unary(OpKind::Cos, y);
+    let wave = a.push_ternary(OpKind::If, inner, sine, cosine);
+    let hot = a.push_binary(OpKind::Mul, wave, y);
+    let growth = a.push_unary(OpKind::Exp, y);
+    let cold = a.push_binary(OpKind::Add, growth, x);
+    let outer_if = a.push_ternary(OpKind::If, outer, hot, cold);
+    let root = a.push_binary(OpKind::Add, outer_if, wave);
+
+    let out = collapse(&a, root, &[], &[]);
+    check(&out, |x, y| {
+        let wave = if y < 7.0 { x.sin() } else { y.cos() };
+        let arm = if x < 14.0 { wave * y } else { y.exp() + x };
+        arm + wave
+    });
+}
+
 /// A plane narrower than one batch: the main fold is empty and the whole
 /// column is the remainder.
 #[test]

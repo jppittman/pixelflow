@@ -201,8 +201,8 @@ allocate : machine function over values → machine function over registers and 
 1. **At a loop head.** A value live across the loop has one location for the loop's whole extent:
    - either it keeps its register lease from the head to the latch,
    - or its home is its slot, and its reloads inside the loop are split values that die before the latch.
-   - The scan keeps the first half exactly (a carried value is in its head register at the latch, asserted there). The second half it keeps loosely: a reload is keyed under the original id and may be held across the latch, which is sound while every trip runs it. A guarded arm can skip a reload, so B9 either asserts at the latch that no non-carried value of the loop is held, or splits the reload.
-2. **At a forward join.** For each live value defined on every incoming path, its location is the same on every path; otherwise the allocator drops its residency and it is read from its slot. A value undefined on some path takes its location from the paths where it is defined.
+   - The scan keeps the first half exactly (a carried value is in its head register at the latch, asserted there). The second half it keeps loosely: a reload is keyed under the original id and may be held across the latch, which is sound while every trip runs it. A guarded arm can skip a reload, and B9 settles it at the arm's join: a register that only the arm's path filled is free again there (invariant 2), so a reload made inside an arm never reaches the latch.
+2. **At a forward join.** For each live value defined on every incoming path, its location is the same on every path; otherwise the allocator drops its residency and it is read from its slot. A value undefined on some path takes its location from the paths where it is defined. ("Defined on a path" is a position: the value's definition comes before the branch that leaves the path. A value the allocator placed again, or reloaded, was defined before every branch and is dropped when a path lacks it.)
    - This is the intersection of the predecessors' states.
    - On a guarded arm, it gives today's rule: a reload made inside the arm dies at the arm's end.
 3. **No `Flags` value is live at a label.**
@@ -1134,8 +1134,9 @@ pub(in crate::emit) enum Origin { Selected, Spill, Reload, Remat, Copy }
    - Every argument is made resident before the first is passed, so a parameter that is not carried takes its argument by a store to its slot, in any order, and an argument that is a parameter of its own target is already home.
    - A carried parameter's register is its home from the loop's entry to its latch. The backward branch's moves are sequentialized so that none overwrites what another reads, and a register cycle is broken through a fresh value, allocated like any other (closure 21). No selected function passes one loop parameter to another, so B6 ships no cycle break: `sequence` panics naming the missing producer, and the break lands with the first producer (its test is then a kernel that swaps two loop parameters, through `compile`).
    - They are sound because no target parameter is live into the other successor (asserted).
+   - A forward join's parameter is in a register, not a slot (B9). A slot would cost the `If` a store on each path and a load after the join, where legacy pays neither. The first branch to reach the join gives the parameter a register as an entering branch does a loop's: the lease of its argument when that dies there, a copy's otherwise. Each later branch puts its argument in that register: a move, or no instruction when the argument is there already, after a store of whatever else holds the register on that path when it is not free. The parameter is stored, when it is, at the join's entry.
 6. **Joins** are checked against §1.3's three invariants. Forward joins take the intersection of their predecessors' states, taken from snapshots recorded at each forward branch.
-   - B5 has no forward join to take: nothing selected before B9 branches past a block, so `allocate` refuses a branch that does, naming B9. B9 adds the snapshots with its first producer.
+   - B5 had no forward join to take: nothing selected before B9 branches past a block, so `allocate` refused a branch that does. B9 adds the snapshots with its first producer: `Edge`, recorded after each forward branch, and `arrive`, which takes them at the block's start. A block entered by the branch just before it, and by no other, is in that state already.
    - A loop head is flushed (B5): every value live into it that the loop does not carry (B6) is stored and dropped from its register, so a loop's body is entered in one state however it is reached. The carried values are in their registers at the head and at the latch, which is asserted there.
 7. **Bind.** The scan records, per operand of every instruction it places, the number of the register that operand held. A tie's write and its read are one number, and so are an instruction's other operands that name one value. After the scan, `&'m mut Frame` becomes `&'m Frame`, the leases all being back on the free lists, and one `walk` per instruction builds `Inst<Bound>`, each operand the token of the lease with the recorded number, with `frame_size()` set to `frame.bytes()`.
    - A store inserted retroactively is kept beside the definition it follows and bound after it.
@@ -1653,11 +1654,11 @@ Every commit in this phase is live in production.
 
 #### B9: An `If` is blocks
 
-- **Files:** `select.rs`, `avx2.rs`, `regalloc/local.rs`.
+- **Files:** `select.rs`, `regalloc/local.rs`. `avx2.rs` is unchanged: B3 landed AVX2's `branch` with both tests (`Test` for a dead `True` arm, `CmpByte` for a dead `False` one) and the encoder's `cmp al` form.
 - **Add:**
-  - Forward joins in the allocator: snapshots at each forward branch, and the intersection at the join (§2.11, step 6).
+  - Forward joins in the allocator: the state at each forward branch (`Edge`), and the intersection at the join (§2.11, step 6, `arrive`).
+  - A join's parameter in a register (§2.11, step 5): the first branch to reach it homes it, and each later one moves its argument there.
   - Guarded arms and the uniform wrapper, as in §2.10, read off `IfGuard`.
-  - AVX2's `branch` is `MoveMask` → `Test` (`dead: True`) or `CmpByte` (`dead: False`) → `Jcc`, and the encoder picks the `cmp al` form when `g` is in `rax`.
 - **Gate:** K(avx2) is now all of V, plus `guard_fold_price`, `guard_parked_reads`, `guard_sibling_fold`, `a_fold_owned_by_an_arm_is_guarded`.
 
 #### B10: The gate for the new pipeline
