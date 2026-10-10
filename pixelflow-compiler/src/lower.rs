@@ -64,7 +64,7 @@ use crate::ast::{
     Role, Stmt, UnaryOp,
 };
 use crate::sema::{
-    AnalyzedKernel, Bounds, ConstValue, RangeScope, Scalar, StructuralRange, range_bounds,
+    AT, AnalyzedKernel, Bounds, ConstValue, RangeScope, Scalar, StructuralRange, range_bounds,
 };
 use crate::symbol::Scopes;
 use pixelflow_ir::arena::{
@@ -211,6 +211,8 @@ pub(crate) trait Site {
     fn close_fold(&mut self, body: Self::Term) -> Result<Self::Term, String>;
     /// `kernel` applied at `(x, y)` ([`ExprArena::apply`]).
     fn apply(&mut self, kernel: &Self::Argument, at: [Self::Term; 2]) -> Self::Term;
+    /// The field `field` observed at `(x, y)` ([`ExprArena::warp`]).
+    fn warp(&mut self, field: Self::Term, at: [Self::Term; 2]) -> Self::Term;
 }
 
 /// A name in scope while a body is lowered.
@@ -527,6 +529,10 @@ impl Site for Expansion {
     fn apply(&mut self, kernel: &Infallible, _at: [ExprId; 2]) -> ExprId {
         match *kernel {}
     }
+
+    fn warp(&mut self, field: ExprId, at: [ExprId; 2]) -> ExprId {
+        self.arena.warp(field, at)
+    }
 }
 
 /// Lower an entry's body at `site`, inlining the block's helpers and folding
@@ -662,6 +668,21 @@ impl<S: Site> Lowering<'_, S> {
                 // Arena expressions are values, so `.clone()` is the identity.
                 if method == "clone" && arg_count == 0 {
                     return Ok(receiver);
+                }
+
+                // The contramap: the receiver observed at the coordinates,
+                // which are lowered after it, in order. It builds no node of
+                // its own; it rewrites the receiver's.
+                if method == AT {
+                    let [x, y] = call.args.as_slice() else {
+                        return Err(format!(
+                            "`.at` observes a field at the two coordinates, and {} were supplied",
+                            arg_count
+                        ));
+                    };
+                    let x = self.lower(x)?;
+                    let y = self.lower(y)?;
+                    return Ok(self.site.warp(receiver, [x, y]));
                 }
 
                 // Primitive ops: one `OpKind` per (name, arity), read from
