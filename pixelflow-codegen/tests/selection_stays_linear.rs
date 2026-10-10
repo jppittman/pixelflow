@@ -211,7 +211,8 @@ fn a_second_sibling_fold_moves_the_total_scheduled_count_by_two() {
         Size::of(&compiled(&a, root, lanes)).scheduled
     };
     assert_eq!(
-        two, one + 2,
+        two,
+        one + 2,
         "one fold schedules {one}; a second sibling fold plus the Add joining them should \
          schedule exactly two more, not {two}"
     );
