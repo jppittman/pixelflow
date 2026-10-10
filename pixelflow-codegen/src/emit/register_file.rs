@@ -124,3 +124,106 @@ impl RegisterFile {
         self.vector_bytes
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID_MEMBERS: Members = Members {
+        vector: &[0, 1, 2],
+        general: &[0, 1, 2, 3],
+        opmask: &[1, 2],
+        flags: &[0],
+    };
+    const VALID_ENTRY: EntryRegisters = EntryRegisters {
+        ctx: 0,
+        out: 1,
+        pitch: 2,
+    };
+
+    #[test]
+    fn a_file_with_no_contradiction_reports_what_it_was_given() {
+        let file = RegisterFile::new(VALID_MEMBERS, VALID_ENTRY, 32);
+        assert_eq!(file.members(FileId::Vector), VALID_MEMBERS.vector);
+        assert_eq!(file.members(FileId::General), VALID_MEMBERS.general);
+        assert_eq!(file.members(FileId::Opmask), VALID_MEMBERS.opmask);
+        assert_eq!(file.members(FileId::Flags), VALID_MEMBERS.flags);
+        assert_eq!(file.entry().ctx, 0);
+        assert_eq!(file.entry().out, 1);
+        assert_eq!(file.entry().pitch, 2);
+        assert_eq!(file.vector_bytes(), 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "a register file names a member twice")]
+    fn a_vector_file_naming_one_register_twice_is_refused() {
+        let members = Members {
+            vector: &[0, 1, 1],
+            ..VALID_MEMBERS
+        };
+        RegisterFile::new(members, VALID_ENTRY, 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "a register file names a member twice")]
+    fn a_general_file_naming_one_register_twice_is_refused() {
+        let members = Members {
+            general: &[0, 1, 2, 2],
+            ..VALID_MEMBERS
+        };
+        RegisterFile::new(members, VALID_ENTRY, 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "a register file names a member twice")]
+    fn an_opmask_file_naming_one_register_twice_is_refused() {
+        let members = Members {
+            opmask: &[1, 1],
+            ..VALID_MEMBERS
+        };
+        RegisterFile::new(members, VALID_ENTRY, 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "there is one flags register")]
+    fn two_flags_registers_are_refused() {
+        let members = Members {
+            flags: &[0, 1],
+            ..VALID_MEMBERS
+        };
+        RegisterFile::new(members, VALID_ENTRY, 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "an entry argument arrives in a register outside the general file")]
+    fn an_entry_register_outside_the_general_file_is_refused() {
+        let entry = EntryRegisters {
+            ctx: 9,
+            ..VALID_ENTRY
+        };
+        RegisterFile::new(VALID_MEMBERS, entry, 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "two entry arguments arrive in one register")]
+    fn two_entry_arguments_sharing_one_register_are_refused() {
+        let entry = EntryRegisters {
+            ctx: 0,
+            out: 0,
+            pitch: 2,
+        };
+        RegisterFile::new(VALID_MEMBERS, entry, 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "a vector is a power of two bytes, at least 16")]
+    fn a_vector_narrower_than_sixteen_bytes_is_refused() {
+        RegisterFile::new(VALID_MEMBERS, VALID_ENTRY, 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "a vector is a power of two bytes, at least 16")]
+    fn a_vector_width_that_is_not_a_power_of_two_is_refused() {
+        RegisterFile::new(VALID_MEMBERS, VALID_ENTRY, 48);
+    }
+}
