@@ -56,6 +56,21 @@ const PINS: [(char, u32, TierPins); 3] = [
     ),
 ];
 
+/// The same three glyphs compiled by the selection pipeline
+/// (`PIXELFLOW_CODEGEN=selection`), `(glyph, px, bytes, fnv1a64)`. It has the
+/// AVX2 tier alone so far, and a run on any other refuses to compile.
+const SELECTED_AVX2_PINS: [(char, u32, usize, u64); 3] = [
+    ('@', 16, 2836, 0x30fd_ab98_f7df_3b32),
+    ('8', 32, 2832, 0x9335_b8d3_4de6_2c38),
+    ('O', 32, 2836, 0x56b2_1cc7_6344_6fd3),
+];
+
+/// Whether this process compiles with the selection pipeline.
+fn selection() -> bool {
+    std::env::var("PIXELFLOW_CODEGEN")
+        .is_ok_and(|name| name.trim().eq_ignore_ascii_case("selection"))
+}
+
 /// `(bytes, fnv1a64)` of `ch` at `px`, compiled at its own tile with the
 /// texel-centre warp the atlas bakes under.
 fn code_of(font: &Font<'_>, ch: char, px: u32) -> (usize, u64) {
@@ -78,10 +93,19 @@ fn a_glyphs_code_is_pinned() {
     let mut moved = Vec::new();
     for (ch, px, pins) in PINS {
         let emitted = code_of(&font, ch, px);
-        let &(_, len, fnv) = pins
-            .iter()
-            .find(|(t, _, _)| *t == tier)
-            .unwrap_or_else(|| panic!("{ch} at {px}px has no pin for the {tier} tier"));
+        let pinned = match selection() {
+            true => SELECTED_AVX2_PINS
+                .iter()
+                .find(|&&(c, p, ..)| (c, p) == (ch, px))
+                .map(|&(_, _, len, fnv)| (len, fnv))
+                .filter(|_| tier == "avx2"),
+            false => pins
+                .iter()
+                .find(|(t, _, _)| *t == tier)
+                .map(|&(_, len, fnv)| (len, fnv)),
+        };
+        let (len, fnv) =
+            pinned.unwrap_or_else(|| panic!("{ch} at {px}px has no pin for the {tier} tier"));
         if emitted != (len, fnv) {
             moved.push(format!(
                 "{ch} at {px}px on {tier}: pinned ({len}, {fnv:#018x}), emitted ({}, {:#018x})",

@@ -31,6 +31,18 @@
 //! split values that are dead before the latch. A parameter that is not carried
 //! is slot-homed too: a branch stores its arguments to it.
 //!
+//! **A join takes what the paths agree on.** A forward branch leaves its state
+//! for the block it reaches, and the block starts in their intersection
+//! ([`Scan::arrive`]): a value is in a register when it is in the same one on
+//! every path that defines it. A value an arm defines exists on the path
+//! through the arm alone, so the join takes its register from that path; one
+//! some path evicted, or placed again, is read from its slot after the join,
+//! and a reload made inside an arm dies at the arm's end. The slots stay
+//! valid on every path because each is written right after its definition. A
+//! join's parameter ([`Scan::join`]) is in a register too: the first branch to
+//! reach it gives it one, as a loop's entering branch does, and each later
+//! branch moves its argument there.
+//!
 //! The slots are the second register file. Liveness is intervals in layout
 //! order: a value lives from its definition to its last read, a value defined
 //! before a loop and read inside it lives to the loop's latch, and a block
@@ -55,7 +67,7 @@ use crate::emit::{
     Target, Value, ValueName, Vector,
 };
 use crate::error::CompileError;
-use alloc::collections::{BTreeMap, BinaryHeap};
+use alloc::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use alloc::vec::Vec;
 use core::cmp::Reverse;
 use core::ops::Range;
@@ -472,8 +484,9 @@ fn plan_carries(live: &Liveness, reads: &[usize], budget: Budget) -> Vec<Vec<u64
 /// its register at its loop's latch, a loop parameter read past the latch, a
 /// backward branch whose moves form a register cycle (no producer before a loop
 /// passes one parameter to another), a latch move into a register that a value
-/// other than the loop's parameters and the moved arguments holds, a forward branch past a block (a join), or an entry block
-/// whose first instruction does not make the frame.
+/// other than the loop's parameters and the moved arguments holds, a value
+/// dropped at a join that is in no slot, a block no scanned branch reaches, or
+/// an entry block whose first instruction does not make the frame.
 pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
     function: Function<B>,
     pool: &'m Pool<B>,
@@ -552,6 +565,8 @@ pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
         loop_at,
         active: Vec::new(),
         want: BTreeMap::new(),
+        edges: BTreeMap::new(),
+        joined: BTreeMap::new(),
         free,
         held,
         pinned: Vec::new(),
@@ -590,10 +605,11 @@ pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
         scan.block += 1;
     }
     assert!(
-        scan.held.is_empty() && scan.active.is_empty(),
-        "values are held after the last instruction: {:?}, and loops are open: {}",
+        scan.held.is_empty() && scan.active.is_empty() && scan.edges.is_empty(),
+        "values are held after the last instruction: {:?}, loops are open: {}, and branches to {:?} were never arrived at",
         scan.held.keys(),
-        scan.active.len()
+        scan.active.len(),
+        scan.edges.keys()
     );
     let Scan {
         free,
@@ -685,6 +701,16 @@ struct Active {
     carried: Vec<(u64, u8)>,
 }
 
+/// The register each value in one holds, by file and number.
+type Residents = BTreeMap<u64, (FileId, u8)>;
+
+/// What a forward branch leaves for the block it reaches.
+struct Edge {
+    /// The position of the branch.
+    from: usize,
+    residents: Residents,
+}
+
 /// One register-to-register move of a branch's parallel move.
 struct Move {
     /// A value of the moved class, to type the copy.
@@ -714,6 +740,12 @@ struct Scan<'f, 'm, B: IsaBackend> {
     /// is written into that parameter's register when that is free of any
     /// other use, which makes the branch's move for it nothing.
     want: BTreeMap<u64, u64>,
+    /// What each forward branch left for the block it reaches, by block, until
+    /// the scan gets there.
+    edges: BTreeMap<Label, Vec<Edge>>,
+    /// A forward join's parameter, once a branch has given it a register: its
+    /// block and the register's number.
+    joined: BTreeMap<u64, (usize, u8)>,
     /// The leases nothing holds, by file.
     free: [Vec<Lent<'m, B>>; 4],
     /// The values in a register, by id.
@@ -786,14 +818,6 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
                 Operand::Reg { .. } | Operand::Frame(_) => None,
             })
             .collect();
-        for target in &targets {
-            assert!(
-                self.blocks_at[&target.label].0 <= self.block + 1,
-                "{:?} branches to {:?}, past a block: a forward join, which arrives with B9 (and a loop's exit store needs the exit's one predecessor)",
-                self.at,
-                target.label
-            );
-        }
         let args: Vec<ValueName> = targets
             .iter()
             .flat_map(|target| target.args.iter().copied())
@@ -819,11 +843,19 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
                 self.enter(l)?;
             }
         }
-        for target in targets {
+        for target in &targets {
             self.pass(target, &args)?;
         }
+        let forward: Vec<Label> = targets
+            .iter()
+            .map(|target| target.label)
+            .filter(|label| self.blocks_at[label].0 > self.block)
+            .collect();
         self.emit(pushed, Origin::Selected)?;
         self.release_dead();
+        for target in forward {
+            self.leave(target);
+        }
         Ok(())
     }
 
@@ -899,10 +931,12 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
         Ok(())
     }
 
-    /// The start of block `label`. A loop's head is entered in one state
+    /// The start of block `label`, in the state every forward branch to it
+    /// agrees on ([`Self::arrive`]). A loop's head is entered in one state
     /// however it is reached: the carried values in their registers and
     /// everything else in its slot, which `flush` makes true.
     fn head(&mut self, label: Label) -> Result<(), CompileError> {
+        self.arrive(label);
         let Some(&l) = self.loop_at.get(&label) else {
             return Ok(());
         };
@@ -927,12 +961,125 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
         Ok(())
     }
 
+    /// Leave the state as it is for `label`, a block after this one, which
+    /// takes it up when the scan gets there.
+    fn leave(&mut self, label: Label) {
+        let residents: Residents = self
+            .held
+            .iter()
+            .map(|(&id, lent)| {
+                assert!(
+                    (id as usize) < self.lives.len() && lent.file() != FileId::Flags,
+                    "value {id} is held at a branch to {label:?}, and no flags value or temporary is live at a label"
+                );
+                (id, (lent.file(), lent.number()))
+            })
+            .collect();
+        let from = self.position;
+        self.edges
+            .entry(label)
+            .or_default()
+            .push(Edge { from, residents });
+    }
+
+    /// Enter the block at `label` in the state every forward branch to it
+    /// leaves agreeing: a value is in a register when it is in the same one
+    /// on every path that defines it, and nothing else is. A value some path
+    /// has evicted is read from its slot after the join, and a register a path
+    /// filled with a reload that the others did not make is free again: a
+    /// reload made inside an arm dies at the arm's end.
+    ///
+    /// # Panics
+    /// When a branch to the block was never scanned, or a value that would
+    /// be dropped is in no slot, or a carried value is not in a register on
+    /// every path.
+    fn arrive(&mut self, label: Label) {
+        if self.block == 0 {
+            return;
+        }
+        let edges = self
+            .edges
+            .remove(&label)
+            .unwrap_or_else(|| panic!("{label:?} is reached by no branch the scan has seen"));
+        // The block after the branch, entered by it alone, is in its state.
+        if let [Edge { from, .. }] = edges[..]
+            && from + 1 == self.position
+        {
+            return;
+        }
+        let start = self.position;
+        let ids: BTreeSet<u64> = edges
+            .iter()
+            .flat_map(|e| e.residents.keys().copied())
+            .collect();
+        let mut agreed = Residents::new();
+        for id in ids {
+            let life = &self.lives[id as usize];
+            let carried = life.carried_until.is_some_and(|latch| start <= latch);
+            if !carried && !self.read_from(id, start) {
+                continue;
+            }
+            let mut register = None;
+            let mut kept = true;
+            for edge in &edges {
+                match (edge.residents.get(&id), register) {
+                    (Some(&at), None) => register = Some(at),
+                    (Some(&at), Some(first)) => kept &= at == first,
+                    // On a path the definition comes after, the value does not
+                    // exist, and takes its register from the paths where it
+                    // does. On any other it was evicted, or placed again there.
+                    (None, _) => {
+                        kept &= life.def > edge.from && !self.remats.contains_key(&id);
+                    }
+                }
+            }
+            let register = register.expect("a candidate is in a register on some path");
+            match kept {
+                true => {
+                    agreed.insert(id, register);
+                }
+                false => {
+                    assert!(
+                        !carried && (life.stored || self.remats.contains_key(&id)),
+                        "value {id} is not in the same register on every path to {label:?}, and is in no slot"
+                    );
+                }
+            }
+        }
+        self.restore(&agreed);
+    }
+
+    /// Whether `value` is read at `position` or after.
+    fn read_from(&self, value: u64, position: usize) -> bool {
+        let own = &self.reads[self.lives[value as usize].reads.clone()];
+        own.partition_point(|&p| p < position) < own.len()
+    }
+
+    /// Put the leases where `residents` says: each value in its register,
+    /// every other register free.
+    fn restore(&mut self, residents: &Residents) {
+        let held = core::mem::take(&mut self.held).into_values();
+        let free = self.free.iter_mut().flat_map(|bank| bank.drain(..));
+        let mut leases: BTreeMap<(FileId, u8), Lent<'m, B>> = held
+            .chain(free)
+            .map(|lent| ((lent.file(), lent.number()), lent))
+            .collect();
+        for (&id, at) in residents {
+            let lent = leases.remove(at);
+            let lent = lent.unwrap_or_else(|| panic!("value {id} is in a register no lease has"));
+            self.held.insert(id, lent);
+        }
+        for lent in leases.into_values() {
+            self.free[lent.file() as usize].push(lent);
+        }
+    }
+
     /// Pass `target`'s arguments to its parameters. A parameter the loop
     /// carries is in a register: the entering branch gives it one
     /// ([`Self::home`]), and a backward branch moves its argument there. Any
-    /// other is stored to its slot. Every argument is in a register before the
-    /// first one is passed, so the moves are a parallel move however they
-    /// overlap.
+    /// other is stored to its slot. A join's parameter is in a register too
+    /// ([`Self::join`]). Every argument is in a register before the first one
+    /// is passed, so the moves are a parallel move however they overlap.
     fn pass(&mut self, target: &Target, args: &[ValueName]) -> Result<(), CompileError> {
         let params = self.blocks_at[&target.label].1.clone();
         let back = self.blocks_at[&target.label].0 <= self.block;
@@ -942,9 +1089,18 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
             if arg.id == param.id || !self.lives[param.id as usize].read {
                 continue;
             }
-            let carried = carrying.is_some_and(|l| self.plan[l].contains(&param.id));
+            let Some(l) = carrying else {
+                self.join(*param, arg, args, self.blocks_at[&target.label].0)?;
+                continue;
+            };
+            let carried = self.plan[l].contains(&param.id);
             match (carried, back) {
-                (true, false) => self.home(*param, arg, args)?,
+                (true, false) => {
+                    let lent = self.home(arg, args)?;
+                    let active = self.active.last_mut().expect("a loop is being entered");
+                    active.homes.push((param.id, lent.number()));
+                    self.held.insert(param.id, lent);
+                }
                 (true, true) => moves.push((arg, *param)),
                 (false, _) => {
                     let slot = self.slot(*param)?;
@@ -961,24 +1117,85 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
         Ok(())
     }
 
-    /// Give `param` a register for its loop: the lease of its argument when
-    /// nothing else wants that, and a copy's otherwise.
-    fn home(
+    /// A register for a parameter that `arg` is passed to: the lease of the
+    /// argument when nothing else wants that, and a copy's otherwise.
+    fn home(&mut self, arg: ValueName, args: &[ValueName]) -> Result<Lent<'m, B>, CompileError> {
+        let once = args.iter().filter(|other| other.id == arg.id).count() == 1;
+        match once && !self.live_after(arg.id) {
+            true => Ok(self.held.remove(&arg.id).expect("an argument is held")),
+            false => self.copy_of(arg),
+        }
+    }
+
+    /// Pass `arg` to `param`, a parameter of the forward join at block `join`.
+    /// The first branch to reach the join gives `param` its register
+    /// ([`Self::home`]); every later one puts its argument in that register,
+    /// after storing whatever else holds it there.
+    fn join(
         &mut self,
         param: ValueName,
         arg: ValueName,
         args: &[ValueName],
+        join: usize,
     ) -> Result<(), CompileError> {
-        let once = args.iter().filter(|other| other.id == arg.id).count() == 1;
-        let lent = match once && !self.live_after(arg.id) {
-            true => self.held.remove(&arg.id).expect("an argument is held"),
-            false => self.copy_of(arg)?,
+        let Some(&(_, to)) = self.joined.get(&param.id) else {
+            let lent = self.home(arg, args)?;
+            self.joined.insert(param.id, (join, lent.number()));
+            self.held.insert(param.id, lent);
+            return Ok(());
         };
-        let number = lent.number();
+        assert!(
+            !self.held.contains_key(&param.id),
+            "{param:?} is in a register before the branch that passes it its argument"
+        );
+        let file = arg.class.file();
+        let from = self.held[&arg.id].number();
+        if from != to {
+            let lent = self.vacate(file, to)?;
+            self.held.insert(param.id, lent);
+            self.move_register(&Move {
+                value: arg,
+                from,
+                to,
+            });
+            return Ok(());
+        }
+        // The argument is in the parameter's register already, and is read
+        // again: it goes to its slot, and the parameter has the register.
+        if self.live_after(arg.id) {
+            self.store_at_definition(arg.id)?;
+        }
+        let lent = self.held.remove(&arg.id).expect("an argument is held");
         self.held.insert(param.id, lent);
-        let active = self.active.last_mut().expect("a loop is being entered");
-        active.homes.push((param.id, number));
         Ok(())
+    }
+
+    /// The lease of register `number` of `file`, which the value in it, if
+    /// any, gives up: it is stored first when the slot does not hold it.
+    ///
+    /// # Panics
+    /// When the value is one the instruction being placed needs, or a carried
+    /// one inside its loop.
+    fn vacate(&mut self, file: FileId, number: u8) -> Result<Lent<'m, B>, CompileError> {
+        let holder = self
+            .held
+            .iter()
+            .find(|(_, lent)| lent.file() == file && lent.number() == number)
+            .map(|(&id, _)| id);
+        if let Some(holder) = holder {
+            assert!(
+                !self.pinned.contains(&holder) && !self.kept(holder),
+                "instruction {} of {:?} needs register {number} of {file:?}, which value {holder} must keep",
+                self.position,
+                self.at
+            );
+            self.store_at_definition(holder)?;
+            let lent = self.held.remove(&holder).expect("the holder is held");
+            self.free[file as usize].push(lent);
+        }
+        let bank = &mut self.free[file as usize];
+        let at = bank.iter().position(|lent| lent.number() == number);
+        Ok(bank.swap_remove(at.expect("a register no value holds is free")))
     }
 
     /// The backward branch of loop `l`: move each carried parameter's argument
@@ -1172,14 +1389,16 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
             .loops
             .iter()
             .find(|l| (l.head..=l.latch).contains(&def) && l.latch < self.position);
-        match over {
-            Some(l) => StorePoint::Entry(l.exit),
-            None => {
-                let (block, index) =
-                    self.defined[value as usize].expect("a value in a register was defined");
-                StorePoint::After(block, index)
-            }
+        if let Some(l) = over {
+            return StorePoint::Entry(l.exit);
         }
+        // A join's parameter is defined where the join begins.
+        if let Some(&(block, _)) = self.joined.get(&value) {
+            return StorePoint::Entry(block);
+        }
+        let (block, index) =
+            self.defined[value as usize].expect("a value in a register was defined");
+        StorePoint::After(block, index)
     }
 
     /// Store `value`, which is in its defining register, right after its
