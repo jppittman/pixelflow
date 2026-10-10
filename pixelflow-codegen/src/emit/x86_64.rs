@@ -541,7 +541,7 @@ impl Gp<Selected> {
 }
 
 impl<S: Placed> Gp<S> {
-    pub(super) fn encode(&self) -> EncodedInst {
+    fn encode(&self) -> EncodedInst {
         let mut inst = EncodedInst::new();
         match self {
             Gp::Mov { dst, src } => {
@@ -666,17 +666,26 @@ impl<S: Placed> Gp<S> {
         inst
     }
 
+    /// The label field the instruction carries: its offset in the bytes, and
+    /// the target it reaches. The one statement of which instructions have one.
+    fn label_field(&self) -> Option<(usize, &S::Target)> {
+        match self {
+            Gp::Jmp { to } => Some((JMP_DISP, to)),
+            Gp::Jcc { taken, .. } => Some((JCC_DISP, taken)),
+            Gp::LeaRip { to, .. } => Some((LEA_RIP_DISP, to)),
+            _ => None,
+        }
+    }
+
     /// The instruction's bytes, and the label fields in them.
     pub(super) fn assemble(&self, out: &mut Encoding<'_>) {
         out.bytes(self.encode().as_bytes());
+        if let Some((at, to)) = self.label_field() {
+            out.field(at, S::target(to), patch_rel32);
+        }
         match self {
-            Gp::Jmp { to } => out.field(JMP_DISP, S::target(to), patch_rel32),
-            Gp::Jcc { taken, next, .. } => {
-                out.field(JCC_DISP, S::target(taken), patch_rel32);
-                out.falls_through(S::target(next));
-            }
+            Gp::Jcc { next, .. } => out.falls_through(S::target(next)),
             Gp::Fallthrough { to } => out.falls_through(S::target(to)),
-            Gp::LeaRip { to, .. } => out.field(LEA_RIP_DISP, S::target(to), patch_rel32),
             _ => {}
         }
     }
@@ -690,13 +699,7 @@ impl AsmInsn for Gp<Physical> {
 
     #[inline]
     fn label_ref(self) -> Option<LabelRef> {
-        let (at, label) = match self {
-            Gp::Jmp { to } => (JMP_DISP, to),
-            Gp::Jcc { taken, .. } => (JCC_DISP, taken),
-            Gp::LeaRip { to, .. } => (LEA_RIP_DISP, to),
-            _ => return None,
-        };
-        Some(LabelRef {
+        self.label_field().map(|(at, &label)| LabelRef {
             at,
             label,
             patch: patch_rel32,

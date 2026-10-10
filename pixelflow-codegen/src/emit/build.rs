@@ -124,8 +124,6 @@ pub(super) struct Builder<B: IsaBackend> {
     interned: BTreeMap<B::Constant, Constant>,
     /// Blocks minted and not yet entered.
     pending: usize,
-    #[expect(dead_code, reason = "live from C4")]
-    anchors: B::Anchors,
 }
 
 impl<B: IsaBackend> Builder<B> {
@@ -146,7 +144,6 @@ impl<B: IsaBackend> Builder<B> {
             constants,
             interned: BTreeMap::new(),
             pending: 0,
-            anchors: B::Anchors::default(),
         };
         let params =
             [ClassId::Pointer, ClassId::Pointer, ClassId::Integer].map(|c| builder.mint(c));
@@ -295,7 +292,6 @@ impl<B: IsaBackend> Builder<B> {
         }
         let entry = Constant {
             label: self.labels.mint(),
-            offset: index * size_of::<B::Constant>() as u64,
         };
         self.constants.entries.push((entry.label, k));
         self.interned.insert(k, entry);
@@ -311,13 +307,6 @@ impl<B: IsaBackend> Builder<B> {
             trips,
         });
         self.loops.len() - 1
-    }
-
-    /// Per-function selection state the backend keeps (aarch64: the pool base
-    /// value).
-    #[expect(dead_code, reason = "live from C4")]
-    pub(super) fn anchors(&mut self) -> &mut B::Anchors {
-        &mut self.anchors
     }
 
     /// The finished function: its open block is the exit.

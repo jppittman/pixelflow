@@ -25,7 +25,8 @@ use super::asm::Assembled;
 use super::regalloc::local::{Allocated, Origin};
 use super::regalloc::{Scope, ValueId};
 use super::{
-    Binding, InstructionPlan, IsaBackend, LegacyBackend, Loc, PtrReg, Reg, Reload, WritePlan,
+    Binding, FileId, InstructionPlan, IsaBackend, LegacyBackend, Loc, PtrReg, Reg, Reload,
+    WritePlan,
 };
 use crate::error::CompileError;
 use alloc::vec::Vec;
@@ -45,7 +46,7 @@ pub struct ScopeTraffic {
     /// fold's slot-held root.
     pub loads: u64,
     /// Constants brought into a register from the kernel's constant pool (or
-    /// an immediate, where the ISA encodes one) rather than from the frame:
+    /// an immediate or an idiom, where the ISA has one) rather than from the frame:
     /// a load, but not of a slot this kernel wrote, which is why it is
     /// counted apart from both the loads and the stores.
     pub remats: u64,
@@ -84,7 +85,8 @@ pub struct EmitTraffic {
     pub scaffold: ScopeTraffic,
     /// Bytes one spilled register occupies: the backend's vector width.
     pub vector_bytes: u32,
-    /// Registers the allocator had to hand out.
+    /// Vector registers the allocator hands out: the size of its pool. The
+    /// selection pipeline leases the whole file, and counts it so.
     pub pool: u8,
     /// Parked roots that hold a register across the scopes inside them
     /// rather than a slot.
@@ -111,7 +113,8 @@ impl EmitTraffic {
     /// instructions as the driver tallied them, its loads and stores by why the
     /// allocator inserted them, and its bytes between its blocks' addresses.
     /// The function's frame and return are the body's instructions here, so
-    /// the scaffold is empty, and no register is reserved or carried.
+    /// the scaffold is empty and nothing is carried. The pool is the whole
+    /// vector file, which the allocator leases from.
     #[must_use]
     pub(super) fn of<B: IsaBackend>(allocated: &Allocated<'_, B>, assembled: &Assembled) -> Self {
         let mut scopes = alloc::vec![ScopeTraffic::default(); allocated.scheduled.len()];
@@ -130,7 +133,8 @@ impl EmitTraffic {
             scope.bytes += (assembled.address(end) - assembled.address(block.label)) as u64;
             for emitted in &block.insts {
                 match emitted.origin {
-                    Origin::Selected => {}
+                    Origin::Selected | Origin::Copy => {}
+                    Origin::Remat => scope.remats += 1,
                     Origin::Reload => scope.loads += 1,
                     Origin::Spill => scope.stores += 1,
                 }
@@ -145,7 +149,8 @@ impl EmitTraffic {
             trips,
             scaffold: ScopeTraffic::default(),
             vector_bytes: B::FILE.vector_bytes() as u32,
-            pool: 0,
+            pool: u8::try_from(B::FILE.members(FileId::Vector).len())
+                .expect("a vector file has far fewer than 256 registers"),
             carried: 0,
         }
     }

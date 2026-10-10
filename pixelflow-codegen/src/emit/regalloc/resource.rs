@@ -7,16 +7,16 @@
 //! these are resources and move.
 
 use crate::emit::{
-    Class, ClassId, File, FileId, FlagsFile, GeneralFile, IsaBackend, OpmaskFile, VectorFile,
+    Class, File, FileId, FlagsFile, GeneralFile, IsaBackend, OpmaskFile, VectorFile,
 };
 use crate::error::CompileError;
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::ops::Deref;
+use core::ops::{Deref, RangeInclusive};
 
-/// The largest frame a kernel may lay out. [`Frame::lease`] refuses a vector
+/// The largest frame a kernel may lay out. [`Frame::lease_vector`] refuses a vector
 /// slot past it, and the nest's layout refuses the whole frame (spills, fold
 /// roots and parks) past it, so every slot offset is below it by construction.
 pub(in crate::emit) const MAX_FRAME: u32 = 2 * 1024 * 1024;
@@ -112,7 +112,7 @@ pub(in crate::emit) enum Lent<'m, B: IsaBackend> {
 }
 
 impl<B: IsaBackend> Lent<'_, B> {
-    pub(in crate::emit) fn file(&self) -> FileId {
+    pub(super) fn file(&self) -> FileId {
         match self {
             Lent::Vector(_) => FileId::Vector,
             Lent::General(_) => FileId::General,
@@ -122,7 +122,7 @@ impl<B: IsaBackend> Lent<'_, B> {
     }
 
     /// The register's hardware number, the scan's tie-break: lowest first.
-    pub(in crate::emit) fn number(&self) -> u8 {
+    pub(super) fn number(&self) -> u8 {
         match self {
             Lent::Vector(lease) => lease.number(),
             Lent::General(lease) => lease.number(),
@@ -240,9 +240,11 @@ impl FrameSlot {
     }
 }
 
-/// The allocator's exclusive right to one slot. Affine, with no lifetime: the
-/// offset is fixed at mint, so nothing borrows the frame while the scan grows
-/// it.
+/// The allocator's exclusive right to one narrow slot, until it is released.
+/// Affine, with no lifetime: the offset is fixed at mint, so nothing borrows
+/// the frame while the scan grows it. A vector slot has no such token: it is
+/// leased for the span of one value, and [`Frame::lease_vector`] checks the
+/// spans.
 pub(super) struct SlotLease {
     name: SlotName,
 }
@@ -272,7 +274,12 @@ const fn align_up(n: u64, to: u64) -> u64 {
 ///   `N` is the peak number of simultaneously live narrow values, measured by
 ///   the allocator before the scan. The vector region starts at
 ///   `align_up(8·N, max(16, vector_bytes))` and grows as the scan leases
-///   slots, lowest free first.
+///   slots.
+/// - **A vector slot is leased for a span.** A value is stored right after its
+///   definition, but the scan only learns it must be when it first evicts the
+///   value, so slots are not handed out in the order their spans begin. A
+///   slot is shared by values whose spans are disjoint, the one freed
+///   latest first.
 /// - **Size.** The vector region's high-water mark, or the narrow region
 ///   alone when no vector was spilled, aligned to the stack pointer's 16.
 /// - **The stack pointer is the frame's.** Its only readers are frame-slot
@@ -286,7 +293,8 @@ pub(in crate::emit) struct Frame {
     narrow: u64,
     vector_start: u64,
     free_narrow: BTreeSet<SlotName>,
-    free_vector: BTreeSet<SlotName>,
+    /// Each vector slot, by the last position any value leased it holds it to.
+    vector_ends: BTreeSet<(usize, SlotName)>,
 }
 
 impl Frame {
@@ -297,7 +305,7 @@ impl Frame {
             narrow: 0,
             vector_start: 0,
             free_narrow: BTreeSet::new(),
-            free_vector: BTreeSet::new(),
+            vector_ends: BTreeSet::new(),
         }
     }
 
@@ -331,35 +339,54 @@ impl Frame {
         name
     }
 
-    /// The lowest free slot that holds a `class`, minting one past the vector
-    /// region's high-water mark when none is free.
+    /// The lowest free narrow slot.
+    ///
+    /// # Panics
+    /// More narrow values live than the peak [`reserve_narrow`](Self::reserve_narrow)
+    /// laid out is an allocator bug: the peak is measured before the scan.
+    pub(super) fn lease_narrow(&mut self) -> SlotLease {
+        let name = self
+            .free_narrow
+            .pop_first()
+            .expect("more narrow values live than the peak the frame was laid out for");
+        SlotLease { name }
+    }
+
+    /// The vector slot freed latest: one no other value's span
+    /// meets, minting one past the vector region's high-water mark when there
+    /// is none.
+    ///
+    /// A lease is taken at a scan position inside its own span, and every
+    /// earlier lease began at or before its own, so an earlier span meets this
+    /// one exactly when it ends at or after this one starts: a slot is free
+    /// when the last position it was leased to is before `span`'s start.
     ///
     /// # Errors
     /// [`CompileError::BudgetExceeded`] when the frame would pass `MAX_FRAME`.
-    ///
-    /// # Panics
-    /// `Flags` cannot be stored, and a narrow slot beyond what
-    /// [`reserve_narrow`](Self::reserve_narrow) laid out is an allocator bug:
-    /// the peak is measured before the scan.
-    pub(super) fn lease(&mut self, class: ClassId) -> Result<SlotLease, CompileError> {
-        let name = match class {
-            ClassId::Flags => panic!("the flags cannot be stored in a frame slot"),
-            ClassId::Pointer | ClassId::Integer | ClassId::Opmask => self
-                .free_narrow
-                .pop_first()
-                .expect("more narrow values live than the peak the frame was laid out for"),
-            ClassId::Vector => match self.free_vector.pop_first() {
-                Some(name) => name,
-                None => {
-                    let offset = self.vector_end();
-                    if offset + self.vector_bytes > u64::from(MAX_FRAME) {
-                        return Err(CompileError::BudgetExceeded(FRAME_OVERFLOW));
-                    }
-                    self.mint(offset)
+    pub(super) fn lease_vector(
+        &mut self,
+        span: RangeInclusive<usize>,
+    ) -> Result<SlotName, CompileError> {
+        let freed = self
+            .vector_ends
+            .range(..(*span.start(), SlotName(0)))
+            .next_back()
+            .copied();
+        let name = match freed {
+            Some(slot) => {
+                self.vector_ends.remove(&slot);
+                slot.1
+            }
+            None => {
+                let offset = self.vector_end();
+                if offset + self.vector_bytes > u64::from(MAX_FRAME) {
+                    return Err(CompileError::BudgetExceeded(FRAME_OVERFLOW));
                 }
-            },
+                self.mint(offset)
+            }
         };
-        Ok(SlotLease { name })
+        self.vector_ends.insert((*span.end(), name));
+        Ok(name)
     }
 
     /// Where the next vector slot would start.
@@ -368,18 +395,14 @@ impl Frame {
         self.vector_start + vectors * self.vector_bytes
     }
 
+    /// Return a narrow slot: its value is dead.
     pub(super) fn release(&mut self, slot: SlotLease) {
-        let free = if slot.name.0 < self.narrow {
-            &mut self.free_narrow
-        } else {
-            &mut self.free_vector
-        };
-        free.insert(slot.name);
+        self.free_narrow.insert(slot.name);
     }
 
     /// How many slots the frame has minted: the narrow region's, then the
     /// vector region's.
-    pub(in crate::emit) fn minted(&self) -> u64 {
+    pub(super) fn minted(&self) -> u64 {
         self.slots.len() as u64
     }
 

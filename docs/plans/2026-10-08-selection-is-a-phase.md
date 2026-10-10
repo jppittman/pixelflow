@@ -188,7 +188,7 @@ allocate : machine function over values → machine function over registers and 
 - A register is leased to at most one live value at a time. A frame slot likewise.
 - The frame is a second register file. It is unbounded, laid out by the allocator, and capped at `MAX_FRAME` (2 MiB).
 
-**A spilled value is stored right after its definition.** It is never stored at the eviction point, because a guard can skip that point (see the ontology entry Spill). The allocator inserts the store retroactively when it first evicts the value. From then on, the value's slot is valid on every path from its definition.
+**A spilled value is stored right after its definition.** It is never stored at the eviction point, because a guard can skip that point (see the ontology entry Spill). The allocator inserts the store retroactively when it first evicts the value. From then on, the value's slot is valid on every path from its definition. A value defined in a loop that has ended by the time it is first evicted is stored at that loop's exit instead (B6): the exit has one predecessor, so it dominates the eviction as the definition does, and it runs once where the definition runs every trip.
 
 **Liveness is intervals in layout order, plus two rules.**
 
@@ -201,6 +201,7 @@ allocate : machine function over values → machine function over registers and 
 1. **At a loop head.** A value live across the loop has one location for the loop's whole extent:
    - either it keeps its register lease from the head to the latch,
    - or its home is its slot, and its reloads inside the loop are split values that die before the latch.
+   - The scan keeps the first half exactly (a carried value is in its head register at the latch, asserted there). The second half it keeps loosely: a reload is keyed under the original id and may be held across the latch, which is sound while every trip runs it. A guarded arm can skip a reload, so B9 either asserts at the latch that no non-carried value of the loop is held, or splits the reload.
 2. **At a forward join.** For each live value defined on every incoming path, its location is the same on every path; otherwise the allocator drops its residency and it is read from its slot. A value undefined on some path takes its location from the paths where it is defined.
    - This is the intersection of the predecessors' states.
    - On a guarded arm, it gives today's rule: a reload made inside the arm dies at the arm's end.
@@ -279,8 +280,10 @@ Encoding is total and makes no choices.
 | `emit/asm.rs` | `Label`, `Labels`, `AsmProgram`, `Item`, `Encoding`, `assemble`. Imports nothing from the crate | yes |
 | `emit/build.rs` | `Def`, `Early`, `Tie`, `Builder`, `Pending`, `Spiller` | yes |
 | `emit/select.rs` | the generic selection driver, with its scoped `Bindings` | — |
-| `emit/regalloc/mod.rs` | `RegisterAllocator`, `LinearScan`, `Allocated` | — |
-| `emit/regalloc/resource.rs` | `Reg`, `Pool`, `Lease`, `In`/`Out`/`InOut`, `FrameSlot`, `Frame`, `SlotLease` | yes |
+| `emit/register_file.rs` | `RegisterFile`, `Members`, `EntryRegisters`: the declaration, with private fields and one checking constructor | yes |
+| `emit/regalloc/mod.rs` | the legacy `RegisterAllocator` and `LinearScan` (D1 deletes it) | — |
+| `emit/regalloc/local.rs` | `allocate`, `Allocated`, `Emitted`, `Origin` | — |
+| `emit/regalloc/resource.rs` | `Reg`, `Pool`, `Lease`, `Lent`, `In`/`Out`/`InOut`, `FrameSlot`, `Frame`, `SlotLease`, `MAX_FRAME`, `FRAME_OVERFLOW` | yes |
 | `emit/regalloc/policy.rs` | `EvictionRank`, carry pricing (retargeted from today's `LinearScan`) | — |
 | `emit/{x86_64,avx2,avx512,aarch64}.rs`, `emit/aarch64/table.rs` | the backends | — |
 
@@ -487,9 +490,10 @@ impl FrameSlot {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(in crate::emit) struct SlotName(u64);
 
-/// The allocator's exclusive right to one slot. Affine, with no lifetime:
-/// the offset is fixed at mint, so nothing borrows the frame while the scan
-/// grows it.
+/// The allocator's exclusive right to one narrow slot, until it is released.
+/// Affine, with no lifetime: the offset is fixed at mint, so nothing borrows
+/// the frame while the scan grows it. A vector slot has no token: it is
+/// leased for the span of one value, and `Frame` checks the spans.
 pub(super) struct SlotLease { name: SlotName }
 
 /// One function's frame, and the stack pointer with it.
@@ -499,7 +503,11 @@ pub(super) struct SlotLease { name: SlotName }
 ///   simultaneously live narrow values, measured by the allocator before the
 ///   scan. `N > 4096` is `BudgetExceeded` (`ldr x, [sp, #imm12·8]` reaches `imm12` 0 through 4095, which is 4096 slots).
 /// - The vector region starts at `align_up(8·N, max(16, vector_bytes))` and
-///   grows as the scan mints slots, lowest free first.
+///   grows as the scan mints slots. A value is stored right after its
+///   definition, but the scan learns that it must be only when it first
+///   evicts it, so slots are not leased in the order their spans begin: a
+///   vector slot is leased for a value's span `[definition, last read]`, and
+///   is shared by values whose spans are disjoint, the one freed latest first.
 /// - The frame's size is the vector region's high-water mark, or the narrow
 ///   region alone (16-aligned) when no vector was spilled. Past
 ///   `MAX_FRAME` (2 MiB) it is `BudgetExceeded`.
@@ -512,8 +520,9 @@ pub(in crate::emit) struct Frame { /* slots by region, free lists, high-water */
 impl Frame {
     pub(in crate::emit) fn empty(vector_bytes: u64) -> Self;
     pub(super) fn reserve_narrow(&mut self, peak: u64) -> Result<(), CompileError>;
-    pub(super) fn lease(&mut self, class: ClassId) -> Result<SlotLease, CompileError>;
+    pub(super) fn lease_narrow(&mut self) -> SlotLease;
     pub(super) fn release(&mut self, slot: SlotLease);
+    pub(super) fn lease_vector(&mut self, span: RangeInclusive<usize>) -> Result<SlotName, CompileError>;
     pub(in crate::emit) fn slot(&self, name: SlotName) -> &FrameSlot;
     pub(in crate::emit) fn bytes(&self) -> u64;
 }
@@ -1082,7 +1091,7 @@ pub(in crate::emit) trait RegisterAllocator {
 pub(in crate::emit) struct Allocated<'m, B: IsaBackend> {
     pub blocks: Vec<Block<Emitted<'m, B>>>,   // no block has parameters: they are slots
     pub loops: Vec<Loop>,
-    pub constants: Constants<B::Constant>,
+    constants: Constants<B::Constant>,        // the program lays them out: `program()`
     labels: Labels,                           // the program takes them: `program()`
     pub text_end: Label,                      // where the data section's padding begins
     pub frame_bytes: u64,
@@ -1093,8 +1102,9 @@ pub(in crate::emit) struct Allocated<'m, B: IsaBackend> {
 /// `Placed` is taken: it is the encoder's stage trait.
 pub(in crate::emit) struct Emitted<'m, B: IsaBackend> { pub inst: B::Inst<Bound<'m, B>>, pub origin: Origin }
 /// Why an instruction is there. `EmitTraffic` counts these per scope and
-/// weights them by trips. B4 has `Selected`, `Spill` and `Reload`; B5 adds
-/// `Copy` and B7 `Remat`.
+/// weights them by trips. B4 has `Selected`, `Spill` and `Reload`; P7 adds
+/// `Remat`, which marks a selected `rematerializable` instruction so that the
+/// remats are true under the knob, B5 adds `Copy`, and B7 inserts `Remat`s.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(in crate::emit) enum Origin { Selected, Spill, Reload, Remat, Copy }
 ```
@@ -1105,26 +1115,29 @@ pub(in crate::emit) enum Origin { Selected, Spill, Reload, Remat, Copy }
 
 1. **Operand table and liveness.** `operands()` once per instruction. Intervals with loop extension (§1.3). Next-read positions for Belady.
 2. **Frame.** The peak live count of the narrow classes goes to `Frame::reserve_narrow`.
-3. **Carry plan.** Per loop, the candidates are every value live into `Head(F)` plus `Head(F)`'s parameters (closure 15). They are priced by today's carry pricing: reads inside the loop × trips, plus one latch copy per trip for a parameter.
+3. **Carry plan** (`plan_carries`, B6). Per loop, the candidates are every value live into `Head(F)` plus `Head(F)`'s parameters (closure 15). They are priced by today's carry pricing: reads inside the loop × the trips of the innermost loop each read is in, plus one latch store per trip for a parameter. A value is a candidate of the outermost loop it is live into, and the carry is live across that loop and every loop inside it (its register is pinned there whether or not an inner loop reads it), so it is counted once in each file's budget however deep the nest. A candidate its budget refuses is not retried for an inner loop alone, so a value read in one of two sibling folds is not carried when the other fold's file is full. That loses a carry and never a result.
    - Budget per file: `members − reserve`.
    - Vector: `CARRY_RESERVE = 7`. This is the fitted constant from escape-hatches 2026-09-04/05, which three principled replacements lost to.
    - General: `GENERAL_CARRY_RESERVE = 5`. That gives x86 4 carries: today's 2 pointer carries plus `out` and `pitch`, the pool base being gone. It gives aarch64 13: today's 9 plus `out`, `pitch`, the pool base, and one more.
    - Opmask: 0. An AVX-512 predicate live into a loop head is spilled (`kmovw`). On AVX2 and NEON, a predicate is a `Vector` and is priced like one.
    - Flags: never carried.
-   - A carried value takes a lease at the preheader and holds it to the latch.
+   - A carried value takes a lease at the preheader and holds it to the latch. The entering branch makes the values resident and gives each parameter the lease of its argument when that dies there, and a copy's otherwise.
 4. **Per instruction `i`:**
    1. Leases of values with no read at or after `i` return to the free lists.
    2. Each read not resident at `i` gets a reload (or a remat) inserted before `i`, into a fresh split value. It takes a free lease, or evicts by `EvictionRank`. Eviction never touches a value read at `i` or a carried value inside its loop. The first eviction of a value inserts its store right after its definition.
    3. A `Tie` takes its read's lease if the read dies at `i`. Otherwise a copy is inserted first, and the copy is tied.
    4. An `Early` write takes a lease that no read of `i` holds.
-   5. A plain write may take the lease of a read that dies at `i`. It prefers the register of the block parameter it flows to (a hint), so a latch value usually needs no back-edge copy.
+   5. A plain write may take the lease of a read that dies at `i`. A value a backward branch passes to a carried parameter takes that parameter's register when this is the parameter's last read (the latch hint), so a latch value usually needs no back-edge copy.
    6. A write nobody reads releases its lease after `i`.
 5. **Block arguments** become a parallel move into the parameters' locations, placed before the terminator. The moves are flags-safe by type.
-   - They are sequentialized.
-   - A register cycle is broken through a fresh value, allocated like any other (closure 21, landing B6).
+   - Every argument is made resident before the first is passed, so a parameter that is not carried takes its argument by a store to its slot, in any order, and an argument that is a parameter of its own target is already home.
+   - A carried parameter's register is its home from the loop's entry to its latch. The backward branch's moves are sequentialized so that none overwrites what another reads, and a register cycle is broken through a fresh value, allocated like any other (closure 21). No selected function passes one loop parameter to another, so B6 ships no cycle break: `sequence` panics naming the missing producer, and the break lands with the first producer (its test is then a kernel that swaps two loop parameters, through `compile`).
    - They are sound because no target parameter is live into the other successor (asserted).
 6. **Joins** are checked against §1.3's three invariants. Forward joins take the intersection of their predecessors' states, taken from snapshots recorded at each forward branch.
-7. **Bind.** The scan records, per operand, the `In`/`Out`/`InOut` made from the lease it held. After the scan, `&'m mut Frame` becomes `&'m Frame`, and one `walk` per instruction builds `Inst<Bound>`, with `frame_size()` set to `frame.bytes()`.
+   - B5 has no forward join to take: nothing selected before B9 branches past a block, so `allocate` refuses a branch that does, naming B9. B9 adds the snapshots with its first producer.
+   - A loop head is flushed (B5): every value live into it that the loop does not carry (B6) is stored and dropped from its register, so a loop's body is entered in one state however it is reached. The carried values are in their registers at the head and at the latch, which is asserted there.
+7. **Bind.** The scan records, per operand of every instruction it places, the number of the register that operand held. A tie's write and its read are one number, and so are an instruction's other operands that name one value. After the scan, `&'m mut Frame` becomes `&'m Frame`, the leases all being back on the free lists, and one `walk` per instruction builds `Inst<Bound>`, each operand the token of the lease with the recorded number, with `frame_size()` set to `frame.bytes()`.
+   - A store inserted retroactively is kept beside the definition it follows and bound after it.
 
 ### 2.12 The driver
 
@@ -1588,34 +1601,40 @@ Every commit in this phase is live in production.
 
 #### B5: Residency
 
-- **Files:** `emit/regalloc/mod.rs`.
+- **Files:** `emit/regalloc/local.rs`, `emit/regalloc/resource.rs` (`Frame`).
 - **Change:**
   - Values stay in registers between instructions.
   - Eviction by `EvictionRank` (`policy.rs`).
   - The store is inserted retroactively after the definition.
   - Split reloads are kept until evicted.
   - Plain writes take a dying read's lease.
-  - Forward joins take the intersection of their predecessors' states (§1.3, invariant 2).
   - Loop heads are still flushed: every live value is slot-homed across a loop until B6.
-- **Gate:** K(avx2) as in B4. Add a test that a straight-line kernel with fewer live values than registers allocates no slot.
+  - A tie whose read is read again is copied first (`IsaBackend::copy`, `Origin::Copy`).
+  - Registers are bound after the scan, from the numbers it recorded (§2.11, step 7).
+  - A vector slot is leased when its value is first stored, for the value's span (§2.4).
+- **Not here:** forward joins (§2.11, step 6), which have no producer before B9.
+- **Gate:** K(avx2) as in B4. Add tests that values which live and die inside a loop's body cost no memory however many there are, that a copy keeps an operand the hardware overwrites, and that eviction gives up the value read farthest out.
+  - A "straight-line kernel allocates no slot" test is not possible through the public API, for two reasons that B6 must both remove before `spill_count` and `frame_bytes` mean what their names say. Every kernel is wrapped in the lattice's row and column loops, so the ABI registers are live across a loop head and are slot-homed until B6 carries them. And `layout` reserves a narrow slot for every narrow value that is read, before the scan, whether or not it is ever stored, so any kernel that reads `ctx`, `out` or `pitch` has a nonzero `Frame::minted()` and `frame_bytes`. B6 or later leases narrow slots at first store (the narrow region's size fixed by a bound computed before the scan), or `spill_count` counts only slots that were stored.
+  - `tests/residency.rs` guards nothing under the default pipeline. It is in K(avx2) from B5 by name, and in B10's `isa-matrix` knob step.
 
 #### B6: Loops
 
-- **Files:** `emit/regalloc/mod.rs`, `policy.rs`.
+- **Files:** `emit/regalloc/local.rs`, `policy.rs`.
 - **Change:**
   - The carry plan (§2.11), with `CARRY_RESERVE = 7` and `GENERAL_CARRY_RESERVE = 5` as named constants documented with their derivation.
   - Head parameters live in registers or slots.
-  - The back edge's parallel move, with cycles broken through a fresh value.
+  - The back edge's parallel move. Its cycle break waits for a producer (§2.11, step 5).
   - The latch hint.
   - Join invariant 1 asserted at each latch.
-- **Gate:** K(avx2) as in B4, plus `a_folds_roots_are_placed_by_the_budget` rewritten as `traffic.loads` before and after a carry-budget-sized root count.
+- **Gate:** K(avx2) as in B4, plus `a_folds_roots_are_placed_by_the_budget` rewritten as `traffic.loads` before and after a carry-budget-sized root count. `tests/loops.rs` guards nothing under the default pipeline. It is in K(avx2) from B6 by name, beside `tests/residency.rs`, and in B10's `isa-matrix` knob step.
 
 #### B7: Rematerialization
 
-- **Files:** `emit/regalloc/mod.rs`, `avx2.rs` (`rematerializable`).
+- **Files:** `emit/regalloc/local.rs`, `avx2.rs` (`rematerializable`, real since P7 for `LoadConst`, `Zero` and `Ones`).
 - **Change:**
   - A rematerializable definition is placed only before a read that needs it in a register, by re-emitting it with a fresh `Def` (`Origin::Remat`). One nobody reads is never placed.
   - Its eviction is free, the remat tier of `EvictionRank`.
+- **Check:** the `parked_roots_w37` row, which B6 left about 1% above legacy in bytes and memory operations (nine pinned registers over one long straight-line fold body); remat of carried constants frees pinned registers and should bring it back below.
 - **Gate:** K(avx2) as in B4, plus `constants_are_rematerialized_rather_than_spilled` and `belady_evicts_the_value_used_farthest_out` rewritten against compiled kernels' `traffic`.
 
 #### B8: AVX2 memory operations
@@ -1628,8 +1647,9 @@ Every commit in this phase is live in production.
 
 #### B9: An `If` is blocks
 
-- **Files:** `select.rs`, `avx2.rs`.
+- **Files:** `select.rs`, `avx2.rs`, `regalloc/local.rs`.
 - **Add:**
+  - Forward joins in the allocator: snapshots at each forward branch, and the intersection at the join (§2.11, step 6).
   - Guarded arms and the uniform wrapper, as in §2.10, read off `IfGuard`.
   - AVX2's `branch` is `MoveMask` → `Test` (`dead: True`) or `CmpByte` (`dead: False`) → `Jcc`, and the encoder picks the `cmp al` form when `g` is in `rax`.
 - **Gate:** K(avx2) is now all of V, plus `guard_fold_price`, `guard_parked_reads`, `guard_sibling_fold`, `a_fold_owned_by_an_arm_is_guarded`.
@@ -1642,7 +1662,7 @@ Every commit in this phase is live in production.
   - **A quality ratchet,** `selection_moves_no_more_memory_than_legacy`. Per row, trip-weighted `loads + stores + remats` of the selection pipeline must be at most 1.25 × legacy's + 8, and the sum over rows at most legacy's. This is the static predictor escape-hatches found tracks wall clock 98–99% of the time.
   - **A compile-size bound,** `selection_stays_linear`. Per row, selected instructions are at most 4 × scheduled ops, and inserted instructions at most 2 × selected. The scan is O(instructions × file size) by construction, so this bounds its `n`.
   - **Register coverage through the production API** (§0.6), in `tests/`: per tier, a pressure kernel whose live vectors outnumber `VectorFile`, and whose live pointers and integers (bound buffers, uniforms, carries) outnumber `GeneralFile`, checked by its values against a scalar reference computed in the test. This is what reaches `cmp sil`/`cmp r9b`'s REX forms (allocation F16). No `samples()` table, no test-only constructor.
-  - **CI, in jobs that are already required** (§0.7): the `isa-matrix` job runs V with `PIXELFLOW_CODEGEN=selection PIXELFLOW_ISA=avx2`.
+  - **CI, in jobs that are already required** (§0.7): the `isa-matrix` job runs V, `tests/residency.rs` and `tests/loops.rs`, with `PIXELFLOW_CODEGEN=selection PIXELFLOW_ISA=avx2`.
   - **The ratchet compares against a pinned table.** The knob is read once per process, so `selection_moves_no_more_memory_than_legacy` reads legacy's per-row numbers from a table generated once in this commit, and says how to regenerate it.
 - **Gate:** G, plus the new steps.
 

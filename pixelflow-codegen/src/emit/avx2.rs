@@ -423,7 +423,7 @@ pub(super) enum Inst<S: Stage> {
 
 impl Inst<Selected> {
     /// Rebuild at stage `T`, visiting each operand once, in field order.
-    pub(super) fn walk<T: Stage>(&self, f: &mut impl Rebind<T>) -> Inst<T> {
+    fn walk<T: Stage>(&self, f: &mut impl Rebind<T>) -> Inst<T> {
         match self {
             Inst::Alu { op, dst, a, b } => Inst::Alu {
                 op: *op,
@@ -630,8 +630,8 @@ impl<S: Placed> Inst<S> {
                     dst != index && dst != mask && index != mask,
                     "vgatherdps: dst, index and mask must be three registers"
                 );
-                // `base` is never `rbp`/`r13`, so the SIB's no-base encoding
-                // is unreachable.
+                // `base` is never `rbp`/`r13` (`GENERAL` excludes them), so
+                // the SIB's no-base encoding is unreachable.
                 Vex::m0f38_66(0x92).vsib_scaled4(dst, mask, S::read::<Pointer>(base), index)
             }
             Inst::MoveMask { dst, src } => {
@@ -661,7 +661,7 @@ impl<S: Placed> Inst<S> {
     }
 
     /// The instruction's bytes, and the label fields in them.
-    pub(super) fn assemble(&self, out: &mut Encoding<'_>) {
+    fn assemble(&self, out: &mut Encoding<'_>) {
         match self {
             Inst::LoadConst { at, .. } => {
                 let inst = self.encode();
@@ -1116,7 +1116,6 @@ fn defined<C: Spill, D: Spill>(b: &mut Spiller<'_, Avx2>) -> (Def<D>, Value<C>) 
 impl IsaBackend for Avx2 {
     type Inst<S: Stage> = Op<S>;
     type Constant = u32;
-    type Anchors = ();
     type Lane = Value<Vector>;
 
     // SysV has no callee-saved vector registers and the collapse ABI passes
@@ -1226,9 +1225,8 @@ impl IsaBackend for Avx2 {
                 })
             }
             // The gather and the broadcast arrive with B8.
-            LaneOp::Gather { .. } | LaneOp::Broadcast { .. } => {
-                unimplemented_op("avx2", OpKind::RawGather)
-            }
+            LaneOp::Gather { .. } => unimplemented_op("avx2", OpKind::RawGather),
+            LaneOp::Broadcast { .. } => unimplemented_op("avx2", "a broadcast load"),
         })
     }
 
@@ -1435,9 +1433,11 @@ impl IsaBackend for Avx2 {
         }
     }
 
-    // Constants become rematerializable with B7.
-    fn rematerializable(_: &Op<Selected>) -> bool {
-        false
+    fn rematerializable(inst: &Op<Selected>) -> bool {
+        matches!(
+            inst,
+            Op::Vector(Inst::LoadConst { .. } | Inst::Zero { .. } | Inst::Ones { .. })
+        )
     }
 
     fn walk<T: Stage>(inst: &Op<Selected>, f: &mut impl Rebind<T>) -> Op<T> {
