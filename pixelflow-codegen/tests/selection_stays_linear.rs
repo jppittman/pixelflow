@@ -79,8 +79,10 @@ fn the_allocator_inserts_at_most_twice_what_was_scheduled() {
 }
 
 /// Twice the terms is at most a little over twice the code and twice the
-/// insertions. A scan that rescanned the kernel for each instruction, or
-/// stored every value to every slot, would show as four times.
+/// insertions. This bounds what is emitted, not the time spent emitting it: a
+/// scan that stored every value to every slot would show as four times, and
+/// one that rescanned the kernel for each instruction and emitted the same
+/// code would not show at all.
 #[test]
 fn doubling_a_kernel_at_most_doubles_what_is_emitted() {
     if !selection() {
@@ -110,5 +112,29 @@ fn doubling_a_kernel_at_most_doubles_what_is_emitted() {
                 "{name}: {TERMS} terms have {small} {what}, and twice the terms {large}"
             );
         }
+    }
+}
+
+/// Selection picks at most four instructions for each scheduled operation and
+/// an instruction is at most ten bytes, so a row's code is bounded by its
+/// scheduled operations: the per-row stand-in for selected instructions at
+/// most four times the scheduled ones. The rows come to 11 to 27.
+#[test]
+fn a_row_emits_bytes_in_proportion_to_its_scheduled_operations() {
+    if !selection() {
+        return;
+    }
+    const BYTES_PER_OPERATION: u64 = 4 * 10;
+    let lanes = (jit_vector_bytes() / BYTES_PER_LANE) as u32;
+    for row in &rows::TABLE {
+        let (arena, root) = (row.build)();
+        let size = Size::of(&compiled(&arena, root, row.width.columns(lanes)));
+        assert!(
+            size.bytes <= BYTES_PER_OPERATION * size.scheduled,
+            "{}: {} bytes of code for {} scheduled operations",
+            row.name,
+            size.bytes,
+            size.scheduled
+        );
     }
 }

@@ -1090,7 +1090,7 @@ pub(in crate::emit) trait RegisterAllocator {
 /// An allocated kernel: every register a borrowed token, every slot a
 /// borrowed slot, every block argument a placed move.
 pub(in crate::emit) struct Allocated<'m, B: IsaBackend> {
-    pub blocks: Vec<Block<Emitted<'m, B>>>,   // no block has parameters: they are slots
+    pub blocks: Vec<Block<Emitted<'m, B>>>,   // a loop parameter that is not carried is a slot; a carried or forward-join one is a register
     pub loops: Vec<Loop>,
     constants: Constants<B::Constant>,        // the program lays them out: `program()`
     labels: Labels,                           // the program takes them: `program()`
@@ -1650,7 +1650,7 @@ Every commit in this phase is live in production.
   - `Gather`: `vcvttps2dq`, `Ones` mask, then `Gather { dst: Early, mask: Tie }`; the tie's write (the cleared mask) is a definition nobody reads;
   - `Broadcast`: `Cvtt`, then `vbroadcastss [base + idx·4]`;
   - the driver selects both from `ScheduledOp::Gather(index, base)` and `Broadcast(index, base)`, the base being a pointer value bound by `Context`.
-- **Gate:** K(avx2) plus `reduce_binder_reads_bound_buffer`, `glyph_*`, `freetype_oracle`.
+- **Gate:** K(avx2) plus `reduce_binder_reads_bound_buffer` and `collapse_paths`' gather and broadcast rows. `glyph_*` and `freetype_oracle` (run with `--all-features`) join at B9: every glyph kernel has a guarded `If`, which selection refuses by name until then.
 
 #### B9: An `If` is blocks
 
@@ -1832,7 +1832,7 @@ The expectation is that emit plus allocation stays within ±20% of today on `'@'
 | F13 | EVEX `disp8` scaling | **Adopted.** Typed `Disp` kept, slots always `disp32`, pin at offset 64 (C2) |
 | F14 | Pool entry type and reach per backend | **Adopted.** `type Constant`, `POOL_REACH`; `BUILTIN_HEADROOM` deleted |
 | F15 | Slot reads inside selected instructions | **Adopted** as a byte change attributed in C1/C4. No fold hook (§4.3) |
-| F16 | No test that every encoder handles every register | **Adopted.** B10's exhaustive encoder test |
+| F16 | No test that every encoder handles every register | **Adopted.** `tests/register_pressure.rs` (§0.6): a pressure kernel checked by its values, in place of the `samples()` encoder test |
 | F17 | A too-low `max_regs` panics with the wrong text | **Moot.** The narrowing removed the cap. The test-only `AtFloor` panic names the file and the instruction |
 | F18 | ABI convention by convention; misaligned slots | Convention **documented** on `RegisterFile`, with the build failure that enforces it. The alignment bias is **not done**, with its reason (§6) |
 | F19 | Stale citations | **Adopted.** Re-verified at `bdee3900`; symbol plus line |
@@ -1861,7 +1861,7 @@ The expectation is that emit plus allocation stays within ±20% of today on `'@'
 | 18 | Uniform loads past `imm12` | **Adopted** (H6, C4) |
 | 19 | General-first conflicts with fixed offsets | **Adopted** (F3) |
 | 20 | No floor without `MIN_SCRATCH` | **Moot** (F17) |
-| 21 | Parallel-copy cycles; overstated `Def` claim; encoder unit tests; implementations in `mod.rs` | **Adopted.** Cycles broken through a fresh value; claim moved to §2.13; numeric encoding helpers keep their pins and B10 adds the exhaustive test; implementations live in leaf modules |
+| 21 | Parallel-copy cycles; overstated `Def` claim; encoder unit tests; implementations in `mod.rs` | **Adopted.** Cycles broken through a fresh value; claim moved to §2.13; numeric encoding helpers keep their pins and B10 adds `tests/register_pressure.rs` (§0.6); implementations live in leaf modules |
 | 22 | S11 before hatches forces throwaway code | **Adopted.** Tokens exist only in the new pipeline |
 | 23 | Not verified against main or the narrowing | **Adopted** (Metadata) |
 

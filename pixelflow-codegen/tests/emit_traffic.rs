@@ -33,11 +33,8 @@ fn a_kernel_reports_the_registers_its_allocator_hands_out() {
     );
 }
 
-/// The legacy pipeline parks a constant in a register for the whole kernel, so
-/// it reports no remat for this one; the knob goes with the legacy pipeline.
-///
-/// A constant is counted where it is read and not where it is selected: it adds
-/// remats and no instruction.
+/// Legacy counts the constant once, where it is defined; selection counts it
+/// at each read, and not as an instruction.
 #[test]
 fn a_selected_constant_is_counted_as_brought_in() {
     if !selection() {
@@ -55,5 +52,28 @@ fn a_selected_constant_is_counted_as_brought_in() {
         sum(&with, |s| s.instructions),
         sum(&without, |s| s.instructions),
         "the constant 3.5 was counted as an instruction as well"
+    );
+}
+
+/// `max(x, k) + y`, where `k` is zero or, for the control, `y`.
+fn clamped(zero: bool) -> CompileResult {
+    let mut a = ExprArena::new();
+    let [x, y] = [0, 1].map(|v| a.push_var(v));
+    let k = if zero { a.push_const(0.0) } else { y };
+    let floor = a.push_binary(OpKind::Max, x, k);
+    let root = a.push_binary(OpKind::Add, floor, y);
+    compile(&a, root, LatticeShape::new([64, 4])).expect("the kernel compiles")
+}
+
+/// A zero is made in a register without reading memory, so it is not a pool
+/// read, whichever pipeline brings it in.
+#[test]
+fn a_zero_is_not_counted_as_a_pool_read() {
+    let remats =
+        |kernel: &CompileResult| -> u64 { kernel.traffic.scopes.iter().map(|s| s.remats).sum() };
+    assert_eq!(
+        remats(&clamped(true)),
+        remats(&clamped(false)),
+        "the constant 0.0 was counted as a read of the pool"
     );
 }

@@ -22,8 +22,11 @@ use pixelflow_ir::LatticeShape;
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
-/// One kernel's code on each tier, `(tier, bytes, fnv1a64)`.
-type TierPins = [(&'static str, usize, u64); 3];
+/// One kernel's code on each tier, `(tier, bytes, fnv1a64)`. The selection
+/// pipeline (`PIXELFLOW_CODEGEN=selection`) is a tier of its own, `+selection`
+/// after the ISA's name: the same glyphs, other code. It has AVX2 alone so far,
+/// and a run on any other refuses to compile.
+type TierPins = [(&'static str, usize, u64); 4];
 
 /// `(glyph, px, pins)`: each glyph's code per tier.
 const PINS: [(char, u32, TierPins); 3] = [
@@ -34,6 +37,7 @@ const PINS: [(char, u32, TierPins); 3] = [
             ("avx2", 3012, 0x2a8c_6135_0420_6970),
             ("avx512", 3172, 0x2d16_3a20_0ca5_5eee),
             ("neon", 1904, 0x8b99_0dca_5fa6_15da),
+            ("avx2+selection", 2836, 0x30fd_ab98_f7df_3b32),
         ],
     ),
     (
@@ -43,6 +47,7 @@ const PINS: [(char, u32, TierPins); 3] = [
             ("avx2", 3008, 0x3c1c_4b85_1887_fa8a),
             ("avx512", 3172, 0x7939_6944_482a_feeb),
             ("neon", 1904, 0x113e_3102_6b9b_2b3e),
+            ("avx2+selection", 2832, 0x9335_b8d3_4de6_2c38),
         ],
     ),
     (
@@ -52,24 +57,10 @@ const PINS: [(char, u32, TierPins); 3] = [
             ("avx2", 3012, 0x0d3a_e133_99a6_af0d),
             ("avx512", 3172, 0xd675_74c3_f870_26e3),
             ("neon", 1888, 0xc973_f004_e574_5a98),
+            ("avx2+selection", 2836, 0x56b2_1cc7_6344_6fd3),
         ],
     ),
 ];
-
-/// The same three glyphs compiled by the selection pipeline
-/// (`PIXELFLOW_CODEGEN=selection`), `(glyph, px, bytes, fnv1a64)`. It has the
-/// AVX2 tier alone so far, and a run on any other refuses to compile.
-const SELECTED_AVX2_PINS: [(char, u32, usize, u64); 3] = [
-    ('@', 16, 2836, 0x30fd_ab98_f7df_3b32),
-    ('8', 32, 2832, 0x9335_b8d3_4de6_2c38),
-    ('O', 32, 2836, 0x56b2_1cc7_6344_6fd3),
-];
-
-/// Whether this process compiles with the selection pipeline.
-fn selection() -> bool {
-    std::env::var("PIXELFLOW_CODEGEN")
-        .is_ok_and(|name| name.trim().eq_ignore_ascii_case("selection"))
-}
 
 /// `(bytes, fnv1a64)` of `ch` at `px`, compiled at its own tile with the
 /// texel-centre warp the atlas bakes under.
@@ -89,21 +80,19 @@ fn code_of(font: &Font<'_>, ch: char, px: u32) -> (usize, u64) {
 #[test]
 fn a_glyphs_code_is_pinned() {
     let font = Font::parse(FONT_DATA).expect("parse font");
-    let tier = isa::detect().name();
+    let selection = std::env::var("PIXELFLOW_CODEGEN")
+        .is_ok_and(|name| name.trim().eq_ignore_ascii_case("selection"));
+    let tier = match selection {
+        true => format!("{}+selection", isa::detect().name()),
+        false => isa::detect().name().to_string(),
+    };
     let mut moved = Vec::new();
     for (ch, px, pins) in PINS {
         let emitted = code_of(&font, ch, px);
-        let pinned = match selection() {
-            true => SELECTED_AVX2_PINS
-                .iter()
-                .find(|&&(c, p, ..)| (c, p) == (ch, px))
-                .map(|&(_, _, len, fnv)| (len, fnv))
-                .filter(|_| tier == "avx2"),
-            false => pins
-                .iter()
-                .find(|(t, _, _)| *t == tier)
-                .map(|&(_, len, fnv)| (len, fnv)),
-        };
+        let pinned = pins
+            .iter()
+            .find(|(t, _, _)| *t == tier)
+            .map(|&(_, len, fnv)| (len, fnv));
         let (len, fnv) =
             pinned.unwrap_or_else(|| panic!("{ch} at {px}px has no pin for the {tier} tier"));
         if emitted != (len, fnv) {

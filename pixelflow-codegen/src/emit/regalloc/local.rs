@@ -486,8 +486,9 @@ fn plan_carries(live: &Liveness, reads: &[usize], budget: Budget) -> Vec<Vec<u64
 /// backward branch whose moves form a register cycle (no producer before a loop
 /// passes one parameter to another), a latch move into a register that a value
 /// other than the loop's parameters and the moved arguments holds, a value
-/// dropped at a join that is in no slot, a block no scanned branch reaches, or
-/// an entry block whose first instruction does not make the frame.
+/// dropped at a join that is in no slot, a block no scanned branch reaches, a
+/// loop's exit reached by anything but its latch, or an entry block whose first
+/// instruction does not make the frame.
 pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
     function: Function<B>,
     pool: &'m Pool<B>,
@@ -607,9 +608,9 @@ pub(in crate::emit) fn allocate<'m, B: IsaBackend>(
     }
     assert!(
         scan.held.is_empty() && scan.active.is_empty() && scan.edges.is_empty(),
-        "values are held after the last instruction: {:?}, loops are open: {}, and branches to {:?} were never arrived at",
+        "values are held after the last instruction: {:?}, loops are open (by index): {:?}, and branches to {:?} were never arrived at",
         scan.held.keys(),
-        scan.active.len(),
+        scan.active.iter().map(|a| a.index).collect::<Vec<_>>(),
         scan.edges.keys()
     );
     let Scan {
@@ -971,7 +972,7 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
             .map(|(&id, lent)| {
                 assert!(
                     (id as usize) < self.lives.len() && lent.file() != FileId::Flags,
-                    "value {id} is held at a branch to {label:?}, and no flags value or temporary is live at a label"
+                    "value {id} is held at a branch to {label:?}, and no flags value, and no value the allocator made, is live at a label"
                 );
                 (id, (lent.file(), lent.number()))
             })
@@ -993,7 +994,8 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
     /// # Panics
     /// When a branch to the block was never scanned, or a value that would
     /// be dropped is in no slot, or a carried value is not in a register on
-    /// every path.
+    /// every path, or the block is a loop's exit and anything but the latch
+    /// reaches it.
     fn arrive(&mut self, label: Label) {
         if self.block == 0 {
             return;
@@ -1002,6 +1004,16 @@ impl<'m, B: IsaBackend> Scan<'_, 'm, B> {
             .edges
             .remove(&label)
             .unwrap_or_else(|| panic!("{label:?} is reached by no branch the scan has seen"));
+        // A loop-defined value is stored once at the exit ([`Self::store_point`]),
+        // which is sound while the latch is the only way there.
+        for l in self.loops.iter().filter(|l| l.exit == self.block) {
+            assert!(
+                matches!(edges[..], [Edge { from, .. }] if from == l.latch),
+                "{label:?} is the exit of the loop latched at {}, and is reached from {:?}: a loop's exit has one predecessor, its latch",
+                l.latch,
+                edges.iter().map(|e| e.from).collect::<Vec<_>>()
+            );
+        }
         // The block after the branch, entered by it alone, is in its state.
         if let [Edge { from, .. }] = edges[..]
             && from + 1 == self.position

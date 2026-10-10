@@ -220,10 +220,40 @@ fn a_guarded_if_runs_the_arm_that_ran() {
     });
 }
 
-/// A guarded `If` inside the arm of another, and the outer's value used by
-/// both: the join of the inner is read after the outer's arm ends.
+/// A guarded `If` that is the whole true arm of another: `wave` is read only
+/// by that arm, and the inner's mask by the false arm too, so the inner's arm
+/// begins where the outer's does and ends before it.
 #[test]
 fn a_guarded_if_nests_in_the_arm_of_another() {
+    let mut a = ExprArena::new();
+    let x = a.push_var(0);
+    let y = a.push_var(1);
+    let [outer_edge, inner_edge] = [14.0, 7.0].map(|c| a.push_const(c));
+    let outer = a.push_binary(OpKind::Lt, x, outer_edge);
+    let inner = a.push_binary(OpKind::Lt, y, inner_edge);
+    let sine = a.push_unary(OpKind::Sin, x);
+    let cosine = a.push_unary(OpKind::Cos, y);
+    let wave = a.push_ternary(OpKind::If, inner, sine, cosine);
+    let growth = a.push_unary(OpKind::Exp, y);
+    let cold = a.push_ternary(OpKind::If, inner, growth, x);
+    let root = a.push_ternary(OpKind::If, outer, wave, cold);
+
+    let out = collapse(&a, root, &[], &[]);
+    check(&out, |x, y| {
+        if x < 14.0 {
+            if y < 7.0 { x.sin() } else { y.cos() }
+        } else if y < 7.0 {
+            y.exp()
+        } else {
+            x
+        }
+    });
+}
+
+/// Two guarded `If`s in sequence, the first's value used by the second's arm
+/// and after it: the first join is read after the second ends.
+#[test]
+fn a_guarded_if_value_is_read_after_the_next_guarded_if() {
     let mut a = ExprArena::new();
     let x = a.push_var(0);
     let y = a.push_var(1);
