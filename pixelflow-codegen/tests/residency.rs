@@ -83,9 +83,9 @@ fn the_value_read_farthest_out_is_the_one_given_up() {
     const FITS: u64 = 4;
     /// Terms past the vector file, so that this many must go to memory.
     const EXCESS: u64 = 8;
-    /// What each costs at most: a store and a reload, in each of the two sums
-    /// that read it, less what the sums' own values share.
-    const PER_TERM: u64 = 5;
+    /// What each costs at most: a store and a reload in each of the two sums
+    /// that read it.
+    const PER_TERM: u64 = 4;
     let wall = |terms: u64| {
         compiled(|a, x, y| {
             let mut sums = Vec::new();
@@ -110,11 +110,12 @@ fn the_value_read_farthest_out_is_the_one_given_up() {
     };
     let fits = wall(FITS);
     let wide = wall(u64::from(fits.pool) + EXCESS);
-    let extra = wide.dynamic_memory_ops() - fits.dynamic_memory_ops();
     assert!(
-        extra <= PER_TERM * EXCESS,
-        "{extra} more memory operations for {EXCESS} terms past a pool of {}",
-        fits.pool
+        wide.dynamic_memory_ops() <= fits.dynamic_memory_ops() + PER_TERM * EXCESS,
+        "{} memory operations for {EXCESS} terms past a pool of {}, against {} for {FITS}",
+        wide.dynamic_memory_ops(),
+        fits.pool,
+        fits.dynamic_memory_ops()
     );
 }
 
