@@ -1646,8 +1646,9 @@ Every commit in this phase is live in production.
 
 - **Files:** `avx2.rs`, `select.rs`.
 - **Add:**
-  - `Gather`: `vcvttps2dq`, `Ones` mask, then `Gather { dst: Early, mask: Tie }`;
-  - `Broadcast`: `Cvtt`, then `vbroadcastss [base + idx·4]`.
+  - `Gather`: `vcvttps2dq`, `Ones` mask, then `Gather { dst: Early, mask: Tie }`; the tie's write (the cleared mask) is a definition nobody reads;
+  - `Broadcast`: `Cvtt`, then `vbroadcastss [base + idx·4]`;
+  - the driver selects both from `ScheduledOp::Gather(index, base)` and `Broadcast(index, base)`, the base being a pointer value bound by `Context`.
 - **Gate:** K(avx2) plus `reduce_binder_reads_bound_buffer`, `glyph_*`, `freetype_oracle`.
 
 #### B9: An `If` is blocks

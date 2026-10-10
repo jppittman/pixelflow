@@ -1224,9 +1224,32 @@ impl IsaBackend for Avx2 {
                     src: Mem { base, disp },
                 })
             }
-            // The gather and the broadcast arrive with B8.
-            LaneOp::Gather { .. } => unimplemented_op("avx2", OpKind::RawGather),
-            LaneOp::Broadcast { .. } => unimplemented_op("avx2", "a broadcast load"),
+            // `vgatherdps` under an all-ones mask: the indices are floats, so
+            // they are truncated first, and the instruction clears the mask
+            // as it completes lanes.
+            LaneOp::Gather { base, index } => {
+                let indices = vex(b, |dst| Inst::Unary {
+                    op: Lanewise::ToInt,
+                    dst,
+                    src: index,
+                });
+                let ones = vex(b, |dst| Inst::Ones { dst });
+                let (dst, mask) = (b.early(), b.tie(ones));
+                let gathered = dst.value();
+                b.push(Op::Vector(Inst::Gather {
+                    dst,
+                    base,
+                    index: indices,
+                    mask,
+                }));
+                gathered
+            }
+            // One element, the same in every lane: the index is lane 0,
+            // truncated.
+            LaneOp::Broadcast { base, index } => {
+                let index = vex(b, |dst| Inst::Cvtt { dst, src: index });
+                vex(b, |dst| Inst::BroadcastIndexed { dst, base, index })
+            }
         })
     }
 

@@ -199,8 +199,13 @@ impl<B: IsaBackend> Selector<'_, B> {
                         element: *element,
                     })?
                 }
-                ScheduledOp::Gather(..) | ScheduledOp::Broadcast(..) => {
-                    unimplemented_op(DRIVER, &def.op)
+                ScheduledOp::Gather(index, base) => {
+                    let (base, index) = (self.pointer(*base), self.lookup(*index));
+                    self.lane(LaneOp::Gather { base, index })?
+                }
+                ScheduledOp::Broadcast(index, base) => {
+                    let (base, index) = (self.pointer(*base), self.lookup(*index));
+                    self.lane(LaneOp::Broadcast { base, index })?
                 }
             };
             self.bind(def.value, value);
