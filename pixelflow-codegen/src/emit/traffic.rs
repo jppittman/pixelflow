@@ -26,7 +26,7 @@ use super::regalloc::local::{Allocated, Origin};
 use super::regalloc::{Scope, ValueId};
 use super::{
     Binding, FileId, InstructionPlan, IsaBackend, LegacyBackend, Loc, PtrReg, Reg, Reload,
-    WritePlan,
+    ResolvedOp, WritePlan,
 };
 use crate::error::CompileError;
 use alloc::vec::Vec;
@@ -39,16 +39,21 @@ use alloc::vec::Vec;
 /// in the column fold runs `rows × batches` times and one in the body once.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScopeTraffic {
-    /// Scheduled operations emitted (one per `InstructionPlan`).
+    /// Scheduled operations emitted. The legacy pipeline counts a constant
+    /// as one, as well as in `remats`; the selection pipeline counts it only
+    /// in `remats`, where it is read.
     pub instructions: u64,
     /// Stack loads emitted: an instruction's operand reloads, a range brought
     /// back into a register, a scope head's reconciliation, a guard's mask, a
     /// fold's slot-held root.
     pub loads: u64,
-    /// Constants brought into a register from the kernel's constant pool (or
-    /// an immediate or an idiom, where the ISA has one) rather than from the frame:
-    /// a load, but not of a slot this kernel wrote, which is why it is
-    /// counted apart from both the loads and the stores.
+    /// Reads of the kernel's constant pool: a constant brought into a register
+    /// by a memory read, whether the instruction folds the operand or a load
+    /// brings it in, counted the same way on both pipelines. What a trip
+    /// executes is the point, so a zero or all-ones idiom, or an immediate,
+    /// is not counted: it reads no memory. A read of the pool, but not of a
+    /// slot this kernel wrote, which is why it is counted apart from the loads
+    /// and the stores.
     pub remats: u64,
     /// Stack stores emitted: spills, parks, a fold's slot-held roots.
     pub stores: u64,
@@ -134,7 +139,7 @@ impl EmitTraffic {
             for emitted in &block.insts {
                 match emitted.origin {
                     Origin::Selected | Origin::Copy => {}
-                    Origin::Remat => scope.remats += 1,
+                    Origin::Remat => scope.remats += u64::from(B::reads_pool(&emitted.inst)),
                     Origin::Reload => scope.loads += 1,
                     Origin::Spill => scope.stores += 1,
                 }
@@ -205,6 +210,9 @@ pub(super) struct Counting<'a, B: LegacyBackend> {
     base: ScopeTraffic,
     open: Vec<Open>,
     closed: Vec<(Scope, ScopeTraffic)>,
+    /// Pool reads of the last `load_const`: a fold's seeds and then its trip
+    /// test's bound, which is the one the fold's scope opens right after.
+    last_const: u64,
 }
 
 impl<'a, B: LegacyBackend> Counting<'a, B> {
@@ -214,7 +222,13 @@ impl<'a, B: LegacyBackend> Counting<'a, B> {
             base: ScopeTraffic::default(),
             open: Vec::new(),
             closed: Vec::new(),
+            last_const: 0,
         }
+    }
+
+    /// 1 when bringing the constant `val_bits` into a register reads the pool.
+    fn pool_reads(&self, val_bits: u32) -> u64 {
+        u64::from(self.inner.reads_pool(val_bits))
     }
 
     /// The count everything emitted right now lands in.
@@ -258,18 +272,29 @@ impl<B: LegacyBackend> LegacyBackend for Counting<'_, B> {
         code: &mut Vec<u8>,
         plan: &InstructionPlan,
     ) -> Result<(), CompileError> {
-        let current = self.current();
-        current.instructions += 1;
+        let (mut loads, mut remats) = (0, 0);
         for reload in &plan.reloads {
             match reload {
-                Reload::FromStack { .. } | Reload::Ptr { .. } => current.loads += 1,
-                Reload::Const { .. } => current.remats += 1,
+                Reload::FromStack { .. } | Reload::Ptr { .. } => loads += 1,
+                Reload::Const { val_bits, .. } => remats += self.pool_reads(*val_bits),
             }
         }
+        // A constant defined in place reads the pool as one brought back does.
+        if let ResolvedOp::LoadConst { val_bits, .. } = plan.op {
+            remats += self.pool_reads(val_bits);
+        }
+        let current = self.current();
+        current.instructions += 1;
+        current.loads += loads;
+        current.remats += remats;
         // No store here: a plan's destination is always a register since
         // #1158, and the one place a value reaches its slot is the emit
         // loop's store-after-definition, which arrives through `emit_store`.
         self.inner.emit_plan(code, plan)
+    }
+
+    fn reads_pool(&self, val_bits: u32) -> bool {
+        self.inner.reads_pool(val_bits)
     }
 
     fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg) {
@@ -295,7 +320,10 @@ impl<B: LegacyBackend> LegacyBackend for Counting<'_, B> {
     ) -> Result<Reg, CompileError> {
         match locs.get(vid.0 as usize).copied().flatten() {
             Some(Binding::Loc(Loc::Slot(_))) => self.current().loads += 1,
-            Some(Binding::Remat(_)) => self.current().remats += 1,
+            Some(Binding::Remat(bits)) => {
+                let reads = self.pool_reads(bits);
+                self.current().remats += reads;
+            }
             // Already in a register, or not placed at all: nothing is emitted.
             Some(Binding::Loc(Loc::Reg(_) | Loc::Ptr(_))) | None => {}
         }
@@ -349,8 +377,15 @@ impl<B: LegacyBackend> LegacyBackend for Counting<'_, B> {
         self.inner.slot_load(code, dst, offset);
     }
 
+    /// The fold's trip test runs once a trip, so the bound it just loaded is
+    /// the opening scope's read and not its parent's.
     fn scope_begin(&mut self) {
+        let tested = core::mem::take(&mut self.last_const);
+        if let Some(parent) = self.open.last_mut() {
+            parent.traffic.remats -= tested;
+        }
         self.open.push(Open::default());
+        self.current().remats += tested;
         self.inner.scope_begin();
     }
 
@@ -374,10 +409,17 @@ impl<B: LegacyBackend> LegacyBackend for Counting<'_, B> {
         scratch: Reg,
         scalar: f32,
     ) -> Result<(), CompileError> {
+        // The step, which a fold runs each trip, just after its scope closed.
+        let reads = self.pool_reads(scalar.to_bits());
+        if let Some((_, trip)) = self.closed.last_mut() {
+            trip.remats += reads;
+        }
         self.inner.add_scalar(code, dst, scratch, scalar)
     }
 
     fn load_const(&mut self, code: &mut Vec<u8>, dst: Reg, val: f32) -> Result<(), CompileError> {
+        self.last_const = self.pool_reads(val.to_bits());
+        self.current().remats += self.last_const;
         self.inner.load_const(code, dst, val)
     }
 
@@ -466,6 +508,10 @@ mod tests {
             _plan: &InstructionPlan,
         ) -> Result<(), CompileError> {
             Ok(())
+        }
+
+        fn reads_pool(&self, val_bits: u32) -> bool {
+            val_bits != 0
         }
 
         fn emit_mov(&mut self, _code: &mut Vec<u8>, _dst: Reg, _src: Reg) {}

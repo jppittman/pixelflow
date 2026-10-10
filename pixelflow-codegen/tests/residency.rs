@@ -10,6 +10,8 @@
 use pixelflow_codegen::emit::{CompileResult, CompiledKernel, compile};
 use pixelflow_ir::{ExprArena, ExprId, LatticeShape, OpKind};
 
+include!("support/knob.rs");
+
 /// `build`'s kernel over the lattice coordinates `x` and `y`, compiled at one
 /// point.
 fn compiled(build: impl FnOnce(&mut ExprArena, ExprId, ExprId) -> ExprId) -> CompileResult {
@@ -174,9 +176,7 @@ fn constants_are_rematerialized_rather_than_spilled() {
 /// this kernel, so the comparison is made on the selection pipeline only.
 #[test]
 fn a_guarded_if_joins_in_a_register() {
-    let selection = std::env::var("PIXELFLOW_CODEGEN")
-        .is_ok_and(|name| name.trim().eq_ignore_ascii_case("selection"));
-    if !selection {
+    if !selection() {
         return;
     }
     let arms = |a: &mut ExprArena, x, y| {

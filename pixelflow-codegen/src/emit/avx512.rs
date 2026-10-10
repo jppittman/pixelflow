@@ -1527,6 +1527,10 @@ pub(super) mod driver {
             Ok(())
         }
 
+        fn reads_pool(&self, val_bits: u32) -> bool {
+            val_bits != 0
+        }
+
         fn emit_plan(
             &mut self,
             code: &mut Vec<u8>,

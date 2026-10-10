@@ -734,7 +734,11 @@ jobs:
     # pins a value is per-tier. Postsubmit still runs the full workspace per
     # tier (see postsubmit-flake-detection.yaml) -- this catches the
     # tier-specific failures early, not all of them.
-    timeout-minutes: 25
+    #
+    # Thirty-five, not twenty-five: the selection pipeline's leg runs the
+    # codegen, core and graphics suites once more, about four minutes of
+    # test execution on the already-built binaries.
+    timeout-minutes: 35
     env:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
@@ -788,6 +792,14 @@ jobs:
       # reported NOT RUN per tier -- a skip that is stated, never silent. See
       # `xtask isa-matrix`'s own doc comment for the per-tier detection and
       # for what `--smoke` covers.
+      #
+      # It also runs the selection pipeline behind its knob,
+      # `PIXELFLOW_CODEGEN=selection` at AVX2, over the whole codegen, core
+      # and graphics suites (docs/plans/2026-10-08-selection-is-a-phase.md):
+      # the tests that pin that pipeline's code and its memory traffic do
+      # nothing under the default one, so this leg is what runs them. A step
+      # of this required job and not a job of its own, so there is nothing
+      # new to register as required.
       - name: Run ISA matrix (build + clippy once, smoke tests per tier)
         shell: bash
         run: cargo run -p xtask -- isa-matrix --clippy --smoke

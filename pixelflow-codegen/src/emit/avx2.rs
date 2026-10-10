@@ -1463,6 +1463,10 @@ impl IsaBackend for Avx2 {
         )
     }
 
+    fn reads_pool<S: Stage>(inst: &Op<S>) -> bool {
+        matches!(inst, Op::Vector(Inst::LoadConst { .. }))
+    }
+
     fn walk<T: Stage>(inst: &Op<Selected>, f: &mut impl Rebind<T>) -> Op<T> {
         inst.walk(f)
     }
@@ -2125,6 +2129,10 @@ pub(super) mod driver {
         /// Nothing to seed: the pool fills as constants are emitted.
         fn begin(&mut self, _schedule: &[regalloc::Def]) -> Result<(), CompileError> {
             Ok(())
+        }
+
+        fn reads_pool(&self, val_bits: u32) -> bool {
+            val_bits != 0
         }
 
         fn emit_plan(

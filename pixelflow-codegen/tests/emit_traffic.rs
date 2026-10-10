@@ -11,6 +11,8 @@
 use pixelflow_codegen::emit::{CompileResult, ScopeTraffic, compile};
 use pixelflow_ir::{ExprArena, LatticeShape, OpKind};
 
+include!("support/knob.rs");
+
 /// `(c − x) + y` over a small lattice, where `c` is a constant or, for the
 /// control, another variable. A constant that is neither zero nor all-ones is
 /// a load.
@@ -38,9 +40,7 @@ fn a_kernel_reports_the_registers_its_allocator_hands_out() {
 /// remats and no instruction.
 #[test]
 fn a_selected_constant_is_counted_as_brought_in() {
-    let selection = std::env::var("PIXELFLOW_CODEGEN")
-        .is_ok_and(|name| name.trim().eq_ignore_ascii_case("selection"));
-    if !selection {
+    if !selection() {
         return;
     }
     let sum = |kernel: &CompileResult, count: fn(&ScopeTraffic) -> u64| -> u64 {

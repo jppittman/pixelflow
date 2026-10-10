@@ -78,7 +78,8 @@ pub(in crate::emit) enum Origin {
     Selected,
     /// A definition the backend can recompute, placed again where a read needs
     /// its value in a register ([`IsaBackend::rematerializable`]):
-    /// `EmitTraffic`'s remats.
+    /// `EmitTraffic`'s remats when it reads the constant pool
+    /// ([`IsaBackend::reads_pool`]).
     Remat,
     Spill,
     Reload,

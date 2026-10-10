@@ -1,0 +1,144 @@
+//! A kernel with more of everything live than any register file holds, run.
+//!
+//! Every class of register gives some up: the vectors (a wall of products, each
+//! read by two sums in opposite orders), and the general registers (one bound
+//! buffer per table, each an address read inside the column loop, beside the
+//! counters and the ABI's three). A guard's mask is a general register too, so
+//! the `If` at the end branches on whichever one is left. A value is wrong the
+//! moment any of them is addressed through the wrong register, so the check is
+//! the kernel's values, against the same arithmetic in `f64`.
+//!
+//! The sizes outnumber the largest file of each class on any tier, so one
+//! kernel is the pressure kernel of AVX2, AVX-512 and NEON; the host's tier is
+//! the one that runs it.
+
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+
+use pixelflow_codegen::emit::compile;
+use pixelflow_codegen::jit_vector_bytes;
+use pixelflow_ir::arena::{BufferDecl, BufferIdentity, ExprArena, ExprId};
+use pixelflow_ir::{LatticeShape, OpKind};
+
+/// Bound buffers, each an address live across the column loop: more than the
+/// general file of any tier.
+const TABLES: usize = 24;
+/// Products live at once: more than the vector file of any tier.
+const TERMS: usize = 48;
+const TABLE_LEN: usize = 64;
+const ROWS: usize = 3;
+const ORIGIN: [f32; 2] = [2.0, 5.0];
+/// Where the guarded `If` turns: a batch wholly before it, one across it and
+/// the rest wholly after.
+const EDGE: f32 = 14.0;
+
+fn width() -> usize {
+    2 * (jit_vector_bytes() / core::mem::size_of::<f32>()) + 3
+}
+
+fn pitch() -> usize {
+    width() + 2
+}
+
+fn table(t: usize) -> Vec<f32> {
+    (0..TABLE_LEN)
+        .map(|i| (i + 1) as f32 * 0.5 + t as f32 * 0.25)
+        .collect()
+}
+
+fn offset(k: usize) -> f32 {
+    0.1 * k as f32
+}
+
+/// `if x < EDGE { sin(x)·y + up } else { exp(y/8) + down }`, where `up` and
+/// `down` are `Σ_k table_{k mod T}[x] · (y + c_k)` summed in opposite orders.
+fn kernel() -> (ExprArena, ExprId, Vec<Vec<f32>>) {
+    let mut a = ExprArena::new();
+    let (x, y) = (a.push_var(0), a.push_var(1));
+    let tables: Vec<Vec<f32>> = (0..TABLES).map(table).collect();
+    let gathered: Vec<ExprId> = tables
+        .iter()
+        .map(|t| {
+            let buffer = a.declare_buffer(BufferDecl {
+                id: BufferIdentity::mint(),
+                width: t.len() as u32,
+                height: 1,
+            });
+            let base = a.push_buffer(buffer);
+            a.push_binary(OpKind::RawGather, base, x)
+        })
+        .collect();
+    let mut products: Vec<ExprId> = (0..TERMS)
+        .map(|k| {
+            let c = a.push_const(offset(k));
+            let shifted = a.push_binary(OpKind::Add, y, c);
+            a.push_binary(OpKind::Mul, gathered[k % TABLES], shifted)
+        })
+        .collect();
+    let sum = |a: &mut ExprArena, terms: &[ExprId]| {
+        terms[1..]
+            .iter()
+            .fold(terms[0], |acc, &t| a.push_binary(OpKind::Add, acc, t))
+    };
+    let up = sum(&mut a, &products);
+    products.reverse();
+    let down = sum(&mut a, &products);
+
+    let edge = a.push_const(EDGE);
+    let before = a.push_binary(OpKind::Lt, x, edge);
+    let wave = a.push_unary(OpKind::Sin, x);
+    let waved = a.push_binary(OpKind::Mul, wave, y);
+    let hot = a.push_binary(OpKind::Add, waved, up);
+    let eighth = a.push_const(0.125);
+    let scaled = a.push_binary(OpKind::Mul, y, eighth);
+    let grown = a.push_unary(OpKind::Exp, scaled);
+    let cold = a.push_binary(OpKind::Add, grown, down);
+    let root = a.push_ternary(OpKind::If, before, hot, cold);
+    (a, root, tables)
+}
+
+fn reference(tables: &[Vec<f32>], x: f32, y: f32) -> f64 {
+    let (x64, y64) = (f64::from(x), f64::from(y));
+    let sum: f64 = (0..TERMS)
+        .map(|k| {
+            let entry = f64::from(tables[k % TABLES][x as usize]);
+            entry * (y64 + f64::from(offset(k)))
+        })
+        .sum();
+    match x < EDGE {
+        true => x64.sin() * y64 + sum,
+        false => (y64 * 0.125).exp() + sum,
+    }
+}
+
+#[test]
+fn a_kernel_wider_than_every_register_file_computes_its_values() {
+    let (arena, root, tables) = kernel();
+    let shape = LatticeShape::new([width() as u32, ROWS as u32]);
+    let result = compile(&arena, root, shape).expect("the kernel compiles");
+
+    let mut out = vec![f32::NAN; ROWS * pitch()];
+    let origin = ORIGIN;
+    let uniforms: [f32; 0] = [];
+    let mut ctx: Vec<*const f32> = tables.iter().map(|t| t.as_ptr()).collect();
+    ctx.push(uniforms.as_ptr());
+    ctx.push(origin.as_ptr());
+    // SAFETY: `ctx` holds one base per buffer the arena declares, in
+    // declaration order, then the (empty) uniform block and the origin;
+    // `out` holds `ROWS` rows of `pitch()` samples, which the call fills.
+    unsafe {
+        result.code.call(ctx.as_ptr(), out.as_mut_ptr(), pitch());
+    }
+    for row in 0..ROWS {
+        for col in 0..width() {
+            let (x, y) = (ORIGIN[0] + col as f32, ORIGIN[1] + row as f32);
+            let (got, want) = (
+                f64::from(out[row * pitch() + col]),
+                reference(&tables, x, y),
+            );
+            assert!(
+                (got - want).abs() <= 1e-3 * want.abs().max(1.0),
+                "row {row} col {col} (x={x}, y={y}): got {got}, want {want}"
+            );
+        }
+    }
+}

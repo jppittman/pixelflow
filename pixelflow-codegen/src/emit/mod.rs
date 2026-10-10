@@ -1002,6 +1002,11 @@ trait IsaBackend: Sized + 'static {
     /// all-ones idioms.
     fn rematerializable(inst: &Self::Inst<Selected>) -> bool;
 
+    /// Whether `inst` reads a constant from the pool: the memory read
+    /// [`EmitTraffic`] counts as a remat. The zero and all-ones idioms bring a
+    /// constant into a register without reading memory.
+    fn reads_pool<S: Stage>(inst: &Self::Inst<S>) -> bool;
+
     /// Rebuild `inst` at stage `T`, visiting each operand once, in field
     /// order. The only per-instruction traversal.
     fn walk<T: Stage>(inst: &Self::Inst<Selected>, f: &mut impl Rebind<T>) -> Self::Inst<T>;
@@ -1436,6 +1441,11 @@ trait LegacyBackend {
     /// Emit one resolved instruction (with its reloads/store).
     fn emit_plan(&mut self, code: &mut Vec<u8>, plan: &InstructionPlan)
     -> Result<(), CompileError>;
+
+    /// Whether bringing the constant `val_bits` into a register reads the
+    /// constant pool, which [`EmitTraffic`] counts as a remat. Zero never
+    /// does, and NEON encodes some others as immediates.
+    fn reads_pool(&self, val_bits: u32) -> bool;
 
     /// Register-to-register move.
     fn emit_mov(&mut self, code: &mut Vec<u8>, dst: Reg, src: Reg);
@@ -2942,6 +2952,9 @@ mod tests {
         }
         fn begin(&mut self, schedule: &[regalloc::Def]) -> Result<(), CompileError> {
             self.0.begin(schedule)
+        }
+        fn reads_pool(&self, val_bits: u32) -> bool {
+            self.0.reads_pool(val_bits)
         }
         fn emit_plan(
             &mut self,
@@ -6749,113 +6762,16 @@ mod tests {
                 .expect("a sibling-fold row compiles on every backend")
         }
 
-        /// The width a row is compiled at, which for two of the three is a
-        /// fact about the target's lanes and so cannot be one number.
-        #[derive(Clone, Copy)]
-        enum Width {
-            /// One sample: all remainder, no main fold exists.
-            One,
-            /// Exactly one batch: all main, no remainder fold exists.
-            OneBatch,
-            /// [`rows::REMAINDER_WIDTH`]: a main fold and a remainder fold.
-            Remainder,
+        /// `row`'s lattice, compiled for `target`.
+        fn shape(row: &rows::Row, target: Target) -> LatticeShape {
+            LatticeShape::new([row.width.columns(target.lanes()), rows::ROWS])
         }
-
-        impl Width {
-            fn at(self, target: Target) -> LatticeShape {
-                let columns = match self {
-                    Self::One => 1,
-                    Self::OneBatch => target.lanes(),
-                    Self::Remainder => rows::REMAINDER_WIDTH,
-                };
-                LatticeShape::new([columns, rows::ROWS])
-            }
-        }
-
-        /// A kernel and the width it is compiled at.
-        struct Row {
-            name: &'static str,
-            build: fn() -> (ExprArena, ExprId),
-            width: Width,
-        }
-
-        fn parked_roots() -> (ExprArena, ExprId) {
-            rows::parked_roots(rows::PARKED_TERMS)
-        }
-
-        fn deep_frame() -> (ExprArena, ExprId) {
-            rows::deep_frame(rows::DEEP_FRAME_TERMS)
-        }
-
-        /// The glyph-like fold at the three widths that decide how many
-        /// sibling column folds exist (a remainder alone; a main alone; both),
-        /// and each other kernel where both exist. After them, the coverage
-        /// rows: every op the backends owe (`coverage`), every way a kernel
-        /// reads memory, and a frame past what NEON addresses directly, all at
-        /// the width with a remainder.
-        const ROWS: [Row; 11] = [
-            Row {
-                name: "glyph_like_w1",
-                build: rows::glyph_like,
-                width: Width::One,
-            },
-            Row {
-                name: "glyph_like_wL",
-                build: rows::glyph_like,
-                width: Width::OneBatch,
-            },
-            Row {
-                name: "glyph_like_w37",
-                build: rows::glyph_like,
-                width: Width::Remainder,
-            },
-            Row {
-                name: "two_sibling_folds_w37",
-                build: rows::two_sibling_folds,
-                width: Width::Remainder,
-            },
-            Row {
-                name: "parked_roots_w37",
-                build: parked_roots,
-                width: Width::Remainder,
-            },
-            Row {
-                name: "guarded_if_in_fold_w37",
-                build: rows::guarded_if_in_fold,
-                width: Width::Remainder,
-            },
-            Row {
-                name: "unary_ops_w37",
-                build: rows::unary_ops,
-                width: Width::Remainder,
-            },
-            Row {
-                name: "binary_ops_w37",
-                build: rows::binary_ops,
-                width: Width::Remainder,
-            },
-            Row {
-                name: "shift_muladd_blend_w37",
-                build: rows::shift_muladd_blend,
-                width: Width::Remainder,
-            },
-            Row {
-                name: "memory_w37",
-                build: rows::memory,
-                width: Width::Remainder,
-            },
-            Row {
-                name: "deep_frame_w37",
-                build: deep_frame,
-                width: Width::Remainder,
-            },
-        ];
 
         /// A target's emitted code: its length in bytes and the FNV-1a 64
         /// digest of those bytes ([`crate::fnv1a64`]).
         type Bytes = (usize, u64);
 
-        /// `ROWS`' bytes, per target in [`Target::ALL`]'s order (AVX2,
+        /// `rows::TABLE`'s bytes, per target in [`Target::ALL`]'s order (AVX2,
         /// AVX-512, aarch64). A row's provenance is `git log -L` on it: a
         /// hash written here would be the hash of the commit that wrote it,
         /// which no commit can know.
@@ -6942,14 +6858,14 @@ mod tests {
         fn the_sibling_fold_rows_emit_the_recorded_bytes_on_every_backend() {
             let mut recomputed = Vec::new();
             let mut moved = Vec::new();
-            for (row, pins) in ROWS.iter().zip(GOLDEN) {
+            for (row, pins) in rows::TABLE.iter().zip(GOLDEN) {
                 let (a, root) = (row.build)();
                 let mut emitted = Vec::new();
                 for (target, pin) in Target::ALL.into_iter().zip(pins) {
                     let subject = Subject {
                         arena: &a,
                         root,
-                        shape: row.width.at(target),
+                        shape: shape(row, target),
                     };
                     let result = target.compile(subject);
                     let code = result.code.as_bytes();
@@ -7042,6 +6958,10 @@ mod tests {
 
             fn begin(&mut self, schedule: &[regalloc::Def]) -> Result<(), CompileError> {
                 self.inner.begin(schedule)
+            }
+
+            fn reads_pool(&self, val_bits: u32) -> bool {
+                self.inner.reads_pool(val_bits)
             }
 
             fn emit_plan(

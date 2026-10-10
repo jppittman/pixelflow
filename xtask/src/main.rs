@@ -577,6 +577,11 @@ struct IsaLevel {
     name: &'static str,
     isa: &'static str,
     requires: &'static [&'static str],
+    /// The `PIXELFLOW_CODEGEN` value to run under, when it is not the default
+    /// pipeline, and the `cargo` invocations that hold that pipeline in place
+    /// of the mode's (none: the mode's own).
+    pipeline: Option<&'static str>,
+    suites: &'static [&'static [&'static str]],
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -590,6 +595,8 @@ const ISA_LEVELS: &[IsaLevel] = &[
         name: "avx2+fma",
         isa: "avx2",
         requires: &["avx2", "fma"],
+        pipeline: None,
+        suites: &[],
     },
     IsaLevel {
         // DQ, not just F: `avx512::emit_compare` materializes a mask with
@@ -601,6 +608,31 @@ const ISA_LEVELS: &[IsaLevel] = &[
         name: "avx512f+dq",
         isa: "avx512",
         requires: &["avx512f", "avx512dq"],
+        pipeline: None,
+        suites: &[],
+    },
+    // The selection pipeline (docs/plans/2026-10-08-selection-is-a-phase.md),
+    // at the one tier it has a backend for. Not a tier, but decided the same
+    // way (the environment, once, at startup) and run the same way: the tests
+    // that pin its code and its traffic do nothing under the default
+    // pipeline, so this is the only leg that runs them. It runs every suite
+    // that compiles a kernel and checks it, in the three crates that do; the
+    // workspace's other crates are not held to it yet.
+    IsaLevel {
+        name: "avx2+fma, selection",
+        isa: "avx2",
+        requires: &["avx2", "fma"],
+        pipeline: Some("selection"),
+        suites: &[&[
+            "test",
+            "-p",
+            "pixelflow-codegen",
+            "-p",
+            "pixelflow-core",
+            "-p",
+            "pixelflow-graphics",
+            "--no-fail-fast",
+        ]],
     },
 ];
 
@@ -862,7 +894,11 @@ fn isa_matrix(with_clippy: bool, mode: IsaExecutionMode) {
             // itself refuses `PIXELFLOW_ISA` naming a tier the host cannot run,
             // so this check is what turns that refusal into a stated NOT RUN
             // rather than a failed test binary.
-            let skip_reason = match mode.test_commands() {
+            let commands = mode.test_commands().map(|tests| match level.suites {
+                [] => tests,
+                own => own,
+            });
+            let skip_reason = match commands {
                 None => Some("build-only mode: tests run in postsubmit".to_string()),
                 Some(_) => level
                     .requires
@@ -877,10 +913,9 @@ fn isa_matrix(with_clippy: bool, mode: IsaExecutionMode) {
                 continue;
             }
 
-            let commands = mode
-                .test_commands()
-                .expect("a mode with no test commands produced no skip reason");
-            let env = [("PIXELFLOW_ISA", level.isa)];
+            let commands = commands.expect("a mode with no test commands produced no skip reason");
+            let mut env = vec![("PIXELFLOW_ISA", level.isa)];
+            env.extend(level.pipeline.map(|knob| ("PIXELFLOW_CODEGEN", knob)));
             if !commands
                 .iter()
                 .all(|args| run_cargo(&workspace_root, &env, args))
@@ -889,14 +924,13 @@ fn isa_matrix(with_clippy: bool, mode: IsaExecutionMode) {
                 results.push((level.name, LevelResult::Failed));
                 continue;
             }
-            println!("isa-matrix: {} — {} tests passed", level.name, mode.scope());
+            let scope = match level.suites {
+                [] => mode.scope(),
+                _ => "codegen, core and graphics suites",
+            };
+            println!("isa-matrix: {} — {scope} tests passed", level.name);
 
-            results.push((
-                level.name,
-                LevelResult::Passed {
-                    scope: mode.scope(),
-                },
-            ));
+            results.push((level.name, LevelResult::Passed { scope }));
         }
 
         println!("\n=== ISA matrix summary ===");
