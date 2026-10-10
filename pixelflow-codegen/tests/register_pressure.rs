@@ -8,13 +8,17 @@
 //! moment any of them is addressed through the wrong register, so the check is
 //! the kernel's values, against the same arithmetic in `f64`.
 //!
+//! The predicates are the opmask file's turn (AVX-512 holds a comparison in a
+//! `k` register, seven of them): a wall of masks combined by `&` and `|`, each
+//! read by two sums in opposite orders, then selected by.
+//!
 //! The sizes outnumber the largest file of each class on any tier, so one
-//! kernel is the pressure kernel of AVX2, AVX-512 and NEON; the host's tier is
-//! the one that runs it.
+//! kernel of each is the pressure kernel of AVX2, AVX-512 and NEON; the host's
+//! tier is the one that runs it.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
-use pixelflow_codegen::emit::compile;
+use pixelflow_codegen::emit::{CompileResult, compile};
 use pixelflow_codegen::jit_vector_bytes;
 use pixelflow_ir::arena::{BufferDecl, BufferIdentity, ExprArena, ExprId};
 use pixelflow_ir::{LatticeShape, OpKind};
@@ -24,6 +28,9 @@ use pixelflow_ir::{LatticeShape, OpKind};
 const TABLES: usize = 24;
 /// Products live at once: more than the vector file of any tier.
 const TERMS: usize = 48;
+/// Predicates live at once: more than the opmask file, and than the vector
+/// file of any tier that holds a mask in one.
+const PREDICATES: usize = 40;
 const TABLE_LEN: usize = 64;
 const ROWS: usize = 3;
 const ORIGIN: [f32; 2] = [2.0, 5.0];
@@ -117,21 +124,20 @@ fn reference(tables: &[Vec<f32>], x: f32, y: f32) -> f64 {
     }
 }
 
-#[test]
-fn a_kernel_wider_than_every_register_file_computes_its_values() {
-    let (arena, root, tables) = kernel();
-    let shape = LatticeShape::new([width() as u32, ROWS as u32]);
-    let result = compile(&arena, root, shape).expect("the kernel compiles");
-    // The pressure the test is for: values outnumber the files, so something
-    // is spilled and read back from the frame. A kernel the optimizer shrinks
-    // below that checks nothing about allocation.
+/// What the compile reports of the pressure: values outnumber the files, so
+/// something is spilled and read back from the frame. A kernel the optimizer
+/// shrinks below that checks nothing about allocation.
+fn assert_pressured(result: &CompileResult) {
     let frame_reads: u64 = result.traffic.scopes.iter().map(|s| s.loads).sum();
     assert!(
         result.spill_count > 0 && frame_reads > 0,
         "the kernel no longer outnumbers the register files: {} slots, {frame_reads} frame reads",
         result.spill_count
     );
+}
 
+/// `result` called over `ROWS` rows of `width()` samples, `tables` bound.
+fn run(result: &CompileResult, tables: &[Vec<f32>]) -> Vec<f32> {
     let mut out = vec![f32::NAN; ROWS * pitch()];
     let origin = ORIGIN;
     let uniforms: [f32; 0] = [];
@@ -144,17 +150,107 @@ fn a_kernel_wider_than_every_register_file_computes_its_values() {
     unsafe {
         result.code.call(ctx.as_ptr(), out.as_mut_ptr(), pitch());
     }
+    out
+}
+
+/// Every sample of `out` against `reference(x, y)`.
+fn assert_values(out: &[f32], reference: impl Fn(f32, f32) -> f64) {
     for row in 0..ROWS {
         for col in 0..width() {
             let (x, y) = (ORIGIN[0] + col as f32, ORIGIN[1] + row as f32);
-            let (got, want) = (
-                f64::from(out[row * pitch() + col]),
-                reference(&tables, x, y),
-            );
+            let (got, want) = (f64::from(out[row * pitch() + col]), reference(x, y));
             assert!(
                 (got - want).abs() <= 1e-3 * want.abs().max(1.0),
                 "row {row} col {col} (x={x}, y={y}): got {got}, want {want}"
             );
         }
     }
+}
+
+#[test]
+fn a_kernel_wider_than_every_register_file_computes_its_values() {
+    let (arena, root, tables) = kernel();
+    let shape = LatticeShape::new([width() as u32, ROWS as u32]);
+    let result = compile(&arena, root, shape).expect("the kernel compiles");
+    assert_pressured(&result);
+    let out = run(&result, &tables);
+    assert_values(&out, |x, y| reference(&tables, x, y));
+}
+
+fn threshold(k: usize) -> f32 {
+    ORIGIN[0] + 0.5 + (k * width() / PREDICATES) as f32
+}
+
+fn is_below(x: f32, k: usize) -> bool {
+    x < threshold(k % PREDICATES)
+}
+
+fn joint(x: f32, k: usize) -> bool {
+    (is_below(x, k) && is_below(x, k + 1)) || is_below(x, k + 2)
+}
+
+/// `Σ_k up_k + Σ_{k reversed} down_k`, where `up_k` and `down_k` each select
+/// by `joint_k = (x < c_k & x < c_{k+1}) | x < c_{k+2}`, so every joint mask is
+/// live from the first sum to the second.
+fn predicate_kernel() -> (ExprArena, ExprId) {
+    let mut a = ExprArena::new();
+    let (x, y) = (a.push_var(0), a.push_var(1));
+    let below: Vec<ExprId> = (0..PREDICATES)
+        .map(|k| {
+            let c = a.push_const(threshold(k));
+            a.push_binary(OpKind::Lt, x, c)
+        })
+        .collect();
+    let joints: Vec<ExprId> = (0..PREDICATES)
+        .map(|k| {
+            let both = a.push_binary(OpKind::BitAnd, below[k], below[(k + 1) % PREDICATES]);
+            a.push_binary(OpKind::BitOr, both, below[(k + 2) % PREDICATES])
+        })
+        .collect();
+    let mut up: Vec<ExprId> = Vec::new();
+    let mut down: Vec<ExprId> = Vec::new();
+    for (k, &mask) in joints.iter().enumerate() {
+        let c = a.push_const(k as f32);
+        let (raised, lowered) = (
+            a.push_binary(OpKind::Add, y, c),
+            a.push_binary(OpKind::Sub, y, c),
+        );
+        let (half, quarter) = (a.push_const(0.5), a.push_const(0.25));
+        let (halved, quartered) = (
+            a.push_binary(OpKind::Mul, y, half),
+            a.push_binary(OpKind::Mul, y, quarter),
+        );
+        up.push(a.push_ternary(OpKind::If, mask, raised, halved));
+        down.push(a.push_ternary(OpKind::If, mask, lowered, quartered));
+    }
+    let sum = |a: &mut ExprArena, terms: &[ExprId]| {
+        terms[1..]
+            .iter()
+            .fold(terms[0], |acc, &t| a.push_binary(OpKind::Add, acc, t))
+    };
+    let ascending = sum(&mut a, &up);
+    down.reverse();
+    let descending = sum(&mut a, &down);
+    let root = a.push_binary(OpKind::Add, ascending, descending);
+    (a, root)
+}
+
+fn predicate_reference(x: f32, y: f32) -> f64 {
+    let y = f64::from(y);
+    (0..PREDICATES)
+        .map(|k| match joint(x, k) {
+            true => (y + k as f64) + (y - k as f64),
+            false => y * 0.5 + y * 0.25,
+        })
+        .sum()
+}
+
+#[test]
+fn more_predicates_than_the_mask_file_holds_compute_their_values() {
+    let (arena, root) = predicate_kernel();
+    let shape = LatticeShape::new([width() as u32, ROWS as u32]);
+    let result = compile(&arena, root, shape).expect("the kernel compiles");
+    assert_pressured(&result);
+    let out = run(&result, &[]);
+    assert_values(&out, predicate_reference);
 }

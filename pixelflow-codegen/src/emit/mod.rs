@@ -2733,10 +2733,11 @@ pub(crate) fn compile_native(
             compile_via_backend(program, &mut aarch64::driver::Aarch64Backend::new())
         }
         (Isa::Avx2, Pipeline::Selection) => compile_on::<avx2::Avx2>(&program),
-        (isa @ (Isa::Avx512 | Isa::Neon), Pipeline::Selection) => panic!(
+        (Isa::Avx512, Pipeline::Selection) => compile_on::<avx512::Avx512>(&program),
+        (Isa::Neon, Pipeline::Selection) => panic!(
             "{PIPELINE_VAR}=selection has no `{}` backend yet; it is refused rather than \
              downgraded, so a run emits exactly the pipeline it was asked for",
-            isa.name()
+            Isa::Neon.name()
         ),
     }
 }
@@ -2755,8 +2756,9 @@ enum Pipeline {
 }
 
 impl Pipeline {
-    /// What a tier compiles with when nothing says otherwise: selection where
-    /// the tier has a backend for it.
+    /// What a tier compiles with when nothing says otherwise: selection once
+    /// the tier has switched to it. AVX-512 has a selection backend and has not
+    /// switched; NEON has neither.
     const fn of(isa: Isa) -> Self {
         match isa {
             Isa::Avx2 => Self::Selection,
@@ -6751,6 +6753,9 @@ mod tests {
                     (Self::Avx2, Pipeline::Selection) => selected_on::<avx2::Avx2>(lanes, subject),
                     (Self::Avx2, Pipeline::Legacy) => {
                         compile_on(avx2::driver::Avx2Backend::new(), lanes, subject)
+                    }
+                    (Self::Avx512, Pipeline::Selection) => {
+                        selected_on::<avx512::Avx512>(lanes, subject)
                     }
                     (Self::Avx512, Pipeline::Legacy) => {
                         compile_on(avx512::driver::Avx512Backend::new(), lanes, subject)

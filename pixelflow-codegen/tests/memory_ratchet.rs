@@ -12,9 +12,10 @@
 //! that moves them is a change to the metric (or to the legacy pipeline), and
 //! fails `legacy_traffic_is_the_recorded_table` with the table to paste.
 //!
-//! At `PIXELFLOW_ISA=avx2`, where selection is the default, the ratchet holds
-//! the new pipeline to that table; the legacy test runs under
-//! `PIXELFLOW_CODEGEN=legacy`. Each does nothing under the other.
+//! On a tier with a table (AVX2 and AVX-512), where selection is the default or
+//! the knob says so, the ratchet holds the new pipeline to that tier's table;
+//! the legacy test runs under the legacy pipeline. Each does nothing under the
+//! other, and neither does anything at a width with no table.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
@@ -27,8 +28,9 @@ mod rows {
 }
 include!("support/knob.rs");
 
-/// The vector width of the AVX2 tier, the one the tables are for.
+/// The vector widths of the tiers the tables are for.
 const AVX2_VECTOR_BYTES: usize = 32;
+const AVX512_VECTOR_BYTES: usize = 64;
 const BYTES_PER_LANE: usize = 4;
 
 /// What one row costs: its code, and what a call executes.
@@ -80,7 +82,8 @@ fn costs() -> Vec<Cost> {
 ///
 /// To regenerate, run `legacy_traffic_is_the_recorded_table` under
 /// `PIXELFLOW_ISA=avx2 PIXELFLOW_CODEGEN=legacy`: its failure prints this
-/// table. A row changes only in a commit that says why the legacy pipeline,
+/// table. `LEGACY_AVX512` is the same at `PIXELFLOW_ISA=avx512`. A row
+/// changes only in a commit that says why the legacy pipeline,
 /// or what is counted, changed.
 ///
 /// The legacy pipeline emits a fold's trip test and step beside the scope of
@@ -156,6 +159,86 @@ const LEGACY_AVX2: [Cost; 11] = [
     },
 ];
 
+/// The legacy pipeline's cost for each of `rows::TABLE`, on AVX-512.
+const LEGACY_AVX512: [Cost; 11] = [
+    Cost {
+        bytes: 676,
+        loads: 3,
+        stores: 3,
+        pool_reads: 49,
+    },
+    Cost {
+        bytes: 664,
+        loads: 3,
+        stores: 3,
+        pool_reads: 49,
+    },
+    Cost {
+        bytes: 992,
+        loads: 9,
+        stores: 9,
+        pool_reads: 124,
+    },
+    Cost {
+        bytes: 1056,
+        loads: 18,
+        stores: 18,
+        pool_reads: 220,
+    },
+    Cost {
+        bytes: 278032,
+        loads: 119558,
+        stores: 11633,
+        pool_reads: 2129,
+    },
+    Cost {
+        bytes: 2932,
+        loads: 383,
+        stores: 77,
+        pool_reads: 130,
+    },
+    Cost {
+        bytes: 1120,
+        loads: 0,
+        stores: 0,
+        pool_reads: 36,
+    },
+    Cost {
+        bytes: 1108,
+        loads: 0,
+        stores: 0,
+        pool_reads: 31,
+    },
+    Cost {
+        bytes: 700,
+        loads: 0,
+        stores: 0,
+        pool_reads: 31,
+    },
+    Cost {
+        bytes: 596,
+        loads: 0,
+        stores: 0,
+        pool_reads: 27,
+    },
+    Cost {
+        bytes: 450476,
+        loads: 90185,
+        stores: 37000,
+        pool_reads: 119,
+    },
+];
+
+/// The recorded legacy table for the tier this process compiles for, when it
+/// has one.
+fn legacy() -> Option<&'static [Cost; 11]> {
+    match jit_vector_bytes() {
+        AVX2_VECTOR_BYTES => Some(&LEGACY_AVX2),
+        AVX512_VECTOR_BYTES => Some(&LEGACY_AVX512),
+        _ => None,
+    }
+}
+
 fn print_table(measured: &[Cost]) -> String {
     measured
         .iter()
@@ -171,15 +254,15 @@ fn print_table(measured: &[Cost]) -> String {
 
 #[test]
 fn legacy_traffic_is_the_recorded_table() {
-    if selection() || jit_vector_bytes() != AVX2_VECTOR_BYTES {
+    let Some(recorded) = legacy().filter(|_| !selection()) else {
         return;
-    }
+    };
     let measured = costs();
     assert_eq!(
         measured,
-        LEGACY_AVX2,
+        recorded,
         "the legacy pipeline's traffic moved; if the metric changed on purpose, \
-         re-record LEGACY_AVX2:\n{}",
+         re-record this tier's table:\n{}",
         print_table(&measured)
     );
 }
@@ -192,13 +275,13 @@ fn legacy_traffic_is_the_recorded_table() {
 /// have none, because the new pipeline is below the old on every row today.
 #[test]
 fn selection_moves_no_more_memory_than_legacy() {
-    if !selection() {
+    let Some(legacy) = legacy().filter(|_| selection()) else {
         return;
-    }
+    };
     const SLACK: u64 = 8;
     let measured = costs();
     let mut worse = Vec::new();
-    for ((row, now), then) in rows::TABLE.iter().zip(&measured).zip(LEGACY_AVX2) {
+    for ((row, now), then) in rows::TABLE.iter().zip(&measured).zip(legacy) {
         let (now_memory, then_memory) = (now.memory(), then.memory());
         let stack = (now.loads + now.stores, then.loads + then.stores);
         if now_memory * 4 > then_memory * 5 + 4 * SLACK
@@ -219,7 +302,7 @@ fn selection_moves_no_more_memory_than_legacy() {
     );
     let (now, then): (u64, u64) = (
         measured.iter().copied().map(Cost::memory).sum(),
-        LEGACY_AVX2.iter().copied().map(Cost::memory).sum(),
+        legacy.iter().copied().map(Cost::memory).sum(),
     );
     assert!(
         now <= then,

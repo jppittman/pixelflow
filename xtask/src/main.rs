@@ -612,18 +612,35 @@ const ISA_LEVELS: &[IsaLevel] = &[
         pipeline: None,
         suites: &[],
     },
-    // The pipelines (docs/plans/2026-10-08-selection-is-a-phase.md), at the one
-    // tier with a selection backend. Not tiers, but decided the same way (the
-    // environment, once, at startup) and run the same way. The selection leg is
-    // the pipeline AVX2 ships: every suite that compiles a kernel and checks
-    // it, in the three crates that do, so the pins that mean something under it
-    // (the glyph and scene byte pins, the V suites) run presubmit under the code
-    // that ships, whatever tier the `test` job's runner happens to have. The
-    // workspace's other crates are not held to it yet.
+    // The pipelines (docs/plans/2026-10-08-selection-is-a-phase.md), at the
+    // tiers with a selection backend. Not tiers, but decided the same way (the
+    // environment, once, at startup) and run the same way. The selection leg
+    // is the pipeline a tier ships, or will: every suite that compiles a
+    // kernel and checks it, in the three crates that do, so the pins that mean
+    // something under it (the glyph and scene byte pins, the V suites) run
+    // presubmit under the code that ships, whatever tier the `test` job's
+    // runner happens to have. The workspace's other crates are not held to it
+    // yet.
     IsaLevel {
         name: "avx2+fma, selection",
         isa: "avx2",
         requires: &["avx2", "fma"],
+        pipeline: Some("selection"),
+        suites: &[&[
+            "test",
+            "-p",
+            "pixelflow-codegen",
+            "-p",
+            "pixelflow-core",
+            "-p",
+            "pixelflow-graphics",
+            "--no-fail-fast",
+        ]],
+    },
+    IsaLevel {
+        name: "avx512f+dq, selection",
+        isa: "avx512",
+        requires: &["avx512f", "avx512dq"],
         pipeline: Some("selection"),
         suites: &[&[
             "test",

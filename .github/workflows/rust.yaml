@@ -735,10 +735,11 @@ jobs:
     # tier (see postsubmit-flake-detection.yaml) -- this catches the
     # tier-specific failures early, not all of them.
     #
-    # Thirty-five, not twenty-five: the selection pipeline's leg runs the
-    # codegen, core and graphics suites once more, about four minutes of
-    # test execution on the already-built binaries.
-    timeout-minutes: 35
+    # Forty, not twenty-five: each selection pipeline leg (AVX2, and AVX-512
+    # on a runner that has it) runs the codegen, core and graphics suites once
+    # more, about four minutes of test execution on the already-built
+    # binaries.
+    timeout-minutes: 40
     env:
       RUSTC_WRAPPER: sccache
       CARGO_INCREMENTAL: "0"
@@ -798,7 +799,8 @@ jobs:
       # `PIXELFLOW_CODEGEN=selection` at AVX2
       # (docs/plans/2026-10-08-selection-is-a-phase.md): the pins that mean
       # something under it must run presubmit under the code that ships, and
-      # the `test` job above runs at whatever tier its runner has. The legacy
+      # the `test` job above runs at whatever tier its runner has. AVX-512 has
+      # the same leg, until its default is selection too. The legacy
       # pipeline, until it is deleted, gets a leg of only what means something
       # under it (its memory table and the byte pins keyed to it). A step of
       # this required job and not a job of its own, so there is nothing new to

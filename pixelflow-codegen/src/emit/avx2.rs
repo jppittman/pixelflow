@@ -30,12 +30,13 @@ use super::regalloc::resource::FrameSlot;
 use super::register_file::{EntryRegisters, Members, RegisterFile};
 use super::x86_64;
 use super::x86_64::{
-    Alu, Direction, Disp, Imm8, Imm32, Lanewise, Mem, NoDisp, Pred, Rounding, Truncate, frame_slot,
+    Alu, Direction, Disp, GENERAL, Imm8, Imm32, Lanewise, Mem, NoDisp, Pred, Rounding, Truncate,
+    X86, frame_slot,
 };
 use super::{
-    AsmInsn, AsmProgram, Bound, Class, ClassId, Edges, EncodedInst, FrameSize, Gpr, Integer,
-    IsaBackend, Label, LaneOp, Physical, Placed, Pointer, PtrReg, Rebind, Reg, Selected, Spill,
-    Stage, Store, Target, Test, Value, ValueName, Vector, unimplemented_op,
+    AsmInsn, AsmProgram, Bound, Class, ClassId, Edges, EncodedInst, Gpr, Integer, IsaBackend,
+    Label, LaneOp, Physical, Placed, Pointer, PtrReg, Rebind, Reg, Selected, Spill, Stage, Store,
+    Target, Test, Value, ValueName, Vector, unimplemented_op,
 };
 use crate::error::CompileError;
 use crate::program::IfArm;
@@ -1079,11 +1080,6 @@ fn emit_gather(code: &mut Vec<u8>, dst: Reg, idx: Reg, base: PtrReg, t: GatherTe
 /// The AVX2 machine, as the selection pipeline sees it.
 pub(in crate::emit) enum Avx2 {}
 
-/// The caller-saved general registers, by hardware number: `rax`, `rcx`,
-/// `rdx`, `rsi`, `rdi` and `r8`-`r11`. A callee-saved register would cost a
-/// prologue, and `rsp` is the frame's.
-const GENERAL: &[u8] = &[0, 1, 2, 6, 7, 8, 9, 10, 11];
-
 /// Define a value of class `C` with `make`, which builds the vector
 /// instruction that writes it.
 fn vex<C: Class>(b: &mut Builder<Avx2>, make: impl FnOnce(Def<C>) -> Inst<Selected>) -> Value<C> {
@@ -1093,24 +1089,10 @@ fn vex<C: Class>(b: &mut Builder<Avx2>, make: impl FnOnce(Def<C>) -> Inst<Select
     value
 }
 
-/// Define a value of class `C` with `make`, which builds the
-/// general-register instruction that writes it.
-fn general<C: Class>(
-    b: &mut Builder<Avx2>,
-    make: impl FnOnce(Def<C>) -> x86_64::Gp<Selected>,
-) -> Value<C> {
-    let dst = b.def();
-    let value = dst.value();
-    b.push(Op::General(make(dst)));
-    value
-}
-
-/// A fresh value of class `D` for an instruction of the allocator's to
-/// define, and its name as the class `C` the allocator asked for.
-fn defined<C: Spill, D: Spill>(b: &mut Spiller<'_, Avx2>) -> (Def<D>, Value<C>) {
-    let dst = b.def::<D>();
-    let value = dst.value().name().typed();
-    (dst, value)
+impl X86 for Avx2 {
+    fn general(inst: x86_64::Gp<Selected>) -> Op<Selected> {
+        Op::General(inst)
+    }
 }
 
 impl IsaBackend for Avx2 {
@@ -1149,7 +1131,7 @@ impl IsaBackend for Avx2 {
             // The bytes `0..8` in through a general register, widened to
             // dwords, converted.
             LaneOp::Lanes => {
-                let bytes = general(b, |dst| x86_64::Gp::Movabs {
+                let bytes = x86_64::define(b, |dst| x86_64::Gp::Movabs {
                     dst,
                     imm: IOTA_BYTES,
                 });
@@ -1261,17 +1243,12 @@ impl IsaBackend for Avx2 {
         param.typed()
     }
 
-    /// `mov p, [ctx + 8·slot]`.
     fn context(
         b: &mut Builder<Self>,
         ctx: Value<Pointer>,
         slot: u64,
     ) -> Result<Value<Pointer>, CompileError> {
-        let disp = x86_64::displacement(slot, x86_64::PTR_BYTES as u64)?;
-        Ok(general(b, |dst| x86_64::Gp::MovLoad {
-            dst,
-            src: Mem { base: ctx, disp },
-        }))
+        x86_64::context(b, ctx, slot)
     }
 
     /// `out + 4·(row·pitch + col)`: each index is lane 0 of its binder,
@@ -1289,25 +1266,7 @@ impl IsaBackend for Avx2 {
         } = store;
         let row = vex(b, |dst| Inst::Cvtt { dst, src: row });
         let col = vex(b, |dst| Inst::Cvtt { dst, src: col });
-        let (scaled, flags) = (b.tie(row), b.def());
-        let row_pitch = scaled.write();
-        b.push(Op::General(x86_64::Gp::Imul {
-            dst: scaled,
-            src: pitch,
-            flags,
-        }));
-        let (summed, flags) = (b.tie(row_pitch), b.def());
-        let index = summed.write();
-        b.push(Op::General(x86_64::Gp::Add {
-            dst: summed,
-            src: col,
-            flags,
-        }));
-        let base = general(b, |dst| x86_64::Gp::Lea4 {
-            dst,
-            base: out,
-            index,
-        });
+        let base = x86_64::element_address(b, out, pitch, (row, col));
         if u64::from(lanes) == Self::FILE.vector_bytes() / 4 {
             b.push(Op::Vector(Inst::StoreBatch {
                 dst: Mem { base, disp: NoDisp },
@@ -1349,109 +1308,58 @@ impl IsaBackend for Avx2 {
                 imm: 0xFF,
             },
         }));
-        let next = Target {
-            label: edges.next,
-            args: Vec::new(),
-        };
-        b.push(Op::General(x86_64::Gp::Jcc {
-            cond: x86_64::Cond::E,
-            flags: tested,
-            taken: edges.taken,
-            next,
-        }));
+        x86_64::branch(b, x86_64::Cond::E, tested, edges);
     }
 
     fn jump(b: &mut Builder<Self>, to: Target, next: Label) {
-        b.push(Op::General(if to.label == next {
-            x86_64::Gp::Fallthrough { to }
-        } else {
-            x86_64::Gp::Jmp { to }
-        }));
+        x86_64::jump(b, to, next);
     }
 
     fn enter(b: &mut Builder<Self>) {
-        let flags = b.def();
-        b.push(Op::General(x86_64::Gp::Enter {
-            size: FrameSize,
-            flags,
-        }));
+        x86_64::enter(b);
     }
 
     fn ret(b: &mut Builder<Self>) {
-        let flags = b.def();
-        b.push(Op::General(x86_64::Gp::Ret {
-            size: FrameSize,
-            flags,
-        }));
+        x86_64::ret(b);
     }
 
     fn copy<C: Spill>(b: &mut Spiller<'_, Self>, src: Value<C>) -> Value<C> {
         match C::ID {
             ClassId::Vector => {
-                let (dst, copy) = defined::<C, Vector>(b);
+                let (dst, copy) = x86_64::defined::<C, Vector>(b);
                 b.push(Op::Vector(Inst::Mov {
                     dst,
                     src: src.name().typed(),
                 }));
                 copy
             }
-            ClassId::Pointer => {
-                let (dst, copy) = defined::<C, Pointer>(b);
-                b.push(Op::General(x86_64::Gp::Mov {
-                    dst,
-                    src: src.name().typed(),
-                }));
-                copy
-            }
-            ClassId::Integer => {
-                let (dst, copy) = defined::<C, Integer>(b);
-                b.push(Op::General(x86_64::Gp::MovInt {
-                    dst,
-                    src: src.name().typed(),
-                }));
-                copy
-            }
+            ClassId::Pointer | ClassId::Integer => x86_64::copy_general(b, src),
             ClassId::Opmask | ClassId::Flags => unreachable!("AVX2 has no {:?} to copy", C::ID),
         }
     }
 
     fn spill<C: Spill>(b: &mut Spiller<'_, Self>, src: Value<C>, slot: &FrameSlot) {
-        let slot = slot.name();
-        b.push(match C::ID {
-            ClassId::Vector => Op::Vector(Inst::SpillVector {
+        match C::ID {
+            ClassId::Vector => b.push(Op::Vector(Inst::SpillVector {
                 src: src.name().typed(),
-                slot,
-            }),
-            ClassId::Pointer => Op::General(x86_64::Gp::SpillPtr {
-                src: src.name().typed(),
-                slot,
-            }),
-            ClassId::Integer => Op::General(x86_64::Gp::SpillInt {
-                src: src.name().typed(),
-                slot,
-            }),
+                slot: slot.name(),
+            })),
+            ClassId::Pointer | ClassId::Integer => x86_64::spill_general(b, src, slot),
             ClassId::Opmask | ClassId::Flags => unreachable!("AVX2 has no {:?} to spill", C::ID),
-        });
+        }
     }
 
     fn reload<C: Spill>(b: &mut Spiller<'_, Self>, slot: &FrameSlot) -> Value<C> {
-        let slot = slot.name();
         match C::ID {
             ClassId::Vector => {
-                let (dst, reloaded) = defined::<C, Vector>(b);
-                b.push(Op::Vector(Inst::ReloadVector { dst, slot }));
+                let (dst, reloaded) = x86_64::defined::<C, Vector>(b);
+                b.push(Op::Vector(Inst::ReloadVector {
+                    dst,
+                    slot: slot.name(),
+                }));
                 reloaded
             }
-            ClassId::Pointer => {
-                let (dst, reloaded) = defined::<C, Pointer>(b);
-                b.push(Op::General(x86_64::Gp::ReloadPtr { dst, slot }));
-                reloaded
-            }
-            ClassId::Integer => {
-                let (dst, reloaded) = defined::<C, Integer>(b);
-                b.push(Op::General(x86_64::Gp::ReloadInt { dst, slot }));
-                reloaded
-            }
+            ClassId::Pointer | ClassId::Integer => x86_64::reload_general(b, slot),
             ClassId::Opmask | ClassId::Flags => unreachable!("AVX2 has no {:?} to reload", C::ID),
         }
     }

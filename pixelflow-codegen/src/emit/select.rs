@@ -434,7 +434,16 @@ impl<B: IsaBackend> Selector<'_, B> {
             if_true,
             if_false,
         })?;
-        let join = self.b.block(&[B::lane_name(blended).class], scope);
+        let class = B::lane_name(blended).class;
+        for arm in [if_true, if_false] {
+            assert_eq!(
+                B::lane_name(arm).class,
+                class,
+                "a guarded If's arm is held in another register file than its value, and \
+                 its join takes one: selection has no way to hold a lane in the other file"
+            );
+        }
+        let join = self.b.block(&[class], scope);
         let result = B::param_lane(join.params()[0]);
         let into = |lane| Target {
             label: join.label(),

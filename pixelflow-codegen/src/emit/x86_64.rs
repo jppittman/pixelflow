@@ -13,9 +13,12 @@
 //! (docs/plans/2026-09-22-the-isa-is-decided-at-startup.md §7).
 
 use super::asm::Encoding;
+use super::build::{Builder, Def, Spiller};
+use super::regalloc::resource::FrameSlot;
 use super::{
-    AsmInsn, Assembly, Binding, EncodedInst, Flags, Gpr, Integer, Label, LabelRef, Loc, Physical,
-    Placed, Pointer, PtrReg, Rebind, Reg, Selected, Stage, WritePlan, regalloc,
+    AsmInsn, Assembly, Binding, Class, ClassId, Edges, EncodedInst, Flags, FrameSize, Gpr, Integer,
+    IsaBackend, Label, LabelRef, Loc, Physical, Placed, Pointer, PtrReg, Rebind, Reg, Selected,
+    Spill, Stage, Target, Value, WritePlan, regalloc,
 };
 use crate::error::CompileError;
 use alloc::collections::BTreeMap;
@@ -704,6 +707,189 @@ impl AsmInsn for Gp<Physical> {
             label,
             patch: patch_rel32,
         })
+    }
+}
+
+// =============================================================================
+// Selection: the general-register half both tiers share
+// =============================================================================
+
+/// The caller-saved general registers, by hardware number: `rax`, `rcx`,
+/// `rdx`, `rsi`, `rdi` and `r8`-`r11`. A callee-saved register would cost a
+/// prologue, and `rsp` is the frame's.
+pub(super) const GENERAL: &[u8] = &[0, 1, 2, 6, 7, 8, 9, 10, 11];
+
+/// An x86 backend: its instructions are its vector ones and these.
+pub(super) trait X86: IsaBackend {
+    /// `inst` as this backend's instruction.
+    fn general(inst: Gp<Selected>) -> Self::Inst<Selected>;
+}
+
+/// Define a value of class `C` with `make`, which builds the
+/// general-register instruction that writes it.
+pub(super) fn define<B: X86, C: Class>(
+    b: &mut Builder<B>,
+    make: impl FnOnce(Def<C>) -> Gp<Selected>,
+) -> Value<C> {
+    let dst = b.def();
+    let value = dst.value();
+    b.push(B::general(make(dst)));
+    value
+}
+
+/// A fresh value of class `D` for an instruction of the allocator's to
+/// define, and its name as the class `C` the allocator asked for.
+pub(super) fn defined<C: Spill, D: Spill>(
+    b: &mut Spiller<'_, impl IsaBackend>,
+) -> (Def<D>, Value<C>) {
+    let dst = b.def::<D>();
+    let value = dst.value().name().typed();
+    (dst, value)
+}
+
+/// `mov p, [ctx + 8·slot]`.
+pub(super) fn context<B: X86>(
+    b: &mut Builder<B>,
+    ctx: Value<Pointer>,
+    slot: u64,
+) -> Result<Value<Pointer>, CompileError> {
+    let disp = displacement(slot, PTR_BYTES as u64)?;
+    Ok(define(b, |dst| Gp::MovLoad {
+        dst,
+        src: Mem { base: ctx, disp },
+    }))
+}
+
+/// `out + 4·(row·pitch + col)`: where the lattice's store writes, from the
+/// two indices as integers.
+pub(super) fn element_address<B: X86>(
+    b: &mut Builder<B>,
+    out: Value<Pointer>,
+    pitch: Value<Integer>,
+    (row, col): (Value<Integer>, Value<Integer>),
+) -> Value<Pointer> {
+    let (scaled, flags) = (b.tie(row), b.def());
+    let row_pitch = scaled.write();
+    b.push(B::general(Gp::Imul {
+        dst: scaled,
+        src: pitch,
+        flags,
+    }));
+    let (summed, flags) = (b.tie(row_pitch), b.def());
+    let index = summed.write();
+    b.push(B::general(Gp::Add {
+        dst: summed,
+        src: col,
+        flags,
+    }));
+    define(b, |dst| Gp::Lea4 {
+        dst,
+        base: out,
+        index,
+    })
+}
+
+/// End the block: `jcc` to `edges.taken` when `flags` meet `cond`, else fall
+/// through to `edges.next`.
+pub(super) fn branch<B: X86>(b: &mut Builder<B>, cond: Cond, flags: Value<Flags>, edges: Edges) {
+    let next = Target {
+        label: edges.next,
+        args: Vec::new(),
+    };
+    b.push(B::general(Gp::Jcc {
+        cond,
+        flags,
+        taken: edges.taken,
+        next,
+    }));
+}
+
+/// End the block: go to `to`. A `Fallthrough` when `to` is `next`.
+pub(super) fn jump<B: X86>(b: &mut Builder<B>, to: Target, next: Label) {
+    b.push(B::general(if to.label == next {
+        Gp::Fallthrough { to }
+    } else {
+        Gp::Jmp { to }
+    }));
+}
+
+pub(super) fn enter<B: X86>(b: &mut Builder<B>) {
+    let flags = b.def();
+    b.push(B::general(Gp::Enter {
+        size: FrameSize,
+        flags,
+    }));
+}
+
+pub(super) fn ret<B: X86>(b: &mut Builder<B>) {
+    let flags = b.def();
+    b.push(B::general(Gp::Ret {
+        size: FrameSize,
+        flags,
+    }));
+}
+
+/// `mov` of an address or an integer between general registers.
+pub(super) fn copy_general<B: X86, C: Spill>(b: &mut Spiller<'_, B>, src: Value<C>) -> Value<C> {
+    match C::ID {
+        ClassId::Pointer => {
+            let (dst, copy) = defined::<C, Pointer>(b);
+            b.push(B::general(Gp::Mov {
+                dst,
+                src: src.name().typed(),
+            }));
+            copy
+        }
+        ClassId::Integer => {
+            let (dst, copy) = defined::<C, Integer>(b);
+            b.push(B::general(Gp::MovInt {
+                dst,
+                src: src.name().typed(),
+            }));
+            copy
+        }
+        class => unreachable!("{class:?} is not held in a general register"),
+    }
+}
+
+/// `mov [rsp + slot], src` of an address or an integer.
+pub(super) fn spill_general<B: X86, C: Spill>(
+    b: &mut Spiller<'_, B>,
+    src: Value<C>,
+    slot: &FrameSlot,
+) {
+    let slot = slot.name();
+    b.push(B::general(match C::ID {
+        ClassId::Pointer => Gp::SpillPtr {
+            src: src.name().typed(),
+            slot,
+        },
+        ClassId::Integer => Gp::SpillInt {
+            src: src.name().typed(),
+            slot,
+        },
+        class => unreachable!("{class:?} is not held in a general register"),
+    }));
+}
+
+/// `mov dst, [rsp + slot]` of an address or an integer.
+pub(super) fn reload_general<B: X86, C: Spill>(
+    b: &mut Spiller<'_, B>,
+    slot: &FrameSlot,
+) -> Value<C> {
+    let slot = slot.name();
+    match C::ID {
+        ClassId::Pointer => {
+            let (dst, reloaded) = defined::<C, Pointer>(b);
+            b.push(B::general(Gp::ReloadPtr { dst, slot }));
+            reloaded
+        }
+        ClassId::Integer => {
+            let (dst, reloaded) = defined::<C, Integer>(b);
+            b.push(B::general(Gp::ReloadInt { dst, slot }));
+            reloaded
+        }
+        class => unreachable!("{class:?} is not held in a general register"),
     }
 }
 
