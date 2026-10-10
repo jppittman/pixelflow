@@ -578,9 +578,10 @@ struct IsaLevel {
     isa: &'static str,
     requires: &'static [&'static str],
     /// The `PIXELFLOW_CODEGEN` value to run under, when it is not the default
-    /// pipeline, and the `cargo` invocations that hold that pipeline in place
-    /// of the mode's (none: the mode's own).
+    /// pipeline.
     pipeline: Option<&'static str>,
+    /// The `cargo` invocations that hold that pipeline in place of the mode's;
+    /// none means the mode's own, which is every level but a pipeline's.
     suites: &'static [&'static [&'static str]],
 }
 

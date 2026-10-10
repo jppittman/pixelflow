@@ -4,11 +4,13 @@
 // carved into both.
 //
 // Included, not compiled: `examples/byte_probe.rs` prints their bytes through
-// the host's own backend, and `emit::tests::sibling_folds` pins their bytes on
-// all three backends at explicit lane counts. One definition, so the two
-// cannot drift into measuring different kernels under the same name. Only
-// `pixelflow_ir`'s public vocabulary is named, since an example is a crate of
-// its own.
+// the host's own backend, `emit::tests::sibling_folds` pins their bytes on all
+// three backends at explicit lane counts, and `tests/golden_selected.rs`,
+// `tests/memory_ratchet.rs` and `tests/selection_stays_linear.rs` measure them
+// through `compile`, all over `TABLE`, the one list of rows. One definition,
+// so none of them can drift into measuring different kernels under the same
+// name. Only `pixelflow_ir`'s public vocabulary is named, since an example is a
+// crate of its own.
 //
 // `deep_frame.rs`, included below, carries the helpers the kernels share.
 //

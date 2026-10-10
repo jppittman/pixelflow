@@ -141,8 +141,9 @@ impl<B: IsaBackend> Selector<'_, B> {
                 open.push((arm.end, past));
             }
             // A placeholder, a sequence and a binder's alias select nothing;
-            // a `Reduce` counts once it is known to open a loop; a constant is
-            // defined where it is read, and counted there, as a remat.
+            // a `Reduce` counts once it is known to open a loop; a constant
+            // counts only when its instruction is not one the allocator
+            // places at each read, where it is counted as a remat.
             if !matches!(
                 def.op,
                 ScheduledOp::Const(_)
@@ -192,7 +193,13 @@ impl<B: IsaBackend> Selector<'_, B> {
                     }
                 }
                 ScheduledOp::Var(var) => self.binder_of_var(*var),
-                ScheduledOp::Const(value) => self.lane(LaneOp::Const(*value))?,
+                ScheduledOp::Const(value) => {
+                    let lane = self.lane(LaneOp::Const(*value))?;
+                    if !self.b.ends_rematerializable() {
+                        self.scheduled[scope_ix(scope)] += 1;
+                    }
+                    lane
+                }
                 ScheduledOp::Lanes(_) => self.lane(LaneOp::Lanes)?,
                 ScheduledOp::Unary(op, a) => {
                     let a = self.lookup(*a);

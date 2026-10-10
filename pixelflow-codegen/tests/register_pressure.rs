@@ -27,12 +27,19 @@ const TERMS: usize = 48;
 const TABLE_LEN: usize = 64;
 const ROWS: usize = 3;
 const ORIGIN: [f32; 2] = [2.0, 5.0];
-/// Where the guarded `If` turns: a batch wholly before it, one across it and
-/// the rest wholly after.
-const EDGE: f32 = 14.0;
+
+fn lanes() -> usize {
+    jit_vector_bytes() / core::mem::size_of::<f32>()
+}
 
 fn width() -> usize {
-    2 * (jit_vector_bytes() / core::mem::size_of::<f32>()) + 3
+    2 * lanes() + 3
+}
+
+/// Where the guarded `If` turns: halfway through the second batch, on every
+/// tier, so one batch is wholly before it and one is across it.
+fn edge() -> f32 {
+    ORIGIN[0] + (lanes() + lanes() / 2) as f32
 }
 
 fn pitch() -> usize {
@@ -49,7 +56,7 @@ fn offset(k: usize) -> f32 {
     0.1 * k as f32
 }
 
-/// `if x < EDGE { sin(x)·y + up } else { exp(y/8) + down }`, where `up` and
+/// `if x < edge() { sin(x)·y + up } else { exp(y/8) + down }`, where `up` and
 /// `down` are `Σ_k table_{k mod T}[x] · (y + c_k)` summed in opposite orders.
 fn kernel() -> (ExprArena, ExprId, Vec<Vec<f32>>) {
     let mut a = ExprArena::new();
@@ -83,7 +90,7 @@ fn kernel() -> (ExprArena, ExprId, Vec<Vec<f32>>) {
     products.reverse();
     let down = sum(&mut a, &products);
 
-    let edge = a.push_const(EDGE);
+    let edge = a.push_const(edge());
     let before = a.push_binary(OpKind::Lt, x, edge);
     let wave = a.push_unary(OpKind::Sin, x);
     let waved = a.push_binary(OpKind::Mul, wave, y);
@@ -104,7 +111,7 @@ fn reference(tables: &[Vec<f32>], x: f32, y: f32) -> f64 {
             entry * (y64 + f64::from(offset(k)))
         })
         .sum();
-    match x < EDGE {
+    match x < edge() {
         true => x64.sin() * y64 + sum,
         false => (y64 * 0.125).exp() + sum,
     }
@@ -115,6 +122,15 @@ fn a_kernel_wider_than_every_register_file_computes_its_values() {
     let (arena, root, tables) = kernel();
     let shape = LatticeShape::new([width() as u32, ROWS as u32]);
     let result = compile(&arena, root, shape).expect("the kernel compiles");
+    // The pressure the test is for: values outnumber the files, so something
+    // is spilled and read back from the frame. A kernel the optimizer shrinks
+    // below that checks nothing about allocation.
+    let frame_reads: u64 = result.traffic.scopes.iter().map(|s| s.loads).sum();
+    assert!(
+        result.spill_count > 0 && frame_reads > 0,
+        "the kernel no longer outnumbers the register files: {} slots, {frame_reads} frame reads",
+        result.spill_count
+    );
 
     let mut out = vec![f32::NAN; ROWS * pitch()];
     let origin = ORIGIN;

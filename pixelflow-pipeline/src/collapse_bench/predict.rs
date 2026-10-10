@@ -88,7 +88,10 @@ pub fn predictors() -> Vec<Predictor> {
         Predictor {
             name: "dyn_traffic",
             gloss: "dyn_mem_ops + trip-weighted rematerializations — every value the code has to \
-                    fetch or rebuild, whether or not it comes from memory",
+                    fetch or rebuild, whether or not it comes from memory. A remat is a read of \
+                    the constant pool: since selection B10 a zero or all-ones idiom is none, and \
+                    legacy counts a LoadConst and a fold's bound and step, so journal rows from \
+                    before it are not comparable",
             eval: |r| dyn_of(r, |s| s.loads + s.remats + s.stores),
         },
         Predictor {

@@ -275,6 +275,13 @@ impl<B: IsaBackend> Builder<B> {
         self.open(block.label, block.params, block.scope);
     }
 
+    /// Whether the instruction last pushed is one the allocator places again
+    /// where a read needs it ([`IsaBackend::rematerializable`]).
+    pub(super) fn ends_rematerializable(&self) -> bool {
+        let open = self.blocks.last().and_then(|block| block.insts.last());
+        open.is_some_and(|pushed| B::rematerializable(&pushed.inst))
+    }
+
     /// The pool entry for `k`, deduplicated.
     ///
     /// # Errors

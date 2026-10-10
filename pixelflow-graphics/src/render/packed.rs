@@ -468,22 +468,22 @@ mod tests {
             ("chrome", chrome(), CHROME_PINS),
             ("silhouette", silhouette(), SILHOUETTE_PINS),
         ];
-        let tier = pixelflow_codegen::isa::detect().name();
+        // The selection pipeline (`PIXELFLOW_CODEGEN=selection`) has a tier of
+        // its own: the same scenes, other code.
+        let selection = std::env::var("PIXELFLOW_CODEGEN")
+            .is_ok_and(|name| name.trim().eq_ignore_ascii_case("selection"));
+        let tier = match selection {
+            true => format!("{}+selection", pixelflow_codegen::isa::detect().name()),
+            false => pixelflow_codegen::isa::detect().name().to_string(),
+        };
         let mut moved = Vec::new();
         for (name, scene, pins) in scenes {
             let code = code_of(&scene);
             let emitted = (code.len(), pixelflow_codegen::fnv1a64(&code));
-            let pinned = match selection() {
-                true => SELECTED_AVX2_PINS
-                    .iter()
-                    .find(|&&(n, ..)| n == name)
-                    .map(|&(_, len, fnv)| (len, fnv))
-                    .filter(|_| tier == "avx2"),
-                false => pins
-                    .iter()
-                    .find(|(t, _, _)| *t == tier)
-                    .map(|&(_, len, fnv)| (len, fnv)),
-            };
+            let pinned = pins
+                .iter()
+                .find(|(t, _, _)| *t == tier)
+                .map(|&(_, len, fnv)| (len, fnv));
             let (len, fnv) =
                 pinned.unwrap_or_else(|| panic!("{name} has no pin for the {tier} tier"));
             if emitted != (len, fnv) {
@@ -496,28 +496,16 @@ mod tests {
         assert!(moved.is_empty(), "scene code moved:\n{}", moved.join("\n"));
     }
 
-    /// The same scenes compiled by the selection pipeline
-    /// (`PIXELFLOW_CODEGEN=selection`), `(scene, bytes, fnv1a64)`. It has the
-    /// AVX2 tier alone so far, and a run on any other refuses to compile.
-    const SELECTED_AVX2_PINS: [(&str, usize, u64); 2] = [
-        ("chrome", 5296, 0x8c12_dcf8_c29d_98b0),
-        ("silhouette", 956, 0xf671_c139_7e06_ee59),
-    ];
-
-    /// Whether this process compiles with the selection pipeline.
-    fn selection() -> bool {
-        std::env::var("PIXELFLOW_CODEGEN")
-            .is_ok_and(|name| name.trim().eq_ignore_ascii_case("selection"))
-    }
-
-    /// One kernel's code on each tier, `(tier, bytes, fnv1a64)`.
-    type TierPins = [(&'static str, usize, u64); 3];
+    /// One kernel's code on each tier, `(tier, bytes, fnv1a64)`; `+selection` after
+    /// the ISA's name is the selection pipeline, which has AVX2 alone so far.
+    type TierPins = [(&'static str, usize, u64); 4];
 
     /// The chrome sphere's code per tier.
     const CHROME_PINS: TierPins = [
         ("avx2", 6192, 0xb419_6e71_9c99_afb6),
         ("avx512", 6224, 0x9e5c_99e8_27bc_546a),
         ("neon", 3520, 0x8a30_5ff7_636f_e4fe),
+        ("avx2+selection", 5296, 0x8c12_dcf8_c29d_98b0),
     ];
 
     /// The silhouette's code per tier.
@@ -525,5 +513,6 @@ mod tests {
         ("avx2", 1276, 0x1d42_97fa_4eec_b1f4),
         ("avx512", 1196, 0x1080_ada6_22ad_f852),
         ("neon", 976, 0xd6f5_70fd_e78e_6f74),
+        ("avx2+selection", 956, 0xf671_c139_7e06_ee59),
     ];
 }
