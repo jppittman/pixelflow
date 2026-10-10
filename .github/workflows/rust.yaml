@@ -793,13 +793,16 @@ jobs:
       # `xtask isa-matrix`'s own doc comment for the per-tier detection and
       # for what `--smoke` covers.
       #
-      # It also runs the selection pipeline behind its knob,
-      # `PIXELFLOW_CODEGEN=selection` at AVX2, over the whole codegen, core
-      # and graphics suites (docs/plans/2026-10-08-selection-is-a-phase.md):
-      # the tests that pin that pipeline's code and its memory traffic do
-      # nothing under the default one, so this leg is what runs them. A step
-      # of this required job and not a job of its own, so there is nothing
-      # new to register as required.
+      # AVX2 compiles with the selection pipeline, so it also runs that
+      # pipeline's whole codegen, core and graphics suites, with
+      # `PIXELFLOW_CODEGEN=selection` at AVX2
+      # (docs/plans/2026-10-08-selection-is-a-phase.md): the pins that mean
+      # something under it must run presubmit under the code that ships, and
+      # the `test` job above runs at whatever tier its runner has. The legacy
+      # pipeline, until it is deleted, gets a leg of only what means something
+      # under it (its memory table and the byte pins keyed to it). A step of
+      # this required job and not a job of its own, so there is nothing new to
+      # register as required.
       - name: Run ISA matrix (build + clippy once, smoke tests per tier)
         shell: bash
         run: cargo run -p xtask -- isa-matrix --clippy --smoke

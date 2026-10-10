@@ -3,8 +3,8 @@
 //! `GOLDEN_SELECTED` is `emit::tests::sibling_folds`'s `GOLDEN` for the new
 //! pipeline: the length and FNV-1a 64 digest of what each of `rows::TABLE`'s
 //! kernels compiles to. It is born with AVX2, the one tier the pipeline has a
-//! backend for, and gains AVX-512 and NEON as they get theirs. It obeys the
-//! same rule from birth:
+//! backend for (and compiles with), and gains AVX-512 and NEON as they get
+//! theirs. It obeys the same rule from birth:
 //!
 //! **A refactor does not edit this table; an intentional byte change does, in
 //! a commit of its own that says why.** A commit that edits it beside other
@@ -14,8 +14,9 @@
 //!
 //! Unlike `GOLDEN`, which emits all three targets from any host through the
 //! crate's own entry points, this reaches the pipeline through `compile`, so it
-//! is the host's tier and the process's knob: it does nothing unless run under
-//! `PIXELFLOW_CODEGEN=selection PIXELFLOW_ISA=avx2`. The `isa-matrix` job does.
+//! is the host's tier and the process's knob: it does nothing unless run on the
+//! selection pipeline at `PIXELFLOW_ISA=avx2`, where it is the default. The
+//! `isa-matrix` job does. `GOLDEN`'s AVX2 column pins the same code.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 

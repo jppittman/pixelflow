@@ -9,8 +9,9 @@
 //! The count of selected machine instructions is not reported, only the
 //! scheduled operations they were selected from (`ScopeTraffic::instructions`,
 //! which counts a constant not at all: it is a pool read, where it is read), so
-//! the code's bytes stand in for it. Run under `PIXELFLOW_CODEGEN=selection
-//! PIXELFLOW_ISA=avx2`; under the default pipeline these do nothing.
+//! the code's bytes stand in for it. They run at AVX2, where selection is the
+//! default, and under `PIXELFLOW_CODEGEN=selection`; under the legacy pipeline
+//! they do nothing.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 

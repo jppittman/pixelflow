@@ -12,9 +12,9 @@
 //! that moves them is a change to the metric (or to the legacy pipeline), and
 //! fails `legacy_traffic_is_the_recorded_table` with the table to paste.
 //!
-//! Run under `PIXELFLOW_CODEGEN=selection PIXELFLOW_ISA=avx2`, the ratchet holds
+//! At `PIXELFLOW_ISA=avx2`, where selection is the default, the ratchet holds
 //! the new pipeline to that table; the legacy test runs under
-//! `PIXELFLOW_ISA=avx2` alone. Each does nothing under the other.
+//! `PIXELFLOW_CODEGEN=legacy`. Each does nothing under the other.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
@@ -79,7 +79,7 @@ fn costs() -> Vec<Cost> {
 /// The legacy pipeline's cost for each of `rows::TABLE`, on AVX2.
 ///
 /// To regenerate, run `legacy_traffic_is_the_recorded_table` under
-/// `PIXELFLOW_ISA=avx2` with the default pipeline: its failure prints this
+/// `PIXELFLOW_ISA=avx2 PIXELFLOW_CODEGEN=legacy`: its failure prints this
 /// table. A row changes only in a commit that says why the legacy pipeline,
 /// or what is counted, changed.
 ///

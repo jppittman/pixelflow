@@ -2721,7 +2721,8 @@ fn location_of(locs: &[Option<Binding>], vid: regalloc::ValueId) -> Binding {
 pub(crate) fn compile_native(
     program: regalloc::ScopedSchedule,
 ) -> Result<CompileResult, CompileError> {
-    match (crate::isa::detect(), pipeline()) {
+    let isa = crate::isa::detect();
+    match (isa, pipeline(isa)) {
         (Isa::Avx2, Pipeline::Legacy) => {
             compile_via_backend(program, &mut avx2::driver::Avx2Backend::new())
         }
@@ -2753,18 +2754,29 @@ enum Pipeline {
     Selection,
 }
 
-/// The pipeline this process compiles with: `PIXELFLOW_CODEGEN=legacy` (the
-/// default when unset) or `selection`, read once at the first compile like
-/// [`crate::isa::detect`], because a compile cache keyed on shape assumes the
-/// choice does not change under it.
+impl Pipeline {
+    /// What a tier compiles with when nothing says otherwise: selection where
+    /// the tier has a backend for it.
+    const fn of(isa: Isa) -> Self {
+        match isa {
+            Isa::Avx2 => Self::Selection,
+            Isa::Avx512 | Isa::Neon => Self::Legacy,
+        }
+    }
+}
+
+/// The pipeline this process compiles with: `PIXELFLOW_CODEGEN=legacy` or
+/// `selection`, else the tier's own ([`Pipeline::of`]). Read once at the first
+/// compile like [`crate::isa::detect`], because a compile cache keyed on shape
+/// assumes the choice does not change under it.
 ///
 /// # Panics
 /// On any other value, quoting it.
-fn pipeline() -> Pipeline {
+fn pipeline(isa: Isa) -> Pipeline {
     static PIPELINE: std::sync::OnceLock<Pipeline> = std::sync::OnceLock::new();
     *PIPELINE.get_or_init(|| {
         let Some(raw) = std::env::var_os(PIPELINE_VAR) else {
-            return Pipeline::Legacy;
+            return Pipeline::of(isa);
         };
         match raw.to_str().map(|name| name.trim().to_ascii_lowercase()) {
             Some(name) if name == "legacy" => Pipeline::Legacy,
@@ -6722,16 +6734,32 @@ mod tests {
                 }
             }
 
-            /// `subject` compiled for this target.
+            const fn isa(self) -> Isa {
+                match self {
+                    Self::Avx2 => Isa::Avx2,
+                    Self::Avx512 => Isa::Avx512,
+                    Self::Aarch64 => Isa::Neon,
+                }
+            }
+
+            /// `subject` compiled for this target, by the pipeline production
+            /// compiles it with ([`Pipeline::of`]): so reverting a tier's
+            /// default moves its column.
             fn compile(self, subject: Subject<'_>) -> CompileResult {
                 let lanes = self.lanes();
-                match self {
-                    Self::Avx2 => compile_on(avx2::driver::Avx2Backend::new(), lanes, subject),
-                    Self::Avx512 => {
+                match (self, Pipeline::of(self.isa())) {
+                    (Self::Avx2, Pipeline::Selection) => selected_on::<avx2::Avx2>(lanes, subject),
+                    (Self::Avx2, Pipeline::Legacy) => {
+                        compile_on(avx2::driver::Avx2Backend::new(), lanes, subject)
+                    }
+                    (Self::Avx512, Pipeline::Legacy) => {
                         compile_on(avx512::driver::Avx512Backend::new(), lanes, subject)
                     }
-                    Self::Aarch64 => {
+                    (Self::Aarch64, Pipeline::Legacy) => {
                         compile_on(aarch64::driver::Aarch64Backend::new(), lanes, subject)
+                    }
+                    (target, Pipeline::Selection) => {
+                        panic!("{target:?} has no selection backend to compile a row with")
                     }
                 }
             }
@@ -6743,6 +6771,20 @@ mod tests {
             arena: &'a ExprArena,
             root: ExprId,
             shape: LatticeShape,
+        }
+
+        /// `subject` legalized for `lanes` lanes and compiled by the selection
+        /// pipeline for `B`, which must be the width `lanes` says.
+        fn selected_on<B: IsaBackend>(lanes: u32, subject: Subject<'_>) -> CompileResult {
+            assert_eq!(
+                B::FILE.vector_bytes() / u64::from(BYTES_PER_LANE),
+                u64::from(lanes),
+                "the backend is not the width this test legalized for"
+            );
+            let Subject { arena, root, shape } = subject;
+            let schedule = schedule_for(arena, root, shape, lanes);
+            crate::emit::compile_on::<B>(&regalloc::ScopedSchedule::from_schedule(schedule))
+                .expect("a sibling-fold row compiles on every backend")
         }
 
         /// `subject` legalized for `lanes` lanes, scheduled, scoped and emitted
@@ -6772,7 +6814,8 @@ mod tests {
         type Bytes = (usize, u64);
 
         /// `rows::TABLE`'s bytes, per target in [`Target::ALL`]'s order (AVX2,
-        /// AVX-512, aarch64). A row's provenance is `git log -L` on it: a
+        /// AVX-512, aarch64), each from the pipeline production compiles that
+        /// target with. A row's provenance is `git log -L` on it: a
         /// hash written here would be the hash of the commit that wrote it,
         /// which no commit can know.
         ///
@@ -6783,57 +6826,57 @@ mod tests {
         /// fails, the failure prints the whole recomputed table.
         const GOLDEN: [[Bytes; 3]; 11] = [
             [
-                (724, 0x23fc2ea3c955d064),
+                (580, 0xcd22a56b8b260b1a),
                 (676, 0xb2ca1015afc4ecf7),
                 (400, 0x78f1164693fe0da6),
             ],
             [
-                (728, 0x4379d55663a9294e),
+                (568, 0x86d60c1545a26d56),
                 (664, 0xf22ace44c2fda4c8),
                 (400, 0xaa96d96596a05551),
             ],
             [
-                (1056, 0xf4f28a978e99b9ec),
+                (880, 0x3ebb4798982a8c6d),
                 (992, 0x66e9f1ebf718d0cd),
                 (608, 0x14a21aabd82fe2e8),
             ],
             [
-                (1056, 0x15c0a9e0e3472c74),
+                (896, 0x609dcba2dd47b291),
                 (1056, 0x662f9c26c2bbcafc),
                 (656, 0x0e7016ed19878723),
             ],
             [
-                (247328, 0x919cb6c0efe53a92),
+                (204768, 0x3bee772bb0d20234),
                 (278032, 0x282aa77769f9e2ff),
                 (188496, 0x578f9987a3386dcc),
             ],
             [
-                (3012, 0x90101b60330eb1ce),
+                (2292, 0x6f731e42104d8439),
                 (2932, 0x3943e837c9f115d3),
                 (2144, 0x92246f5ac70b7ef7),
             ],
             [
-                (1136, 0xb3294ca012954180),
+                (992, 0x99dfdad6d446b32d),
                 (1120, 0x2a5133484f338421),
                 (704, 0x435919f39c14241c),
             ],
             [
-                (932, 0xfa99679abc99f7b8),
+                (852, 0x2c228ca476b28b53),
                 (1108, 0x9bac855b3070b143),
                 (736, 0xe94f00f62e4f2b4e),
             ],
             [
-                (636, 0x140b048db98bf221),
+                (556, 0x8403cb1c517f09a5),
                 (700, 0x18187fcf1e57608f),
                 (432, 0xad9d34cf0f162be5),
             ],
             [
-                (500, 0xa8675d79b34a94d3),
+                (452, 0x737225ee0861c2c9),
                 (596, 0x261da02fa7c98009),
                 (480, 0x4adfc2b1aba3fa1f),
             ],
             [
-                (420428, 0x486f93190a3ec20d),
+                (356060, 0x3046d9022ee419bb),
                 (450476, 0x894da10795bcf548),
                 (605648, 0xff316d78ddef246a),
             ],

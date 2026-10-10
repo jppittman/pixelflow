@@ -15,6 +15,7 @@
 //! re-pins from the values the failure prints, after checking the glyphs'
 //! branches with the emitter's census and their bake throughput.
 
+use pixelflow_codegen::isa::Isa;
 use pixelflow_codegen::{fnv1a64, isa, jit_cache};
 use pixelflow_core::Kernel;
 use pixelflow_graphics::fonts::Font;
@@ -22,10 +23,10 @@ use pixelflow_ir::LatticeShape;
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
 
-/// One kernel's code on each tier, `(tier, bytes, fnv1a64)`. The selection
-/// pipeline (`PIXELFLOW_CODEGEN=selection`) is a tier of its own, `+selection`
-/// after the ISA's name: the same glyphs, other code. It has AVX2 alone so far,
-/// and a run on any other refuses to compile.
+/// One kernel's code on each tier, `(tier, bytes, fnv1a64)`. A tier is pinned
+/// under the pipeline it compiles with by default; the other, which
+/// `PIXELFLOW_CODEGEN` asks for, is a tier of its own, `+legacy` after the ISA's
+/// name: the same glyphs, other code.
 type TierPins = [(&'static str, usize, u64); 4];
 
 /// `(glyph, px, pins)`: each glyph's code per tier.
@@ -34,30 +35,30 @@ const PINS: [(char, u32, TierPins); 3] = [
         '@',
         16,
         [
-            ("avx2", 3012, 0x2a8c_6135_0420_6970),
+            ("avx2", 2836, 0x30fd_ab98_f7df_3b32),
             ("avx512", 3172, 0x2d16_3a20_0ca5_5eee),
             ("neon", 1904, 0x8b99_0dca_5fa6_15da),
-            ("avx2+selection", 2836, 0x30fd_ab98_f7df_3b32),
+            ("avx2+legacy", 3012, 0x2a8c_6135_0420_6970),
         ],
     ),
     (
         '8',
         32,
         [
-            ("avx2", 3008, 0x3c1c_4b85_1887_fa8a),
+            ("avx2", 2832, 0x9335_b8d3_4de6_2c38),
             ("avx512", 3172, 0x7939_6944_482a_feeb),
             ("neon", 1904, 0x113e_3102_6b9b_2b3e),
-            ("avx2+selection", 2832, 0x9335_b8d3_4de6_2c38),
+            ("avx2+legacy", 3008, 0x3c1c_4b85_1887_fa8a),
         ],
     ),
     (
         'O',
         32,
         [
-            ("avx2", 3012, 0x0d3a_e133_99a6_af0d),
+            ("avx2", 2836, 0x56b2_1cc7_6344_6fd3),
             ("avx512", 3172, 0xd675_74c3_f870_26e3),
             ("neon", 1888, 0xc973_f004_e574_5a98),
-            ("avx2+selection", 2836, 0x56b2_1cc7_6344_6fd3),
+            ("avx2+legacy", 3012, 0x0d3a_e133_99a6_af0d),
         ],
     ),
 ];
@@ -80,11 +81,16 @@ fn code_of(font: &Font<'_>, ch: char, px: u32) -> (usize, u64) {
 #[test]
 fn a_glyphs_code_is_pinned() {
     let font = Font::parse(FONT_DATA).expect("parse font");
-    let selection = std::env::var("PIXELFLOW_CODEGEN")
-        .is_ok_and(|name| name.trim().eq_ignore_ascii_case("selection"));
-    let tier = match selection {
-        true => format!("{}+selection", isa::detect().name()),
-        false => isa::detect().name().to_string(),
+    let host = isa::detect();
+    let default = match host {
+        Isa::Avx2 => "selection",
+        Isa::Avx512 | Isa::Neon => "legacy",
+    };
+    let tier = match std::env::var("PIXELFLOW_CODEGEN") {
+        Ok(knob) if !knob.trim().eq_ignore_ascii_case(default) => {
+            format!("{}+{}", host.name(), knob.trim().to_ascii_lowercase())
+        }
+        _ => host.name().to_string(),
     };
     let mut moved = Vec::new();
     for (ch, px, pins) in PINS {
