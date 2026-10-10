@@ -998,7 +998,6 @@ impl ExprArena {
     /// this file names an offset, which is why there is no `nodes_raw`/
     /// `nary_children_raw` pair here any more).
     #[inline]
-    #[must_use]
     pub fn nodes(&self) -> impl DoubleEndedIterator<Item = (ExprId, ExprNode)> + '_ {
         (0..self.builder.dag().len() as u32).map(move |i| {
             let id = ExprId(i);

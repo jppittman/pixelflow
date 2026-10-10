@@ -223,7 +223,6 @@ impl<T> Dag<T> {
     }
 
     /// Every node, children strictly before parents.
-    #[must_use]
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = Node<'_, T>> + '_ {
         (0..self.nodes.len() as u32).map(move |ix| Node { dag: self, ix })
     }
@@ -577,7 +576,6 @@ impl<T: Clone> Clone for Rooted<T> {
 
 impl<T> Rooted<T> {
     /// The nodes the builder was told to keep.
-    #[must_use]
     pub fn entries(&self) -> impl ExactSizeIterator<Item = Node<'_, T>> + '_ {
         self.entries
             .iter()
