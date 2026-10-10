@@ -1685,17 +1685,22 @@ Every commit in this phase is live in production.
 
 #### C2: AVX-512 selection, beside
 
-- **Files:** `avx512.rs`.
+- **Files:** `avx512.rs`; `x86_64.rs` (the general-register half both tiers select the same way is shared: the `X86` trait and `define`, `context`, `element_address`, `branch`, `jump`, `enter`, `ret` and the general-class copy, spill and reload, which `avx2.rs` now calls); `mod.rs` (the `(Avx512, Selection)` arms of `compile_native` and `GOLDEN`'s `Target::compile`); `select.rs` (the refusal below); `xtask/src/main.rs` and `rust.yaml` (the leg); the tests keyed by tier.
 - **Add:**
   - `type Lane` as in §0.1: comparisons are `vcmpps k`; `BitAnd`/`BitOr` of two `Opmask` lanes are `kandw`/`korw`; an `Opmask` lane read by an instruction with no `k` form is `vpmovm2d` first;
   - `Blend` as `vblendmps zmm{k}` on an `Opmask` condition, `vpternlogd 0xCA` on a `Vector` one;
-  - `Gather` through `KOnes`;
+  - `Gather` through `KOnes`, which is `kxnorw k, k0, k0`: `k0` is never written, so the mask waits on nothing, where `kxnorw k, k, k` would chain each gather behind the last (H8);
   - `branch` as `KorTest(k)` → `Jcc` on an `Opmask` condition, with `Ptestm` first on a `Vector` one;
   - the masked remainder store through `MovImm32` → `Kmovw`;
-  - a pin that a zmm slot at offset 64 encodes `disp32 = 0x40` (EVEX `disp8` scaling).
-  - the `Tied` arm of `Scan::place` takes `write_plain`'s steal: a tied write whose tied read is a carried parameter that is read no more takes the parameter's lease and its `carried_until`, where it copies the parameter now and the latch moves the value back (two moves a trip). AVX2's loop path never reaches it (the step and the combine are plain VEX writes); `Tie` operands on AVX-512 and NEON do.
-- **`GOLDEN_SELECTED[avx512]`.** The `isa-matrix` step adds `PIXELFLOW_ISA=avx512` V.
-- **Gate:** G plus the steps.
+  - `Neg` and `Abs` build their mask from `Ones` and a shift (`0x8000_0000` is `-1 << 31`, `0x7FFF_FFFF` is `-1 >> 1`) instead of reading the pool, so a loop does not read memory for it every trip;
+  - `copy`, `spill` and `reload` of an `Opmask` value: `kmovw`, to and from the frame.
+- **Deviation from the plan as first written:**
+  - *The `disp32` pin.* A spill is `disp32` by construction (`Imm32`, never EVEX's scaled `disp8`), so the byte pin is the values of `tests/register_pressure.rs`, whose kernels spill zmm slots at offsets past 64 and read them back; a scaled displacement would read another slot. The predicate kernel added there spills `Opmask` values.
+  - *The `Tied` steal in `Scan::place` is not built.* It is reached by a tied write that a backward branch passes to a carried parameter. Every latch argument on every tier is a plain write (the step and the combine), and a probe over the codegen, core and graphics suites at both tiers found no tied write that a parameter wants. Code nothing reaches cannot be tested through the public API (§0.6); the first backend whose accumulate is tied builds it.
+  - *`set_gather_mask` stays* until D1: the legacy driver still sets its gather mask that way. The selected gather no longer does.
+  - *A guarded `If` whose arm is a bare comparison is refused by name* under the knob (`select.rs`'s `guarded_if`): the join's parameter takes one class, and the arm's lane is in the other file. §0.1 has no conversion to make them one. C3 may not switch production until this is settled.
+- **`GOLDEN_SELECTED[avx512]`** is `tests/golden_selected.rs`'s second table. The `isa-matrix` job's `avx512f+dq, selection` leg runs V under `PIXELFLOW_CODEGEN=selection PIXELFLOW_ISA=avx512` where the runner has AVX-512.
+- **Gate:** G Q K5 L.
 
 #### C3: AVX-512 runs the selection pipeline
 

@@ -2,9 +2,8 @@
 //!
 //! `GOLDEN_SELECTED` is `emit::tests::sibling_folds`'s `GOLDEN` for the new
 //! pipeline: the length and FNV-1a 64 digest of what each of `rows::TABLE`'s
-//! kernels compiles to. It is born with AVX2, the one tier the pipeline has a
-//! backend for (and compiles with), and gains AVX-512 and NEON as they get
-//! theirs. It obeys the same rule from birth:
+//! kernels compiles to. It is born with AVX2, and gains AVX-512 and NEON as they
+//! get a backend. It obeys the same rule from birth:
 //!
 //! **A refactor does not edit this table; an intentional byte change does, in
 //! a commit of its own that says why.** A commit that edits it beside other
@@ -15,8 +14,9 @@
 //! Unlike `GOLDEN`, which emits all three targets from any host through the
 //! crate's own entry points, this reaches the pipeline through `compile`, so it
 //! is the host's tier and the process's knob: it does nothing unless run on the
-//! selection pipeline at `PIXELFLOW_ISA=avx2`, where it is the default. The
-//! `isa-matrix` job does. `GOLDEN`'s AVX2 column pins the same code.
+//! selection pipeline, at a tier with a table below. The `isa-matrix` job does.
+//! `GOLDEN`'s columns pin the same code for the tiers whose default is
+//! selection.
 
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
@@ -30,6 +30,10 @@ mod rows {
 include!("support/knob.rs");
 
 const BYTES_PER_LANE: usize = 4;
+
+/// The vector widths of the tiers the tables are for.
+const AVX2_VECTOR_BYTES: usize = 32;
+const AVX512_VECTOR_BYTES: usize = 64;
 
 /// A row's emitted code: its length in bytes and the FNV-1a 64 digest of those
 /// bytes.
@@ -51,15 +55,35 @@ const GOLDEN_SELECTED_AVX2: [Bytes; 11] = [
     (356060, 0x3046d9022ee419bb),
 ];
 
+/// The same, on AVX-512.
+const GOLDEN_SELECTED_AVX512: [Bytes; 11] = [
+    (512, 0xabb746a4fdea20ab),
+    (516, 0xf62e0615af4611a3),
+    (780, 0xb1440de7d447321b),
+    (864, 0xdeca0265eef3cc0e),
+    (231856, 0x294d1e93336fc580),
+    (2224, 0x284d1cf632c0dd2b),
+    (984, 0x3f1775672612760b),
+    (852, 0x485e5615c1be05cb),
+    (556, 0xef8b747d224acea3),
+    (484, 0xe5056286f1efe99d),
+    (401036, 0x3cdee506439ac2b6),
+];
+
 #[test]
 fn the_sibling_fold_rows_emit_the_recorded_bytes_through_selection() {
+    let pins = match jit_vector_bytes() {
+        AVX2_VECTOR_BYTES => GOLDEN_SELECTED_AVX2,
+        AVX512_VECTOR_BYTES => GOLDEN_SELECTED_AVX512,
+        _ => return,
+    };
     if !selection() {
         return;
     }
     let lanes = (jit_vector_bytes() / BYTES_PER_LANE) as u32;
     let mut recomputed = Vec::new();
     let mut moved = Vec::new();
-    for (row, pin) in rows::TABLE.iter().zip(GOLDEN_SELECTED_AVX2) {
+    for (row, pin) in rows::TABLE.iter().zip(pins) {
         let (arena, root) = (row.build)();
         let shape = LatticeShape::new([row.width.columns(lanes), rows::ROWS]);
         let result = compile(&arena, root, shape).expect("a sibling-fold row compiles");
@@ -75,7 +99,7 @@ fn the_sibling_fold_rows_emit_the_recorded_bytes_through_selection() {
     }
     assert!(
         moved.is_empty(),
-        "emitted bytes moved from GOLDEN_SELECTED_AVX2:\n{}\n\n\
+        "emitted bytes moved from GOLDEN_SELECTED:\n{}\n\n\
          if the change is intentional, re-baseline it in its own commit with:\n{}",
         moved.join("\n"),
         recomputed.join("\n")

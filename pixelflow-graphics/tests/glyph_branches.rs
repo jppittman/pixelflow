@@ -25,9 +25,9 @@ const FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf")
 
 /// One kernel's code on each tier, `(tier, bytes, fnv1a64)`. A tier is pinned
 /// under the pipeline it compiles with by default; the other, which
-/// `PIXELFLOW_CODEGEN` asks for, is a tier of its own, `+legacy` after the ISA's
-/// name: the same glyphs, other code.
-type TierPins = [(&'static str, usize, u64); 4];
+/// `PIXELFLOW_CODEGEN` asks for, is a tier of its own, `+legacy` or `+selection`
+/// after the ISA's name: the same glyphs, other code.
+type TierPins = [(&'static str, usize, u64); 5];
 
 /// `(glyph, px, pins)`: each glyph's code per tier.
 const PINS: [(char, u32, TierPins); 3] = [
@@ -38,6 +38,7 @@ const PINS: [(char, u32, TierPins); 3] = [
             ("avx2", 2836, 0x30fd_ab98_f7df_3b32),
             ("avx512", 3172, 0x2d16_3a20_0ca5_5eee),
             ("neon", 1904, 0x8b99_0dca_5fa6_15da),
+            ("avx512+selection", 2604, 0x1b972673dfb044fd),
             ("avx2+legacy", 3012, 0x2a8c_6135_0420_6970),
         ],
     ),
@@ -48,6 +49,7 @@ const PINS: [(char, u32, TierPins); 3] = [
             ("avx2", 2832, 0x9335_b8d3_4de6_2c38),
             ("avx512", 3172, 0x7939_6944_482a_feeb),
             ("neon", 1904, 0x113e_3102_6b9b_2b3e),
+            ("avx512+selection", 2604, 0x926e25e2bfb82e00),
             ("avx2+legacy", 3008, 0x3c1c_4b85_1887_fa8a),
         ],
     ),
@@ -58,6 +60,7 @@ const PINS: [(char, u32, TierPins); 3] = [
             ("avx2", 2836, 0x56b2_1cc7_6344_6fd3),
             ("avx512", 3172, 0xd675_74c3_f870_26e3),
             ("neon", 1888, 0xc973_f004_e574_5a98),
+            ("avx512+selection", 2604, 0x205a2b4475ff1274),
             ("avx2+legacy", 3012, 0x0d3a_e133_99a6_af0d),
         ],
     ),
