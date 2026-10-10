@@ -37,6 +37,9 @@ pub(super) enum ReadHere {
 /// Whether giving up a value's register costs a store, cheapest first.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(super) enum Store {
+    /// The value is defined again where it is read: its definition is
+    /// rematerializable, so it has no slot and never will.
+    Never,
     /// The slot already holds the value.
     NotNeeded,
     /// The register holds the only copy.
@@ -46,8 +49,8 @@ pub(super) enum Store {
 /// What giving up a register costs, cheapest first — the order eviction picks
 /// its loser in.
 ///
-/// A value whose slot already holds it needs no store; anything else has to be
-/// written out. Belady's distance breaks ties *within* a tier and only within
+/// A value defined again where it is read needs no store, nor does one whose
+/// slot already holds it; anything else has to be written out. Belady's distance breaks ties *within* a tier and only within
 /// one: the traffic an eviction causes outweighs how long it waits to cause it.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct EvictionRank {
@@ -64,8 +67,8 @@ pub(super) struct EvictionRank {
     /// (`next_read(operand, i + 1)`), so by the time the destination is
     /// contested a just-kept operand would read as "not needed now".
     read_here: ReadHere,
-    /// Whether losing the register costs a store: not once the slot holds
-    /// the value, which for a constant is from birth.
+    /// Whether losing the register costs a store: not for a value defined
+    /// again where it is read, nor once the slot holds it.
     store: Store,
     /// Nearest next read *last*, so the cheapest loser is the one used
     /// farthest out.

@@ -973,12 +973,13 @@ pub(in crate::emit) trait IsaBackend: Sized + 'static {
     /// `SlotAddr` into a fresh `Pointer`, then the store through it.
     fn spill<C: Spill>(b: &mut Spiller<'_, Self>, src: Value<C>, slot: &FrameSlot);
     fn reload<C: Spill>(b: &mut Spiller<'_, Self>, slot: &FrameSlot) -> Value<C>;
-    /// Whether the allocator may recompute this instruction's definition
-    /// instead of storing it. It must read no value that is not itself
-    /// rematerializable, have no effect, and write no `Flags`:
-    /// - pool loads;
+    /// Whether the allocator may place this instruction again where a read
+    /// needs its definition, instead of storing it. It must have no effect and
+    /// one operand: the register it writes, of any class but `Flags`. The
+    /// allocator asserts that, and B7 does not place an instruction that reads
+    /// (C4 teaches it, for a pool load through the base register `p`):
+    /// - pool loads addressed by a label;
     /// - `movi`/`fmov` immediates;
-    /// - `adrp+add` of a label;
     /// - the zero and all-ones idioms.
     fn rematerializable(inst: &Self::Inst<Selected>) -> bool;
 
@@ -1103,8 +1104,8 @@ pub(in crate::emit) struct Allocated<'m, B: IsaBackend> {
 pub(in crate::emit) struct Emitted<'m, B: IsaBackend> { pub inst: B::Inst<Bound<'m, B>>, pub origin: Origin }
 /// Why an instruction is there. `EmitTraffic` counts these per scope and
 /// weights them by trips. B4 has `Selected`, `Spill` and `Reload`; P7 adds
-/// `Remat`, which marks a selected `rematerializable` instruction so that the
-/// remats are true under the knob, B5 adds `Copy`, and B7 inserts `Remat`s.
+/// `Remat`, B5 adds `Copy`, and B7 places `Remat`s: a `rematerializable`
+/// instruction is placed again where a read needs it, and not where selected.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(in crate::emit) enum Origin { Selected, Spill, Reload, Remat, Copy }
 ```
@@ -1176,7 +1177,7 @@ fn compile_on<B: IsaBackend>(scoped: &ScopedSchedule) -> Result<CompileResult, C
 | A `Pending` parameter's class | Parameter lists are data | `B::param_lane`'s `ValueName::typed` panics |
 | Exclusivity inside the allocated program: an `Early`'s register is none of its instruction's reads | The allocated program holds shared borrows, by design (§2.2) | The scan's lease state, plus an assertion at binding |
 | No `Flags` live across a flags write or at a label | Liveness is a function property | The allocator panics. Spilling flags is a type error (`Spill`) |
-| A rematerialized instruction writes no `Flags` | A cloning walk must mint any class | The allocator asserts it at remat |
+| A rematerialized instruction writes no `Flags` | A placement of it elsewhere must not clobber them | The allocator asserts it when it keeps the instruction |
 | A `program::ValueId`'s class at the boundary | `ValueId` is untyped by design (`scripts/check-emit-boundary.sh`) | One check, in `select.rs`'s `Bindings` |
 | Tokens from two pools of one backend mixed | A generative brand costs more than it buys: both pools encode the same numbers, and `allocate` takes one | — |
 | The relaxed dominance across a uniform guard | A correlated branch is not in the CFG | Interval liveness and join invariant 2; documented on `Function` |
@@ -1632,10 +1633,14 @@ Every commit in this phase is live in production.
 
 - **Files:** `emit/regalloc/local.rs`, `avx2.rs` (`rematerializable`, real since P7 for `LoadConst`, `Zero` and `Ones`).
 - **Change:**
-  - A rematerializable definition is placed only before a read that needs it in a register, by re-emitting it with a fresh `Def` (`Origin::Remat`). One nobody reads is never placed.
-  - Its eviction is free, the remat tier of `EvictionRank`.
-- **Check:** the `parked_roots_w37` row, which B6 left about 1% above legacy in bytes and memory operations (nine pinned registers over one long straight-line fold body); remat of carried constants frees pinned registers and should bring it back below.
-- **Gate:** K(avx2) as in B4, plus `constants_are_rematerialized_rather_than_spilled` and `belady_evicts_the_value_used_farthest_out` rewritten against compiled kernels' `traffic`.
+  - A rematerializable definition is not placed where it is selected. The scan keeps it (`Scan::remats`, by the value it defines), and a read that finds the value in no register places it again before that read (`Origin::Remat`). One nobody reads is never placed.
+    - It is the same selected instruction placed twice, so the scan keeps its instructions in one list and a record names one by index. No cloning walk and no fresh `Def` are needed: the value keeps its id and takes a new register, as a reload does.
+    - It has no slot and no store. `store_at_definition` skips it, so a loop head's flush and an eviction drop it for nothing.
+    - Its eviction is the cheapest tier of `EvictionRank` (`Store::Never`), below a value whose slot already holds it.
+    - The allocator asserts that the instruction defines one value, reads none, and does not define `Flags`.
+- **Check:** the `parked_roots_w37` row, which B6 left about 1% above legacy in bytes and memory operations (nine pinned registers over one long straight-line fold body). It is below legacy in both now (bytes 249,664 to 204,768 against legacy's 247,328; loads plus stores 212,099 to 112,090 against 209,915), because a constant is no longer stored and reloaded. The loads that remain are remats, which legacy folds into memory operands and does not count.
+  - Remat of a carried constant instead of carrying it was tried and measured: it shrinks the glyph row's code (768 bytes against 880) but nearly doubles its trip-weighted traffic (634 against 340), since the hot scope then redefines each constant every trip. Carrying stays priced as in B6.
+- **Gate:** K(avx2) as in B4, plus `constants_are_rematerialized_rather_than_spilled` in `tests/residency.rs`, against a compiled kernel's `traffic`. B5's `the_value_read_farthest_out_is_the_one_given_up` there is sized from `traffic.pool`, and replaces the in-file `belady_evicts_the_value_used_farthest_out`, which is deleted. Both run under either pipeline.
 
 #### B8: AVX2 memory operations
 
@@ -1698,6 +1703,7 @@ Every commit in this phase is live in production.
 - **Files:** `aarch64.rs`, `aarch64/table.rs`, `.github/workflows/rust.yaml` (a macOS step running V with the knob).
 - **Add:**
   - `enter` defines the pool base `p = AdrpAdd(pool section)`, rematerializable.
+  - `Scan::defer` and the remat placement place a rematerializable instruction's reads first (B7 asserts there are none): `ldr q, [p, #offset]` reads the rematerializable `p`.
   - Constants: `movi`, `fmov`, or `ldr q, [p, #offset]`. `POOL_REACH = 4096`; past it, `BudgetExceeded`.
   - `Uniform` and `Context` with the address arithmetic of H6.
   - The gather as `UmovW`/`LdrS`/`InsFirst`/`InsLane`.

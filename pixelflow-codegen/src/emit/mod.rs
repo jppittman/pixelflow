@@ -993,11 +993,13 @@ trait IsaBackend: Sized + 'static {
     fn spill<C: Spill>(b: &mut build::Spiller<'_, Self>, src: Value<C>, slot: &FrameSlot);
     fn reload<C: Spill>(b: &mut build::Spiller<'_, Self>, slot: &FrameSlot) -> Value<C>;
 
-    /// Whether the allocator may recompute this instruction's definition
-    /// instead of storing it. It must read no value that is not itself
-    /// rematerializable, have no effect, and write no `Flags`: pool loads,
-    /// `movi`/`fmov` immediates, `adrp+add` of a label, the zero and all-ones
-    /// idioms.
+    /// Whether the allocator may place this instruction again where a read
+    /// needs its definition, instead of storing it. It must have no effect and
+    /// one operand: the register it writes, of any class but `Flags`. The
+    /// allocator asserts that, and does not yet place an instruction that
+    /// reads (a pool load through aarch64's base register is C4's to teach it):
+    /// pool loads addressed by a label, `movi`/`fmov` immediates, the zero and
+    /// all-ones idioms.
     fn rematerializable(inst: &Self::Inst<Selected>) -> bool;
 
     /// Rebuild `inst` at stage `T`, visiting each operand once, in field
