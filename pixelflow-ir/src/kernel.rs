@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arena::{
-    Axis, BufferDecl, BufferIdentity, ExprArena, ExprId, ExprNode, IndexSpaceFull, UniformDecl,
+    Axis, BufferDecl, BufferIdentity, ExprArena, ExprId, IndexSpaceFull, UniformDecl,
     UniformIdentity,
 };
 use crate::dag::{Builder, Dag, Node, Rooted};
@@ -1095,13 +1095,13 @@ impl ExprArena {
     }
 
     /// `argument` applied at `(u, v)`, nodes of this arena: its term
-    /// spliced in with `X := u` and `Y := v` — see this block's doc for what
-    /// that denotes.
+    /// spliced in and [`warp`](Self::warp)ed to `(u, v)` — see this block's
+    /// doc for what that denotes. Application is contramap, and this is the
+    /// same contramap `kernel!`'s `.at` lowers to, not a second copy of it.
     ///
-    /// At `(X, Y)` the substitution is the identity, and there is nothing to
-    /// substitute: the term is spliced as it stands, a [`Ref`] in it left a
-    /// name. Under a real warp a name is expanded first, as [`Kernel::at`]
-    /// expands one, because a substitution cannot reach through it.
+    /// At `(X, Y)` the warp is the identity: the term is spliced as it
+    /// stands, a [`Ref`] in it left a name. Under a real warp a name is
+    /// expanded first, because a substitution cannot reach through it.
     ///
     /// # Panics
     ///
@@ -1113,7 +1113,7 @@ impl ExprArena {
     /// reads off its parameters (D-a and O3 of
     /// docs/plans/2026-09-25-the-language-is-kernel.md).
     ///
-    /// [`Ref`]: ExprNode::Ref
+    /// [`Ref`]: crate::arena::ExprNode::Ref
     pub fn apply(&mut self, argument: &Argument<'_>, [u, v]: [ExprId; 2]) -> ExprId {
         let Argument(kernel) = *argument;
         let declared = |decl: &UniformDecl| self.uniforms().iter().any(|d| d.id == decl.id);
@@ -1123,15 +1123,9 @@ impl ExprArena {
              uniforms would be declared in the order this application reads them, not \
              its own (D-a of docs/plans/2026-09-25-the-language-is-kernel.md)",
         );
-        let at_the_sample = self.node(u) == ExprNode::Var(Axis::X.var())
-            && self.node(v) == ExprNode::Var(Axis::Y.var());
-        if at_the_sample {
-            let (arena, root) = kernel.parts();
-            return self.splice(arena, root);
-        }
-        let (linked, root) = kernel.linked_parts();
-        let spliced = self.splice(&linked, root);
-        self.substitute_vars_with(spliced, &[(Axis::X.var(), u), (Axis::Y.var(), v)])
+        let (arena, root) = kernel.parts();
+        let spliced = self.splice(arena, root);
+        self.warp(spliced, [u, v])
     }
 }
 

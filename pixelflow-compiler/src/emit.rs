@@ -820,6 +820,10 @@ impl Site for Staged {
     fn apply(&mut self, kernel: &Ident, [x, y]: [Ident; 2]) -> Ident {
         self.step(quote!(__arena.apply(&#kernel, [#x, #y])))
     }
+
+    fn warp(&mut self, field: Ident, [x, y]: [Ident; 2]) -> Ident {
+        self.step(quote!(__arena.warp(#field, [#x, #y])))
+    }
 }
 
 /// The path naming `kind` in generated code.

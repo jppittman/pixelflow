@@ -40,6 +40,18 @@
     §1.7). The families are superseded (B3) and deleted
     (`refactor(compiler): kernel! has no collection types`). What the documents do not settle is listed as open,
     not decided (§4, O1–O4).
+- **`.at` is back, as first-class contramap** (2026-10-06; D5 overturned).
+  JP: *"I want first class contramap support."* D5 answered `.at` with
+  helper application, which is contramap on *functions*: a helper written
+  over its coordinates, or a kernel-typed parameter. It is not contramap on
+  *fields*. Every expression is already a field, and a field bound to a
+  name — a `let`, a helper's parameter, a kernel's application — could not
+  be observed anywhere but the sample without being rewritten as a function
+  first. `f.at(x, y)` is that observation, for any `f32` or `bool`, and
+  lowers to `ExprArena::warp`, the one arena-level definition a kernel's
+  application goes through too. §1.2's rule is unchanged — `X` and `Y`
+  appear only in entries — because `.at` reads neither: it rebinds them in
+  its receiver. Pinned in `pixelflow-compiler/tests/at_is_contramap.rs`.
 - **Integrals deleted** (2026-09-29). JP: *"just do b. delete all the
   integral stuff. other languages don't try this. probably for good
   reason."* The language has no integral: §1.5's `integral`, `area` and
@@ -164,9 +176,18 @@ A `pub fn` is an **entry**: the macro emits a host function for it. A private
 sugar for a block with one entry.
 
 - **`X` and `Y` appear only in entries. Helpers take coordinates as
-  arguments.** Application is contramap: `f(X + 0.5, Y + 0.5)` is today's
-  `.at(X + ½, Y + ½)`. There is no `.at` method. A helper therefore cannot
-  read an unshifted `X` by accident.
+  arguments.** Application is contramap: `f(X + 0.5, Y + 0.5)` is `f` at
+  `(X + ½, Y + ½)`. A helper therefore cannot read an unshifted `X` by
+  accident.
+- **Every expression is a field, and `.at` observes one elsewhere.**
+  `d.at(x, y)` is the field `d` at `(x, y)` — contramap on a *value*, where
+  application is contramap on a function: `let d = …; d.at(X + 1.0, Y) - d`
+  is the neighbour's difference without rewriting `d` as a helper. It keeps
+  its receiver's type (a mask stays a mask), and reads no coordinate of its
+  own, so it is allowed in a helper as in an entry. A derivative observed
+  elsewhere is the derivative of the warped field, the chain rule, as
+  `Kernel::at` has it; under a translation that is the pointwise reading
+  too (D5, overturned 2026-10-06).
 - **Recursion, loops with state, `mut` and assignment are refused.** The
   language is a DAG with bounded folds.
 
@@ -644,7 +665,7 @@ The evidence and JP's rulings settle these. JP can overturn any.
 | D2 | what the macro compiles | the JIT template always; declared instances optimized at expansion (Phase E); `macro_tier`, `Templates`, `ENode::Param` and `kernel_raw!` deleted (one-pipeline M1–M5) |
 | D3 | tables and arrays | **none** (JP: no tables; 2026-10-01, no arrays). No collection type: data enters as scalar uniforms, a count is how many instances the host composed, and choice is `if` (§1.3, §1.6) |
 | D4 | binders | `usize` in sema; slots inside-out; a kernel-typed argument's binders are renamed away from those live at its hole |
-| D5 | `.at` | application is contramap (§1.2) |
+| D5 | `.at` | ~~application is contramap (§1.2)~~ **Overturned 2026-10-06** (JP: first-class contramap). Application is contramap on a function; `f.at(x, y)` is contramap on a field, any `f32` or `bool`, through `ExprArena::warp` (§1.2) |
 | D6 | functions across blocks or crates | inlined within a block; across blocks only as kernel-typed arguments at runtime (D-a, done). A proc macro sees only its own tokens |
 | D7 | records and tuples | flattened in the front end; record returns (`-> Rgba`) with one `if` on the packed word, as `packed.rs` relies on (Phase D) |
 | D8 | masks and bits | types in sema only |

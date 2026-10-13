@@ -166,8 +166,9 @@
 //! `usize` name; an integer an `f32` does not hold exactly where a value is
 //! expected; a `const` whose initializer is not a `cexpr` or an `iexpr`; a
 //! negated `usize`; a range whose bounds are not constant or that runs
-//! backwards; `.at()`,
-//! `.constant()`, `.collapse()`; a block with no final expression; an
+//! backwards;
+//! `.constant()`, `.collapse()`; `.at` of a count, a kernel or a record, or at
+//! anything but two `f32`s; a block with no final expression; an
 //! `Args` record's name taken twice; a function type spelled any way but
 //! `impl Fn(f32, f32) -> f32`; a kernel used as anything but applied, with
 //! two `f32`s, or passed by name to a helper's kernel-typed parameter — in

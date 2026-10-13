@@ -1630,10 +1630,52 @@ impl ExprArena {
         Binder::all().find(|binder| !bound[usize::from(binder.slot())])
     }
 
+    /// The field at `root` observed at `(u, v)`: contramap,
+    /// `⟦warp(f, u, v)⟧(x, y) = ⟦f⟧(⟦u⟧(x, y), ⟦v⟧(x, y))`. `u` and `v` are
+    /// fields of the outer coordinates, nodes of this arena, and the two
+    /// substitutions are simultaneous: `(X − Y)` at `(Y, X)` is `Y − X`.
+    ///
+    /// The one arena-level definition. `kernel!`'s `.at` lowers to it at
+    /// both of its sites, and a kernel-typed argument's application is a
+    /// splice and then this ([`ExprArena::apply`]); `Kernel::at` is the same
+    /// substitution over a `Kernel`'s DAG, and `kernel!`'s tests pin the two
+    /// to one program.
+    ///
+    /// **A derivative is of the warped field.** `Dwrt` is left for the
+    /// runtime tier to resolve, so the substitution reaches its operand:
+    /// `DX(f)` at `(u, v)` is `∂/∂X (f ∘ (u, v))`, the chain rule, not
+    /// `(∂f/∂X) ∘ (u, v)`. That is deliberate — it is what keeps a glyph's
+    /// antialiasing ramp one *screen* pixel wide at any scale — and the two
+    /// readings agree wherever the warp is a translation, its Jacobian being
+    /// the identity (`pixelflow-compiler/tests/derivative_under_warp.rs`).
+    ///
+    /// **Fold binders are not substituted, and cannot be captured.** Only
+    /// the coordinate axes are rewritten. A binder free in `u` or `v` is a
+    /// fold's placeholder while that fold's body is built, outside every
+    /// slot an inner fold of `f` can hold, and the slot it is renamed to on
+    /// closing is the lowest one nothing in the body binds — `f`'s folds
+    /// included ([`ExprArena::close_over`]).
+    ///
+    /// **A name is expanded first.** A substitution cannot reach through a
+    /// [`ExprNode::Ref`] — it has no `Var` to rewrite here, only a key — so
+    /// left in place it would sample its referent at the *outer*
+    /// coordinates: plausible pixels, wrong ones. At `(X, Y)` there is
+    /// nothing to substitute and `root` is returned as it stands, a name
+    /// still a name and still its own optimization unit.
+    pub fn warp(&mut self, root: ExprId, [u, v]: [ExprId; 2]) -> ExprId {
+        let at_the_sample = self.node(u) == ExprNode::Var(Axis::X.var())
+            && self.node(v) == ExprNode::Var(Axis::Y.var());
+        if at_the_sample {
+            return root;
+        }
+        let linked = crate::passes::expand_refs(self, root);
+        self.substitute_vars_with(linked, &[(Axis::X.var(), u), (Axis::Y.var(), v)])
+    }
+
     /// Rebuild the subgraph at `root`, replacing every `Var(i)` for which
     /// `subs` has an entry with the given (already existing) node — the
-    /// generic contramap: a coordinate warp substitutes `Var(0..4)` with
-    /// coordinate expressions, which is what `Kernel::at` is built from.
+    /// generic substitution [`warp`](Self::warp) is built on, which is what
+    /// `Kernel::at` is built from.
     ///
     /// Entries must reference nodes already in this arena (e.g. from
     /// [`ExprArena::splice`]). Unlisted variables are preserved. Returns the
