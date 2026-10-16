@@ -1650,6 +1650,15 @@ mod tests {
     }
 
     #[test]
+    fn it_should_add_a_newline_for_a_line_whose_start_is_past_the_grid_width() {
+        let mut screen = create_test_screen(5, 3);
+        set_char(&mut screen, 1, 0, 'a');
+        screen.start_selection(Point { x: 10, y: 0 }, SelectionMode::Cell);
+        screen.update_selection(Point { x: 0, y: 1 });
+        assert_eq!(screen.get_selected_text(), Some("\na".to_string()));
+    }
+
+    #[test]
     fn get_selected_text_pads_columns_beyond_the_grid_width_in_block_mode() {
         let mut screen = create_test_screen(3, 2);
         set_char(&mut screen, 0, 0, 'a');
@@ -2416,6 +2425,26 @@ mod tests {
             }),
         );
         assert_eq!(screen.dirty, vec![0; 3]);
+    }
+
+    #[test]
+    fn it_should_not_panic_when_write_ascii_overwrites_a_wide_primary_at_the_last_column() {
+        // A `WidePrimary` can't legitimately reach the last column (its spacer
+        // would have nowhere to go), but `set_glyph` doesn't enforce that
+        // invariant, so `write_ascii` must not assume the cell past its
+        // written range exists just because the overwritten cell was wide.
+        let mut screen = create_test_screen(4, 2);
+        screen.set_glyph(
+            3,
+            0,
+            Glyph::WidePrimary(ContentCell {
+                c: '你',
+                attr: Attributes::default(),
+                combining: None,
+            }),
+        );
+        screen.write_ascii(3, 0, "z", Attributes::default());
+        assert_eq!(line_text(&screen, 0).chars().nth(3), Some('z'));
     }
 
     // --- tab stops ---
