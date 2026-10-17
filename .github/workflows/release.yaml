@@ -1,0 +1,184 @@
+name: Release
+
+# Pushing a version tag (e.g. v0.2.0) builds, signs, notarizes, and publishes
+# a DMG to a GitHub Release. Nothing else triggers this -- ordinary pushes and
+# PRs only run the presubmit checks in rust.yaml.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write # to create the GitHub Release and upload the DMG
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-sign-release:
+    name: Build, sign, notarize, and publish
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Derive release version from tag
+        id: version
+        run: |
+          # GITHUB_REF_NAME is the tag itself for a tag push (e.g. v0.2.0).
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      # Imports the Developer ID Application certificate into a throwaway
+      # keychain scoped to this job. The keychain password is generated here,
+      # not stored as a secret: it only needs to exist for this run, on this
+      # ephemeral runner, and is discarded (along with the keychain) in the
+      # cleanup step at the end regardless of how the job finishes.
+      - name: Import signing certificate
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+
+          echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode -o "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -A \
+            -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          # Without this, codesign prompts (and hangs, since nothing on a CI
+          # runner can answer) for permission to use the imported key.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed 's/"//g')
+
+          rm -f "$CERT_PATH"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Build and bundle CoreTerm.app
+        run: cargo run -p xtask --release -- bundle
+
+      # `codesign --sign` wants the identity's name or hash, not the .p12
+      # password -- looked up here instead of stored as another secret, since
+      # it's derivable from the certificate that's already imported.
+      - name: Find signing identity
+        id: identity
+        run: |
+          set -euo pipefail
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | grep 'Developer ID Application' | head -n1 | sed -E 's/^[[:space:]]*[0-9]+\) ([0-9A-F]+) .*/\1/')"
+          if [[ -z "$IDENTITY" ]]; then
+            echo "::error::No 'Developer ID Application' identity found in the imported certificate" >&2
+            exit 1
+          fi
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+
+      - name: Codesign CoreTerm.app
+        run: |
+          set -euo pipefail
+          codesign --force --deep --timestamp --options runtime \
+            --entitlements assets/entitlements.plist \
+            --sign "${{ steps.identity.outputs.identity }}" \
+            CoreTerm.app
+          codesign --verify --deep --strict --verbose=2 CoreTerm.app
+
+      - name: Build DMG
+        run: bash scripts/make-dmg.sh CoreTerm.app CoreTerm.dmg
+
+      - name: Codesign DMG
+        run: |
+          codesign --force --timestamp \
+            --sign "${{ steps.identity.outputs.identity }}" \
+            CoreTerm.dmg
+
+      # `--wait` blocks until Apple's notary service finishes (usually a few
+      # minutes). On failure, notarytool's own summary rarely has enough
+      # detail, so the next step fetches the full log using the submission id
+      # this step captures.
+      - name: Notarize DMG
+        id: notarize
+        env:
+          AC_API_KEY_P8_BASE64: ${{ secrets.AC_API_KEY_P8_BASE64 }}
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          echo "$AC_API_KEY_P8_BASE64" | base64 --decode -o "$API_KEY_PATH"
+
+          set +e
+          xcrun notarytool submit CoreTerm.dmg \
+            --key "$API_KEY_PATH" \
+            --key-id "$AC_API_KEY_ID" \
+            --issuer "$AC_API_ISSUER_ID" \
+            --wait \
+            | tee "$RUNNER_TEMP/notarize.log"
+          status=$?
+          set -e
+
+          rm -f "$API_KEY_PATH"
+          submission_id="$(grep -oE 'id: [0-9a-f-]+' "$RUNNER_TEMP/notarize.log" | head -n1 | awk '{print $2}')"
+          echo "submission_id=$submission_id" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Fetch notarization log (only runs if notarization failed)
+        if: failure() && steps.notarize.outputs.submission_id != ''
+        env:
+          AC_API_KEY_P8_BASE64: ${{ secrets.AC_API_KEY_P8_BASE64 }}
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          API_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          echo "$AC_API_KEY_P8_BASE64" | base64 --decode -o "$API_KEY_PATH"
+          xcrun notarytool log "${{ steps.notarize.outputs.submission_id }}" \
+            --key "$API_KEY_PATH" \
+            --key-id "$AC_API_KEY_ID" \
+            --issuer "$AC_API_ISSUER_ID"
+          rm -f "$API_KEY_PATH"
+
+      - name: Staple notarization ticket
+        run: xcrun stapler staple CoreTerm.dmg
+
+      - name: Verify Gatekeeper acceptance
+        run: spctl --assess --type open --context context:primary-signature -v CoreTerm.dmg
+
+      - name: Rename DMG with version
+        run: mv CoreTerm.dmg "CoreTerm-${{ steps.version.outputs.version }}.dmg"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            "CoreTerm-${{ steps.version.outputs.version }}.dmg" \
+            --title "CoreTerm ${{ steps.version.outputs.tag }}" \
+            --generate-notes
+
+      # Runs even if an earlier step failed, so a signing certificate never
+      # lingers on the runner past this job -- GitHub-hosted runners are
+      # ephemeral and destroyed after the job anyway, but there's no reason
+      # to rely on that as the only cleanup.
+      - name: Remove temporary keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN_PATH" || true
