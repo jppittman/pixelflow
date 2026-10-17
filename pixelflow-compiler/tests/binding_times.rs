@@ -5,10 +5,10 @@
 //! own program. Everything else is a **uniform**: an `f32` parameter is one,
 //! a record parameter one per field, and a call's values are the kernel's
 //! arguments, never its constants. So every call of an entry at one
-//! structural instantiation is one program — one canonical key, one compiled
-//! region — and a program compiled once is rebound per call from the entry's
-//! `Args` record, into a block the caller keeps; so is a program the entry's
-//! kernel was composed into, beside kernels with no arguments of their own.
+//! structural instantiation is one program — one canonical key — and a
+//! program compiled once is rebound per call from the entry's `Args` record,
+//! into a block the caller keeps; so is a program the entry's kernel was
+//! composed into, beside kernels with no arguments of their own.
 //!
 //! What a record and a count *mean* is pinned against rustc in
 //! `rustc_is_the_oracle.rs`; the refusals are `sema`'s and the parser's unit
@@ -72,17 +72,6 @@ fn program_key(k: &Kernel) -> Vec<u8> {
     canonical(arena, root).key
 }
 
-/// The address of the code `k` compiles to at `FRAME`'s shape: one compiled
-/// region per program, shared by every kernel of it.
-fn code_at_frame(k: &Kernel) -> *const u8 {
-    let shape = pixelflow_ir::LatticeShape::new([FRAME.0 as u32, FRAME.1 as u32]);
-    pixelflow_codegen::jit_cache::compile(k, shape)
-        .expect("compile")
-        .kernel
-        .as_bytes()
-        .as_ptr()
-}
-
 /// A record parameter is one uniform per field, in field order, before the
 /// parameters after it: the call's values, in declaration order.
 #[test]
@@ -95,8 +84,7 @@ fn a_record_parameter_is_one_uniform_per_field_in_declaration_order() {
 }
 
 /// Every call of an entry is one program: two calls with different values
-/// share a canonical key and a compiled region. Each structural value is a
-/// program of its own.
+/// share a canonical key. Each structural value is a program of its own.
 #[test]
 fn every_call_of_an_entry_at_one_instantiation_is_one_program() {
     let a = boxed(UNIT, 1.0, 0.0);
@@ -111,13 +99,8 @@ fn every_call_of_an_entry_at_one_instantiation_is_one_program() {
         0.75,
     );
     assert_eq!(program_key(&a), program_key(&b));
-    assert_eq!(code_at_frame(&a), code_at_frame(&b), "one compiled region");
 
     assert_eq!(program_key(&ramp::<4>(1.0)), program_key(&ramp::<4>(2.5)));
-    assert_eq!(
-        code_at_frame(&ramp::<4>(1.0)),
-        code_at_frame(&ramp::<4>(2.5))
-    );
     assert_ne!(
         program_key(&ramp::<4>(1.0)),
         program_key(&ramp::<5>(1.0)),

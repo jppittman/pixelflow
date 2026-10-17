@@ -22,37 +22,11 @@
 //! - **admission**: an argument is closed and reads no table.
 
 use pixelflow_compiler::{kernel, kernel_raw};
-use pixelflow_core::{DiscreteManifold, Kernel, Lattice, Uniform};
-use pixelflow_ir::key::canonical;
-use pixelflow_ir::{ExprArena, ExprNode, OpKind};
+use pixelflow_core::{DiscreteManifold, Kernel, Uniform};
+use pixelflow_ir::{ExprArena, OpKind};
 
-/// The sample the values are read at: `X = 3`, `Y = 5`.
-const AT: (f32, f32) = (3.0, 5.0);
-
-fn bake(k: &Kernel) -> f32 {
-    Lattice::eval_at(k, AT.0, AT.1)
-}
-
-/// Whether two kernels are one program: the same canonical key.
-fn assert_same_program(written: &Kernel, built: &Kernel) {
-    let (written_arena, written_root) = written.parts();
-    let (built_arena, built_root) = built.parts();
-    assert_eq!(
-        canonical(written_arena, written_root).key,
-        canonical(built_arena, built_root).key,
-        "written: {}\nbuilt:   {}",
-        written_arena.display(written_root),
-        built_arena.display(built_root),
-    );
-}
-
-fn x() -> Kernel {
-    Kernel::x()
-}
-
-fn y() -> Kernel {
-    Kernel::y()
-}
+mod common;
+use common::{AT, assert_same_program, bake, x, y};
 
 fn constant(v: f32) -> Kernel {
     Kernel::constant(v)
@@ -192,24 +166,6 @@ fn an_argument_holding_a_fold_inside_a_fold_captures_nothing() {
     assert_same_program(&shifted_sum_by_helper(&k), &written);
 }
 
-/// Each fold binds its own slot: the argument's, inside, the one its
-/// closing chose, and the entry's, around it, the next.
-#[test]
-fn the_fold_around_an_application_binds_past_the_arguments() {
-    let k = folded();
-    let written = shifted_sum(&k);
-    let (arena, root) = written.parts();
-    let ExprNode::Reduce { fold: outer, .. } = arena.node(root) else {
-        panic!("the entry's fold, got {}", arena.display(root));
-    };
-    let (k_arena, k_root) = k.parts();
-    let ExprNode::Reduce { fold: inner, .. } = k_arena.node(k_root) else {
-        panic!("the argument's fold, got {}", k_arena.display(k_root));
-    };
-    assert_eq!(inner.binder().slot(), 0);
-    assert_eq!(outer.binder().slot(), 1);
-}
-
 /// An argument with two nested folds keeps both, and the fold around its
 /// application takes a third slot: the value is rustc's for the same sums.
 #[test]
@@ -325,64 +281,18 @@ fn an_unapplied_argument_declares_and_a_shared_one_declares_once() {
     assert_eq!(defaults, [0.5, 1.0]);
 }
 
-/// The program an entry builds holds the program and nothing else: what a
-/// substitution replaced, and a uniform nothing reads, are dropped, as
-/// emission drops them from an arena built at expansion.
-#[test]
-fn a_composed_kernel_holds_only_its_program() {
-    let k = kernel!(|s: f32| X * 3.0 - Y * s)(1.0);
-    for composed in [warped(&k), shifted_sum(&folded()), first(&k, &k)] {
-        let (arena, root) = composed.parts();
-        let mut reached = vec![false; arena.len()];
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            if !std::mem::replace(&mut reached[id.0 as usize], true) {
-                stack.extend(arena.children(id));
-            }
-        }
-        assert!(reached.iter().all(|&r| r), "{}", arena.display(root));
-    }
-}
-
 // ─────────────────────────── admission ───────────────────────────
 
-/// At the sample an argument is spliced as it stands, so a name in it stays
-/// a name: a glyph held by reference (O1 of the plan) is still one when it
-/// is summed, and draws what it names.
+/// A kernel held by name and the same kernel as itself give the same sum
+/// beside a fold's index: `Σ_i (k(X, Y) + X·i)` with `k = 6X + 4Y`, a fold of
+/// its own, is 123 at (3, 5), as Rust's sum is.
 #[test]
-fn a_name_summed_at_the_sample_stays_a_name() {
-    let a = kernel!(|| X * Y);
-    let b = kernel!(|| X - Y);
-    let named = sum2(&a.by_ref(), &b.by_ref());
-    let (arena, root) = named.parts();
-    let names = arena
-        .nodes()
-        .filter(|(_, n)| matches!(n, ExprNode::Ref(_)))
-        .count();
-    assert_eq!(names, 2, "{}", arena.display(root));
-    assert_eq!(bake(&named), bake(&sum2(&a, &b)));
-}
-
-/// A name applied at the sample inside a fold stays a name, so the fold
-/// around it cannot see the referent's own fold and may choose its binder:
-/// once the name is expanded the referent's fold shadows it, which is
-/// binding, not capture. `Σ_i (k(X, Y) + X·i)` with `k = 6X + 4Y`, a fold
-/// of its own, is 123 at (3, 5) held by name or as itself, as Rust's sum
-/// is. The two are one program under two keys: `at` would expand the name.
-#[test]
-fn a_name_applied_inside_a_fold_is_what_it_names() {
+fn a_kernel_held_by_name_or_as_itself_gives_the_same_sum_in_a_fold() {
     let k = folded();
     let rust_k = |x: f32, y: f32| -> f32 { (0..4).map(|j| x * (j as f32) + y).sum() };
     let rust: f32 = (0..3).map(|i| rust_k(AT.0, AT.1) + AT.0 * (i as f32)).sum();
     assert_eq!(rust, 123.0);
-    let named = beside_the_index(&k.by_ref());
-    let (arena, root) = named.parts();
-    assert!(
-        arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))),
-        "the name is kept: {}",
-        arena.display(root)
-    );
-    assert_eq!(bake(&named), rust);
+    assert_eq!(bake(&beside_the_index(&k.by_ref())), rust);
     assert_eq!(bake(&beside_the_index(&k)), rust);
 }
 

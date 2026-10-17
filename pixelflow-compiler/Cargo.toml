@@ -9,6 +9,9 @@ license = "Apache-2.0"
 [lib]
 proc-macro = true
 
+[lints]
+workspace = true
+
 [features]
 # Forwards to `pixelflow-search/saturation-telemetry`: the macro tier's
 # `Saturate` pass emits one JSONL saturation record per e-graph run when this
@@ -16,13 +19,11 @@ proc-macro = true
 saturation-telemetry = ["pixelflow-search/saturation-telemetry"]
 
 [dependencies]
-syn = { version = "2", features = ["full", "fold", "extra-traits", "parsing"] }
+syn = { version = "2", features = ["full", "extra-traits", "parsing"] }
 quote = "1"
 proc-macro2 = "1"
 pixelflow-ir = { path = "../pixelflow-ir" }
 pixelflow-search = { path = "../pixelflow-search" }
 
 [dev-dependencies]
-pixelflow-codegen = { path = "../pixelflow-codegen" }
 pixelflow-core = { path = "../pixelflow-core" }
-pixelflow-ir = { path = "../pixelflow-ir" }

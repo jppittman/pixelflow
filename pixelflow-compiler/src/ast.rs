@@ -52,7 +52,7 @@ use syn::{Ident, Type};
 /// every stage after the parser sees one shape; only emission asks how the
 /// result is spelled.
 #[derive(Debug, Clone)]
-pub struct KernelDef {
+pub(crate) struct KernelDef {
     /// How the macro's value is spelled.
     pub spelling: Spelling,
     /// The block's records, in declaration order: [`RecordId`] indexes this.
@@ -69,7 +69,7 @@ impl KernelDef {
     /// The one resolution of a record's name: `sema` types a parameter by
     /// it, and lowering and emission lay a record parameter out by it, so no
     /// two stages can disagree about which record a type is.
-    pub fn record_named(&self, ty: &Type) -> Option<RecordId> {
+    pub(crate) fn record_named(&self, ty: &Type) -> Option<RecordId> {
         let Type::Path(path) = ty else {
             return None;
         };
@@ -84,7 +84,7 @@ impl KernelDef {
     }
 
     /// The record `id` names.
-    pub fn record(&self, id: RecordId) -> &RecordItem {
+    pub(crate) fn record(&self, id: RecordId) -> &RecordItem {
         &self.records[id.0]
     }
 }
@@ -92,7 +92,7 @@ impl KernelDef {
 /// Which of the block's records a type is: an index into
 /// [`KernelDef::records`], in declaration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RecordId(pub usize);
+pub(crate) struct RecordId(pub usize);
 
 /// `struct R { a: f32, b: f32 }`: a record of named `f32` fields
 /// (docs/language/2026-09-25-the-language-is-kernel.md §1.3).
@@ -102,7 +102,7 @@ pub struct RecordId(pub usize);
 /// is one uniform per field, in field order, and a helper's is its
 /// argument's fields.
 #[derive(Debug, Clone)]
-pub struct RecordItem {
+pub(crate) struct RecordItem {
     /// Its attributes (any but `repr` and `cfg`), re-emitted on the host
     /// struct.
     pub attrs: Vec<syn::Attribute>,
@@ -115,7 +115,7 @@ pub struct RecordItem {
 
 /// One named field of a record. `sema` requires its type to be `f32`.
 #[derive(Debug, Clone)]
-pub struct RecordField {
+pub(crate) struct RecordField {
     /// Its attributes (any but `repr` and `cfg`), re-emitted on the host
     /// struct's field.
     pub attrs: Vec<syn::Attribute>,
@@ -126,7 +126,7 @@ pub struct RecordField {
 
 /// How a `kernel!` invocation spells its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Spelling {
+pub(crate) enum Spelling {
     /// `kernel!(|a: f32, …| e)`: one entry, and the expansion is an
     /// expression — a `Kernel` with no parameters, a closure over their
     /// `f32`s with some, each one a uniform.
@@ -140,7 +140,7 @@ pub enum Spelling {
 /// A `const NAME: f32 = expr;` or `const NAME: usize = expr;` item,
 /// evaluated at expansion.
 #[derive(Debug, Clone)]
-pub struct ConstItem {
+pub(crate) struct ConstItem {
     /// Doc comments, re-emitted on a `pub const`'s host twin.
     pub attrs: Vec<syn::Attribute>,
     /// `pub` makes the value a host `const` too.
@@ -153,7 +153,7 @@ pub struct ConstItem {
 
 /// A `fn` item: an entry when `pub`, a helper otherwise.
 #[derive(Debug, Clone)]
-pub struct FnItem {
+pub(crate) struct FnItem {
     /// Doc comments, re-emitted on an entry's host function.
     pub attrs: Vec<syn::Attribute>,
     /// `pub` makes an entry — the macro emits a host function for it. A
@@ -175,7 +175,7 @@ pub struct FnItem {
 
 /// What a `fn` item is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
+pub(crate) enum Role {
     /// A program: it may read `X` and `Y`, and the macro emits a host
     /// function for it.
     Entry,
@@ -185,7 +185,7 @@ pub enum Role {
 
 impl FnItem {
     /// An entry is any `fn` with a visibility; a helper has none.
-    pub fn role(&self) -> Role {
+    pub(crate) fn role(&self) -> Role {
         match self.vis {
             syn::Visibility::Inherited => Role::Helper,
             _ => Role::Entry,
@@ -194,7 +194,7 @@ impl FnItem {
 
     /// Whether a parameter is kernel-typed: the entry is then a composition,
     /// built when its host function is called (plan Phase D-a).
-    pub fn takes_a_kernel(&self) -> bool {
+    pub(crate) fn takes_a_kernel(&self) -> bool {
         self.params.iter().any(Param::is_kernel)
     }
 
@@ -203,15 +203,17 @@ impl FnItem {
     /// its program declares the kernel's uniforms after its own, and the
     /// record could rebind only a program whose argument declares none.
     /// Binding a composed program is O3 of the plan.
-    pub fn has_args_record(&self) -> bool {
+    pub(crate) fn has_args_record(&self) -> bool {
         !self.params.is_empty() && !self.takes_a_kernel()
     }
 
     /// The name of an entry's `Args` record: the entry's name in
     /// UpperCamelCase, then `Args` — `shifted_radius` has
-    /// `ShiftedRadiusArgs` (plan §1.4). `sema` refuses one that collides,
-    /// and emission names the record by it.
-    pub fn args_record(&self) -> Ident {
+    /// `ShiftedRadiusArgs` (plan §1.4). Dropping the underscores can leave a
+    /// digit first, which no identifier starts with, so the name then gains
+    /// one leading underscore: `_2d` has `_2dArgs`, `__3` has `_3Args`.
+    /// `sema` refuses one that collides, and emission names the record by it.
+    pub(crate) fn args_record(&self) -> Ident {
         let camel: String = self
             .name
             .unraw()
@@ -226,13 +228,18 @@ impl FnItem {
                     .flatten()
             })
             .collect();
-        Ident::new(&format!("{camel}Args"), self.name.span())
+        let lead = if camel.starts_with(char::is_numeric) {
+            "_"
+        } else {
+            ""
+        };
+        Ident::new(&format!("{lead}{camel}Args"), self.name.span())
     }
 }
 
 /// A declared parameter: a scalar, one of the block's records, or a kernel.
 #[derive(Debug, Clone)]
-pub struct Param {
+pub(crate) struct Param {
     /// Parameter name.
     pub name: Ident,
     /// The declared type (`f32`, a record or `impl Fn(f32, f32) -> f32`;
@@ -242,7 +249,7 @@ pub struct Param {
 
 impl Param {
     /// Whether the parameter is kernel-typed, `impl Fn(f32, f32) -> f32`.
-    pub fn is_kernel(&self) -> bool {
+    pub(crate) fn is_kernel(&self) -> bool {
         FunctionType::of(&self.ty) == FunctionType::Kernel
     }
 }
@@ -256,7 +263,7 @@ impl Param {
 /// this one, and lowering and emission find an entry's kernel-typed
 /// parameters by it, so no two stages can disagree about which they are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FunctionType {
+pub(crate) enum FunctionType {
     /// Not a function.
     NotOne,
     /// `impl Fn(f32, f32) -> f32`.
@@ -268,7 +275,7 @@ pub enum FunctionType {
 
 impl FunctionType {
     /// The classification of `ty`.
-    pub fn of(ty: &Type) -> Self {
+    pub(crate) fn of(ty: &Type) -> Self {
         match ty {
             Type::Paren(inner) => Self::of(&inner.elem),
             Type::Group(inner) => Self::of(&inner.elem),
@@ -360,7 +367,7 @@ fn is_f32(ty: &Type) -> bool {
 /// refuses at the token, with a span; nothing is carried along to be refused
 /// by a later stage.
 #[derive(Debug, Clone)]
-pub enum Expr {
+pub(crate) enum Expr {
     /// A variable reference (X, Y, cx, etc.).
     Ident(IdentExpr),
 
@@ -401,7 +408,7 @@ pub enum Expr {
 impl Expr {
     /// Where the expression is, for a diagnostic to point at: an operator's
     /// token, a name, a block's braces.
-    pub fn span(&self) -> Span {
+    pub(crate) fn span(&self) -> Span {
         match self {
             Expr::Ident(e) => e.span,
             Expr::Literal(e) => e.span,
@@ -422,7 +429,7 @@ impl Expr {
     /// it is not a name. A `usize` and a record are both written only by
     /// name: nothing in a body computes a count (plan §1.6) or builds a
     /// record (Phase D, D7).
-    pub fn named(&self) -> Option<&Ident> {
+    pub(crate) fn named(&self) -> Option<&Ident> {
         match self {
             Expr::Paren(inner) => inner.named(),
             Expr::Ident(ident) => Some(&ident.name),
@@ -435,7 +442,7 @@ impl Expr {
 /// parameter or a `let` alias of one — which `sema` checks, with the
 /// member one of the record's fields.
 #[derive(Debug, Clone)]
-pub struct FieldExpr {
+pub(crate) struct FieldExpr {
     pub base: Box<Expr>,
     pub member: Ident,
     /// The member's span.
@@ -444,7 +451,7 @@ pub struct FieldExpr {
 
 /// An identifier expression.
 #[derive(Debug, Clone)]
-pub struct IdentExpr {
+pub(crate) struct IdentExpr {
     pub name: Ident,
     /// The name's span.
     pub span: Span,
@@ -460,14 +467,14 @@ pub struct IdentExpr {
 /// asks those two questions here, so no two stages can answer them
 /// differently.
 #[derive(Debug, Clone)]
-pub struct LiteralExpr {
+pub(crate) struct LiteralExpr {
     pub value: Literal,
     pub span: Span,
 }
 
 /// What a numeric literal denotes, before its position gives it a type.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Literal {
+pub(crate) enum Literal {
     /// A float literal, or an integer suffixed `f32` (a float literal to
     /// rustc): the `f32` it rounds to, once.
     F32(f32),
@@ -484,7 +491,7 @@ impl LiteralExpr {
     /// refuses an unsuffixed integer where an `f32` is expected. `16777217`
     /// (2²⁴ + 1) is the first integer refused; `1099511627776` (2⁴⁰) is
     /// accepted.
-    pub fn f32_value(&self) -> syn::Result<f32> {
+    pub(crate) fn f32_value(&self) -> syn::Result<f32> {
         match self.value {
             Literal::F32(value) => Ok(value),
             // Exact, and finite: below 2¹²⁸, an integer with at most
@@ -510,7 +517,7 @@ impl LiteralExpr {
     /// const: an integer, at most `usize::MAX`. A `usize` is 64 bits on
     /// every target this language compiles for (x86-64 and aarch64), and
     /// the control plane is 64-bit.
-    pub fn usize_value(&self) -> syn::Result<u64> {
+    pub(crate) fn usize_value(&self) -> syn::Result<u64> {
         let Literal::Int(n) = self.value else {
             return Err(syn::Error::new(
                 self.span,
@@ -544,7 +551,7 @@ fn significant_bits(n: u128) -> u32 {
 
 /// Binary operators we recognize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinaryOp {
+pub(crate) enum BinaryOp {
     Add,
     Sub,
     Mul,
@@ -563,7 +570,7 @@ pub enum BinaryOp {
 
 /// A binary expression.
 #[derive(Debug, Clone)]
-pub struct BinaryExpr {
+pub(crate) struct BinaryExpr {
     pub op: BinaryOp,
     pub lhs: Box<Expr>,
     pub rhs: Box<Expr>,
@@ -573,13 +580,13 @@ pub struct BinaryExpr {
 
 /// Unary operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnaryOp {
+pub(crate) enum UnaryOp {
     Neg,
 }
 
 /// A unary expression.
 #[derive(Debug, Clone)]
-pub struct UnaryExpr {
+pub(crate) struct UnaryExpr {
     pub op: UnaryOp,
     pub operand: Box<Expr>,
     /// The operator's span.
@@ -588,7 +595,7 @@ pub struct UnaryExpr {
 
 /// A method call expression.
 #[derive(Debug, Clone)]
-pub struct MethodCallExpr {
+pub(crate) struct MethodCallExpr {
     /// The receiver (what the method is called on).
     pub receiver: Box<Expr>,
     /// The method name (sqrt, sin, max, etc.).
@@ -601,7 +608,7 @@ pub struct MethodCallExpr {
 
 /// A free function call expression (DX(expr), a helper, etc.).
 #[derive(Debug, Clone)]
-pub struct CallExpr {
+pub(crate) struct CallExpr {
     /// The function being called (V, DX, DY, a helper's name).
     pub func: Ident,
     /// Function arguments.
@@ -614,7 +621,7 @@ pub struct CallExpr {
 /// an expression, and there is no unit. An `else if` chain is an `If` in
 /// the `else` position.
 #[derive(Debug, Clone)]
-pub struct IfExpr {
+pub(crate) struct IfExpr {
     pub cond: Box<Expr>,
     pub then_branch: BlockExpr,
     pub else_branch: Box<Expr>,
@@ -631,7 +638,7 @@ pub struct IfExpr {
 /// are constant, evaluated by `sema` at expansion, and the binder is a
 /// `usize`, which a body makes a value of only by `i as f32`.
 #[derive(Debug, Clone)]
-pub struct FoldExpr {
+pub(crate) struct FoldExpr {
     pub reduction: Reduction,
     pub range: RangeExpr,
     /// The closure's parameter: the index the body reads.
@@ -644,7 +651,7 @@ pub struct FoldExpr {
 
 /// The half-open `lo..hi` a fold ranges over.
 #[derive(Debug, Clone)]
-pub struct RangeExpr {
+pub(crate) struct RangeExpr {
     pub lo: Box<Expr>,
     pub hi: Box<Expr>,
     /// The `..` token's span.
@@ -653,7 +660,7 @@ pub struct RangeExpr {
 
 /// Which monoid a fold combines its terms under, as the source spells it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reduction {
+pub(crate) enum Reduction {
     /// `.map(|i| e).sum()`: `+`, identity 0.
     Sum,
     /// `.map(|i| e).product()`: `×`, identity 1.
@@ -673,7 +680,7 @@ pub enum Reduction {
 /// accepts one operand: a `usize`, by name, a fold's index, a `usize` const
 /// or an entry's structural parameter.
 #[derive(Debug, Clone)]
-pub struct CastExpr {
+pub(crate) struct CastExpr {
     pub operand: Box<Expr>,
     /// The `as` token's span.
     pub span: Span,
@@ -684,14 +691,14 @@ impl CastExpr {
     /// operand is not a name. Only a name can be a `usize`: nothing in a
     /// body computes one (plan §1.6), so a `usize` expression is always a
     /// fold's index, a `usize` const or a structural parameter.
-    pub fn named(&self) -> Option<&Ident> {
+    pub(crate) fn named(&self) -> Option<&Ident> {
         self.operand.named()
     }
 }
 
 /// A statement in a block.
 #[derive(Debug, Clone)]
-pub enum Stmt {
+pub(crate) enum Stmt {
     /// A let binding: `let dx = X - cx;`
     Let(Box<LetStmt>),
     /// `let (a, b) = (e1, e2);`, flattened: each name bound to its
@@ -706,7 +713,7 @@ pub enum Stmt {
 
 /// A let statement.
 #[derive(Debug, Clone)]
-pub struct LetStmt {
+pub(crate) struct LetStmt {
     pub name: Ident,
     pub ty: Option<Type>,
     pub init: Expr,
@@ -717,7 +724,7 @@ pub struct LetStmt {
 
 /// A block expression.
 #[derive(Debug, Clone)]
-pub struct BlockExpr {
+pub(crate) struct BlockExpr {
     pub stmts: Vec<Stmt>,
     /// The final expression (if any).
     pub expr: Option<Box<Expr>>,
@@ -727,7 +734,7 @@ pub struct BlockExpr {
 
 impl BinaryOp {
     /// Convert from syn's BinOp.
-    pub fn from_syn(op: &syn::BinOp) -> Option<Self> {
+    pub(crate) fn from_syn(op: &syn::BinOp) -> Option<Self> {
         match op {
             syn::BinOp::Add(_) => Some(BinaryOp::Add),
             syn::BinOp::Sub(_) => Some(BinaryOp::Sub),
@@ -748,7 +755,7 @@ impl BinaryOp {
 
 impl UnaryOp {
     /// Convert from syn's UnOp.
-    pub fn from_syn(op: &syn::UnOp) -> Option<Self> {
+    pub(crate) fn from_syn(op: &syn::UnOp) -> Option<Self> {
         match op {
             syn::UnOp::Neg(_) => Some(UnaryOp::Neg),
             _ => None,
@@ -813,6 +820,8 @@ mod tests {
             ("shifted_radius2", "ShiftedRadius2Args"),
             ("a__b_", "ABArgs"),
             ("r#type", "TypeArgs"),
+            ("_1", "_1Args"),
+            ("__3", "_3Args"),
         ] {
             let item: FnItem = FnItem {
                 attrs: Vec::new(),

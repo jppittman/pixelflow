@@ -206,7 +206,7 @@ use syn::{Pat, Token, Type};
 const SUGAR_ENTRY: &str = "__kernel";
 
 /// Parse kernel input from token stream.
-pub fn parse(input: TokenStream) -> syn::Result<KernelDef> {
+pub(crate) fn parse(input: TokenStream) -> syn::Result<KernelDef> {
     syn::parse2(input)
 }
 
@@ -1826,7 +1826,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_simple_kernel() {
+    fn the_closure_sugar_is_one_entry_with_an_inferred_return_type() {
         let input = quote! { |r: f32| X * X + Y * Y - r };
         let kernel = parse(input).unwrap();
         let entry = entry(&kernel);
@@ -1837,32 +1837,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_empty_params() {
-        let input = quote! { || X * X + Y * Y };
-        let kernel = parse(input).unwrap();
-        assert_eq!(entry(&kernel).params.len(), 0);
-    }
-
-    #[test]
-    fn parse_multiple_params() {
-        let input = quote! { |cx: f32, cy: f32, r: f32| X - cx };
-        let kernel = parse(input).unwrap();
-        assert_eq!(entry(&kernel).params.len(), 3);
-    }
-
-    #[test]
-    fn parse_method_call() {
-        let input = quote! { |r: f32| (X * X + Y * Y).sqrt() - r };
-        let kernel = parse(input).unwrap();
-        // Should successfully parse the .sqrt() method call
-        match &entry(&kernel).body {
-            Expr::Binary(_) => {} // Expected: sqrt() - r
-            _ => panic!("expected binary expression"),
-        }
-    }
-
-    #[test]
-    fn parse_block_expr() {
+    fn a_block_body_parses_its_lets_and_final_expression() {
         let input = quote! {
             |cx: f32, cy: f32| {
                 let dx = X - cx;
@@ -2177,26 +2152,6 @@ mod tests {
         for other in [quote!(true), quote!("text"), quote!('c')] {
             let err = literal(other).expect_err("not a number");
             assert!(err.contains("only numeric literals"), "got: {err}");
-        }
-    }
-
-    #[test]
-    fn parse_block_body_with_a_scalar_param() {
-        let input = quote! {
-            |x: f32| {
-                let a = X + x;
-                a
-            }
-        };
-        let kernel = parse(input).unwrap();
-        assert_eq!(entry(&kernel).params.len(), 1);
-
-        match &entry(&kernel).body {
-            Expr::Block(block) => {
-                assert_eq!(block.stmts.len(), 1, "expected 1 let statement");
-                assert!(block.expr.is_some(), "expected final expression");
-            }
-            other => panic!("expected block expression, got {other:?}"),
         }
     }
 
@@ -2760,15 +2715,15 @@ mod tests {
     /// refusal named B3 until B3 was done without helper generics.)
     #[test]
     fn a_fn_signature_is_plain() {
-        let cases: [(TokenStream, &str); 9] = [
-            (
-                quote! { fn h<const N: usize>(x: f32) -> f32 { x } pub fn f() -> f32 { X } },
-                "generics on a helper",
-            ),
-            (
-                quote! { fn h<const N: usize>(x: f32) -> f32 { x } pub fn f() -> f32 { X } },
-                "pass `n as f32`",
-            ),
+        let err = refusal(quote! {
+            fn h<const N: usize>(x: f32) -> f32 { x }
+            pub fn f() -> f32 { X }
+        });
+        assert!(
+            err.contains("generics on a helper") && err.contains("pass `n as f32`"),
+            "got: {err}"
+        );
+        let cases: [(TokenStream, &str); 7] = [
             (quote! { pub fn f<T>() -> f32 { X } }, "B3"),
             (quote! { pub fn f<'a>() -> f32 { X } }, "lifetime parameter"),
             (

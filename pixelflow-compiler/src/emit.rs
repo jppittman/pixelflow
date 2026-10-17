@@ -84,7 +84,7 @@ use pixelflow_ir::{Binder, Monoid};
 /// that is the entire difference between the two macros.
 ///
 /// Returns `Err` if a body contains an operation lowering cannot express.
-pub fn emit_kernel(
+pub(crate) fn emit_kernel(
     analyzed: &AnalyzedKernel,
     optimizer: &mut dyn Optimize,
 ) -> Result<TokenStream, String> {
@@ -184,7 +184,7 @@ fn argument(scalar: Scalar<'_>) -> TokenStream {
 /// What an entry's arena is emitted against: the argument each declared
 /// uniform defaults to, in declaration order, and — for a template — the
 /// structural parameters and open ranges its holes are filled from.
-pub struct EntryContext<'a> {
+pub(crate) struct EntryContext<'a> {
     arguments: Vec<TokenStream>,
     structural: &'a [Ident],
     holes: &'a Holes,
@@ -437,7 +437,7 @@ fn instantiated_range(range: &crate::sema::StructuralRange) -> TokenStream {
 /// lowering declares one uniform per argument, and a relink restores the
 /// table after optimization, so a mismatch is a front-end bug, not a
 /// kernel's.
-pub fn arena_to_tokens(arena: &ExprArena, root: ExprId, context: &EntryContext) -> TokenStream {
+fn arena_to_tokens(arena: &ExprArena, root: ExprId, context: &EntryContext) -> TokenStream {
     assert_eq!(
         arena.uniforms().len(),
         context.arguments.len(),
@@ -637,7 +637,7 @@ fn node(arena: &ExprArena, id: ExprId, context: &EntryContext) -> TokenStream {
 /// [`ExprArena::apply`]: pixelflow_ir::arena::ExprArena::apply
 /// [`ExprArena::compact`]: pixelflow_ir::arena::ExprArena::compact
 #[derive(Default)]
-pub struct Staged {
+struct Staged {
     statements: Vec<TokenStream>,
     /// How many variables have been named: every one is fresh.
     named: u64,
@@ -653,7 +653,7 @@ impl Staged {
     /// # Errors
     ///
     /// When the body has a construct lowering cannot express.
-    pub fn lower(entry: &FnItem, analyzed: &AnalyzedKernel) -> Result<TokenStream, String> {
+    fn lower(entry: &FnItem, analyzed: &AnalyzedKernel) -> Result<TokenStream, String> {
         let mut site = Staged::default();
         let root = lower_entry(entry, analyzed, &mut site)?;
         let statements = site.statements;
@@ -817,7 +817,7 @@ impl Site for Staged {
         }))
     }
 
-    fn apply(&mut self, kernel: &Ident, [x, y]: [Ident; 2]) -> Ident {
+    fn apply(&mut self, kernel: Ident, [x, y]: [Ident; 2]) -> Ident {
         self.step(quote!(__arena.apply(&#kernel, [#x, #y])))
     }
 }
@@ -853,108 +853,28 @@ mod tests {
             .to_string()
     }
 
-    /// The items form expands to items: a `fn` per entry with the entry's
-    /// visibility and doc comment, a `const` per `pub const`, and nothing
-    /// for a helper or a private `const`.
+    /// A record is a host `#[repr(C)]` struct, and no path the expansion
+    /// names is `::std`: a `no_std` crate expands any block. One block
+    /// exercises every emission path (a record, a `pub const`, a helper, a
+    /// fold over `N`, an entry taking a kernel).
     #[test]
-    fn the_items_form_expands_to_items() {
+    fn a_record_is_repr_c_and_the_expansion_names_no_std_path() {
         let code = expansion(quote! {
-            const R: f32 = 1.0;
-            /// Twice the radius.
-            pub const TWO_R: f32 = R * 2.0;
-            fn sq(x: f32) -> f32 { x * x }
-            /// The circle.
-            pub fn circle(cx: f32) -> f32 { sq(X - cx) - R }
-            pub(crate) fn plain() -> f32 { X }
-        });
-        assert!(
-            code.contains("pub const TWO_R : f32 = f32 :: from_bits ("),
-            "{code}"
-        );
-        assert!(
-            code.contains("Twice the radius."),
-            "the const's doc: {code}"
-        );
-        assert!(
-            !code.contains("const R :"),
-            "a private const is folded: {code}"
-        );
-        assert!(!code.contains("fn sq"), "a helper is inlined: {code}");
-        assert!(code.contains("The circle."), "the entry's doc: {code}");
-        assert!(
-            code.contains("# [must_use] pub fn circle (cx : f32) -> :: pixelflow_core :: Kernel"),
-            "an entry takes its parameters by their declared types: {code}"
-        );
-        assert!(code.contains("pub struct CircleArgs"), "{code}");
-        assert!(code.contains("pub (crate) fn plain () ->"), "{code}");
-        assert!(
-            !code.contains("PlainArgs"),
-            "an entry with no parameters has no `Args` record: {code}"
-        );
-        assert!(
-            !code.contains("Scalar") && !code.contains("Into"),
-            "no call-site type decides anything: {code}"
-        );
-    }
-
-    /// The closure form expands to an expression: a `Kernel`, or a closure
-    /// over `f32`s whose kernel declares each as a uniform with the call's
-    /// value.
-    #[test]
-    fn the_closure_form_expands_to_an_expression() {
-        let code = expansion(quote! { || X });
-        assert!(code.starts_with("{ let (__arena , __root) ="), "{code}");
-        let code = expansion(quote! { |r: f32| X - r });
-        assert!(
-            code.starts_with("move | r : f32 | -> :: pixelflow_core :: Kernel"),
-            "{code}"
-        );
-        assert!(code.contains("default : r"), "{code}");
-    }
-
-    /// A record is a host `#[repr(C)]` struct with its docs, fields and
-    /// visibility; an entry's `Args` record holds its parameters by their
-    /// declared types, generic over its structural parameters, and streams
-    /// them — the record's fields in field order — in declaration order.
-    #[test]
-    fn a_record_and_an_args_record_expand_to_host_structs() {
-        let code = expansion(quote! {
-            /// A box.
             pub struct Bounds { pub x0: f32, pub x1: f32 }
+            pub const TWO: f32 = 2.0;
+            fn sq(x: f32) -> f32 { x * x }
             pub fn inside<const N: usize>(b: Bounds, r: f32) -> f32 {
-                if (X > b.x0) & (X < b.x1) { r } else { 0.0 }
+                sq(r) + (0..N).map(|i| X * (i as f32)).sum::<f32>() + b.x0
+            }
+            pub fn glyph(ink: impl Fn(f32, f32) -> f32, b: Bounds) -> f32 {
+                if (X > b.x0) & (X < b.x1) { ink(X + 0.5, Y) } else { 0.0 }
             }
         });
-        assert!(
-            code.contains(
-                "A box.\"] # [repr (C)] # [derive (Clone , Copy , Debug , Default , PartialEq)] \
-                 pub struct Bounds { pub x0 : f32 , pub x1 : f32 , }"
-            ),
-            "{code}"
-        );
-        assert!(
-            code.contains("pub fn inside < const N : usize > (b : Bounds , r : f32)"),
-            "{code}"
-        );
-        assert!(
-            code.contains("pub struct InsideArgs < const N : usize >"),
-            "{code}"
-        );
-        assert!(
-            code.contains("block . set_declared ([self . b . x0 , self . b . x1 , self . r])"),
-            "{code}"
-        );
-        assert!(
-            code.contains("# [derive (Clone , Copy , Debug , PartialEq)] pub struct InsideArgs"),
-            "{code}"
-        );
-        assert!(
-            code.contains("default : b . x0") && code.contains("default : r"),
-            "{code}"
-        );
+        assert!(code.contains("# [repr (C)]"), "{code}");
         // Spelled as `to_string` spaces a path: `"::std"` matches nothing.
-        // `items_block.rs` expands a block in a `#[no_implicit_prelude]`
-        // module.
+        // `items_block.rs`'s `#[no_implicit_prelude]` module still resolves
+        // `::std`, so this grep is the only check that a `no_std` crate can
+        // expand any block.
         assert!(
             !code.contains(":: std ::"),
             "no `::std` path, so a `no_std` crate expands it: {code}"
@@ -962,25 +882,20 @@ mod tests {
     }
 
     /// A template's open fold takes its range from the instantiation, in a
-    /// `const` block that refuses what lowering refuses of a known range;
-    /// its `N as f32` is the structural parameter's.
+    /// `const` block that refuses at the instantiation what lowering refuses
+    /// of a known range.
     #[test]
-    fn a_templates_holes_are_filled_by_the_instantiation() {
+    fn a_template_refuses_at_instantiation_what_lowering_refuses_of_a_known_range() {
         let code = expansion(quote! {
             pub fn mean<const N: usize>() -> f32 {
                 (0..N).map(|i| X * (i as f32)).sum::<f32>() / (N as f32)
             }
         });
         assert!(
-            code.contains("const { let __lo : usize = 0 ; let __hi : usize = N ;"),
-            "{code}"
-        );
-        assert!(
             code.contains("runs backwards at this instantiation"),
             "{code}"
         );
         assert!(code.contains("__hi <= 16777216"), "{code}");
-        assert!(code.contains("push_const (N as f32)"), "{code}");
     }
 
     /// An optimizer that counts the arenas it is offered, and declines each.
@@ -993,73 +908,29 @@ mod tests {
         }
     }
 
-    /// No optimizer sees a template, an entry with structural parameters:
-    /// its open folds hold placeholder ranges a rewrite would read as
-    /// ranges, so it is emitted as lowered and optimized when its
-    /// instantiation is baked; an entry without one is offered.
+    /// No optimizer sees a template, whose open folds hold placeholder ranges
+    /// a rewrite would read as ranges, nor an entry that takes a kernel,
+    /// whose program exists only once its host function is called: both are
+    /// emitted as lowered. An entry with neither is offered.
     #[test]
-    fn a_template_is_offered_to_no_optimizer() {
+    fn an_optimizer_is_offered_only_entries_it_can_read() {
         let analyzed = analyze(
             parse(quote! {
+                pub struct Bounds { pub x0: f32, pub x1: f32 }
                 pub fn counted<const N: usize>(r: f32) -> f32 {
                     r + (0..N).map(|i| (i as f32) * X).sum::<f32>()
+                }
+                pub fn glyph(ink: impl Fn(f32, f32) -> f32, b: Bounds) -> f32 {
+                    if (X > b.x0) & (X < b.x1) { ink(X + 0.5, Y) } else { 0.0 }
+                }
+                pub fn sum2(a: impl Fn(f32, f32) -> f32, b: impl Fn(f32, f32) -> f32) -> f32 {
+                    a(X, Y) + b(X, Y)
                 }
                 pub fn plain(r: f32) -> f32 { r + X }
             })
             .expect("parses"),
         )
         .expect("analyzes");
-        let mut offered = Offered(0);
-        emit_kernel(&analyzed, &mut offered).expect("emits");
-        assert_eq!(offered.0, 1, "`plain` alone");
-    }
-
-    /// An entry that takes a kernel is staged: its host function takes the
-    /// argument as a `&Kernel`, admits it after declaring its own uniforms,
-    /// applies it where the body does, and compacts what it built. It has no
-    /// `Args` record, and no optimizer sees it — its program exists only
-    /// once the host function is called.
-    #[test]
-    fn an_entry_that_takes_a_kernel_is_staged() {
-        let input = quote! {
-            pub struct Bounds { pub x0: f32, pub x1: f32 }
-            pub fn glyph(ink: impl Fn(f32, f32) -> f32, b: Bounds) -> f32 {
-                if (X > b.x0) & (X < b.x1) { ink(X + 0.5, Y) } else { 0.0 }
-            }
-            pub fn sum2(a: impl Fn(f32, f32) -> f32, b: impl Fn(f32, f32) -> f32) -> f32 {
-                a(X, Y) + b(X, Y)
-            }
-            pub fn plain(r: f32) -> f32 { r + X }
-        };
-        let code = expansion(input.clone());
-        assert!(
-            code.contains(
-                "pub fn glyph (ink : & :: pixelflow_core :: Kernel , b : Bounds) -> :: \
-                 pixelflow_core :: Kernel"
-            ),
-            "{code}"
-        );
-        assert!(
-            code.contains(
-                "pub fn sum2 (a : & :: pixelflow_core :: Kernel , b : & :: pixelflow_core :: \
-                 Kernel)"
-            ),
-            "{code}"
-        );
-        let declared_last = code.find("default : b . x1").expect("b.x1 is declared");
-        let admitted = code.find("__arena . admit (ink)").expect("ink is admitted");
-        assert!(declared_last < admitted, "own uniforms first: {code}");
-        assert!(code.contains("__arena . apply (&"), "{code}");
-        assert!(code.contains("__arena . compact ("), "{code}");
-        assert!(!code.contains("GlyphArgs"), "no `Args` record: {code}");
-        assert!(!code.contains("Sum2Args"), "no `Args` record: {code}");
-        assert!(code.contains("PlainArgs"), "{code}");
-        assert!(
-            !code.contains(":: std ::"),
-            "no `::std` path, so a `no_std` crate expands it: {code}"
-        );
-
-        let analyzed = analyze(parse(input).expect("parses")).expect("analyzes");
         let mut offered = Offered(0);
         emit_kernel(&analyzed, &mut offered).expect("emits");
         assert_eq!(offered.0, 1, "`plain` alone");

@@ -1,26 +1,15 @@
-//! The macro's five public-behaviour contracts: a `kernel!` body, baked, must
-//! agree with scalar `f32` ground truth.
+//! The macro's public-behaviour contracts: a `kernel!` body, baked, must agree
+//! with scalar `f32` ground truth.
 //!
-//! There is one tier now. This file used to be `kernel_routing_parity`, and
-//! each contract checked the same body twice — once through the LLVM tier's
-//! combinator ZST evaluated by this test's own loop, once through the arena
-//! tier's `Lattice::bake` — against ground truth, because the two tiers no
-//! longer shared a value. The combinator tier is gone
-//! (docs/archive/plans/2026-09-06-kernel-with-a-lattice.md, S4b-2), so what is left is
-//! the half that was ever the point: **truth**, not agreement between two
-//! implementations of it.
-//!
-//! Ground truth is scalar `f32` computed here in Rust, deliberately *not* the
-//! IR's own `eval_scalar` oracle: an oracle that shares a definition with the
-//! thing it checks cannot see a shared-definition bug (CLAUDE.md, "Precision
-//! is on the table; range is not"). A kernel is baked over a one-point
-//! lattice, which is the only way a kernel becomes a number.
+//! Ground truth is scalar `f32` computed here in Rust, deliberately not an
+//! oracle that shares a definition with the thing it checks: that cannot see a
+//! shared-definition bug (CLAUDE.md, "Precision is on the table; range is
+//! not"). A kernel is baked over a one-point lattice, which is the only way a
+//! kernel becomes a number.
 //!
 //! Transcendentals are deliberately absent: their accuracy is pinned against
-//! libm per op in `pixelflow-codegen/tests/transcendental_jit.rs`. Their
-//! *range* was pinned in `pixelflow-ir/tests/trig_range.rs`, which asserted
-//! it through the scalar interpreter and was deleted with it — that check
-//! needs rebuilding on the JIT (CLAUDE.md says so where it states the rule). What these five check is
+//! libm per op in `pixelflow-codegen/tests/transcendental_jit.rs` and their
+//! *range* in `pixelflow-codegen/tests/trig_range_jit.rs`. What these check is
 //! that the front end, the e-graph and the backend carry an expression's
 //! meaning from source to buffer.
 
@@ -32,9 +21,8 @@ fn bake(k: &Kernel, p: (f32, f32, f32, f32)) -> f32 {
     Lattice::eval_at(k, p.0, p.1)
 }
 
-/// `(x, y, z, w)` — the first two are coordinates, the last two are scalars
-/// the builder folds in. They were the Z and W coordinates until a lattice
-/// became two axes.
+/// `(x, y, z, w)` — the first two are coordinates, the last two are the values
+/// the parameters `z` and `w` take.
 const SAMPLES: &[(f32, f32, f32, f32)] = &[
     (0.0, 0.0, 0.0, 0.0),
     (1.0, 2.0, 3.0, 4.0),
@@ -102,12 +90,9 @@ fn abs_recip_matches_scalar_truth() {
     }
 }
 
-/// A projection is the *symbolic* derivative of the expression it wraps,
-/// resolved by the e-graph at expansion when it can and by codegen otherwise
-/// — not a finite difference, and not zero. This was the contract that used
-/// to say the two tiers disagreed here on purpose (over a `Field` domain the
-/// combinator backend's `DX` was 0, which is what the fonts' "hard step" case
-/// relied on); with one tier there is one answer, and it is the calculus.
+/// A projection is the *symbolic* derivative of the expression it wraps: a
+/// `Dwrt` chain that the runtime tier resolves when the kernel is baked — not a
+/// finite difference, and not zero.
 #[test]
 fn projections_are_the_symbolic_derivative() {
     let k = kernel!(|| DX(X * X));
@@ -118,5 +103,80 @@ fn projections_are_the_symbolic_derivative() {
     let k = kernel!(|| DY(X * Y * Y));
     for &p in SAMPLES {
         check("dy_of_x_y_squared", bake(&k, p), 2.0 * p.0 * p.1);
+    }
+}
+
+/// `V(e)` is `e`: every expression is already a value.
+#[test]
+fn v_of_an_expression_is_the_expression() {
+    let build = kernel!(|z: f32| V(X * Y + z));
+    for &p in SAMPLES {
+        check("v_identity", bake(&build(p.2), p), p.0 * p.1 + p.2);
+    }
+}
+
+/// `∂/∂x √(x²+y²) = x/r` and `∂/∂y = y/r`, sampled away from the singularity
+/// at `r = 0`.
+#[test]
+fn dx_and_dy_of_a_distance_field_are_x_over_r_and_y_over_r() {
+    const AWAY_FROM_ORIGIN: &[(f32, f32, f32, f32)] = &[
+        (3.0, 4.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0, 0.0),
+        (-2.0, 5.0, 0.0, 0.0),
+        (0.5, -0.25, 0.0, 0.0),
+        (10.0, -10.0, 0.0, 0.0),
+    ];
+    let dx = kernel!(|| DX((X * X + Y * Y).sqrt()));
+    let dy = kernel!(|| DY((X * X + Y * Y).sqrt()));
+    for &p in AWAY_FROM_ORIGIN {
+        let r = (p.0 * p.0 + p.1 * p.1).sqrt();
+        check("dx_dist", bake(&dx, p), p.0 / r);
+        check("dy_dist", bake(&dy, p), p.1 / r);
+    }
+}
+
+/// `d²/dx² x³ = 6x`, by nested `Dwrt`.
+#[test]
+fn dxx_of_a_cubic_is_six_x() {
+    let k = kernel!(|| DXX(X * X * X));
+    for &p in SAMPLES {
+        check("dxx_cubic", bake(&k, p), 6.0 * p.0);
+    }
+}
+
+/// The font-shaped coverage ramp over a line, minus the Y-range mask, which
+/// carries no derivative content: with `d = x − ((y−y0)k + x0)` its gradient
+/// is `√(1+k²)`, so the coverage is a clamped ramp of `d` over that gradient.
+#[test]
+fn the_font_coverage_ramp_matches_its_closed_form() {
+    let (x0, y0, k, dir, min_grad) = (0.3_f32, -0.2_f32, 0.7_f32, -1.0_f32, 0.001_f32);
+    let coverage = kernel!(
+        |x0: f32, y0: f32, dx_over_dy: f32, dir: f32, min_grad: f32| {
+            let d = X - ((Y - y0) * dx_over_dy + x0);
+            let grad = (DX(d.clone()) * DX(d.clone()) + DY(d.clone()) * DY(d.clone())).sqrt();
+            let ramp = (V(d) / (grad + V(min_grad)) + V(0.5))
+                .max(V(0.0))
+                .min(V(1.0));
+            ramp * V(dir)
+        }
+    )(x0, y0, k, dir, min_grad);
+
+    // Both sides of the ramp, its interior, and points far into each
+    // saturated region.
+    for (x, y) in [
+        (0.0_f32, 0.0_f32),
+        (0.3, -0.2),
+        (0.31, -0.2),
+        (0.29, -0.2),
+        (1.5, 0.5),
+        (-1.5, 0.5),
+        (0.8, 1.0),
+        (-0.4, -1.0),
+        (2.0, -2.0),
+    ] {
+        let d = x - ((y - y0) * k + x0);
+        let grad = (1.0 + k * k).sqrt();
+        let want = (d / (grad + min_grad) + 0.5).clamp(0.0, 1.0) * dir;
+        check("font_coverage", bake(&coverage, (x, y, 0.0, 0.0)), want);
     }
 }

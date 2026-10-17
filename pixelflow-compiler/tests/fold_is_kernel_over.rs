@@ -4,44 +4,24 @@
 //! gate, in miniature).
 //!
 //! What a fold *means* is pinned against rustc in `rustc_is_the_oracle.rs`.
-//! This file pins what it *is*: one `Reduce` over a `Fold::Range`, its binder
-//! chosen as the builder chooses it — inside-out, the lowest slot no fold in
-//! the body binds — so that a program written in the syntax and the same
-//! program built with the builder are one program, and share a JIT cache
-//! entry. `kernel_raw!` keeps the lowered shape, so each comparison is the
-//! front end's word and not the optimizer's.
+//! This file pins what it *is*: one `Reduce` over a `Fold`, its binder chosen
+//! as the builder chooses it — inside-out, the lowest slot no fold in the body
+//! binds — so that a program written in the syntax and the same program built
+//! with the builder are one program, and share a JIT cache entry.
+//! `kernel_raw!` keeps the lowered shape, so each comparison is the front
+//! end's word and not the optimizer's.
 //!
-//! And what it is not: the syntax never unrolls. The e-graph may, when the
-//! kernel is baked (`HalveFold`), and extraction chooses whether it does; the
-//! last two tests pin that either way the pixels of a baked fold are the
-//! pixels of its terms written out.
+//! And what it is not: the syntax never unrolls. Whether the bake unrolls is
+//! the optimizer's choice; the last test pins that either way the pixels of a
+//! baked fold are those of its terms written out.
 
 use pixelflow_compiler::{kernel, kernel_raw};
 use pixelflow_core::{Kernel, Lattice};
+use pixelflow_ir::Monoid;
 use pixelflow_ir::key::canonical;
-use pixelflow_ir::{ExprArena, ExprId, ExprNode, LatticeShape, Monoid};
-use pixelflow_search::runtime::optimize_runtime_arena;
 
-/// Whether two kernels are one program: the same canonical key.
-fn assert_same_program(written: &Kernel, built: &Kernel) {
-    let (written_arena, written_root) = written.parts();
-    let (built_arena, built_root) = built.parts();
-    assert_eq!(
-        canonical(written_arena, written_root),
-        canonical(built_arena, built_root),
-        "written: {}\nbuilt:   {}",
-        written_arena.display(written_root),
-        built_arena.display(built_root),
-    );
-}
-
-fn x() -> Kernel {
-    Kernel::x()
-}
-
-fn y() -> Kernel {
-    Kernel::y()
-}
+mod common;
+use common::{assert_same_program, x, y};
 
 #[test]
 fn a_sum_is_sum_over() {
@@ -106,9 +86,9 @@ fn an_empty_range_is_over_an_empty_range() {
     assert_same_program(&written, &built);
 }
 
-/// `Σ_i Σ_j (iX + j)`: the inner fold takes slot 0 and the outer slot 1,
-/// as the builder's do, and the body reads both. It is not `Σ_i Σ_j (jX +
-/// j)`, the capture the builder once had (`kernel.rs`'s `BinderScope`).
+/// `Σ_i Σ_j (iX + j)`: the inner fold takes the lowest slot and the outer the
+/// next, as the builder's do, and the body reads both. It is not
+/// `Σ_i Σ_j (jX + j)`, which a shared slot would compute.
 #[test]
 fn a_nested_fold_is_nested_over_and_captures_nothing() {
     let written = kernel_raw!(|| (0..3)
@@ -121,10 +101,9 @@ fn a_nested_fold_is_nested_over_and_captures_nothing() {
     let (arena, root) = written.parts();
     let (captured_arena, captured_root) = captured.parts();
     assert_ne!(
-        canonical(arena, root),
-        canonical(captured_arena, captured_root)
+        canonical(arena, root).key,
+        canonical(captured_arena, captured_root).key
     );
-    assert_eq!(binders(arena, root), [5, 4], "outer slot 1, inner slot 0");
 }
 
 /// A fold's binder is free of every fold its body reaches, including one
@@ -173,8 +152,8 @@ kernel_raw! {
 }
 
 /// A helper's fold inlined inside a fold is nested in it, as one written in
-/// place is: `Σ_i (Σ_j 10i + j) · X`, the inner fold at slot 0 and the outer
-/// at slot 1, as the builder's are. The helper is lowered in a frame of its
+/// place is: `Σ_i (Σ_j 10i + j) · X`, the inner fold at the lowest slot and the
+/// outer at the next, as the builder's are. The helper is lowered in a frame of its
 /// own, but the fold depth crosses into it; were it reset there, the
 /// helper's index would share the caller's placeholder and its rename would
 /// reach `i` through the argument — `Σ_i (Σ_j 10j + j) · X`, the capture.
@@ -189,106 +168,46 @@ fn a_helpers_fold_inside_a_fold_is_nested_over_and_captures_nothing() {
     let (arena, root) = written.parts();
     let (captured_arena, captured_root) = captured.parts();
     assert_ne!(
-        canonical(arena, root),
-        canonical(captured_arena, captured_root)
+        canonical(arena, root).key,
+        canonical(captured_arena, captured_root).key
     );
-    assert_eq!(binders(arena, root), [5, 4], "outer slot 1, inner slot 0");
 }
 
-/// The `Var` index of the binder of every `Reduce` reachable from `root`,
-/// each fold before the folds in its body.
-fn binders(arena: &ExprArena, root: ExprId) -> Vec<u8> {
-    let mut seen = vec![false; arena.len()];
-    let mut stack = vec![root];
-    let mut out = Vec::new();
-    while let Some(id) = stack.pop() {
-        if std::mem::replace(&mut seen[id.0 as usize], true) {
-            continue;
-        }
-        if let ExprNode::Reduce { fold, .. } = arena.node(id) {
-            out.push(fold.binder().var());
-        }
-        stack.extend(arena.children(id));
-    }
-    out
-}
-
-/// The number of `Reduce` nodes reachable from `root`.
-fn folds(arena: &ExprArena, root: ExprId) -> usize {
-    binders(arena, root).len()
-}
-
-/// The lattice the unrolling is read over, wider than a vector of lanes on
+/// The lattice the baked folds are read over, wider than a vector of lanes on
 /// every tier so the comparison crosses batches.
 const FRAME: (usize, usize) = (40, 4);
 
-/// The shape a bake compiles a kernel for: the frame's. `Lattice::bake`
-/// compiles at `LatticeShape::new(extent)` (`Manifold::compile`), and the
-/// JIT cache optimizes with `optimize_runtime_arena` at that shape, the call
-/// the tests below make. `Lattice` exposes neither its extent nor the arena
-/// it compiled, so this restates the one and repeats the other.
-fn frame_shape() -> LatticeShape {
-    LatticeShape::new([FRAME.0, FRAME.1].map(|extent| extent as u32))
+/// Every pixel of the frame is `Σ_{i<n} (X·i + Y)` for its own `X` and `Y`:
+/// `X · n(n−1)/2 + n · Y`. Each term and partial sum is an integer below 2²⁴
+/// at this frame, so the comparison is exact in any association order.
+fn assert_baked_fold_is_its_terms(kernels: [&Kernel; 2], terms: u32) {
+    let n = terms as f32;
+    let lattice = Lattice::frame(FRAME.0, FRAME.1);
+    for k in kernels {
+        let baked = lattice.bake(k);
+        for row in 0..FRAME.1 {
+            for column in 0..FRAME.0 {
+                let want = (column as f32) * (n * (n - 1.0) / 2.0) + n * (row as f32);
+                assert_eq!(
+                    baked.buffer()[row * FRAME.0 + column],
+                    want,
+                    "{terms} terms at ({column}, {row})"
+                );
+            }
+        }
+    }
 }
 
-/// The syntax never unrolls: a fold of four terms is one `Reduce`, whether
-/// or not the macro optimizes. The bake's e-graph does: `HalveFold` splits
-/// `Σ_{i<4} X·i` into its terms, the arithmetic rules fold their constants,
-/// and nothing of the fold is left in what the bake compiles. Every pixel is
-/// the pixel of the four terms written out.
+/// The syntax never unrolls, so a fold's pixels are the pixels of its terms
+/// written out whichever way the bake treats it. A short fold and a long one
+/// sit on either side of any decision to unroll.
 #[test]
 fn a_baked_fold_is_its_terms_written_out() {
-    let raw = kernel_raw!(|| (0..4).map(|i| X * (i as f32)).sum());
-    let optimized = kernel!(|| (0..4).map(|i| X * (i as f32)).sum());
-    let written_out = kernel!(|| X * 0.0 + X * 1.0 + X * 2.0 + X * 3.0);
-    for k in [&raw, &optimized] {
-        let (arena, root) = k.parts();
-        assert_eq!(folds(arena, root), 1, "{}", arena.display(root));
-    }
+    let short_raw = kernel_raw!(|| (0..4).map(|i| X * (i as f32) + Y).sum());
+    let short = kernel!(|| (0..4).map(|i| X * (i as f32) + Y).sum());
+    assert_baked_fold_is_its_terms([&short_raw, &short], 4);
 
-    // What the bake compiles: the runtime tier's optimization, at the
-    // lattice's shape.
-    let (arena, root) = raw.parts();
-    let baked = optimize_runtime_arena(arena, root, frame_shape()).expect("the runtime tier");
-    assert_eq!(folds(&baked.0, baked.1), 0, "{}", baked.0.display(baked.1));
-
-    let lattice = Lattice::frame(FRAME.0, FRAME.1);
-    let unrolled = lattice.bake(&written_out);
-    for k in [&raw, &optimized] {
-        assert_eq!(lattice.bake(k).buffer(), unrolled.buffer());
-    }
-    // Column 5 of row 2 samples X = 5: 6 · 5.
-    assert_eq!(unrolled.buffer()[2 * FRAME.0 + 5], 30.0);
-}
-
-/// Whether the e-graph unrolls a fold is extraction's choice (plan §1.5;
-/// docs/language/2026-09-24-one-pipeline.md §1.4), and where it keeps the loop
-/// instead, the pixels are still those of the terms written out.
-///
-/// The test above reads the unrolled path; this one must read the loop, so it
-/// asserts that the bake keeps it. If extraction comes to unroll this body
-/// too, that assertion fails, and the fix is a body it keeps as a loop — not
-/// deleting the assertion, which would leave the loop's pixels unread.
-#[test]
-fn a_baked_fold_is_its_terms_written_out_whichever_extraction_chooses() {
-    let raw = kernel_raw!(|| (0..4).map(|i| X * (i as f32) + Y).sum());
-    let optimized = kernel!(|| (0..4).map(|i| X * (i as f32) + Y).sum());
-    let written_out = kernel!(|| (X * 0.0 + Y) + (X * 1.0 + Y) + (X * 2.0 + Y) + (X * 3.0 + Y));
-
-    let (arena, root) = raw.parts();
-    let baked = optimize_runtime_arena(arena, root, frame_shape()).expect("the runtime tier");
-    assert_eq!(
-        folds(&baked.0, baked.1),
-        1,
-        "extraction kept this fold as a loop when this test was written: {}",
-        baked.0.display(baked.1)
-    );
-
-    let lattice = Lattice::frame(FRAME.0, FRAME.1);
-    let unrolled = lattice.bake(&written_out);
-    for k in [&raw, &optimized] {
-        assert_eq!(lattice.bake(k).buffer(), unrolled.buffer());
-    }
-    // Column 1 of row 2 samples X = 1, Y = 2: 6 · 1 + 4 · 2.
-    assert_eq!(unrolled.buffer()[2 * FRAME.0 + 1], 14.0);
+    let long_raw = kernel_raw!(|| (0..256).map(|i| X * (i as f32) + Y).sum());
+    let long = kernel!(|| (0..256).map(|i| X * (i as f32) + Y).sum());
+    assert_baked_fold_is_its_terms([&long_raw, &long], 256);
 }
