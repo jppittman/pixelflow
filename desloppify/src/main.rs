@@ -11,7 +11,7 @@ use desloppify::agent::{self, Ask, Usage};
 use desloppify::decide::{self, Decide};
 use desloppify::model::Provider;
 use desloppify::rate_limit::{self, AdaptiveConfig, RateLimiter, SystemClock, TokenBucketConfig};
-use desloppify::review::{Call, Report, Reviewers, diagnose, plan, review, synthesize};
+use desloppify::review::{Call, Report, Reviewers, Synthesis, identify, plan, review, synthesize};
 use desloppify::rule::{self, Rule};
 use desloppify::skills;
 
@@ -94,13 +94,14 @@ struct Args {
     /// Most calls in flight at once, retries included.
     #[arg(long, default_value = "8")]
     jobs: NonZeroUsize,
-    /// Print each finding as `path:line: [rule] message` instead of the
-    /// lead reviewer's synthesized review.
+    /// Print each finding as `path:line: [rule] message`, and the things
+    /// they are about, instead of asking the lead reviewer for the review.
     #[arg(long)]
     findings_only: bool,
     /// Keep the run here: every model reply in `journal.jsonl` as it
-    /// arrives, and the gathered findings and diagnoses in `report.json`
-    /// before the lead review is asked for. A rerun with the same directory
+    /// arrives, and the gathered findings and things in `report.json`
+    /// before the lead review is asked for, with its diagnoses and roots
+    /// once it answers. A rerun with the same directory
     /// answers every question already in the journal without a call.
     #[arg(long)]
     out: Option<PathBuf>,
@@ -181,20 +182,19 @@ async fn run<A: Ask, D: Decide>(
         min_confidence: args.min_confidence,
     });
     let mut report = review(reviewers.clone(), rules.clone(), plan).await?;
-    let diagnosed = diagnose(&reviewers.ask, &report).await?;
-    report.diagnoses = diagnosed.diagnoses;
-    report.roots = diagnosed.roots;
-    report.failures.extend(diagnosed.failures);
+    let identified = identify(&reviewers.ask, &report).await?;
+    report.things = identified.things;
+    report.failures.extend(identified.failures);
     for failure in &report.failures {
         eprintln!("error: {failure:#}");
     }
     if let Some(out) = &args.out {
-        write_report(&out.join(REPORT), &report)?;
+        write_report(&out.join(REPORT), &report, None)?;
     }
-    let lead = if args.findings_only {
+    let synthesis = if args.findings_only {
         None
     } else {
-        // Without a lead, the findings and diagnoses are still the review.
+        // Without a lead, the findings and things are still the review.
         synthesize(&reviewers.ask, &rules, &report)
             .await
             .unwrap_or_else(|error| {
@@ -202,14 +202,19 @@ async fn run<A: Ask, D: Decide>(
                 None
             })
     };
-    match &lead {
-        Some(review) => println!("{}", review.text),
+    match &synthesis {
+        Some(synthesis) => {
+            println!("{}", synthesis.review);
+            if let Some(out) = &args.out {
+                write_report(&out.join(REPORT), &report, Some(synthesis))?;
+            }
+        }
         None => print_findings(&report),
     }
     print_decisions(&rules, &report);
     let after = After {
-        diagnosis: diagnosed.usage,
-        lead: lead.map(|l| l.usage),
+        identify: identified.usage,
+        lead: synthesis.map(|s| s.usage),
     };
     print_usage(&rules, &report, &after);
     let clean = report.findings.is_empty() && report.failures.is_empty();
@@ -220,15 +225,17 @@ async fn run<A: Ask, D: Decide>(
     })
 }
 
-/// Everything the review gathered, as one JSON object: findings, diagnoses
-/// and roots (their `explains` index the findings and diagnoses), each
-/// rule's decisions, and the failures as text.
-fn write_report(path: &Path, report: &Report) -> Result<()> {
+/// Everything the review gathered, as one JSON object: findings, things,
+/// and once the lead has answered its diagnoses and roots (their `thing` and
+/// `explains` index the things, findings and diagnoses), each rule's
+/// decisions, and the failures as text.
+fn write_report(path: &Path, report: &Report, synthesis: Option<&Synthesis>) -> Result<()> {
     let failures: Vec<String> = report.failures.iter().map(|f| format!("{f:#}")).collect();
     let json = serde_json::json!({
         "findings": report.findings,
-        "diagnoses": report.diagnoses,
-        "roots": report.roots,
+        "things": report.things,
+        "diagnoses": synthesis.map(|s| &s.diagnoses),
+        "roots": synthesis.map(|s| &s.roots),
         "decisions": report.decisions,
         "escalated": report.escalated,
         "usage": report.usage,
@@ -259,7 +266,7 @@ fn print_decisions(rules: &[Rule], report: &Report) {
 /// levels — then System One's and the lead's, to stderr.
 /// What the calls after the rules' own cost.
 struct After {
-    diagnosis: Usage,
+    identify: Usage,
     lead: Option<Usage>,
 }
 
@@ -289,14 +296,14 @@ fn print_usage(rules: &[Rule], report: &Report, after: &After) {
     }
     row(&total, "", "(model total)");
     row(&report.system_one, "", "(system one)");
-    row(&after.diagnosis, "3→4", "(diagnosis)");
+    row(&after.identify, "2", "(identify)");
     if let Some(lead) = after.lead {
         row(&lead, "4", "(lead review)");
     }
 }
 
-/// Each finding as `path:line: [rule/outcome] message`, then each diagnosis
-/// in Markdown.
+/// Each finding as `path:line: [rule/outcome] message`, then each thing
+/// they are about in Markdown.
 fn print_findings(report: &Report) {
     for f in &report.findings {
         println!(
@@ -308,22 +315,8 @@ fn print_findings(report: &Report) {
             f.message
         );
     }
-    for r in &report.roots {
-        let things: Vec<&str> = r
-            .explains
-            .iter()
-            .filter_map(|&i| report.diagnoses.get(i).map(|d| d.thing.as_str()))
-            .collect();
-        println!(
-            "\n## Root — {}\n\n{}\n\n**What falls out.** {}\n\n**Explains the diagnoses of:** {}",
-            r.component.display(),
-            r.root,
-            r.falls_out,
-            things.join("; ")
-        );
-    }
-    for d in &report.diagnoses {
-        let explains: Vec<String> = d
+    for t in &report.things {
+        let symptoms: Vec<String> = t
             .explains
             .iter()
             .map(|&i| {
@@ -332,14 +325,11 @@ fn print_findings(report: &Report) {
             })
             .collect();
         println!(
-            "\n## {} — {}\n\n**Diagnosis.** {}\n\n**The thing, from first principles.** {}\n\n**Its shape in the code.** {}\n\n**With the thing's shape.** {}\n\n**Explains:** {}",
-            d.thing,
-            d.component.display(),
-            d.diagnosis,
-            d.denotation,
-            d.shape,
-            d.falls_out,
-            explains.join(", ")
+            "\n## {} — {}\n\n**From first principles.** {}\n\n**Symptoms:** {}",
+            t.thing,
+            t.component.display(),
+            t.description,
+            symptoms.join(", ")
         );
     }
 }

@@ -32,7 +32,7 @@ crate: this cites its README, not DENOTATION.
 `mod.rs`: `Snippet` (`first_line`, `numbered`), `snippets` (a rule's units
 in a file) and `outline` (the file with bodies elided); `capture.rs` is the
 implementation, all `pub(super)`. Callers: `review/plan.rs` (`snippets`, and
-`outline` for a module root) and `review/diagnose.rs` (`outline`).
+`outline` for a module root) and `review/identify.rs` (`outline`).
 
 ## Enforced by
 - Visibility: `capture.rs` exports `pub(super)` only and `mod snippet;` is not

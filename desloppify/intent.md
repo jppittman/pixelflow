@@ -3,13 +3,14 @@
 **Is.** Rule-driven code review: a function from (rules, files) to a `Report`
 (desloppify/README.md, not DENOTATION: this is not a pixelflow crate). A rule is
 a typed decision; tree-sitter cuts the units, a cheap decider answers, a model
-explains only the violations, and findings that converge on a module are
-diagnosed as symptoms of a missing model.
+explains only the violations, small models name what converging findings are
+about, and one frontier call diagnoses them as symptoms of a missing model and
+writes the review.
 
 ## Owns
 - The shipped rules (`rules/*.json`, 27) and the skills they pull in
   (`skills/<name>/SKILL.md`): what this repository asks a reviewer.
-- The pipeline's shape: plan, decide, explain, diagnose, lead review;
+- The pipeline's shape: plan, decide, explain, identify, synthesize;
   `main.rs` only wires it from flags.
 - The exit status: failure on any finding or undecided unit.
 - Its own layout: every module is a directory whose `mod.rs` is the contract,
@@ -23,7 +24,7 @@ diagnosed as symptoms of a missing model.
   or backend names one. Jev's `jev-latest` is System One's, in `decide/`.
 - A module that is handed source never reads a file: `language/` and
   `snippet/` import no `std::fs`; only `skills`, `rule`, `review/plan.rs`,
-  `review/diagnose.rs`, `agent/journal.rs` and `main.rs` touch the disk.
+  `review/identify.rs`, `review/synthesize.rs`, `agent/journal.rs` and `main.rs` touch the disk.
 - No rule's id or outcome is matched in `src/`; judgment lives in the JSON.
 - No `#[test]` or `#[cfg(test)]` module in `src/`; tests live in `tests/`.
 
@@ -34,7 +35,7 @@ its own `intent.md`. The CLI is `src/main.rs` (`Args`): paths to review;
 `--backend` (`anthropic`, `gemini`, `claude-code`, `dry-run`), `--system-one`
 (`none`, `jev`, `dry-run`), `--limiter`, `--min-confidence`, `--jobs`,
 `--findings-only`, `--out`, `--rules`, `--skills`; it calls `skills::load`,
-`rule::load_dir`, `review::{plan, review, diagnose, synthesize}`.
+`rule::load_dir`, `review::{plan, review, identify, synthesize}`.
 
 ## Enforced by
 - `desloppify/tests/shipped_rules.rs`: every rule in `rules/` loads, and each

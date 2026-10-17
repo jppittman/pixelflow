@@ -31,29 +31,31 @@ TYPESAFE_API_KEY=...  cargo run -p desloppify -- --system-one jev path/to/src  #
 4. **Explain.** A unit decided as one of the rule's `violations` goes to a
    model at `levels.explain`, told the question and the outcome, which reports
    findings: line, what, and the fix.
-5. **Diagnose.** Findings are symptoms. Where they converge on a module —
-   at least three, from at least two rules — the review asks what they are
-   symptoms *of*, the way a person would: what is this thing, how does it
-   work, what does it do, how does it behave? One level-3 call names the
-   thing in its domain's words ("an assembler"). One level-4 call describes
-   it from first principles and is never shown the code, so it cannot borrow
-   the code's model of itself. A last level-4 call translates that
-   description's shape onto the code's outline — where each part is, or that
-   it is nowhere — and states the diagnosis: the model the code is missing,
-   the symptoms it explains, and what falls out once the code has the
-   thing's shape. Diagnoses are symptoms too: a module with two or more is
-   asked once more, at level 4, for the root beneath them — the deepest
-   model that makes several true at once, with its consequences followed to
-   closure.
-6. **Lead review.** One level-4 call reads every finding and writes the
-   review, leading with the roots, then the diagnoses: grouped by file, duplicates across
-   rules merged, trivial or mistaken findings dropped and counted, recurring
-   patterns called out.
-   `--findings-only` prints the raw findings instead, one
-   `path:line: [rule/outcome] message` per line.
+5. **Identify.** Findings are symptoms. Where they converge on a module —
+   at least three, from at least two rules — a level-2 call names the things
+   they are about in their domain's words ("an assembler"), and one more
+   level-2 call per thing describes it from first principles without being
+   shown the code, so it cannot borrow the code's model of itself. Every
+   module and every thing is asked at once.
+6. **Synthesize.** One level-4 call — the only one that sees everything —
+   reads every finding, every named thing with its description, and the
+   outlines of their modules, and judges: for each thing, the model the code
+   is missing and what falls out once the code has the thing's shape; the
+   roots beneath several diagnoses, across modules as well as within one;
+   and the review, leading with the roots, then the diagnoses, then the
+   findings grouped by file, duplicates across rules merged, trivial or
+   mistaken findings dropped and counted, recurring patterns called out.
+   `--findings-only` skips it and prints the raw findings, one
+   `path:line: [rule/outcome] message` per line, and the things named.
 
-Each model call sees one rule and a little code, so none forgets a rule; the
-fine outcomes, which are most of them, never pay for an explanation. A run
+Small models make many calls and the large one makes one: each small call
+sees one rule and a little code, or one module, so none forgets a rule, and
+the frontier spends its judgment on the whole picture rather than on any
+one module. The rules of a unit are asked at once, as are the units, up to
+`--jobs` in flight; the findings are put in one total order, so the same
+answers give the same synthesis prompt and a `--out` rerun replays it.
+
+The fine outcomes, which are most of them, never pay for an explanation. A run
 ends with each rule's tally of outcomes and escalations, and calls and tokens
 per rule, for System One and for the lead, on stderr. Exits non-zero on any
 finding or any unit that could not be decided.

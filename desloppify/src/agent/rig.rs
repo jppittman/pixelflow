@@ -11,11 +11,14 @@ use rig_core::providers::{anthropic::Anthropic, gemini::Gemini};
 use tokio::sync::Semaphore;
 
 use super::{Answer, Ask, Question, Usage};
-use crate::model::Provider;
+use crate::model::{ModelLevel, Provider};
 use crate::rate_limit::{BoxError, RateLimiter, Signal};
 
-/// Enough for a list of findings; the reply is JSON, not prose.
+/// Enough for a decision or a list of findings.
 const MAX_REPLY_TOKENS: u64 = 4096;
+/// The frontier writes the whole review, its diagnoses and roots in one
+/// reply.
+const MAX_FRONTIER_REPLY_TOKENS: u64 = 16_000;
 
 const TOO_MANY_REQUESTS: u16 = 429;
 const RETRY_AFTER: &str = "retry-after";
@@ -71,7 +74,7 @@ impl Ask for RigAgent {
             tokio::time::sleep(wait).await;
             let request = CompletionRequest::new(question.prompt)
                 .preamble(question.system)
-                .max_tokens(MAX_REPLY_TOKENS)
+                .max_tokens(max_reply_tokens(question.level))
                 .output_schema(schema.clone());
             let reply = match &self.client {
                 Client::Anthropic(client) => client
@@ -95,6 +98,13 @@ impl Ask for RigAgent {
             }
             last = Some(Box::new(error));
         }
+    }
+}
+
+fn max_reply_tokens(level: ModelLevel) -> u64 {
+    match level {
+        ModelLevel::Frontier => MAX_FRONTIER_REPLY_TOKENS,
+        ModelLevel::Lite | ModelLevel::Fast | ModelLevel::Strong => MAX_REPLY_TOKENS,
     }
 }
 

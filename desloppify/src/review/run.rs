@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use futures::future::join_all;
 use tokio::task::JoinSet;
 
 use super::reply::{
@@ -68,9 +69,12 @@ pub(super) async fn review<A: Ask, D: Decide>(
             }
         }
     }
-    report
-        .findings
-        .sort_by(|a, b| (&a.path, a.line, &a.rule).cmp(&(&b.path, b.line, &b.rule)));
+    // A total order: calls finish in any order, and the synthesis numbers
+    // the findings in this one.
+    report.findings.sort_by(|a, b| {
+        (&a.path, a.line, &a.rule, &a.outcome, &a.message)
+            .cmp(&(&b.path, b.line, &b.rule, &b.outcome, &b.message))
+    });
     Ok(report)
 }
 
@@ -107,10 +111,13 @@ async fn reviewed<A: Ask, D: Decide>(
         state,
         decisions,
     };
-    let mut judged = Vec::new();
-    for &index in &call.rules {
-        judged.push(judge(reviewers, &unit, index).await);
-    }
+    // Each rule's questions about the unit are independent of the others'.
+    let judged = join_all(
+        call.rules
+            .iter()
+            .map(|&index| judge(reviewers, &unit, index)),
+    )
+    .await;
     Reviewed {
         system_one: unit.decisions.usage,
         system_one_failure,

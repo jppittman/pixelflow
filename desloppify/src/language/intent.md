@@ -32,7 +32,7 @@ right. desloppify is not a pixelflow crate: this cites its README, not DENOTATIO
 and `of`, `grammar`, `query`, `bodies`, `is_test_module`. The module is
 crate-private (`mod language;` in `lib.rs`). Callers: `rule/file.rs`
 (compiles every language's query for a rule's unit when the rule loads),
-`snippet/` (cuts a file), `review/plan.rs` and `review/diagnose.rs` (pick the
+`snippet/` (cuts a file), `review/plan.rs` and `review/identify.rs` (pick the
 language of a file).
 
 ## Enforced by

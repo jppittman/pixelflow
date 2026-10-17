@@ -96,8 +96,9 @@ already exists: recover what the thing *means*, then hold the code to it.
 
 ## Tools
 
-- `desloppify`'s diagnose step runs steps 2–6 for each module whose findings
-  converge; its description call never sees the code (step 3).
+- `desloppify` names the thing for each module whose findings converge and
+  describes it without the code (step 3), then one frontier call runs the
+  rest of the steps over every module at once.
 - Its `trait-first` (bypassed general path), `invariant-in-comment` (identity
   in a string) and `phases-in-order` (predictions, late decisions) rules are
   tuned to the symptoms above.

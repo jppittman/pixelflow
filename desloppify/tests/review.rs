@@ -1,4 +1,4 @@
-//! `plan`, `review` and `synthesize` driven through their public API, with a
+//! `plan`, `review`, `identify` and `synthesize` driven through their public API, with a
 //! scripted `Ask` standing in for a model and a scripted `Decide` for
 //! System One.
 
@@ -9,7 +9,7 @@ use anyhow::{Result, bail};
 use desloppify::agent::{self, Answer, Ask, Question, Usage};
 use desloppify::decide::{self, Choice, Decide, Decided, Decisions};
 use desloppify::model::ModelLevel;
-use desloppify::review::{Diagnosis, Report, Reviewers, diagnose, plan, review, synthesize};
+use desloppify::review::{Report, Reviewers, identify, plan, review, synthesize};
 use desloppify::rule::{self, Rule};
 use desloppify::skills;
 
@@ -37,9 +37,7 @@ enum Kind {
     Explain,
     Identify,
     Describe,
-    Diagnose,
-    Root,
-    Prose,
+    Synthesize,
 }
 
 /// What a model call was asked.
@@ -52,17 +50,14 @@ struct Asked {
 }
 
 fn kind(schema: Option<&serde_json::Value>) -> Kind {
-    let Some(schema) = schema else {
-        return Kind::Prose;
-    };
+    let schema = schema.expect("every call is held to a schema");
     let has = |property: &str| schema["properties"].get(property).is_some();
     match () {
         () if has("outcome") => Kind::Decide,
         () if has("findings") => Kind::Explain,
         () if has("things") => Kind::Identify,
         () if has("description") => Kind::Describe,
-        () if has("diagnosis") => Kind::Diagnose,
-        () if has("root") => Kind::Root,
+        () if has("review") => Kind::Synthesize,
         () => panic!("an unknown schema: {schema}"),
     }
 }
@@ -782,16 +777,19 @@ async fn files_in_no_known_language_or_outside_a_rules_paths_are_never_shown() {
     assert_eq!(decided(&report, "scoped", "f"), 1);
 }
 
+/// A synthesis that diagnoses nothing and writes `# Review`.
+const REVIEW: &str = r##"{"diagnoses": [], "roots": [], "review": "# Review\n"}"##;
+
 #[tokio::test]
 async fn a_report_without_findings_is_not_synthesized() {
-    let lead = Scripted::new(|_| Ok("unused".into()));
-    let review = synthesize(&lead, &[], &Report::default()).await.unwrap();
-    assert!(review.is_none());
+    let lead = Scripted::new(|_| Ok(REVIEW.into()));
+    let synthesis = synthesize(&lead, &[], &Report::default()).await.unwrap();
+    assert!(synthesis.is_none());
     assert!(lead.asked().is_empty());
 }
 
 #[tokio::test]
-async fn the_lead_review_is_one_frontier_call_over_every_finding_with_its_rule() {
+async fn the_synthesis_is_one_frontier_call_over_every_finding_with_its_rule() {
     let tree = Tree::new(
         "lead",
         &[("everything", EVERYTHING)],
@@ -800,18 +798,21 @@ async fn the_lead_review_is_one_frontier_call_over_every_finding_with_its_rule()
     let reviewers = reviewers(Scripted::new(wrong_on_line_one), decide::none());
     let report = run(&tree, &["a.rs", "b.rs"], &reviewers).await;
 
-    let lead = Scripted::new(|_| Ok("# Review\n".into()));
-    let review = synthesize(&lead, &tree.rules(), &report)
+    let lead = Scripted::new(|_| Ok(REVIEW.into()));
+    let synthesis = synthesize(&lead, &tree.rules(), &report)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(review.text, "# Review\n");
-    assert_eq!(review.usage, ONE_CALL);
+    assert_eq!(synthesis.review, "# Review\n");
+    assert!(synthesis.diagnoses.is_empty() && synthesis.roots.is_empty());
+    assert_eq!(synthesis.usage, ONE_CALL);
 
     let asked = lead.asked();
     assert_eq!(asked.len(), 1);
-    assert_eq!(asked[0].level, ModelLevel::Frontier);
-    assert_eq!(asked[0].kind, Kind::Prose, "the lead writes prose");
+    assert_eq!(
+        (asked[0].kind, asked[0].level),
+        (Kind::Synthesize, ModelLevel::Frontier)
+    );
     let brief = &asked[0].prompt;
     assert!(
         brief.contains("`everything`: Is anything wrong here?"),
@@ -952,6 +953,14 @@ async fn a_dry_run_decides_every_unit_by_its_first_outcome_and_prices_it_by_its_
 
 /// Two rules that each find two places wrong in every file: symptoms that
 /// converge on a module from two angles.
+const CONVERGING: fn(&Asked) -> Result<String> = |asked| {
+    Ok(match asked.kind {
+        Kind::Decide => WRONG.into(),
+        _ => r#"{"findings": [{"outcome": "wrong", "line": 1, "message": "one"}, {"outcome": "wrong", "line": 2, "message": "two"}]}"#.into(),
+    })
+};
+
+/// A module `m` whose findings converge.
 fn converging(name: &str) -> (Tree, Arc<Reviewers<Scripted, impl Decide>>) {
     let tree = Tree::new(
         name,
@@ -961,63 +970,49 @@ fn converging(name: &str) -> (Tree, Arc<Reviewers<Scripted, impl Decide>>) {
             ("m/a.rs", "pub fn distinctive_leaf() {\n    body();\n}\n"),
         ],
     );
-    let reviewers = reviewers(
-        Scripted::new(|asked| {
-            Ok(match asked.kind {
-                Kind::Decide => WRONG.into(),
-                _ => r#"{"findings": [{"outcome": "wrong", "line": 1, "message": "one"}, {"outcome": "wrong", "line": 2, "message": "two"}]}"#.into(),
-            })
-        }),
-        decide::none(),
-    );
-    (tree, reviewers)
+    (tree, reviewers(Scripted::new(CONVERGING), decide::none()))
 }
 
-/// Names an assembler from symptoms 1-3, describes it, and diagnoses it as
-/// explaining symptoms 1 and 3.
-fn diagnosing(asked: &Asked) -> Result<String> {
+/// Names an assembler from symptoms 1-3 and describes it.
+fn naming(asked: &Asked) -> Result<String> {
     Ok(match asked.kind {
         Kind::Identify => r#"{"things": [{"thing": "an assembler", "context": "in a JIT", "symptoms": [1, 2, 3]}]}"#.into(),
         Kind::Describe => r#"{"description": "An assembler turns labelled items into bytes."}"#.into(),
-        Kind::Diagnose => r#"{"shape": "labels are strings", "diagnosis": "a label is a key", "falls_out": "the names go", "explains": [1, 3]}"#.into(),
-        other => bail!("not a diagnosis call: {other:?}"),
+        other => bail!("not a naming call: {other:?}"),
     })
 }
 
 #[tokio::test]
-async fn converging_symptoms_are_named_described_without_the_code_and_diagnosed() {
-    let (tree, reviewers) = converging("diagnosed");
+async fn converging_symptoms_are_named_by_small_models_and_described_without_the_code() {
+    let (tree, reviewers) = converging("named");
     let report = run(&tree, &["m/mod.rs", "m/a.rs"], &reviewers).await;
     assert_eq!(report.findings.len(), 8);
 
-    let doctor = Scripted::new(diagnosing);
-    let diagnosed = diagnose(&doctor, &report).await.unwrap();
-    assert!(diagnosed.failures.is_empty());
-    assert_eq!(diagnosed.diagnoses.len(), 1);
-    let d = &diagnosed.diagnoses[0];
-    assert_eq!(d.component, tree.path("m"));
-    assert_eq!(d.thing, "an assembler");
+    let namer = Scripted::new(naming);
+    let identified = identify(&namer, &report).await.unwrap();
+    assert!(identified.failures.is_empty());
+    assert_eq!(identified.things.len(), 1);
+    let t = &identified.things[0];
+    assert_eq!(t.component, tree.path("m"));
     assert_eq!(
-        d.denotation,
+        (t.thing.as_str(), t.context.as_str()),
+        ("an assembler", "in a JIT")
+    );
+    assert_eq!(
+        t.description,
         "An assembler turns labelled items into bytes."
     );
-    assert_eq!(
-        (d.diagnosis.as_str(), d.falls_out.as_str()),
-        ("a label is a key", "the names go")
-    );
-    // Symptoms 1 and 3 of the thing's own three are the module's first and
-    // third findings, which are the report's.
-    assert_eq!(d.explains, [0, 2]);
-    assert_eq!(diagnosed.usage.calls, 3);
+    // The module's first three findings are the report's.
+    assert_eq!(t.explains, [0, 1, 2]);
+    assert_eq!(identified.usage.calls, 2);
 
-    let asked = doctor.asked();
+    let asked = namer.asked();
     let steps: Vec<_> = asked.iter().map(|a| (a.kind, a.level)).collect();
     assert_eq!(
         steps,
         [
-            (Kind::Identify, ModelLevel::Strong),
-            (Kind::Describe, ModelLevel::Frontier),
-            (Kind::Diagnose, ModelLevel::Frontier),
+            (Kind::Identify, ModelLevel::Fast),
+            (Kind::Describe, ModelLevel::Fast),
         ]
     );
     for code in ["distinctive_root", "distinctive_leaf"] {
@@ -1026,46 +1021,26 @@ async fn converging_symptoms_are_named_described_without_the_code_and_diagnosed(
             !asked[1].prompt.contains(code),
             "the description never sees the code"
         );
-        assert!(
-            asked[2].prompt.contains(code),
-            "the diagnosis sees the outline"
-        );
     }
+    assert!(!asked[0].prompt.contains("body()"), "bodies are elided");
     assert_eq!(asked[1].prompt, "an assembler, in a JIT");
-    assert!(
-        asked[2]
-            .prompt
-            .contains("An assembler turns labelled items into bytes.")
-    );
-    assert!(
-        !asked[2].prompt.contains("body()"),
-        "bodies are elided from the shape"
-    );
 }
 
 #[tokio::test]
-async fn symptoms_from_one_rule_alone_are_not_diagnosed() {
+async fn symptoms_from_one_rule_alone_are_not_named() {
     let tree = Tree::new(
         "one-rule",
         &[("first", EVERYTHING)],
         &[("m/mod.rs", "mod a;\n"), ("m/a.rs", "fn a() {}\n")],
     );
-    let reviewers = reviewers(
-        Scripted::new(|asked| {
-            Ok(match asked.kind {
-                Kind::Decide => WRONG.into(),
-                _ => r#"{"findings": [{"outcome": "wrong", "line": 1, "message": "one"}, {"outcome": "wrong", "line": 2, "message": "two"}]}"#.into(),
-            })
-        }),
-        decide::none(),
-    );
+    let reviewers = reviewers(Scripted::new(CONVERGING), decide::none());
     let report = run(&tree, &["m/mod.rs", "m/a.rs"], &reviewers).await;
     assert_eq!(report.findings.len(), 4);
 
-    let doctor = Scripted::new(diagnosing);
-    let diagnosed = diagnose(&doctor, &report).await.unwrap();
-    assert!(diagnosed.diagnoses.is_empty());
-    assert!(doctor.asked().is_empty());
+    let namer = Scripted::new(naming);
+    let identified = identify(&namer, &report).await.unwrap();
+    assert!(identified.things.is_empty());
+    assert!(namer.asked().is_empty());
 }
 
 #[tokio::test]
@@ -1073,7 +1048,7 @@ async fn a_thing_only_one_symptom_concerns_is_not_described() {
     let (tree, reviewers) = converging("one-symptom");
     let report = run(&tree, &["m/mod.rs", "m/a.rs"], &reviewers).await;
 
-    let doctor = Scripted::new(|asked| {
+    let namer = Scripted::new(|asked| {
         Ok(match asked.kind {
             Kind::Identify => {
                 r#"{"things": [{"thing": "a parser", "context": "c", "symptoms": [2]}]}"#.into()
@@ -1081,61 +1056,33 @@ async fn a_thing_only_one_symptom_concerns_is_not_described() {
             other => bail!("asked {other:?}"),
         })
     });
-    let diagnosed = diagnose(&doctor, &report).await.unwrap();
-    assert!(diagnosed.diagnoses.is_empty() && diagnosed.failures.is_empty());
-    assert_eq!(doctor.asked().len(), 1);
+    let identified = identify(&namer, &report).await.unwrap();
+    assert!(identified.things.is_empty() && identified.failures.is_empty());
+    assert_eq!(namer.asked().len(), 1);
 }
 
 #[tokio::test]
-async fn a_diagnosis_outside_its_schema_is_a_failure_not_an_abort() {
-    let (tree, reviewers) = converging("bad-diagnosis");
+async fn a_description_outside_its_schema_is_a_failure_not_an_abort() {
+    let (tree, reviewers) = converging("bad-description");
     let report = run(&tree, &["m/mod.rs", "m/a.rs"], &reviewers).await;
 
-    let doctor = Scripted::new(|asked| {
+    let namer = Scripted::new(|asked| {
         Ok(match asked.kind {
-            Kind::Diagnose => "It is an assembler, probably.".into(),
-            _ => diagnosing(asked)?,
+            Kind::Describe => "It is an assembler, probably.".into(),
+            _ => naming(asked)?,
         })
     });
-    let diagnosed = diagnose(&doctor, &report).await.unwrap();
-    assert!(diagnosed.diagnoses.is_empty());
-    assert_eq!(diagnosed.failures.len(), 1);
-    assert!(format!("{:#}", diagnosed.failures[0]).contains("an assembler"));
+    let identified = identify(&namer, &report).await.unwrap();
+    assert!(identified.things.is_empty());
+    assert_eq!(identified.failures.len(), 1);
+    assert!(format!("{:#}", identified.failures[0]).contains("an assembler"));
 }
 
-#[tokio::test]
-async fn the_lead_review_leads_with_the_diagnoses() {
-    let (tree, reviewers) = converging("lead-diagnosed");
+/// Two things in `m`, named by small models, ready for the synthesis.
+async fn identified(name: &str) -> (Tree, Report) {
+    let (tree, reviewers) = converging(name);
     let mut report = run(&tree, &["m/mod.rs", "m/a.rs"], &reviewers).await;
-    report.diagnoses = vec![Diagnosis {
-        component: tree.path("m"),
-        thing: "an assembler".into(),
-        denotation: "items into bytes".into(),
-        shape: "labels are strings".into(),
-        diagnosis: "a label is a key".into(),
-        falls_out: "the names go".into(),
-        explains: vec![0, 2],
-    }];
-
-    let lead = Scripted::new(|_| Ok("# Review\n".into()));
-    synthesize(&lead, &tree.rules(), &report)
-        .await
-        .unwrap()
-        .unwrap();
-    let brief = &lead.asked()[0].prompt;
-    let diagnoses = brief.find("## Diagnoses").expect(brief);
-    assert!(diagnoses < brief.find("## Rules").unwrap(), "{brief}");
-    assert!(brief.contains("a label is a key"), "{brief}");
-    assert!(brief.contains("Explains: F1, F3"), "{brief}");
-    assert!(brief.contains("- F1 line 1 [first/wrong]: one"), "{brief}");
-}
-
-#[tokio::test]
-async fn several_diagnoses_in_a_module_are_asked_for_the_root_beneath_them() {
-    let (tree, reviewers) = converging("rooted");
-    let report = run(&tree, &["m/mod.rs", "m/a.rs"], &reviewers).await;
-
-    let doctor = Scripted::new(|asked| {
+    let namer = Scripted::new(|asked| {
         Ok(match asked.kind {
             Kind::Identify => r#"{"things": [
                 {"thing": "an assembler", "context": "c", "symptoms": [1, 2]},
@@ -1143,57 +1090,142 @@ async fn several_diagnoses_in_a_module_are_asked_for_the_root_beneath_them() {
             ]}"#
             .into(),
             Kind::Describe => r#"{"description": "described"}"#.into(),
-            Kind::Diagnose if asked.prompt.contains("an assembler") => {
-                r#"{"shape": "s", "diagnosis": "labels are names", "falls_out": "f", "explains": [1]}"#.into()
-            }
-            Kind::Diagnose => {
-                r#"{"shape": "s", "diagnosis": "temps are predicted", "falls_out": "f", "explains": [1]}"#.into()
-            }
-            Kind::Root => r#"{"root": "selection is a phase", "falls_out": "the predictions go", "explains": [1, 2, 9]}"#.into(),
             other => bail!("asked {other:?}"),
         })
     });
-    let diagnosed = diagnose(&doctor, &report).await.unwrap();
-    assert!(diagnosed.failures.is_empty(), "{:?}", diagnosed.failures);
-    assert_eq!(diagnosed.diagnoses.len(), 2);
-    assert_eq!(diagnosed.roots.len(), 1);
-    let root = &diagnosed.roots[0];
-    assert_eq!(root.component, tree.path("m"));
-    assert_eq!(root.root, "selection is a phase");
-    // A number past the module's diagnoses names nothing.
-    assert_eq!(root.explains, [0, 1]);
+    let identified = identify(&namer, &report).await.unwrap();
+    report.things = identified.things;
+    (tree, report)
+}
 
-    let asked = doctor.asked();
-    let rooted = asked.iter().find(|a| a.kind == Kind::Root).unwrap();
-    assert_eq!(rooted.level, ModelLevel::Frontier);
-    assert!(
-        rooted
-            .prompt
-            .contains("D1. an assembler\nDiagnosis: labels are names"),
-        "{}",
-        rooted.prompt
+#[tokio::test]
+async fn the_synthesis_sees_the_things_and_their_outlines_and_its_numbers_become_indexes() {
+    let (tree, report) = identified("synthesized").await;
+    assert_eq!(report.things.len(), 2);
+
+    let lead = Scripted::new(|_| {
+        Ok(r##"{
+            "diagnoses": [
+                {"thing": 1, "diagnosis": "a label is a key", "falls_out": "names go", "explains": [1, 2, 99]},
+                {"thing": 2, "diagnosis": "temps are predicted", "falls_out": "f", "explains": [3]}
+            ],
+            "roots": [{"root": "selection is a phase", "falls_out": "predictions go", "explains": [1, 2, 9]}],
+            "review": "# Review\n"
+        }"##
+        .into())
+    });
+    let synthesis = synthesize(&lead, &tree.rules(), &report)
+        .await
+        .unwrap()
+        .unwrap();
+    let d = &synthesis.diagnoses;
+    assert_eq!((d[0].thing, d[1].thing), (0, 1));
+    assert_eq!(d[0].diagnosis, "a label is a key");
+    // A number past what it indexes names nothing.
+    assert_eq!(d[0].explains, [0, 1]);
+    assert_eq!(synthesis.roots[0].explains, [0, 1]);
+
+    let brief = &lead.asked()[0].prompt;
+    assert!(brief.contains("### T1 — an assembler, c — "), "{brief}");
+    assert!(brief.contains("Symptoms: F1, F2"), "{brief}");
+    assert!(brief.contains("distinctive_root"), "the outline: {brief}");
+    assert!(!brief.contains("body()"), "bodies are elided: {brief}");
+    assert!(brief.contains("- F1 line 1 [first/wrong]: one"), "{brief}");
+}
+
+#[tokio::test]
+async fn a_diagnosis_of_a_thing_never_named_is_an_error() {
+    let (tree, report) = identified("unnamed").await;
+    let lead = Scripted::new(|_| {
+        Ok(r#"{"diagnoses": [{"thing": 3, "diagnosis": "d", "falls_out": "f", "explains": []}], "roots": [], "review": "r"}"#.into())
+    });
+    let error = synthesize(&lead, &tree.rules(), &report).await.unwrap_err();
+    assert!(format!("{error:#}").contains("T3"), "{error:#}");
+}
+
+/// [`Scripted`], except that calls of `kind` are answered only once two are
+/// in flight together, and fail if one waits alone.
+struct Together {
+    inner: Scripted,
+    kind: Kind,
+    pair: tokio::sync::Barrier,
+}
+
+/// Longer than any pair of concurrent calls takes to meet.
+const ALONE: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl Together {
+    fn new(kind: Kind, reply: fn(&Asked) -> Result<String>) -> Self {
+        Self {
+            inner: Scripted::new(reply),
+            kind,
+            pair: tokio::sync::Barrier::new(2),
+        }
+    }
+}
+
+impl Ask for Together {
+    async fn ask(&self, question: &Question<'_>) -> Result<Answer> {
+        if kind(question.schema) == self.kind
+            && tokio::time::timeout(ALONE, self.pair.wait()).await.is_err()
+        {
+            bail!("asked alone");
+        }
+        self.inner.ask(question).await
+    }
+}
+
+#[tokio::test]
+async fn every_rule_about_a_unit_is_asked_at_once() {
+    let tree = Tree::new(
+        "together",
+        &[("first", EVERYTHING), ("second", EVERYTHING)],
+        &[("a.rs", "fn a() {}\n")],
     );
-    assert!(
-        rooted
-            .prompt
-            .contains("D2. a register allocator\nDiagnosis: temps are predicted"),
-        "{}",
-        rooted.prompt
-    );
+    let reviewers = Arc::new(Reviewers {
+        ask: Together::new(Kind::Decide, |_| Ok(CLEAN.into())),
+        decide: decide::none(),
+        min_confidence: MIN_CONFIDENCE,
+    });
+    let report = run(&tree, &["a.rs"], &reviewers).await;
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert_eq!(
-        asked.last().unwrap().kind,
-        Kind::Root,
-        "the root is asked last"
+        decided(&report, "first", "clean") + decided(&report, "second", "clean"),
+        2
     );
 }
 
 #[tokio::test]
-async fn one_diagnosis_alone_is_not_asked_for_a_root() {
-    let (tree, reviewers) = converging("one-root");
-    let report = run(&tree, &["m/mod.rs", "m/a.rs"], &reviewers).await;
-    let doctor = Scripted::new(diagnosing);
-    let diagnosed = diagnose(&doctor, &report).await.unwrap();
-    assert_eq!(diagnosed.diagnoses.len(), 1);
-    assert!(diagnosed.roots.is_empty());
-    assert!(doctor.asked().iter().all(|a| a.kind != Kind::Root));
+async fn every_converging_module_is_named_at_once() {
+    let tree = Tree::new(
+        "modules",
+        &[("first", EVERYTHING), ("second", EVERYTHING)],
+        &[
+            ("m/mod.rs", "mod a;\n"),
+            ("m/a.rs", "fn a() {}\n"),
+            ("n/mod.rs", "mod b;\n"),
+            ("n/b.rs", "fn b() {}\n"),
+        ],
+    );
+    let reviewers = reviewers(Scripted::new(CONVERGING), decide::none());
+    let report = run(
+        &tree,
+        &["m/mod.rs", "m/a.rs", "n/mod.rs", "n/b.rs"],
+        &reviewers,
+    )
+    .await;
+
+    let namer = Together::new(Kind::Identify, naming);
+    let identified = identify(&namer, &report).await.unwrap();
+    assert!(identified.failures.is_empty(), "{:?}", identified.failures);
+    let components: Vec<_> = identified
+        .things
+        .iter()
+        .map(|t| t.component.clone())
+        .collect();
+    assert_eq!(
+        components,
+        [tree.path("m"), tree.path("n")],
+        "in module order"
+    );
 }

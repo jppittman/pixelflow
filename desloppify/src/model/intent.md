@@ -17,7 +17,7 @@ question that hard. A rule says how hard its question is, 1 to 4 (`Lite`,
 - No model id is spelled outside `Provider::model`: no rule, skill, prompt or
   backend names a model, only a level.
 - No level is chosen here: the levels a rule asks at (`Levels`) and a
-  diagnosis step asks at belong to `rule/` and `review/`.
+  naming or synthesis asks at belong to `rule/` and `review/`.
 - No knowledge of how a backend runs a model: thinking effort, rate limits,
   credentials, retries and tokens are `agent/` and `rate_limit/`.
 - No fallback. `Provider::model` has no wildcard arm, so a new level or
@@ -39,8 +39,8 @@ is the human reading of `Provider::model`.
   `an_explain_level_below_the_decide_level_is_refused` (the derived `Ord` is
   what `explain >= decide` compares, in `rule/file.rs`).
 - `desloppify/tests/review.rs`: an `unsure` answer climbs Lite, Fast, Strong
-  and stops at the rule's explain level; diagnosis is asked at Strong and
-  Frontier.
+  and stops at the rule's explain level; things are named and described at
+  Fast, and the one synthesis is asked at Frontier.
 
 ## Behind
 - No test pins the ladder: nothing fails if an id in `Provider::model` is

@@ -1,5 +1,6 @@
 //! A review: every rule's decision about every unit it applies to, the
-//! violations explained, and one lead review over all of it.
+//! violations explained, the things they converge on named, and one
+//! frontier call's judgment over all of it.
 //!
 //! [`plan`] decides the calls without making any. [`review`] makes them in
 //! System One's cascade: each call's unit goes to a [`Decide`] with every
@@ -7,11 +8,15 @@
 //! `min_confidence` settles that rule, and the rest are asked of a model
 //! through [`Ask`] at the rule's decide level, escalating a level on
 //! `unsure`. A unit decided as a violation is shown to a model at the rule's
-//! explain level, which writes the findings. [`synthesize`] has one frontier
-//! call read every finding and write the review a person reads. Each model
-//! call sees one rule and a little code, so none forgets a rule.
+//! explain level, which writes the findings. [`identify`] names what the
+//! findings in each converging module are about, and describes each thing
+//! without the code. [`synthesize`] has one frontier call read all of it,
+//! diagnose, find the roots and write the review a person reads.
+//!
+//! Small models make many calls, each seeing one rule or one module, so none
+//! forgets a rule; the one large call is the only one that sees everything.
 
-mod diagnose;
+mod identify;
 mod plan;
 mod reply;
 mod run;
@@ -23,7 +28,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::agent::{Answer, Ask, Usage};
+use crate::agent::{Ask, Usage};
 use crate::decide::Decide;
 use crate::rule::Rule;
 use crate::snippet::Snippet;
@@ -77,7 +82,7 @@ pub struct Finding {
 /// Everything a review produced.
 #[derive(Default)]
 pub struct Report {
-    /// Sorted by path, then line, then rule.
+    /// Sorted by path, then line, then rule, then outcome, then message.
     pub findings: Vec<Finding>,
     /// One per rule and unit that could not be decided or explained — a call
     /// failed or its reply did not match its schema — and one per System One
@@ -95,29 +100,45 @@ pub struct Report {
     /// Units each rule's question went to the model for, because System One
     /// did not answer it confidently.
     pub escalated: BTreeMap<String, u64>,
-    /// What the findings are symptoms of, once [`diagnose`] has been asked;
-    /// [`synthesize`] leads with these.
-    pub diagnoses: Vec<Diagnosis>,
-    /// What several diagnoses in one module are symptoms of; [`synthesize`]
-    /// leads with these before the diagnoses.
-    pub roots: Vec<Root>,
+    /// What the findings in each converging module are about, once
+    /// [`identify`] has been asked; [`synthesize`] diagnoses these.
+    pub things: Vec<Thing>,
 }
 
-/// What a cluster of findings in one module is a symptom of.
+/// A thing several findings in one module are about, named by its domain
+/// and described without the code.
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct Diagnosis {
+pub struct Thing {
     /// The module the symptoms are in.
     pub component: PathBuf,
     /// What the code is, in its domain's words: "an assembler".
     pub thing: String,
+    /// What it is part of: "in a JIT compiler".
+    pub context: String,
     /// The thing described from first principles, by a call that never saw
     /// the code.
-    pub denotation: String,
-    /// The description's parts and behaviours mapped onto the code: where
-    /// each is — a type, a function, a convention, nowhere — and what the
-    /// code has that the description does not.
-    pub shape: String,
-    /// The model of the thing that the code is missing or has wrong.
+    pub description: String,
+    /// The findings that concern it, as indexes into [`Report::findings`].
+    pub explains: Vec<usize>,
+}
+
+/// What [`identify`] produced.
+#[derive(Default)]
+pub struct Identified {
+    pub things: Vec<Thing>,
+    /// One per module or thing whose call failed or whose reply did not
+    /// match its schema; the others still count.
+    pub failures: Vec<anyhow::Error>,
+    /// Tokens every call used.
+    pub usage: Usage,
+}
+
+/// The model of a thing the code is missing or has wrong.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Diagnosis {
+    /// The thing, as an index into [`Report::things`].
+    pub thing: usize,
+    /// The model, stated as what the thing is: "a label is an operand".
     pub diagnosis: String,
     /// The code with the thing's shape: what becomes a type, what is
     /// deleted, what falls out.
@@ -126,33 +147,26 @@ pub struct Diagnosis {
     pub explains: Vec<usize>,
 }
 
-/// The model beneath several diagnoses in one module: the diagnoses are its
-/// symptoms, one level up.
+/// The model beneath several diagnoses, in one module or across several.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Root {
-    /// The module the diagnoses are in.
-    pub component: PathBuf,
     /// The deepest model the diagnoses support, stated as what the thing is:
     /// "instruction selection is a phase".
     pub root: String,
     /// With that model in place: what stops being special, what is deleted,
     /// and what follows from that, to closure.
     pub falls_out: String,
-    /// The diagnoses it explains, as indexes into [`Diagnoses::diagnoses`].
+    /// The diagnoses it explains, as indexes into [`Synthesis::diagnoses`].
     pub explains: Vec<usize>,
 }
 
-/// What [`diagnose`] produced.
-#[derive(Default)]
-pub struct Diagnoses {
+/// The frontier call's judgment of a review.
+#[derive(Debug, Clone)]
+pub struct Synthesis {
+    /// The review a person reads, in Markdown.
+    pub review: String,
     pub diagnoses: Vec<Diagnosis>,
-    /// Indexes into `diagnoses` are the indexes of [`Report::diagnoses`]
-    /// once the caller moves them there.
     pub roots: Vec<Root>,
-    /// One per module or thing whose call failed or whose reply did not
-    /// match its schema; the others still count.
-    pub failures: Vec<anyhow::Error>,
-    /// Tokens every diagnosis call used.
     pub usage: Usage,
 }
 
@@ -188,55 +202,49 @@ pub async fn review<A: Ask, D: Decide>(
     run::review(reviewers, rules, plan).await
 }
 
-/// What the findings are symptoms of: from symptom to diagnosis.
+/// What the findings are about: the things each converging module's
+/// symptoms concern, each described from first principles.
 ///
 /// A module whose findings converge — at least three, from at least two
-/// rules — is diagnosed in three steps:
+/// rules — gets one call at [`ModelLevel::Fast`](crate::model::ModelLevel::Fast),
+/// shown the symptoms and the module's outline, that names the things they
+/// are about in their domain's words — "an assembler" — each with the
+/// symptoms that concern it. Each thing at least two symptoms concern gets
+/// one more call at the same level that describes it from first principles,
+/// shown only the thing's name and context, never the code, so it cannot
+/// borrow the code's model of itself.
 ///
-/// 1. One call at [`ModelLevel::Strong`](crate::model::ModelLevel::Strong),
-///    shown the symptoms and the module's outline, names the things they
-///    are about in their domain's words — "an assembler" — each with the
-///    symptoms that concern it.
-/// 2. For each thing at least two symptoms concern, one call at
-///    [`ModelLevel::Frontier`](crate::model::ModelLevel::Frontier) describes
-///    it from first principles: what it is, its parts, what it does, how it
-///    behaves. It is shown only the thing's name and context, never the
-///    code, so it cannot borrow the code's model of itself.
-/// 3. One more frontier call translates that description's shape onto the
-///    code's — where each part is, or that it is nowhere — and states the
-///    diagnosis: the model the code is missing, the symptoms it explains,
-///    and what falls out once the code has the thing's shape.
-/// 4. Diagnoses are symptoms too. A module with at least two is asked once
-///    more, at the frontier, for the root beneath them: the deepest model
-///    that makes several true at once, and its consequences to closure.
-///
-/// Every reply is held to a schema. A failed step is a failure in the
-/// result and stops only its own module or thing.
+/// Every module, and every thing in one, is asked at once; the result keeps
+/// module order, then the namer's. Every reply is held to a schema. A failed
+/// call is a failure in the result and stops only its own module or thing.
 ///
 /// # Errors
 ///
 /// A module's files cannot be read or parsed.
-pub async fn diagnose<A: Ask>(agent: &A, report: &Report) -> Result<Diagnoses> {
-    diagnose::diagnose(agent, report).await
+pub async fn identify<A: Ask>(agent: &A, report: &Report) -> Result<Identified> {
+    identify::identify(agent, report).await
 }
 
-/// The review a person reads, written by one call at
-/// [`ModelLevel::Frontier`](crate::model::ModelLevel::Frontier) from every
-/// finding in `report`: grouped by file, duplicates across rules merged,
-/// trivial or mistaken findings dropped (and counted), recurring patterns
-/// called out. The call is told each rule's question and violation meanings
-/// and how many reviews failed. It returns the reply verbatim, with its
-/// usage.
+/// The judgment: one call at
+/// [`ModelLevel::Frontier`](crate::model::ModelLevel::Frontier) shown every
+/// rule that found something, every [`Thing`] with its description, the
+/// outlines of their modules (bodies elided, to a budget), and every finding
+/// numbered. It diagnoses the things, finds the roots beneath the diagnoses
+/// — across modules as well as within one — and writes the review: roots,
+/// then diagnoses, then the findings by file, duplicates merged, trivial or
+/// mistaken ones dropped and counted, recurring patterns called out. The
+/// reply is held to a schema; a number past what it indexes names nothing.
 ///
 /// `Ok(None)`, with no call made, when `report` has no findings.
 ///
 /// # Errors
 ///
-/// The call failed.
+/// The call failed, its reply does not match the schema, a diagnosis names
+/// a thing that does not exist, or a module's files cannot be read.
 pub async fn synthesize<A: Ask>(
     agent: &A,
     rules: &[Rule],
     report: &Report,
-) -> Result<Option<Answer>> {
+) -> Result<Option<Synthesis>> {
     synthesize::synthesize(agent, rules, report).await
 }
