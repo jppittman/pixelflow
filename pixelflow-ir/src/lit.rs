@@ -124,6 +124,7 @@ impl fmt::Display for Lit {
 #[cfg(test)]
 mod tests {
     use super::Lit;
+    use crate::arena::ExprArena;
 
     /// A true mask and the NaN that shares its lane are two literals. This is
     /// the aliasing the type exists to close: keyed by bits they were one
@@ -157,5 +158,36 @@ mod tests {
         assert_eq!(Lit::Real(2.0).mask(), None);
         assert_eq!(Lit::Mask(true).mask(), Some(true));
         assert_eq!(Lit::Mask(true).real(), None);
+    }
+
+    /// `ExprArena::push_lit` interns by `Lit`'s own `Eq`/`Hash`: the same
+    /// literal pushed twice is one node, and two distinct ones are two —
+    /// the property the module's doc calls out as what interning needs.
+    #[test]
+    fn a_repeated_literal_interns_to_one_node_and_a_distinct_one_to_another() {
+        let mut arena = ExprArena::new();
+        let real = arena.push_const(1.5);
+        assert_eq!(real, arena.push_const(1.5), "the same real interns once");
+        let mask = arena.push_lit(Lit::Mask(true));
+        assert_eq!(
+            mask,
+            arena.push_lit(Lit::Mask(true)),
+            "the same mask interns once"
+        );
+        assert_ne!(
+            real,
+            arena.push_const(2.5),
+            "a different real is a new node"
+        );
+        assert_ne!(
+            mask,
+            arena.push_lit(Lit::Mask(false)),
+            "a different mask is a new node"
+        );
+        assert_eq!(
+            arena.len(),
+            4,
+            "four distinct literals, however many times each was pushed"
+        );
     }
 }

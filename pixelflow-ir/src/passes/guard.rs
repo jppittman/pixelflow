@@ -311,6 +311,23 @@ mod tests {
         assert_eq!(count_of(&arena, domain, OpKind::Le), 2, "one test of u");
     }
 
+    /// A bound used for both `lo` and `hi` is tested once, with no `BitAnd`
+    /// joining the test to itself: `in_domain`'s own two `BitAnd`s are the
+    /// whole domain, not a third wrapping them.
+    #[test]
+    fn a_value_bound_shared_by_lo_and_hi_is_not_joined_to_itself() {
+        let mut arena = ExprArena::new();
+        let u = uniform(&mut arena, 3.0);
+        let same = counted(Monoid::SUM, &mut arena, Bound::Value(u), Bound::Value(u));
+        let (arena, root) = guard_value_bounds_owned(arena, same);
+        let domain = Guard::of(&arena, root).domain;
+        assert_eq!(
+            count_of(&arena, domain, OpKind::BitAnd),
+            2,
+            "in_domain's two joins, and no outer one"
+        );
+    }
+
     /// The guard varies with its bounds and the fold with its body, so that the
     /// tests of a uniform are computed once per call while the loop over `X`
     /// runs per sample: every def takes the variance of the arena's transfer.
