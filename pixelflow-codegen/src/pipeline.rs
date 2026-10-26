@@ -1,9 +1,9 @@
 //! The driver: from an arena and a lattice's shape to machine code.
 //!
 //! The stages are [`Pass`] values, run as one chain: the arena is legalized
-//! around the lattice's folds ([`Front`], [`Collapse`], [`Pack`], [`Back`];
+//! around the lattice's folds ([`Front`], [`Collapse`], [`Back`];
 //! the traversal is this backend's, the halves are `pixelflow_ir::passes`'),
-//! lowered to a flat schedule ([`Lower`]), split into its nest ([`Nest`]), its
+//! lowered to a flat schedule ([`Lower`]), split into its nest, with the lattice factored around it ([`Nest`]), its
 //! arms' ownership read off backward ([`Own`]) and their blocks laid out
 //! ([`Layout`]); then the emitter selects, allocates and assembles it
 //! ([`emit::native`]). Nothing here is the emitter's: `emit/` is handed the
@@ -12,7 +12,7 @@
 use crate::emit::{self, CompileResult};
 use crate::error::CompileError;
 use crate::pass::Pass;
-use crate::program::{Collapse, Def, Domain, Factored, Layout, Nest, Own, arena_to_schedule};
+use crate::program::{Collapse, Domain, Factored, Layout, Lowered, Nest, Own, arena_to_schedule};
 use core::marker::PhantomData;
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{ExprArena, ExprId, UniformDecl, UniformId, UniformIdentity};
@@ -106,7 +106,7 @@ struct Lower;
 
 impl Pass for Lower {
     type Input = Factored;
-    type Output = Vec<Def>;
+    type Output = Lowered;
 
     fn run(self, factored: Self::Input) -> Result<Self::Output, CompileError> {
         let Factored {
@@ -114,12 +114,13 @@ impl Pass for Lower {
             root,
             traversal,
         } = factored;
-        Ok(arena_to_schedule(
-            &arena,
-            root,
-            origin_slots(&arena),
-            Some(&traversal),
-        ))
+        let (schedule, value) =
+            arena_to_schedule(&arena, root, origin_slots(&arena), Some(&traversal));
+        Ok(Lowered {
+            schedule,
+            value,
+            traversal,
+        })
     }
 }
 
@@ -212,7 +213,7 @@ pub(crate) mod tests {
         root: ExprId,
         shape: LatticeShape,
         lanes: u32,
-    ) -> Vec<Def> {
+    ) -> Lowered {
         let schedule = legalization(shape, lanes).then(Lower);
         schedule.run((a, root)).expect("legalize")
     }
@@ -361,7 +362,7 @@ pub(crate) mod tests {
         );
     }
 
-    use crate::program::ScheduledOp;
+    use crate::program::{Def, ScheduledOp};
     use pixelflow_ir::arena::ExprNode;
     use pixelflow_ir::fold::{Binder, Bound, Fold, KNOWN_RANGE, Monoid};
     use pixelflow_ir::{Lit, OpKind};
@@ -519,7 +520,13 @@ pub(crate) mod tests {
         };
         assert_eq!(fold, valued[0]);
 
-        let schedule = schedule_for(&a, root, LatticeShape::new([4, 2]), FOUR_LANES);
+        let lowered = schedule_for(&a, root, LatticeShape::new([4, 2]), FOUR_LANES);
+        let scoped = Nest.run(lowered).expect("the schedule nests");
+        let schedule: Vec<&Def> = core::iter::once(&scoped.body)
+            .map(|region| &region.schedule)
+            .chain(scoped.folds.iter().map(|fold| &fold.schedule))
+            .flatten()
+            .collect();
         let count =
             |keep: fn(&ScheduledOp) -> bool| schedule.iter().filter(|d| keep(&d.op)).count();
         assert_eq!(count(|op| matches!(op, ScheduledOp::Write { .. })), 1);

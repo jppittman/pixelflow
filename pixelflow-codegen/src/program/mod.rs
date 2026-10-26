@@ -26,6 +26,14 @@ use pixelflow_ir::fold::{Binder, Bound, Fold, KnownRange};
 use pixelflow_ir::kind::OpKind;
 use pixelflow_ir::variance::Variance;
 
+/// What [`Nest`] factors: the kernel's flat schedule, the id of its value, and
+/// the traversal whose loops go around that value.
+pub(crate) struct Lowered {
+    pub(crate) schedule: Vec<Def>,
+    pub(crate) value: ValueId,
+    pub(crate) traversal: lattice::Traversal,
+}
+
 /// The lane a literal tabulates to, as the `f32` a [`ScheduledOp::Const`]
 /// carries: a real is itself, a true mask is the all-ones lane and a false
 /// mask is zero. The backends key a constant by its bits, so the `f32` here
