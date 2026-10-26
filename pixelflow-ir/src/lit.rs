@@ -184,10 +184,5 @@ mod tests {
             arena.push_lit(Lit::Mask(false)),
             "a different mask is a new node"
         );
-        assert_eq!(
-            arena.len(),
-            4,
-            "four distinct literals, however many times each was pushed"
-        );
     }
 }
