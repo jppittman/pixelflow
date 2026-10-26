@@ -461,6 +461,10 @@ pub enum BoundRefusal {
     /// A bound that varies with a coordinate or with its own fold's binder
     /// (L3): `reads` is what it varies with.
     BoundVaries { end: BoundEnd, reads: Variance },
+    /// A user-written bound that is an index. User folds are rectangular:
+    /// their bounds are constants or unchanged uniforms. Internal arena
+    /// transforms may still construct folds whose bounds read binders.
+    BoundIndex { end: BoundEnd },
     /// A bound that is arithmetic, at a user surface (§1.4): until bounds are
     /// `Int` (T6), a computed bound is `f32` arithmetic that can round into the
     /// domain, so a user writes a leaf.
@@ -491,6 +495,12 @@ impl core::fmt::Display for BoundRefusal {
                 f,
                 "BoundVaries: a fold's {end} bound varies with {reads:?}: a bound reads no \
                  coordinate and not its own fold's binder (L3 of {PLAN})"
+            ),
+            Self::BoundIndex { end } => write!(
+                f,
+                "BoundIndex: a fold's {end} bound is an index: a user fold's bound is a \
+                 constant or an unchanged uniform count (§4 of \
+                 docs/language/2026-10-25-kernel-staging-and-rectangular-folds.md)"
             ),
             Self::BoundArithmetic { end } => write!(
                 f,
@@ -2142,6 +2152,11 @@ mod tests {
                 },
                 "BoundVaries",
                 "L3",
+            ),
+            (
+                BoundRefusal::BoundIndex { end },
+                "BoundIndex",
+                "unchanged uniform",
             ),
             (
                 BoundRefusal::BoundArithmetic { end },

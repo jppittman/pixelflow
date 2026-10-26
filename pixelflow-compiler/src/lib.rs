@@ -162,9 +162,8 @@ pub(crate) const BOUND_PLAN: &str = "docs/language/2026-10-20-a-bound-is-a-value
 /// optimizer's algebraic rules, which are not sound at NaN or infinity
 /// (BACKLOG E9). Each bound is a
 /// `usize`: an integer, a `usize` const or `+ - * /` over them, known at
-/// expansion; an enclosing fold's index, for a triangular `(0..i)`; or an
-/// entry's count parameter, `n: usize`, bound per call. A bound that is a
-/// name the program binds stands alone — `0..i + 1` waits for bounds typed
+/// expansion; or an entry's count parameter, `n: usize`, bound per call. A
+/// bound that is a name the program binds stands alone — `0..i + 1` waits for bounds typed
 /// as integers — and no bound reads `X` or `Y`. The index `i` is a `usize`,
 /// which a body reads only as `i as f32`: there is no arithmetic on an index
 /// and nothing to index. A fold lowers to one `Reduce`, the node

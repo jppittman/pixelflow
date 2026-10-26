@@ -624,7 +624,7 @@ pub struct IfExpr {
 /// The closure's parameter is the binder and its body is the fold's body.
 /// The closure is not a value, and has no meaning anywhere else. Each bound
 /// is a `usize`, known at expansion or a name the program binds (an
-/// enclosing fold's index, an entry's count parameter), typed by `sema`
+/// entry's unchanged count parameter), typed by `sema`
 /// where the fold is written; the binder is a `usize`, which a body makes a
 /// value of only by `i as f32`.
 #[derive(Debug, Clone)]
