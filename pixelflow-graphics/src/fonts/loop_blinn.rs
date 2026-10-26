@@ -1009,12 +1009,19 @@ fn piece_row(piece: Piece) -> [f32; PIECE_ROW_COLS] {
 /// changing what the glyph draws.
 ///
 /// Powers of two, per
-/// `docs/graphics/2026-09-09-glyph-as-a-fold-execution.md` §S3's own framing
-/// — see that section, and this crate's measurements in
-/// `docs/BACKLOG.md`, for the trade against a coarser bucket.
+/// `docs/graphics/2026-09-09-glyph-as-a-fold-execution.md` §S3's own framing,
+/// floored at [`MIN_TRIP_BUCKET`]. Measured in
+/// `docs/results/2026-10-26-font-reuse-policy.md`: the floor puts every ASCII
+/// glyph of a monospace face in one program, and a cold warm costs ~35% less
+/// than bare powers of two (six saturations become one) at no measurable bake
+/// cost, since a padding row's term is a literal `0.0`.
 fn bucketed_trip_count(pieces: u32) -> u32 {
-    pieces.next_power_of_two()
+    pieces.next_power_of_two().max(MIN_TRIP_BUCKET)
 }
+
+/// The smallest trip count a glyph's fold is compiled at. Covers every ASCII
+/// glyph in the faces measured (at most 64 pieces), so they share one program.
+const MIN_TRIP_BUCKET: u32 = 64;
 
 /// A row that folds to the identity of [`glyph`]'s sum at every sample:
 /// **all zeros**.
@@ -1115,13 +1122,14 @@ mod tests {
     }
 
     #[test]
-    fn bucketed_trip_count_rounds_up_to_a_power_of_two() {
-        assert_eq!(bucketed_trip_count(1), 1);
-        assert_eq!(bucketed_trip_count(2), 2);
-        assert_eq!(bucketed_trip_count(3), 4);
-        assert_eq!(bucketed_trip_count(4), 4);
-        assert_eq!(bucketed_trip_count(5), 8);
-        assert_eq!(bucketed_trip_count(34), 64);
+    fn bucketed_trip_count_rounds_up_to_a_floored_power_of_two() {
+        assert_eq!(bucketed_trip_count(1), MIN_TRIP_BUCKET);
+        assert_eq!(bucketed_trip_count(MIN_TRIP_BUCKET), MIN_TRIP_BUCKET);
+        assert_eq!(
+            bucketed_trip_count(MIN_TRIP_BUCKET + 1),
+            2 * MIN_TRIP_BUCKET
+        );
+        assert_eq!(bucketed_trip_count(262), 512);
     }
 
     /// A [`padding_row`] changes no bit of the fold. Baking the signed area
