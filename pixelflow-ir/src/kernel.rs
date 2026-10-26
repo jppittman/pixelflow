@@ -210,6 +210,10 @@ impl Terms for Values {
     fn binary(&mut self, op: OpKind, [a, b]: [Kernel; 2]) -> Kernel {
         a.combine(&b, op)
     }
+
+    fn ternary(&mut self, op: OpKind, [a, b, c]: [Kernel; 3]) -> Kernel {
+        a.combine3(&b, &c, op)
+    }
 }
 
 impl Kernel {
