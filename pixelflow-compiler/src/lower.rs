@@ -70,6 +70,7 @@ use pixelflow_ir::arena::{
     Axis, ExprArena, ExprId, FoldTerms, IndexSpaceFull, OpenFold, UniformDecl, UniformIdentity,
 };
 use pixelflow_ir::library;
+use pixelflow_ir::passes::lattice::KERNEL_BINDER_CAPACITY;
 use pixelflow_ir::{Binder, Bound, Fold, KnownRange, Monoid, OpKind};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -649,14 +650,16 @@ impl<S: Site> Lowering<'_, S> {
         let bounds = self.fold_bounds(fold.reduction, counts)?;
         // One placeholder per fold open at once, the `n`th for `n` open, so a
         // nested fold's rename never reaches its enclosing fold's index. No
-        // more open than the IR has binders: the refusal names the depth,
+        // more open than a collapsed kernel has binders: the refusal names the depth,
         // where running out of placeholders would name nothing the author
         // wrote.
-        if self.open_folds >= Binder::COUNT {
+        if self.open_folds >= KERNEL_BINDER_CAPACITY {
             return Err(format!(
-                "folds nested more than {} deep: the IR binds at most that many indices at \
-                 once (`Binder::COUNT`)",
-                Binder::COUNT
+                "folds nested more than {} deep: collapse reserves {} of the IR's {} binder \
+                 slots for its row, column, and lane folds",
+                KERNEL_BINDER_CAPACITY,
+                pixelflow_ir::passes::lattice::COLLAPSE_BINDERS,
+                Binder::COUNT,
             ));
         }
         let index = self
@@ -1362,23 +1365,26 @@ mod tests {
         );
     }
 
-    /// Folds nest as deep as the IR has binders, and no deeper: one more is
+    /// Folds nest as deep as collapse leaves binders, and no deeper: one more is
     /// refused, not a panic.
     #[test]
-    fn folds_nest_as_deep_as_the_ir_has_binders() {
+    fn folds_nest_as_deep_as_collapse_has_binders() {
         use proc_macro2::TokenStream;
         let fold = |body: TokenStream| quote! { (0..1).map(|i| #body).sum::<f32>() };
         let nest = |depth: usize| (0..depth).fold(quote! { X }, |body, _| fold(body));
         let closure = |body: TokenStream| quote! { || #body };
-        let (arena, root) = lowered(closure(nest(Binder::COUNT)));
+        let (arena, root) = lowered(closure(nest(KERNEL_BINDER_CAPACITY)));
         let ExprNode::Reduce { fold: outer, .. } = arena.node(root) else {
             panic!("expected a fold");
         };
-        assert_eq!(usize::from(outer.binder().slot()), Binder::COUNT - 1);
-        let Err(err) = lower_unanalyzed(closure(nest(Binder::COUNT + 1))) else {
-            panic!("one binder deeper than the IR has");
+        assert_eq!(
+            usize::from(outer.binder().slot()),
+            KERNEL_BINDER_CAPACITY - 1
+        );
+        let Err(err) = lower_unanalyzed(closure(nest(KERNEL_BINDER_CAPACITY + 1))) else {
+            panic!("one binder deeper than collapse admits");
         };
-        assert!(err.contains("folds nested more than"), "got: {err}");
+        assert!(err.contains("collapse reserves 3"), "got: {err}");
     }
 
     /// `let (a, b) = (b, a);` binds both names at once, to what each
