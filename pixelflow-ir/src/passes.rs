@@ -1206,10 +1206,10 @@ fn expand_exp2(arena: &mut ExprArena, arg_x: ExprId) -> ExprId {
     // 2^xi = Float((int(xi) + 127) << 23): the biased exponent, shifted into
     // its field, read back as the real whose bits those are.
     let xi_int = arena.push_unary(OpKind::TruncToInt, xi);
-    let bias = arena.push_const(f32::from_bits(127)); // integer 127 as lane bits
+    let bias = arena.push_lit(Lit::Int(127));
     let biased = arena.push_binary(OpKind::IAdd, xi_int, bias);
     // A literal `ShiftCount::from_literal` accepts, so the emitter takes it as written.
-    let shift = arena.push_const(23.0);
+    let shift = arena.push_lit(Lit::Int(23));
     let pow2i_bits = arena.push_binary(OpKind::Shl, biased, shift);
     let pow2i = arena.push_unary(OpKind::Float, pow2i_bits);
 
@@ -1241,15 +1241,15 @@ fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
     let bits = arena.push_unary(OpKind::Bits, x);
 
     // Exponent: e = (bits >> 23) - 127. Shift amount read by value -> plain 23.0.
-    let shift23 = arena.push_const(23.0);
+    let shift23 = arena.push_lit(Lit::Int(23));
     let exp_field = arena.push_binary(OpKind::Shr, bits, shift23);
     let exp_f = arena.push_unary(OpKind::IntToFloat, exp_field);
     let bias = arena.push_const(127.0);
     let e = arena.push_binary(OpKind::Sub, exp_f, bias);
 
     // Mantissa m = Float((bits & 0x007FFFFF) | 0x3F800000) ∈ [1, 2).
-    let mant_mask = arena.push_const(f32::from_bits(0x007F_FFFF));
-    let one_bits = arena.push_const(f32::from_bits(0x3F80_0000));
+    let mant_mask = arena.push_lit(Lit::Int(0x007F_FFFF));
+    let one_bits = arena.push_lit(Lit::Int(0x3F80_0000));
     let mant = arena.push_binary(OpKind::BitAnd, bits, mant_mask);
     let m_bits = arena.push_binary(OpKind::BitOr, mant, one_bits);
     let m = arena.push_unary(OpKind::Float, m_bits);
@@ -1634,71 +1634,12 @@ mod dwrt_tests {
         assert_eq!(a.known_range(red), None);
     }
 
-    /// `is_err()` alone can't tell a specific "no rule for this op" message
-    /// apart from the generic per-arity fallback (`"no derivative rule for
-    /// this {unary,binary,ternary} op"`), since both are `Err`. Assert the
-    /// exact message everywhere below so a deleted specific-op arm — which
-    /// falls through to the generic one — is observable.
+    /// Differentiating a coordinate-varying memory address is refused before
+    /// either the structured or lowered gather can reach code generation.
     #[test]
-    fn lower_dwrt_refuses_integer_domain_and_raw_memory_ops() {
-        const BOUND_MEMORY: &str = "lower_dwrt: cannot differentiate a bound-memory read";
-        const INT_BIT: &str = "lower_dwrt: cannot differentiate integer/bit-manipulation ops";
-
-        // The unary integer-domain arm: the two conversions and the two
-        // reinterpretations. Each is its own alternative in the grouped arm,
-        // so each is tried. Wrapping a Gather (itself undifferentiable)
-        // distinguishes the arm's own message from a leaked child error — if
-        // `push_deriv_children`'s arm wrongly marked the operand as needing a
-        // derivative, the child's `BOUND_MEMORY` error would surface here
-        // instead of `INT_BIT`.
+    fn lower_dwrt_refuses_raw_and_structured_memory_ops() {
         use crate::arena::{BufferDecl, BufferIdentity};
-        for op in [
-            OpKind::TruncToInt,
-            OpKind::IntToFloat,
-            OpKind::Bits,
-            OpKind::Float,
-        ] {
-            let mut a = ExprArena::new();
-            let b = a.declare_buffer(BufferDecl {
-                id: BufferIdentity::mint(),
-                width: 2,
-                height: 1,
-            });
-            let gx = a.push_var(0);
-            let zero = a.push_const(0.0);
-            let g = a.push_gather(b, gx, zero);
-            let e = a.push_unary(op, g);
-            let v0 = a.push_const(0.0);
-            let root = a.push_binary(OpKind::Dwrt, e, v0);
-            match lower_dwrt_owned(&a, root) {
-                Err(msg) => assert_eq!(msg, INT_BIT, "for {op:?}"),
-                Ok(_) => panic!("expected {INT_BIT:?} for {op:?}"),
-            }
-        }
-
-        // IAdd/Shl/Shr/BitAnd/BitOr: integer/bit-manipulation primitives, at
-        // the binary-op level. Each is its own alternative in the grouped arm,
-        // so testing only `IAdd` would let any of the other four fall through
-        // to the generic per-arity fallback — a different message, or worse, a
-        // derivative — while this test still passed.
-        for op in [
-            OpKind::IAdd,
-            OpKind::Shl,
-            OpKind::Shr,
-            OpKind::BitAnd,
-            OpKind::BitOr,
-        ] {
-            let mut a = ExprArena::new();
-            let x = a.push_var(0);
-            let y = a.push_var(1);
-            let e = a.push_binary(op, x, y);
-            let v0 = a.push_const(0.0);
-            let root = a.push_binary(OpKind::Dwrt, e, v0);
-            match lower_dwrt_owned(&a, root) {
-                Err(msg) => assert_eq!(msg, INT_BIT, "for {op:?}"),
-                Ok(_) => panic!("expected {INT_BIT:?} for {op:?}"),
-            }
-        }
+        const BOUND_MEMORY: &str = "lower_dwrt: cannot differentiate a bound-memory read";
 
         // A Gather whose index moves with the variable cannot be
         // differentiated, and neither can its lowered RawGather form. (An

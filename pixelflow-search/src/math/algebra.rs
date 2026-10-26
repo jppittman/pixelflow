@@ -1048,7 +1048,6 @@ impl Rewrite for ConstantFold {
         // looking like a safety check.
         if let Lit::Real(real) = result
             && !real.is_finite()
-            && !op.is_bitwise_domain()
         {
             return None;
         }

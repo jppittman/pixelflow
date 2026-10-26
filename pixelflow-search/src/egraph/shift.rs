@@ -52,10 +52,10 @@ pub(crate) fn spelled<I: Ir>(
     children: Children<'_, I::Ref>,
 ) -> Option<(I::Ref, ShiftCount)> {
     let (operand, count) = (children.get(0)?, children.get(1)?);
-    let Shape::Const(Lit::Real(literal)) = term.project(count) else {
+    let Shape::Const(Lit::Int(literal)) = term.project(count) else {
         return None;
     };
-    Some((operand, ShiftCount::from_literal(literal)?))
+    Some((operand, ShiftCount::from_int(literal)?))
 }
 
 #[cfg(test)]

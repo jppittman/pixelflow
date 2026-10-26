@@ -964,7 +964,7 @@ impl Selection {
                 ENode::Shift {
                     direction, count, ..
                 } => {
-                    operand_ids.push(arena.embed(Shape::Const(Lit::Real(count.literal()))));
+                    operand_ids.push(arena.embed(Shape::Const(Lit::Int(count.int_literal()))));
                     Shape::Op(direction.op(), Children::Many(&operand_ids))
                 }
                 ENode::Reduce { header, .. } => {

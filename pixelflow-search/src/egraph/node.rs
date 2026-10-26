@@ -363,7 +363,7 @@ impl ENode {
     pub fn is_lit(&self, lit: Lit) -> bool {
         match lit {
             Lit::Real(val) => self.is_const(val),
-            Lit::Mask(_) => self.literal() == Some(lit),
+            Lit::Int(_) | Lit::Mask(_) => self.literal() == Some(lit),
         }
     }
 

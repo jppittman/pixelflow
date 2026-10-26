@@ -28,8 +28,26 @@ use core::fmt;
 use crate::dag::{Builder, Id, Memo, Node};
 use crate::fold::{Binder, Bound, BoundEnd, Fold, FoldHeader, KnownRange, Monoid, Placeholder};
 use crate::key::KernelKey;
-use crate::kind::OpKind;
+use crate::kind::{OpKind, Signature, Sort};
 use crate::lit::Lit;
+
+/// An operation application whose operands do not match its signature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeError {
+    pub op: OpKind,
+    pub got: Vec<Sort>,
+    pub want: Signature,
+}
+
+impl fmt::Display for TypeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ill-typed {0:?} node: got {1:?}, want {2:?}",
+            self.op, self.got, self.want
+        )
+    }
+}
 
 /// This arena's node payload: everything about a node except its edges,
 /// which the underlying [`Dag`](crate::dag::Dag) owns. Distinct from
@@ -614,6 +632,7 @@ impl DoubleEndedIterator for ExprChildren<'_> {
 #[derive(Clone)]
 pub struct ExprArena {
     builder: Builder<NodeData>,
+    sorts: Vec<Sort>,
     /// The append-only cache backing every interned [`ExprNode::Nary`]
     /// node's children: [`NaryChildren`] is only ever a range into this.
     /// Not derived from `builder`'s own edges on demand, because
@@ -648,6 +667,7 @@ impl ExprArena {
     pub fn new() -> Self {
         Self {
             builder: Builder::new(),
+            sorts: Vec::new(),
             nary_children: Vec::new(),
             nary_ranges: Vec::new(),
             buffers: Vec::new(),
@@ -660,6 +680,7 @@ impl ExprArena {
     pub fn with_capacity(n: usize) -> Self {
         Self {
             builder: Builder::with_capacity(n, n),
+            sorts: Vec::with_capacity(n),
             nary_children: Vec::new(),
             nary_ranges: Vec::new(),
             buffers: Vec::new(),
@@ -670,6 +691,7 @@ impl ExprArena {
     /// Truncate to zero nodes without deallocating backing storage.
     pub fn clear(&mut self) {
         self.builder.clear();
+        self.sorts.clear();
         self.nary_children.clear();
         self.nary_ranges.clear();
         self.buffers.clear();
@@ -696,9 +718,63 @@ impl ExprArena {
     /// [`ExprId`] boundary — the one choke point every `push_*` method
     /// spends its arguments through. Structural: two pushes of equal `data`
     /// over equal `children` return the same id (see the module doc).
-    fn intern(&mut self, data: NodeData, children: &[ExprId]) -> ExprId {
+    fn intern_typed(&mut self, data: NodeData, children: &[ExprId], sort: Sort) -> ExprId {
         let dag_children: Vec<Id> = children.iter().copied().map(to_dag_id).collect();
-        from_dag_id(self.builder.intern(data, &dag_children))
+        let id = from_dag_id(self.builder.intern(data, &dag_children));
+        if self.sorts.len() == id.0 as usize {
+            self.sorts.push(sort);
+        } else {
+            assert_eq!(
+                self.sorts[id.0 as usize], sort,
+                "interned node changed type"
+            );
+        }
+        id
+    }
+
+    fn intern(&mut self, data: NodeData, children: &[ExprId]) -> ExprId {
+        let sort = match data {
+            NodeData::Var(_) | NodeData::Param(_) | NodeData::Uniform(_) | NodeData::Ref(_) => {
+                Sort::Real
+            }
+            NodeData::Buffer(_) => Sort::Buffer,
+            NodeData::Const(Lit::Real(_)) => Sort::Real,
+            NodeData::Const(Lit::Int(_)) => Sort::Int,
+            NodeData::Const(Lit::Mask(_)) => Sort::Mask,
+            NodeData::Unary(op)
+            | NodeData::Binary(op)
+            | NodeData::Ternary(op)
+            | NodeData::Nary(op) => self
+                .infer_op(op, children)
+                .unwrap_or_else(|error| panic!("{error}")),
+            NodeData::Reduce(_) => self.sort(children[0]),
+            NodeData::Write(..) => Sort::Unit,
+        };
+        self.intern_typed(data, children, sort)
+    }
+
+    fn infer_op(&self, op: OpKind, children: &[ExprId]) -> Result<Sort, TypeError> {
+        let got: Vec<_> = children.iter().map(|&id| self.sort(id)).collect();
+        let want = op.signature();
+        let result = match want {
+            Signature::Fixed(args, result) if got == args => Some(result),
+            Signature::If if matches!(got.as_slice(), [Sort::Mask, a, b] if a == b && matches!(a, Sort::Real | Sort::Int | Sort::Mask)) => {
+                Some(got[1])
+            }
+            Signature::Bitwise if matches!(got.as_slice(), [a, b] if a == b && matches!(a, Sort::Int | Sort::Mask)) => {
+                Some(got[0])
+            }
+            Signature::Tuple => Some(Sort::Tuple),
+            Signature::Reduce if !got.is_empty() => Some(got[0]),
+            _ => None,
+        };
+        result.ok_or(TypeError { op, got, want })
+    }
+
+    /// The lane sort assigned when `id` was inserted.
+    #[must_use]
+    pub fn sort(&self, id: ExprId) -> Sort {
+        self.sorts[id.0 as usize]
     }
 
     /// Push a `Var(i)` node.
@@ -1074,7 +1150,15 @@ impl ExprArena {
     /// Panics if `op` is not a unary op ([`OpKind::arity`] is not 1).
     pub fn push_unary(&mut self, op: OpKind, child: ExprId) -> ExprId {
         assert_eq!(op.arity(), 1, "{op:?} is not a unary op");
-        self.intern(NodeData::Unary(op), &[child])
+        self.try_push_unary(op, child)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible form of [`Self::push_unary`], refusing an operand of the wrong sort.
+    pub fn try_push_unary(&mut self, op: OpKind, child: ExprId) -> Result<ExprId, TypeError> {
+        let children = [child];
+        let sort = self.infer_op(op, &children)?;
+        Ok(self.intern_typed(NodeData::Unary(op), &children, sort))
     }
 
     /// Push a binary operation node.
@@ -1084,7 +1168,20 @@ impl ExprArena {
     /// Panics if `op` is not a binary op ([`OpKind::arity`] is not 2).
     pub fn push_binary(&mut self, op: OpKind, a: ExprId, b: ExprId) -> ExprId {
         assert_eq!(op.arity(), 2, "{op:?} is not a binary op");
-        self.intern(NodeData::Binary(op), &[a, b])
+        self.try_push_binary(op, a, b)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible form of [`Self::push_binary`], refusing operands of the wrong sort.
+    pub fn try_push_binary(
+        &mut self,
+        op: OpKind,
+        a: ExprId,
+        b: ExprId,
+    ) -> Result<ExprId, TypeError> {
+        let children = [a, b];
+        let sort = self.infer_op(op, &children)?;
+        Ok(self.intern_typed(NodeData::Binary(op), &children, sort))
     }
 
     /// Push a ternary operation node.
@@ -1094,7 +1191,21 @@ impl ExprArena {
     /// Panics if `op` is not a ternary op ([`OpKind::arity`] is not 3).
     pub fn push_ternary(&mut self, op: OpKind, a: ExprId, b: ExprId, c: ExprId) -> ExprId {
         assert_eq!(op.arity(), 3, "{op:?} is not a ternary op");
-        self.intern(NodeData::Ternary(op), &[a, b, c])
+        self.try_push_ternary(op, a, b, c)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible form of [`Self::push_ternary`], refusing operands of the wrong sort.
+    pub fn try_push_ternary(
+        &mut self,
+        op: OpKind,
+        a: ExprId,
+        b: ExprId,
+        c: ExprId,
+    ) -> Result<ExprId, TypeError> {
+        let children = [a, b, c];
+        let sort = self.infer_op(op, &children)?;
+        Ok(self.intern_typed(NodeData::Ternary(op), &children, sort))
     }
 
     /// Push an N-ary operation node. Children are copied into the internal slab.
@@ -3360,5 +3471,28 @@ mod composition_tests {
         });
         assert_eq!(copies, by_hand, "hash-consed onto the same nodes");
         assert_ne!(copies[0], copies[1]);
+    }
+
+    #[test]
+    fn construction_records_literal_and_operation_sorts() {
+        let mut arena = ExprArena::new();
+        let x = arena.push_const(1.0);
+        let y = arena.push_const(2.0);
+        let mask = arena.push_binary(OpKind::Lt, x, y);
+        let bits = arena.push_unary(OpKind::Bits, x);
+        assert_eq!(arena.sort(x), Sort::Real);
+        assert_eq!(arena.sort(mask), Sort::Mask);
+        assert_eq!(arena.sort(bits), Sort::Int);
+    }
+
+    #[test]
+    fn fallible_construction_refuses_a_mask_in_arithmetic() {
+        let mut arena = ExprArena::new();
+        let x = arena.push_const(1.0);
+        let y = arena.push_const(2.0);
+        let mask = arena.push_binary(OpKind::Lt, x, y);
+        let error = arena.try_push_binary(OpKind::Add, mask, x).unwrap_err();
+        assert_eq!(error.op, OpKind::Add);
+        assert_eq!(error.got, vec![Sort::Mask, Sort::Real]);
     }
 }

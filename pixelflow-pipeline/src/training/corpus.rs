@@ -369,6 +369,14 @@ fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<(
                 format!("the corpus format holds real constants only; found a mask literal ({m})"),
             ));
         }
+        ExprNode::Const(Lit::Int(v)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the corpus format holds real constants only; found an integer literal ({v})"
+                ),
+            ));
+        }
         ExprNode::Param(i) => {
             w.write_all(&[TAG_PARAM, i])?;
         }

@@ -47,6 +47,18 @@ impl ShiftCount {
         (f32::from(count) == literal).then_some(Self(count))
     }
 
+    /// The count named by an integer literal.
+    #[must_use]
+    pub fn from_int(literal: i32) -> Option<Self> {
+        (literal >= 0 && literal < Self::WORD_BITS as i32).then_some(Self(literal as u8))
+    }
+
+    /// The integer literal used by the typed arena spelling.
+    #[must_use]
+    pub const fn int_literal(self) -> i32 {
+        self.0 as i32
+    }
+
     /// The count as the literal the arena spells it with: `+0.0..31.0`. The
     /// count `0` reads back as `+0.0` even when it came from `-0.0`, which
     /// names the same count.
