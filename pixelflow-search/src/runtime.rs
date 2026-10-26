@@ -119,6 +119,25 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Why the mandatory optimization phase could not produce a program.
+///
+/// `unit` is the identity of the separately optimized unit that was refused;
+/// `None` means the term around the units was refused. Keeping that identity
+/// makes a failure in a large linked program actionable without exposing the
+/// optimizer's internal job ordering.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OptimizationError {
+    /// The e-graph could not admit the term.
+    Admission {
+        /// The refused unit, or `None` for the outer term.
+        unit: Option<KernelKey>,
+        /// The construct admission refused.
+        reason: Declined,
+    },
+    /// Symbolic differentiation could not lower the optimized program.
+    Derivative(&'static str),
+}
+
 /// Optimize a runtime-built arena via bounded e-graph saturation, through
 /// the same [`Optimizer`] entry point — rule set, budget, cost model,
 /// extractor — as the `kernel!` macro.
@@ -132,11 +151,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 ///
 /// A **reference** is a unit (see the module docs): its body is optimized by
 /// itself and linked in after extraction, so the arena handed back holds no
-/// `Ref`. A unit, or the term around it, that the e-graph declines is linked
-/// as written while the rest still optimize — a decline narrows to the term
-/// that declined.
+/// `Ref`. A unit, or the term around it, that the e-graph declines makes the whole
+/// optimization fail, naming that unit when there is one.
 ///
-/// Returns `None`, unchanged, when the term holds no reference and the
+/// Returns an [`OptimizationError::Admission`] when the
 /// subgraph reachable from `root` contains a construct the e-graph doesn't
 /// model:
 ///
@@ -164,9 +182,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// `Uniform` leaves are representable like `Buffer`: opaque to every rule,
 /// hash-consed by identity, redeclared by extraction. Nothing folds one.
 ///
-/// Callers compile the original arena unchanged in that case — `optimize_runtime_arena`
-/// is strictly an optimization, never required for correctness. The
-/// declining is memoized by structure like a result is.
+/// The decline is reported instead of compiling the source term, and is memoized by
+/// structure like a successful result.
 ///
 /// # One saturation per structure, one extraction per lattice
 ///
@@ -204,12 +221,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 ///
 /// With `--features saturation-telemetry`, one record per *saturation* —
 /// a cache hit extracts and records nothing, since nothing was saturated.
-#[must_use]
 pub fn optimize_runtime_arena(
     arena: &ExprArena,
     root: ExprId,
     shape: LatticeShape,
-) -> Option<Arc<(ExprArena, ExprId)>> {
+) -> Result<Arc<(ExprArena, ExprId)>, OptimizationError> {
     Program::of(arena, root)
         .optimize(Run::new(shape, saturated_for))
         .map(Arc::new)
@@ -223,7 +239,7 @@ fn optimize_runtime_arena_uncached(
     arena: &ExprArena,
     root: ExprId,
     shape: LatticeShape,
-) -> Option<(ExprArena, ExprId)> {
+) -> Result<(ExprArena, ExprId), OptimizationError> {
     Program::of(arena, root).optimize(Run::new(shape, saturate_fresh))
 }
 
@@ -330,9 +346,8 @@ impl<'a> Program<'a> {
     ///
     /// With no unit this is the sequence of calls the runtime tier has always
     /// made, so a term without a reference is optimized exactly as before:
-    /// `None` when the e-graph declines it, for the caller to compile as
-    /// given.
-    fn optimize(&self, run: Run) -> Option<(ExprArena, ExprId)> {
+    /// an error when the e-graph declines it.
+    fn optimize(&self, run: Run) -> Result<(ExprArena, ExprId), OptimizationError> {
         let leaves: BTreeMap<KernelKey, Variance> =
             self.units.iter().map(|(k, u)| (*k, u.variance)).collect();
         let outer = Job {
@@ -341,8 +356,9 @@ impl<'a> Program<'a> {
             leaves: &leaves,
         };
         if self.units.is_empty() {
-            let (optimized, optimized_root) = outer.optimize(run)?;
-            return pixelflow_ir::passes::lower_dwrt_owned(&optimized, optimized_root).ok();
+            let (optimized, optimized_root) = outer.optimize(run, None)?;
+            return pixelflow_ir::passes::lower_dwrt_owned(&optimized, optimized_root)
+                .map_err(OptimizationError::Derivative);
         }
 
         // The term around the units first, then each unit, in key order: the
@@ -358,7 +374,9 @@ impl<'a> Program<'a> {
             .each(&jobs)
             .into_iter()
             .zip(&jobs)
-            .map(|(done, job)| done.unwrap_or_else(|| (job.arena.clone(), job.root)));
+            .map(|(done, _job)| done)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter();
         let (mut program, program_root) = optimized
             .next()
             .expect("the term around the units is the first job");
@@ -371,7 +389,8 @@ impl<'a> Program<'a> {
         // shape survived saturation — a `Dwrt` the chain rule did not reach
         // — and making it emittable. It owns nothing the graph does not also
         // know, so running it first only takes choices away.
-        pixelflow_ir::passes::lower_dwrt_owned(&program, linked_root).ok()
+        pixelflow_ir::passes::lower_dwrt_owned(&program, linked_root)
+            .map_err(OptimizationError::Derivative)
     }
 }
 
@@ -462,9 +481,13 @@ struct Job<'a> {
 
 impl Job<'_> {
     /// `Ô_s`: saturate (or find saturated) and extract, in this term's own
-    /// names and slot order. `None` when the e-graph declines the term, which
-    /// telemetry records.
-    fn optimize(&self, run: Run) -> Option<(ExprArena, ExprId)> {
+    /// names and slot order. Returns an error when the e-graph declines the term;
+    /// telemetry records the same decline.
+    fn optimize(
+        &self,
+        run: Run,
+        unit: Option<KernelKey>,
+    ) -> Result<(ExprArena, ExprId), OptimizationError> {
         let canon = canonical(self.arena, self.root);
         // One optimizer per job: it keys the cache, saturates, and extracts.
         let mut optimizer = runtime_optimizer(run.shape);
@@ -475,10 +498,13 @@ impl Job<'_> {
                 crate::telemetry::record_decline(crate::tier::Tier::Runtime, declined);
                 #[cfg(not(feature = "saturation-telemetry"))]
                 let _ = declined;
-                return None;
+                return Err(OptimizationError::Admission {
+                    unit,
+                    reason: declined,
+                });
             }
         };
-        Some(self.extract(&obtained, &canon, &optimizer))
+        Ok(self.extract(&obtained, &canon, &optimizer))
     }
 
     /// Extract the graph `obtained` under `optimizer`'s lattice and hand the
@@ -554,8 +580,8 @@ impl Run {
     /// Every job optimized, the result for `jobs[i]` at `i`: workers pull
     /// the next index until there is none, so which worker ran which job, and
     /// in what order, cannot reach the result.
-    fn each(self, jobs: &[Job<'_>]) -> Vec<Option<(ExprArena, ExprId)>> {
-        let results: Vec<OnceLock<Option<(ExprArena, ExprId)>>> =
+    fn each(self, jobs: &[Job<'_>]) -> Vec<Result<(ExprArena, ExprId), OptimizationError>> {
+        let results: Vec<OnceLock<Result<(ExprArena, ExprId), OptimizationError>>> =
             jobs.iter().map(|_| OnceLock::new()).collect();
         let next = AtomicUsize::new(0);
         let work = || {
@@ -564,7 +590,10 @@ impl Run {
                 let Some(job) = jobs.get(i) else {
                     return;
                 };
-                let done = results[i].set(job.optimize(self)).is_ok();
+                let unit = i
+                    .checked_sub(1)
+                    .and_then(|i| jobs[0].leaves.keys().nth(i).copied());
+                let done = results[i].set(job.optimize(self, unit)).is_ok();
                 assert!(done, "Run::each: job {i} was claimed twice");
             }
         };
@@ -921,15 +950,15 @@ mod tests {
             for (count, (arena, root)) in &declined {
                 for ask in ["first", "memoized"] {
                     assert!(
-                        optimize_runtime_arena(arena, *root, shape).is_none(),
-                        "{op:?} by {count}, {ask} ask: the term must be left as written"
+                        optimize_runtime_arena(arena, *root, shape).is_err(),
+                        "{op:?} by {count}, {ask} ask: the decline must be reported"
                     );
                 }
             }
 
             let (arena, root) = shifted_by(&|a| a.push_const(3.0));
             assert!(
-                optimize_runtime_arena(&arena, root, shape).is_some(),
+                optimize_runtime_arena(&arena, root, shape).is_ok(),
                 "{op:?} by 3 is a shift the graph holds"
             );
         }
@@ -1210,41 +1239,25 @@ mod tests {
         );
     }
 
-    /// **A decline narrows.** A unit the e-graph cannot hold — here, one
-    /// holding a `Seq`, an op no vocabulary resolves — is linked as written,
-    /// while the unit beside it is still optimized: one declining unit no
-    /// longer costs the program every other unit's optimization.
+    /// A unit the e-graph cannot hold is reported with its identity.
     #[test]
-    fn a_declining_unit_does_not_cost_the_others_their_optimization() {
+    fn a_declining_unit_is_identified() {
         let mut sequenced = ExprArena::new();
         let x = sequenced.push_var(0);
         let y = sequenced.push_var(1);
         let seq = sequenced.push_binary(OpKind::Seq, x, y);
         let declines = Kernel::from_parts(sequenced, seq);
+        let declined_key = KernelStore::intern(&declines);
         // X·0 + Y: folds to Y, which only an optimized unit can say.
         let folds = Kernel::x().mul(&Kernel::constant(0.0)).add(&Kernel::y());
         let program = declines.by_ref().add(&folds.by_ref());
         let (arena, root) = program.parts();
-        let (out, out_root) = &*optimize_runtime_arena(arena, root, LatticeShape::POINT)
-            .expect("a program of units links even when one declines");
-        let ExprNode::Binary(OpKind::Add, a, b) = out.node(*out_root) else {
-            panic!(
-                "expected the sum of the two units, got {}",
-                out.display(*out_root)
-            );
-        };
-        let kinds = [out.node(a), out.node(b)];
-        assert!(
-            kinds
-                .iter()
-                .any(|n| matches!(n, ExprNode::Binary(OpKind::Seq, ..))),
-            "the declining unit is linked as written: {}",
-            out.display(*out_root)
-        );
-        assert!(
-            kinds.iter().any(|n| matches!(n, ExprNode::Var(1))),
-            "the other unit is optimized to Y: {}",
-            out.display(*out_root)
+        assert_eq!(
+            optimize_runtime_arena(arena, root, LatticeShape::POINT).err(),
+            Some(OptimizationError::Admission {
+                unit: Some(declined_key),
+                reason: Declined::Op(OpKind::Seq),
+            })
         );
     }
 }
@@ -2949,11 +2962,10 @@ mod production_equivalence {
             // would make the second kernel with an equal arena report the
             // first one's answer rather than recomputing it.
             let line = match optimize_runtime_arena_uncached(&arena, root, LatticeShape::POINT) {
-                Some((opt, opt_root)) => digest(&opt, opt_root),
-                // `None` is a real production outcome (an arena
-                // `optimize_runtime_arena` bails on), and it must stay the
-                // same outcome across the change, so it is a row, not a skip.
-                None => String::from("BAILED\t0"),
+                Ok((opt, opt_root)) => digest(&opt, opt_root),
+                // A decline is a real production outcome and must stay the same
+                // outcome across the change, so it is a row, not a skip.
+                Err(_) => String::from("BAILED\t0"),
             };
             writeln!(text, "{name}\t{line}").expect("fmt");
         }

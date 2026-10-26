@@ -66,7 +66,7 @@ fn bake_pipeline(arena: &ExprArena, root: ExprId, shape: [u32; 2]) -> (ExprArena
         root,
         pixelflow_ir::LatticeShape::new(shape),
     )
-    .unwrap_or_else(|| {
+    .unwrap_or_else(|_| {
         panic!("the runtime tier declined the glyph; a bake would compile it unoptimized")
     });
     let (a, r) = &*optimized;

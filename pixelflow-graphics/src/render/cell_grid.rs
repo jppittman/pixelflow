@@ -834,7 +834,7 @@ mod tests {
                 let lattice =
                     pixelflow_ir::LatticeShape::new([FRAME_SHAPE.frame_w, FRAME_SHAPE.frame_h]);
                 let optimized = optimize_runtime_arena(arena, root, lattice)
-                    .unwrap_or_else(|| panic!("shifts {shifts:?}: the program declined"));
+                    .unwrap_or_else(|_| panic!("shifts {shifts:?}: the program declined"));
                 let (out, out_root) = &*optimized;
                 (shifts, program_digest(out, *out_root))
             })

@@ -88,7 +88,7 @@ pub struct Linked {
 ///
 /// # Errors
 ///
-/// Whatever [`emit::compile`] reports for the (optimized) arena.
+/// Whatever optimization or [`emit::compile`] reports.
 ///
 /// # Panics
 ///
@@ -134,12 +134,8 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // extraction (`pixelflow_search::runtime`'s units;
     // docs/language/2026-09-25-the-language-is-kernel.md §4, O1).
     //
-    // It bails for constructs the e-graph does not model
-    // (`egraph::insert`'s `Declined`: a `Param`, an op
-    // `Vocabulary::Runtime` does not admit, such as a `RawGather`) in a
-    // term with no unit; those still compile — from the *expanded* arena, so
-    // a reference never reaches the emitter — just without the extra fusion,
-    // and saturation telemetry records the decline. A `Reduce` is modelled —
+    // A construct the e-graph does not model is a compile error rather than
+    // permission to emit the source term. A `Reduce` is modelled —
     // it enters the e-graph as itself, and a fold extraction keeps is
     // emitted as a loop.
     //
@@ -148,11 +144,10 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // walk order — without touching a node, so the bytes of a kernel that
     // declares neither a buffer nor a uniform are exactly what they were.
     let emit_fn = || {
-        let optimized = pixelflow_search::runtime::optimize_runtime_arena(arena, root, shape);
-        let (arena, root) = optimized
-            .as_deref()
-            .map(|(a, r)| (a, *r))
-            .unwrap_or((linked_arena, linked_root));
+        let optimized = pixelflow_search::runtime::optimize_runtime_arena(arena, root, shape)
+            .map_err(CompileError::Optimization)?;
+        let (arena, root) = optimized.as_ref();
+        let root = *root;
         if buffers.is_empty() && uniforms.is_empty() {
             return emit::compile(arena, root, shape);
         }
