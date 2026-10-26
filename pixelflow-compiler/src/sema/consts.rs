@@ -2,6 +2,7 @@
 //! evaluator checks it, a fold's bounds, and every `const`'s value.
 
 use crate::ast::{BinaryOp, ConstItem, Expr, Name, RangeExpr, UnaryOp};
+use pixelflow_ir::passes::lattice::{COLLAPSE_BINDERS, KERNEL_BINDER_CAPACITY};
 use pixelflow_ir::{Binder, Fold, KnownRange};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
@@ -198,7 +199,8 @@ pub(crate) fn range_bounds(range: &RangeExpr, scope: RangeScope<'_>) -> syn::Res
     Ok([lo, hi])
 }
 
-/// The refusal of a fold opened with every binder of the IR already taken.
+/// The refusal of a fold opened with every user binder available to collapse
+/// already taken.
 ///
 /// `sema` makes it for the folds one body nests; lowering makes it again
 /// where an inlined helper's fold nests inside a caller's, the one depth
@@ -207,9 +209,11 @@ pub(crate) fn folds_nested_too_deep(span: Span) -> syn::Error {
     syn::Error::new(
         span,
         format!(
-            "folds nested more than {} deep: the IR binds at most that many indices at once \
-             (`Binder::COUNT`)",
-            Binder::COUNT
+            "folds nested more than {} deep: collapse reserves {} of the IR's {} binder \
+             slots for its row, column, and lane folds",
+            KERNEL_BINDER_CAPACITY,
+            COLLAPSE_BINDERS,
+            Binder::COUNT,
         ),
     )
 }

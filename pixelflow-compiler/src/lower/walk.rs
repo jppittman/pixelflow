@@ -12,7 +12,8 @@ use crate::sema::{
     range_bounds,
 };
 use pixelflow_ir::arena::Axis;
-use pixelflow_ir::{Binder, Monoid, OpKind};
+use pixelflow_ir::passes::lattice::KERNEL_BINDER_CAPACITY;
+use pixelflow_ir::{Monoid, OpKind};
 use std::collections::HashMap;
 use std::rc::Rc;
 use syn::Ident;
@@ -298,10 +299,10 @@ impl<S: Site> Lowering<'_, S> {
         let bounds = [bound(lo)?, bound(hi)?];
         // One placeholder per fold open at once, the `n`th for `n` open, so a
         // nested fold's rename never reaches its enclosing fold's index. No
-        // more open than the IR has binders: the refusal names the depth,
+        // more open than a collapsed kernel has binders: the refusal names the depth,
         // where running out of placeholders would name nothing the author
         // wrote.
-        if self.open_folds >= Binder::COUNT {
+        if self.open_folds >= KERNEL_BINDER_CAPACITY {
             return Err(folds_nested_too_deep(fold.span));
         }
         let index = self

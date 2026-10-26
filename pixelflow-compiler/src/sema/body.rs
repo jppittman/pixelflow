@@ -7,7 +7,8 @@ use crate::ast::{
     FoldExpr, FunctionType, IfExpr, LetStmt, Method, MethodCallExpr, Name, PLAN, Param,
     ProjectExpr, Projection, RecordId, Role, Scopes, Stmt, UnaryOp, arity_mismatch, same_name,
 };
-use pixelflow_ir::{Binder, OpKind};
+use pixelflow_ir::OpKind;
+use pixelflow_ir::passes::lattice::KERNEL_BINDER_CAPACITY;
 use proc_macro2::Span;
 use std::collections::HashMap;
 use syn::Ident;
@@ -365,7 +366,7 @@ impl<'a> FnAnalyzer<'a> {
                 ));
             }
         }
-        if self.folds_open >= Binder::COUNT {
+        if self.folds_open >= KERNEL_BINDER_CAPACITY {
             return Err(folds_nested_too_deep(fold.span));
         }
         self.refuse_shadowing_an_item(&fold.binder, "a fold's index")?;

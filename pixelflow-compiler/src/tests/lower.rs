@@ -4,15 +4,15 @@
 use crate::ast::Role;
 use crate::lower::{Expansion, Lowered};
 use crate::parser::parse;
-use pixelflow_ir::Binder;
 use pixelflow_ir::arena::ExprNode;
+use pixelflow_ir::passes::lattice::KERNEL_BINDER_CAPACITY;
 use quote::quote;
 
 /// `sema` counts the folds one body nests; a helper's fold inlined into
 /// them nests deeper than any body shows, and lowering refuses that one,
-/// where the IR would run out of binders.
+/// where collapse would run out of binders.
 #[test]
-fn a_helper_fold_nests_inside_the_callers_and_is_refused_past_the_binders() {
+fn a_helper_fold_nests_inside_the_callers_and_is_refused_past_collapse_capacity() {
     use proc_macro2::TokenStream;
     let fold = |body: TokenStream| quote! { (0..1).map(|i| #body).sum::<f32>() };
     let nest =
@@ -29,16 +29,19 @@ fn a_helper_fold_nests_inside_the_callers_and_is_refused_past_the_binders() {
         let entry = analyzed.def.fns().iter().find(|f| f.role() == Role::Entry);
         Expansion::lower(entry.expect("one entry").callable(), &analyzed)
     };
-    let Ok(Lowered { arena, root, .. }) = through_sema(program(Binder::COUNT - 1)) else {
-        panic!("as deep as the IR has binders lowers");
+    let Ok(Lowered { arena, root, .. }) = through_sema(program(KERNEL_BINDER_CAPACITY - 1)) else {
+        panic!("as deep as collapse has binders lowers");
     };
     let ExprNode::Reduce { fold: outer, .. } = arena.node(root) else {
         panic!("expected a fold");
     };
-    assert_eq!(usize::from(outer.binder().slot()), Binder::COUNT - 1);
-    let Err(err) = through_sema(program(Binder::COUNT)) else {
-        panic!("one binder deeper than the IR has");
+    assert_eq!(
+        usize::from(outer.binder().slot()),
+        KERNEL_BINDER_CAPACITY - 1
+    );
+    let Err(err) = through_sema(program(KERNEL_BINDER_CAPACITY)) else {
+        panic!("one binder deeper than collapse admits");
     };
     let err = err.to_string();
-    assert!(err.contains("folds nested more than"), "got: {err}");
+    assert!(err.contains("collapse reserves 3"), "got: {err}");
 }

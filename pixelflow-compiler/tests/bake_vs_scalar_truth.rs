@@ -52,6 +52,22 @@ fn arithmetic_matches_scalar_truth() {
     }
 }
 
+/// A coordinate-dependent right operand must stay on the right of subtraction
+/// and division when the backend assigns registers for two-operand code.
+#[test]
+fn noncommutative_ops_with_heavy_right_operands_match_scalar_truth() {
+    let subtract = kernel!(|z: f32| X - Y * z);
+    let divide = kernel!(|z: f32| X / (Y * z + 1.0));
+    for &p in SAMPLES {
+        check("sub_heavy_right", bake(&subtract(p.2), p), p.0 - p.1 * p.2);
+        check(
+            "div_heavy_right",
+            bake(&divide(p.2), p),
+            p.0 / (p.1 * p.2 + 1.0),
+        );
+    }
+}
+
 #[test]
 fn params_match_scalar_truth() {
     let (cx, cy, r) = (0.25_f32, -0.75_f32, 1.5_f32);

@@ -77,7 +77,7 @@
 //!     /// in `analyzed.parameters(entry.params)` order; kernel parameters admitted next in
 //!     /// `kernel_parameters()` order; then the body, children first, helpers inlined (β), consts
 //!     /// folded, each fold one `Reduce`, a `let` one shared node. Err: a coordinate in a helper;
-//!     /// a fold at depth `Binder::COUNT` counting inlined ones.
+//!     /// a fold at depth `KERNEL_BINDER_CAPACITY` counting inlined ones.
 //!     fn lower_entry<S: Site>(entry: Callable<'_>, analyzed: &AnalyzedKernel, site: &mut S) -> syn::Result<S::Term>;
 //!     /// `lower_entry` at a fresh arena. Err: `lower_entry`'s, and an entry that takes a kernel.
 //!     fn Expansion::lower(entry: Callable<'_>, analyzed: &AnalyzedKernel) -> syn::Result<Lowered>;
@@ -152,8 +152,8 @@ pub(crate) trait Site {
     ///
     /// # Panics
     ///
-    /// At `depth` [`pixelflow_ir::Binder::COUNT`] or more: lowering refuses a fold nested
-    /// that deep before it opens one.
+    /// At `depth` [`pixelflow_ir::passes::lattice::KERNEL_BINDER_CAPACITY`] or more:
+    /// lowering refuses a fold nested that deep before it opens one.
     fn open_fold(
         &mut self,
         depth: usize,

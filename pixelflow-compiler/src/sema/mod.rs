@@ -117,7 +117,7 @@
 //!     /// Known ends run forward and `KnownRange::admits` them; value ends
 //!     /// are checked by the IR guard.
 //!     fn range_bounds(range: &RangeExpr, scope: RangeScope<'_>) -> syn::Result<[Count; 2]>;
-//!     /// The refusal of a fold opened with `Binder::COUNT` already open.
+//!     /// The refusal of a fold opened with `KERNEL_BINDER_CAPACITY` already open.
 //!     fn folds_nested_too_deep(span: Span) -> syn::Error;
 //! }
 //! /// The AST, validated, and the value of every `const`.

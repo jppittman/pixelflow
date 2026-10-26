@@ -268,9 +268,11 @@
 - **Is not:** a lattice origin. Not evaluation. Not a resolver of
   derivatives: a `Dwrt` inside survives and follows the warp, so
   `DX(X·X)` at `(2X, Y)` is 24 at x = 3, not 12. Not able to reach through a
-  `Ref` (collapse refuses a reachable `Ref`). In `kernel!`, `f.at(x, y)`
-  observes any `f32` or `bool` field, including a `let`, helper parameter,
-  kernel application or fold, and keeps its type.
+  `Ref` (collapse refuses a reachable `Ref`). Not only for functions: in
+  `kernel!`, `f.at(x, y)` observes any field, an `f32` or `bool` of any
+  form — a `let`, a helper's parameter, a kernel's application, a fold —
+  and keeps its type (D5 overturned 2026-10-06; JP: "I want first class
+  contramap support").
 - **Follows:**
   - The lattice can be index-only.
   - Once a frame offset is in the arena, the optimizer may reassociate it.
@@ -284,10 +286,12 @@
     expand or call chosen at extraction, is unbuilt; tabulation is the
     backend's materialization (kernels-evaluate-kernels §3).
     (composition-is-linking §8).
-- **Lives:** `ExprArena::warp` (`pixelflow-ir/src/arena.rs`), used by `.at` at
-  both lowering sites; `ExprArena::apply` (`pixelflow-ir/src/kernel.rs`)
-  splices a kernel before warping it. `Kernel::at` performs the same
-  substitution on a `Kernel` DAG. Pinned in
+- **Lives:** `ExprArena::warp` (`pixelflow-ir/src/arena.rs`), the one
+  arena-level definition: `kernel!`'s `.at` lowers to it at both sites, and
+  `ExprArena::apply` (`pixelflow-ir/src/kernel.rs`) is a splice and then it.
+  `Kernel::at` is the same substitution over a `Kernel`'s DAG, a second
+  implementation pinned to the same program by test and recorded as debt
+  (BACKLOG N6). Built on `ExprArena::substitute_vars_with`. Pinned in
   `pixelflow-compiler/tests/at_is_contramap.rs`. Decided in
   `2026-09-06-lattice-is-the-index.md` "The shape" and §9.2, and
   the-language-is-kernel §1.2, D5. Today the pixel-centre ½ is not a

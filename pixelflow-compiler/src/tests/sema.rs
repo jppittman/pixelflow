@@ -3,7 +3,7 @@
 
 use crate::parser::parse;
 use crate::sema::{AnalyzedKernel, analyze};
-use pixelflow_ir::Binder;
+use pixelflow_ir::passes::lattice::KERNEL_BINDER_CAPACITY;
 use proc_macro2::TokenStream;
 use quote::quote;
 
@@ -553,16 +553,19 @@ fn a_bound_past_the_exact_index_is_refused() {
     accepted(quote! { || (16777215..16777216).map(|i| i as f32).sum() });
 }
 
-/// Folds nest as deep as the IR has binders, and no deeper: one more is
+/// Folds nest as deep as collapse leaves binders, and no deeper: one more is
 /// refused, not a panic.
 #[test]
-fn folds_nest_as_deep_as_the_ir_has_binders() {
+fn folds_nest_as_deep_as_collapse_has_binders() {
     let fold = |body: TokenStream| quote! { (0..1).map(|i| #body).sum::<f32>() };
     let nest = |depth: usize| (0..depth).fold(quote! { X }, |body, _| fold(body));
-    let (deepest, one_deeper) = (nest(Binder::COUNT), nest(Binder::COUNT + 1));
+    let (deepest, one_deeper) = (
+        nest(KERNEL_BINDER_CAPACITY),
+        nest(KERNEL_BINDER_CAPACITY + 1),
+    );
     accepted(quote! { || #deepest });
     let err = refusal(quote! { || #one_deeper });
-    assert!(err.contains("folds nested more than"), "got: {err}");
+    assert!(err.contains("collapse reserves 3"), "got: {err}");
 }
 
 /// A range's bounds are built from `usize` consts, at the largest value a

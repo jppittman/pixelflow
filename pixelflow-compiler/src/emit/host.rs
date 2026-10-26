@@ -36,7 +36,7 @@ use syn::Ident;
 /// # Errors
 ///
 /// When lowering refuses what `sema` accepted: folds nested past
-/// `Binder::COUNT` after a helper is inlined.
+/// `KERNEL_BINDER_CAPACITY` after a helper is inlined.
 pub(crate) fn emit_kernel(
     analyzed: &AnalyzedKernel,
     optimizer: &mut dyn Optimize,
