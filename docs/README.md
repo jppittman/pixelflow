@@ -74,7 +74,12 @@ A live document is one that still decides something or owns open work. Its statu
 ## Evidence
 
 - [`results/`](results/) — recorded measurements: extraction, rewrite rules, JIT cost, actor benchmarks, the claims ledger. Point-in-time; heed each report's corrections.
-- [`bugs/`](bugs/) — defect reports and the test-quality audit series (2026-07-20 → 2026-09-07, a chain: read the newest, [`bugs/2026-09-07-test-quality-audit-followup.md`](bugs/2026-09-07-test-quality-audit-followup.md), which carries the live backlog). Still open there: [`bugs/2026-07-15-pty-fork-malloc-deadlock.md`](bugs/2026-07-15-pty-fork-malloc-deadlock.md).
+
+Defects, audit follow-ups, status, and priority live in Linear rather than in a
+checked-in bug backlog. Repository documentation records durable design and
+measured results; regression tests live beside the public behavior they
+protect. A proposed test should state an observable, documented API outcome in
+the “it should …” style instead of pinning an implementation detail.
 
 ## Archive
 
