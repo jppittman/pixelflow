@@ -62,11 +62,16 @@ A mask is a bit pattern, not a number, and that is a load-bearing distinction:
 literal bitwise ops. (The blend is the last step of `If`, after both guarded arms, not a
 path of its own — see "`If` guards its arms" below.) Spell a
 true mask `1.0` and `mask & 1.0` is `0x3f800000`, which blends `7.0` against
-`9.0` into `4.5` — a value neither branch held. `OpKind::mask(bool)` is the only
-constructor, `OpKind::is_bitwise_domain()` marks the ops whose results are
-patterns, and the folder's "refuse non-finite results" guard exempts them —
-otherwise an all-ones mask reads as NaN and comparison folding switches itself
-off while looking like a safety check.
+`9.0` into `4.5` — a value neither branch held. So a constant mask is its own
+literal: `Lit::Mask(bool)` (`pixelflow-ir/src/lit.rs`), beside `Lit::Real(f32)`,
+and the folder's comparison arms yield one. A mask is never spelled as a float,
+the e-graph keys a constant by its typed value, so a true mask and the NaN that
+shares its lane are two e-classes, and the backend is the one place a mask
+becomes bits (`Lit::bits`). What still rides in a real lane by convention is
+the integer domain — `TruncToInt`, `IAdd`, the shifts, and `BitAnd`/`BitOr` on
+two reals in the exp/log lowering — and `OpKind::is_bitwise_domain()` marks
+those so the folder's "refuse non-finite results" guard exempts them; it lasts
+until those results have a type of their own.
 
 Behavior that differs by target, because the instructions do:
 
@@ -172,7 +177,7 @@ went with the tiers that held them. A copy is a future divergence.
 - **A kernel with a lattice is the evaluation API**: `Kernel` describes, `Manifold::compile` specializes it at a shape, `Lattice::collapse` tabulates it. There is no per-batch entry and no interpreter.
 - **SIMD as algebra**: users write equations; the compiler owns the loop nest, the hoisting, the pack and the register allocation, and emits the assembly. Lane width is never in the vocabulary.
 - **The Fixed Observer**: Camera is at origin. Movement is achieved by warping coordinate space.
-- **The language is a DAG**: no iteration binder. A fixed-count iteration is unrolled at construction; a trip count that must change is a recompile through the shape-keyed cache.
+- **The language is a DAG**: the fold is its one binder, and no fold's bound is a function of a coordinate (X, Y) or of a lattice binder. A bound is a value placed by its variance: a literal is the fold's data, which extraction may unroll; a per-call count is a uniform, computed once per call, so one program serves every count; a count is an integer in `0..=2²⁴`, and a fold with a bound that is not one is NaN, up to the optimizer's rules unsound at NaN (BACKLOG E9) (docs/language/2026-10-20-a-bound-is-a-value.md).
 - **Zero allocations** - No per-frame heap allocation (ping-pong buffer strategy).
 - **Platform on main thread** - Especially macOS Cocoa (Apple requirement).
 
@@ -427,7 +432,8 @@ docs/codegen/2026-09-22-the-isa-is-decided-at-startup.md.
   **Branchless is the limit**: no case survives to runtime at all, because one
   expression is correct for every input. It is what this codebase is made of —
   a comparison yields a mask rather than a `bool`, and the language is a DAG
-  with no binder — so take it wherever the hardware offers it. `If` is
+  whose one binder, the fold, has no bound that varies with a coordinate — so
+  take it wherever the hardware offers it. `If` is
   **not** an example of it, however much it looks like one; see "`If`
   guards its arms" below. What it does not license is hand-rolling a
   *worse* branchless form than the instruction already there: the retired

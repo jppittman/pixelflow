@@ -31,7 +31,7 @@ Values are names, registers are resources, `encode` makes no choice; a lane is
 
 ## Contract
 `mod.rs` exports `compile`, `CompiledKernel` (`as_bytes`, `call`), `EmitTraffic`,
-`ScopeTraffic`, `CompileResult`; `pub(crate)` `native`, `vector_bytes`. Inside:
+`ScopeTraffic`, `Trips`, `CompileResult`; `pub(crate)` `native`, `vector_bytes`. Inside:
 `IsaBackend`, `Function`, `Stage` (`Selected`, `Bound`), `Class` (sealed: `Vector`,
 `Pointer`, `Integer`, `Opmask`, `Flags`), `Value`, `LaneOp`, `Assemble`. Encoders:
 `x86_64.rs` (shared), `avx2.rs`, `avx512.rs`, `aarch64.rs`; `regalloc/` has its own intent.

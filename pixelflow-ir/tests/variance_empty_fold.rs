@@ -1,13 +1,13 @@
 //! A fold over nothing varies with nothing.
 //!
-//! `⊕_{i∈∅} body` is the monoid's identity (`Fold::is_empty`): a constant,
+//! `⊕_{i∈∅} body` is the monoid's identity (`KnownRange::is_empty`): a constant,
 //! whatever its body reads. By the variance law (if `b ∉ var(v)` then `⟦v⟧` is
 //! constant along `b`) the exact set for a constant is empty, so the fold adds
 //! nothing to its readers. Read off the body (`deps(body) \ {i}`), it would
 //! name every variable the never-evaluated body reads, and a reader such as
 //! `y + ·` would inherit them.
 
-use pixelflow_ir::fold::{Binder, Fold, Monoid};
+use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 use pixelflow_ir::variance::{Variance, compute_arena_variance};
 use pixelflow_ir::{ExprArena, OpKind};
 
@@ -21,8 +21,9 @@ fn a_fold_over_nothing_varies_with_nothing() {
     let y = arena.push_var(1);
     let index = arena.push_var(i.var());
     let body = arena.push_binary(OpKind::Mul, index, x);
-    let none = arena.push_reduce(Fold::new(Monoid::PRODUCT, i, 0..0), body);
-    let some = arena.push_reduce(Fold::new(Monoid::PRODUCT, i, 0..3), body);
+    let fold = Fold::new(Monoid::PRODUCT, i);
+    let none = arena.push_reduce(fold, Bound::Lit(0), Bound::Lit(0), body);
+    let some = arena.push_reduce(fold, Bound::Lit(0), Bound::Lit(3), body);
     let read = arena.push_binary(OpKind::Add, y, none);
 
     let variance = compute_arena_variance(&arena);

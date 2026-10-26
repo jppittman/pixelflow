@@ -72,6 +72,9 @@ use proc_macro::TokenStream;
 /// refusal of one names the phase that brings it.
 pub(crate) const PLAN: &str = "docs/language/2026-09-25-the-language-is-kernel.md";
 
+/// The plan that made a fold's bound a value.
+pub(crate) const BOUND_PLAN: &str = "docs/language/2026-10-20-a-bound-is-a-value.md";
+
 /// The `kernel!` macro: the language, as a block of items or as a closure,
 /// optimized by the e-graph at macro-expansion time.
 ///
@@ -155,13 +158,19 @@ pub(crate) const PLAN: &str = "docs/language/2026-09-25-the-language-is-kernel.m
 /// `(a..b).map(|i| e).sum()` is Σ of `e` over `i ∈ [a, b)`; `.product()`,
 /// `.fold(f32::INFINITY, f32::min)` and `.fold(f32::NEG_INFINITY, f32::max)`
 /// are Π, min and max, and `(a..b).any(|i| m)` and `.all(|i| m)` are ∃ and ∀
-/// of `bool`s. An empty range gives the monoid's identity. The bounds are
-/// constant — integers, `usize` consts and an entry's structural parameters
-/// — and the index `i` is a `usize`, which a body reads only as `i as f32`:
-/// there is no arithmetic on an index and nothing to index. A fold lowers to
-/// one `Reduce`, the node `Kernel::over` builds; unrolling it is the
-/// e-graph's choice, at bake time. A closure is the body of a fold and
-/// appears nowhere else.
+/// of `bool`s. An empty range gives the monoid's identity, up to the
+/// optimizer's algebraic rules, which are not sound at NaN or infinity
+/// (BACKLOG E9). Each bound is a
+/// `usize`: an integer, a `usize` const or `+ - * /` over them, known at
+/// expansion; an enclosing fold's index, for a triangular `(0..i)`; or an
+/// entry's count parameter, `n: usize`, bound per call. A bound that is a
+/// name the program binds stands alone — `0..i + 1` waits for bounds typed
+/// as integers — and no bound reads `X` or `Y`. The index `i` is a `usize`,
+/// which a body reads only as `i as f32`: there is no arithmetic on an index
+/// and nothing to index. A fold lowers to one `Reduce`, the node
+/// `Kernel::over` builds, or `Kernel::over_values` for a bound that is a
+/// value; unrolling it is the e-graph's choice, at bake time.
+/// A closure is the body of a fold and appears nowhere else.
 ///
 /// `if` is the choice. `.select(a, b)` still lowers to the same node this
 /// phase, and Phase B of the plan removes it.
@@ -191,8 +200,10 @@ pub(crate) const PLAN: &str = "docs/language/2026-09-25-the-language-is-kernel.m
 ///
 /// - Zero params → a `Kernel` value.
 /// - N params → a closure `move |p0: f32, ...| -> Kernel`, every parameter a
-///   uniform, as an entry's are. It has no `Args` record: a program compiled
-///   from it is rebound by position, `block.set_declared([p0, ...])`.
+///   uniform, as an entry's are. A count parameter, `n: usize`, is an entry's
+///   of the items form: the closure form takes `f32`s. It has no `Args`
+///   record: a program compiled from it is rebound by position,
+///   `block.set_declared([p0, ...])`.
 ///
 /// ```ignore
 /// let circle = kernel!(|cx: f32, cy: f32, r: f32| {
@@ -249,30 +260,34 @@ pub(crate) const PLAN: &str = "docs/language/2026-09-25-the-language-is-kernel.m
 ///
 /// # Binding times
 ///
-/// Every value a program reads is bound at one of three times (§1.4):
+/// An entry's parameters are bound at one of two times (§1.4):
 ///
-/// - **Structural**: an entry's `const N: usize` generics. The host function
-///   is generic over them, and each value is its own program — a count in a
-///   fold's range, or `N as f32`. A helper takes none; it reads its entry's
-///   through an argument.
-/// - **Uniform**: every parameter. An `f32` is one uniform and a record is
-///   one per field; the kernel an entry returns declares them in that order,
+/// - **Uniform**: every `f32`, count and record parameter. An `f32` is one
+///   uniform, a count (`n: usize`) one holding `n as f32`, and a record one
+///   per field; the kernel an entry returns declares them in that order,
 ///   each with the call's value as its default, and baking it draws the
 ///   call. The value is an argument of the program, never folded into it, so
-///   every call of an entry is one program: compiled once, and rebound per
-///   call from the entry's `Args` record — `<Entry in UpperCamelCase>Args`,
-///   its parameters as fields, written into a block the program made with
-///   `write_into`, which allocates nothing once the block is the caller's
-///   alone. A kernel the entry's is composed into still rebinds from it, its
-///   declarations the entry's in order beside argument-free kernels; beside
-///   other arguments the count differs, and `write_into` refuses. A
-///   constant is a `const` item.
+///   every call of an entry that takes no kernel is one program: compiled
+///   once, and rebound per call from the entry's `Args` record —
+///   `<Entry in UpperCamelCase>Args`, its parameters as fields, written into
+///   a block the program made with `write_into`, which allocates nothing
+///   once the block is the caller's alone. A kernel the entry's is composed
+///   into still rebinds from it, its declarations the entry's in order
+///   beside argument-free kernels; beside other arguments the number of
+///   arguments differs, and `write_into` refuses. A count past 2²⁴ is refused where the host
+///   writes it: the host function panics, and so does `write_into`, writing
+///   nothing. A constant is a `const` item.
 /// - **Kernel-typed**: an argument the host passes when it calls the entry.
 ///   The composed program declares the entry's own uniforms first, in
 ///   declaration order, then each argument's, in parameter order and that
 ///   argument's own order, read or not — an instance passed twice declared
 ///   once, where it first appears. Its key is the composed term's. It has
 ///   no `Args` record: binding a composed program is O3 of the plan.
+///
+/// A count known at expansion — a fold's bound, or `N as f32` — is built from
+/// literals and `usize` consts with `+ - * /`; one that changes per call is an
+/// entry parameter `n: usize`. Neither makes a program of its own, and no `fn`
+/// takes generics (docs/language/2026-10-20-a-bound-is-a-value.md §1.2, §3.4).
 ///
 /// ```ignore
 /// use pixelflow_compiler::kernel;
@@ -282,8 +297,11 @@ pub(crate) const PLAN: &str = "docs/language/2026-09-25-the-language-is-kernel.m
 ///     /// An axis-aligned box: a record.
 ///     pub struct Bounds { pub x0: f32, pub y0: f32, pub x1: f32, pub y1: f32 }
 ///
+///     /// How many rings.
+///     const N: usize = 4;
+///
 ///     /// `N` rings about the box's corner, `fg` on `bg`.
-///     pub fn rings<const N: usize>(b: Bounds, fg: f32, bg: f32) -> f32 {
+///     pub fn rings(b: Bounds, fg: f32, bg: f32) -> f32 {
 ///         let dx = X - b.x0;
 ///         let dy = Y - b.y0;
 ///         let r = (dx * dx + dy * dy).sqrt();
@@ -295,11 +313,11 @@ pub(crate) const PLAN: &str = "docs/language/2026-09-25-the-language-is-kernel.m
 ///
 /// let lattice = Lattice::frame(64, 64);
 /// let b = Bounds { x0: 8.0, y0: 8.0, x1: 40.0, y1: 40.0 };
-/// let once = lattice.bake(&rings::<4>(b, 1.0, 0.0));            // one call, baked
+/// let once = lattice.bake(&rings(b, 1.0, 0.0));            // one call, baked
 ///
-/// let program = Manifold::compile(&rings::<4>(b, 1.0, 0.0), lattice.extent);
+/// let program = Manifold::compile(&rings(b, 1.0, 0.0), lattice.extent);
 /// let mut block = program.block();
-/// RingsArgs::<4> { b, fg: 0.5, bg: 0.25 }.write_into(&mut block)?;
+/// RingsArgs { b, fg: 0.5, bg: 0.25 }.write_into(&mut block)?;
 /// let again = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
 /// ```
 ///
@@ -312,9 +330,7 @@ pub(crate) const PLAN: &str = "docs/language/2026-09-25-the-language-is-kernel.m
 ///    inlined, its parameters declared as uniforms
 /// 4. **Optimization**: e-graph saturation + latency-prior extraction, on
 ///    the arena. A kernel carrying a `Dwrt` declines here and is optimized
-///    at bake time instead, so composition still gets the chain rule; so is
-///    an entry with structural parameters, a template until it is
-///    instantiated.
+///    at bake time instead, so composition still gets the chain rule.
 /// 5. **Emission**: the arena becomes code that rebuilds it at load time,
 ///    the call's values as its uniforms' defaults
 ///

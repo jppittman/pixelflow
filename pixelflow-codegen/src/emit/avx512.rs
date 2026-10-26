@@ -34,8 +34,8 @@ use super::{
     Stage, Store, Test, Value, ValueName, Vector,
 };
 use crate::error::CompileError;
-use crate::program::BinaryOp;
 use crate::program::IfArm;
+use crate::program::MaskOp;
 
 /// `vpternlogd`'s truth table for `A ? B : C` per bit, with `A` the
 /// destination (the mask), `B` the first source and `C` the second.
@@ -147,13 +147,13 @@ pub(super) enum KOp {
     Or = 0x45,
 }
 
-impl KOp {
-    /// The mask-register form of a bitwise op, when it has one.
-    fn of(op: BinaryOp) -> Option<Self> {
+impl From<MaskOp> for KOp {
+    /// The mask-register form of a bitwise op on masks
+    /// ([`BinaryOp::on_masks`](crate::program::BinaryOp::on_masks)).
+    fn from(op: MaskOp) -> Self {
         match op {
-            BinaryOp::BitAnd => Some(Self::And),
-            BinaryOp::BitOr => Some(Self::Or),
-            _ => None,
+            MaskOp::And => Self::And,
+            MaskOp::Or => Self::Or,
         }
     }
 }
@@ -189,9 +189,11 @@ pub(in crate::emit) enum Avx512 {}
 
 /// One IR lane value on this machine. A comparison, and the `kandw`/`korw` of
 /// two of them, is a bit per lane in the opmask file; everything else is in the
-/// vector file. Where an instruction reads the other file's lane it is first
-/// widened (`vpmovm2d`), or, when it has a form for the lane where it is
-/// (`vblendmps`, `kortestw`), it reads it there.
+/// vector file. `ScheduledOp::is_mask` asks the same question before selection,
+/// through the same `BinaryOp::on_masks`, and a test holds the two equal.
+/// Where an instruction reads the other file's lane it is first widened
+/// (`vpmovm2d`), or, when it has a form for the lane where it is (`vblendmps`,
+/// `kortestw`), it reads it there.
 #[derive(Copy, Clone)]
 pub(super) enum Lane {
     Vector(Value<Vector>),
@@ -199,6 +201,14 @@ pub(super) enum Lane {
 }
 
 impl Lane {
+    /// This lane as a mask, if it is held in the opmask file.
+    fn opmask(self) -> Option<Value<Opmask>> {
+        match self {
+            Lane::Vector(_) => None,
+            Lane::Opmask(k) => Some(k),
+        }
+    }
+
     /// For an instruction with no `k` form: this lane in the vector file, all
     /// ones where its bit is set.
     fn vector(self, b: &mut Builder<Avx512>) -> Value<Vector> {
@@ -410,16 +420,16 @@ impl X86 for Avx512 {
                 let src = src.vector(b);
                 Lane::Vector(x86_64::unary(b, op, src)?)
             }
-            LaneOp::Binary(op, a, c) => match (KOp::of(op), a, c) {
-                (Some(op), Lane::Opmask(x), Lane::Opmask(y)) => Lane::Opmask(emit(b, |dst| {
+            LaneOp::Binary(op, a, c) => match op.on_masks(a.opmask(), c.opmask()) {
+                Some((op, x, y)) => Lane::Opmask(emit(b, |dst| {
                     Inst::Extra(Extra::KLogic {
-                        op,
+                        op: op.into(),
                         dst,
                         a: x,
                         b: y,
                     })
                 })),
-                _ => {
+                None => {
                     let (a, c) = (a.vector(b), c.vector(b));
                     Lane::Vector(x86_64::arithmetic(b, op, (a, c)))
                 }
@@ -592,6 +602,123 @@ impl X86 for Avx512 {
                 }))
             }),
             class => unreachable!("{class:?} is not reloaded"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::emit::IsaBackend;
+    use crate::program::{BinaryOp, CompareOp, ScheduledOp, ShiftOp, UnaryOp, ValueId};
+
+    /// Whether `selected` lands in the opmask file exactly when `scheduled`
+    /// is a mask, value 0 of the schedule being the one mask operand.
+    fn is_where_is_mask_says(
+        b: &mut Builder<Avx512>,
+        selected: LaneOp<Avx512>,
+        scheduled: &ScheduledOp,
+    ) -> bool {
+        let lane = <Avx512 as X86>::lane(b, selected).expect("the op selects");
+        let in_opmask = matches!(lane, Lane::Opmask(_));
+        in_opmask == scheduled.is_mask(|value| value == ValueId(0))
+    }
+
+    /// Lowering refuses a fold's bound that is a mask (`ScheduledOp::is_mask`),
+    /// which names no count, by asking before selection which values this tier
+    /// will keep in the opmask file. The two answer one question: this
+    /// selects every op that reads a lane over a mask and a number in every
+    /// operand position (unary, shift, compare, binary, mul-add, the select,
+    /// gather and broadcast), and asks the file each result lands in. A
+    /// constant, the lane iota and a uniform read no lane, so they have no
+    /// operand to make a mask.
+    #[test]
+    fn a_value_is_an_opmask_exactly_when_is_mask_says_it_is_a_mask() {
+        let (mut b, entry) = Builder::<Avx512>::new();
+        <Avx512 as IsaBackend>::enter(&mut b);
+        let number = <Avx512 as X86>::lane(&mut b, LaneOp::Const(1.0)).expect("a constant selects");
+        let compared = LaneOp::Compare(CompareOp::Lt, number, number);
+        let mask = <Avx512 as X86>::lane(&mut b, compared).expect("a comparison selects");
+        assert!(matches!(mask, Lane::Opmask(_)));
+
+        // The schedule's view of the same two values.
+        let operands = [(mask, ValueId(0)), (number, ValueId(1))];
+        let mut every = |selected: LaneOp<Avx512>, scheduled: ScheduledOp| {
+            assert!(
+                is_where_is_mask_says(&mut b, selected, &scheduled),
+                "{scheduled:?}"
+            );
+        };
+        for &(x, x_id) in &operands {
+            for op in UnaryOp::ALL {
+                every(LaneOp::Unary(*op, x), ScheduledOp::Unary(*op, x_id));
+            }
+            for op in ShiftOp::ALL {
+                every(
+                    LaneOp::Shift(*op, x, 3),
+                    ScheduledOp::ShiftImm(*op, x_id, 3),
+                );
+            }
+            // The base is a pointer, the context's; the schedule names it by an
+            // id no lane can be.
+            let base = ValueId(2);
+            every(
+                LaneOp::Gather {
+                    base: entry.ctx,
+                    index: x,
+                },
+                ScheduledOp::Gather(x_id, base),
+            );
+            every(
+                LaneOp::Broadcast {
+                    base: entry.ctx,
+                    index: x,
+                },
+                ScheduledOp::Broadcast(x_id, base),
+            );
+            for &(y, y_id) in &operands {
+                for op in CompareOp::ALL {
+                    every(
+                        LaneOp::Compare(*op, x, y),
+                        ScheduledOp::Compare(*op, x_id, y_id),
+                    );
+                }
+                for op in BinaryOp::ALL {
+                    every(
+                        LaneOp::Binary(*op, x, y),
+                        ScheduledOp::Binary(*op, x_id, y_id),
+                    );
+                }
+                for &(z, z_id) in &operands {
+                    every(
+                        LaneOp::MulAdd(x, y, z),
+                        ScheduledOp::MulAdd(x_id, y_id, z_id),
+                    );
+                    every(
+                        LaneOp::Blend {
+                            cond: x,
+                            if_true: y,
+                            if_false: z,
+                        },
+                        ScheduledOp::If(x_id, y_id, z_id),
+                    );
+                }
+            }
+        }
+
+        // The agreement is not vacuous: a comparison and a bitwise op on two
+        // masks are masks, and the same op on a number is not.
+        let bitwise = |op| ScheduledOp::Binary(op, ValueId(0), ValueId(0));
+        let on_a_number = |op| ScheduledOp::Binary(op, ValueId(1), ValueId(0));
+        let is_mask = |scheduled: ScheduledOp| scheduled.is_mask(|value| value == ValueId(0));
+        assert!(is_mask(ScheduledOp::Compare(
+            CompareOp::Lt,
+            ValueId(1),
+            ValueId(1)
+        )));
+        for op in [BinaryOp::BitAnd, BinaryOp::BitOr] {
+            assert!(is_mask(bitwise(op)), "{op:?} on two masks is a mask");
+            assert!(!is_mask(on_a_number(op)), "{op:?} on a number is a number");
         }
     }
 }

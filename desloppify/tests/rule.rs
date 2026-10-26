@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use desloppify::model::ModelLevel;
-use desloppify::review::{Reviewers, plan, review};
+use desloppify::review::{Session, plan};
 use desloppify::rule::{self, Rule};
 use desloppify::skills;
 use desloppify::{agent, decide};
@@ -72,13 +72,9 @@ async fn a_dry_run_decides_every_unit_by_the_rules_first_fine_outcome_and_explai
     let file = rules.0.join("a.rs");
     std::fs::write(&file, "fn a() {}\nfn b() {}\n").unwrap();
     let loaded = rules.load().unwrap();
-    let calls = plan(&loaded, &[file]).unwrap();
-    let reviewers = Arc::new(Reviewers {
-        ask: agent::dry_run(),
-        decide: decide::none(),
-        min_confidence: 0.7,
-    });
-    let report = review(reviewers, Arc::new(loaded), calls).await.unwrap();
+    let calls = plan(loaded, &[file]).unwrap();
+    let session = Arc::new(Session::new(agent::dry_run(), decide::none()));
+    let report = session.review(calls).await.unwrap();
 
     // `a_fine` sorts before `b_fine`, and every fine outcome before `v`.
     let decided: Vec<_> = report.decisions["first"].iter().collect();

@@ -18,14 +18,16 @@
 //! both wrong (the guard-clustering search, not regalloc; compile, not collapse), so
 //! it is measured rather than reasoned about.
 //!
-//! **How many programs.** A fold's trip count is a `Fold` field, hashed into
-//! the `KernelKey` the JIT cache keys on, so *a different trip count is a
-//! different program* — that is the language's premise, not an accident
-//! (CLAUDE.md: "a trip count that must change is a recompile"). One program
-//! for the whole font therefore needs every glyph padded to the font-wide
-//! maximum, and every glyph then pays the worst glyph's work at every pixel,
-//! because a constant trip count cannot exit early and an `If` computes
-//! both arms.
+//! **How many programs.** A fold's trip count is read off its node's bounds
+//! (`ExprArena::known_range`, through the node's `FoldHeader`), and a literal
+//! bound is part of the header bits (`FoldHeader::to_bits`, a `u128`) that the
+//! `KernelKey` the JIT cache keys on writes for the node, so a different literal
+//! trip count is a different program. One program for the whole font therefore
+//! needs every glyph padded to the font-wide maximum, and every glyph then pays
+//! the worst glyph's work at every pixel, because a constant trip count cannot
+//! exit early and an `If` computes both arms. A count that is a value is one
+//! program for every count (docs/language/2026-10-20-a-bound-is-a-value.md); a
+//! production glyph's counts are literals until it moves them there.
 //!
 //! So this counts the **distinct trip counts**, which is the number of
 //! programs a font actually needs, and what bucketing them to a power of two
@@ -40,6 +42,7 @@ use std::time::Instant;
 
 use pixelflow_graphics::fonts::{Font, GlyphAtlas};
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+use pixelflow_ir::fold::KNOWN_RANGE;
 use pixelflow_pipeline::schema::fnv1a64_hex;
 
 /// core-term's font asset (`terminal_app.rs`: `FONT_FILENAME`).
@@ -64,7 +67,7 @@ fn tile_for(density: f32) -> u32 {
 /// These are the numbers baked into the program. Two glyphs agree on a
 /// program only if they agree on this whole multiset, so it — not the piece
 /// count, which is a proxy for it — is what a cache key partitions on.
-fn trip_counts(arena: &ExprArena, root: ExprId) -> Vec<u32> {
+fn trip_counts(arena: &ExprArena, root: ExprId) -> Vec<u64> {
     let mut seen = vec![false; arena.len()];
     let mut stack = vec![root];
     let mut trips = Vec::new();
@@ -72,8 +75,10 @@ fn trip_counts(arena: &ExprArena, root: ExprId) -> Vec<u32> {
         if core::mem::replace(&mut seen[id.0 as usize], true) {
             continue;
         }
-        if let ExprNode::Reduce { fold, .. } = arena.node(id) {
-            trips.push(fold.len());
+        if let ExprNode::Reduce { .. } = arena.node(id) {
+            // A production glyph's folds are all literal until B2 lets a glyph
+            // bound a fold by a value (`KNOWN_RANGE` names this reason).
+            trips.push(arena.known_range(id).expect(KNOWN_RANGE).len());
         }
         stack.extend(arena.children(id));
     }
@@ -83,7 +88,7 @@ fn trip_counts(arena: &ExprArena, root: ExprId) -> Vec<u32> {
 
 /// The next power of two at or above `n` — the bucket a quantized trip count
 /// would round up to.
-fn bucket(n: u32) -> u32 {
+fn bucket(n: u64) -> u64 {
     n.max(1).next_power_of_two()
 }
 
@@ -116,11 +121,11 @@ fn main() {
         let mut kernels = 0usize;
         // The distinct programs a font needs: one per distinct trip-count
         // multiset, and one per distinct bucketed multiset.
-        let mut exact: BTreeSet<Vec<u32>> = BTreeSet::new();
-        let mut bucketed: BTreeSet<Vec<u32>> = BTreeSet::new();
+        let mut exact: BTreeSet<Vec<u64>> = BTreeSet::new();
+        let mut bucketed: BTreeSet<Vec<u64>> = BTreeSet::new();
         // Padding cost of one global program: every glyph runs the maximum.
-        let mut max_trip = 0u32;
-        let mut trip_histogram: BTreeMap<u32, usize> = BTreeMap::new();
+        let mut max_trip = 0u64;
+        let mut trip_histogram: BTreeMap<u64, usize> = BTreeMap::new();
 
         for ch in WARM_RANGE {
             if only.is_some_and(|c| c != ch) {

@@ -4,7 +4,7 @@
 #![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 
 use pixelflow_codegen::emit::{CompileResult, compile};
-use pixelflow_ir::fold::{Binder, Fold, Monoid};
+use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 use pixelflow_ir::{ExprArena, ExprId, LatticeShape, OpKind};
 
 /// The one sample of a kernel compiled at one point, at `(x, y)`.
@@ -31,14 +31,19 @@ fn eval_point(result: &CompileResult, x: f32, y: f32) -> f32 {
 fn a_fold_result_given_up_after_its_loop_is_read_at_its_value() {
     /// More values live at once than any tier's vector file holds.
     const WALL: u64 = 48;
-    const TRIPS: u32 = 7;
+    const TRIPS: u64 = 7;
 
     let mut a = ExprArena::new();
     let (x, y) = (a.push_var(0), a.push_var(1));
     let binder = Binder::from_slot(0).expect("slot 0 exists");
     let i = a.push_var(binder.var());
     let along = a.push_binary(OpKind::Add, x, i);
-    let sum = a.push_reduce(Fold::new(Monoid::SUM, binder, 0..TRIPS), along);
+    let sum = a.push_reduce(
+        Fold::new(Monoid::SUM, binder),
+        Bound::Lit(0),
+        Bound::Lit(TRIPS),
+        along,
+    );
 
     let mut term = sum;
     let mut terms = Vec::new();

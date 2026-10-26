@@ -1,11 +1,3 @@
-//! Platform-specific pixel type definition.
+//! The platform's framebuffer pixel format.
 
-// Platform-appropriate pixel format
-#[cfg(target_os = "macos")]
-pub type PlatformPixel = pixelflow_graphics::render::color::Rgba8;
-
-#[cfg(target_os = "linux")]
-pub type PlatformPixel = pixelflow_graphics::render::color::Bgra8;
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub type PlatformPixel = pixelflow_graphics::render::color::Rgba8;
+pub use crate::platform::PlatformPixel;

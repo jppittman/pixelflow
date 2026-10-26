@@ -109,6 +109,7 @@ pub fn derivative<T: Terms>(terms: &mut T, e: T::Term, axis: Axis) -> T::Term {
 mod tests {
     use super::*;
     use crate::arena::ExprNode;
+    use crate::lit::Lit;
 
     /// Each composite is the nodes its doc says, over an arena.
     #[test]
@@ -154,7 +155,7 @@ mod tests {
             panic!("Dwrt(e, axis), got {}", a.display(d));
         };
         assert_eq!(e, xy);
-        assert!(matches!(a.node(axis), ExprNode::Const(v) if v == 1.0));
+        assert_eq!(a.node(axis), ExprNode::Const(Lit::Real(1.0)));
         let lowered = crate::passes::lower_dwrt(&mut a, d).expect("lowers");
         let mut stack = alloc::vec![lowered];
         while let Some(id) = stack.pop() {

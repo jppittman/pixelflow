@@ -19,17 +19,18 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arena::{
-    Axis, BufferDecl, BufferIdentity, ExprArena, ExprId, IndexSpaceFull, UniformDecl,
+    Axis, BufferDecl, BufferIdentity, ExprArena, ExprId, FoldTerms, IndexSpaceFull, UniformDecl,
     UniformIdentity,
 };
 use crate::dag::{Builder, Dag, Node, Rooted};
 use crate::expr::{
     Environment, ExprBuilderExt, ExprData, copy_subgraph, from_arena, splice, substitute_vars,
-    to_arena,
+    to_arena, to_arena_roots,
 };
-use crate::fold::{Binder, Chain, Fold, Monoid, Placeholder};
+use crate::fold::{Binder, Bound, BoundEnd, BoundRefusal, Chain, Fold, Monoid, Placeholder};
 use crate::kind::OpKind;
 use crate::library::{self, Terms};
+use crate::lit::Lit;
 use crate::shift::ShiftCount;
 
 /// One bit per placeholder index, set while that index is claimed by a binder
@@ -306,8 +307,12 @@ impl Kernel {
     /// A constant.
     #[must_use]
     pub fn constant(v: f32) -> Self {
+        Self::literal(Lit::Real(v))
+    }
+
+    fn literal(lit: Lit) -> Self {
         let mut b = Builder::new();
-        let r = b.push_const(v);
+        let r = b.push_lit(lit);
         Self::wrap(b.finish(&[r]), Environment::new(), BTreeMap::new())
     }
 
@@ -677,7 +682,7 @@ impl Kernel {
     #[must_use]
     pub fn fold(monoid: Monoid, kernels: &[Kernel]) -> Self {
         let Some((head, tail)) = kernels.split_first() else {
-            return Self::constant(monoid.identity());
+            return Self::literal(monoid.identity());
         };
         let mut b = Builder::new();
         let mut env = head.inner.env.clone();
@@ -692,7 +697,7 @@ impl Kernel {
             chain.push(term, |op, folded, term| b.push_binary(op, folded, term));
             merge_buffer_data(&mut buffers, &k.inner.buffers);
         }
-        let root = chain.finish(|identity| b.push_const(identity));
+        let root = chain.finish(|identity| b.push_lit(identity));
         Self::wrap(b.finish(&[root]), env, buffers)
     }
 
@@ -704,12 +709,19 @@ impl Kernel {
     /// language without touching this method.
     ///
     /// The closure receives the bound index as a `Kernel` of its own, so Rust's
-    /// scoping *is* the binder's scoping — an index cannot escape the fold that
-    /// binds it, and a repeated index in nested folds is a genuine contraction
-    /// rather than an accident. `range` is static, which is what keeps the
-    /// language total and its cost closed-form (`|D| × cost(body)`); the
-    /// backend unrolls, so the domain is bounded in practice as well as in
-    /// principle.
+    /// scoping is the binder's scoping for what the closure returns, and a
+    /// repeated index in nested folds is a genuine contraction rather than an
+    /// accident. It is not a guarantee that the index stays there: a closure
+    /// can keep a clone of it, and a later fold that reclaims its placeholder
+    /// captures it, which no check sees (docs/BACKLOG.md C10). An index that
+    /// has escaped and is not captured is open, and `ExprArena::free_index`
+    /// says so. `range` is the literal spelling of a known
+    /// range; a bound that is a value is [`Kernel::over_values`]'s. Either way
+    /// no bound reads a coordinate, which is what keeps
+    /// the language total and its cost closed-form — `|D|·cost(body) +
+    /// (|D|−1)·cost(⊕)` (docs/language/2026-10-20-a-bound-is-a-value.md §1.5).
+    /// A fold that survives extraction is a loop; extraction unrolls a known
+    /// one where that is cheaper.
     ///
     /// **Where the domain starts is the fold's, not the body's.** Two folds
     /// whose bodies read `table[i]` over different rows of one table have
@@ -727,7 +739,7 @@ impl Kernel {
     ///
     /// # Panics
     ///
-    /// Panics unless [`Fold::admits`] `range`: if it runs backwards, or ends
+    /// Panics unless [`KnownRange::admits`](crate::fold::KnownRange::admits) `range`: if it runs backwards, or ends
     /// past 2²⁴, where an `f32` index stops naming every integer. Panics too
     /// when the body already binds every slot, i.e. one fold deeper than the
     /// index space.
@@ -750,9 +762,12 @@ impl Kernel {
         };
         let body = body(&index);
         let (arena, root) = body.parts();
-        let closed = arena.close_over(root, scope.placeholder, |binder| {
-            Fold::new(monoid, binder, range)
-        });
+        let terms = FoldTerms {
+            monoid,
+            lo: Bound::Lit(u64::from(range.start)),
+            hi: Bound::Lit(u64::from(range.end)),
+        };
+        let closed = arena.close_over(root, scope.placeholder, terms);
         let (arena, root) = closed.unwrap_or_else(|IndexSpaceFull| {
             panic!(
                 "more than {} live nested reductions: the index space is full",
@@ -762,6 +777,123 @@ impl Kernel {
         // Only `body`'s own graph is used above — no other kernel is spliced
         // in — so its buffer table carries forward unchanged.
         Self::adopt(arena, root, body.inner.buffers.clone())
+    }
+
+    /// `⊕_{i ∈ [lo, hi)} body(i)`: [`Kernel::over`] with bounds that are values
+    /// — a per-call count (a [`Uniform`]), an enclosing fold's index (a
+    /// triangular `Σ_i Σ_{j<i}`), or a constant
+    /// (docs/language/2026-10-20-a-bound-is-a-value.md §1.2).
+    ///
+    /// A bound that is a value is read per call: `n` a [`Uniform`] is one
+    /// compiled program for every `n`, and the fold runs `n` trips. A bound that
+    /// is no count at run time — a count is an integer in `0..=2²⁴`; a uniform
+    /// set to `2.5`, `−1`, NaN or `2²⁴ + 2` is none — makes the fold NaN (L5),
+    /// and a pair that runs backwards at run time is the identity, up to the
+    /// factoring edge `FactorFold` accepts at a runtime-empty range (decision
+    /// 5). The NaN has an exception on the optimized path: under
+    /// [`Monoid::SUM`], a body with a factor the optimizer proves zero (a
+    /// literal `0`, or one such as `X − X`) loses its fold to the annihilation rule
+    /// (`0·y → 0`, [`OpKind::annihilator`]), so no fold is left for the guard
+    /// to wrap and a bound that is no count gives `0` (`FactorFold`'s doc).
+    /// Annihilation is one of the algebraic rules unsound at NaN: cancellation
+    /// and inverse annihilation drop a fold from an enclosing expression the
+    /// same way (BACKLOG E9).
+    ///
+    /// Constness is discovered, not declared: a bound that is a constant naming
+    /// a count is the fold's data, so `over_values(⊕, 0, 4, f)` is
+    /// `over(⊕, 0..4, f)` node for node, and a pair of constants running
+    /// backwards is the empty range (`over_values(⊕, 5, 3, f)` is the identity,
+    /// L2), where `over`'s literal `5..3` is refused. A bound that is not a
+    /// constant is a child of the fold, after the body, and the fold's range is
+    /// not known: it is not unrolled, and is priced at an estimate.
+    ///
+    /// The arena declares the body's uniforms, then `lo`'s, then `hi`'s, each in
+    /// its own order, as every composition does ([`Kernel::uniforms`]).
+    ///
+    /// # Panics
+    ///
+    /// On a bound that is not a leaf
+    /// ([`BoundRefusal::BoundArithmetic`]: until bounds are `Int`, a computed
+    /// bound can round into the domain, §1.4); on one that is not a number
+    /// ([`BoundRefusal::BoundNotANumber`]: a `Param`, a `Buffer`); on a constant
+    /// naming no count ([`BoundRefusal::BoundOutOfDomain`]) or a mask
+    /// ([`BoundRefusal::BoundSort`]); and, from the fold
+    /// [`ExprArena::close_over`] builds, on a bound reading a coordinate
+    /// ([`BoundRefusal::BoundVaries`], L3), on a value bound under `ANY`, `ALL`
+    /// or `SEQ` ([`BoundRefusal::BoundSort`]), and when the body binds every
+    /// slot.
+    ///
+    /// ```
+    /// use pixelflow_ir::{Kernel, Monoid, Uniform};
+    ///
+    /// let n = Uniform::new(8.0);
+    /// // Σ_{i < n} X·i, one program for every n.
+    /// let sum = Kernel::over_values(Monoid::SUM, &Kernel::constant(0.0), &n.kernel(), |i| {
+    ///     Kernel::x().mul(i)
+    /// });
+    /// assert_eq!(sum.uniforms().len(), 1);
+    /// ```
+    #[must_use]
+    pub fn over_values(
+        monoid: Monoid,
+        lo: &Kernel,
+        hi: &Kernel,
+        body: impl FnOnce(&Kernel) -> Kernel,
+    ) -> Self {
+        for (end, bound) in [(BoundEnd::Lo, lo), (BoundEnd::Hi, hi)] {
+            if let Err(refusal) = Self::user_bound(end, bound) {
+                panic!("{refusal}");
+            }
+        }
+        let scope = BinderScope::enter();
+        let index = {
+            let mut b = Builder::new();
+            let r = b.push_var(scope.placeholder.var());
+            Self::wrap(b.finish(&[r]), Environment::new(), BTreeMap::new())
+        };
+        let body = body(&index);
+        // One arena, the body's terms first and each bound's after, declared in
+        // that order. A leaf bound carries no tabulation (`user_bound`), so the
+        // body's table is the fold's.
+        let mut b = Builder::new();
+        let mut env = body.inner.env.clone();
+        let body_root = copy_subgraph(&mut b, body.root());
+        let lo_root = splice(&mut b, &mut env, lo.root(), &lo.inner.env);
+        let hi_root = splice(&mut b, &mut env, hi.root(), &hi.inner.env);
+        let rooted = b.finish(&[body_root, lo_root, hi_root]);
+        let entries: Vec<_> = rooted.entries().collect();
+        let (arena, ids) = to_arena_roots(&rooted, &entries, &env);
+        let terms = FoldTerms {
+            monoid,
+            lo: Bound::Value(ids[1]),
+            hi: Bound::Value(ids[2]),
+        };
+        let (arena, root) = arena
+            .close_over(ids[0], scope.placeholder, terms)
+            .unwrap_or_else(|IndexSpaceFull| {
+                panic!(
+                    "more than {} live nested reductions: the index space is full",
+                    Binder::COUNT
+                )
+            });
+        Self::adopt(arena, root, body.inner.buffers.clone())
+    }
+
+    /// Whether `bound`, the fold's `end` bound as a user wrote it, is one
+    /// `over_values` takes: a leaf naming a number — a constant naming a count,
+    /// a uniform, an index — and nothing computed (§1.4, until T6).
+    fn user_bound(end: BoundEnd, bound: &Kernel) -> Result<(), BoundRefusal> {
+        match *bound.root() {
+            ExprData::Var(_) | ExprData::Uniform(_) => Ok(()),
+            ExprData::Const(Lit::Mask(_)) => Err(BoundRefusal::BoundSort { end }),
+            ExprData::Const(literal @ Lit::Real(real)) => Fold::count(literal)
+                .map(|_| ())
+                .ok_or(BoundRefusal::BoundOutOfDomain { end, literal: real }),
+            ExprData::Param(_) | ExprData::Buffer(_) => Err(BoundRefusal::BoundNotANumber { end }),
+            ExprData::Op(_) | ExprData::Reduce(_) | ExprData::Ref(_) => {
+                Err(BoundRefusal::BoundArithmetic { end })
+            }
+        }
     }
 
     /// `Σ_{i ∈ 0..extent} body(i)` — contraction, projection, and every other
@@ -1229,7 +1361,7 @@ impl Bits {
 mod tests {
     use super::*;
     use crate::arena::ExprNode;
-    use crate::fold::Fold;
+    use crate::fold::{Bound, Fold};
 
     /// The count is still checked at runtime; the OPERAND no longer needs
     /// checking, because `Kernel::x().shl(32)` does not compile at all now —
@@ -1240,14 +1372,17 @@ mod tests {
         let _refused = Kernel::x().trunc_to_int().shl(32);
     }
 
-    /// The builder refuses a fold past 2²⁴ as `kernel!` does: both build
-    /// through `Fold`, which holds the one bound. Before, `kernel!`
-    /// refused and this summed the wrong terms without a word
+    /// The builder refuses a fold past 2²⁴ as `kernel!` does: both answer to
+    /// `KnownRange::admits`, the one statement of the contract. The builder
+    /// meets it in `FoldHeader::new`, whose `KnownRange::new` panics with the
+    /// message pinned here; `kernel!` asks `admits` while lowering a literal
+    /// range, and refuses in its own words before any header is built. Before,
+    /// `kernel!` refused and this summed the wrong terms without a word
     /// (docs/BACKLOG.md, C8).
     #[test]
     #[should_panic(expected = "ends at most at 16777216 (2^24)")]
     fn a_fold_past_the_exact_bound_is_refused_by_the_builder_too() {
-        let past = Fold::EXACT_BOUND + 1;
+        let past = u32::try_from(Fold::EXACT_BOUND + 1).expect("2^24 + 1 fits u32");
         let _refused = Kernel::over(Monoid::SUM, 16_777_100..past, |i| i.clone());
     }
 
@@ -1272,12 +1407,62 @@ mod tests {
                 ExprNode::Binary(OpKind::Mul, ExprId(2), ExprId(0)),
                 ExprNode::Binary(OpKind::Add, ExprId(3), ExprId(1)),
                 ExprNode::Reduce {
-                    fold: Fold::new(Monoid::SUM, binder, 0..4),
+                    fold: Fold::new(Monoid::SUM, binder),
+                    lo: Bound::Lit(0),
+                    hi: Bound::Lit(4),
                     body: ExprId(4),
                 },
             ],
             "{}",
             arena.display(root)
+        );
+    }
+
+    /// A literal equal to a fold's bound, built after the fold, is a node of
+    /// its own after the fold: a known bound is the fold's data, so nothing
+    /// the fold holds is there for the literal to intern to (plan L1,
+    /// docs/language/2026-10-20-a-bound-is-a-value.md). `combine` copies the
+    /// fold's kernel and then splices the divisor, so the divisor is the
+    /// later node.
+    #[test]
+    fn a_literal_equal_to_a_bound_lands_after_its_fold() {
+        let mean = Kernel::sum_over(4, |i| Kernel::x().mul(i)).div(&Kernel::constant(4.0));
+        let (arena, root) = mean.parts();
+        let mut reached = alloc::vec![false; arena.len()];
+        let mut stack = alloc::vec![root];
+        while let Some(id) = stack.pop() {
+            if !core::mem::replace(&mut reached[id.0 as usize], true) {
+                stack.extend(arena.children(id));
+            }
+        }
+        let live = |id: &ExprId| reached[id.0 as usize];
+        let fold = arena
+            .nodes()
+            .filter(|(id, _)| live(id))
+            .find_map(|(id, node)| matches!(node, ExprNode::Reduce { .. }).then_some(id))
+            .expect("a live fold");
+        let fours: Vec<ExprId> = arena
+            .nodes()
+            .filter(|(id, _)| live(id))
+            .filter_map(|(id, node)| {
+                matches!(node, ExprNode::Const(Lit::Real(v)) if v == 4.0).then_some(id)
+            })
+            .collect();
+        assert_eq!(
+            fours.len(),
+            1,
+            "one 4.0, the divisor: {}",
+            arena.display(root)
+        );
+        assert!(
+            fours[0] > fold,
+            "the divisor follows the fold: {}",
+            arena.display(root)
+        );
+        assert_eq!(
+            arena.children(fold).count(),
+            1,
+            "the fold's one child is its body"
         );
     }
 
@@ -1493,8 +1678,13 @@ mod tests {
         let index = open.index();
         let y = arena.push_var(Axis::Y.var());
         let body = arena.apply(&argument, [index, y]);
+        let terms = FoldTerms {
+            monoid: Monoid::SUM,
+            lo: Bound::Lit(0),
+            hi: Bound::Lit(3),
+        };
         let fold = arena
-            .close_fold(open, body, |binder| Fold::new(Monoid::SUM, binder, 0..3))
+            .close_fold(open, body, terms)
             .expect("a binder is free");
         assert_eq!(arena.uniforms(), k.uniforms());
         assert!(matches!(arena.node(fold), ExprNode::Reduce { .. }));
@@ -1603,5 +1793,289 @@ mod tests {
     fn naming_a_term_reading_a_free_binder_is_refused() {
         let binder = Binder::from_slot(0).expect("a binder");
         let _refused = open_at(binder.var()).by_ref();
+    }
+
+    // ───────────────────────── over_values ─────────────────────────
+
+    /// The body the `over_values` tests fold: `X·i + Y`.
+    fn affine(i: &Kernel) -> Kernel {
+        Kernel::x().mul(i).add(&Kernel::y())
+    }
+
+    /// The nodes of `kernel`'s arena, in order.
+    fn nodes_of(kernel: &Kernel) -> Vec<ExprNode> {
+        kernel.parts().0.nodes().map(|(_, node)| node).collect()
+    }
+
+    /// The root's fold, with its two bounds.
+    fn root_fold(kernel: &Kernel) -> (Bound<ExprId>, Bound<ExprId>) {
+        let (arena, root) = kernel.parts();
+        let ExprNode::Reduce { lo, hi, .. } = arena.node(root) else {
+            panic!("a fold at the root, got {}", arena.display(root));
+        };
+        (lo, hi)
+    }
+
+    /// L1: a bound that is a constant naming a count is the fold's data, so
+    /// the fold over constants is `over` node for node — and no constant of
+    /// the bounds is left in the arena.
+    #[test]
+    fn over_values_over_literals_is_over() {
+        let by_values = Kernel::over_values(
+            Monoid::SUM,
+            &Kernel::constant(0.0),
+            &Kernel::constant(4.0),
+            affine,
+        );
+        let by_range = Kernel::over(Monoid::SUM, 0..4, affine);
+        assert_eq!(nodes_of(&by_values), nodes_of(&by_range));
+        assert!(
+            !nodes_of(&by_values)
+                .iter()
+                .any(|node| matches!(node, ExprNode::Const(_))),
+            "the bounds were read into the header"
+        );
+    }
+
+    /// L2: constants running backwards are the empty range at the first, the
+    /// fold's identity; the same fold as `over` over the empty range.
+    #[test]
+    fn over_values_from_five_to_three_is_the_empty_range() {
+        let k = Kernel::over_values(
+            Monoid::SUM,
+            &Kernel::constant(5.0),
+            &Kernel::constant(3.0),
+            affine,
+        );
+        let (arena, root) = k.parts();
+        let range = arena.known_range(root).expect("two constants are known");
+        assert_eq!(range.range(), 5..5);
+        assert!(range.is_empty());
+        assert_eq!(
+            nodes_of(&k),
+            nodes_of(&Kernel::over(Monoid::SUM, 5..5, affine))
+        );
+    }
+
+    /// The literal spelling keeps its refusal: `5..3` is a reversed range,
+    /// which `over_values` over the same constants makes empty.
+    #[test]
+    #[should_panic(expected = "runs forwards")]
+    fn over_from_five_to_three_is_still_refused() {
+        // Through variables: a literal `5..3` is a lint about an empty range,
+        // and the point here is the builder's refusal.
+        let (lo, hi) = (5u32, 3u32);
+        let _refused = Kernel::over(Monoid::SUM, lo..hi, affine);
+    }
+
+    /// A per-call count is a uniform: the bound is a child, the range is not
+    /// known, and the arena declares the body's uniforms, then the bound's.
+    #[test]
+    fn over_values_takes_a_uniform_count() {
+        let n = Uniform::new(8.0);
+        let m = Uniform::new(2.0);
+        let k = Kernel::over_values(Monoid::SUM, &Kernel::constant(0.0), &n.kernel(), |i| {
+            i.mul(&m.kernel())
+        });
+        let (arena, root) = k.parts();
+        assert_eq!(arena.known_range(root), None);
+        let (lo, hi) = root_fold(&k);
+        assert_eq!(lo, Bound::Lit(0));
+        let Bound::Value(count) = hi else {
+            panic!("a value bound, got {hi:?}");
+        };
+        assert!(matches!(arena.node(count), ExprNode::Uniform(_)));
+        assert_eq!(k.uniforms(), [m.decl(), n.decl()]);
+    }
+
+    /// L3 admits an enclosing fold's index, through the builder: a triangular
+    /// `Σ_i Σ_{j<i}`. The outer fold binds slot 1, the inner slot 0, and the
+    /// inner bound is the outer's index, bound by the time the root is reached.
+    #[test]
+    fn over_values_takes_an_enclosing_index() {
+        let k = Kernel::over(Monoid::SUM, 0..4, |i| {
+            Kernel::over_values(Monoid::SUM, &Kernel::constant(0.0), i, |j| {
+                j.mul(&Kernel::x())
+            })
+        });
+        let (arena, root) = k.parts();
+        let ExprNode::Reduce {
+            fold: outer, body, ..
+        } = arena.node(root)
+        else {
+            panic!("a fold at the root, got {}", arena.display(root));
+        };
+        let ExprNode::Reduce {
+            fold: inner, hi, ..
+        } = arena.node(body)
+        else {
+            panic!("a fold in the body, got {}", arena.display(body));
+        };
+        assert_eq!(outer.binder().slot(), 1);
+        assert_eq!(inner.binder().slot(), 0);
+        let Bound::Value(index) = hi else {
+            panic!("a value bound, got {hi:?}");
+        };
+        assert_eq!(arena.node(index), ExprNode::Var(outer.binder().var()));
+        assert_eq!(arena.free_index(root), None);
+        assert_eq!(
+            crate::variance::compute_arena_variance(arena)[root.0 as usize],
+            crate::Variance::X
+        );
+    }
+
+    /// Each end is read for itself: a uniform lower bound beside a constant
+    /// upper one is a value and a literal, and the same uniform at both ends is
+    /// two value bounds that read one term.
+    #[test]
+    fn over_values_reads_each_end_for_itself() {
+        let n = Uniform::new(2.0);
+        let k = Kernel::over_values(Monoid::SUM, &n.kernel(), &Kernel::constant(6.0), affine);
+        let (lo, hi) = root_fold(&k);
+        assert!(matches!(lo, Bound::Value(_)), "{lo:?}");
+        assert_eq!(hi, Bound::Lit(6));
+
+        let k = Kernel::over_values(Monoid::SUM, &n.kernel(), &n.kernel(), affine);
+        let (arena, root) = k.parts();
+        let (lo, hi) = root_fold(&k);
+        let (Bound::Value(lo), Bound::Value(hi)) = (lo, hi) else {
+            panic!("two value bounds, got {}", arena.display(root));
+        };
+        assert_eq!(arena.node(lo), arena.node(hi));
+        assert_eq!(arena.known_range(root), None);
+        assert_eq!(k.uniforms(), [n.decl()]);
+    }
+
+    /// Until bounds are `Int`, a computed bound can round into the domain, so
+    /// a user writes a leaf.
+    #[test]
+    #[should_panic(expected = "BoundArithmetic")]
+    fn over_values_refuses_arithmetic() {
+        let n = Uniform::new(8.0).kernel();
+        let _refused = Kernel::over_values(
+            Monoid::SUM,
+            &Kernel::constant(0.0),
+            &n.add(&Kernel::constant(1.0)),
+            affine,
+        );
+    }
+
+    /// L3: a coordinate would make the trip count a function of the pixel.
+    #[test]
+    #[should_panic(expected = "BoundVaries")]
+    fn over_values_refuses_a_coordinate() {
+        let _refused =
+            Kernel::over_values(Monoid::SUM, &Kernel::constant(0.0), &Kernel::x(), affine);
+    }
+
+    /// A fraction names no count.
+    #[test]
+    #[should_panic(expected = "BoundOutOfDomain")]
+    fn over_values_refuses_a_fraction() {
+        let _refused = Kernel::over_values(
+            Monoid::SUM,
+            &Kernel::constant(0.0),
+            &Kernel::constant(2.5),
+            affine,
+        );
+    }
+
+    /// Nor does a negative.
+    #[test]
+    #[should_panic(expected = "BoundOutOfDomain")]
+    fn over_values_refuses_a_negative() {
+        let _refused = Kernel::over_values(
+            Monoid::SUM,
+            &Kernel::constant(-1.0),
+            &Kernel::constant(2.0),
+            affine,
+        );
+    }
+
+    /// Nor a count past the exact bound, which no `f32` counter steps through.
+    #[test]
+    #[should_panic(expected = "BoundOutOfDomain")]
+    fn over_values_refuses_a_count_past_the_exact_bound() {
+        let _refused = Kernel::over_values(
+            Monoid::SUM,
+            &Kernel::constant(0.0),
+            &Kernel::constant(16_777_218.0),
+            affine,
+        );
+    }
+
+    /// A `Param` is a slot with no value.
+    #[test]
+    #[should_panic(expected = "BoundNotANumber")]
+    fn over_values_refuses_a_param() {
+        let mut arena = ExprArena::new();
+        let param = arena.push_param(0);
+        let _refused = Kernel::over_values(
+            Monoid::SUM,
+            &Kernel::constant(0.0),
+            &Kernel::from_parts(arena, param),
+            affine,
+        );
+    }
+
+    /// A `Buffer` leaf is a table's address, read through a gather.
+    #[test]
+    #[should_panic(expected = "BoundNotANumber")]
+    fn over_values_refuses_a_buffer() {
+        let mut arena = ExprArena::new();
+        let buffer = arena.declare_buffer(BufferDecl {
+            id: BufferIdentity::mint(),
+            width: 4,
+            height: 1,
+        });
+        let leaf = arena.push_buffer(buffer);
+        let _refused = Kernel::over_values(
+            Monoid::SUM,
+            &Kernel::constant(0.0),
+            &Kernel::from_parts(arena, leaf),
+            affine,
+        );
+    }
+
+    /// A fold of masks has no NaN to answer an out-of-domain bound.
+    #[test]
+    #[should_panic(expected = "BoundSort")]
+    fn over_values_refuses_a_value_bound_on_any() {
+        let n = Uniform::new(3.0).kernel();
+        let _refused = Kernel::over_values(Monoid::ANY, &Kernel::constant(0.0), &n, |i| {
+            i.lt(&Kernel::x())
+        });
+    }
+
+    /// As for `ANY`.
+    #[test]
+    #[should_panic(expected = "BoundSort")]
+    fn over_values_refuses_a_value_bound_on_all() {
+        let n = Uniform::new(3.0).kernel();
+        let _refused = Kernel::over_values(Monoid::ALL, &Kernel::constant(0.0), &n, |i| {
+            i.lt(&Kernel::x())
+        });
+    }
+
+    /// The lattice's folds keep constant ranges.
+    #[test]
+    #[should_panic(expected = "BoundSort")]
+    fn over_values_refuses_a_value_bound_on_seq() {
+        let n = Uniform::new(3.0).kernel();
+        let _refused = Kernel::over_values(Monoid::SEQ, &Kernel::constant(0.0), &n, affine);
+    }
+
+    /// The monoid is `FoldHeader::new`'s to refuse, not an up-front check: a
+    /// pair of constants is a literal fold, legal under `ANY`.
+    #[test]
+    fn over_values_takes_literal_bounds_on_any() {
+        let k = Kernel::over_values(
+            Monoid::ANY,
+            &Kernel::constant(0.0),
+            &Kernel::constant(3.0),
+            |i| i.lt(&Kernel::x()),
+        );
+        let (arena, root) = k.parts();
+        assert_eq!(arena.known_range(root).expect("literals").range(), 0..3);
     }
 }

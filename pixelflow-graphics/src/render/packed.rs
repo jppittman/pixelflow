@@ -360,8 +360,8 @@ mod tests {
             }
             if let ExprNode::Binary(OpKind::Shl, _, count) = arena.node(id) {
                 match arena.node(count) {
-                    ExprNode::Const(c) => counts.push(c as u32),
-                    other => panic!("a shift's count is {other:?}, not a literal"),
+                    ExprNode::Const(pixelflow_ir::Lit::Real(c)) => counts.push(c as u32),
+                    other => panic!("a shift's count is {other:?}, not a real literal"),
                 }
             }
             stack.extend(arena.children(id));

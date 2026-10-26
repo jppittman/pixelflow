@@ -59,6 +59,12 @@ fn constant(v: f32) -> Kernel {
 }
 
 kernel! {
+    /// How many terms `mean_down` sums.
+    const DOWN: usize = 4;
+
+    /// A count of one: a one-term fold.
+    const ONE: usize = 1;
+
     /// The monoid's operation: two kernels summed at the sample.
     pub fn sum2(a: impl Fn(f32, f32) -> f32, b: impl Fn(f32, f32) -> f32) -> f32 {
         a(X, Y) + b(X, Y)
@@ -91,9 +97,19 @@ kernel! {
         b(X, Y) * r + a(X, Y)
     }
 
-    /// An argument applied under a structural count's fold.
-    pub fn mean_down<const N: usize>(k: impl Fn(f32, f32) -> f32) -> f32 {
-        (0..N).map(|i| k(X, Y + (i as f32))).sum::<f32>() / (N as f32)
+    /// An argument applied under a fold over a `usize` const.
+    pub fn mean_down(k: impl Fn(f32, f32) -> f32) -> f32 {
+        (0..DOWN).map(|i| k(X, Y + (i as f32))).sum::<f32>() / (DOWN as f32)
+    }
+
+    /// The same over a count of one: a one-term fold around an application.
+    pub fn mean_down_one(k: impl Fn(f32, f32) -> f32) -> f32 {
+        (0..ONE).map(|i| k(X, Y + (i as f32))).sum::<f32>() / (ONE as f32)
+    }
+
+    /// A count beside a kernel: a fold's range per call, around an application.
+    pub fn columns_to(k: impl Fn(f32, f32) -> f32, n: usize) -> f32 {
+        (0..n).map(|i| k(X + (i as f32), Y)).sum()
     }
 
     /// An argument that is never applied: its uniforms are declared all the
@@ -257,14 +273,45 @@ fn a_derivative_inside_an_argument_follows_the_warp() {
     assert_ne!(bake(&written), resolved_first);
 }
 
-/// A structural count's fold around an application: each count is its own
-/// program, built when the host function is instantiated and called.
+/// A fold over a `usize` const around an application, the count read as a
+/// value too; a count of one is a fold of one term.
 #[test]
-fn a_structural_entry_applies_its_argument() {
+fn a_fold_over_a_usize_const_applies_its_argument() {
     let k = kernel!(|| X + Y);
     // (8 + 9 + 10 + 11) / 4.
-    assert_eq!(bake(&mean_down::<4>(&k)), 9.5);
-    assert_eq!(bake(&mean_down::<1>(&k)), 8.0);
+    assert_eq!(bake(&mean_down(&k)), 9.5);
+    assert_eq!(bake(&mean_down_one(&k)), 8.0);
+}
+
+/// A staged entry's host function refuses a count past 2²⁴ before it builds
+/// anything, as one that takes no kernel does.
+#[test]
+#[should_panic(expected = "past 16777216 (2^24)")]
+fn a_staged_entry_refuses_a_count_past_the_domain() {
+    let k = kernel!(|s: f32| X * s)(2.0);
+    drop(columns_to(&k, 16_777_217));
+}
+
+/// An entry that takes a kernel and a count is built when its host function is
+/// called, and is one program for every count, as one that takes no kernel is:
+/// the count is the composed program's own uniform, declared first.
+#[test]
+fn a_count_beside_a_kernel_is_one_program_for_every_count() {
+    let k = kernel!(|s: f32| X * s)(2.0);
+    let (three, five) = (columns_to(&k, 3), columns_to(&k, 5));
+    let ((three_arena, three_root), (five_arena, five_root)) = (three.parts(), five.parts());
+    assert_eq!(
+        canonical(three_arena, three_root).key,
+        canonical(five_arena, five_root).key
+    );
+    let defaults: Vec<f32> = three.uniforms().iter().map(|u| u.default).collect();
+    assert_eq!(
+        defaults,
+        [3.0, 2.0],
+        "the entry's count first, then the argument's"
+    );
+    // Σ_{i<3} 2·(X + i) at X = 3: 2 · (3 + 4 + 5).
+    assert_eq!(bake(&three), 24.0);
 }
 
 // ─────────────────────────── binding ───────────────────────────

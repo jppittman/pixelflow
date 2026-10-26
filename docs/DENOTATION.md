@@ -58,12 +58,17 @@ T ::= S | D → T                      a kernel is a value of arrow type
   generics, which would forbid runtime-sized frames.
 
 **Totality is the root axiom.** The language is strongly normalizing: no
-`fix`, no `while`, no recursion, no `mut`, no data-dependent trip count or
-extent. Every program's cost is a closed-form function of static extents,
-computable without running it. "Estimatable by the cost model", "a valid
-shader" and "`bake` terminates" are one property. Total is not cheap:
-totality gives a number; the budget decides whether the number is
-acceptable.
+`fix`, no `while`, no recursion, no `mut`, and no trip count or extent that is
+a function of a coordinate or of a lattice binder. A fold's bounds are values
+placed by their variance ([a bound is a
+value](language/2026-10-20-a-bound-is-a-value.md)), each fixed before the
+lattice is traversed. Every program's cost is a closed-form function of values
+known before the traversal, computable without running it; nothing evaluates it
+per call, and the static model prices a fold whose range is not a known
+constant at an estimate (`Fold::ESTIMATED_TRIPS`). "Estimatable by the cost
+model", "a valid shader" and "`bake` terminates" are one property. Total is not
+cheap: totality gives a number, and a value-bounded program is priced at the
+estimate, never reported over budget.
 
 **The program is a DAG with one binder.** Terms are hash-consed in an arena
 (`ExprArena`, the sole IR): two uses of one term are one node, and the graph
@@ -121,8 +126,10 @@ sample is an argument, not an axis."
 spaces, a uniform block is a point in the flattened product and a slot is a
 projection. A uniform is invariant on `L` (its variance is `CONST`) and
 unknown on `P` (it is never a `Const`, never folded). Its identity is the
-instance, not the name and not the index. Loop bounds, extents and ranges
-are never uniforms.
+instance, not the name and not the index. A uniform may bound a fold, as a
+per-call count ([a bound is a
+value](language/2026-10-20-a-bound-is-a-value.md) §1.2); it is never an
+extent, and the lattice's extent stays in the program and the key (§5).
 
 Decided in: `archive/plans/2026-09-06-lattice-is-the-index.md`,
 `language/2026-09-09-composition-is-linking.md`, `language/2026-09-10-one-name-bound-later.md`,
@@ -137,12 +144,16 @@ Decided in: `archive/plans/2026-09-06-lattice-is-the-index.md`,
 ⟦Reduce{⊕, i ∈ [lo, hi), body}⟧ = ⊕_{i ∈ [lo, hi)} ⟦body⟧[i]
 ```
 
-`⊕` is a monoid (`+`, `×`, `min`, `max`, `∧`, `∨`); the range is a static
-natural; the body is the only child; the monoid, binder and range are the
-node's identity, so hash-consing is on exactly the fold's meaning. `⊕` over
-a set has no accumulator and no order: that absence is what lets the
-e-graph reassociate it, and iteration is introduced by lowering, never by
-the term.
+`⊕` is a monoid (`+`, `×`, `min`, `max`, `∧`, `∨`); each bound is a literal,
+which the node holds, or a term, a child after the body, fixed before the
+lattice is traversed and reading no coordinate and no lattice binder; the
+equation holds where every bound is a count, an integer in `0..=2²⁴`, and a
+fold over `+`, `×`, `min` or `max` with a bound that is none (a fraction, a
+negative, NaN, an infinity) is NaN, while `∧`, `∨` take literal bounds only;
+the monoid, the binder and the literal bounds are the node's identity, so
+hash-consing is on exactly the fold's meaning. `⊕` over a set has no
+accumulator and no order: that absence is what lets the e-graph reassociate
+it, and iteration is introduced by lowering, never by the term.
 
 ```
 ⊕_{[lo,hi)} f = ⊕_{[lo,hi−1)} f ⊕ f(hi−1)                 peel
@@ -169,9 +180,10 @@ d(⊕_i f) = ⊕_i d(f)            for ⊕ = Σ only (linearity)
   closed form is written down and summed: glyph coverage is
   `min(|Σ_p σ_p·A_p|, 1)` over a set of monotone arcs, each piece's area
   `A_p` in closed form, every term zero outside its piece's box. When the
-  binder returns it returns with the fold's laws: every range constant, no
-  indefinite integral, no data-dependent bound, no accumulation from one
-  pixel into the next, and `at` never touching a bound index.
+  binder returns it returns with the fold's laws: every bound fixed before the
+  lattice is traversed, no indefinite integral, no bound that is a function of
+  a coordinate, no accumulation from one pixel into the next, and `at` never
+  touching a bound index.
 - **A matrix is a discrete kernel, and a linear operator is a kernel of
   kernels.** `M : Lattice(n, m) → Real`. An operator on kernels with kernel
   `k` is `λf. λj. Σ_i k(j, i)·f(i)`: a fold of a product of two
@@ -245,7 +257,9 @@ Kernel ──compile(extent)──▶ Manifold ──collapse──▶ DiscreteM
 frame (a frame is a contramap, §2), not a runtime argument, not a home for
 uniforms, not a union of ranges. An axis that never varies is a `Uniform`,
 not an axis of extent 1. Its extent is part of the program and of the
-compile key, so a resize is a recompile. A sub-lattice is an index range,
+compile key, so a resize is a recompile. That stays so under [a bound is a
+value](language/2026-10-20-a-bound-is-a-value.md), which leaves the lattice's own
+folds constant (its §4: deferred, not argued). A sub-lattice is an index range,
 the one thing that lives on the domain side.
 
 **Collapse is tabulation, and the table is the function.**
@@ -443,10 +457,11 @@ Decided in: `archive/plans/2026-09-02-optimizer-api.md`,
 1. **Base sorts on arena nodes.** `Real`/`Int`/`Mask` on every node: `Lt`
    returns `Mask`, `If` demands one, `BitAnd` is `Mask × Mask` or
    `Int × Int`, `floor`/`TruncToInt` are the only bridges `Real → Int`, and
-   rules are sort-preserving. `OpKind::is_bitwise_domain()`, the folder's
-   non-finite exemption and `OpKind::mask(bool)` are the runtime recovery of
-   what the sort makes unbuildable, and the mask that leaks through a `bool`
-   entry's `&Kernel` is the open bug the sort closes.
+   rules are sort-preserving. A constant already has its sort (`Lit::Real`,
+   `Lit::Mask`); `OpKind::is_bitwise_domain()` and the folder's non-finite
+   exemption are the runtime recovery of what the sort on nodes makes
+   unbuildable, and the mask that leaks through a `bool` entry's `&Kernel` is
+   the open bug the sort closes.
 2. **Arrow sorts on binders.** `Var`, `Uniform` and a kernel-typed parameter
    are binders of types `Real`, `Real` and `L → Real`; a `Ref` is
    application of an arrow. BACKLOG N1–N3 in these words.

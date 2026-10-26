@@ -12,7 +12,7 @@ use super::provenance::ENodeId;
 use alloc::collections::BinaryHeap;
 use alloc::vec::Vec;
 use core::cmp::Reverse;
-use pixelflow_ir::{Children, ExprArena, ExprId, Ir, LatticeShape, OpKind, Shape, Variance};
+use pixelflow_ir::{Children, ExprArena, ExprId, Ir, LatticeShape, Lit, OpKind, Shape, Variance};
 
 /// A witnessed choice map: an e-graph, a root e-class, and a well-founded
 /// choice function from every e-class reachable from `root` to the node
@@ -944,7 +944,7 @@ impl Selection {
             );
             let shape = match self.node(egraph, position) {
                 ENode::Var(var) => Shape::Var(*var),
-                ENode::Const(bits) => Shape::Const(f32::from_bits(*bits)),
+                ENode::Const(lit) => Shape::Const(*lit),
                 // One slot per distinct identity, and the assertion that a
                 // repeat identity agrees on extents, both live in
                 // `ExprArena`'s `embed`: declaring a buffer is what the
@@ -954,7 +954,7 @@ impl Selection {
                 // the destination arena, one slot per identity.
                 ENode::Uniform(decl) => Shape::Uniform(*decl),
                 // The slot index is the whole node; it means the same thing in
-                // the destination arena, and the builder substitutes it there.
+                // the destination arena.
                 ENode::Param(slot) => Shape::Param(*slot),
                 // A unit comes back as its name: its body is optimized by
                 // itself and linked after extraction
@@ -964,13 +964,18 @@ impl Selection {
                 ENode::Shift {
                     direction, count, ..
                 } => {
-                    operand_ids.push(arena.embed(Shape::Const(count.literal())));
+                    operand_ids.push(arena.embed(Shape::Const(Lit::Real(count.literal()))));
                     Shape::Op(direction.op(), Children::Many(&operand_ids))
                 }
-                ENode::Reduce { fold, .. } => Shape::Reduce {
-                    fold: *fold,
-                    body: operand_ids[0],
-                },
+                ENode::Reduce { header, .. } => {
+                    let (lo, hi) = header.attach(operand_ids[1..].iter().copied());
+                    Shape::Reduce {
+                        fold: header.fold(),
+                        lo,
+                        hi,
+                        body: operand_ids[0],
+                    }
+                }
             };
             ids.push(arena.embed(shape));
         }
@@ -999,23 +1004,30 @@ impl Selection {
         for position in 0..self.len() {
             let node = self.node(egraph, position);
             let operands = self.operands_of(position);
+            let pick_of = |class: EClassId| {
+                let class = egraph.find(class);
+                operands
+                    .iter()
+                    .copied()
+                    .find(|&operand| self.picks[operand].class == class)
+                    .expect("a chosen node's operands are picks")
+            };
             let node_variance = node.variance(
                 |key| egraph.ref_variance(key),
-                |child| {
-                    let child = egraph.find(child);
-                    let at = operands
-                        .iter()
-                        .find(|&&operand| self.picks[operand].class == child)
-                        .expect("a chosen node's operands are picks");
-                    variance[*at]
-                },
+                |child| variance[pick_of(child)],
             );
-            let own = weighted_own(costs, node, shape.evals(node_variance));
+            // A fold whose value bounds were chosen as literals is priced as
+            // the fold over them, as the settlement priced it: the operands
+            // are the classes' settled picks, so the claim and the price read
+            // the same literals.
+            let twin = node.literal_twin(|class| self.node(egraph, pick_of(class)).literal());
+            let form = twin.as_ref().unwrap_or(node);
+            let own = weighted_own(costs, form, shape.evals(node_variance));
             // Saturating throughout: a tree cost is exponential in the sharing
             // it refuses to price, so it reaches the ceiling on real inputs,
             // and a fold whose monoid has no combiner is priced
             // `usize::MAX / 4` (`CostModel::node_op_cost`).
-            let below = below(node, operands.iter().map(|&operand| tree[operand]));
+            let below = below(form, operands.iter().map(|&operand| tree[operand]));
             tree.push(own.saturating_add(below));
             variance.push(node_variance);
             dag = dag.saturating_add(own);
@@ -1664,6 +1676,14 @@ fn weighted_own<C: CostFunction>(costs: &C, node: &ENode, weight: u64) -> usize 
 /// e-class, so after saturation one slot carries folds of many different
 /// lengths over one shared body and no per-slot number is right for it.
 ///
+/// The trips are the node's
+/// ([`FoldHeader::priced_trips`](pixelflow_ir::FoldHeader::priced_trips)), and
+/// a price site hands `below` a fold's priced form ([`ENode::literal_twin`]), so a
+/// fold whose value bounds were chosen as literals is multiplied by their
+/// count. Its operands are still those of the fold as written: the body, then
+/// each value bound, charged once — before value bounds `below` read only the
+/// body, so bound arithmetic would have gone unpriced.
+///
 /// An `If(m, a, b)` compiles to one shape: its mask, each arm's own block
 /// under a guard that skips it when no lane selects it, and the select
 /// (docs/language/2026-10-15-kernels-evaluate-kernels.md §1). How often `m` is
@@ -1675,10 +1695,14 @@ fn weighted_own<C: CostFunction>(costs: &C, node: &ENode, weight: u64) -> usize 
 /// the settlement is no longer exact at an `If` — see [`Settling`].
 fn below(node: &ENode, mut operand: impl Iterator<Item = usize>) -> usize {
     match node {
-        ENode::Reduce { fold, .. } => {
+        ENode::Reduce { header, .. } => {
             let body = operand.next().expect("a fold has a body");
-            usize::try_from((body as u64).saturating_mul(u64::from(fold.len())))
-                .unwrap_or(usize::MAX)
+            let body = usize::try_from((body as u64).saturating_mul(header.priced_trips()))
+                .unwrap_or(usize::MAX);
+            // Each value bound is evaluated once per evaluation of the fold:
+            // `+ cost(lo) + cost(hi)` (docs/language/2026-10-20-a-bound-is-a-value.md
+            // §1.5).
+            operand.fold(body, usize::saturating_add)
         }
         ENode::Op { op: OpKind::If, .. } => {
             let mask = operand.next().expect("an If has a mask");
@@ -2061,6 +2085,7 @@ pub(crate) fn tree_dp_pass<C: CostFunction, T: TieBreak, R: StageRecorder>(
         // variance sets its parent's weight, and a parent's weight is part
         // of what makes one child's form worth choosing over another's.
         var: alloc::vec![Variance::CONST; problem.egraph().num_classes()],
+        chosen: alloc::vec![None; problem.egraph().num_classes()],
     };
     settle_in_cost_order(problem, &mut pricer)
         .expect("the tree pass has no budget and never abandons")
@@ -2075,12 +2100,18 @@ struct TreePricer<'a, 'c, C, T, R> {
     cost: LiveTable<Option<usize>>,
     /// By e-class id, the table `node_variance` reads.
     var: Vec<Variance>,
+    /// By e-class id, the literal each settled class was chosen as: what a
+    /// fold whose bound is that class is priced by.
+    chosen: Vec<Option<Lit>>,
 }
 
 impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for TreePricer<'_, '_, C, T, R> {
     fn price(&mut self, candidate: Candidate, node: &ENode) -> Priced {
-        let var = node_variance(self.problem.egraph(), node, &self.var, candidate.class());
-        let own = weighted_own(self.dp.costs, node, self.dp.shape.evals(var));
+        let egraph = self.problem.egraph();
+        let var = node_variance(egraph, node, &self.var, candidate.class());
+        let twin = node.literal_twin(|class| self.chosen[egraph.find(class).index()]);
+        let form = twin.as_ref().unwrap_or(node);
+        let own = weighted_own(self.dp.costs, form, self.dp.shape.evals(var));
         let cost = match node {
             ENode::Var(_)
             | ENode::Const(_)
@@ -2106,7 +2137,7 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for TreePricer<'_,
                         .expect("an operand's class is in its candidate's row");
                     self.cost[child.live].expect("a priced candidate's children are settled")
                 });
-                own.saturating_add(below(node, settled))
+                own.saturating_add(below(form, settled))
             }
         };
         self.dp
@@ -2122,6 +2153,11 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for TreePricer<'_,
     }
 
     fn settle(&mut self, candidate: Candidate, priced: Priced) -> bool {
+        let picked = self
+            .problem
+            .egraph()
+            .node(self.problem.graph().node_id(candidate));
+        self.chosen[candidate.class().index()] = picked.literal();
         self.cost[candidate.live()] = Some(priced.cost);
         self.var[candidate.class().index()] = priced.var;
         self.dp.rec.settled(candidate.class(), candidate.idx());
@@ -2169,6 +2205,7 @@ pub(crate) fn shared_dag_dp_pass<C: CostFunction, T: TieBreak, R: StageRecorder>
         problem,
         dp,
         var: alloc::vec![Variance::CONST; problem.egraph().num_classes()],
+        chosen: alloc::vec![None; problem.egraph().num_classes()],
         sets: ReachSets {
             reach: graph.table_from_fn(|_| None),
             own: graph.table(0),
@@ -2319,13 +2356,19 @@ struct SharedPricer<'a, 'c, C, T, R> {
     problem: Problem<'a>,
     dp: &'a mut Dp<'c, C, T, R>,
     var: Vec<Variance>,
+    /// By e-class id, the literal each settled class was chosen as: what a
+    /// fold whose bound is that class is priced by.
+    chosen: Vec<Option<Lit>>,
     sets: ReachSets,
 }
 
 impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for SharedPricer<'_, '_, C, T, R> {
     fn price(&mut self, candidate: Candidate, node: &ENode) -> Priced {
-        let var = node_variance(self.problem.egraph(), node, &self.var, candidate.class());
-        let own = weighted_own(self.dp.costs, node, self.dp.shape.evals(var));
+        let egraph = self.problem.egraph();
+        let var = node_variance(egraph, node, &self.var, candidate.class());
+        let twin = node.literal_twin(|class| self.chosen[egraph.find(class).index()]);
+        let form = twin.as_ref().unwrap_or(node);
+        let own = weighted_own(self.dp.costs, form, self.dp.shape.evals(var));
         let below = self
             .sets
             .cost_below(self.problem.graph().children(candidate));
@@ -2343,6 +2386,11 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for SharedPricer<'
     }
 
     fn settle(&mut self, candidate: Candidate, priced: Priced) -> bool {
+        let picked = self
+            .problem
+            .egraph()
+            .node(self.problem.graph().node_id(candidate));
+        self.chosen[candidate.class().index()] = picked.literal();
         // Rebuild the winner's union rather than carrying one per class in
         // flight: the driver prices candidates for many unsettled classes
         // before any of them settles, so a stored winner set would be a
@@ -2526,7 +2574,7 @@ mod tests {
         let mut egraph = EGraph::new();
         let x = egraph.add(ENode::Var(0));
         let z = egraph.add(ENode::Var(2));
-        let two = egraph.add(ENode::Const(2.0f32.to_bits()));
+        let two = egraph.add(ENode::constant(2.0));
 
         let fused = egraph.add(ENode::apply(OpKind::MulAdd, &[two, z, x]));
         let z_plus_z = egraph.add(ENode::apply(OpKind::Add, &[z, z]));
@@ -2945,6 +2993,157 @@ mod tests {
             choices[n1c.index()].is_some(),
             "the class was priced but not settled"
         );
+    }
+
+    /// **Both twins of a fold price at the count their bound names**
+    /// (docs/language/2026-10-20-a-bound-is-a-value.md §3.2). A class holding
+    /// `Σ_{j<c} |X − j|`, `c` the class of the literal 40, and
+    /// `Σ_{j<40} |X − j|` prices both candidates as the fold over 40 trips,
+    /// `CostModel::fold_cost` at 40: the combiner chain for the node's own
+    /// share and the body 40 times, under either objective. A header-only
+    /// price would read the value twin at the estimate, 32, and make it the
+    /// cheaper: 40 is past it, which is why the pin uses it. A graph holding
+    /// only the value twin prices it the same, since the pick of `c` is the
+    /// literal.
+    #[test]
+    fn both_twins_of_a_fold_price_at_the_count_their_bound_names() {
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
+
+        #[derive(Default)]
+        struct Prices(Vec<(EClassId, usize, usize)>);
+        impl StageRecorder for Prices {
+            fn candidate(&mut self, class: EClassId, _idx: usize, cost: usize, own: usize) {
+                self.0.push((class, cost, own));
+            }
+            fn settled(&mut self, _: EClassId, _: usize) {}
+        }
+
+        let binder = Binder::from_slot(0).expect("a live binder");
+        let fold = Fold::new(Monoid::SUM, binder);
+        let costs = CostModel::latency_prior();
+        let body_cost = costs.cost(OpKind::Sub) + costs.cost(OpKind::Abs);
+        // The node's own share of the fold over 40 trips: its header is all
+        // the price reads, so any class stands in for the body.
+        let own_share = costs.node_op_cost(&ENode::reduce(
+            fold,
+            Bound::Lit(0),
+            Bound::Lit(40),
+            EClassId::from_index(0),
+        ));
+        let whole = own_share + 40 * body_cost;
+
+        // The fold whose bound is the class of the literal 40, with no fold
+        // over that literal beside it.
+        let value_twin_only = || {
+            let mut egraph = EGraph::new();
+            let x = egraph.add(ENode::Var(0));
+            let j = egraph.add(ENode::Var(binder.var()));
+            let diff = egraph.add(ENode::apply(OpKind::Sub, &[x, j]));
+            let body = egraph.add(ENode::apply(OpKind::Abs, &[diff]));
+            let forty = egraph.add(ENode::constant(40.0));
+            let value = egraph.add(ENode::reduce(
+                fold,
+                Bound::Lit(0),
+                Bound::Value(forty),
+                body,
+            ));
+            egraph.rebuild();
+            (egraph, value, body)
+        };
+        // The same, with the fold over the literal 40 joined to its class.
+        let both_twins = || {
+            let (mut egraph, value, body) = value_twin_only();
+            let literal = egraph.add(ENode::reduce(fold, Bound::Lit(0), Bound::Lit(40), body));
+            egraph.union(value, literal);
+            egraph.rebuild();
+            (egraph, value)
+        };
+
+        let (egraph, class) = both_twins();
+        let class = egraph.find(class);
+        let frozen = Frozen::new(egraph.as_frozen(), class);
+        let mut tree = Dp::new(&costs, LatticeShape::POINT, Insertion, Prices::default());
+        tree_dp_pass(frozen.problem(), &mut tree);
+        let mut shared = Dp::new(&costs, LatticeShape::POINT, Insertion, Prices::default());
+        shared_dag_dp_pass(frozen.problem(), &mut shared, usize::MAX)
+            .outcome
+            .expect("unbounded");
+        for (objective, priced) in [
+            ("tree", tree.into_recorder().0),
+            ("shared", shared.into_recorder().0),
+        ] {
+            let folds: Vec<_> = priced.iter().filter(|&&(c, ..)| c == class).collect();
+            assert_eq!(folds.len(), 2, "{objective}: both twins are candidates");
+            for &&(_, cost, own) in &folds {
+                assert_eq!(own, own_share, "{objective}: the combiner chain over 40");
+                if objective == "tree" {
+                    assert_eq!(cost, whole, "{objective}: the body 40 times");
+                }
+            }
+        }
+        let dag = extract_dag(&egraph, class, &costs);
+        assert_eq!(dag.total_cost, whole);
+        let audit = dag.report.audit.expect("the DP ran");
+        assert_eq!(
+            audit.signed_error(dag.cost()),
+            0,
+            "the DP's claim is the price of the term it names"
+        );
+
+        let (alone, value, _) = value_twin_only();
+        assert_eq!(extract_dag(&alone, value, &costs).total_cost, whole);
+
+        // The arena holds the twin the price was read off: `embed` reads the
+        // chosen literal into the fold.
+        let (out, out_root, _) = extract(&alone, value, &costs);
+        assert_eq!(
+            out.known_range(out_root).map(|range| range.range()),
+            Some(0..40)
+        );
+    }
+
+    /// A bound whose chosen form names no count leaves the fold at the
+    /// estimate: a fraction, a count past the domain and a mask each price the
+    /// fold as `Fold::ESTIMATED_TRIPS` trips of its body, as a bound that is no
+    /// literal at all does.
+    #[test]
+    fn a_bound_that_picks_no_count_is_priced_at_the_estimate() {
+        use pixelflow_ir::Lit;
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
+
+        let binder = Binder::from_slot(0).expect("a live binder");
+        let fold = Fold::new(Monoid::SUM, binder);
+        let costs = CostModel::latency_prior();
+        let body_cost = costs.cost(OpKind::Sub) + costs.cost(OpKind::Abs);
+        // The fold over as many trips as the estimate: its header is all
+        // `node_op_cost` reads, so any class stands in for the body.
+        let estimated = ENode::reduce(
+            fold,
+            Bound::Lit(0),
+            Bound::Lit(Fold::ESTIMATED_TRIPS),
+            EClassId::from_index(0),
+        );
+        let whole = costs.node_op_cost(&estimated) + Fold::ESTIMATED_TRIPS as usize * body_cost;
+
+        for bound in [Lit::Real(2.5), Lit::Real(16_777_218.0), Lit::Mask(true)] {
+            let mut egraph = EGraph::new();
+            let x = egraph.add(ENode::Var(0));
+            let j = egraph.add(ENode::Var(binder.var()));
+            let diff = egraph.add(ENode::apply(OpKind::Sub, &[x, j]));
+            let body = egraph.add(ENode::apply(OpKind::Abs, &[diff]));
+            let count = egraph.add(ENode::Const(bound));
+            let class = egraph.add(ENode::reduce(
+                fold,
+                Bound::Lit(0),
+                Bound::Value(count),
+                body,
+            ));
+            assert_eq!(
+                extract_dag(&egraph, class, &costs).total_cost,
+                whole,
+                "{bound:?} names no count"
+            );
+        }
     }
 
     /// Kahn admission over the chosen edges: a class is admitted once every
@@ -3823,11 +4022,11 @@ mod tests {
     /// literal the fold's sibling names is the same arena node.
     #[test]
     fn a_shift_under_a_fold_body_materializes_with_its_count() {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
         use pixelflow_ir::{ExprArena, OpKind};
 
         let binder = Binder::from_slot(0).expect("a live binder");
-        let fold = Fold::new(Monoid::SUM, binder, 0..4);
+        let fold = Fold::new(Monoid::SUM, binder);
 
         // root = Add(Reduce(Shift(x, 3)), three)
         let mut eg = EGraph::new();
@@ -3838,10 +4037,7 @@ mod tests {
             count: ShiftCount::from_literal(3.0).expect("3 is a count"),
             operand: x,
         });
-        let reduce = eg.add(ENode::Reduce {
-            fold,
-            body: shifted,
-        });
+        let reduce = eg.add(ENode::reduce(fold, Bound::Lit(0), Bound::Lit(4), shifted));
         let root = eg.add(ENode::apply(OpKind::Add, &[reduce, three]));
 
         let extraction = Extraction::from_backfill(&eg, root, alloc::vec![None; eg.num_classes()]);
@@ -3851,7 +4047,7 @@ mod tests {
         let ex = expected.push_var(0);
         let e3 = expected.push_const(3.0);
         let eshl = expected.push_binary(OpKind::Shl, ex, e3);
-        let ereduce = expected.push_reduce(fold, eshl);
+        let ereduce = expected.push_reduce(fold, Bound::Lit(0), Bound::Lit(4), eshl);
         let eroot = expected.push_binary(OpKind::Add, ereduce, e3);
         assert_eq!(arena_root, eroot);
         assert_eq!(

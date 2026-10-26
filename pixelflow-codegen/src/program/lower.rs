@@ -8,13 +8,13 @@
 
 use alloc::vec::Vec;
 
-use pixelflow_ir::ShiftCount;
-use pixelflow_ir::arena::UniformId;
-use pixelflow_ir::fold::Binder;
+use pixelflow_ir::arena::{ExprId, ExprNode, UniformId};
+use pixelflow_ir::fold::{Binder, Bound, BoundEnd, BoundRefusal, KNOWN_RANGE, KnownRange};
 use pixelflow_ir::kind::OpKind;
 use pixelflow_ir::variance::{Variance, compute_arena_variance};
+use pixelflow_ir::{Lit, ShiftCount};
 
-use super::{CompareOp, Def, Legal, ScheduledOp, ValueId, legal, not_legal};
+use super::{CompareOp, Def, Legal, ScheduledOp, ValueId, lane_pattern, legal, not_legal};
 
 /// Mark nodes reachable from `root` via DFS.
 ///
@@ -34,8 +34,7 @@ fn mark_reachable(
         }
         reachable[idx] = true;
         // An empty fold is its identity whatever its body says (see `arena_to_schedule`).
-        if matches!(arena.node(id), pixelflow_ir::arena::ExprNode::Reduce { fold, .. } if fold.is_empty())
-        {
+        if is_empty_fold(arena, id) {
             continue;
         }
         for child in arena.children(id) {
@@ -43,6 +42,155 @@ fn mark_reachable(
                 stack.push(child);
             }
         }
+    }
+}
+
+/// Whether `id` is a fold over nothing: its monoid's identity, whatever its
+/// body says. A range that is not known is not known to be empty, so it is
+/// not one.
+fn is_empty_fold(arena: &pixelflow_ir::arena::ExprArena, id: pixelflow_ir::arena::ExprId) -> bool {
+    matches!(arena.node(id), pixelflow_ir::arena::ExprNode::Reduce { .. })
+        && arena.known_range(id).is_some_and(KnownRange::is_empty)
+}
+
+/// What reads a fold whose bound is a value, as far as a schedule has met it.
+#[derive(Clone, Copy)]
+enum ValueFold {
+    /// Not such a fold.
+    Not,
+    /// Such a fold that nothing reachable has read yet.
+    Unread,
+    /// Such a fold, and the node that read it first.
+    ReadBy(ExprId),
+}
+
+/// The folds whose bound is a value that the schedule reaches, and who reads
+/// each: the single-reader property placement rests on.
+///
+/// A fold whose bound is a value arrives inside the guard `passes::legalize`
+/// ends with, `If(dom, If(Lt(lo, hi), fold, identity), NaN)`, and the fold's
+/// one reader is the inner `If`, as its true arm. That makes the fold the
+/// arm's alone to own, so its loop sits in an arm block and runs only for a
+/// bound that names a count. A second reader, of any shape, would own the
+/// fold at the two readers' lowest common ancestor, outside the arm, and the
+/// loop would run unguarded: a bound of `+∞` or `2²⁴ + 2` stalls its counter
+/// at `2²⁴`, which never reaches the end.
+struct ValueFolds {
+    /// By arena id; empty when no reachable fold has a value bound.
+    readers: Vec<ValueFold>,
+}
+
+impl ValueFolds {
+    /// The folds `ids`, in an arena of `len` nodes, none read yet.
+    fn unread(len: usize, ids: &[ExprId]) -> Self {
+        if ids.is_empty() {
+            return Self {
+                readers: Vec::new(),
+            };
+        }
+        let mut readers = alloc::vec![ValueFold::Not; len];
+        for id in ids {
+            readers[id.0 as usize] = ValueFold::Unread;
+        }
+        Self { readers }
+    }
+
+    /// Record `reader`'s reads of these folds, and check each.
+    ///
+    /// # Panics
+    ///
+    /// If `reader` is a second reader of a fold, or reads one other than as
+    /// the true arm of an `If` (not the mask, and not the false arm too):
+    /// the arena was not legalized, which is a pipeline bug and not a
+    /// kernel's.
+    fn read_by(&mut self, arena: &pixelflow_ir::arena::ExprArena, reader: ExprId) {
+        // An empty fold's children are not reached (`mark_reachable`).
+        if self.readers.is_empty() || is_empty_fold(arena, reader) {
+            return;
+        }
+        for fold in arena.children(reader) {
+            match self.readers[fold.0 as usize] {
+                ValueFold::Not => continue,
+                ValueFold::ReadBy(first) => panic!(
+                    "arena_to_schedule: {fold:?}, a fold whose bound is a value, is read by \
+                     {first:?} and by {reader:?}: exactly one reader, an If's true arm, is the \
+                     guard that owns it (passes::legalize ends with the guard, L5)"
+                ),
+                ValueFold::Unread => self.readers[fold.0 as usize] = ValueFold::ReadBy(reader),
+            }
+            let as_an_arm = matches!(
+                arena.node(reader),
+                ExprNode::Ternary(OpKind::If, mask, if_true, if_false)
+                    if if_true == fold && mask != fold && if_false != fold
+            );
+            assert!(
+                as_an_arm,
+                "arena_to_schedule: {fold:?}, a fold whose bound is a value, is read by \
+                 {reader:?} other than as an If's true arm: an arena that was not legalized \
+                 (passes::legalize ends with the guard that owns such a fold, L5)"
+            );
+        }
+    }
+
+    /// Check, after the walk, that every value-bounded fold found a reader.
+    ///
+    /// # Panics
+    ///
+    /// If a fold was read by nothing: it is the root, or its readers were not
+    /// reached, and either way no guard owns it.
+    fn assert_every_fold_was_read(&self) {
+        let unread = self
+            .readers
+            .iter()
+            .position(|fold| matches!(fold, ValueFold::Unread));
+        if let Some(fold) = unread {
+            panic!(
+                "arena_to_schedule: ExprId({fold}), a fold whose bound is a value, is read by \
+                 nothing: an arena that was not legalized (passes::legalize ends with the \
+                 guard that owns such a fold, L5)"
+            );
+        }
+    }
+}
+
+/// L3 after collapse: a fold's bound varies with no binder of the lattice.
+///
+/// A bound reads no lattice binder, so it is fixed before the lattice is
+/// traversed: one value for the call or, where it is an enclosing fold's index,
+/// one value per trip of that fold, and either way one value in every lane of a
+/// batch. `collapse` picks the lattice's binder slots from those no reachable
+/// `Var` or fold uses, so this cannot fail on a legalized arena. It is also
+/// what keeps every lane of a guard's mask and of a latch's compare at one
+/// value: the lane binder would vary them within a batch, and a guard's arm
+/// would run on some of its lanes; the row and column binders would vary them
+/// between batches, which the law forbids all the same.
+fn assert_off_the_lattice(end: BoundEnd, reads: Variance, lattice: Variance) {
+    let shared = reads.intersection(lattice);
+    assert!(
+        shared.is_const(),
+        "arena_to_schedule: a fold's {end} bound varies with {shared:?}, a lattice binder's: \
+         L3 after collapse (docs/language/2026-10-20-a-bound-is-a-value.md); a pipeline bug, \
+         not a kernel's"
+    );
+}
+
+/// Which values of a schedule are masks ([`ScheduledOp::is_mask`]), worked out
+/// as far as a fold's bound asks, in schedule order.
+struct MaskValues(Vec<bool>);
+
+impl MaskValues {
+    /// Whether `value`, a def of `schedule`, is a mask.
+    fn is_mask(&mut self, schedule: &[Def], value: ValueId) -> bool {
+        for def in &schedule[self.0.len()..] {
+            assert_eq!(
+                def.value.0 as usize,
+                self.0.len(),
+                "a schedule numbers its defs in order"
+            );
+            let mask = def.op.is_mask(|operand| self.0[operand.0 as usize]);
+            self.0.push(mask);
+        }
+        self.0[value.0 as usize]
     }
 }
 
@@ -88,6 +236,10 @@ fn shift_immediate(op: OpKind, count: f32) -> u8 {
 /// - **The lane binder is a constant.** Its `Var` becomes
 ///   [`ScheduledOp::Lanes`], the iota every lane-varying value is built on.
 ///
+/// A fold whose bound is a value arrives inside its guard (`passes::legalize`'s
+/// last pass): its bounds are operands ([`operands`](super::operands)), and it
+/// is read only as an `If`'s true arm.
+///
 /// Every def carries the variance of the node it was lowered from, which
 /// scoping places it by. A block's base pointer has no node: it is the call's,
 /// `CONST`.
@@ -98,33 +250,63 @@ fn shift_immediate(op: OpKind, count: f32) -> u8 {
 /// # Panics
 ///
 /// Panics if a `Param` or `Nary` node is encountered (these are not expected
-/// in JIT compilation), or a coordinate `Var` survived `collapse`.
+/// in JIT compilation), or a `Var` that is no fold's binder survived
+/// lowering: a coordinate or a retired axis, which means the lowering
+/// pipeline was skipped, or an index past the binder slots, which means the
+/// kernel is open. Such an index is a fold index that escaped its builder (a
+/// placeholder, which the variance this reads types as constant) or an index
+/// past the index space; either way this is the refusal that stops one from
+/// being placed.
+///
+/// It also panics, for a fold whose bound is a value, when a bound reads a
+/// binder of the lattice (L3 after collapse) or the fold is read other than
+/// once, as an `If`'s true arm: an arena that was not legalized, a pipeline
+/// bug and not a kernel's. A bound the emitter holds as a mask
+/// (`ScheduledOp::is_mask`: a comparison, or a bitwise and/or of two such) is
+/// refused by name (`BoundSort`), at either end and on every tier alike: a mask
+/// names no count.
 pub(crate) fn arena_to_schedule(
     arena: &pixelflow_ir::arena::ExprArena,
     root: pixelflow_ir::arena::ExprId,
     origin: [UniformId; 2],
 ) -> Vec<Def> {
-    use pixelflow_ir::arena::{ExprId, ExprNode};
-
     let len = arena.len();
     let mut reachable = alloc::vec![false; len];
     mark_reachable(arena, root, &mut reachable);
 
     // The lane binder: the one every reachable `Write` names as its lane.
     // One slot, by construction (`passes::lattice::pack` builds both lane
-    // folds on `collapse`'s), asserted rather than assumed.
+    // folds on `collapse`'s), asserted rather than assumed. The same scan
+    // reads which binders the lattice's folds bind (a `Write` names all
+    // three), and which folds have a bound that is a value.
     let mut lane: Option<Binder> = None;
+    let mut lattice = Variance::CONST;
+    let mut value_folds = Vec::new();
     for (idx, _) in reachable.iter().enumerate().filter(|(_, r)| **r) {
-        if let ExprNode::Write { lane: l, .. } = arena.node(ExprId(idx as u32)) {
-            match lane {
-                None => lane = Some(l),
-                Some(seen) => assert_eq!(
-                    seen, l,
-                    "two Writes name different lane binders; a lattice has one lane fold"
-                ),
+        let id = ExprId(idx as u32);
+        match arena.node(id) {
+            ExprNode::Write {
+                row, col, lane: l, ..
+            } => {
+                match lane {
+                    None => lane = Some(l),
+                    Some(seen) => assert_eq!(
+                        seen, l,
+                        "two Writes name different lane binders; a lattice has one lane fold"
+                    ),
+                }
+                for binder in [row, col, l] {
+                    lattice = lattice.union(Variance::from_var(binder.var()));
+                }
             }
+            ExprNode::Reduce { lo, hi, .. } if lo.value().is_some() || hi.value().is_some() => {
+                value_folds.push(id);
+            }
+            _ => {}
         }
     }
+    let mut folds = ValueFolds::unread(len, &value_folds);
+    let mut masks = MaskValues(Vec::new());
 
     // What every value varies with, read once: each def carries its
     // node's, and a `RawGather` whose index lacks the lane binder's bit is
@@ -155,6 +337,8 @@ pub(crate) fn arena_to_schedule(
         }
         let expr_id = ExprId(idx as u32);
         let node = arena.node(expr_id);
+        // Before the `Write` skip: a store of the fold itself is a read of it.
+        folds.read_by(arena, expr_id);
         if let ExprNode::Write { .. } = node {
             continue;
         }
@@ -172,21 +356,23 @@ pub(crate) fn arena_to_schedule(
 
         let sched_op = match node {
             ExprNode::Var(i) => match Binder::from_var(i) {
+                None if i < Variance::VARIABLES => panic!(
+                    "arena_to_schedule: Var({i}) is a coordinate or a retired axis, which \
+                     the lowering pipeline substitutes away or refuses -- this schedule was \
+                     built without it"
+                ),
                 None => panic!(
-                    "arena_to_schedule: Var({i}) is a coordinate, which \
-                     passes::lattice::collapse substitutes away -- this schedule was \
-                     built without the lowering pipeline"
+                    "arena_to_schedule: Var({i}) is past the binder slots: a fold index that \
+                     escaped its builder, or an index past the index space. No fold binds it, \
+                     so the kernel is open"
                 ),
                 Some(b) if lane == Some(b) => ScheduledOp::Lanes,
                 Some(b) => ScheduledOp::Var(b),
             },
-            ExprNode::Const(v) => ScheduledOp::Const(v),
-            ExprNode::Param(i) => panic!(
-                "ExprNode::Param({}) reached the JIT emitter -- a template's slot (a `kernel!` \
-                 template's structural hole, a rewrite rule's metavariable) is filled before \
-                 a Kernel exists",
-                i
-            ),
+            ExprNode::Const(lit) => ScheduledOp::Const(lane_pattern(lit)),
+            ExprNode::Param(i) => {
+                panic!("ExprNode::Param({i}) reached the JIT emitter: a `Param` has no value")
+            }
             // A buffer's base pointer: the `k`-th context entry, a pointer
             // value the gathers reading the buffer take as an operand.
             ExprNode::Buffer(id) => ScheduledOp::Context(id.0),
@@ -216,6 +402,15 @@ pub(crate) fn arena_to_schedule(
                 });
                 ScheduledOp::Uniform(block, offset)
             }
+            // A reinterpretation is its operand: the same lanes, read as the
+            // other sort. It defines nothing and takes no `ValueId`; whatever
+            // reads it reads the operand, so no backend sees it and no `mov`
+            // is spent on it.
+            ExprNode::Unary(OpKind::Bits | OpKind::Float, child) => {
+                let operand = map_child(child);
+                id_map[idx] = operand;
+                continue;
+            }
             ExprNode::Unary(op, child) => ScheduledOp::Unary(legal(op), map_child(child)),
             // Shl/Shr fold their Const shift-count operand into an immediate, so
             // the count never becomes a scheduled value (matching the imm-only
@@ -223,9 +418,9 @@ pub(crate) fn arena_to_schedule(
             // own schedule entry (harmless/unused) if shared.
             ExprNode::Binary(op @ (OpKind::Shl | OpKind::Shr), a, b) => {
                 let amount = match arena.node(b) {
-                    ExprNode::Const(v) => shift_immediate(op, v),
+                    ExprNode::Const(Lit::Real(v)) => shift_immediate(op, v),
                     _ => panic!(
-                        "{:?} shift count must be a Const (lowering guarantees this)",
+                        "{:?} shift count must be a real Const (lowering guarantees this)",
                         op
                     ),
                 };
@@ -287,12 +482,12 @@ pub(crate) fn arena_to_schedule(
             ExprNode::Nary(_, _) => panic!("Nary not supported in JIT arena compilation"),
             // Its body was not reached (`mark_reachable`), and the arena's
             // variance for it is `CONST` already: the identity's.
-            ExprNode::Reduce { fold, .. } if fold.is_empty() => {
-                ScheduledOp::Const(fold.monoid().identity())
+            ExprNode::Reduce { fold, .. } if is_empty_fold(arena, expr_id) => {
+                ScheduledOp::Const(lane_pattern(fold.monoid().identity()))
             }
             // The lane fold, executed by lanes: its body is the store, and
             // the store is this def, with the fold's trip count as its width.
-            ExprNode::Reduce { fold, body } if matches!(arena.node(body), ExprNode::Write { lane, .. } if lane == fold.binder()) =>
+            ExprNode::Reduce { fold, body, .. } if matches!(arena.node(body), ExprNode::Write { lane, .. } if lane == fold.binder()) =>
             {
                 let ExprNode::Write {
                     row, col, value, ..
@@ -304,7 +499,8 @@ pub(crate) fn arena_to_schedule(
                     row,
                     col,
                     lane: fold.binder(),
-                    lanes: fold.len(),
+                    lanes: u32::try_from(arena.known_range(expr_id).expect(KNOWN_RANGE).len())
+                        .expect("a lane fold's trip count is a lane count"),
                     value: map_child(value),
                 }
             }
@@ -313,8 +509,36 @@ pub(crate) fn arena_to_schedule(
             // topological order), so `map_child(body)` is that per-iteration
             // value's `ValueId` in *this* numbering. `scopes::extract_folds` reads
             // it back out into the fold's own `ScopeFold`; nothing after
-            // that resolves it as an operand (see `ScheduledOp::Reduce`).
-            ExprNode::Reduce { fold, body } => ScheduledOp::Reduce(fold, map_child(body)),
+            // that resolves it as an operand (see `ScheduledOp::Reduce`). A
+            // value bound is an operand of its fold (`operands`): `lo` seeds
+            // the loop and `hi` is read at its latch.
+            ExprNode::Reduce { fold, lo, hi, body } => {
+                for (end, bound) in [(BoundEnd::Lo, lo), (BoundEnd::Hi, hi)] {
+                    let Bound::Value(term) = bound else { continue };
+                    let reads = variance[term.0 as usize];
+                    if let Err(refusal) = fold.admits_bound(end, reads) {
+                        panic!("arena_to_schedule: {refusal}");
+                    }
+                    assert_off_the_lattice(end, reads, lattice);
+                    // A mask names no count, at either end, in whichever
+                    // file a target keeps it: `is_mask` asks, before
+                    // selection, what the emitter will hold as one.
+                    assert!(
+                        !masks.is_mask(&schedule, map_child(term)),
+                        "arena_to_schedule: {}: the bound is a mask (a comparison, or a \
+                         bitwise op on masks), which names no count; until a bound is typed \
+                         (T6 of docs/language/2026-10-17-the-arena-is-typed.md) it is refused \
+                         here, on every tier",
+                        BoundRefusal::BoundSort { end }
+                    );
+                }
+                ScheduledOp::Reduce {
+                    fold,
+                    lo: lo.map(map_child),
+                    hi: hi.map(map_child),
+                    body: map_child(body),
+                }
+            }
             ExprNode::Write { .. } => unreachable!("a Write node is skipped above"),
         };
         // Numbered after the op is built: a `Uniform` may have pushed its
@@ -328,6 +552,7 @@ pub(crate) fn arena_to_schedule(
             variance: variance[idx],
         });
     }
+    folds.assert_every_fold_was_read();
     // A `Write` whose lane fold nothing reached is a lane fold that is not
     // where `pack` put it — under a column fold — and the schedule would
     // be silently store-free.
@@ -344,7 +569,9 @@ pub(crate) fn arena_to_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program::operands;
     use pixelflow_ir::arena::ExprArena;
+    use pixelflow_ir::fold::{Fold, Monoid};
 
     /// The uniform slots a schedule built by hand names for the origin.
     ///
@@ -385,6 +612,25 @@ mod tests {
         let _ = arena_to_schedule(&a, root, RAW_ORIGIN);
     }
 
+    /// A placeholder is a fold index that escaped its builder: `Variance::of_var`
+    /// types it as constant, so placement would not tell it from a uniform, and
+    /// the refusal is this `Var` arm's. It answers for the open term before
+    /// anything is scheduled, whatever the variance says, and as an open
+    /// kernel, not as a schedule built without the lowering pipeline.
+    #[test]
+    #[should_panic(expected = "so the kernel is open")]
+    fn a_surviving_placeholder_fails_loudly() {
+        let mut a = ExprArena::new();
+        let index = a.push_var(
+            pixelflow_ir::fold::Placeholder::nth(0)
+                .expect("placeholder 0 exists")
+                .var(),
+        );
+        let two = a.push_const(2.0);
+        let root = a.push_binary(OpKind::Mul, index, two);
+        let _ = arena_to_schedule(&a, root, RAW_ORIGIN);
+    }
+
     /// And the same for a `Ref`: its body is not in this arena at all, so a
     /// survivor is a schedule built without `expand_refs`. `compile` runs
     /// `legalize` first, so this too has to call the scheduler directly.
@@ -396,5 +642,282 @@ mod tests {
             .by_ref();
         let (arena, root) = named.parts();
         let _ = arena_to_schedule(arena, root, RAW_ORIGIN);
+    }
+
+    /// The uniform slots after the one a test below declares for a count, so
+    /// that the count is not read as an origin axis.
+    const AFTER_ONE_UNIFORM: [UniformId; 2] = [UniformId(1), UniformId(2)];
+
+    /// The bound that is the count itself.
+    fn the_count(_: &mut ExprArena, count: ExprId) -> ExprId {
+        count
+    }
+
+    /// The literal at the end of a range a test bounds by a value at the other.
+    const OTHER_END: u64 = 8;
+
+    /// A count, a fold bounded at `at` by `end(count)`, and a guard around it:
+    /// `If(Lt(0, count), Σ_i i, 0)`, as `(arena, count, fold, root)`. The fold's
+    /// other bound is a literal: `0` below, [`OTHER_END`] above. The `If`'s test
+    /// is a stand-in, not the `Lt(lo, hi)` that `passes::legalize` builds:
+    /// lowering asks only that the fold has one reader, an `If`'s true arm.
+    ///
+    /// The body is the binder's own `Var`, not `X`: a coordinate is a
+    /// survivor refused first, and would answer for the bound.
+    fn a_guarded_fold(
+        at: BoundEnd,
+        end: impl FnOnce(&mut ExprArena, ExprId) -> ExprId,
+    ) -> (ExprArena, ExprId, ExprId, ExprId) {
+        let mut a = ExprArena::new();
+        let slot = a.declare_uniform(pixelflow_ir::Uniform::new(3.0).decl());
+        let count = a.push_uniform(slot);
+        let end = Bound::Value(end(&mut a, count));
+        let (lo, hi) = match at {
+            BoundEnd::Lo => (end, Bound::Lit(OTHER_END)),
+            BoundEnd::Hi => (Bound::Lit(0), end),
+        };
+        let binder = Binder::from_slot(0).expect("slot 0 exists");
+        let i = a.push_var(binder.var());
+        let fold = a.push_reduce(Fold::new(Monoid::SUM, binder), lo, hi, i);
+        let zero = a.push_const(0.0);
+        let runs = a.push_binary(OpKind::Lt, zero, count);
+        let root = a.push_ternary(OpKind::If, runs, fold, zero);
+        (a, count, fold, root)
+    }
+
+    /// A bound that is a value is an operand of its fold, so the carve,
+    /// ownership and the closure check see it as a read of the `Reduce`.
+    #[test]
+    fn a_value_bound_is_an_operand_of_its_fold() {
+        let (a, _, _, root) = a_guarded_fold(BoundEnd::Hi, the_count);
+        let schedule = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM);
+
+        let reduce = schedule
+            .iter()
+            .find(|def| matches!(def.op, ScheduledOp::Reduce { .. }))
+            .expect("the fold survives");
+        let ScheduledOp::Reduce { lo, hi, .. } = reduce.op else {
+            unreachable!("matched a Reduce above")
+        };
+        let Bound::Value(count) = hi else {
+            panic!("the end is the count: {hi:?}")
+        };
+        assert_eq!(lo, Bound::Lit(0));
+        let loads = schedule
+            .iter()
+            .find(|def| def.value == count)
+            .map(|d| &d.op);
+        assert!(
+            matches!(loads, Some(ScheduledOp::Uniform(..))),
+            "the end names the uniform's load, not a copy: {loads:?}"
+        );
+        assert_eq!(operands(&reduce.op).collect::<Vec<_>>(), [count]);
+    }
+
+    /// A value-bounded fold read by an `Add` is one nothing guarded, and the
+    /// loop would run for any count: the arena was not legalized.
+    #[test]
+    #[should_panic(expected = "other than as an If's true arm")]
+    fn an_unguarded_value_bounded_fold_fails_loudly() {
+        let (mut a, _, fold, _) = a_guarded_fold(BoundEnd::Hi, the_count);
+        let one = a.push_const(1.0);
+        let root = a.push_binary(OpKind::Add, fold, one);
+        let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM);
+    }
+
+    /// An `If`'s false arm is not its true arm: the guard skips the loop for
+    /// the wrong mask.
+    #[test]
+    #[should_panic(expected = "other than as an If's true arm")]
+    fn a_value_bounded_fold_in_the_false_arm_fails_loudly() {
+        let (mut a, count, fold, _) = a_guarded_fold(BoundEnd::Hi, the_count);
+        let zero = a.push_const(0.0);
+        let runs = a.push_binary(OpKind::Lt, zero, count);
+        let root = a.push_ternary(OpKind::If, runs, zero, fold);
+        let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM);
+    }
+
+    /// Two `If`s that both read the fold as their true arm each pass the
+    /// shape check, and own the fold between them at their common ancestor,
+    /// outside both arms: the loop would run unguarded, and a count of `+∞`
+    /// would stall its counter at `2²⁴` for ever. The reader count is what
+    /// catches it, whatever the readers' shape.
+    #[test]
+    #[should_panic(expected = "and by")]
+    fn a_value_bounded_fold_with_two_guards_fails_loudly() {
+        let (mut a, count, fold, guarded) = a_guarded_fold(BoundEnd::Hi, the_count);
+        let one = a.push_const(1.0);
+        let runs = a.push_binary(OpKind::Lt, one, count);
+        let other = a.push_ternary(OpKind::If, runs, fold, one);
+        let root = a.push_binary(OpKind::Add, guarded, other);
+        let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM);
+    }
+
+    /// A value-bounded fold that is the root has no reader at all.
+    #[test]
+    #[should_panic(expected = "is read by nothing")]
+    fn a_value_bounded_fold_nothing_reads_fails_loudly() {
+        let (a, _, fold, _) = a_guarded_fold(BoundEnd::Hi, the_count);
+        let _ = arena_to_schedule(&a, fold, AFTER_ONE_UNIFORM);
+    }
+
+    /// The fold's own guard is in the arena but unreachable from the root:
+    /// what a rebuilt arena leaves behind (`rebuild_arena` appends and keeps
+    /// the nodes it replaced). Only reachable readers count.
+    #[test]
+    fn a_reader_that_is_not_reachable_is_not_a_reader() {
+        let (mut a, _, fold, guarded) = a_guarded_fold(BoundEnd::Hi, the_count);
+        let one = a.push_const(1.0);
+        let _stale = a.push_binary(OpKind::Add, fold, one);
+        let _ = arena_to_schedule(&a, guarded, AFTER_ONE_UNIFORM);
+    }
+
+    /// L3 after collapse: a bound reads no coordinate, and collapse spells the
+    /// coordinates through the lattice's binders, so a bound reads none of
+    /// them. Only the lane binder would vary
+    /// a guard's mask within a batch; `row` and `col` would vary it between
+    /// batches, which is refused all the same. `collapse` picks its binders
+    /// from slots nothing else uses, so no pipeline builds this; it is built by
+    /// hand, through the term vocabulary, because the arena's own `push_write`
+    /// is not for a crate that is not the IR.
+    ///
+    /// `Σ_{i<row} i` stored at `(row, col, lane)`, `row` being the lattice's.
+    #[test]
+    #[should_panic(expected = "a lattice binder's")]
+    fn a_bound_on_a_lattice_binder_fails_loudly() {
+        use pixelflow_ir::{Ir, Shape};
+
+        let slot = |n| Binder::from_slot(n).expect("the slot exists");
+        let (i, row, col, lane) = (slot(0), slot(1), slot(2), slot(3));
+        let mut a = ExprArena::new();
+        let index = a.push_var(i.var());
+        let rows = a.push_var(row.var());
+        let fold = a.push_reduce(
+            Fold::new(Monoid::SUM, i),
+            Bound::Lit(0),
+            Bound::Value(rows),
+            index,
+        );
+        let zero = a.push_const(0.0);
+        let runs = a.push_binary(OpKind::Lt, zero, rows);
+        let value = a.push_ternary(OpKind::If, runs, fold, zero);
+        let store = a.embed(Shape::Write {
+            row,
+            col,
+            lane,
+            value,
+        });
+        let root = a.push_reduce(
+            Fold::new(Monoid::SEQ, lane),
+            Bound::Lit(0),
+            Bound::Lit(4),
+            store,
+        );
+        let _ = arena_to_schedule(&a, root, RAW_ORIGIN);
+    }
+
+    /// What lowering a fold bounded at `at` by `end(count)` panics with, or
+    /// `None` if it lowers.
+    fn refusal_of_the_end(
+        at: BoundEnd,
+        end: impl FnOnce(&mut ExprArena, ExprId) -> ExprId,
+    ) -> Option<String> {
+        let (a, _, _, root) = a_guarded_fold(at, end);
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM);
+        }))
+        .err()?;
+        let message = match payload.downcast::<String>() {
+            Ok(message) => *message,
+            Err(payload) => payload
+                .downcast_ref::<&str>()
+                .map_or_else(String::new, |message| (*message).to_owned()),
+        };
+        Some(message)
+    }
+
+    /// Whether lowering refuses a fold bounded at `at` by `end(count)` by
+    /// name, as a mask, and not for some other reason.
+    fn is_refused_as_a_mask(
+        at: BoundEnd,
+        end: impl FnOnce(&mut ExprArena, ExprId) -> ExprId,
+    ) -> bool {
+        refusal_of_the_end(at, end).is_some_and(|message| message.contains("BoundSort"))
+    }
+
+    /// A mask names no count, so a bound the emitter holds as one is refused
+    /// at either end and on every tier alike, by `ScheduledOp::is_mask`, which
+    /// AVX-512's selector is held to: a comparison, a bitwise op on two masks, a
+    /// reinterpretation of either. A bitwise op on a mask and a number is a
+    /// number, and a count.
+    #[test]
+    fn a_bound_is_refused_exactly_when_the_emitter_holds_it_as_a_mask() {
+        let lt = |a: &mut ExprArena, c| {
+            let zero = a.push_const(0.0);
+            a.push_binary(OpKind::Lt, zero, c)
+        };
+        let gt = |a: &mut ExprArena, c| {
+            let one = a.push_const(1.0);
+            a.push_binary(OpKind::Gt, c, one)
+        };
+        for at in [BoundEnd::Lo, BoundEnd::Hi] {
+            assert!(is_refused_as_a_mask(at, lt), "{at}: a comparison is a mask");
+            assert!(
+                is_refused_as_a_mask(at, |a, c| {
+                    let (x, y) = (lt(a, c), gt(a, c));
+                    a.push_binary(OpKind::BitAnd, x, y)
+                }),
+                "{at}: a bitwise and of two masks is a mask"
+            );
+            assert!(
+                is_refused_as_a_mask(at, |a, c| {
+                    let (x, y) = (lt(a, c), gt(a, c));
+                    let both = a.push_binary(OpKind::BitOr, x, y);
+                    let wider = a.push_binary(OpKind::BitAnd, both, y);
+                    a.push_binary(OpKind::BitOr, wider, x)
+                }),
+                "{at}: a bitwise op on masks is a mask, however deep"
+            );
+            assert!(
+                is_refused_as_a_mask(at, |a, c| {
+                    let mask = lt(a, c);
+                    a.push_unary(OpKind::Bits, mask)
+                }),
+                "{at}: a reinterpretation defines no value: it is its operand, a mask"
+            );
+            assert_eq!(
+                refusal_of_the_end(at, |a, c| {
+                    let mask = lt(a, c);
+                    let three = a.push_const(3.0);
+                    a.push_binary(OpKind::BitAnd, mask, three)
+                }),
+                None,
+                "{at}: a mask and a number is a number: 3 where it holds, 0 where it does not"
+            );
+            assert_eq!(
+                refusal_of_the_end(at, |a, c| {
+                    let one = a.push_const(1.0);
+                    a.push_binary(OpKind::Add, c, one)
+                }),
+                None,
+                "{at}: arithmetic is a number"
+            );
+            assert_eq!(
+                refusal_of_the_end(at, the_count),
+                None,
+                "{at}: a uniform is a number"
+            );
+        }
+    }
+
+    /// The refusal names the law: a mask names no count.
+    #[test]
+    #[should_panic(expected = "BoundSort")]
+    fn a_bound_that_is_a_mask_fails_by_name() {
+        let (a, _, _, root) = a_guarded_fold(BoundEnd::Hi, |a, count| {
+            let zero = a.push_const(0.0);
+            a.push_binary(OpKind::Lt, zero, count)
+        });
+        let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM);
     }
 }

@@ -1,15 +1,17 @@
-//! A fold written in `kernel!` is the fold `Kernel::over` builds: the same
+//! A fold written in `kernel!` is the fold `Kernel::over` (or, for a bound that
+//! is a value, `Kernel::over_values`) builds: the same
 //! arena, by `pixelflow_ir::key::canonical`, for every monoid
 //! (docs/language/2026-09-25-the-language-is-kernel.md §1.5; B7's equivalence
 //! gate, in miniature).
 //!
 //! What a fold *means* is pinned against rustc in `rustc_is_the_oracle.rs`.
-//! This file pins what it *is*: one `Reduce` over a `Fold::Range`, its binder
+//! This file pins what it *is*: one `Reduce` over a `Fold`, its binder
 //! chosen as the builder chooses it — inside-out, the lowest slot no fold in
 //! the body binds — so that a program written in the syntax and the same
 //! program built with the builder are one program, and share a JIT cache
 //! entry. `kernel_raw!` keeps the lowered shape, so each comparison is the
-//! front end's word and not the optimizer's.
+//! front end's word and not the optimizer's. A bound that is a value — an
+//! entry's count, an enclosing index — is `Kernel::over_values`'s.
 //!
 //! And what it is not: the syntax never unrolls. The e-graph may, when the
 //! kernel is baked (`HalveFold`), and extraction chooses whether it does; the
@@ -17,7 +19,7 @@
 //! pixels of its terms written out.
 
 use pixelflow_compiler::{kernel, kernel_raw};
-use pixelflow_core::{Kernel, Lattice};
+use pixelflow_core::{Kernel, Lattice, Uniform};
 use pixelflow_ir::key::canonical;
 use pixelflow_ir::{ExprArena, ExprId, ExprNode, LatticeShape, Monoid};
 use pixelflow_search::runtime::optimize_runtime_arena;
@@ -192,6 +194,65 @@ fn a_helpers_fold_inside_a_fold_is_nested_over_and_captures_nothing() {
         canonical(arena, root),
         canonical(captured_arena, captured_root)
     );
+    assert_eq!(binders(arena, root), [5, 4], "outer slot 1, inner slot 0");
+}
+
+kernel_raw! {
+    /// Σ_{i<n} (X·i + Y), its count per call.
+    pub fn sum_to(n: usize) -> f32 {
+        (0..n).map(|i| X * (i as f32) + Y).sum()
+    }
+}
+
+/// A fold over a per-call count is `Kernel::over_values` over a uniform: one
+/// key, and the same default. (`Canonical` holds each uniform's identity too,
+/// which two mints never share, so the key and the defaults are compared.)
+#[test]
+fn a_per_call_count_is_over_values() {
+    let written = sum_to(3);
+    let built = Kernel::over_values(
+        Monoid::SUM,
+        &Kernel::constant(0.0),
+        &Uniform::new(3.0).kernel(),
+        |i| x().mul(i).add(&y()),
+    );
+    let (written_arena, written_root) = written.parts();
+    let (built_arena, built_root) = built.parts();
+    let (written_key, built_key) = (
+        canonical(written_arena, written_root),
+        canonical(built_arena, built_root),
+    );
+    assert_eq!(
+        written_key.key,
+        built_key.key,
+        "written: {}\nbuilt:   {}",
+        written_arena.display(written_root),
+        built_arena.display(built_root),
+    );
+    let defaults = |uniforms: &[pixelflow_ir::arena::UniformDecl]| -> Vec<u32> {
+        uniforms.iter().map(|u| u.default.to_bits()).collect()
+    };
+    assert_eq!(
+        defaults(&written_key.uniforms),
+        defaults(&built_key.uniforms)
+    );
+}
+
+/// A triangular fold — the inner bounded by the outer index — is `Kernel::over`
+/// with `Kernel::over_values` inside it, the outer index its `hi`: the inner at
+/// slot 0, the outer at slot 1.
+#[test]
+fn a_triangular_fold_is_over_values_inside_over() {
+    let written = kernel_raw!(|| (0..4)
+        .map(|i| (0..i).map(|j| X * (j as f32) + Y).sum::<f32>())
+        .sum());
+    let built = Kernel::over(Monoid::SUM, 0..4, |i| {
+        Kernel::over_values(Monoid::SUM, &Kernel::constant(0.0), i, |j| {
+            x().mul(j).add(&y())
+        })
+    });
+    assert_same_program(&written, &built);
+    let (arena, root) = written.parts();
     assert_eq!(binders(arena, root), [5, 4], "outer slot 1, inner slot 0");
 }
 

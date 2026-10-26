@@ -361,7 +361,7 @@ fn a_size_keyed_budget_refuses_a_graph_already_rewritten() {
     let mut optimizer = Optimizer::production().no_ceiling();
     let mut eg = optimizer.egraph();
     let x = eg.add(ENode::Var(0));
-    let zero = eg.add(ENode::Const(0.0f32.to_bits()));
+    let zero = eg.add(ENode::constant(0.0));
     let root = eg.add(ENode::apply(OpKind::Add, &[x, zero]));
     let _first = optimizer.run(&mut eg, root);
     assert!(eg.application_count() > 0, "x + 0 must have been rewritten");

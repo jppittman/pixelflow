@@ -16,8 +16,8 @@
 #![cfg(target_arch = "x86_64")]
 
 use pixelflow_codegen::emit::{CompiledKernel, compile};
-use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::{Lit, OpKind};
 
 /// One point of a kernel compiled at [`pixelflow_ir::LatticeShape::POINT`],
 /// the one sample read back. `CompiledKernel::call` is the collapse driver's
@@ -102,8 +102,8 @@ fn the_reference_forms_disagree_on_these_inputs() {
          rest of this file proves nothing"
     );
     assert_eq!(
-        OpKind::MulAdd.eval_ternary(A, B, C).map(f32::to_bits),
-        Some(fused(A, B, C).to_bits()),
+        OpKind::MulAdd.eval_ternary(Lit::Real(A), Lit::Real(B), Lit::Real(C)),
+        Some(Lit::Real(fused(A, B, C))),
         "the folder rounds once, and does so whatever profile built it"
     );
     // The halved constants must double back exactly.

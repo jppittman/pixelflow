@@ -19,9 +19,18 @@ pub(crate) use scopes::Nest;
 
 use alloc::vec::Vec;
 
-use pixelflow_ir::fold::{Binder, Fold};
+use pixelflow_ir::Lit;
+use pixelflow_ir::fold::{Binder, Bound, Fold};
 use pixelflow_ir::kind::OpKind;
 use pixelflow_ir::variance::Variance;
+
+/// The lane a literal tabulates to, as the `f32` a [`ScheduledOp::Const`]
+/// carries: a real is itself, a true mask is the all-ones lane and a false
+/// mask is zero. The backends key a constant by its bits, so the `f32` here
+/// is the data plane's 32-bit pattern and nothing is read as a number.
+pub(crate) fn lane_pattern(lit: Lit) -> f32 {
+    f32::from_bits(lit.bits())
+}
 
 /// A value in the program (SSA-style).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -124,15 +133,26 @@ pub(crate) enum ScheduledOp {
     /// remainder is. Reads no register — the schedule's order *is* the
     /// sequencing — and defines no value.
     Seq(ValueId, ValueId),
-    /// A surviving bounded fold: `⊕` over `fold`'s visited indices, whose
-    /// body is the value named by the second field — in *this schedule's*
-    /// numbering (`lower::arena_to_schedule` maps it like any other child).
-    /// `scopes::extract_folds` carves the body's closure out into its own
-    /// [`ScopeFold`]; the field is then the root of that scope's schedule, the
-    /// value each trip accumulates, which selection reads when it opens the
-    /// loop for the [`Scope::Fold`] this def opens. It is never an operand of
-    /// the scope this def sits in.
-    Reduce(Fold, ValueId),
+    /// A surviving bounded fold: `⊕` over the indices from `lo` to `hi`, under
+    /// `fold`'s algebra and binder, whose body is the value named by `body` —
+    /// in *this schedule's* numbering (`lower::arena_to_schedule` maps it like
+    /// any other child). `scopes::extract_folds` carves the body's closure out
+    /// into its own [`ScopeFold`]; `body` is then the root of that scope's
+    /// schedule, the value each trip accumulates, which selection reads when
+    /// it opens the loop for the [`Scope::Fold`] this def opens. It is never
+    /// an operand of the scope this def sits in.
+    ///
+    /// `lo` and `hi` are the arena node's bounds, copied where the node is in
+    /// hand (`lower::arena_to_schedule`). A literal is selection's constant; a
+    /// value is an operand ([`operands`]): `lo` is the loop's seed, read where
+    /// the loop is entered, and `hi` is read at its latch, both in the scope
+    /// this def sits in. Selection reads a known range with `KnownRange::of`.
+    Reduce {
+        fold: Fold,
+        lo: Bound<ValueId>,
+        hi: Bound<ValueId>,
+        body: ValueId,
+    },
 }
 
 /// The ops a backend selects, as types: [`ScheduledOp`] carries these and not
@@ -150,6 +170,12 @@ macro_rules! legal_ops {
         $(#[$meta])*
         #[derive(Copy, Clone, Debug, PartialEq, Eq)]
         pub(crate) enum $name { $($op),+ }
+
+        #[cfg(test)]
+        impl $name {
+            /// Every op of this type, for a test that must cover each.
+            pub(crate) const ALL: &'static [Self] = &[$(Self::$op),+];
+        }
 
         impl Legal for $name {
             fn of(kind: OpKind) -> Option<Self> {
@@ -172,6 +198,38 @@ legal_ops! {
     CompareOp { Lt, Le, Gt, Ge, Eq, Ne }
     /// A lane shifted by an immediate.
     ShiftOp { Shl, Shr }
+}
+
+/// A bitwise op on two masks that leaves a mask: the part of [`BinaryOp`] a
+/// target with a register file for masks spells in it ([`BinaryOp::on_masks`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MaskOp {
+    And,
+    Or,
+}
+
+impl BinaryOp {
+    /// The mask op this op is on `a` and `b`, each its operand as a mask when
+    /// it is one, with the two masks: a bitwise op on two masks leaves a mask,
+    /// and every other pairing yields a number, or a bit pattern read as one.
+    /// A comparison is a mask whatever it compares, so it takes no operands to
+    /// say so.
+    ///
+    /// The one place that says which binary ops keep a mask a mask. A
+    /// selector that holds masks apart from numbers (AVX-512's opmasks) hands
+    /// it each operand it holds as one and takes the file of the result from
+    /// the answer; [`ScheduledOp::is_mask`] hands it what the schedule says of
+    /// each operand, to ask that choice before a selector is reached.
+    pub(crate) fn on_masks<M>(self, a: Option<M>, b: Option<M>) -> Option<(MaskOp, M, M)> {
+        let op = match self {
+            Self::BitAnd => MaskOp::And,
+            Self::BitOr => MaskOp::Or,
+            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Min | Self::Max | Self::IAdd => {
+                return None;
+            }
+        };
+        Some((op, a?, b?))
+    }
 }
 
 /// The legal op `op` is. `passes::legalize` leaves only these, so none is a
@@ -358,18 +416,46 @@ pub(crate) struct ArmBlock {
     pub(super) items: Vec<Item>,
 }
 
+impl ScheduledOp {
+    /// Whether the value this op defines is a mask: a comparison, or a
+    /// bitwise op on two operands that are masks ([`BinaryOp::on_masks`]),
+    /// `operand_is_mask` saying which. A reinterpretation defines no value
+    /// (lowering maps it to its operand), so it keeps its operand's answer.
+    ///
+    /// A mask is a bit pattern, not a number, and a target may hold it in a
+    /// file of its own (AVX-512's opmasks), so
+    /// what a position that needs a number may take is asked here, before any
+    /// target is chosen. The bitwise rule is the selector's own (`on_masks`);
+    /// that a comparison is a mask, and that nothing else is, is the selector's
+    /// choice of file restated, and the AVX-512 test
+    /// `a_value_is_an_opmask_exactly_when_is_mask_says_it_is_a_mask` holds the
+    /// two equal.
+    pub(crate) fn is_mask(&self, operand_is_mask: impl Fn(ValueId) -> bool) -> bool {
+        match self {
+            Self::Compare(..) => true,
+            Self::Binary(op, a, b) => op
+                .on_masks(
+                    operand_is_mask(*a).then_some(()),
+                    operand_is_mask(*b).then_some(()),
+                )
+                .is_some(),
+            _ => false,
+        }
+    }
+}
+
 /// The values an operation reads *as registers*, in operand order.
 ///
-/// A `Reduce` is a leaf here, the same as `Uniform` — by the time one reaches
-/// a schedule this function walks, `scopes::extract_folds` has already carved its
-/// body out into its own `ScopeFold`; the `ValueId` `ScheduledOp::Reduce`
-/// still carries names that scope's root, never an operand
-/// this scope's allocation resolves. What the
-/// loop it opens reads from this scope is a dependency all the same, and the
-/// ownership has it as one (`ownership::FoldReads`). A `Seq`
-/// sequences two effects and reads no register; a `Write` reads the one
-/// value it stores — its row and column are binders, found where their
-/// folds keep them, not operands.
+/// A `Reduce`'s operands are its value bounds, the seed and the end its loop
+/// reads; its body is not an operand: by the time one reaches a schedule this
+/// function walks, `scopes::extract_folds` has already carved its body out
+/// into its own `ScopeFold`; the `ValueId` `ScheduledOp::Reduce` still
+/// carries names that scope's root, never an operand this scope's allocation
+/// resolves. What the loop it opens reads from this scope is a dependency
+/// all the same, and the ownership has it as one (`ownership::FoldReads`). A
+/// `Seq` sequences two effects and reads no register; a `Write` reads the one
+/// value it stores — its row and column are binders, found where their folds
+/// keep them, not operands.
 pub(crate) fn operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use<'_> {
     let (a, b, c) = match sop {
         ScheduledOp::Var(_)
@@ -377,8 +463,8 @@ pub(crate) fn operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use
         | ScheduledOp::Const(_)
         | ScheduledOp::Context(_)
         | ScheduledOp::Uniform(..)
-        | ScheduledOp::Reduce(..)
         | ScheduledOp::Seq(..) => (None, None, None),
+        ScheduledOp::Reduce { lo, hi, .. } => (lo.value(), hi.value(), None),
         // A gather's base is a pointer, read through `pointer_operand`; the
         // index is its one vector operand.
         ScheduledOp::Unary(_, a)
@@ -412,12 +498,13 @@ pub(crate) fn all_operands(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> +
 }
 
 /// Every value an operation is *built from*: its operands of both classes,
-/// plus the body a `Reduce` folds and the two effects a `Seq` orders — the
-/// children a walk of the DAG's structure follows, as opposed to the
-/// registers an instruction reads ([`operands`]).
+/// plus the body a `Reduce` folds (its value bounds are operands already) and
+/// the two effects a `Seq` orders — the children a walk of the DAG's
+/// structure follows, as opposed to the registers an instruction reads
+/// ([`operands`]).
 fn structural_children(sop: &ScheduledOp) -> impl Iterator<Item = ValueId> + use<'_> {
     let extra = match sop {
-        ScheduledOp::Reduce(_, body) => [Some(*body), None],
+        ScheduledOp::Reduce { body, .. } => [Some(*body), None],
         ScheduledOp::Seq(a, b) => [Some(*a), Some(*b)],
         _ => [None, None],
     };

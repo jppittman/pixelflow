@@ -64,25 +64,28 @@
 ### Program, template, instance
 
 - **Is:** a **program** is what P produces, bytes plus links:
-  `⟦P(k, s, t)⟧ : f32^m → (L_s → f32)`. Lowering produces a **template**,
-  "a replay of `ExprArena` pushes", and instantiating it with structural
-  values gives a program. An **instance** is one instantiation, with
-  identity by instance. A font at a zoom level is one program per piece
-  count: exact N, unbucketed (JP, 2026-10-09; see terminal.md, "Font
-  programs").
+  `⟦P(k, s, t)⟧ : f32^m → (L_s → f32)`. Emission produces a **template**,
+  "a replay of `ExprArena` pushes"; an entry has no structural values since
+  a-bound-is-a-value A5, so an entry that takes no kernel replays one
+  program, and an entry that takes a kernel is instantiated with its
+  arguments when it is called. An **instance** is one instantiation, with
+  identity by instance. A font at a
+  zoom level is one program per piece count: exact N, unbucketed (JP,
+  2026-10-09; see terminal.md, "Font programs").
 - **Is not:** per glyph (95), per bucket (6; JP: unbucketed), or one program
   holding every glyph under an `if id < k` tree (superseded 2026-10-09). Not
   unrolling: "Composing instances is the host walking data."
-- **Follows:** structural parameters and the shape key the program, and
-  uniforms bind through its block. The host chooses a program by its
-  structural parameters, for the font the glyph's piece count, and then
-  writes the glyph's block into it. Sharing one `id` instance across a tree
+- **Follows:** the program's terms and the shape key it, and uniforms bind
+  through its block. The host chooses a program (for the font, by the
+  glyph's piece count, until a-bound-is-a-value B2) and then writes the
+  glyph's block into it. Sharing one `id` instance across a tree
   walk was a convention of the host walk, not a type (O3); superseded
   2026-10-09, since no program holds more than one glyph (terminal.md, "Font
   programs"). Before extracting in a template, give template inputs a
   meaning of their own (B6).
 - **Lives:** the-language-is-kernel §1.1, §1.4, §1.7–§1.8, D9. Templates are
-  `Staged` and the `Param` holes of `pixelflow-compiler/src/{emit,lower}.rs`.
+  `arena_to_tokens`' output, or `Staged`'s for an entry that takes a kernel
+  (`pixelflow-compiler/src/emit.rs`).
 
 ### Pass, legalize, Optimize
 

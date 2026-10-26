@@ -69,7 +69,7 @@ The judgment is a table, generated from `op_table!` like `COUNT`, `ALL` and
 | `BitAnd BitOr` | `Mask × Mask → Mask` and `Int × Int → Int` |
 | **`Bits`** (new) | `Real → Int`, the reinterpretation: zero instructions |
 | **`Float`** (new) | `Int → Real`, its inverse: zero instructions |
-| `Reduce` with `⊕` | `⊕ : S × S → S`, body `: S`, result `: S` |
+| `Reduce` with `⊕` | `⊕ : S × S → S`, body `: S`, a value bound `: Real` (`Int` at T6), result `: S`; a known bound is node data |
 | `Gather` | `Buffer × Real × Real → Real` (item 1; see §5 for item 2) |
 | `Tuple` | a product of its children's types; root only |
 | `Dwrt` | `Real → Real`, operand `Real` |
@@ -214,7 +214,11 @@ explained for T6.
 - **T5. `Dwrt` is `Real → Real` by type.** The seven bit-op derivative arms
   become unrepresentable and are deleted.
 - **T6. The fold binder is `Int`.** `Var(binder) : Int`; the body reads it
-  through `IntToFloat`; the backend's counter is measured per §3.
+  through `IntToFloat`; the backend's counter is measured per §3. T6 also
+  retypes a fold's value bounds with the binder
+  (docs/language/2026-10-20-a-bound-is-a-value.md §5): it lifts
+  `BoundArithmetic` and deletes the guard's integrality conjunct, measured. A
+  known bound is node data, so T6 re-keys no bound literal.
 
 T1 and T2 are independent of each other and of nothing; T3 needs both; T4–T6
 follow T3 in order.

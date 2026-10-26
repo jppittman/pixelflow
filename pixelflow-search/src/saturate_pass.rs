@@ -16,8 +16,8 @@ use crate::tier::Tier;
 
 /// Rewrite a term by equality saturation under `optimizer`.
 ///
-/// Declines a term the [`Vocabulary`] cannot hold — a `Param` slot that
-/// should have been specialized, an op this tier may not model. Declining is
+/// Declines a term the [`Vocabulary`] cannot hold — a `Param` slot under
+/// [`Vocabulary::Runtime`], an op this tier may not model. Declining is
 /// ordinary: the caller compiles the term unoptimized.
 pub struct Saturate {
     optimizer: Optimizer,

@@ -39,7 +39,7 @@ impl Ir for ExprArena {
                 };
                 Shape::Op(op, Children::Many(slice))
             }
-            ExprNode::Reduce { fold, body } => Shape::Reduce { fold, body },
+            ExprNode::Reduce { fold, lo, hi, body } => Shape::Reduce { fold, lo, hi, body },
             ExprNode::Write {
                 row,
                 col,
@@ -57,7 +57,7 @@ impl Ir for ExprArena {
     fn embed(&mut self, shape: Shape<'_, ExprId>) -> ExprId {
         match shape {
             Shape::Var(i) => self.push_var(i),
-            Shape::Const(v) => self.push_const(v),
+            Shape::Const(v) => self.push_lit(v),
             Shape::Param(i) => self.push_param(i),
             Shape::Buffer(decl) => {
                 let slot = self.buffer_slot_for(decl);
@@ -82,7 +82,7 @@ impl Ir for ExprArena {
                     _ => self.push_nary(op, s),
                 },
             },
-            Shape::Reduce { fold, body } => self.push_reduce(fold, body),
+            Shape::Reduce { fold, lo, hi, body } => self.push_reduce(fold, lo, hi, body),
             Shape::Write {
                 row,
                 col,
@@ -145,9 +145,11 @@ impl ExprArena {
                         .iter()
                         .filter(|k| memo[k.0 as usize].is_none())
                         .collect(),
-                    Shape::Reduce { body, .. } if memo[body.0 as usize].is_none() => {
-                        alloc::vec![body]
-                    }
+                    Shape::Reduce { lo, hi, body, .. } => [Some(body), lo.value(), hi.value()]
+                        .into_iter()
+                        .flatten()
+                        .filter(|k| memo[k.0 as usize].is_none())
+                        .collect(),
                     Shape::Write { value, .. } if memo[value.0 as usize].is_none() => {
                         alloc::vec![value]
                     }
@@ -175,9 +177,16 @@ impl ExprArena {
                         .collect();
                     out.embed(Shape::Op(op, Children::Many(&mapped)))
                 }
-                Shape::Reduce { fold, body } => {
-                    let body = memo[body.0 as usize].expect("rebuild_into: body before fold");
-                    out.embed(Shape::Reduce { fold, body })
+                Shape::Reduce { fold, lo, hi, body } => {
+                    let child = |k: ExprId| {
+                        memo[k.0 as usize].expect("rebuild_into: body and bounds before fold")
+                    };
+                    out.embed(Shape::Reduce {
+                        fold,
+                        lo: lo.map(child),
+                        hi: hi.map(child),
+                        body: child(body),
+                    })
                 }
                 Shape::Write {
                     row,

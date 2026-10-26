@@ -48,6 +48,7 @@ fn report(label: &str, kernel: &Kernel, shape: LatticeShape) {
         result.spill_count,
         result.hoisted_values,
         t.dynamic_memory_ops()
+            .map_or_else(|| "an estimate".to_owned(), |n| n.to_string())
     );
     println!("  scope    trips  bytes  instr  remats   loads  stores");
     for (i, (s, trips)) in t.scopes.iter().zip(&t.trips).enumerate() {

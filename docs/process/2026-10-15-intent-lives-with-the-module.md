@@ -93,8 +93,8 @@ Two hooks, both small:
 
 1. **desloppify reads the intent** (built). A rule's `"context"` takes
    `"module_intent"`: each call also sees the nearest `intent.md` up the
-   reviewed file's directory tree within its crate (`review/plan.rs`, beside
-   `module_root`), under the same "for context only" framing.
+   reviewed file's directory tree within its crate (`review/module.rs`, beside
+   `root_outline`), under the same "for context only" framing.
    The module-shape rules (`mod-rs-is-a-contract`,
    `interface-lives-in-mod-rs`, `behavior-through-the-trait`,
    `registers-come-from-the-allocator`, `phases-in-order`) take it, so a

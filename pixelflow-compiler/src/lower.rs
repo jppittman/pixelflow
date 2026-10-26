@@ -20,32 +20,31 @@
 //! fold is opened and closed by [`ExprArena::open_fold`] and
 //! [`ExprArena::close_fold`], whose binder is chosen and placeholder renamed
 //! by [`ExprArena::close_over`], as `Kernel::over`'s are; a range is one
-//! [`Fold::admits`]; a kernel is applied by [`ExprArena::apply`]. So each
+//! [`KnownRange::admits`]; a kernel is applied by [`ExprArena::apply`]. So each
 //! construction written here and the same one built with the builder are
 //! one program (`tests/the_library_is_the_builders.rs`,
 //! `tests/fold_is_kernel_over.rs`, `tests/kernel_typed_parameters.rs`).
 //!
 //! A fold lowers to one `Reduce` node over its [`Fold`], built as
-//! `Kernel::over` builds it: the body against a placeholder, then closed
-//! over it. Nothing here unrolls: that is the e-graph's (`HalveFold`,
-//! `PeelFold`), when the kernel is baked.
+//! `Kernel::over` builds it — or `Kernel::over_values`, for a bound that is a
+//! value, resolved before the fold opens: the body against a placeholder,
+//! then closed over it. Nothing here unrolls: that is the e-graph's
+//! (`HalveFold`, `PeelFold`), when the kernel is baked.
 //!
-//! An entry's parameters are its uniforms
+//! An entry's `f32`, count and record parameters are its uniforms
 //! (docs/language/2026-09-25-the-language-is-kernel.md §1.4): each scalar — an
-//! `f32` parameter, or one field of a record parameter — is declared as a
-//! uniform, in [`AnalyzedKernel::parameters`]' order, and read through its
-//! `Uniform` leaf. Nothing a call passes is a constant of the program, so
-//! every call of an entry is one program.
+//! `f32` parameter, a count parameter, or one field of a record parameter —
+//! is declared as a uniform, in [`AnalyzedKernel::parameters`]' order, and
+//! read through its `Uniform` leaf; a count is declared as `n as f32`.
+//! Nothing a call passes is a constant of the program, so every call of an
+//! entry that takes no kernel is one program.
 //!
 //! **Where a term is built is a [`Site`]** (Phase D-a). Lowering is one walk,
 //! and there are two places it can build:
 //!
 //! - [`Expansion`]: an [`ExprArena`], at macro expansion — every entry that
 //!   takes no kernel. Its declarations hold a placeholder default, and
-//!   emission declares each with the call's value; an entry with structural
-//!   parameters lowers to a *template* whose folds over a range that names
-//!   one, and its `N as f32`s, are left open ([`Holes`]) and filled when its
-//!   host function is instantiated.
+//!   emission declares each with the call's value.
 //! - [`Staged`](crate::emit::Staged): Rust statements that build the arena
 //!   when the entry's host function is called — an entry that takes a
 //!   kernel-typed parameter, whose argument exists only then. Each step is
@@ -58,20 +57,21 @@
 //! — its [`Site::Argument`] is uninhabited — so no entry that takes one can
 //! be lowered there.
 
-use crate::PLAN;
 use crate::ast::{
     BinaryOp, BlockExpr, CastExpr, Expr, FieldExpr, FnItem, FoldExpr, LetStmt, RecordId, Reduction,
     Role, Stmt, UnaryOp,
 };
 use crate::sema::{
-    AT, AnalyzedKernel, Bounds, ConstValue, RangeScope, Scalar, StructuralRange, range_bounds,
+    AT, AnalyzedKernel, ConstValue, Count, ParameterKind, RangeScope, Scalar, bound_names,
+    range_bounds,
 };
 use crate::symbol::Scopes;
+use crate::{BOUND_PLAN, PLAN};
 use pixelflow_ir::arena::{
-    Axis, ExprArena, ExprId, IndexSpaceFull, OpenFold, UniformDecl, UniformIdentity,
+    Axis, ExprArena, ExprId, FoldTerms, IndexSpaceFull, OpenFold, UniformDecl, UniformIdentity,
 };
 use pixelflow_ir::library;
-use pixelflow_ir::{Binder, Fold, Monoid, OpKind};
+use pixelflow_ir::{Binder, Bound, Fold, KnownRange, Monoid, OpKind};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::ops::Range;
@@ -135,15 +135,6 @@ impl Projection {
     }
 }
 
-/// The range a fold runs over, as lowering hands it to a [`Site`]: known
-/// here, and admitted ([`known_range`]), or naming an entry's structural
-/// parameters, known when its host function is instantiated.
-#[derive(Debug, Clone)]
-pub(crate) enum FoldRange {
-    Known(Range<u32>),
-    Structural(StructuralRange),
-}
-
 /// Somewhere lowering builds a term: each step of the walk, as a call.
 ///
 /// Two of them, and they differ only in *when* a step runs ([`Expansion`]
@@ -184,25 +175,18 @@ pub(crate) trait Site {
     ///
     /// Where there is no argument to admit.
     fn kernel_parameter(&mut self, name: &Ident) -> Result<Self::Argument, String>;
-    /// `name as f32`, the entry's `position`th structural parameter.
-    ///
-    /// # Errors
-    ///
-    /// Where the position has no room.
-    fn count(&mut self, position: usize, name: &Ident) -> Result<Self::Term, String>;
-    /// Open a fold over `range` under `monoid`, `depth` folds being open
-    /// already: its index ([`ExprArena::open_fold`]). Lowering has refused
-    /// a depth past the binders.
-    ///
-    /// # Errors
-    ///
-    /// Where the range has no room.
+    /// Open a fold under `monoid` between `bounds`, `depth` folds being open
+    /// already: its index ([`ExprArena::open_fold`]). A value bound's term was
+    /// built before the fold opened, so it names the same node in the copy
+    /// the body is built in ([`ExprArena::close_fold`]). Lowering has refused
+    /// a depth past the binders and a literal past the index
+    /// ([`literal_range`], [`literal_bound`]).
     fn open_fold(
         &mut self,
         depth: usize,
         monoid: Monoid,
-        range: FoldRange,
-    ) -> Result<Self::Term, String>;
+        bounds: [Bound<Self::Term>; 2],
+    ) -> Self::Term;
     /// Close the innermost open fold over `body` ([`ExprArena::close_fold`]).
     ///
     /// # Errors
@@ -221,9 +205,10 @@ enum Binding<T, A> {
     /// A value: a `let`'s node, an entry's parameter's uniform, or a
     /// helper's parameter bound to its argument's node.
     Value(T),
-    /// A fold's index, a `usize`: its placeholder `Var` while the fold's
-    /// body is built. A body reads it only as `i as f32`.
-    Index(T),
+    /// A `usize`: a fold's index — its placeholder `Var` while the fold's body
+    /// is built — or an entry's count parameter — its `Uniform` leaf. A body
+    /// reads one only as `i as f32`, and a fold reads one as a bound.
+    Count(T),
     /// A record: its fields' nodes, in field order — an entry's record
     /// parameter's uniforms, a helper's record argument, or a `let` alias of
     /// either. A record has no node of its own.
@@ -250,30 +235,37 @@ fn monoid(reduction: Reduction) -> Monoid {
     }
 }
 
-/// A known fold's bounds at the IR's width, if [`Fold::admits`] them.
+/// A known fold's bounds, if [`KnownRange::admits`] them.
 ///
-/// `sema` holds a bound in 64 bits, as the control plane is, and has
-/// refused a range that runs backwards. The IR narrows a bound twice: its
-/// ends are `u32` today (widening them is A5 of the plan, deprioritized),
-/// and its index is an `f32` lane, exact to [`Fold::EXACT_BOUND`]. The
-/// lane is the tighter of the two, the one A5 would not lift, and the IR's
-/// to state; lowering asks it before building the body, so the refusal
-/// names the bounds, in the words of both narrowings.
-fn known_range(lo: u64, hi: u64) -> Result<Range<u32>, String> {
-    let range = match (u32::try_from(lo), u32::try_from(hi)) {
-        (Ok(lo), Ok(hi)) => Some(lo..hi),
-        _ => None,
-    };
-    range.filter(Fold::admits).ok_or_else(|| {
+/// `sema` holds a bound in 64 bits, as the IR does, and has refused a range
+/// that runs backwards. What the IR narrows is the index, an `f32` lane,
+/// exact to [`Fold::EXACT_BOUND`]: the IR's to state, so lowering asks it
+/// before building the body and the refusal names the bounds.
+fn literal_range(range: Range<u64>) -> Result<Range<u64>, String> {
+    let Range { start: lo, end: hi } = range;
+    Some(lo..hi).filter(KnownRange::admits).ok_or_else(|| {
         let bound = Fold::EXACT_BOUND;
         format!(
             "the range `{lo}..{hi}` reaches past {bound} (2^24): a fold's index is an `f32` \
              lane, which names every integer only that far, so past it indices would round \
-             together and the fold would not be the one written (`Fold::EXACT_BOUND`)\n\
-             note: a fold's ends are also `u32` in the IR today (`Fold`); 64-bit fold ends \
-             are A5 of {PLAN}, deprioritized, and would not widen the lane"
+             together and the fold would not be the one written (`Fold::EXACT_BOUND`)"
         )
     })
+}
+
+/// A known bound beside a value, if [`KnownRange::admits`] it alone: the
+/// plan's predicate on one count (§1.4), asked so the refusal names the
+/// bound before `FoldHeader::new` would panic on it.
+fn literal_bound(bound: u64) -> Result<u64, String> {
+    Some(bound)
+        .filter(|&end| KnownRange::admits(&(0..end)))
+        .ok_or_else(|| {
+            format!(
+                "the bound `{bound}` reaches past {} (2^24): a fold's index is an `f32` lane, \
+                 which names every integer only that far (`Fold::EXACT_BOUND`)",
+                Fold::EXACT_BOUND
+            )
+        })
 }
 
 /// The default a uniform is declared with here, where no call has supplied
@@ -282,109 +274,15 @@ fn known_range(lo: u64, hi: u64) -> Result<Range<u32>, String> {
 /// would poison whatever read it by mistake rather than pass for a number.
 const UNBOUND: f32 = f32::NAN;
 
-/// The range every open fold of a template is built over ([`Holes`]):
-/// empty, so that read as a program an open fold is its monoid's identity,
-/// never plausible pixels.
-const OPEN_RANGE: Range<u32> = 0..0;
-
-/// The stride an open fold over a template's first distinct range text is
-/// built with; the `k`th's is this plus `k`. No known fold has it: lowering
-/// builds every known fold with `Fold::new`, whose stride is 1, so no known
-/// fold interns with an open one, and none reads as one.
-const HOLE_STRIDE: u32 = 2;
-
-/// What a structural entry's template leaves open, for its host function to
-/// fill per instantiation (plan §1.4): each fold whose range names a
-/// structural parameter, and — as `Param(k)` leaves — each `N as f32`,
-/// `k` the parameter's position.
-///
-/// An open fold is built as any fold is, over [`OPEN_RANGE`] strided by
-/// [`HOLE_STRIDE`]` + k` for the `k`th distinct range text: the ends of a
-/// range [`Fold::admits`] have no room for a placeholder, and its
-/// stride does. Two folds over one range text, of one monoid and one body,
-/// are one fold, and are interned as one; two over different ranges never
-/// are. The range text lives in the fold's bits rather than beside a node
-/// id because lowering splices a fold's arena into its enclosing one, which
-/// renumbers every id.
-#[derive(Debug, Default)]
-pub struct Holes {
-    ranges: Vec<StructuralRange>,
-}
-
-impl Holes {
-    /// The stride an open fold over `range` is built with, over
-    /// [`OPEN_RANGE`].
-    fn stride(&mut self, range: StructuralRange) -> Result<u32, String> {
-        let text = range.text();
-        let index = match self.ranges.iter().position(|r| r.text() == text) {
-            Some(index) => index,
-            None => {
-                self.ranges.push(range);
-                self.ranges.len() - 1
-            }
-        };
-        u32::try_from(index)
-            .ok()
-            .and_then(|index| HOLE_STRIDE.checked_add(index))
-            .ok_or_else(|| {
-                format!(
-                    "more distinct ranges over structural parameters than a placeholder can \
-                     name ({index})"
-                )
-            })
-    }
-
-    /// The range an open fold of this template is over, or `None` if `fold`
-    /// is a known one.
-    ///
-    /// # Panics
-    ///
-    /// On a placeholder stride no hole names — one from another template.
-    /// Emitted as it stands it would be an empty fold, its monoid's
-    /// identity, with plausible pixels.
-    pub fn range_of(&self, range: Fold) -> Option<&StructuralRange> {
-        if range.range() != OPEN_RANGE {
-            return None;
-        }
-        let index = range.stride().checked_sub(HOLE_STRIDE)?;
-        let hole = usize::try_from(index)
-            .ok()
-            .and_then(|index| self.ranges.get(index));
-        Some(hole.unwrap_or_else(|| {
-            panic!(
-                "kernel!: a fold over the placeholder stride {} that no structural range of \
-                 this entry names",
-                range.stride()
-            )
-        }))
-    }
-}
-
-/// An entry lowered at expansion: its arena and root, and what the arena
-/// leaves open if it is a template.
-pub struct Lowered {
-    pub arena: ExprArena,
-    pub root: ExprId,
-    pub holes: Holes,
-}
-
 /// The site an entry that takes no kernel is lowered at: an [`ExprArena`],
-/// at macro expansion, with the folds open in it and the template's holes.
+/// at macro expansion, with the folds open in it, each with the terms it
+/// closes over.
 #[derive(Default)]
 pub struct Expansion {
     arena: ExprArena,
-    holes: Holes,
     /// The folds whose bodies are being built, innermost last, each with
-    /// the fold it closes into.
-    open: Vec<(OpenFold, ExpansionFold)>,
-}
-
-/// The fold an open one closes into at expansion: a known range, or a
-/// template's hole ([`Holes`]).
-#[derive(Debug, Clone)]
-enum ExpansionFold {
-    Known(Monoid, Range<u32>),
-    Hole(Monoid, u32),
+    /// the terms it closes over.
+    open: Vec<(OpenFold, FoldTerms)>,
 }
 
 impl Expansion {
@@ -399,14 +297,10 @@ impl Expansion {
     /// When the body has a construct lowering cannot express, or `entry`
     /// takes a kernel — an argument that exists only when its host function
     /// is called.
-    pub fn lower(entry: &FnItem, analyzed: &AnalyzedKernel) -> Result<Lowered, String> {
+    pub fn lower(entry: &FnItem, analyzed: &AnalyzedKernel) -> Result<(ExprArena, ExprId), String> {
         let mut site = Expansion::default();
         let root = lower_entry(entry, analyzed, &mut site)?;
-        Ok(Lowered {
-            arena: site.arena,
-            root,
-            holes: site.holes,
-        })
+        Ok((site.arena, root))
     }
 }
 
@@ -468,55 +362,23 @@ impl Site for Expansion {
         ))
     }
 
-    /// A template's `Param` hole, which its host function fills with the
-    /// same `N as f32`.
-    fn count(&mut self, position: usize, name: &Ident) -> Result<ExprId, String> {
-        // Borrowed: `Param(u8)` is a rewrite rule's metavariable too, and a
-        // `u8` is narrower than the control plane allows. It is loud past
-        // 256 rather than wrapping, and it goes with `Param` when D2 of the
-        // plan deletes it — a structural hole wants a leaf of its own then.
-        let hole = u8::try_from(position).map_err(|_| {
-            format!(
-                "`{name} as f32`: an entry reads at most {} structural parameters as values, \
-                 the width of the IR's `Param` leaf",
-                usize::from(u8::MAX) + 1
-            )
-        })?;
-        Ok(self.arena.push_param(hole))
-    }
-
-    fn open_fold(
-        &mut self,
-        depth: usize,
-        monoid: Monoid,
-        range: FoldRange,
-    ) -> Result<ExprId, String> {
-        let fold = match range {
-            FoldRange::Known(range) => ExpansionFold::Known(monoid, range),
-            FoldRange::Structural(range) => ExpansionFold::Hole(monoid, self.holes.stride(range)?),
-        };
+    fn open_fold(&mut self, depth: usize, monoid: Monoid, [lo, hi]: [Bound<ExprId>; 2]) -> ExprId {
         let open = self
             .arena
             .open_fold(depth)
             .expect("lowering refuses a fold nested past the binders before it opens one");
         let index = open.index();
-        self.open.push((open, fold));
-        Ok(index)
+        self.open.push((open, FoldTerms { monoid, lo, hi }));
+        index
     }
 
     fn close_fold(&mut self, body: ExprId) -> Result<ExprId, String> {
-        let (open, fold) = self
+        let (open, terms) = self
             .open
             .pop()
             .expect("lowering closes only the folds it opened");
-        let fold_at = |binder: Binder| match fold {
-            ExpansionFold::Known(monoid, range) => Fold::new(monoid, binder, range),
-            ExpansionFold::Hole(monoid, stride) => {
-                Fold::strided(monoid, binder, OPEN_RANGE, stride)
-            }
-        };
         self.arena
-            .close_fold(open, body, fold_at)
+            .close_fold(open, body, terms)
             .map_err(|IndexSpaceFull| {
                 format!(
                     "a fold whose body already binds all {} of the IR's indices \
@@ -559,10 +421,16 @@ pub(crate) fn lower_entry<S: Site>(
         .collect();
     let mut locals = Scopes::default();
     for parameter in analyzed.parameters(entry) {
-        let mut uniforms = parameter.scalars().map(|scalar| site.uniform(scalar));
-        let binding = match parameter.record {
-            Some((record, _)) => Binding::Record(record, uniforms.collect()),
-            None => Binding::Value(uniforms.next().expect("a scalar parameter is one uniform")),
+        let binding = match parameter.kind {
+            ParameterKind::Value => Binding::Value(site.uniform(Scalar::Value(parameter.name))),
+            ParameterKind::Count => Binding::Count(site.uniform(Scalar::Count(parameter.name))),
+            ParameterKind::Record(record, _) => Binding::Record(
+                record,
+                parameter
+                    .scalars()
+                    .map(|scalar| site.uniform(scalar))
+                    .collect(),
+            ),
         };
         locals.bind(parameter.name.to_string(), binding);
     }
@@ -574,7 +442,6 @@ pub(crate) fn lower_entry<S: Site>(
         program: Program { analyzed, helpers },
         frame: Frame {
             role: entry.role(),
-            structural: &entry.structural,
             locals,
         },
         site,
@@ -590,23 +457,21 @@ struct Program<'a> {
     helpers: HashMap<String, &'a FnItem>,
 }
 
-/// The function being lowered: its structural parameters, and the bindings
-/// in scope — its parameters in the function's own scope, then the
-/// `let`-bound locals and fold indices of the blocks being walked (one scope
-/// per block, and one per fold body, with Rust's lexical scoping). An
-/// entry's parameters are bound to their uniforms and admitted arguments; an
-/// inlined helper's, to its argument nodes and the kernels passed to it.
-struct Frame<'a, S: Site> {
+/// The function being lowered: the bindings in scope — its parameters in the
+/// function's own scope, then the `let`-bound locals and fold indices of the
+/// blocks being walked (one scope per block, and one per fold body, with
+/// Rust's lexical scoping). An entry's parameters are bound to their uniforms
+/// and admitted arguments; an inlined helper's, to its argument nodes and the
+/// kernels passed to it.
+struct Frame<S: Site> {
     role: Role,
-    /// An entry's structural parameters; a helper has none.
-    structural: &'a [Ident],
     locals: Scopes<Binding<S::Term, S::Argument>>,
 }
 
 /// State threaded through the AST → term walk.
 struct Lowering<'a, S: Site> {
     program: Program<'a>,
-    frame: Frame<'a, S>,
+    frame: Frame<S>,
     site: &'a mut S,
     /// How many folds' bodies are being built, across inlined helpers too:
     /// the depth that picks the next one's placeholder.
@@ -785,23 +650,25 @@ impl<S: Site> Lowering<'_, S> {
         Ok(self.site.apply(kernel, [x, y]))
     }
 
-    /// `⊕_{i ∈ [lo, hi)} body` as one `Reduce` over its [`Fold`]: a
-    /// known range, or one naming the entry's structural parameters.
-    ///
-    /// The body is built against the fold's index, a placeholder, and the
-    /// fold is closed after it, by the IR's one definition of how a binder
-    /// is chosen and a placeholder renamed ([`ExprArena::close_over`]),
-    /// which `Kernel`'s folds are built through too.
+    /// `⊕_{i ∈ [lo, hi)} body` as one `Reduce` over its [`Fold`], built as
+    /// `Kernel::over` builds it, or `Kernel::over_values` for a bound that is
+    /// a value: the bounds are resolved first, in the scope the fold is
+    /// written in, so its own index is none of them (L3); the body is built
+    /// against the fold's index, a placeholder, and the fold is closed after
+    /// it, by the IR's one definition of how a binder is chosen and a
+    /// placeholder renamed ([`ExprArena::close_over`]).
     fn lower_fold(&mut self, fold: &FoldExpr) -> Result<S::Term, String> {
+        let names = bound_names(&fold.range.lo)
+            .into_iter()
+            .chain(bound_names(&fold.range.hi));
+        for name in names {
+            self.refuse_a_bound_that_is_no_count(name)?;
+        }
         let scope = RangeScope {
             consts: &self.program.analyzed.consts,
-            structural: self.frame.structural,
         };
-        let bounds = range_bounds(&fold.range, scope).map_err(|e| e.to_string())?;
-        let range = match bounds {
-            Bounds::Known(lo, hi) => FoldRange::Known(known_range(lo, hi)?),
-            Bounds::Structural(range) => FoldRange::Structural(range),
-        };
+        let counts = range_bounds(&fold.range, scope).map_err(|e| e.to_string())?;
+        let bounds = self.fold_bounds(fold.reduction, counts)?;
         // One placeholder per fold open at once, the `n`th for `n` open, so a
         // nested fold's rename never reaches its enclosing fold's index. No
         // more open than the IR has binders: the refusal names the depth,
@@ -816,11 +683,11 @@ impl<S: Site> Lowering<'_, S> {
         }
         let index = self
             .site
-            .open_fold(self.open_folds, monoid(fold.reduction), range)?;
+            .open_fold(self.open_folds, monoid(fold.reduction), bounds);
         self.frame.locals.push_scope();
         self.frame
             .locals
-            .bind(fold.binder.to_string(), Binding::Index(index));
+            .bind(fold.binder.to_string(), Binding::Count(index));
         self.open_folds += 1;
         let body = self.lower(&fold.body);
         self.open_folds -= 1;
@@ -828,17 +695,78 @@ impl<S: Site> Lowering<'_, S> {
         self.site.close_fold(body?)
     }
 
-    /// `i as f32`. A fold's index is an `f32` lane already, so its
-    /// conversion is its binder's `Var`; a `usize` const is its value's
-    /// `f32`, rounded as Rust's `as` rounds it; a structural parameter is the
-    /// site's [`Site::count`], the same `N as f32` its host function has.
+    /// A name in a fold's bound is a `usize` const or a count binding in this
+    /// frame — an enclosing fold's index, or an entry's count parameter — and
+    /// nothing else: a coordinate, an `f32`, a record. Asked of every name
+    /// before any arithmetic over them is, as `sema` asks it, so `0..X + 1`
+    /// is a coordinate in a bound and not arithmetic on a value. A const is
+    /// looked up before a binding, where sema looks innermost first; the two
+    /// agree because sema refuses a binding that shadows a const.
+    fn refuse_a_bound_that_is_no_count(&self, name: &Ident) -> Result<(), String> {
+        let consts = &self.program.analyzed.consts;
+        if let Some(ConstValue::Usize(_)) = consts.get(&name.to_string()) {
+            return Ok(());
+        }
+        self.count_term(name)?;
+        Ok(())
+    }
+
+    /// The term a count binding holds: the one name a bound that is a value
+    /// can be.
+    fn count_term(&self, name: &Ident) -> Result<&S::Term, String> {
+        match self.frame.locals.lookup(&name.to_string()) {
+            Some(Binding::Count(term)) => Ok(term),
+            _ => Err(format!(
+                "`{name}` as a range's bound: a bound that is a value is an enclosing fold's index \
+                 or an entry's count parameter, a `usize`"
+            )),
+        }
+    }
+
+    /// A fold's bounds as the IR takes them: a known pair if
+    /// [`KnownRange::admits`] it; otherwise each end a literal checked alone,
+    /// or the term the name is bound to. A value bound under `any` or `all`
+    /// is refused (decision 8). The names and decision 8 are refused here
+    /// without relying on `sema`, which refuses them first; the 2²⁴ checks on a
+    /// known end are lowering's alone.
+    fn fold_bounds(
+        &self,
+        reduction: Reduction,
+        [lo, hi]: [Count; 2],
+    ) -> Result<[Bound<S::Term>; 2], String> {
+        if let (Count::Known(lo), Count::Known(hi)) = (&lo, &hi) {
+            let range = literal_range(*lo..*hi)?;
+            return Ok([Bound::Lit(range.start), Bound::Lit(range.end)]);
+        }
+        if matches!(reduction, Reduction::Any | Reduction::All) {
+            return Err(format!(
+                "`any` or `all` over a range with a bound that is a value: a mask has no NaN for a \
+                 count outside the domain (decision 8 of {BOUND_PLAN})"
+            ));
+        }
+        Ok([self.bound(lo)?, self.bound(hi)?])
+    }
+
+    /// One end of a fold with a bound that is a value: a literal, checked
+    /// alone against the domain, or the term a count binding holds.
+    fn bound(&self, count: Count) -> Result<Bound<S::Term>, String> {
+        match count {
+            Count::Known(literal) => literal_bound(literal).map(Bound::Lit),
+            Count::Name(name) => self.count_term(&name).cloned().map(Bound::Value),
+        }
+    }
+
+    /// `i as f32`. A fold's index is an `f32` lane already, and a count
+    /// parameter's uniform holds `n as f32`, so either converts to its own
+    /// term; a `usize` const is its value's `f32`, rounded as Rust's `as`
+    /// rounds it.
     fn lower_cast(&mut self, cast: &CastExpr) -> Result<S::Term, String> {
         let Some(name) = cast.named() else {
             return Err("`as f32` converts a `usize`, which is a name".to_string());
         };
         if let Some(binding) = self.frame.locals.lookup(&name.to_string()) {
             return match binding {
-                Binding::Index(index) => Ok(index.clone()),
+                Binding::Count(term) => Ok(term.clone()),
                 Binding::Value(_) | Binding::Record(..) => Err(format!(
                     "`{name} as f32`: `{name}` is a value, and `as f32` converts a `usize`"
                 )),
@@ -846,9 +774,6 @@ impl<S: Site> Lowering<'_, S> {
                     "`{name} as f32`: `{name}` is a kernel, and `as f32` converts a `usize`"
                 )),
             };
-        }
-        if let Some(position) = self.frame.structural.iter().position(|n| n == name) {
-            return self.site.count(position, name);
         }
         match self.program.analyzed.consts.get(&name.to_string()) {
             Some(&ConstValue::Usize(count)) => Ok(self.site.constant(count as f32)),
@@ -884,7 +809,7 @@ impl<S: Site> Lowering<'_, S> {
     fn record_named(&self, expr: &Expr) -> Option<RecordFields<S::Term>> {
         match self.frame.locals.lookup(&expr.named()?.to_string())? {
             Binding::Record(record, fields) => Some((*record, Rc::clone(fields))),
-            Binding::Value(_) | Binding::Index(_) | Binding::Kernel(_) => None,
+            Binding::Value(_) | Binding::Count(_) | Binding::Kernel(_) => None,
         }
     }
 
@@ -893,7 +818,7 @@ impl<S: Site> Lowering<'_, S> {
     fn kernel_named(&self, expr: &Expr) -> Option<S::Argument> {
         match self.frame.locals.lookup(&expr.named()?.to_string())? {
             Binding::Kernel(kernel) => Some(kernel.clone()),
-            Binding::Value(_) | Binding::Index(_) | Binding::Record(..) => None,
+            Binding::Value(_) | Binding::Count(_) | Binding::Record(..) => None,
         }
     }
 
@@ -925,8 +850,7 @@ impl<S: Site> Lowering<'_, S> {
     /// The arguments are lowered in the caller's frame, once each, so an
     /// argument used twice in the body is one node. The body is lowered in a
     /// frame of its own: the helper's parameters are its base scope, and
-    /// nothing of the caller's — no local, no entry parameter, no structural
-    /// parameter — is visible.
+    /// nothing of the caller's — no local and no entry parameter — is visible.
     fn inline(&mut self, helper: &FnItem, args: &[Expr]) -> Result<S::Term, String> {
         if args.len() != helper.params.len() {
             return Err(format!(
@@ -947,7 +871,6 @@ impl<S: Site> Lowering<'_, S> {
         }
         let callee = Frame {
             role: Role::Helper,
-            structural: &[],
             locals,
         };
         // The frame is swapped and the fold depth is not: a helper's fold
@@ -975,9 +898,8 @@ impl<S: Site> Lowering<'_, S> {
         if let Some(binding) = self.frame.locals.lookup(name) {
             return match binding {
                 Binding::Value(id) => Ok(id.clone()),
-                Binding::Index(_) => Err(format!(
-                    "`{name}` is a fold's index, a `usize`, where a value is expected: \
-                     `{name} as f32`"
+                Binding::Count(_) => Err(format!(
+                    "`{name}` is a `usize`, where a value is expected: `{name} as f32`"
                 )),
                 Binding::Record(..) => Err(format!(
                     "`{name}` is a record, where a value is expected: read a field, \
@@ -989,10 +911,9 @@ impl<S: Site> Lowering<'_, S> {
                 )),
             };
         }
-        // The same order sema documents: a binding, then a const, then a
-        // structural parameter, then the coordinates. Sema refuses a
-        // parameter named X or Y, so the two stages agree without one
-        // relying on the other's refusal.
+        // The same order sema documents: a binding, then a const, then the
+        // coordinates. Sema refuses a parameter named X or Y, so the two
+        // stages agree without one relying on the other's refusal.
         match self.program.analyzed.consts.get(name) {
             Some(&ConstValue::F32(value)) => return Ok(self.site.constant(value)),
             Some(ConstValue::Usize(_)) => {
@@ -1001,12 +922,6 @@ impl<S: Site> Lowering<'_, S> {
                 ));
             }
             None => {}
-        }
-        if self.frame.structural.iter().any(|n| n == name) {
-            return Err(format!(
-                "`{name}` is a structural parameter, a `usize`, where a value is expected: \
-                 `{name} as f32`"
-            ));
         }
         let axis = match name {
             "X" => Axis::X,
@@ -1079,8 +994,9 @@ mod tests {
     use super::*;
     use crate::parser::parse;
     use crate::sema::Ty;
-    use pixelflow_ir::Placeholder;
     use pixelflow_ir::arena::{ExprNode, UniformId};
+    use pixelflow_ir::fold::KNOWN_RANGE;
+    use pixelflow_ir::{Lit, Placeholder};
     use quote::quote;
 
     /// Lower a block straight from the parser, with no `sema` in front: what
@@ -1111,8 +1027,7 @@ mod tests {
             .iter()
             .find(|f| f.role() == Role::Entry)
             .expect("one entry");
-        let Lowered { arena, root, .. } = Expansion::lower(entry, &unanalyzed)?;
-        Ok((arena, root))
+        Expansion::lower(entry, &unanalyzed)
     }
 
     fn lowered(input: proc_macro2::TokenStream) -> (ExprArena, ExprId) {
@@ -1177,78 +1092,11 @@ mod tests {
         assert!(matches!(arena.node(r), ExprNode::Uniform(UniformId(3))));
     }
 
-    /// A template's `N as f32` is its structural parameter's `Param` hole,
-    /// and a fold over a range naming one is built over a placeholder its
-    /// holes map back to the range — two different ranges to two different
-    /// holes; a known fold is not a hole.
-    #[test]
-    fn a_structural_parameter_leaves_the_template_open() {
-        let def = parse(quote! {
-            pub fn f<const N: usize, const M: usize>() -> f32 {
-                (0..M * 2).map(|i| X * (i as f32)).sum::<f32>()
-                    + (0..N).map(|i| Y * (i as f32)).sum::<f32>()
-                    + (0..3).map(|i| i as f32).sum::<f32>()
-                    + (M as f32)
-            }
-        })
-        .expect("parses");
-        let analyzed = crate::sema::analyze(def).expect("analyzes");
-        let Lowered {
-            arena, root, holes, ..
-        } = Expansion::lower(&analyzed.def.fns[0], &analyzed).expect("lowers");
-        let mut open = Vec::new();
-        let mut known = Vec::new();
-        let mut params = Vec::new();
-        for (_, node) in arena.nodes() {
-            match node {
-                ExprNode::Reduce { fold, .. } => match holes.range_of(fold) {
-                    Some(range) => open.push(range.text()),
-                    None => known.push(fold),
-                },
-                ExprNode::Param(k) => params.push(k),
-                _ => {}
-            }
-        }
-        open.sort();
-        assert_eq!(open, ["0..(M * 2)", "0..N"], "each range is its own hole");
-        assert_eq!(
-            known.len(),
-            1,
-            "`0..3` is known here: {}",
-            arena.display(root)
-        );
-        assert_eq!(params, [1], "`M` is the second structural parameter");
-    }
-
-    /// A placeholder no hole names is a front-end bug, never a known fold:
-    /// emitted as it stands it would be empty, its monoid's identity.
-    #[test]
-    #[should_panic(expected = "no structural range of this entry names")]
-    fn a_placeholder_no_hole_names_is_refused() {
-        let binder = Binder::all().next().expect("a binder");
-        let stray = Fold::strided(Monoid::SUM, binder, OPEN_RANGE, HOLE_STRIDE);
-        let _unreachable = Holes::default().range_of(stray);
-    }
-
-    /// A known fold is never read as a hole, whatever its range: empty at
-    /// the open range's position, or strided by a pass.
-    #[test]
-    fn a_known_fold_is_no_hole() {
-        let binder = Binder::all().next().expect("a binder");
-        let holes = Holes::default();
-        for known in [
-            Fold::new(Monoid::SUM, binder, OPEN_RANGE),
-            Fold::strided(Monoid::SUM, binder, 0..8, HOLE_STRIDE),
-        ] {
-            assert!(holes.range_of(known).is_none(), "{known}");
-        }
-    }
-
     /// A literal lowers to the value the parser gave it, bit for bit.
     #[test]
     fn a_literal_lowers_to_the_value_the_parser_rounded_once() {
         let (arena, root) = lowered(quote! { || 1.00000005960464477539062500001 });
-        let ExprNode::Const(value) = arena.node(root) else {
+        let ExprNode::Const(Lit::Real(value)) = arena.node(root) else {
             panic!("expected a constant, got {:?}", arena.node(root));
         };
         assert_eq!(value.to_bits(), 0x3f80_0001);
@@ -1279,7 +1127,7 @@ mod tests {
         let ExprNode::Binary(OpKind::Mul, _, r) = arena.node(root) else {
             panic!("expected the product, got {:?}", arena.node(root));
         };
-        assert!(matches!(arena.node(r), ExprNode::Const(v) if v == 2.5));
+        assert!(matches!(arena.node(r), ExprNode::Const(Lit::Real(v)) if v == 2.5));
     }
 
     /// A helper's body is lowered in a frame of its own: its parameter
@@ -1354,17 +1202,17 @@ mod tests {
     #[test]
     fn a_fold_lowers_to_one_reduce_and_leaves_nothing_behind() {
         let (arena, root) = lowered(quote! { || (2..6).map(|i| X * (i as f32)).sum() });
-        let ExprNode::Reduce { fold: range, body } = arena.node(root) else {
+        let ExprNode::Reduce { fold, body, .. } = arena.node(root) else {
             panic!("expected a fold, got {}", arena.display(root));
         };
-        assert_eq!(range.range(), 2..6);
-        assert_eq!(range.monoid(), Monoid::SUM);
-        assert_eq!(range.binder().slot(), 0);
+        assert_eq!(arena.known_range(root).expect(KNOWN_RANGE).range(), 2..6);
+        assert_eq!(fold.monoid(), Monoid::SUM);
+        assert_eq!(fold.binder().slot(), 0);
         let ExprNode::Binary(OpKind::Mul, x, index) = arena.node(body) else {
             panic!("expected the product, got {}", arena.display(body));
         };
         assert!(matches!(arena.node(x), ExprNode::Var(0)));
-        assert!(matches!(arena.node(index), ExprNode::Var(v) if v == range.binder().var()));
+        assert!(matches!(arena.node(index), ExprNode::Var(v) if v == fold.binder().var()));
         assert!(!holds_a_placeholder(&arena));
         assert_eq!(
             arena.len(),
@@ -1380,7 +1228,10 @@ mod tests {
         let (arena, root) = lowered(quote! {
             || (0..3).map(|i| (0..4).map(|j| (i as f32) * (j as f32)).sum::<f32>()).sum()
         });
-        let ExprNode::Reduce { fold: outer, body } = arena.node(root) else {
+        let ExprNode::Reduce {
+            fold: outer, body, ..
+        } = arena.node(root)
+        else {
             panic!("expected the outer fold, got {}", arena.display(root));
         };
         let ExprNode::Reduce { fold: inner, .. } = arena.node(body) else {
@@ -1398,10 +1249,7 @@ mod tests {
         let Err(err) = lower_unanalyzed(quote! { || (0..4).map(|i| X * i).sum() }) else {
             panic!("`i` is a `usize`");
         };
-        assert!(
-            err.contains("`i` is a fold's index, a `usize`"),
-            "got: {err}"
-        );
+        assert!(err.contains("`i` is a `usize`"), "got: {err}");
         let Err(err) = lower_unanalyzed(quote! {
             const N: usize = 4;
             pub fn f() -> f32 { X * N }
@@ -1409,6 +1257,96 @@ mod tests {
             panic!("`N` is a `usize`");
         };
         assert!(err.contains("`N` is a `usize` const"), "got: {err}");
+        let Err(err) = lower_unanalyzed(quote! { pub fn f(n: usize) -> f32 { X * n } }) else {
+            panic!("`n` is a `usize`");
+        };
+        assert!(err.contains("`n` is a `usize`"), "got: {err}");
+    }
+
+    /// A bound that is a value is a child of its fold: an entry's count its
+    /// `Uniform` leaf, an enclosing fold's index that fold's binder; and the
+    /// fold's range is not known.
+    #[test]
+    fn a_value_bound_is_a_child_of_its_fold() {
+        let (arena, root) = lowered(quote! {
+            pub fn f(n: usize) -> f32 { (0..n).map(|i| X * (i as f32)).sum() }
+        });
+        let ExprNode::Reduce { lo, hi, .. } = arena.node(root) else {
+            panic!("expected a fold, got {}", arena.display(root));
+        };
+        assert_eq!(lo, Bound::Lit(0));
+        let Bound::Value(count) = hi else {
+            panic!("`n` is a value bound");
+        };
+        assert!(matches!(arena.node(count), ExprNode::Uniform(UniformId(0))));
+        assert!(arena.known_range(root).is_none());
+
+        let (arena, root) = lowered(quote! {
+            || (0..4).map(|i| (0..i).map(|j| j as f32).sum::<f32>()).sum()
+        });
+        let ExprNode::Reduce {
+            fold: outer, body, ..
+        } = arena.node(root)
+        else {
+            panic!("expected the outer fold, got {}", arena.display(root));
+        };
+        let ExprNode::Reduce {
+            hi: Bound::Value(index),
+            ..
+        } = arena.node(body)
+        else {
+            panic!(
+                "the inner fold's `hi` is the outer index, got {}",
+                arena.display(body)
+            );
+        };
+        assert!(matches!(arena.node(index), ExprNode::Var(v) if v == outer.binder().var()));
+        assert!(!holds_a_placeholder(&arena));
+    }
+
+    /// Lowering refuses a bound that is no count by itself, as `sema` does for
+    /// the names and decision 8 (the domain is lowering's alone), without
+    /// relying on it: the names first, as `sema` judges them, so a
+    /// coordinate or an `f32` under arithmetic is a name that is no bound and
+    /// not arithmetic on a value.
+    #[test]
+    fn a_bound_that_is_no_count_is_refused_here_too() {
+        let cases: [(proc_macro2::TokenStream, &str); 7] = [
+            (
+                quote! { |n: f32| (0..n).map(|i| i as f32).sum() },
+                "`n` as a range's bound",
+            ),
+            (
+                quote! { || (0..X).map(|i| i as f32).sum() },
+                "`X` as a range's bound",
+            ),
+            (
+                quote! { || (0..X + 1).map(|i| i as f32).sum() },
+                "`X` as a range's bound",
+            ),
+            (
+                quote! { |r: f32| (0..r - 1).map(|i| i as f32).sum() },
+                "`r` as a range's bound",
+            ),
+            (
+                quote! { pub fn f(n: usize) -> bool { (0..n).any(|i| X < i as f32) } },
+                "decision 8",
+            ),
+            (
+                quote! { pub fn f(n: usize) -> f32 { (0..n - 1).map(|i| i as f32).sum() } },
+                "arithmetic on `n`",
+            ),
+            (
+                quote! { pub fn f(n: usize) -> f32 { (16777217..n).map(|i| i as f32).sum() } },
+                "past 16777216 (2^24)",
+            ),
+        ];
+        for (input, expected) in cases {
+            let Err(err) = lower_unanalyzed(input) else {
+                panic!("lowering builds no fold over a bound that is no count");
+            };
+            assert!(err.contains(expected), "expected `{expected}`, got: {err}");
+        }
     }
 
     /// A `usize` const `as f32` is its value's `f32`.
@@ -1418,15 +1356,14 @@ mod tests {
             const N: usize = 4;
             pub fn f() -> f32 { N as f32 }
         });
-        assert!(matches!(arena.node(root), ExprNode::Const(v) if v == 4.0));
+        assert!(matches!(arena.node(root), ExprNode::Const(Lit::Real(v)) if v == 4.0));
     }
 
-    /// `sema` holds a bound in 64 bits; the IR's index is an `f32` lane,
-    /// exact to 2²⁴, and its fold ends are `u32`. A bound past the lane is
-    /// refused — past `u32` too, naming the plan's A5 — and 2²⁴ itself is
-    /// the last bound accepted.
+    /// `sema` holds a bound in 64 bits, as the IR does; the IR's index is an
+    /// `f32` lane, exact to 2²⁴. A bound past the lane is refused — past
+    /// `u32` too — and 2²⁴ itself is the last bound accepted.
     #[test]
-    fn a_bound_past_the_exact_index_is_refused_naming_a5() {
+    fn a_bound_past_the_exact_index_is_refused() {
         for past in [
             quote! { || (0..16777217).map(|i| i as f32).sum() },
             quote! { || (16777217..16777217).map(|i| i as f32).sum() },
@@ -1435,16 +1372,16 @@ mod tests {
             let Err(err) = lower_unanalyzed(past) else {
                 panic!("past 2^24 an f32 lane does not name every index");
             };
-            assert!(
-                err.contains("past 16777216 (2^24)") && err.contains("A5") && err.contains(PLAN),
-                "got: {err}"
-            );
+            assert!(err.contains("past 16777216 (2^24)"), "got: {err}");
         }
         let (arena, root) = lowered(quote! { || (16777215..16777216).map(|i| i as f32).sum() });
-        let ExprNode::Reduce { fold: range, .. } = arena.node(root) else {
+        let ExprNode::Reduce { .. } = arena.node(root) else {
             panic!("expected a fold, got {}", arena.display(root));
         };
-        assert_eq!(range.range(), 16_777_215..16_777_216);
+        assert_eq!(
+            arena.known_range(root).expect(KNOWN_RANGE).range(),
+            16_777_215..16_777_216
+        );
     }
 
     /// Folds nest as deep as the IR has binders, and no deeper: one more is

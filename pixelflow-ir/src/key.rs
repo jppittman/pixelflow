@@ -33,6 +33,7 @@ use alloc::vec::Vec;
 
 use crate::arena::{BufferDecl, ExprArena, ExprId, ExprNode, UniformDecl, UniformIdentity};
 use crate::dag::Memo;
+use crate::lit::Lit;
 
 /// The identity of a kernel: a 64-bit digest of its whole [`Canonical`] form
 /// — the shape bytes **and** the link.
@@ -46,15 +47,14 @@ use crate::dag::Memo;
 /// kernel that was interned. Two samplers over two different 4×3 tables have
 /// identical shape bytes and are not the same kernel.
 ///
-/// **Why 64 bits and not 128.** An identity has to be nameable *inside* an
-/// arena — `ExprNode::Ref(KernelKey)` — and `ExprNode` is held to 16 bytes by
-/// a static assertion in [`arena`](crate::arena), because every node of every
-/// kernel pays for that width. A 128-bit payload plus a discriminant is 24,
-/// which is a 50% memory increase on every arena in the process to buy
-/// collision resistance that is not needed: the store keyed on this compares
-/// the *full* canonical bytes on every lookup and panics on a mismatch, so a
-/// collision is a loud programming-error-class event, never a kernel silently
-/// resolving to the wrong body.
+/// **Why 64 bits and not 128.** Collision resistance past 64 bits is not
+/// needed: the store keyed on this compares the *full* canonical bytes on
+/// every lookup and panics on a mismatch, so a collision is a loud
+/// programming-error-class event, never a kernel silently resolving to the
+/// wrong body. (This was once argued from `ExprNode`'s width as well, a
+/// 16-byte static assertion in [`arena`](crate::arena); that assertion is a
+/// tripwire and not a requirement, and the choice stands on the collision
+/// argument alone.)
 ///
 /// The digest is computed here rather than through `core::hash` so that it is
 /// a fixed function of the bytes: `DefaultHasher`'s algorithm is explicitly
@@ -195,10 +195,12 @@ pub struct Canonical {
 ///
 /// **Why no two programs share a key.** Each emitted node names its children
 /// by canonical ids smaller than its own, every tag has a fixed encoding
-/// length (an n-ary node carries its count), and the root is the last node
-/// emitted: it cannot equal an earlier one, because that one would be its own
-/// descendant. So the bytes parse back into exactly one tree over (tag,
-/// payload, dense slot), and two programs with different unfoldings have
+/// length given its payload (an n-ary node carries its count, a fold's header
+/// says how many children follow it,
+/// [`FoldHeader::arity`](crate::fold::FoldHeader::arity)), and the root is the
+/// last node emitted: it cannot equal an earlier one, because that one would
+/// be its own descendant. So the bytes parse back into exactly one tree over
+/// (tag, payload, dense slot), and two programs with different unfoldings have
 /// different bytes. What is deliberately *not* in the bytes — which memory a
 /// slot binds — is the two tables beside them.
 #[must_use]
@@ -374,9 +376,15 @@ impl<'a> Walk<'a> {
                 self.scratch.push(0);
                 self.scratch.push(i);
             }
-            ExprNode::Const(v) => {
+            ExprNode::Const(Lit::Real(v)) => {
                 self.scratch.push(1);
                 self.scratch.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+            // Its own tag, not tag 1 with the mask's lane: a true mask and
+            // the NaN that shares its bits are two kernels.
+            ExprNode::Const(Lit::Mask(b)) => {
+                self.scratch.push(13);
+                self.scratch.push(u8::from(b));
             }
             ExprNode::Param(i) => {
                 self.scratch.push(2);
@@ -438,15 +446,23 @@ impl<'a> Walk<'a> {
                 self.scratch.push(9);
                 self.scratch.extend_from_slice(&key_of.bits().to_le_bytes());
             }
-            // The fold is metadata, so it is *in the tag bytes* rather than
-            // encoded as three child nodes. Two folds over the same body
-            // under different algebras, binders or ranges are different
-            // kernels, and this is where that is said.
-            ExprNode::Reduce { fold, body } => {
+            // The fold's header is metadata, so it is *in the tag bytes*
+            // rather than encoded as three child nodes; a bound that is a
+            // value writes its header field's marker and its child's key after
+            // the body's. Two folds over the same body under different
+            // algebras, binders or ranges are different kernels, and this is
+            // where that is said. A known bound is header data at its
+            // `to_bits` field, so a fold over literals keys as it always has.
+            // A uniform bound contributes its dense slot, not its default, so
+            // every count is one key (L9).
+            ExprNode::Reduce { lo, hi, body, .. } => {
                 self.scratch.push(10);
                 self.scratch
-                    .extend_from_slice(&fold.to_bits().to_le_bytes());
+                    .extend_from_slice(&self.arena.fold_header(id).to_bits().to_le_bytes());
                 self.push_child(body);
+                for value in [lo.value(), hi.value()].into_iter().flatten() {
+                    self.push_child(value);
+                }
             }
             // The value is a real child; the three binders are metadata in
             // the tag bytes, as a fold's is: a store of the same value
@@ -691,7 +707,7 @@ mod tests {
     /// tell two programs apart on their own.
     #[test]
     fn two_different_programs_are_two_keys() {
-        use crate::fold::{Binder, Fold, Monoid};
+        use crate::fold::{Binder, Bound, Fold, Monoid};
 
         let x_minus_y = {
             let mut a = ExprArena::new();
@@ -728,21 +744,132 @@ mod tests {
         );
 
         let slot = |s: u8| Binder::from_slot(s).expect("a binder slot");
-        let folded = |fold: Fold| {
+        let folded = |fold: Fold, hi: u64| {
             let mut a = ExprArena::new();
             let x = a.push_var(0);
             let body = a.push_binary(OpKind::Mul, x, x);
-            let r = a.push_reduce(fold, body);
+            let r = a.push_reduce(fold, Bound::Lit(0), Bound::Lit(hi), body);
             KernelKey::of(&a, r)
         };
-        let over_three = folded(Fold::new(Monoid::SUM, slot(0), 0..3));
-        let over_four = folded(Fold::new(Monoid::SUM, slot(0), 0..4));
-        let under_another_binder = folded(Fold::new(Monoid::SUM, slot(1), 0..3));
+        let over_three = folded(Fold::new(Monoid::SUM, slot(0)), 3);
+        let over_four = folded(Fold::new(Monoid::SUM, slot(0)), 4);
+        let under_another_binder = folded(Fold::new(Monoid::SUM, slot(1)), 3);
         assert_ne!(over_three, over_four, "a fold's range is part of its key");
         assert_ne!(
             over_three, under_another_binder,
             "a fold's binder is part of its key"
         );
+    }
+
+    /// A fold's record is its tag, its header's bits and its body — the
+    /// bytes a fold has always keyed as, now that its bounds are the node's:
+    /// `[10] ++ to_bits().to_le_bytes()` for a fold over literals, the layout
+    /// assembled by hand rather than read back from `to_bits`.
+    #[test]
+    fn a_folds_key_record_is_tag_ten_then_its_bits() {
+        use crate::fold::{Binder, Bound, Fold, Monoid};
+
+        let mut a = ExprArena::new();
+        let x = a.push_var(0);
+        let body = a.push_binary(OpKind::Mul, x, x);
+        let slot1 = Binder::from_slot(1).expect("a binder slot");
+        let r = a.push_reduce(
+            Fold::new(Monoid::SUM, slot1),
+            Bound::Lit(3),
+            Bound::Lit(11),
+            body,
+        );
+        let mut record = vec![10u8];
+        record.extend_from_slice(&0x0000_0000_0001_0201_0000_0003_0000_000bu128.to_le_bytes());
+        let key = canonical(&a, r).key;
+        assert!(
+            key.windows(record.len()).any(|window| window == record),
+            "no tag-ten record in {key:?}"
+        );
+    }
+
+    /// `Σ_{k ∈ [lo, hi)} k` over binder slot 1, each bound the literal it is
+    /// or the uniform its declaration names.
+    fn counted(
+        lo: crate::Bound<UniformDecl>,
+        hi: crate::Bound<UniformDecl>,
+    ) -> (ExprArena, ExprId) {
+        use crate::fold::{Binder, Fold, Monoid};
+
+        let mut a = ExprArena::new();
+        let slot1 = Binder::from_slot(1).expect("a binder slot");
+        let body = a.push_var(slot1.var());
+        let mut leaf = |bound: crate::Bound<UniformDecl>| {
+            bound.map(|decl| {
+                let slot = a.uniform_slot_for(decl);
+                a.push_uniform(slot)
+            })
+        };
+        let (lo, hi) = (leaf(lo), leaf(hi));
+        let r = a.push_reduce(Fold::new(Monoid::SUM, slot1), lo, hi, body);
+        (a, r)
+    }
+
+    /// A fold whose bound is a value keys as tag ten, its header's bits with the
+    /// bound's count field all ones, the body's canonical id, then the bound's:
+    /// the record assembled by hand, beside the two leaves it names.
+    #[test]
+    fn a_value_bounded_folds_key_record_is_tag_ten_its_bits_and_its_children() {
+        use crate::Bound;
+
+        let u = crate::Uniform::new(8.0);
+        let (a, r) = counted(Bound::Lit(0), Bound::Value(u.decl()));
+        let mut want = vec![0u8, crate::fold::Binder::from_slot(1).expect("slot").var()];
+        // The uniform, at its dense slot 0.
+        want.push(8);
+        want.extend_from_slice(&0u64.to_le_bytes());
+        want.push(10);
+        want.extend_from_slice(&0x0000_0000_0001_0201_0000_0000_ffff_ffffu128.to_le_bytes());
+        // The body (canonical 0), then the bound (canonical 1).
+        want.extend_from_slice(&0u32.to_le_bytes());
+        want.extend_from_slice(&1u32.to_le_bytes());
+        assert_eq!(canonical(&a, r).key, want);
+    }
+
+    /// A count is not part of the program: two uniform instances bounding one
+    /// fold are one canonical shape however their defaults differ, which is
+    /// what the JIT cache keys on. Their [`KernelKey`]s differ, as every two
+    /// uniform instances' do, because the instance is part of a kernel's
+    /// identity and the shape is not.
+    #[test]
+    fn every_count_is_one_key() {
+        use crate::Bound;
+
+        let (a, ra) = counted(Bound::Lit(0), Bound::Value(crate::Uniform::new(0.0).decl()));
+        let (b, rb) = counted(Bound::Lit(0), Bound::Value(crate::Uniform::new(7.0).decl()));
+        let (shape_a, shape_b) = (canonical(&a, ra), canonical(&b, rb));
+        assert_eq!(shape_a.key, shape_b.key);
+        assert_eq!(shape_a.uniforms.len(), 1);
+        assert_ne!(shape_a.uniforms, shape_b.uniforms);
+        assert_ne!(KernelKey::of(&a, ra), KernelKey::of(&b, rb));
+    }
+
+    /// Which end is a value, and whether the other is the literal 0 or a value
+    /// too, each tell two folds apart: the mark sits in the field it bounds.
+    #[test]
+    fn which_end_is_a_value_is_in_the_key() {
+        use crate::Bound;
+
+        let u = crate::Uniform::new(4.0).decl();
+        let shape = |lo, hi| {
+            let (a, r) = counted(lo, hi);
+            canonical(&a, r).key
+        };
+        let value_below = shape(Bound::Value(u), Bound::Lit(4));
+        let value_above = shape(Bound::Lit(0), Bound::Value(u));
+        let literal = shape(Bound::Lit(0), Bound::Lit(4));
+        let both = shape(Bound::Value(u), Bound::Value(u));
+        let keys = [&value_below, &value_above, &literal, &both];
+        for (i, one) in keys.iter().enumerate() {
+            for other in &keys[i + 1..] {
+                assert_ne!(one, other);
+            }
+        }
     }
 
     /// A store of one value under different binders is a different program,

@@ -9,6 +9,8 @@ language: it is the actors, threads and drivers around a collapse.
 - The windowing platform: `PlatformOps` behind `PlatformActor`, `ActivePlatform`,
   the event loop, and the OS's pixel format (`PlatformPixel`). The driver is the
   troupe's `[main]` actor, so it runs on the thread that built the `Troupe`.
+- `platform::PlatformPixel` re-exports the graphics framebuffer format;
+  `pixel::PlatformPixel` re-exports that same type.
 - The frame buffer: `WindowKeeper` allocates it at a resize, lends it, takes it back.
 - The engine's wiring: the actors (`driver`, `engine`, vsync and coordinator
   nodes) and each message's lane.
@@ -47,8 +49,8 @@ language: it is the actors, threads and drivers around a collapse.
 ## Behind
 - `EngineHandler` still relays app input to the coordinator; the mediator is not
   yet a mesh (mesh-migration design, Draft 2026-07-25, §8).
-- `PlatformPixel` is defined in `pixel.rs` and `platform/mod.rs`; `traits.rs` holds
-  an `EngineEvent` nothing imports, shadowing `api::public::EngineEvent`.
+- `traits.rs` holds an `EngineEvent` nothing imports, shadowing
+  `api::public::EngineEvent`.
 - `lib.rs` carries two `wasm_bindgen` entry points its own comment says belong in
   the platform. The web driver does not build (no wasm32 JIT backend), keeps the
   legacy `DisplayDriver` trait, and discards send results (`display/drivers/web/mod.rs`).

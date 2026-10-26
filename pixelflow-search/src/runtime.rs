@@ -147,8 +147,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// - An admitted op applied to other than its arity's worth of operands,
 ///   which `push_nary` permits — a node holds exactly that many inline
 ///   (`Declined::Arity`).
-/// - `Param` — a `pixelflow-compiler` macro-parameter slot that should never
-///   reach a runtime-built `Kernel` in the first place.
+/// - `Param` — an unbound scalar slot, a leaf with no value
+///   (`Declined::Param`).
 /// - A `Shl`/`Shr` whose count is not a `Const` holding a
 ///   [`ShiftCount`](pixelflow_ir::ShiftCount) (`Declined::ShiftCount`). The
 ///   count is a parameter of the shift's node, so the graph cannot hold
@@ -258,10 +258,20 @@ impl<'a> Program<'a> {
     ///
     /// Panics if a key names no interned kernel (a corrupt graph, as
     /// `passes::expand_refs` says), or if a unit is not closed — its
-    /// variance names a binder or a retired axis, which no rewrite outside
-    /// it could substitute (Law U, step 2). `Kernel::by_ref` refuses the
-    /// open term it can see; `KernelStore::intern` and `ExprArena::push_ref`
-    /// can name anything, so the law is checked here, where it is used.
+    /// variance names a binder or a retired axis, or it reads an index no fold
+    /// in it binds, which no rewrite outside it could substitute (Law U,
+    /// step 2). `Kernel::by_ref` refuses the open term it can see;
+    /// `KernelStore::intern` and `ExprArena::push_ref` can name anything, so
+    /// the law is checked here, where it is used.
+    ///
+    /// Two checks, because variance cannot be the whole of closedness: a fold
+    /// index that escaped its builder (a closure that kept a clone of it) is a
+    /// placeholder, and a placeholder varies with nothing
+    /// (`Variance::of_var`: it is a binder-to-be, and the question that
+    /// answer serves is L3's of
+    /// docs/language/2026-10-20-a-bound-is-a-value.md). The variance assertion
+    /// judges what the unit varies with; [`ExprArena::free_index`] judges what
+    /// it leaves unbound, the test `Kernel::by_ref` makes.
     fn of(arena: &'a ExprArena, root: ExprId) -> Self {
         let mut units = BTreeMap::new();
         if !holds_a_ref(arena) {
@@ -294,6 +304,14 @@ impl<'a> Program<'a> {
                  over the coordinates: no rewrite outside it can substitute a binder \
                  inside it"
             );
+            if let Some(index) = body.free_index(body_root) {
+                panic!(
+                    "optimize_runtime_arena: the unit {key:?} reads Var({index}), an index \
+                     no fold inside it binds — a fold index that escaped its builder. A unit \
+                     is optimized out of its context, which is sound only for a closed \
+                     term: no rewrite outside it can substitute an index inside it"
+                );
+            }
             pending.extend(refs_reachable(&body, body_root));
             units.insert(
                 key,
@@ -1112,6 +1130,36 @@ mod tests {
             vec![KernelStore::intern(&beside)],
             "the differentiated one is linked into the term itself"
         );
+    }
+
+    /// **A fold index that escaped its builder is no unit.** The closure given
+    /// to `Kernel::sum_over` keeps a clone of the index; interned, it is a
+    /// kernel that reads an index no fold binds, which `Kernel::by_ref` would
+    /// refuse and `KernelStore::intern` + `ExprArena::push_ref` do not. Its
+    /// variance is empty (a placeholder is a binder-to-be, never a coordinate:
+    /// `Variance::of_var`), so the variance assertion alone admits it and the
+    /// unit walk would hand the e-graph an open term, as a unit. Law U's check
+    /// is `free_index`.
+    #[test]
+    #[should_panic(expected = "an index no fold inside it binds")]
+    fn a_unit_that_reads_an_escaped_fold_index_is_refused() {
+        let mut escaped = None;
+        let _closed = Kernel::sum_over(2, |i| {
+            escaped = Some(i.clone());
+            i.clone()
+        });
+        let open = escaped.expect("the closure ran");
+        let (arena, root) = open.parts();
+        assert!(
+            pixelflow_ir::variance::compute_arena_variance(arena)[root.0 as usize].is_const(),
+            "the premise: variance alone calls the escaped index constant"
+        );
+
+        let mut around = ExprArena::new();
+        let unit = around.push_ref(KernelStore::intern(&open));
+        let x = around.push_var(0);
+        let root = around.push_binary(OpKind::Add, unit, x);
+        let _refused = optimize_runtime_arena(&around, root, LatticeShape::POINT);
     }
 
     /// Whether some fold reachable from `root` has a body that reaches

@@ -66,8 +66,7 @@
   64 bits with no profiler reason:
   - `ExprId(pub u32)`, `BufferId(pub u16)`, `BufferIdentity(u32)` (justified
     as "on the way out") and `Var(u8)` (`pixelflow-ir/src/arena.rs`).
-  - `Fold { lo, hi, stride: u32 }`, whose own field doc cites this rule, and
-    `Binder(u8)` (`pixelflow-ir/src/fold.rs`).
+  - `Binder(u8)` (`pixelflow-ir/src/fold.rs`).
   - `LatticeShape([u32; _])` (`pixelflow-ir/src/variance.rs`).
   - The DAG's `Id(u32)` and `DagIdentity(u32)` (`pixelflow-ir/src/dag.rs`).
   - `ScheduledOp::Context(u16)` (`pixelflow-codegen/src/program/mod.rs`).
@@ -76,9 +75,6 @@
   Narrower than 64 bits *with* a profiler reason, written in the type's own
   doc as the rule asks: `EClassId(pub(crate) u32)`
   (`pixelflow-search/src/egraph/node.rs`; the doc carries the measurement).
-
-  `ExprNode`'s own doc still says the assertion "guarantees <= 16 bytes",
-  while the assertion reads `<= 32`.
 
 ### Fold and dispatch (style). Homonym of the IR's Fold
 

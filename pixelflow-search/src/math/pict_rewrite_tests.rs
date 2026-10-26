@@ -27,8 +27,8 @@
 
 use crate::egraph::{EGraph, ENode, RuleSet, Saturation, extract_dag, saturate_with_budget};
 use crate::math::all_rules;
-use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
+use pixelflow_ir::{Lit, OpKind};
 
 // ============================================================================
 // Pairwise covering-array generator (see the ANSI/SGR POC for the annotated
@@ -115,7 +115,7 @@ fn named_op(kind: OpKind) -> OpKind {
 fn expr_to_egraph(arena: &ExprArena, id: ExprId, egraph: &mut EGraph) -> crate::egraph::EClassId {
     match arena.node(id) {
         ExprNode::Var(idx) => egraph.add(ENode::Var(idx)),
-        ExprNode::Const(val) => egraph.add(ENode::Const(val.to_bits())),
+        ExprNode::Const(val) => egraph.add(ENode::Const(val)),
         ExprNode::Ref(k) => panic!("Ref({k:?}) reached the pict rewrite tests"),
         ExprNode::Reduce { .. } => panic!("a bounded fold reached the pict rewrite tests"),
         ExprNode::Write { .. } => panic!("a Write reached the pict rewrite tests"),
@@ -160,11 +160,12 @@ fn eval_arena(arena: &ExprArena, id: ExprId, vars: &[f32; 4]) -> f32 {
     let rec = |c| eval_arena(arena, c, vars);
     match arena.node(id) {
         ExprNode::Var(i) => vars[i as usize],
-        ExprNode::Const(c) => c,
+        ExprNode::Const(Lit::Real(c)) => c,
         ExprNode::Unary(op, a) => exact_unary(op, rec(a)),
         ExprNode::Binary(op, a, b) => exact_binary(op, rec(a), rec(b)),
         ExprNode::Ternary(op, a, b, c) => op
-            .eval_ternary(rec(a), rec(b), rec(c))
+            .eval_ternary(Lit::Real(rec(a)), Lit::Real(rec(b)), Lit::Real(rec(c)))
+            .and_then(Lit::real)
             .unwrap_or_else(|| panic!("exact oracle: ternary {op:?}")),
         ref other => panic!("exact oracle: unsupported node {other:?}"),
     }
@@ -185,7 +186,8 @@ fn exact_unary(op: OpKind, x: f32) -> f32 {
         OpKind::Log2 => x.log2(),
         OpKind::Log10 => x.log10(),
         _ => op
-            .eval_unary(x)
+            .eval_unary(Lit::Real(x))
+            .and_then(Lit::real)
             .unwrap_or_else(|| panic!("exact oracle: unary {op:?}")),
     }
 }
@@ -196,7 +198,8 @@ fn exact_binary(op: OpKind, x: f32, y: f32) -> f32 {
         OpKind::Atan2 => x.atan2(y),
         OpKind::Pow => x.powf(y),
         _ => op
-            .eval_binary(x, y)
+            .eval_binary(Lit::Real(x), Lit::Real(y))
+            .and_then(Lit::real)
             .unwrap_or_else(|| panic!("exact oracle: binary {op:?}")),
     }
 }

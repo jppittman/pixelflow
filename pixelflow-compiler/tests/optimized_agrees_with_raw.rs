@@ -246,3 +246,36 @@ fn short_sum_over_agrees() {
         },
     );
 }
+
+kernel! {
+    /// Σ_{i<n} (X + i)·Y, the count per call.
+    pub fn counted(n: usize) -> f32 {
+        (0..n).map(|i| (X + i as f32) * Y).sum::<f32>()
+    }
+}
+
+kernel_raw! {
+    /// The same, as written.
+    pub fn counted_raw(n: usize) -> f32 {
+        (0..n).map(|i| (X + i as f32) * Y).sum::<f32>()
+    }
+}
+
+/// A per-call count: `Σ_{i<n} (X + i)·Y = Y·(nX + n(n−1)/2)`, the program
+/// saturated at expansion and the one as written. The lattice's coordinates
+/// are integers, so every value here is exact.
+#[test]
+fn a_per_call_count_agrees() {
+    for n in [0_usize, 1, 5] {
+        check(
+            &format!("counted({n})"),
+            &counted(n),
+            &counted_raw(n),
+            |x, y| {
+                let n = n as f64;
+                let want = y * (n * x + n * (n - 1.0) / 2.0);
+                (want, four_ulps(want))
+            },
+        );
+    }
+}

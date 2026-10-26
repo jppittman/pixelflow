@@ -11,7 +11,7 @@ use pixelflow_codegen::jit_vector_bytes;
 use pixelflow_ir::arena::{
     BufferDecl, BufferIdentity, ExprArena, ExprId, UniformDecl, UniformIdentity,
 };
-use pixelflow_ir::fold::{Binder, Fold, Monoid};
+use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 use pixelflow_ir::{LatticeShape, OpKind};
 
 /// Two full batches and a remainder, at the tier this host selected.
@@ -150,7 +150,12 @@ fn a_folds_table_reads_are_broadcasts() {
     let tk = a.push_binary(OpKind::RawGather, buf, k);
     let xk = a.push_binary(OpKind::Add, x, k);
     let body = a.push_binary(OpKind::Mul, tk, xk);
-    let root = a.push_reduce(Fold::new(Monoid::SUM, binder, 0..6), body);
+    let root = a.push_reduce(
+        Fold::new(Monoid::SUM, binder),
+        Bound::Lit(0),
+        Bound::Lit(6),
+        body,
+    );
 
     let out = collapse(&a, root, &[&table], &[]);
     check(&out, |x, _| (0..6).map(|k| table[k] * (x + k as f32)).sum());
@@ -167,7 +172,12 @@ fn a_reduce_runs_inside_the_lattices_folds() {
     let k = a.push_var(binder.var());
     let xk = a.push_binary(OpKind::Add, x, k);
     let body = a.push_binary(OpKind::Mul, xk, y);
-    let root = a.push_reduce(Fold::new(Monoid::SUM, binder, 0..5), body);
+    let root = a.push_reduce(
+        Fold::new(Monoid::SUM, binder),
+        Bound::Lit(0),
+        Bound::Lit(5),
+        body,
+    );
 
     let out = collapse(&a, root, &[], &[]);
     check(&out, |x, y| (0..5).map(|k| (x + k as f32) * y).sum());

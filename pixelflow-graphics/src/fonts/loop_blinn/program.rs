@@ -12,9 +12,9 @@
 //! "atlas" becomes the kernel for that number of control points, everything
 //! else is a uniform.*
 //!
-//! Choosing a glyph's program is choosing by a structural parameter, the
-//! piece count, which is what structural means: each value its own program.
-//! There is no table: a glyph's rows are a block's values, written per call.
+//! Choosing a glyph's program is choosing by its piece count: each count its
+//! own program. There is no table: a glyph's rows are a block's values,
+//! written per call.
 //!
 //! What stays host Rust: the outline's monotone split and each piece's
 //! rounding to a row ([`pieces`], [`piece_row`]), which [`GlyphRows::of`]

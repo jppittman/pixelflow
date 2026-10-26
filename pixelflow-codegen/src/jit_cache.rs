@@ -82,7 +82,9 @@ pub struct Linked {
 ///
 /// The returned `Arc` is the shared handle — two constructions of the same
 /// kernel at the same shape yield pointer-equal manifolds — and the link
-/// beside it says what this construction's slots bind.
+/// beside it says what this construction's slots bind. A fold whose bound is a
+/// value compiles inside its guard (`Kernel::over_values`), and every count it
+/// is run with shares the one program.
 ///
 /// # Errors
 ///
@@ -92,9 +94,13 @@ pub struct Linked {
 ///
 /// Panics if the arena — as handed in, or as saturation leaves it — names a
 /// retired coordinate axis (`Var(2)`/`Var(3)`, the old Z and W), or if `shape`
-/// has a zero extent, which has no sample to compute. The assertions live one
-/// layer down, in [`emit::compile`], because that is the boundary every route
-/// to machine code passes through and this is only one of them.
+/// has a zero extent, which has no sample to compute, or if a fold's bound is
+/// a mask an emitter holds as one, which is refused by name (`BoundSort`) at
+/// either end on every tier, since a mask names no count.
+/// `Kernel::over_values` takes no such bound, but a kernel adopted with
+/// `Kernel::from_parts` can carry one. The assertions live one layer down, in
+/// [`emit::compile`], because that is the boundary every route to machine code
+/// passes through and this is only one of them.
 pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Linked, CompileError> {
     let (arena, root) = kernel.parts();
     // The link tables, and the key, are read off the kernel with every
@@ -223,7 +229,7 @@ mod tests {
     use super::*;
     use pixelflow_ir::Kernel;
     use pixelflow_ir::arena::{BufferIdentity, ExprArena, UniformIdentity};
-    use pixelflow_ir::fold::{Binder, Fold, Monoid};
+    use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
     use pixelflow_ir::kind::OpKind;
 
     const TEST_SHAPE: LatticeShape = LatticeShape::new([64, 64]);
@@ -259,23 +265,43 @@ mod tests {
     #[test]
     fn a_folds_range_is_part_of_its_kernel_identity() {
         // Two kernels alike but for one fold's extent must not share a cache
-        // entry: the property is that `Fold::to_bits` is in the key.
+        // entry: the property is that `FoldHeader::to_bits` is in the key.
         let slot = |s: u8| Binder::from_slot(s).expect("a live binder");
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let body1 = a.push_binary(OpKind::Add, x, x);
-        let r1 = a.push_reduce(Fold::new(Monoid::SUM, slot(0), 0..3), body1);
+        let r1 = a.push_reduce(
+            Fold::new(Monoid::SUM, slot(0)),
+            Bound::Lit(0),
+            Bound::Lit(3),
+            body1,
+        );
         let body2 = a.push_binary(OpKind::Mul, x, x);
-        let r2 = a.push_reduce(Fold::new(Monoid::PRODUCT, slot(1), 0..6), body2);
+        let r2 = a.push_reduce(
+            Fold::new(Monoid::PRODUCT, slot(1)),
+            Bound::Lit(0),
+            Bound::Lit(6),
+            body2,
+        );
         let root = a.push_binary(OpKind::Add, r1, r2);
 
         let mut a2 = ExprArena::new();
         let x2 = a2.push_var(0);
         let body1b = a2.push_binary(OpKind::Add, x2, x2);
-        let r1b = a2.push_reduce(Fold::new(Monoid::SUM, slot(0), 0..3), body1b);
+        let r1b = a2.push_reduce(
+            Fold::new(Monoid::SUM, slot(0)),
+            Bound::Lit(0),
+            Bound::Lit(3),
+            body1b,
+        );
         let body2b = a2.push_binary(OpKind::Mul, x2, x2);
         // The extent differs only here.
-        let r2b = a2.push_reduce(Fold::new(Monoid::PRODUCT, slot(1), 0..9), body2b);
+        let r2b = a2.push_reduce(
+            Fold::new(Monoid::PRODUCT, slot(1)),
+            Bound::Lit(0),
+            Bound::Lit(9),
+            body2b,
+        );
         let root2 = a2.push_binary(OpKind::Add, r1b, r2b);
 
         let m1 = kernel_of(&Kernel::from_parts(a, root));

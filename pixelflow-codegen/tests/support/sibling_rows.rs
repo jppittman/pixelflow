@@ -16,7 +16,8 @@
 include!("deep_frame.rs");
 
 use pixelflow_ir::arena::{BufferDecl, BufferIdentity, UniformDecl, UniformIdentity};
-use pixelflow_ir::fold::{Binder, Fold, Monoid};
+use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
+use pixelflow_ir::Kernel;
 
 /// Rows the lattice every sibling-fold kernel is compiled over has. Small:
 /// the row fold is not what these kernels are about, but it must exist as a
@@ -82,8 +83,8 @@ pub fn glyph_like() -> (ExprArena, ExprId) {
     let square = a.push_binary(OpKind::Mul, clamped, clamped);
     let area = a.push_binary(OpKind::Mul, square, rest);
 
-    let fold = Fold::new(Monoid::SUM, binder(), 0..PIECES);
-    let total = a.push_reduce(fold, area);
+    let fold = Fold::new(Monoid::SUM, binder());
+    let total = a.push_reduce(fold, Bound::Lit(0), Bound::Lit(u64::from(PIECES)), area);
     let magnitude = a.push_unary(OpKind::Abs, total);
     let root = a.push_binary(OpKind::Min, magnitude, one);
     (a, root)
@@ -104,14 +105,14 @@ pub fn two_sibling_folds() -> (ExprArena, ExprId) {
     let eighth = a.push_const(0.125);
     let sy = a.push_binary(OpKind::Mul, y, eighth);
     let scaled = a.push_binary(OpKind::Mul, shifted, sy);
-    let first = a.push_reduce(Fold::new(Monoid::SUM, binder(), 0..6), scaled);
+    let first = a.push_reduce(Fold::new(Monoid::SUM, binder()), Bound::Lit(0), Bound::Lit(6), scaled);
 
     let step = a.push_const(0.75);
     let si = a.push_binary(OpKind::Mul, i, step);
     let behind = a.push_binary(OpKind::Sub, x, si);
     let floor = a.push_const(-2.0);
     let bounded = a.push_binary(OpKind::Max, behind, floor);
-    let second = a.push_reduce(Fold::new(Monoid::MIN, binder(), 0..4), bounded);
+    let second = a.push_reduce(Fold::new(Monoid::MIN, binder()), Bound::Lit(0), Bound::Lit(4), bounded);
 
     let root = a.push_binary(OpKind::Add, first, second);
     (a, root)
@@ -136,7 +137,7 @@ pub fn parked_roots(terms: u64) -> (ExprArena, ExprId) {
         })
         .collect();
     let body = sum_tree(&mut a, &cells);
-    let root = a.push_reduce(Fold::new(Monoid::SUM, binder(), 0..3), body);
+    let root = a.push_reduce(Fold::new(Monoid::SUM, binder()), Bound::Lit(0), Bound::Lit(3), body);
     (a, root)
 }
 
@@ -172,7 +173,7 @@ pub fn guarded_if_in_fold() -> (ExprArena, ExprId) {
     let cold = a.push_unary(OpKind::Sqrt, lifted);
 
     let body = a.push_ternary(OpKind::If, mask, hot, cold);
-    let root = a.push_reduce(Fold::new(Monoid::SUM, binder(), 0..4), body);
+    let root = a.push_reduce(Fold::new(Monoid::SUM, binder()), Bound::Lit(0), Bound::Lit(4), body);
     (a, root)
 }
 
@@ -374,13 +375,72 @@ fn deep() -> (ExprArena, ExprId) {
     deep_frame(DEEP_FRAME_TERMS)
 }
 
+/// Terms of the mean rows' fold, and the divisor they push after it. No
+/// other literal in either kernel equals it.
+pub const MEAN_TERMS: u32 = 7;
+
+/// `max(Σ_{i<7} (x/4 + i/2) / 7, 0)`: a literal equal to each of the fold's
+/// bounds, pushed after the fold — `7.0` (its `hi`) as the divisor, `0.0`
+/// (its `lo`) as the floor. A bound interned as a `Const` would be the
+/// earlier node either literal hash-conses to, ahead of the `Reduce` in
+/// arena order and so in the schedule and the constant pool (plan L1,
+/// §3.1); a bound held as the node's data moves nothing. Built on the arena.
+///
+/// Expected: a known bound is the fold's own data, not a node, so nothing
+/// precedes the fold for either literal to intern to. The divisor and the
+/// floor are fresh nodes after the `Reduce`, and the row's bytes are
+/// whatever the compile makes of that layout; a change in where a fold keeps
+/// its bounds must print these two rows unchanged.
+pub fn mean() -> (ExprArena, ExprId) {
+    let mut a = ExprArena::new();
+    let (x, _, i) = leaves(&mut a);
+    let quarter = a.push_const(0.25);
+    let sx = a.push_binary(OpKind::Mul, x, quarter);
+    let half = a.push_const(0.5);
+    let si = a.push_binary(OpKind::Mul, i, half);
+    let term = a.push_binary(OpKind::Add, sx, si);
+    let total = a.push_reduce(
+        Fold::new(Monoid::SUM, binder()),
+        Bound::Lit(0),
+        Bound::Lit(u64::from(MEAN_TERMS)),
+        term,
+    );
+    let divisor = a.push_const(MEAN_TERMS as f32);
+    let mean = a.push_binary(OpKind::Div, total, divisor);
+    let floor = a.push_const(0.0);
+    let root = a.push_binary(OpKind::Max, mean, floor);
+    (a, root)
+}
+
+/// [`mean`] built through `Kernel`: `Kernel::sum_over` closes the fold in an
+/// arena of its own (`ExprArena::close_over`) and each operator copies it and
+/// splices its operand after it — the layout production's glyph kernels are
+/// built with. Expected: a fold with the divisor and the floor after it, by
+/// `Kernel::combine`'s order (it copies `self`, then splices the operand) and
+/// the builder keeping push order; the optimized column prints [`mean`]'s
+/// bytes.
+pub fn mean_kernel() -> (ExprArena, ExprId) {
+    let terms = Kernel::sum_over(MEAN_TERMS, |i| {
+        Kernel::x()
+            .mul(&Kernel::constant(0.25))
+            .add(&i.mul(&Kernel::constant(0.5)))
+    });
+    let mean = terms
+        .div(&Kernel::constant(MEAN_TERMS as f32))
+        .max(&Kernel::constant(0.0));
+    let (a, r) = mean.parts();
+    (a.clone(), r)
+}
+
 /// The glyph-like fold at the three widths that decide how many sibling column
 /// folds exist (a remainder alone; a main alone; both), and each other kernel
 /// where both exist. After them, the coverage rows: every op the backends owe,
 /// every way a kernel reads memory, and a frame past what NEON addresses
-/// directly, all at the width with a remainder. The names are the ones
-/// `byte_probe` prints and the traffic tests report.
-pub const TABLE: [Row; 11] = [
+/// directly, all at the width with a remainder. Last, the mean rows: a
+/// literal equal to a fold's bound, pushed after the fold, in both
+/// constructions (plan L1). The names are the ones `byte_probe` prints and
+/// the traffic tests report.
+pub const TABLE: [Row; 13] = [
     Row {
         name: "glyph_like_w1",
         build: glyph_like,
@@ -434,6 +494,16 @@ pub const TABLE: [Row; 11] = [
     Row {
         name: "deep_frame_w37",
         build: deep,
+        width: Width::Remainder,
+    },
+    Row {
+        name: "mean_w37",
+        build: mean,
+        width: Width::Remainder,
+    },
+    Row {
+        name: "mean_kernel_w37",
+        build: mean_kernel,
         width: Width::Remainder,
     },
 ];

@@ -129,7 +129,8 @@ struct LoopFacts {
     latch: usize,
     /// The block that follows the latch's.
     exit: usize,
-    /// How many times its body runs per call.
+    /// How many times its body runs per call, an estimate's price for a fold
+    /// whose range is not known.
     trips: u64,
     parent: Option<usize>,
     /// The head's parameters, and what the backward branch passes to them.
@@ -198,7 +199,7 @@ impl Liveness {
                     head: 0,
                     latch: 0,
                     exit: 0,
-                    trips: l.trips,
+                    trips: l.trips.weight(),
                     parent: l.parent,
                     params: Vec::new(),
                     latch_args: Vec::new(),
@@ -426,14 +427,20 @@ fn plan_carries(live: &Liveness, reads: &[usize], budget: Budget) -> Vec<Vec<u64
             if covered {
                 continue;
             }
-            let reloads: usize = own[from..to].iter().map(|&p| trips_at[p]).sum();
+            // The sum saturates. A read weighs its nest's trips, `u64::MAX` for
+            // a nest priced past `u64`, so adding two such reads would overflow;
+            // a value read that deep weighs the most a weight can and compiles.
+            let reloads = own[from..to]
+                .iter()
+                .map(|&p| trips_at[p])
+                .fold(0, usize::saturating_add);
             let latch_stores = match param {
                 true => usize::try_from(facts.trips).unwrap_or(usize::MAX),
                 false => 0,
             };
             chosen.push(l);
             candidates.push(Candidate {
-                weight: reloads + latch_stores,
+                weight: reloads.saturating_add(latch_stores),
                 class: file,
                 live_across: inside[l].clone(),
                 root: (id as u64, l),

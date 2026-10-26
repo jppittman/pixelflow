@@ -18,7 +18,7 @@
 use pixelflow_codegen::CompileError;
 use pixelflow_codegen::emit::compile;
 use pixelflow_ir::arena::{BufferDecl, BufferIdentity};
-use pixelflow_ir::fold::{Binder, Fold, Monoid};
+use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 use pixelflow_ir::{ExprArena, ExprId, LatticeShape, OpKind};
 
 const ROWS: u32 = 2;
@@ -26,7 +26,7 @@ const ORIGIN: [f32; 2] = [3.0, 7.0];
 /// More than one batch on every tier (4, 8 and 16 lanes would leave
 /// remainders of 1, 5 and 5), so the column fold has a main range.
 const WIDE: usize = 37;
-const PIECES: u32 = 5;
+const PIECES: u64 = 5;
 
 /// `Σ_{i<5} (x/2 + y/4 + i/8)`: a surviving fold whose body varies with the
 /// column, so the lattice's column fold is not hoisted out from under it.
@@ -40,7 +40,12 @@ fn kernel() -> (ExprArena, ExprId) {
     let si = a.push_binary(OpKind::Mul, i, eighth);
     let column = a.push_binary(OpKind::Add, sx, sy);
     let body = a.push_binary(OpKind::Add, column, si);
-    let root = a.push_reduce(Fold::new(Monoid::SUM, binder, 0..PIECES), body);
+    let root = a.push_reduce(
+        Fold::new(Monoid::SUM, binder),
+        Bound::Lit(0),
+        Bound::Lit(PIECES),
+        body,
+    );
     (a, root)
 }
 
@@ -94,9 +99,16 @@ fn a_fold_the_kernel_writes_over_nothing_is_its_identity() {
     let binder = Binder::from_slot(0).expect("slot 0 exists");
     let [x, y, i] = [0, 1, binder.var()].map(|v| a.push_var(v));
     let body = a.push_binary(OpKind::Mul, i, x);
-    let none = |monoid| Fold::new(monoid, binder, 0..0);
-    let sum = a.push_reduce(none(Monoid::SUM), body);
-    let product = a.push_reduce(none(Monoid::PRODUCT), body);
+    let none = |a: &mut ExprArena, monoid| {
+        a.push_reduce(
+            Fold::new(monoid, binder),
+            Bound::Lit(0),
+            Bound::Lit(0),
+            body,
+        )
+    };
+    let sum = none(&mut a, Monoid::SUM);
+    let product = none(&mut a, Monoid::PRODUCT);
     let left = a.push_binary(OpKind::Add, x, sum);
     let right = a.push_binary(OpKind::Add, y, product);
     let root = a.push_binary(OpKind::Mul, left, right);
@@ -139,12 +151,17 @@ fn read_at(address: impl FnOnce(&mut ExprArena) -> ExprId) -> (ExprArena, ExprId
 
 /// `∂/∂x` of a read addressed by `Π_{i<trips}(i·x)`: a table read whose
 /// address names the differentiated axis through a fold.
-fn dx_of_a_read_addressed_by_a_fold(trips: u32) -> (ExprArena, ExprId) {
+fn dx_of_a_read_addressed_by_a_fold(trips: u64) -> (ExprArena, ExprId) {
     let (mut a, read) = read_at(|a| {
         let binder = Binder::from_slot(0).expect("slot 0 exists");
         let [x, i] = [0, binder.var()].map(|v| a.push_var(v));
         let body = a.push_binary(OpKind::Mul, i, x);
-        a.push_reduce(Fold::new(Monoid::PRODUCT, binder, 0..trips), body)
+        a.push_reduce(
+            Fold::new(Monoid::PRODUCT, binder),
+            Bound::Lit(0),
+            Bound::Lit(trips),
+            body,
+        )
     });
     let axis = a.push_const(0.0);
     let root = a.push_binary(OpKind::Dwrt, read, axis);

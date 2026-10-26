@@ -16,7 +16,9 @@ under a cost. `Optimizer::run` is its one entry; the five laws of §8 are its co
 - The budget: `Budget` resolves to `Limits` (iterations, minted ids, applications); `SaturationConfig`
   picks the tier from the input.
 - Extraction and cost: the tree and shared DP arms and their arbiter, `Selection`. `cost(If) = cost(m) +
-  (cost(a)+cost(b))/2 + cost(select)`; a fold costs `len·body + (len−1)·combine`; a surviving `Dwrt`
+  (cost(a)+cost(b))/2 + cost(select)`; a fold costs `n·body + (n−1)·combine`, plus its value bounds once;
+  `n` is read off its node when its range is known (`ENode::known_range`, per node: after `HalveFold` a class
+  holds two ranges), else off its bounds' chosen literals, else `Fold::ESTIMATED_TRIPS`; a surviving `Dwrt`
   costs `LEGALIZATION_PRICE`. The fold rewrites and the chain rule are here; other rule bodies are `crate::math`.
 - The guided loop, provenance journal, labeler and growth telemetry: research, off in production.
 
@@ -54,8 +56,10 @@ under a cost. `Optimizer::run` is its one entry; the five laws of §8 are its co
   reversing guide that does not exist; the plan's `optimizer_laws.rs` was deleted. L4 has no test.
 - L5's argmin half is violated and two docs lag the code: DENOTATION §8 and the `Optimizer::cost` doc say
   sharing is never priced, but `extract_dag_over` also runs `shared_dag_dp_pass` and keeps the cheaper by
-  `dag_cost`. Both arms are greedy (BACKLOG E5); a fold ties its unrolling and insertion order decides
-  (E6); `Reranker` has no implementation outside tests.
+  `dag_cost`. Both arms are greedy (BACKLOG E5); a fold over a known range ties its unrolling and insertion
+  order decides (E6); `Reranker` has no implementation outside tests.
+- A value bound's pick is unconstrained: a class read as a bound can settle on a member that reads a coordinate,
+  and `ExprArena::push_reduce` refuses it by name; pinned in `fold_rules.rs`, left loud until a kernel hits it.
 - No test pins `cost(If)` directly; `SETTLEMENT_DIGESTS` in `extract.rs` holds it.
 - `Vocabulary` still admits `Gather` and `ENode::Buffer`; the language has no bound buffers
   (kernels-evaluate-kernels, 2026-10-15). `mod.rs` lists an `extraction` module that does not exist and

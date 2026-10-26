@@ -7,17 +7,21 @@
 //! blocks, and the lattice's store.
 
 use super::build::{Builder, Pending};
-use super::traffic::scope_ix;
+use super::traffic::{Trips, scope_ix};
 use super::{Edges, Entry, Function, IsaBackend, LaneOp, Pointer, Store, Target, Test, Value};
 use crate::error::CompileError;
 use crate::pass::Pass;
 use crate::program::{
-    BinaryOp, CompareOp, Def, Flow, IfArm, Item, ScheduledOp, Scope, ScopedSchedule, ValueId, legal,
+    BinaryOp, CompareOp, Def, Flow, IfArm, Item, ScheduledOp, Scope, ScopedSchedule, ValueId,
+    lane_pattern, legal,
 };
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use pixelflow_ir::fold::{Binder, Fold, Monoid};
+use pixelflow_ir::fold::{Binder, Bound, Fold, KnownRange, Monoid};
+
+/// The step beside a value bound: `FoldHeader::new` admits no other there.
+const UNIT_STRIDE: u64 = 1;
 
 /// Selection: a scoped schedule as one machine function.
 pub(super) struct Select<B: IsaBackend>(pub(super) PhantomData<fn() -> B>);
@@ -63,10 +67,21 @@ struct Selector<'s, B: IsaBackend> {
     /// `Var`, and a store's row and column, find their lane.
     binders: Vec<(Binder, B::Lane)>,
     /// Each open loop's index in the function's loops, and how many times its
-    /// body runs per call.
-    loops: Vec<(usize, u64)>,
+    /// body runs per call, or an estimate's price where a fold's range is not
+    /// known.
+    loops: Vec<(usize, Trips)>,
     /// Scheduled ops selected, per scope.
     scheduled: Vec<u64>,
+}
+
+/// A surviving `Reduce` as selection meets it: one field per field of
+/// [`ScheduledOp::Reduce`].
+#[derive(Clone, Copy)]
+struct Looped {
+    fold: Fold,
+    lo: Bound<ValueId>,
+    hi: Bound<ValueId>,
+    body: ValueId,
 }
 
 /// What one scope has defined. An operand knows by position which class it
@@ -143,7 +158,7 @@ impl<B: IsaBackend> Selector<'_, B> {
             ScheduledOp::Const(_)
                 | ScheduledOp::Seq(..)
                 | ScheduledOp::Var(_)
-                | ScheduledOp::Reduce(..)
+                | ScheduledOp::Reduce { .. }
         ) {
             self.scheduled[scope_ix(scope)] += 1;
         }
@@ -167,14 +182,14 @@ impl<B: IsaBackend> Selector<'_, B> {
                 B::store(&mut self.b, store);
                 return Ok(());
             }
-            ScheduledOp::Reduce(fold, body) => {
+            &ScheduledOp::Reduce { fold, lo, hi, body } => {
                 let j = scoped
                     .folds
                     .iter()
                     .position(|f| f.parent == scope && f.reduce == def.value)
                     .unwrap_or_else(|| panic!("{:?} opens no fold in its scope", def.value));
                 self.scheduled[scope_ix(scope)] += 1;
-                match self.fold(scope, j, (*fold, *body))? {
+                match self.fold(scope, j, Looped { fold, lo, hi, body })? {
                     Some(result) => result,
                     None => return Ok(()),
                 }
@@ -257,22 +272,39 @@ impl<B: IsaBackend> Selector<'_, B> {
     /// It returns the accumulator after the last trip, which dominates the
     /// exit (one predecessor), so the exit takes no parameter. A fold over
     /// the unit monoid has no accumulator and returns `None`.
+    ///
+    /// A value bound starts the counter at its lane plus zero and ends it at
+    /// its lane. The guard around this fold (an `If`'s arm, `passes::legalize`)
+    /// made the range non-empty and within `[0, 2²⁴]`, so the do-while runs
+    /// `hi − lo` trips; the counter and the end stay `f32` lanes, and no count
+    /// becomes an integer on any tier. The zero is what makes the count `-0.0`
+    /// the integer 0 a literal seeds: `-0.0 + 0.0` is `+0.0` under round to
+    /// nearest on every tier, so a body that sees the sign of zero sees the same
+    /// first index from a uniform as from a constant.
     fn fold(
         &mut self,
         parent: Scope,
         j: usize,
-        (fold, body): (Fold, ValueId),
+        looped: Looped,
     ) -> Result<Option<B::Lane>, CompileError> {
+        let Looped { fold, lo, hi, body } = looped;
+        let range = KnownRange::of(fold, lo, hi);
         assert!(
-            !fold.is_empty(),
+            range.is_none_or(|range| !range.is_empty()),
             "an empty fold is its monoid's identity before it reaches selection"
         );
         let accumulates = fold.monoid() != Monoid::SEQ;
-        let range = fold.range();
 
-        let lo = self.constant(range.start as f32)?;
+        let lo = match lo {
+            Bound::Lit(_) => self.bound(lo)?,
+            Bound::Value(_) => {
+                let seed = self.bound(lo)?;
+                let zero = self.constant(0.0)?;
+                self.binary(BinaryOp::Add, seed, zero)?
+            }
+        };
         let seeds: Vec<B::Lane> = if accumulates {
-            alloc::vec![lo, self.constant(fold.monoid().identity())?]
+            alloc::vec![lo, self.constant(lane_pattern(fold.monoid().identity()))?]
         } else {
             alloc::vec![lo]
         };
@@ -282,9 +314,9 @@ impl<B: IsaBackend> Selector<'_, B> {
         let head = self.b.block(&classes, Scope::Fold(j));
         let (parent_loop, parent_trips) = match self.loops.last() {
             Some(&(index, trips)) => (Some(index), trips),
-            None => (None, 1),
+            None => (None, Trips::ONCE),
         };
-        let trips = parent_trips * u64::from(fold.len());
+        let trips = Trips::of(range).nested_in(parent_trips);
         let index = self.b.open_loop(head.label(), parent_loop, trips);
         let head_label = head.label();
         let params: Vec<B::Lane> = head.params().iter().map(|&p| B::param_lane(p)).collect();
@@ -306,9 +338,12 @@ impl<B: IsaBackend> Selector<'_, B> {
             Some(body) => Some(self.binary(legal(fold.combine_op()), params[1], body)?),
             None => None,
         };
-        let stride = self.constant(fold.stride() as f32)?;
+        let stride = range.map_or(UNIT_STRIDE, KnownRange::stride);
+        let stride = self.constant(stride as f32)?;
         let step = self.binary(BinaryOp::Add, binder, stride)?;
-        let end = self.constant(range.end as f32)?;
+        // After the body's frame has popped: a value `hi` resolves in the
+        // scope the fold sits in, or an enclosing one, never in the body's.
+        let end = self.bound(hi)?;
         let done = self.lane(LaneOp::Compare(CompareOp::Ge, step, end))?;
         let exit = self.b.block(&[], parent);
         let args = [Some(step), accumulated]
@@ -369,6 +404,15 @@ impl<B: IsaBackend> Selector<'_, B> {
 
     fn constant(&mut self, value: f32) -> Result<B::Lane, CompileError> {
         self.lane(LaneOp::Const(value))
+    }
+
+    /// The lane of a fold's bound: a literal is a constant, a value is the
+    /// lane its scope (or an enclosing one) defined.
+    fn bound(&mut self, bound: Bound<ValueId>) -> Result<B::Lane, CompileError> {
+        match bound {
+            Bound::Lit(n) => self.constant(n as f32),
+            Bound::Value(value) => Ok(self.lookup(value)),
+        }
     }
 
     fn binary(&mut self, op: BinaryOp, a: B::Lane, b: B::Lane) -> Result<B::Lane, CompileError> {

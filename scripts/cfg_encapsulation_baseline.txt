@@ -113,9 +113,6 @@ pixelflow-runtime/src/engine_troupe.rs	#[cfg(target_os = "macos")]	{
 pixelflow-runtime/src/lib.rs	#[cfg(all(use_web_display, target_arch = "wasm32"))]	pub fn pixelflow_dispatch_event(
 pixelflow-runtime/src/lib.rs	#[cfg(all(use_web_display, target_arch = "wasm32"))]	pub fn pixelflow_init_worker(
 pixelflow-runtime/src/lib.rs	#[cfg(all(use_web_display, target_arch = "wasm32"))]	use wasm_bindgen::prelude::*;
-pixelflow-runtime/src/pixel.rs	#[cfg(not(any(target_os = "macos", target_os = "linux")))]	pub type PlatformPixel = pixelflow_graphics::render::color::Rgba8;
-pixelflow-runtime/src/pixel.rs	#[cfg(target_os = "linux")]	pub type PlatformPixel = pixelflow_graphics::render::color::Bgra8;
-pixelflow-runtime/src/pixel.rs	#[cfg(target_os = "macos")]	pub type PlatformPixel = pixelflow_graphics::render::color::Rgba8;
 pixelflow-runtime/src/platform/waker.rs	#[cfg(all(target_os = "macos", not(use_cocoa_display)))]	pub(crate) fn consume_wake_token() {}
 xtask/src/main.rs	#[cfg(not(target_arch = "x86_64"))]	{
 xtask/src/main.rs	#[cfg(target_arch = "x86_64")]	const ISA_LEVELS: &[IsaLevel] = &[

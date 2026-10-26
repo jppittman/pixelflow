@@ -27,9 +27,10 @@
 //! written down.
 
 use crate::arena::{BufferDecl, UniformDecl};
-use crate::fold::{Binder, Fold};
+use crate::fold::{Binder, Bound, Fold};
 use crate::key::KernelKey;
 use crate::kind::OpKind;
+use crate::lit::Lit;
 
 /// The children of one node, borrowed where they are contiguous.
 ///
@@ -98,10 +99,11 @@ impl<R: Copy> Children<'_, R> {
 pub enum Shape<'a, R> {
     /// Coordinate or bound variable by index.
     Var(u8),
-    /// Literal.
-    Const(f32),
-    /// Macro-parameter slot. Valid only before kernel compilation; an e-graph
-    /// insert declines one rather than inventing a value for it.
+    /// Literal: a number or a mask.
+    Const(Lit),
+    /// Unbound scalar slot: a leaf with no value. Kernel compilation refuses
+    /// one, and a runtime-tier e-graph insert declines it rather than
+    /// inventing a value for it.
     Param(u8),
     /// Bound-memory leaf, carrying the identity that survives a merge.
     Buffer(BufferDecl),
@@ -112,8 +114,8 @@ pub enum Shape<'a, R> {
     /// [`KernelStore`](crate::store::KernelStore) and not in this term. An
     /// e-graph insert holds one as an opaque leaf only when the graph was
     /// told it is a unit and given its variance (the runtime tier's unit
-    /// walk), and otherwise declines it, for the reason it declines a
-    /// `Param`: there is nothing to reason about until something resolves it.
+    /// walk), and otherwise declines it: there is nothing to reason about
+    /// until something resolves it.
     ///
     /// (The `Ref` in [`Ir::Ref`] is unrelated — that is how a representation
     /// *names* one of its own nodes; this is a name for a whole kernel.)
@@ -123,13 +125,19 @@ pub enum Shape<'a, R> {
     /// A fold: `⊕_{k} body[fold.binder() := k]` over its range's visited
     /// indices (see [`Fold`](crate::Fold)'s doc).
     ///
-    /// Deliberately *not* a [`Shape::Op`]. A fold's algebra, binder and range
-    /// are metadata, not operands: handing them to a walker as children is
-    /// what let the combiner's `Const` share an e-class with any literal of
-    /// the same value, and put a trip count within reach of every arithmetic
-    /// rule in the set. The one child is the body, and the binder is bound in
-    /// it — this is the only shape in the language that binds anything.
-    Reduce { fold: Fold, body: R },
+    /// Deliberately *not* a [`Shape::Op`]. A fold's algebra and binder are
+    /// metadata, not operands, and so is a bound that is known: handing them
+    /// to a walker as children is what let the combiner's `Const` share an
+    /// e-class with any literal of the same value, and put a trip count within
+    /// reach of every arithmetic rule in the set. The children are the body
+    /// and each value bound, and the binder is bound in the body — this is the
+    /// only shape in the language that binds anything.
+    Reduce {
+        fold: Fold,
+        lo: Bound<R>,
+        hi: Bound<R>,
+        body: R,
+    },
     /// A store — mirrors [`ExprNode::Write`](crate::arena::ExprNode::Write).
     /// One child, the value; the binders are metadata, as a fold's are. An
     /// e-graph `insert` declines one: an effect is not a value any rule may

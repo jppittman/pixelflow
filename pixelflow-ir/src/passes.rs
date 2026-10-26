@@ -1,6 +1,6 @@
 //! IR-to-IR transforms: legalization.
 //!
-//! [`legalize`] runs six passes, each `(arena, root) -> (arena, root)`, each
+//! [`legalize`] runs seven passes, each `(arena, root) -> (arena, root)`, each
 //! turning nodes no backend can emit into nodes every backend can:
 //!
 //! | pass | consumes | produces |
@@ -11,6 +11,7 @@
 //! | [`lattice::pack`] | `collapse`'s degenerate `[0,1)` lane fold | the same folds strip-mined to the target's lane width |
 //! | [`expand_gather`] | `Gather` | index arithmetic + `RawGather` |
 //! | [`expand_transcendentals`] | `Sin`..`Pow` | arithmetic + bit-manip atoms |
+//! | `guard` (crate-private, `passes/guard.rs`) | a `Reduce` with a value bound | `If(dom, If(Lt(lo, hi), Reduce, identity), NaN)`: NaN unless every value bound is a count, an integer in `0..=2²⁴`, and the identity over an empty range (L5, L2) |
 //!
 //! The order in that table is the order they must run: differentiating a `sin`
 //! produces a `cos`, so `lower_dwrt` has to go before the pass that expands
@@ -18,12 +19,17 @@
 //! everything; a derivative is taken with respect to `X` before `collapse`
 //! substitutes `X` away, and a read's address arithmetic is built
 //! over the lattice's binders after it, so the two lattice passes sit between
-//! (docs/archive/plans/2026-09-16-collapse-is-a-fold.md §2.3). Every pass is
-//! idempotent and has an identity fast-path, so running one that has nothing
-//! to do is free — except the two lattice passes, which always wrap: after
-//! them no coordinate `Var` exists and the root is a `Reduce` over the unit
-//! monoid whose body is a `Write`. That is the shape every backend emits, and
-//! the only shape.
+//! (docs/archive/plans/2026-09-16-collapse-is-a-fold.md §2.3). The guard goes
+//! last, so no pass after it rebuilds the `If` lowering relies on. Every pass
+//! but the guard and the two lattice passes is idempotent: the guard wraps every
+//! value-bounded fold it meets, its own output's included, `collapse` wraps its
+//! input in the lattice's folds, and `pack` takes `collapse`'s own output and
+//! nothing else, so `legalize` runs each of the three once. Every pass but the
+//! lattice passes has an identity fast-path, so running one that has nothing to
+//! do is free (the guard leaves a kernel whose bounds are all literals
+//! untouched); the two lattice passes always wrap: after them no coordinate
+//! `Var` exists and the root is a `Reduce` over the unit monoid whose body is a
+//! `Write`. That is the shape every backend emits, and the only shape.
 //!
 //! **`Reduce` is legal in the arena and [`legalize`] leaves every one
 //! standing**, nested or not: codegen emits a surviving fold as a loop, and a
@@ -56,6 +62,7 @@
 
 use crate::arena::{ExprArena, ExprId, ExprNode};
 use crate::kind::OpKind;
+use crate::lit::Lit;
 use crate::variance::Variance;
 use alloc::borrow::Cow;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -64,6 +71,8 @@ use alloc::vec::Vec;
 /// The lattice's own two folds — `collapse(extent)`, `pack(lanes)` — as
 /// legalize passes. See the module doc above for their place in the order.
 pub mod lattice;
+
+mod guard;
 
 /// Run every legalization pass, in the one order they compose in, for the
 /// collapse `collapse` describes: the kernel comes back wrapped in the
@@ -75,6 +84,10 @@ pub mod lattice;
 /// `CompileWorkspace` came to run none of them *and* skip the guard that
 /// refuses a surviving `Dwrt`. An order that has to be retyped is an order
 /// that can be forgotten.
+///
+/// A fold whose bound is a value comes back inside its guard: NaN where a
+/// bound is not a count (an integer in `0..=2²⁴`), and the monoid's identity
+/// where the range is empty.
 ///
 /// # Errors
 ///
@@ -112,7 +125,10 @@ pub fn legalize(
     // `'@'` alone 655,866 B -> 478,404 B. Saturation is unmoved (2,534 ms ->
     // 2,569 ms), which is the point of legalizing last.
     let (arena, root) = expand_gather_owned(&arena, root);
-    Ok(expand_transcendentals_owned(&arena, root))
+    let (arena, root) = expand_transcendentals_owned(&arena, root);
+    // The guard is last: nothing after it rebuilds the `If` that holds a
+    // value-bounded fold's loop, and lowering asserts that shape.
+    Ok(guard::guard_value_bounds_owned(arena, root))
 }
 
 /// Whether `op` is a unary transcendental this pass expands.
@@ -220,7 +236,7 @@ fn copy_node(
 ) -> ExprId {
     match node {
         ExprNode::Var(i) => arena.push_var(*i),
-        ExprNode::Const(v) => arena.push_const(*v),
+        ExprNode::Const(v) => arena.push_lit(*v),
         ExprNode::Param(i) => arena.push_param(*i),
         // Same arena, so the buffer and uniform tables (and ids) stay valid.
         ExprNode::Buffer(b) => arena.push_buffer(*b),
@@ -234,7 +250,9 @@ fn copy_node(
             let mapped: Vec<ExprId> = children.into_iter().map(&m).collect();
             arena.push_nary(*op, &mapped)
         }
-        ExprNode::Reduce { fold, body } => arena.push_reduce(*fold, m(*body)),
+        ExprNode::Reduce { fold, lo, hi, body } => {
+            arena.push_reduce(*fold, lo.map(m), hi.map(m), m(*body))
+        }
         // The binders are metadata, copied as a fold's are; the value is
         // the one child.
         ExprNode::Write {
@@ -513,8 +531,8 @@ pub fn lower_dwrt(arena: &mut ExprArena, root: ExprId) -> Result<ExprId, &'stati
     try_rebuild_arena(arena, root, |arena, node, m| match node {
         ExprNode::Binary(OpKind::Dwrt, expr, var) => {
             let var_idx = match arena.node(m(*var)) {
-                ExprNode::Const(v) => v as u8,
-                _ => return Err("lower_dwrt: Dwrt's variable operand must be a Const"),
+                ExprNode::Const(Lit::Real(v)) => v as u8,
+                _ => return Err("lower_dwrt: Dwrt's variable operand must be a real Const"),
             };
             differentiate(arena, m(*expr), var_idx).map(Some)
         }
@@ -665,7 +683,7 @@ fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
             // d = 0 without touching the operand.
             OpKind::Floor | OpKind::Ceil | OpKind::Round => {}
             // No rule: the error surfaces at the node, not its children.
-            OpKind::TruncToInt | OpKind::IntToFloat => {}
+            OpKind::TruncToInt | OpKind::IntToFloat | OpKind::Bits | OpKind::Float => {}
             _ => stack.push(a),
         },
         ExprNode::Binary(op, a, b) => match op {
@@ -726,7 +744,11 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
                 OpKind::Floor | OpKind::Ceil | OpKind::Round => {
                     return Ok(arena.push_const(0.0));
                 }
-                OpKind::TruncToInt | OpKind::IntToFloat => {
+                // The conversions, and the reinterpretations: `Real → Int`
+                // and back are not `Real → Real`, so there is no derivative
+                // to take. Refused by name until the arena's types make the
+                // case unbuildable (docs/language/2026-10-17-the-arena-is-typed.md T5).
+                OpKind::TruncToInt | OpKind::IntToFloat | OpKind::Bits | OpKind::Float => {
                     return Err("lower_dwrt: cannot differentiate integer/bit-manipulation ops");
                 }
                 _ => {}
@@ -964,11 +986,11 @@ fn sqrt_one_minus_sq(arena: &mut ExprArena, u: ExprId) -> ExprId {
 }
 
 fn is_const_zero(arena: &ExprArena, id: ExprId) -> bool {
-    matches!(arena.node(id), ExprNode::Const(v) if v == 0.0)
+    matches!(arena.node(id), ExprNode::Const(Lit::Real(v)) if v == 0.0)
 }
 
 fn is_const_one(arena: &ExprArena, id: ExprId) -> bool {
-    matches!(arena.node(id), ExprNode::Const(v) if v == 1.0)
+    matches!(arena.node(id), ExprNode::Const(Lit::Real(v)) if v == 1.0)
 }
 
 // Peephole constructors for derivative arithmetic. Most leaf derivatives are
@@ -1159,9 +1181,10 @@ fn expand_atan2(arena: &mut ExprArena, y: ExprId, x: ExprId) -> ExprId {
 ///
 /// Split `x = xi + xf` (xi integer, xf ∈ [0,1)); approximate `2^xf` by the
 /// degree-5 Taylor polynomial [`EXP2_POLY`]; reconstruct `2^xi` by writing the IEEE-754
-/// exponent field directly: `2^xi = bitcast((int(xi) + 127) << 23)`. Built from
-/// the bit-manip primitives (`TruncToInt`/`IntToFloat`/`IAdd`/`Shl`) — these are
-/// the float↔int conversions a backend cannot avoid for exp/log.
+/// exponent field directly: `2^xi = Float((int(xi) + 127) << 23)`. Built from
+/// the integer-domain primitives (`TruncToInt`/`IAdd`/`Shl`), with the
+/// reinterpretation back to a real spelled as the `Float` node it is — the
+/// same register, no instruction — rather than left to a comment.
 fn expand_exp2(arena: &mut ExprArena, arg_x: ExprId) -> ExprId {
     // Clamp to a safe exponent range to avoid int overflow / inf.
     let lo = arena.push_const(-EXP2_CLAMP);
@@ -1180,13 +1203,15 @@ fn expand_exp2(arena: &mut ExprArena, arg_x: ExprId) -> ExprId {
         p = horner_step(arena, p, xf, c);
     }
 
-    // 2^xi = bitcast((int(xi) + 127) << 23).
+    // 2^xi = Float((int(xi) + 127) << 23): the biased exponent, shifted into
+    // its field, read back as the real whose bits those are.
     let xi_int = arena.push_unary(OpKind::TruncToInt, xi);
     let bias = arena.push_const(f32::from_bits(127)); // integer 127 as lane bits
     let biased = arena.push_binary(OpKind::IAdd, xi_int, bias);
     // A literal `ShiftCount::from_literal` accepts, so the emitter takes it as written.
     let shift = arena.push_const(23.0);
-    let pow2i = arena.push_binary(OpKind::Shl, biased, shift); // bitcast result
+    let pow2i_bits = arena.push_binary(OpKind::Shl, biased, shift);
+    let pow2i = arena.push_unary(OpKind::Float, pow2i_bits);
 
     // 2^x = 2^xf · 2^xi
     let val = arena.push_binary(OpKind::Mul, p, pow2i);
@@ -1212,19 +1237,22 @@ fn expand_exp2(arena: &mut ExprArena, arg_x: ExprId) -> ExprId {
 /// Uses `If` on a `Ge` mask for the range reduction, so (like the other
 /// bit-manipulating expansions) this is value-path only.
 fn expand_log2(arena: &mut ExprArena, x: ExprId) -> ExprId {
-    // Reinterpret x's bits as int (free) and extract exponent: e = (bits >> 23) - 127.
-    // Shift amount read by value -> plain 23.0.
+    // x's bits, as the integer they are: the one node both fields below read.
+    let bits = arena.push_unary(OpKind::Bits, x);
+
+    // Exponent: e = (bits >> 23) - 127. Shift amount read by value -> plain 23.0.
     let shift23 = arena.push_const(23.0);
-    let exp_field = arena.push_binary(OpKind::Shr, x, shift23); // int lanes
+    let exp_field = arena.push_binary(OpKind::Shr, bits, shift23);
     let exp_f = arena.push_unary(OpKind::IntToFloat, exp_field);
     let bias = arena.push_const(127.0);
     let e = arena.push_binary(OpKind::Sub, exp_f, bias);
 
-    // Mantissa m = bitcast((bits & 0x007FFFFF) | 0x3F800000) ∈ [1, 2).
+    // Mantissa m = Float((bits & 0x007FFFFF) | 0x3F800000) ∈ [1, 2).
     let mant_mask = arena.push_const(f32::from_bits(0x007F_FFFF));
     let one_bits = arena.push_const(f32::from_bits(0x3F80_0000));
-    let mant = arena.push_binary(OpKind::BitAnd, x, mant_mask);
-    let m = arena.push_binary(OpKind::BitOr, mant, one_bits);
+    let mant = arena.push_binary(OpKind::BitAnd, bits, mant_mask);
+    let m_bits = arena.push_binary(OpKind::BitOr, mant, one_bits);
+    let m = arena.push_unary(OpKind::Float, m_bits);
 
     // Range-reduce: if m ≥ √2 { m /= 2; e += 1 } so t = m − 1 ∈ [−0.293, 0.414].
     let sqrt2 = arena.push_const(core::f32::consts::SQRT_2);
@@ -1326,7 +1354,7 @@ pub const EXP2_POLY: [f32; 6] = [
 
 /// Exponent range `exp2` saturates to, rather than overflowing to `inf`.
 ///
-/// `2^n` is built as `bitcast((int(n) + 127) << 23)`, so an unclamped `n` past
+/// `2^n` is built as `Float((int(n) + 127) << 23)`, so an unclamped `n` past
 /// this walks out of the exponent field and produces a value that is not a
 /// power of two at all. CLAUDE.md lists the saturation as behavior every target
 /// agrees on; clamping here is what makes that true.
@@ -1503,7 +1531,7 @@ fn horner_step(arena: &mut ExprArena, acc: ExprId, x: ExprId, add: ExprId) -> Ex
 #[cfg(test)]
 mod dwrt_tests {
     use super::*;
-    use crate::fold::{Binder, Fold, Monoid};
+    use crate::fold::{Binder, Bound, Fold, KNOWN_RANGE, Monoid};
 
     /// The first reduction binder — `Var(4)`, which these folds bind.
     fn binder() -> Binder {
@@ -1548,7 +1576,12 @@ mod dwrt_tests {
         // Differentiating a fold has no rule here: the pass must refuse.
         let mut a = ExprArena::new();
         let body = a.push_var(4);
-        let red = a.push_reduce(Fold::new(Monoid::SUM, binder(), 0..4), body);
+        let red = a.push_reduce(
+            Fold::new(Monoid::SUM, binder()),
+            Bound::Lit(0),
+            Bound::Lit(4),
+            body,
+        );
         let v0 = a.push_const(0.0);
         let root = a.push_binary(OpKind::Dwrt, red, v0);
         assert!(lower_dwrt_owned(&a, root).is_err());
@@ -1557,22 +1590,48 @@ mod dwrt_tests {
     /// A uniform is a value, never an extent — and that used to need a test,
     /// because the extent was a `Const` child and an arena could be
     /// hand-built (or *rewritten*) into holding a `Uniform` there, at which
-    /// point the unroll would have read a slot index as a trip count. The
-    /// extent is a field of [`Fold`] now, so there is no slot to put a
-    /// uniform in and no panic left to pin. The property below — the other
-    /// side of the same rule — is the half that was always about semantics.
+    /// point the unroll would have read a slot index as a trip count. A known
+    /// extent is a `Bound::Lit` in the `Reduce` node's `lo` and `hi`, header
+    /// data and never an `ExprId`, so there is no child to put a uniform in.
+    /// A `Bound::Value` is a child after the body, which the next test pins;
+    /// the property below — the other side of the same rule — is the half that
+    /// was always about semantics.
     #[test]
     fn an_extent_is_not_an_expression() {
         let mut a = ExprArena::new();
         let body = a.push_var(4);
-        let red = a.push_reduce(Fold::new(Monoid::SUM, binder(), 0..4), body);
-        let ExprNode::Reduce { fold, .. } = a.node(red) else {
+        let red = a.push_reduce(
+            Fold::new(Monoid::SUM, binder()),
+            Bound::Lit(0),
+            Bound::Lit(4),
+            body,
+        );
+        let ExprNode::Reduce { .. } = a.node(red) else {
             panic!("expected a range fold");
         };
-        assert_eq!(fold.len(), 4);
+        assert_eq!(a.known_range(red).expect(KNOWN_RANGE).len(), 4);
         // The trip count is not reachable from the node's children, so no
         // rewrite can substitute anything for it.
         assert_eq!(a.children(red).count(), 1);
+    }
+
+    /// A bound that is a value *is* a child, after the body: the term a rewrite
+    /// can reach, so a uniform count is substitutable where a literal one is
+    /// not. The fold's range is then not known.
+    #[test]
+    fn a_value_bound_is_a_child_after_the_body() {
+        let mut a = ExprArena::new();
+        let body = a.push_var(4);
+        let decl = a.declare_uniform(crate::Uniform::new(4.0).decl());
+        let count = a.push_uniform(decl);
+        let red = a.push_reduce(
+            Fold::new(Monoid::SUM, binder()),
+            Bound::Lit(0),
+            Bound::Value(count),
+            body,
+        );
+        assert_eq!(a.children(red).collect::<Vec<_>>(), [body, count]);
+        assert_eq!(a.known_range(red), None);
     }
 
     /// `is_err()` alone can't tell a specific "no rule for this op" message
@@ -1585,47 +1644,36 @@ mod dwrt_tests {
         const BOUND_MEMORY: &str = "lower_dwrt: cannot differentiate a bound-memory read";
         const INT_BIT: &str = "lower_dwrt: cannot differentiate integer/bit-manipulation ops";
 
-        // TruncToInt: no derivative for a discontinuous bit-reinterpret.
-        // Wrapping a Gather (itself undifferentiable) distinguishes this
-        // arm's own message from a leaked child error — if
-        // `push_deriv_children`'s TruncToInt/IntToFloat arm wrongly marked
-        // the operand as needing a derivative, the child's `BOUND_MEMORY`
-        // error would surface here instead of `INT_BIT`.
+        // The unary integer-domain arm: the two conversions and the two
+        // reinterpretations. Each is its own alternative in the grouped arm,
+        // so each is tried. Wrapping a Gather (itself undifferentiable)
+        // distinguishes the arm's own message from a leaked child error — if
+        // `push_deriv_children`'s arm wrongly marked the operand as needing a
+        // derivative, the child's `BOUND_MEMORY` error would surface here
+        // instead of `INT_BIT`.
         use crate::arena::{BufferDecl, BufferIdentity};
-        let mut a = ExprArena::new();
-        let b = a.declare_buffer(BufferDecl {
-            id: BufferIdentity::mint(),
-            width: 2,
-            height: 1,
-        });
-        let gx = a.push_var(0);
-        let zero = a.push_const(0.0);
-        let g = a.push_gather(b, gx, zero);
-        let e = a.push_unary(OpKind::TruncToInt, g);
-        let v0 = a.push_const(0.0);
-        let root = a.push_binary(OpKind::Dwrt, e, v0);
-        match lower_dwrt_owned(&a, root) {
-            Err(msg) => assert_eq!(msg, INT_BIT),
-            Ok(_) => panic!("expected {INT_BIT:?}"),
-        }
-
-        // IntToFloat, the other half of the unary integer-domain arm. Wrapped
-        // around a Gather for the same reason as TruncToInt above.
-        let mut a = ExprArena::new();
-        let b = a.declare_buffer(BufferDecl {
-            id: BufferIdentity::mint(),
-            width: 2,
-            height: 1,
-        });
-        let gx = a.push_var(0);
-        let zero = a.push_const(0.0);
-        let g = a.push_gather(b, gx, zero);
-        let e = a.push_unary(OpKind::IntToFloat, g);
-        let v0 = a.push_const(0.0);
-        let root = a.push_binary(OpKind::Dwrt, e, v0);
-        match lower_dwrt_owned(&a, root) {
-            Err(msg) => assert_eq!(msg, INT_BIT),
-            Ok(_) => panic!("expected {INT_BIT:?}"),
+        for op in [
+            OpKind::TruncToInt,
+            OpKind::IntToFloat,
+            OpKind::Bits,
+            OpKind::Float,
+        ] {
+            let mut a = ExprArena::new();
+            let b = a.declare_buffer(BufferDecl {
+                id: BufferIdentity::mint(),
+                width: 2,
+                height: 1,
+            });
+            let gx = a.push_var(0);
+            let zero = a.push_const(0.0);
+            let g = a.push_gather(b, gx, zero);
+            let e = a.push_unary(op, g);
+            let v0 = a.push_const(0.0);
+            let root = a.push_binary(OpKind::Dwrt, e, v0);
+            match lower_dwrt_owned(&a, root) {
+                Err(msg) => assert_eq!(msg, INT_BIT, "for {op:?}"),
+                Ok(_) => panic!("expected {INT_BIT:?} for {op:?}"),
+            }
         }
 
         // IAdd/Shl/Shr/BitAnd/BitOr: integer/bit-manipulation primitives, at
@@ -1725,7 +1773,7 @@ mod dwrt_tests {
         let (lowered, lroot) =
             lower_dwrt_owned(&a, root).expect("a binder-indexed read is a constant");
         assert!(
-            matches!(lowered.node(lroot), ExprNode::Const(v) if v == 0.0),
+            matches!(lowered.node(lroot), ExprNode::Const(Lit::Real(v)) if v == 0.0),
             "expected Const(0.0), got {:?}",
             lowered.node(lroot)
         );
@@ -1739,7 +1787,7 @@ mod dwrt_tests {
         let (lowered, lroot) =
             lower_dwrt_owned(&a, root).expect("a binder-indexed read is a constant");
         assert!(
-            matches!(lowered.node(lroot), ExprNode::Const(v) if v == 0.0),
+            matches!(lowered.node(lroot), ExprNode::Const(Lit::Real(v)) if v == 0.0),
             "expected Const(0.0), got {:?}",
             lowered.node(lroot)
         );
@@ -1761,7 +1809,7 @@ mod dwrt_tests {
         let (lowered, lroot) =
             lower_dwrt_owned(&a, root).expect("an X-indexed read is constant in Y");
         assert!(
-            matches!(lowered.node(lroot), ExprNode::Const(v) if v == 0.0),
+            matches!(lowered.node(lroot), ExprNode::Const(Lit::Real(v)) if v == 0.0),
             "expected Const(0.0), got {:?}",
             lowered.node(lroot)
         );
@@ -1903,7 +1951,7 @@ impl Optimize for LowerDwrt {
 #[cfg(test)]
 mod nested_reduce_tests {
     use super::*;
-    use crate::fold::{Binder, Fold, Monoid};
+    use crate::fold::{Binder, Bound, Fold, KNOWN_RANGE, Monoid};
 
     /// Every `Reduce` reachable from `root`.
     fn reachable_reduces(arena: &ExprArena, root: ExprId) -> usize {
@@ -1940,12 +1988,22 @@ mod nested_reduce_tests {
         let inner_binder = Binder::from_slot(0).expect("slot 0 exists");
         let i = a.push_var(inner_binder.var());
         let inner_body = a.push_binary(OpKind::Add, x, i);
-        let inner = a.push_reduce(Fold::new(Monoid::SUM, inner_binder, 0..3), inner_body);
+        let inner = a.push_reduce(
+            Fold::new(Monoid::SUM, inner_binder),
+            Bound::Lit(0),
+            Bound::Lit(3),
+            inner_body,
+        );
 
         let outer_binder = Binder::from_slot(1).expect("slot 1 exists");
         let j = a.push_var(outer_binder.var());
         let outer_body = a.push_binary(OpKind::Add, inner, j);
-        let root = a.push_reduce(Fold::new(Monoid::SUM, outer_binder, 0..2), outer_body);
+        let root = a.push_reduce(
+            Fold::new(Monoid::SUM, outer_binder),
+            Bound::Lit(0),
+            Bound::Lit(2),
+            outer_body,
+        );
 
         let origin = |default| UniformDecl {
             id: UniformIdentity::mint(),
@@ -1969,10 +2027,19 @@ mod nested_reduce_tests {
             panic!("root must be the lattice's row fold");
         };
         assert_eq!(fold.monoid(), Monoid::SEQ);
-        assert_eq!(fold.range(), 0..1);
+        assert_eq!(
+            legalized.known_range(new_root).expect(KNOWN_RANGE).range(),
+            0..1
+        );
+        // A fold's range is read through the arena, which panics on any other
+        // node: keep the shape check first.
+        let ranges_over = |id: ExprId, range: core::ops::Range<u64>| {
+            matches!(legalized.node(id), ExprNode::Reduce { .. })
+                && legalized.known_range(id).expect(KNOWN_RANGE).range() == range
+        };
         let outer = (0..legalized.len())
             .map(|k| ExprId(k as u32))
-            .find(|id| matches!(legalized.node(*id), ExprNode::Reduce { fold, .. } if fold.range() == (0..2)))
+            .find(|id| ranges_over(*id, 0..2))
             .expect("the outer kernel fold survives");
         let ExprNode::Reduce { body, .. } = legalized.node(outer) else {
             unreachable!()
@@ -1981,9 +2048,97 @@ mod nested_reduce_tests {
             panic!("the outer body must still be `inner + j`");
         };
         assert!(
-            matches!(legalized.node(lhs), ExprNode::Reduce { fold, .. } if fold.range() == (0..3)),
+            ranges_over(lhs, 0..3),
             "the inner Reduce must be the outer body's own operand, not unrolled into it"
         );
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+    use crate::fold::{Binder, Bound, Fold, KNOWN_RANGE, Monoid};
+    use crate::lit::Lit;
+
+    /// `legalize` of `X + Σ_{k<u} k` at `[4, 2]` with four lanes: the kernel
+    /// comes back wrapped in the lattice's three folds, whose ranges are
+    /// literal, and the `Write`'s value reads the sum only through its guard.
+    #[test]
+    fn legalize_guards_a_value_bounded_fold_inside_the_lattice() {
+        use crate::variance::LatticeShape;
+
+        let mut a = ExprArena::new();
+        let slot = a.declare_uniform(crate::Uniform::new(8.0).decl());
+        let u = a.push_uniform(slot);
+        let binder = Binder::from_slot(0).expect("slot 0 exists");
+        let k = a.push_var(binder.var());
+        let sum = a.push_reduce(
+            Fold::new(Monoid::SUM, binder),
+            Bound::Lit(0),
+            Bound::Value(u),
+            k,
+        );
+        let x = a.push_var(0);
+        let root = a.push_binary(OpKind::Add, x, sum);
+
+        let origin = |default| crate::Uniform::new(default).decl();
+        let collapse = lattice::Collapse {
+            domain: lattice::Domain {
+                shape: LatticeShape::new([4, 2]),
+                origin: [origin(0.0), origin(0.0)],
+            },
+            lanes: 4,
+        };
+        let (legalized, new_root) = legalize(&a, root, &collapse).expect("legalize");
+
+        // An arena keeps the nodes a rebuild replaced, so only what the root
+        // reaches is the legalized kernel.
+        let mut seen = alloc::vec![false; legalized.len()];
+        let mut stack = alloc::vec![new_root];
+        let mut reachable = Vec::new();
+        while let Some(id) = stack.pop() {
+            if !core::mem::replace(&mut seen[id.0 as usize], true) {
+                reachable.push(id);
+                stack.extend(legalized.children(id));
+            }
+        }
+        let (valued, lattice): (Vec<ExprId>, Vec<ExprId>) = reachable
+            .iter()
+            .copied()
+            .filter(|id| matches!(legalized.node(*id), ExprNode::Reduce { .. }))
+            .partition(|id| legalized.known_range(*id).is_none());
+        assert_eq!(
+            valued.len(),
+            1,
+            "the kernel's fold is the one whose range is a value"
+        );
+        assert_eq!(lattice.len(), 3, "the row, column and lane folds");
+        for fold in lattice {
+            let range = legalized.known_range(fold).expect(KNOWN_RANGE);
+            assert!(!range.is_empty());
+        }
+
+        let write = reachable
+            .iter()
+            .find_map(|id| match legalized.node(*id) {
+                ExprNode::Write { value, .. } => Some(value),
+                _ => None,
+            })
+            .expect("the lattice's store");
+        let ExprNode::Binary(OpKind::Add, _, guarded) = legalized.node(write) else {
+            panic!("the store's value is `x + sum`");
+        };
+        let ExprNode::Ternary(OpKind::If, _, ran, nan) = legalized.node(guarded) else {
+            panic!("the sum reaches the store through its guard");
+        };
+        assert!(matches!(
+            legalized.node(nan),
+            ExprNode::Const(Lit::Real(v)) if v.is_nan()
+        ));
+        let ExprNode::Ternary(OpKind::If, _, fold, _) = legalized.node(ran) else {
+            panic!("the guard's true arm is the range test");
+        };
+        assert_eq!(fold, valued[0]);
     }
 }
 
@@ -2063,7 +2218,7 @@ mod ref_expansion_tests {
             panic!("expected X + 7, got {}", linked.display(a));
         };
         assert_eq!(linked.node(x), ExprNode::Var(0));
-        assert_eq!(linked.node(c), ExprNode::Const(7.0));
+        assert_eq!(linked.node(c), ExprNode::Const(Lit::Real(7.0)));
     }
 
     /// `lower_dwrt` on its own refuses a reference rather than inventing a

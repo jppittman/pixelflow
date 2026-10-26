@@ -32,10 +32,15 @@ pub mod dyadic;
 /// binds, and the domain that index runs over. See the module docs for why
 /// those are a type rather than three `Const` children.
 pub mod fold;
-pub use fold::{Binder, Fold, Monoid, Placeholder};
+pub use fold::{Binder, Bound, Fold, FoldHeader, KnownRange, Monoid, Placeholder};
 
 pub mod kind;
 pub mod library;
+
+/// A constant is a typed literal: a number or a mask, never a lane whose
+/// bits mean one or the other by convention.
+pub mod lit;
+pub use lit::Lit;
 
 pub mod variance;
 

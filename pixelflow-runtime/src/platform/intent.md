@@ -9,7 +9,8 @@ interrupts that platform's blocking poll from another thread. No logic of its ow
 - The selection of `linux/` or `macos/`, as `#[cfg]` on `mod` items and on
   single-line `pub use` and `pub type` items in `mod.rs`.
 - `ActivePlatform` (`PlatformActor<LinuxOps>` or `<MetalOps>`), `PlatformDriver`
-  (the `DriverActor` over it), and `PlatformPixel` (`Bgra8` on Linux, else `Rgba8`).
+  (the `DriverActor` over it), and the re-export of graphics' `PlatformPixel`
+  (`Bgra8` on Linux, else `Rgba8`), also re-exported through `pixel.rs`.
 - `EventLoopWaker` and its implementations (`X11Waker`, `CocoaWaker`,
   `NoOpWaker`), and the macOS wake-token coalescing (`consume_wake_token`).
 
@@ -40,10 +41,6 @@ and `consume_wake_token` (`use_cocoa_display`).
   no platform module in the loop.
 
 ## Behind
-- `PlatformPixel` is defined twice, in `pixel.rs` and here, with identical
-  cfgs; `render_coordinator.rs` and `coordinator_node.rs` import this one,
-  `display/messages.rs`, `display/window_keeper.rs` and `api/private.rs` the
-  other. The `pixel.rs` copy is baselined; one definition has no plan yet.
 - The waker is chosen outside the seam: `engine_troupe.rs` picks `CocoaWaker`,
   `X11Waker` or none by `target_os` (baselined), and `linux/` is gated by
   `target_os` while `X11Waker` is gated by `use_x11_display`.

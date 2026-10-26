@@ -9,11 +9,10 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use desloppify::agent::{self, Answer, Ask, Question};
 use desloppify::decide;
-use desloppify::review::{Reviewers, plan, review};
+use desloppify::review::{Session, plan};
 use desloppify::rule::{self, Rule};
 use desloppify::skills::{self, Skills};
 
-const MIN_CONFIDENCE: f64 = 0.7;
 const CONTEXT_MARKER: &str = "\nFor context only";
 
 fn manifest() -> &'static Path {
@@ -105,21 +104,15 @@ async fn shown(id: &str, files: &[(&str, &str)]) -> Vec<String> {
     let scratch = Scratch::new(id);
     scratch.copy_rule(id, Scoping::Dropped);
     let paths: Vec<_> = files.iter().map(|(p, t)| scratch.write(p, t)).collect();
-    let rules = scratch.rules();
-    let calls = plan(&rules, &paths).unwrap();
-    let reviewers = Arc::new(Reviewers {
-        ask: Recording {
-            inner: agent::dry_run(),
-            shown: Mutex::new(Vec::new()),
-        },
-        decide: decide::none(),
-        min_confidence: MIN_CONFIDENCE,
-    });
-    let report = review(reviewers.clone(), Arc::new(rules), calls)
-        .await
-        .unwrap();
-    assert!(report.failures.is_empty() && report.findings.is_empty());
-    let mut shown = reviewers.ask.shown.lock().unwrap().clone();
+    let calls = plan(scratch.rules(), &paths).unwrap();
+    let recording = Recording {
+        inner: agent::dry_run(),
+        shown: Mutex::new(Vec::new()),
+    };
+    let session = Arc::new(Session::new(recording, decide::none()));
+    let report = session.clone().review(calls).await.unwrap();
+    assert!(report.failures.is_empty() && report.findings().is_empty());
+    let mut shown = session.ask.shown.lock().unwrap().clone();
     shown.sort();
     shown
 }
@@ -222,6 +215,34 @@ async fn an_implementation_file_is_shown_with_its_module_roots_outline() {
         leaf.ends_with("mod.rs:\n\n    1 | mod leaf;\n    2 | pub fn made() -> u8 { … }\n"),
         "{leaf}"
     );
+}
+
+/// The binary, dry-running over a file it plans nothing for, at `minimum`.
+fn run_at_minimum_confidence(minimum: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_desloppify"))
+        .args(["--backend", "dry-run"])
+        .arg(format!("--min-confidence={minimum}"))
+        .arg(manifest().join("Cargo.toml"))
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn a_minimum_confidence_outside_zero_to_one_stops_the_binary_and_says_so() {
+    for outside in ["1.5", "-0.5", "NaN"] {
+        let output = run_at_minimum_confidence(outside);
+        assert!(!output.status.success(), "{outside}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("between 0 and 1"), "{outside}: {stderr}");
+    }
+}
+
+#[test]
+fn a_minimum_confidence_between_zero_and_one_runs() {
+    for inside in ["0", "0.2", "1"] {
+        let output = run_at_minimum_confidence(inside);
+        assert!(output.status.success(), "{inside}: {output:?}");
+    }
 }
 
 /// Each rule's decision tally, as the binary prints it, from a dry review of

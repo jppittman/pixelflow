@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use pixelflow_ir::arena::ExprNode;
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{ExprArena, ExprId, Lit, OpKind};
 
 // ============================================================================
 // Expression Parsing (for loading training data)
@@ -598,9 +598,12 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
                         "arena_to_kernel_code: variable index {} exceeds X/Y/Z/W range",
                         i
                     ),
-                    ExprNode::Const(v) => format_const_kc(v),
+                    ExprNode::Const(Lit::Real(v)) => format_const_kc(v),
+                    ExprNode::Const(Lit::Mask(m)) => panic!(
+                        "arena_to_kernel_code: a mask literal ({m}) has no `kernel!` spelling"
+                    ),
                     ExprNode::Param(i) => panic!(
-                        "ExprNode::Param({}) reached arena_to_kernel_code — substitute params first",
+                        "ExprNode::Param({}) reached arena_to_kernel_code: a `Param` has no value",
                         i
                     ),
                     ExprNode::Buffer(b) => panic!(

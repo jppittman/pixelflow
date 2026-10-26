@@ -69,7 +69,7 @@ fn match_root(
         // one — `compose_rules` always composes at an Op position. Refuse
         // rather than guess a binding with no class to bind it to.
         ExprData::Var(_) => false,
-        ExprData::Const(v) => node.is_const(f32::from_bits(v)),
+        ExprData::Const(lit) => node.is_lit(lit),
         ExprData::Param(_)
         | ExprData::Buffer(_)
         | ExprData::Uniform(_)
@@ -105,7 +105,7 @@ fn match_class(
 ) -> bool {
     match *pat {
         ExprData::Var(mv) => bind_var(mv, class, egraph, bindings),
-        ExprData::Const(v) => egraph.contains_const(class, f32::from_bits(v)),
+        ExprData::Const(lit) => egraph.contains_lit(class, lit),
         ExprData::Param(_)
         | ExprData::Buffer(_)
         | ExprData::Uniform(_)
@@ -452,7 +452,7 @@ fn unify(arena: &ExprArena, x: ExprId, y: ExprId, subst: &mut BTreeMap<u8, ExprI
             subst.insert(b, x);
             true
         }
-        (ExprNode::Const(cx), ExprNode::Const(cy)) => cx.to_bits() == cy.to_bits(),
+        (ExprNode::Const(cx), ExprNode::Const(cy)) => cx == cy,
         (ExprNode::Param(_), _) | (_, ExprNode::Param(_)) => false,
         (ExprNode::Buffer(_), _) | (_, ExprNode::Buffer(_)) => false,
         (ExprNode::Uniform(_), _) | (_, ExprNode::Uniform(_)) => false,

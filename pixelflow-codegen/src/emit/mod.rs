@@ -28,6 +28,27 @@
 //! is inlined into the column fold's
 //! (docs/archive/plans/2026-09-16-collapse-is-a-fold.md §2.2).
 //!
+//! A fold whose bound is a value arrives inside the guard
+//! [`pixelflow_ir::passes::legalize`] builds (an `If`'s arm): its counter
+//! starts at `lo`'s lane (plus zero, so a `-0.0` count starts at the integer 0
+//! a literal seeds) and its latch compares against `hi`'s, and the arm is
+//! skipped when the range is empty or a bound is not a count in `[0, 2²⁴]` (a
+//! fraction, NaN and an infinity are none). The latch's compare reads two
+//! registers, so `hi` is one the allocator carries across the loop or reloads
+//! at each latch, where a literal end is a constant placed again at its read.
+//!
+//! The guard's masks are the call's when the bounds are. Its arm tests sit
+//! where the fold does, in the innermost scope of the nest that the fold reads,
+//! and run as often as that scope does. The first of these that holds:
+//! - in an enclosing fold's scope, once per trip of it, when the fold's body or
+//!   bound reads that fold's index (the innermost such fold's);
+//! - in the column fold, in every batch of it, when it reads `X`;
+//! - in the row fold, once per row, when it reads `Y`;
+//! - in the body, once per call, when it reads none of these.
+//!
+//! A mask the register file cannot keep across the trips of that scope (an
+//! opmask, on AVX-512) is reloaded each time the scope runs.
+//!
 //! ## Spilling
 //!
 //! Values the register file cannot hold go to frame slots, which the allocator
@@ -52,7 +73,7 @@ mod x86_64;
 // this path), what it hands back, and the counts inside that.
 pub use crate::pipeline::compile;
 pub use executable::CompiledKernel;
-pub use traffic::{EmitTraffic, ScopeTraffic};
+pub use traffic::{EmitTraffic, ScopeTraffic, Trips};
 
 use asm::{Encoding, Label, Labels, Patch};
 use encoded::EncodedInst;
@@ -513,9 +534,9 @@ struct Loop {
     head: Label,
     /// The enclosing loop, as an index into [`Function::loops`].
     parent: Option<usize>,
-    /// How many times its body runs per call: its own trip count times its
-    /// parent's.
-    trips: u64,
+    /// How many times its body runs per call, or an estimate's price where a
+    /// fold's range is not known: its own trips nested in its parent's.
+    trips: Trips,
 }
 
 /// The pool section: its label, then each entry with its own label, in order.
@@ -948,7 +969,7 @@ mod tests {
     /// somewhere to show up.
     #[test]
     fn a_surviving_reduce_compiles_and_runs() {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 
         let binder = Binder::from_slot(0).expect("slot 0 exists");
 
@@ -957,8 +978,8 @@ mod tests {
         let x = sum_arena.push_var(0);
         let i = sum_arena.push_var(binder.var());
         let body = sum_arena.push_binary(OpKind::Add, x, i);
-        let sum_fold = Fold::new(Monoid::SUM, binder, 0..4);
-        let sum_root = sum_arena.push_reduce(sum_fold, body);
+        let sum_fold = Fold::new(Monoid::SUM, binder);
+        let sum_root = sum_arena.push_reduce(sum_fold, Bound::Lit(0), Bound::Lit(4), body);
         let sum_code =
             compile(&sum_arena, sum_root, POINT).expect("a surviving SUM Reduce compiles");
 
@@ -973,8 +994,8 @@ mod tests {
         let x = min_arena.push_var(0);
         let i = min_arena.push_var(binder.var());
         let body = min_arena.push_binary(OpKind::Sub, x, i);
-        let min_fold = Fold::new(Monoid::MIN, binder, 0..4);
-        let min_root = min_arena.push_reduce(min_fold, body);
+        let min_fold = Fold::new(Monoid::MIN, binder);
+        let min_root = min_arena.push_reduce(min_fold, Bound::Lit(0), Bound::Lit(4), body);
         let min_code =
             compile(&min_arena, min_root, POINT).expect("a surviving MIN Reduce compiles");
 
@@ -1001,7 +1022,7 @@ mod tests {
     /// `root = reduce + shared + Y = 4*shared + 3 + Y`.
     #[test]
     fn a_surviving_reduce_shares_a_leaf_and_feeds_further_arithmetic() {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 
         let mut a = ExprArena::new();
         let x = a.push_var(0);
@@ -1010,8 +1031,8 @@ mod tests {
         let binder = Binder::from_slot(0).expect("slot 0 exists");
         let i = a.push_var(binder.var());
         let body = a.push_binary(OpKind::Add, shared, i);
-        let fold = Fold::new(Monoid::SUM, binder, 0..3);
-        let reduce = a.push_reduce(fold, body);
+        let fold = Fold::new(Monoid::SUM, binder);
+        let reduce = a.push_reduce(fold, Bound::Lit(0), Bound::Lit(3), body);
         let plus_shared = a.push_binary(OpKind::Add, reduce, shared);
         let root = a.push_binary(OpKind::Add, plus_shared, y);
 
@@ -1041,7 +1062,7 @@ mod tests {
     /// `root = shared + reduce = 5*shared + 6`.
     #[test]
     fn a_surviving_reduces_own_recompute_of_a_shared_leaf_does_not_clobber_the_outer_copy() {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 
         let mut a = ExprArena::new();
         let x = a.push_var(0);
@@ -1056,8 +1077,8 @@ mod tests {
         let binder = Binder::from_slot(0).expect("slot 0 exists");
         let i = a.push_var(binder.var());
         let body = a.push_binary(OpKind::Add, shared, i);
-        let fold = Fold::new(Monoid::SUM, binder, 0..4);
-        let reduce = a.push_reduce(fold, body);
+        let fold = Fold::new(Monoid::SUM, binder);
+        let reduce = a.push_reduce(fold, Bound::Lit(0), Bound::Lit(4), body);
         let root = a.push_binary(OpKind::Add, shared, reduce);
 
         let code = compile(&a, root, POINT).expect("interleaved shared-leaf order compiles");
@@ -1089,10 +1110,10 @@ mod tests {
     /// `root = Σ_k (p_k + reduce)`.
     #[test]
     fn a_folds_spill_slots_do_not_alias_its_parents() {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 
         const K: usize = 20;
-        const R: u32 = 3;
+        const R: u64 = 3;
 
         // A balanced sum, pushed level by level: every leaf is defined before
         // the first combine, so they are all live at once.
@@ -1132,7 +1153,12 @@ mod tests {
             })
             .collect();
         let body = tree_sum(&mut a, q);
-        let reduce = a.push_reduce(Fold::new(Monoid::SUM, binder, 0..R), body);
+        let reduce = a.push_reduce(
+            Fold::new(Monoid::SUM, binder),
+            Bound::Lit(0),
+            Bound::Lit(R),
+            body,
+        );
 
         let joined: alloc::vec::Vec<ExprId> = p
             .iter()
@@ -1172,7 +1198,7 @@ mod tests {
     /// `root = Σ_{j<2} inner(j) = 6X + 3`.
     #[test]
     fn a_reduce_inside_a_reduce_compiles_and_runs() {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 
         let mut a = ExprArena::new();
         let x = a.push_var(0);
@@ -1182,8 +1208,18 @@ mod tests {
         let j = a.push_var(outer_binder.var());
         let ij = a.push_binary(OpKind::Mul, i, j);
         let inner_body = a.push_binary(OpKind::Add, x, ij);
-        let inner = a.push_reduce(Fold::new(Monoid::SUM, inner_binder, 0..3), inner_body);
-        let root = a.push_reduce(Fold::new(Monoid::SUM, outer_binder, 0..2), inner);
+        let inner = a.push_reduce(
+            Fold::new(Monoid::SUM, inner_binder),
+            Bound::Lit(0),
+            Bound::Lit(3),
+            inner_body,
+        );
+        let root = a.push_reduce(
+            Fold::new(Monoid::SUM, outer_binder),
+            Bound::Lit(0),
+            Bound::Lit(2),
+            inner,
+        );
 
         let code = compile(&a, root, POINT).expect("a fold inside a fold compiles");
         for x in [0.0f32, 2.0, -1.5, 10.0] {
@@ -1209,7 +1245,7 @@ mod tests {
 
     /// The three-deep contraction of the test above, as an arena.
     fn three_deep_contraction() -> (ExprArena, ExprId) {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 
         let mut a = ExprArena::new();
         let x = a.push_var(0);
@@ -1222,11 +1258,26 @@ mod tests {
         let xi = a.push_binary(OpKind::Add, x, i);
         let xij = a.push_binary(OpKind::Add, xi, j);
         let xijk = a.push_binary(OpKind::Add, xij, k);
-        let inner = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..2), xijk);
+        let inner = a.push_reduce(
+            Fold::new(Monoid::SUM, bi),
+            Bound::Lit(0),
+            Bound::Lit(2),
+            xijk,
+        );
         let j_inner = a.push_binary(OpKind::Add, j, inner);
-        let middle = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..2), j_inner);
+        let middle = a.push_reduce(
+            Fold::new(Monoid::SUM, bj),
+            Bound::Lit(0),
+            Bound::Lit(2),
+            j_inner,
+        );
         let k_middle = a.push_binary(OpKind::Add, k, middle);
-        let root = a.push_reduce(Fold::new(Monoid::SUM, bk, 0..2), k_middle);
+        let root = a.push_reduce(
+            Fold::new(Monoid::SUM, bk),
+            Bound::Lit(0),
+            Bound::Lit(2),
+            k_middle,
+        );
         (a, root)
     }
 
@@ -1251,17 +1302,22 @@ mod tests {
     /// `Σ_{i<3} (X + i) + Σ_{i<2} 2i = (3X + 3) + 2 = 3X + 5`.
     #[test]
     fn sibling_folds_sharing_a_binder_node_read_their_own_counters() {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let bi = Binder::from_slot(0).expect("slot 0 exists");
         let i = a.push_var(bi.var());
         let xi = a.push_binary(OpKind::Add, x, i);
-        let left = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), xi);
+        let left = a.push_reduce(Fold::new(Monoid::SUM, bi), Bound::Lit(0), Bound::Lit(3), xi);
         let two = a.push_const(2.0);
         let two_i = a.push_binary(OpKind::Mul, two, i);
-        let right = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..2), two_i);
+        let right = a.push_reduce(
+            Fold::new(Monoid::SUM, bi),
+            Bound::Lit(0),
+            Bound::Lit(2),
+            two_i,
+        );
         let root = a.push_binary(OpKind::Add, left, right);
 
         let code = compile(&a, root, POINT).expect("sibling folds compile");
@@ -1282,7 +1338,7 @@ mod tests {
     /// `X + Σ_{i<3} 2i = X + 6`.
     #[test]
     fn a_lattice_invariant_fold_is_the_bodys_own() {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 
         let mut a = ExprArena::new();
         let x = a.push_var(0);
@@ -1290,7 +1346,12 @@ mod tests {
         let i = a.push_var(bi.var());
         let two = a.push_const(2.0);
         let two_i = a.push_binary(OpKind::Mul, two, i);
-        let sum = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), two_i);
+        let sum = a.push_reduce(
+            Fold::new(Monoid::SUM, bi),
+            Bound::Lit(0),
+            Bound::Lit(3),
+            two_i,
+        );
         let root = a.push_binary(OpKind::Add, x, sum);
 
         let code = compile(&a, root, POINT).expect("a hoisted fold compiles");
@@ -1307,9 +1368,9 @@ mod tests {
     /// `Σ_{i<5} Σ_k (x·c_k + y)·i`, with `k` over the roots.
     #[test]
     fn a_fold_over_many_roots_computes_its_value() {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
         /// The fold's trips, which no lattice loop shares at a point.
-        const TRIPS: u32 = 5;
+        const TRIPS: u64 = 5;
         /// Roots within every tier's vector file, and roots past the widest
         /// one, which AVX-512 and NEON share.
         const FEW: usize = 2;
@@ -1332,7 +1393,12 @@ mod tests {
             let body = terms[1..]
                 .iter()
                 .fold(terms[0], |acc, &t| a.push_binary(OpKind::Add, acc, t));
-            let sum = a.push_reduce(Fold::new(Monoid::SUM, b, 0..TRIPS), body);
+            let sum = a.push_reduce(
+                Fold::new(Monoid::SUM, b),
+                Bound::Lit(0),
+                Bound::Lit(TRIPS),
+                body,
+            );
             let code = compile(&a, sum, POINT).expect("a fold over roots compiles");
 
             let (px, py) = (0.5f32, 1.5f32);
@@ -1363,7 +1429,7 @@ mod tests {
     /// 2·inner + 1`; `root = outer + inner = 3·inner + 1 = 9X + 10`.
     #[test]
     fn an_invariant_reduce_inside_a_reduce_is_hoisted_and_shared() {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 
         let mut a = ExprArena::new();
         let x = a.push_var(0);
@@ -1371,10 +1437,15 @@ mod tests {
         let bj = Binder::from_slot(1).expect("slot 1 exists");
         let i = a.push_var(bi.var());
         let xi = a.push_binary(OpKind::Add, x, i);
-        let inner = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), xi);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, bi), Bound::Lit(0), Bound::Lit(3), xi);
         let j = a.push_var(bj.var());
         let inner_j = a.push_binary(OpKind::Add, inner, j);
-        let outer = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..2), inner_j);
+        let outer = a.push_reduce(
+            Fold::new(Monoid::SUM, bj),
+            Bound::Lit(0),
+            Bound::Lit(2),
+            inner_j,
+        );
         let root = a.push_binary(OpKind::Add, outer, inner);
 
         let code = compile(&a, root, POINT).expect("a hoisted fold compiles");
@@ -1390,7 +1461,7 @@ mod tests {
     /// scope's loop bound. `Σ_{j<2} Σ_{i<3} (X + i) = 2·(3X + 3) = 6X + 6`.
     #[test]
     fn an_invariant_reduce_as_a_folds_whole_body_is_hoisted() {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 
         let mut a = ExprArena::new();
         let x = a.push_var(0);
@@ -1398,8 +1469,13 @@ mod tests {
         let bj = Binder::from_slot(1).expect("slot 1 exists");
         let i = a.push_var(bi.var());
         let xi = a.push_binary(OpKind::Add, x, i);
-        let inner = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..3), xi);
-        let root = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..2), inner);
+        let inner = a.push_reduce(Fold::new(Monoid::SUM, bi), Bound::Lit(0), Bound::Lit(3), xi);
+        let root = a.push_reduce(
+            Fold::new(Monoid::SUM, bj),
+            Bound::Lit(0),
+            Bound::Lit(2),
+            inner,
+        );
 
         let code = compile(&a, root, POINT).expect("a fold whose body is a hoisted fold compiles");
         for x in [0.0f32, 2.0, -1.5, 10.0] {
@@ -1419,11 +1495,11 @@ mod tests {
     /// p_k)`; `outer body = Σ_k (p_k + inner(j))`; `root = Σ_{j<J} outer`.
     #[test]
     fn a_nested_folds_spill_slots_do_not_alias_its_parents() {
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 
         const K: usize = 20;
-        const R: u32 = 3;
-        const J: u32 = 2;
+        const R: u64 = 3;
+        const J: u64 = 2;
 
         fn tree_sum(a: &mut ExprArena, mut ids: alloc::vec::Vec<ExprId>) -> ExprId {
             while ids.len() > 1 {
@@ -1459,13 +1535,23 @@ mod tests {
             .map(|k| a.push_binary(OpKind::Add, i, p[k]))
             .collect();
         let inner_body = tree_sum(&mut a, q);
-        let inner = a.push_reduce(Fold::new(Monoid::SUM, bi, 0..R), inner_body);
+        let inner = a.push_reduce(
+            Fold::new(Monoid::SUM, bi),
+            Bound::Lit(0),
+            Bound::Lit(R),
+            inner_body,
+        );
         let joined: alloc::vec::Vec<ExprId> = p
             .iter()
             .map(|&pk| a.push_binary(OpKind::Add, pk, inner))
             .collect();
         let outer_body = tree_sum(&mut a, joined);
-        let root = a.push_reduce(Fold::new(Monoid::SUM, bj, 0..J), outer_body);
+        let root = a.push_reduce(
+            Fold::new(Monoid::SUM, bj),
+            Bound::Lit(0),
+            Bound::Lit(J),
+            outer_body,
+        );
 
         let code = compile(&a, root, POINT).expect("nested folds under register pressure compile");
 
@@ -1521,6 +1607,56 @@ mod tests {
         compile_for::<aarch64::Neon>(&a, root, POINT).expect("NEON emit");
         compile_for::<avx2::Avx2>(&a, root, POINT).expect("AVX2 emit");
         compile_for::<avx512::Avx512>(&a, root, POINT).expect("AVX-512 emit");
+    }
+
+    /// A fold whose bound is a value, on every backend from this host: the
+    /// guard's arms around a loop whose counter starts at one lane and ends at
+    /// another. Three shapes that reach what a literal fold never does: a
+    /// seed that reads another loop's counter (`i + 0`, added where the fold
+    /// is entered), a bound read by nothing in the body that must live across
+    /// a wall of values, and a ragged row whose main and remainder column
+    /// folds both open the loop.
+    ///
+    /// NEON cannot run here; selection, allocation and assembly can.
+    #[test]
+    fn every_backend_emits_a_fold_whose_bound_is_a_value() {
+        use pixelflow_ir::fold::Monoid;
+        use pixelflow_ir::{Kernel, Uniform};
+
+        // More values live at once than any tier's vector file holds.
+        const WALL: u32 = 48;
+
+        let (zero, eight) = (Kernel::constant(0.0), Kernel::constant(8.0));
+        let count = || Uniform::new(7.0).kernel();
+        let from_the_outer_index = Kernel::sum_over(8, |i| {
+            Kernel::over_values(Monoid::SUM, i, &eight, |j| Kernel::x().add(j))
+        });
+        let a_wall = Kernel::over_values(Monoid::SUM, &zero, &count(), |k| {
+            let terms: Vec<Kernel> = (1..=WALL)
+                .map(|m| Kernel::x().add(k).mul(&Kernel::constant(m as f32)))
+                .collect();
+            let up = terms[1..]
+                .iter()
+                .fold(terms[0].clone(), |acc, t| acc.add(t));
+            let down = terms
+                .iter()
+                .rev()
+                .skip(1)
+                .fold(terms[WALL as usize - 1].clone(), |acc, t| acc.add(t));
+            up.add(&down)
+        });
+        let ragged = Kernel::over_values(Monoid::SUM, &zero, &count(), |k| Kernel::x().add(k));
+
+        for (kernel, shape) in [
+            (from_the_outer_index, POINT),
+            (a_wall, LatticeShape::new([8, 2])),
+            (ragged, LatticeShape::new([37, 3])),
+        ] {
+            let (arena, root) = kernel.parts();
+            compile_for::<aarch64::Neon>(arena, root, shape).expect("NEON emit");
+            compile_for::<avx2::Avx2>(arena, root, shape).expect("AVX2 emit");
+            compile_for::<avx512::Avx512>(arena, root, shape).expect("AVX-512 emit");
+        }
     }
 
     // =========================================================================
@@ -1697,7 +1833,7 @@ mod tests {
         }
 
         /// Trip count of [`a_fold_owned_by_an_arm_is_guarded`]'s fold.
-        const ARM_FOLD_TRIPS: u32 = 64;
+        const ARM_FOLD_TRIPS: u64 = 64;
 
         /// `(X > 0) ? Σ_{j<64} |X − j| : 0`, plus a value carried across: an
         /// arm that is a loop and nothing else. The arm owns the loop and is
@@ -1705,7 +1841,7 @@ mod tests {
         /// false arm's.
         #[test]
         fn a_fold_owned_by_an_arm_is_guarded() {
-            use pixelflow_ir::fold::{Binder, Fold, Monoid};
+            use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 
             let mut a = ExprArena::new();
             let x = a.push_var(0);
@@ -1716,7 +1852,12 @@ mod tests {
             let j = a.push_var(binder.var());
             let diff = a.push_binary(OpKind::Sub, x, j);
             let term = a.push_unary(OpKind::Abs, diff);
-            let fold = a.push_reduce(Fold::new(Monoid::SUM, binder, 0..ARM_FOLD_TRIPS), term);
+            let fold = a.push_reduce(
+                Fold::new(Monoid::SUM, binder),
+                Bound::Lit(0),
+                Bound::Lit(ARM_FOLD_TRIPS),
+                term,
+            );
             let sel = a.push_ternary(OpKind::If, cond, fold, zero);
             let carried = a.push_binary(OpKind::Sub, x, y);
             let root = a.push_binary(OpKind::Add, sel, carried);

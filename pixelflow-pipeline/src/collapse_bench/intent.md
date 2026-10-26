@@ -25,6 +25,8 @@ it. The clock is the outcome; the traffic is a column.
   `tier()` is `isa::detect().name()`.
 - No timestamp, path or host name in a row, and no mixed schemas (`points`
   panics); two runs of one build differ only in what was measured.
+- No estimate shown as a count: `features_of` panics on a kernel with a fold
+  whose range is not known, so a value-bounded kernel is refused at measurement.
 
 ## Contract
 `mod.rs` declares `corpus`, `predict`, `row` and offers `lanes`, `tier`,

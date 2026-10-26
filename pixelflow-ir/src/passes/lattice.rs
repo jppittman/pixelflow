@@ -28,7 +28,7 @@
 //! (docs/archive/plans/2026-09-16-collapse-is-a-fold.md §2.1–§2.4).
 
 use crate::arena::{COORD_AXES, ExprArena, ExprId, ExprNode, UniformDecl};
-use crate::fold::{Binder, Fold, Monoid};
+use crate::fold::{Binder, Bound, Fold, KNOWN_RANGE, Monoid};
 use crate::kind::OpKind;
 use crate::variance::LatticeShape;
 
@@ -124,9 +124,24 @@ pub fn collapse(arena: &mut ExprArena, root: ExprId, domain: Domain) -> ExprId {
     let write = arena.push_write(row, col, lane, body);
 
     let [w, h] = domain.shape.extent();
-    let lane_fold = arena.push_reduce(Fold::new(Monoid::SEQ, lane, 0..1), write);
-    let col_fold = arena.push_reduce(Fold::new(Monoid::SEQ, col, 0..w), lane_fold);
-    arena.push_reduce(Fold::new(Monoid::SEQ, row, 0..h), col_fold)
+    let lane_fold = arena.push_reduce(
+        Fold::new(Monoid::SEQ, lane),
+        Bound::Lit(0),
+        Bound::Lit(1),
+        write,
+    );
+    let col_fold = arena.push_reduce(
+        Fold::new(Monoid::SEQ, col),
+        Bound::Lit(0),
+        Bound::Lit(u64::from(w)),
+        lane_fold,
+    );
+    arena.push_reduce(
+        Fold::new(Monoid::SEQ, row),
+        Bound::Lit(0),
+        Bound::Lit(u64::from(h)),
+        col_fold,
+    )
 }
 
 /// The full pass order, named once so every panic message in this file spells
@@ -200,24 +215,48 @@ pub fn pack(arena: &mut ExprArena, root: ExprId, lanes: u32) -> ExprId {
     assert!(lanes != 0, "pack: lanes must be nonzero");
 
     let (row_fold, col_fold, lane_fold, write) = collapse_shape(arena, root);
-    let row = row_fold.binder();
-    let col = col_fold.binder();
-    let lane = lane_fold.binder();
+    let (row, col, lane) = (row_fold.binder, col_fold.binder, lane_fold.binder);
 
-    let w = col_fold.range().end;
-    let h = row_fold.range().end;
+    let w = arena
+        .known_range(col_fold.id)
+        .expect(KNOWN_RANGE)
+        .range()
+        .end;
+    let h = arena
+        .known_range(row_fold.id)
+        .expect(KNOWN_RANGE)
+        .range()
+        .end;
+    let lanes = u64::from(lanes);
     let r = w % lanes;
 
     let main = (w > r).then(|| {
-        let lane_main = arena.push_reduce(Fold::new(Monoid::SEQ, lane, 0..lanes), write);
+        let lane_main = arena.push_reduce(
+            Fold::new(Monoid::SEQ, lane),
+            Bound::Lit(0),
+            Bound::Lit(lanes),
+            write,
+        );
         arena.push_reduce(
-            Fold::strided(Monoid::SEQ, col, 0..(w - r), lanes),
+            Fold::strided(Monoid::SEQ, col, lanes),
+            Bound::Lit(0),
+            Bound::Lit(w - r),
             lane_main,
         )
     });
     let remainder = (r > 0).then(|| {
-        let lane_rem = arena.push_reduce(Fold::new(Monoid::SEQ, lane, 0..r), write);
-        arena.push_reduce(Fold::new(Monoid::SEQ, col, (w - r)..(w - r + 1)), lane_rem)
+        let lane_rem = arena.push_reduce(
+            Fold::new(Monoid::SEQ, lane),
+            Bound::Lit(0),
+            Bound::Lit(r),
+            write,
+        );
+        arena.push_reduce(
+            Fold::new(Monoid::SEQ, col),
+            Bound::Lit(w - r),
+            Bound::Lit(w - r + 1),
+            lane_rem,
+        )
     });
     let body = match (main, remainder) {
         (Some(main), Some(remainder)) => arena.push_binary(OpKind::Seq, main, remainder),
@@ -225,21 +264,40 @@ pub fn pack(arena: &mut ExprArena, root: ExprId, lanes: u32) -> ExprId {
         (None, None) => panic!("pack: the lattice has no column"),
     };
 
-    arena.push_reduce(Fold::new(Monoid::SEQ, row, 0..h), body)
+    arena.push_reduce(
+        Fold::new(Monoid::SEQ, row),
+        Bound::Lit(0),
+        Bound::Lit(h),
+        body,
+    )
+}
+
+/// One of [`collapse`]'s folds read back out of the arena: the node that holds
+/// it, which is where its range is read ([`ExprArena::known_range`]), and the
+/// binder its `Write` reads.
+#[derive(Clone, Copy)]
+struct CollapseFold {
+    id: ExprId,
+    binder: Binder,
 }
 
 /// Read [`collapse`]'s three folds and its shared `Write` back out of `root`,
 /// or panic naming the shape `pack` expects — see [`pack`]'s own doc.
-fn collapse_shape(arena: &ExprArena, root: ExprId) -> (Fold, Fold, Fold, ExprId) {
+fn collapse_shape(
+    arena: &ExprArena,
+    root: ExprId,
+) -> (CollapseFold, CollapseFold, CollapseFold, ExprId) {
     const SHAPE: &str = "pack expects collapse's shape: three nested Reduces \
         over Monoid::SEQ — row, then col, then a lane fold over [0,1) — \
         wrapping a Write whose row/col/lane equal the three folds' binders, \
         in that order";
 
+    let row_id = root;
     let ExprNode::Reduce {
         fold: row_fold,
         body: col_id,
-    } = arena.node(root)
+        ..
+    } = arena.node(row_id)
     else {
         panic!("{SHAPE} (root is not a Reduce)");
     };
@@ -247,6 +305,7 @@ fn collapse_shape(arena: &ExprArena, root: ExprId) -> (Fold, Fold, Fold, ExprId)
     let ExprNode::Reduce {
         fold: col_fold,
         body: lane_id,
+        ..
     } = arena.node(col_id)
     else {
         panic!("{SHAPE} (the row fold's body is not a range Reduce)");
@@ -255,6 +314,7 @@ fn collapse_shape(arena: &ExprArena, root: ExprId) -> (Fold, Fold, Fold, ExprId)
     let ExprNode::Reduce {
         fold: lane_fold,
         body: write,
+        ..
     } = arena.node(lane_id)
     else {
         panic!("{SHAPE} (the col fold's body is not a range Reduce)");
@@ -279,17 +339,17 @@ fn collapse_shape(arena: &ExprArena, root: ExprId) -> (Fold, Fold, Fold, ExprId)
         );
     }
     assert_eq!(
-        row_fold.range().start,
+        arena.known_range(row_id).expect(KNOWN_RANGE).range().start,
         0,
         "{SHAPE} (the row fold must start at 0)"
     );
     assert_eq!(
-        col_fold.range().start,
+        arena.known_range(col_id).expect(KNOWN_RANGE).range().start,
         0,
         "{SHAPE} (the col fold must start at 0)"
     );
     assert_eq!(
-        lane_fold.range(),
+        arena.known_range(lane_id).expect(KNOWN_RANGE).range(),
         0..1,
         "{SHAPE} (the lane fold must be collapse's degenerate [0,1))"
     );
@@ -299,13 +359,23 @@ fn collapse_shape(arena: &ExprArena, root: ExprId) -> (Fold, Fold, Fold, ExprId)
         "{SHAPE} (the Write's binders must equal the three folds', in order)"
     );
 
-    (row_fold, col_fold, lane_fold, write)
+    let read = |id: ExprId, fold: Fold| CollapseFold {
+        id,
+        binder: fold.binder(),
+    };
+    (
+        read(row_id, row_fold),
+        read(col_id, col_fold),
+        read(lane_id, lane_fold),
+        write,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::arena::{BufferDecl, BufferIdentity, UniformIdentity};
+    use crate::fold::KnownRange;
     use crate::variance::{Variance, compute_arena_variance};
     use crate::{Kernel, key::KernelKey};
 
@@ -322,6 +392,11 @@ mod tests {
                 default: 0.0,
             },
         ]
+    }
+
+    /// The range of the fold at `id`.
+    fn range_of(arena: &ExprArena, id: ExprId) -> KnownRange {
+        arena.known_range(id).expect(KNOWN_RANGE)
     }
 
     /// Whether `Var(target)` is reachable from `root` — the check
@@ -377,32 +452,35 @@ mod tests {
         let ExprNode::Reduce {
             fold: row_fold,
             body: col_id,
+            ..
         } = arena.node(new_root)
         else {
             panic!("collapse's root must be a Reduce");
         };
         assert_eq!(row_fold.monoid(), Monoid::SEQ);
-        assert_eq!(row_fold.range(), 0..3);
+        assert_eq!(range_of(&arena, new_root).range(), 0..3);
 
         let ExprNode::Reduce {
             fold: col_fold,
             body: lane_id,
+            ..
         } = arena.node(col_id)
         else {
             panic!("the row fold's body must be a Reduce");
         };
         assert_eq!(col_fold.monoid(), Monoid::SEQ);
-        assert_eq!(col_fold.range(), 0..5);
+        assert_eq!(range_of(&arena, col_id).range(), 0..5);
 
         let ExprNode::Reduce {
             fold: lane_fold,
             body: write,
+            ..
         } = arena.node(lane_id)
         else {
             panic!("the col fold's body must be a Reduce");
         };
         assert_eq!(lane_fold.monoid(), Monoid::SEQ);
-        assert_eq!(lane_fold.range(), 0..1);
+        assert_eq!(range_of(&arena, lane_id).range(), 0..1);
 
         let ExprNode::Write {
             row,
@@ -479,9 +557,9 @@ mod tests {
         let (row_fold, col_fold, lane_fold, write) = collapse_shape(&arena, new_root);
         assert_eq!(
             [
-                row_fold.binder().slot(),
-                col_fold.binder().slot(),
-                lane_fold.binder().slot()
+                row_fold.binder.slot(),
+                col_fold.binder.slot(),
+                lane_fold.binder.slot()
             ],
             [1, 2, 3],
             "slot 0 is taken, so the lattice takes 1, 2, 3 in ascending order"
@@ -523,9 +601,9 @@ mod tests {
             "every binder is bound by the time the root is reached"
         );
 
-        let all_three = Variance::from_var(row_fold.binder().var())
-            .union(Variance::from_var(col_fold.binder().var()))
-            .union(Variance::from_var(lane_fold.binder().var()));
+        let all_three = Variance::from_var(row_fold.binder.var())
+            .union(Variance::from_var(col_fold.binder.var()))
+            .union(Variance::from_var(lane_fold.binder.var()));
         assert_eq!(
             v[write.0 as usize], all_three,
             "the store reads all three binders for its address"
@@ -583,9 +661,9 @@ mod tests {
 
         let v = compute_arena_variance(&arena);
         let (row, col, lane) = (
-            row_fold.binder().var(),
-            col_fold.binder().var(),
-            lane_fold.binder().var(),
+            row_fold.binder.var(),
+            col_fold.binder.var(),
+            lane_fold.binder.var(),
         );
 
         assert!(v[new_row_only.0 as usize].depends_on(row));
@@ -617,33 +695,28 @@ mod tests {
         let ExprNode::Reduce {
             fold: row_fold,
             body: row_body,
+            ..
         } = arena.node(packed)
         else {
             panic!("packed root must be the row fold");
         };
         assert_eq!(row_fold.monoid(), Monoid::SEQ);
-        assert_eq!(row_fold.range(), 0..3);
+        assert_eq!(range_of(&arena, packed).range(), 0..3);
 
-        let ExprNode::Reduce {
-            fold: col_fold,
-            body: lane_id,
-        } = arena.node(row_body)
-        else {
+        let ExprNode::Reduce { body: lane_id, .. } = arena.node(row_body) else {
             panic!("the row fold's body must be the strided col fold");
         };
-        assert_eq!(col_fold.range(), 0..8);
-        assert_eq!(col_fold.stride(), 4);
-        assert_eq!(col_fold.len(), 2);
+        let col_range = range_of(&arena, row_body);
+        assert_eq!(col_range.range(), 0..8);
+        assert_eq!(col_range.stride(), 4);
+        assert_eq!(col_range.len(), 2);
 
-        let ExprNode::Reduce {
-            fold: lane_fold,
-            body: write,
-        } = arena.node(lane_id)
-        else {
+        let ExprNode::Reduce { body: write, .. } = arena.node(lane_id) else {
             panic!("the col fold's body must be the lane fold");
         };
-        assert_eq!(lane_fold.range(), 0..4);
-        assert_eq!(lane_fold.stride(), 1);
+        let lane_range = range_of(&arena, lane_id);
+        assert_eq!(lane_range.range(), 0..4);
+        assert_eq!(lane_range.stride(), 1);
 
         assert_eq!(write, write_before, "pack shares collapse's Write");
         assert!(!reachable_seq(&arena, packed), "no remainder means no Seq");
@@ -666,54 +739,46 @@ mod tests {
 
         let packed = pack(&mut arena, collapsed, 4);
 
-        let ExprNode::Reduce {
-            fold: row_fold,
-            body: row_body,
-        } = arena.node(packed)
-        else {
+        let ExprNode::Reduce { body: row_body, .. } = arena.node(packed) else {
             panic!("packed root must be the row fold");
         };
-        assert_eq!(row_fold.range(), 0..2);
+        assert_eq!(range_of(&arena, packed).range(), 0..2);
 
         let ExprNode::Binary(OpKind::Seq, main, rem) = arena.node(row_body) else {
             panic!("a nonzero remainder must sequence main then remainder");
         };
 
         let ExprNode::Reduce {
-            fold: main_col,
-            body: main_lane_id,
+            body: main_lane_id, ..
         } = arena.node(main)
         else {
             panic!("main must be the strided col fold");
         };
-        assert_eq!(main_col.range(), 0..8);
-        assert_eq!(main_col.stride(), 4);
+        assert_eq!(range_of(&arena, main).range(), 0..8);
+        assert_eq!(range_of(&arena, main).stride(), 4);
         let ExprNode::Reduce {
-            fold: main_lane,
-            body: main_write,
+            body: main_write, ..
         } = arena.node(main_lane_id)
         else {
             panic!("main's body must be the lane fold");
         };
-        assert_eq!(main_lane.range(), 0..4);
+        assert_eq!(range_of(&arena, main_lane_id).range(), 0..4);
 
         let ExprNode::Reduce {
-            fold: rem_col,
-            body: rem_lane_id,
+            body: rem_lane_id, ..
         } = arena.node(rem)
         else {
             panic!("rem must be the [8,9) col fold");
         };
-        assert_eq!(rem_col.range(), 8..9);
-        assert_eq!(rem_col.stride(), 1);
+        assert_eq!(range_of(&arena, rem).range(), 8..9);
+        assert_eq!(range_of(&arena, rem).stride(), 1);
         let ExprNode::Reduce {
-            fold: rem_lane,
-            body: rem_write,
+            body: rem_write, ..
         } = arena.node(rem_lane_id)
         else {
             panic!("rem's body must be the lane fold");
         };
-        assert_eq!(rem_lane.range(), 0..2);
+        assert_eq!(range_of(&arena, rem_lane_id).range(), 0..2);
 
         assert_eq!(main_write, write_before);
         assert_eq!(
@@ -745,17 +810,16 @@ mod tests {
         };
 
         let ExprNode::Reduce {
-            fold: rem_col,
-            body: rem_lane_id,
+            body: rem_lane_id, ..
         } = arena.node(row_body)
         else {
             panic!("the row fold's body must be the remainder, with no main fold");
         };
-        assert_eq!(rem_col.range(), 0..1);
-        let ExprNode::Reduce { fold: rem_lane, .. } = arena.node(rem_lane_id) else {
+        assert_eq!(range_of(&arena, row_body).range(), 0..1);
+        let ExprNode::Reduce { .. } = arena.node(rem_lane_id) else {
             panic!("rem's body must be the lane fold");
         };
-        assert_eq!(rem_lane.range(), 0..3);
+        assert_eq!(range_of(&arena, rem_lane_id).range(), 0..3);
     }
 
     /// `pack` on anything but `collapse`'s own output is a pipeline-order

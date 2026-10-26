@@ -601,8 +601,7 @@ impl EdgeTrace {
     ///
     /// # Panics
     ///
-    /// Panics if the subtree contains `ExprNode::Param` — substitute
-    /// parameters before walking.
+    /// Panics if the subtree contains `ExprNode::Param`, which has no value.
     #[must_use]
     pub fn from_arena_dag(arena: &ExprArena, root: ExprId) -> Self {
         Self::walk(&ArenaCostDag { arena, root })
@@ -775,7 +774,7 @@ impl CostDag for ArenaCostDag<'_> {
     fn resolve(&self, id: u32, out: &mut Vec<u32>) -> Option<OpKind> {
         let eid = ExprId(id);
         if let ExprNode::Param(i) = self.arena.node(eid) {
-            panic!("ExprNode::Param({i}) reached the edge walker — substitute params first");
+            panic!("ExprNode::Param({i}) reached the edge walker: a `Param` has no value");
         }
         for child in self.arena.children(eid) {
             out.push(child.0);

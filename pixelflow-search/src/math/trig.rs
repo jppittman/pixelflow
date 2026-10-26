@@ -250,12 +250,12 @@ impl Rewrite for Pythagorean {
         // Try to find sin²(x) + cos²(x) pattern
         if let Some(_x) = self.match_pythagorean_pair(egraph, left, right) {
             // sin²(x) + cos²(x) → 1
-            return Some(RewriteAction::Create(ENode::Const(1.0_f32.to_bits())));
+            return Some(RewriteAction::Create(ENode::constant(1.0)));
         }
 
         // Also try cos²(x) + sin²(x) (commuted)
         if let Some(_x) = self.match_pythagorean_pair(egraph, right, left) {
-            return Some(RewriteAction::Create(ENode::Const(1.0_f32.to_bits())));
+            return Some(RewriteAction::Create(ENode::constant(1.0)));
         }
 
         None

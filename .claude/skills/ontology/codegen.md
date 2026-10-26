@@ -492,9 +492,10 @@
   nothing about folds"); selected as blocks by `Selector::fold`
   (`pixelflow-codegen/src/emit/select.rs`, B3 of
   `docs/archive/plans/2026-10-08-selection-is-a-phase.md`), whose
-  `Loop::trips` is the body's runs per call. The verbs that once emitted it
-  inline (`Reduce` arm, `Scratch::REDUCE_TEMPS`) were deleted with the legacy
-  driver (D1).
+  `Loop::trips` is a `Trips`: the body's runs per call when every bound is a
+  literal, an estimate otherwise. The verbs that once emitted it inline
+  (`Reduce` arm, `Scratch::REDUCE_TEMPS`) were deleted with the legacy driver
+  (D1).
 
 ### Block. Homonym
 
