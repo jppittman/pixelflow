@@ -516,6 +516,9 @@ fn node(arena: &ExprArena, id: ExprId) -> TokenStream {
             let bits = v.to_bits();
             quote! { __arena.push_const(f32::from_bits(#bits)) }
         }
+        ExprNode::Const(Lit::Int(v)) => {
+            quote! { __arena.push_lit(::pixelflow_core::__macro::ir::Lit::Int(#v)) }
+        }
         // A mask is its own literal: a folded comparison, or `BitAnd`'s
         // monoid identity and therefore `all_over`'s seed.
         ExprNode::Const(Lit::Mask(m)) => {

@@ -885,7 +885,7 @@ impl Kernel {
     fn user_bound(end: BoundEnd, bound: &Kernel) -> Result<(), BoundRefusal> {
         match *bound.root() {
             ExprData::Var(_) | ExprData::Uniform(_) => Ok(()),
-            ExprData::Const(Lit::Mask(_)) => Err(BoundRefusal::BoundSort { end }),
+            ExprData::Const(Lit::Mask(_) | Lit::Int(_)) => Err(BoundRefusal::BoundSort { end }),
             ExprData::Const(literal @ Lit::Real(real)) => Fold::count(literal)
                 .map(|_| ())
                 .ok_or(BoundRefusal::BoundOutOfDomain { end, literal: real }),
@@ -1304,7 +1304,7 @@ impl Bits {
         };
         let mut b = Builder::new();
         let r = copy_subgraph(&mut b, self.inner.root());
-        let count = b.push_const(shift.literal());
+        let count = b.push_lit(Lit::Int(shift.int_literal()));
         let root = b.push_binary(OpKind::Shl, r, count);
         Self {
             inner: Kernel::wrap(
@@ -1545,11 +1545,11 @@ mod tests {
         assert!(carries(&seeded.add(&plain)), "combine (binary) via add");
         assert!(carries(&plain.add(&seeded)), "combine (binary), rhs seeded");
         assert!(
-            carries(&Kernel::x().select(&seeded, &plain)),
+            carries(&Kernel::x().lt(&Kernel::y()).select(&seeded, &plain)),
             "combine3 via select's if_true arm"
         );
         assert!(
-            carries(&Kernel::x().select(&plain, &seeded)),
+            carries(&Kernel::x().lt(&Kernel::y()).select(&plain, &seeded)),
             "combine3 via select's if_false arm"
         );
         assert!(

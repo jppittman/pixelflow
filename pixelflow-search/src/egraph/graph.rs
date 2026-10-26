@@ -9,7 +9,7 @@ use super::rewrite::{RewriteAction, RootShapes};
 use alloc::collections::BTreeMap;
 use columns::{Birth, Columns, Kept, SaturationColumns, Slot};
 use pixelflow_ir::fold::{Bound, BoundEnd, BoundRefusal, Fold};
-use pixelflow_ir::kind::OpKind;
+use pixelflow_ir::kind::{OpKind, Signature, Sort};
 use pixelflow_ir::{KernelKey, Lit, Variance};
 
 mod columns;
@@ -391,6 +391,7 @@ impl EGraph {
         if let Some(&id) = self.memo.get(&node) {
             return self.find(id);
         }
+        let sort = self.node_sort(&node);
         // L3's backstop (docs/language/2026-10-20-a-bound-is-a-value.md §3.2):
         // a value bound read off the classes it is made of, as `push_reduce`
         // reads one off its term, for a node a rule or a caller built. A fold
@@ -418,6 +419,7 @@ impl EGraph {
                 node,
                 const_fact: node.literal(),
                 variance,
+                sort,
                 shape: node.shape(),
                 stamp: self.mutation_counter,
             },
@@ -428,6 +430,35 @@ impl EGraph {
         }
         self.memo.insert(node, id);
         id
+    }
+
+    fn node_sort(&self, node: &ENode) -> Sort {
+        let child_sort = |id| self.graph.columns.sort[self.graph.columns.root(id)];
+        match node {
+            ENode::Var(_) | ENode::Uniform(_) | ENode::Param(_) | ENode::Ref { .. } => Sort::Real,
+            ENode::Buffer(_) => Sort::Buffer,
+            ENode::Const(Lit::Real(_)) => Sort::Real,
+            ENode::Const(Lit::Int(_)) => Sort::Int,
+            ENode::Const(Lit::Mask(_)) => Sort::Mask,
+            ENode::Shift { operand, .. } => {
+                assert_eq!(child_sort(*operand), Sort::Int, "ill-typed shift operand");
+                Sort::Int
+            }
+            ENode::Reduce { children, .. } => child_sort(children[0]),
+            ENode::Op { op, children } => {
+                let got: Vec<_> = children.iter().copied().map(child_sort).collect();
+                match op.signature() {
+                    Signature::Fixed(args, result) if got == args => result,
+                    Signature::If if matches!(got.as_slice(), [Sort::Mask, a, b] if a == b) => {
+                        got[1]
+                    }
+                    Signature::Bitwise if matches!(got.as_slice(), [a, b] if a == b && matches!(a, Sort::Int | Sort::Mask)) => {
+                        got[0]
+                    }
+                    want => panic!("ill-typed {op:?} e-node: got {got:?}, want {want:?}"),
+                }
+            }
+        }
     }
 
     /// Panic unless the value bounds of `node`, canonical and not in the memo,
@@ -468,6 +499,10 @@ impl EGraph {
         if a == b {
             return a.id();
         }
+        assert_eq!(
+            self.graph.columns.sort[a], self.graph.columns.sort[b],
+            "cannot union differently typed e-classes {a:?} and {b:?}"
+        );
         // An e-class asserts "these are all equal", so a union placing two
         // numerically UNEQUAL constants in one class would be a proved
         // falsehood — and congruence closure amplifies any proved falsehood

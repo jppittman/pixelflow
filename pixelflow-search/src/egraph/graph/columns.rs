@@ -44,7 +44,7 @@
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::ops::{Index, IndexMut};
-use pixelflow_ir::kind::{OpKind, OpSet};
+use pixelflow_ir::kind::{OpKind, OpSet, Sort};
 use pixelflow_ir::{Lit, Variance};
 
 use crate::egraph::live::{ClassSet, ClassesByKind};
@@ -167,6 +167,7 @@ pub(super) struct Birth {
     pub(super) node: ENode,
     pub(super) const_fact: Option<Lit>,
     pub(super) variance: Variance,
+    pub(super) sort: Sort,
     /// The node's shape, as `ENode::shape` names it: the one kind the
     /// new class starts with.
     pub(super) shape: Option<OpKind>,
@@ -276,6 +277,7 @@ pub(crate) struct Columns {
     /// waved contradictory merges through at exactly the moment congruence
     /// closure does its work. The fact must outlive the members.
     pub(super) const_fact: Column<Root, Option<Lit>>,
+    pub(super) sort: Column<Root, Sort>,
     /// Which binders each class may depend on — the per-class variance fact
     /// (docs/archive/plans/2026-09-23-an-integral-is-a-fold.md §1, §3), kept beside
     /// `const_fact` and out of the member list for the same reason: a guard
@@ -360,6 +362,7 @@ impl Columns {
         self.head.push(Link::to(tag_of(id)));
         self.tail.push(Link::to(tag_of(id)));
         self.const_fact.push(birth.const_fact);
+        self.sort.push(birth.sort);
         self.var_fact.push(birth.variance);
         saturation.last_changed.push(birth.stamp);
         let kinds = match birth.shape {

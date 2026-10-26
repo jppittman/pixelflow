@@ -29,6 +29,8 @@ use core::hash::{Hash, Hasher};
 pub enum Lit {
     /// A number, held as the `f32` it denotes.
     Real(f32),
+    /// A signed 32-bit integer lane.
+    Int(i32),
     /// A comparison's answer: `true` is an all-ones lane, `false` all-zero.
     Mask(bool),
 }
@@ -40,7 +42,7 @@ impl Lit {
     pub const fn real(self) -> Option<f32> {
         match self {
             Self::Real(v) => Some(v),
-            Self::Mask(_) => None,
+            Self::Int(_) | Self::Mask(_) => None,
         }
     }
 
@@ -50,7 +52,7 @@ impl Lit {
     pub const fn mask(self) -> Option<bool> {
         match self {
             Self::Mask(b) => Some(b),
-            Self::Real(_) => None,
+            Self::Real(_) | Self::Int(_) => None,
         }
     }
 
@@ -66,6 +68,7 @@ impl Lit {
     pub const fn bits(self) -> u32 {
         match self {
             Self::Real(v) => v.to_bits(),
+            Self::Int(v) => v as u32,
             Self::Mask(true) => u32::MAX,
             Self::Mask(false) => 0,
         }
@@ -77,7 +80,8 @@ impl Lit {
     const fn key(self) -> (u8, u32) {
         match self {
             Self::Real(v) => (0, v.to_bits()),
-            Self::Mask(b) => (1, b as u32),
+            Self::Int(v) => (1, v as u32),
+            Self::Mask(b) => (2, b as u32),
         }
     }
 }
@@ -116,6 +120,7 @@ impl fmt::Display for Lit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Real(v) => write!(f, "{v}"),
+            Self::Int(v) => write!(f, "{v}"),
             Self::Mask(b) => write!(f, "{b}"),
         }
     }

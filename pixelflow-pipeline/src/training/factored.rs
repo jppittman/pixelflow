@@ -599,6 +599,9 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
                         i
                     ),
                     ExprNode::Const(Lit::Real(v)) => format_const_kc(v),
+                    ExprNode::Const(Lit::Int(v)) => panic!(
+                        "arena_to_kernel_code: an integer literal ({v}) has no `kernel!` spelling"
+                    ),
                     ExprNode::Const(Lit::Mask(m)) => panic!(
                         "arena_to_kernel_code: a mask literal ({m}) has no `kernel!` spelling"
                     ),

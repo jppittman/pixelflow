@@ -107,7 +107,6 @@ impl ExprData {
 /// Construction helpers on [`Builder<ExprData>`].
 pub(crate) trait ExprBuilderExt {
     fn push_var(&mut self, var: u8) -> Id;
-    fn push_const(&mut self, val: f32) -> Id;
     fn push_lit(&mut self, lit: Lit) -> Id;
     fn push_param(&mut self, param: u8) -> Id;
     fn push_buffer(&mut self, buf: BufferId) -> Id;
@@ -124,11 +123,6 @@ impl ExprBuilderExt for Builder<ExprData> {
     #[inline]
     fn push_var(&mut self, var: u8) -> Id {
         self.push_unique(ExprData::Var(var), &[])
-    }
-
-    #[inline]
-    fn push_const(&mut self, val: f32) -> Id {
-        self.push_lit(Lit::Real(val))
     }
 
     #[inline]

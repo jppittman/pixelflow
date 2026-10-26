@@ -99,7 +99,8 @@ pub use expr::{
 /// IR-to-IR transforms: each takes an expression graph and returns another.
 /// Target-blind by construction — nothing here knows which ISA it is feeding.
 pub mod passes;
-pub use arena::{ExprArena, ExprId, ExprNode};
+pub use arena::{ExprArena, ExprId, ExprNode, TypeError};
+pub use kind::Sort;
 
 /// The term language the e-graph speaks: destructure a node, rebuild a node.
 /// Naming it is what makes an optimizer expressible as an endomorphism on the
