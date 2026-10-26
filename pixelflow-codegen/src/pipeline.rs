@@ -1,7 +1,7 @@
 //! The driver: from an arena and a lattice's shape to machine code.
 //!
 //! The stages are [`Pass`] values, run as one chain: the arena is legalized
-//! around the lattice's folds ([`Front`], [`Collapse`], [`Pack`], [`Back`];
+//! around the lattice's folds ([`Front`], [`Collapse`], [`Back`];
 //! the traversal is this backend's, the halves are `pixelflow_ir::passes`'),
 //! lowered to a flat schedule ([`Lower`]), split into its nest ([`Nest`]), its
 //! arms' ownership read off backward ([`Own`]) and their blocks laid out
