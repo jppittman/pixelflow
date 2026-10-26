@@ -122,7 +122,7 @@ Not deleted, deliberately: `EdgeAccumulator::remove_*` (A6 says keep the API), `
 | PR | disposition |
 |---|---|
 | **#1044** round2b-contrastive | **Close.** Cherry-pick its 2-line `docs/results/journal.jsonl` change onto main first so #1072 §5.3's Round 2b number has a journal trace. #1086 offered merge-as-record; the record is the paper + journal, not 2.7k LOC behind a `training` feature |
-| **#1049** graph.rs test renames (draft, +113) | #1086: "close or fold" — the cost.rs backlog item it corrects was closed by #1027 and now #1051. Close, or fold the one stale-note fix into whichever PR next touches `docs/bugs/2026-08-28-test-quality-audit-followup.md` |
+| **#1049** graph.rs test renames (draft, +113) | #1086: "close or fold" — the cost.rs backlog item it corrects was closed by #1027 and now #1051. Close; the former checked-in test-audit backlog is historical and live tracking belongs in Linear. |
 | **#1051** cost.rs mutation gaps | **Merged** 2026-09-01 21:40. Note it added tests to the persistence block §3 proposes deleting (D3) |
 | **#1054** x86_64.rs mutation gaps | Merge after the one #1086 caveat (rerun mutants on `emit_vpextrd_to_gpr`/`emit_vmovss_load_scaled` or soften the "0 real gaps" line) |
 | **#1050** regalloc mutation tests | Already **closed** (#1055/#1068 deleted the graph-coloring allocator). Moot, as predicted |

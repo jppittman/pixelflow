@@ -16,14 +16,13 @@
 # is an identifier, and a check that cries wolf is worse than no check.
 # A backticked `foo/bar.rs` is unambiguous, so that is what this reads.
 #
-# SCOPE -- every document under docs/ except the dated evidence (results/,
-# bugs/), every module's intent.md, and the agent instructions
-# at the repository root (../CLAUDE.md, ../AGENTS.md, ../GEMINI.md), which every
+# SCOPE -- every document under docs/ except the dated evidence in results/,
+# every module's intent.md, and the agent instructions
+# at the repository root (CLAUDE.md, AGENTS.md, GEMINI.md), which every
 # session reads before anything else. Those are the documents a reader *acts
 # on*, so a dead path in one sends somebody to a file that is not there.
-# `docs/results/` and `docs/bugs/` are dated evidence: a July audit naming a
-# file deleted in August is a correct record of July, and flagging it would
-# be wrong.
+# `docs/results/` is dated evidence: a July measurement naming a file deleted
+# in August is a correct record of July, and flagging it would be wrong.
 #
 # THREE WAYS TO BE FINE, the first two of which say something true to a reader:
 #
@@ -136,16 +135,16 @@ done < <(
   # directory) -- plus the loose docs at the root of docs/, which are a mix of
   # design notes and analyses that a reader acts on the same way, and the
   # agent instructions, which a session acts on before it reads any of them.
-  # ../CLAUDE.md said a glyph was closed by a test that had been deleted, and
+  # CLAUDE.md said a glyph was closed by a test that had been deleted, and
   # this check, scoped to docs/ alone, passed.
   #
-  # `docs/results/` and `docs/bugs/` stay out, deliberately: they are dated
-  # evidence, and a July audit naming a file deleted in August is a correct
-  # record of July rather than a defect.
+  # `docs/results/` stays out deliberately: it is dated evidence, and a July
+  # measurement naming a file deleted in August is a correct record of July
+  # rather than stale guidance.
   {
-    find docs -name '*.md' ! -path 'docs/results/*' ! -path 'docs/bugs/*' ! -name 'README.md'
+    find docs -name '*.md' ! -path 'docs/results/*' ! -name 'README.md'
     find . -name 'intent.md' -not -path './target*' | sed 's|^\./||'
-    printf '%s\n' ../CLAUDE.md ../AGENTS.md ../GEMINI.md
+    printf '%s\n' CLAUDE.md AGENTS.md GEMINI.md
   } | sort
 )
 
