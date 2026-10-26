@@ -105,6 +105,14 @@ mod tests {
         assert_eq!(osc("52;c;"), copy(Selection::Clipboard, ""));
     }
 
+    /// `p` alone means primary; `p` alongside `c` does not — the clipboard
+    /// target wins, the same as `c` alone.
+    #[test]
+    fn osc_52_targeting_both_clipboard_and_primary_writes_the_clipboard() {
+        assert_eq!(osc("52;cp;aGVsbG8="), copy(Selection::Clipboard, "hello"));
+        assert_eq!(osc("52;pc;aGVsbG8="), copy(Selection::Clipboard, "hello"));
+    }
+
     #[test]
     fn osc_52_query_asks_for_the_named_selection_and_echoes_its_target() {
         let Some(EmulatorAction::ReportSelection { selection, report }) = osc("52;c;?") else {
