@@ -173,8 +173,9 @@
 //! negated `usize`; a range's bound that names a coordinate (L3) or anything
 //! but a `usize`, that is arithmetic on a value, or that is a value under
 //! `any` or `all`; a known range that runs backwards; a count parameter of a
-//! helper or of the closure form; `.at()`,
-//! `.constant()`, `.collapse()`; a block with no final expression; an
+//! helper or of the closure form; `.at` of a count, a kernel or a record, or at
+//! anything but two `f32`s; `.constant()`, `.collapse()`; a block with no
+//! final expression; an
 //! `Args` record's name taken twice; a function type spelled any way but
 //! `impl Fn(f32, f32) -> f32`; a kernel used as anything but applied, with
 //! two `f32`s, or passed by name to a helper's kernel-typed parameter — in
