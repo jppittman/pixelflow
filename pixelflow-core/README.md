@@ -65,7 +65,7 @@ A reduction's bounds are values: a literal, a per-call count (`Kernel::over_valu
 `Uniform`; in `kernel!`, an entry's `n: usize`), or an enclosing reduction's index, and none may
 be a function of a coordinate or of a lattice binder. One compiled program serves every count; a
 count is an integer in `0..=2²⁴`, and a reduction with a bound that is not one is NaN (up to
-the optimizer's algebraic rules, which are not sound at NaN; BACKLOG E9). General
+the optimizer's algebraic rules, which are not sound at NaN; Linear JP-12). General
 unbounded recursion is intentionally outside the language: **the language is a DAG**, and the fold
 is its one binder ([a bound is a value](../docs/language/2026-10-20-a-bound-is-a-value.md)).
 

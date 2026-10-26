@@ -46,7 +46,7 @@ carries to the next call; a pending UTF-8 sequence does not.
 - The `mod.rs` doc says partial UTF-8 is buffered across chunks; the code emits
   `U+FFFD` at the end of each call (pinned by
   `it_should_handle_fragmented_utf8_input_with_intermediate_finalization`),
-  though a PTY read can split a character. No plan or BACKLOG item names it.
+  though a PTY read can split a character. No plan or Linear issue names it.
 - A string past `MAX_OSC_LEN` (1024) is truncated and dispatched unmarked.
 - `AnsiProcessor`'s `lexer` and `parser` fields are `pub(super)`, crate-wide;
   nothing outside `ansi` uses them.

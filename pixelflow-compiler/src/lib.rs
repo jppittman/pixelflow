@@ -160,7 +160,7 @@ pub(crate) const BOUND_PLAN: &str = "docs/language/2026-10-20-a-bound-is-a-value
 /// are Π, min and max, and `(a..b).any(|i| m)` and `.all(|i| m)` are ∃ and ∀
 /// of `bool`s. An empty range gives the monoid's identity, up to the
 /// optimizer's algebraic rules, which are not sound at NaN or infinity
-/// (BACKLOG E9). Each bound is a
+/// (Linear JP-12). Each bound is a
 /// `usize`: an integer, a `usize` const or `+ - * /` over them, known at
 /// expansion; an enclosing fold's index, for a triangular `(0..i)`; or an
 /// entry's count parameter, `n: usize`, bound per call. A bound that is a

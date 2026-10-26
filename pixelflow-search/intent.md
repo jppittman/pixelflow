@@ -49,7 +49,7 @@ meaning, and a non-additive cost enters only as a `Reranker`.
 - Laws 1, 3, 4 have no test of their own: `egraph/optimizer.rs` cites a laws
   module that is not in the tree (optimizer-api audit, DENOTATION §8).
 - Law 5's first half is violated: extraction prices a tree, never sharing
-  (BACKLOG E5); `Reranker` has no implementation.
+  (JP-15); `Reranker` has no implementation.
 - `Tier`, `Saturate::macro_tier` and the telemetry `"tier"` field remain
   though the pipeline has no tier (one-pipeline M1, M3). A declined term
   compiles unoptimized, unreported (`jit_cache` takes the raw arena; M12).

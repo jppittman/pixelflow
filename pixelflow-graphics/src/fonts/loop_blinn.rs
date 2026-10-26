@@ -1010,8 +1010,9 @@ fn piece_row(piece: Piece) -> [f32; PIECE_ROW_COLS] {
 ///
 /// Powers of two, per
 /// `docs/graphics/2026-09-09-glyph-as-a-fold-execution.md` §S3's own framing
-/// — see that section, and this crate's measurements in
-/// `docs/BACKLOG.md`, for the trade against a coarser bucket.
+/// — see that section, and
+/// `docs/results/2026-10-20-production-glyph-baseline.md`, for the trade
+/// against a coarser bucket.
 fn bucketed_trip_count(pieces: u32) -> u32 {
     pieces.next_power_of_two()
 }
