@@ -713,24 +713,13 @@ fn a_count_in_a_ranges_const_arithmetic_folds_as_rustcs_does() {
 // ─────────────── values as bounds ───────────────
 //
 // A fold's bound may be a value (docs/language/2026-10-20-a-bound-is-a-value.md
-// §3.4): an enclosing fold's index — a triangular `0..i` — or an entry's count
-// parameter `n: usize`, bound per call. Rust's iterator over the same tokens is
+// §3.4): an entry's count parameter `n: usize`, bound per call. Rust's iterator over the same tokens is
 // the oracle, the count a `usize` argument of the host `fn`.
 
 kernel! {
-    /// Σ_{i<4} Σ_{j<i} (X·j + i): an inner fold bounded by the outer index.
-    pub fn triangle() -> f32 {
-        (0..4).map(|i| (0..i).map(|j| X * (j as f32) + (i as f32)).sum::<f32>()).sum()
-    }
-
     /// Σ_{i<n} X·i, the count a per-call value.
     pub fn sum_to(n: usize) -> f32 {
         (0..n).map(|i| X * (i as f32)).sum()
-    }
-
-    /// Σ_{i<n} Σ_{j<i} (X·j + i): a count bounding the fold an index bounds.
-    pub fn triangle_to(n: usize) -> f32 {
-        (0..n).map(|i| (0..i).map(|j| X * (j as f32) + (i as f32)).sum::<f32>()).sum()
     }
 
     /// Σ_{n≤i<8} X·i: a count at the first end.
@@ -744,20 +733,8 @@ kernel! {
     }
 }
 
-fn rust_triangle(x: f32) -> f32 {
-    (0..4)
-        .map(|i| (0..i).map(|j| x * (j as f32) + (i as f32)).sum::<f32>())
-        .sum()
-}
-
 fn rust_sum(n: usize, x: f32) -> f32 {
     (0..n).map(|i| x * (i as f32)).sum()
-}
-
-fn rust_triangle_to(n: usize, x: f32) -> f32 {
-    (0..n)
-        .map(|i| (0..i).map(|j| x * (j as f32) + (i as f32)).sum::<f32>())
-        .sum()
 }
 
 fn rust_sum_from(n: usize, x: f32) -> f32 {
@@ -768,25 +745,10 @@ fn rust_sum_between(lo: usize, hi: usize, x: f32, y: f32) -> f32 {
     (lo..hi).map(|i| x * (i as f32) + y).sum()
 }
 
-/// A fold bounded by the index of the fold around it, `Σ_i Σ_{j<i}`, means
-/// what the same iterator means; every sum is exact.
-#[test]
-fn a_triangular_fold_folds_as_rustcs_does() {
-    for (x, y) in FOLD_SAMPLES {
-        assert_eq!(
-            Lattice::eval_at(&triangle(), x, y),
-            rust_triangle(x),
-            "at ({x}, {y})"
-        );
-    }
-    // X = 3: 0 + 1 + (2 + 5) + (3 + 6 + 9).
-    assert_eq!(bake(&triangle()), 26.0);
-}
-
 /// A count passed per call bounds a fold as Rust's `0..n` does, at every
 /// count — the empty one too, whose zero may differ from rustc's in sign,
 /// which `==` cannot see (`a_fold_over_an_empty_range_is_the_identity_as_in_rustc`)
-/// — and bounds the outer fold of a triangle.
+/// at the public entry boundary.
 #[test]
 fn a_per_call_count_folds_as_rustcs_does() {
     for n in [0, 1, 3, 7] {
@@ -794,11 +756,6 @@ fn a_per_call_count_folds_as_rustcs_does() {
             assert_eq!(
                 Lattice::eval_at(&sum_to(n), x, y),
                 rust_sum(n, x),
-                "n = {n}, at ({x}, {y})"
-            );
-            assert_eq!(
-                Lattice::eval_at(&triangle_to(n), x, y),
-                rust_triangle_to(n, x),
                 "n = {n}, at ({x}, {y})"
             );
         }

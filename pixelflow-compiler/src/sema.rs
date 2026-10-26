@@ -956,8 +956,8 @@ impl<'a> FnAnalyzer<'a> {
     /// of the fold's monoid, typed in a scope of its own where the closure's
     /// parameter is the index. The bounds are typed before that scope opens,
     /// so a fold's own index is no name its bound can read (L3), and an
-    /// enclosing fold's is. The body sees every enclosing binding, as a Rust
-    /// closure does.
+    /// enclosing fold's index is not an admissible user bound. The body
+    /// sees every enclosing binding, as a Rust closure does.
     fn type_of_fold(&mut self, fold: &FoldExpr) -> syn::Result<Ty> {
         let names = bound_names(&fold.range.lo)
             .into_iter()
@@ -978,15 +978,25 @@ impl<'a> FnAnalyzer<'a> {
         typed
     }
 
-    /// A name in a range's bound: a `usize` — a `usize` const, an enclosing
-    /// fold's index, an entry's count parameter — whatever arithmetic joins
-    /// it to others, which [`range_bounds`] judges after. So `0..X + 1`
-    /// breaks L3, not the leaf rule.
+    /// A name in a range's bound: a `usize` const or an entry's count
+    /// parameter. An enclosing index is recognized and refused here before
+    /// [`range_bounds`] judges the bound's shape. So `0..X + 1` breaks L3,
+    /// not the leaf rule.
     fn bound_named(&self, name: &Ident) -> syn::Result<()> {
         let Some(symbol) = self.symbols.lookup(&name.to_string()) else {
             return Err(self.not_in_scope(name));
         };
         match (symbol.kind, symbol.ty) {
+            (SymbolKind::Index, Ty::Usize) => Err(syn::Error::new(
+                name.span(),
+                format!(
+                    "`{name}` is a fold index used as a range bound\n\
+                     \n\
+                     note: a user fold's bound is a constant or an unchanged uniform count; \
+                     enclosing indices would make the iteration space non-rectangular (§4 of \
+                     docs/language/2026-10-25-kernel-staging-and-rectangular-folds.md)"
+                ),
+            )),
             (_, Ty::Usize) => Ok(()),
             (SymbolKind::Intrinsic, _) => Err(a_coordinate_bounds_no_fold(name)),
             (kind, ty) => Err(self.not_a_usize_bound(name, kind, ty)),
@@ -1018,7 +1028,7 @@ impl<'a> FnAnalyzer<'a> {
                 "mismatched types: expected `usize`, found `{found}`\n\
                  \n\
                  note: `{name}` is a range's bound, and a bound is an integer literal, a \
-                 `usize` const, an enclosing fold's index or an entry's count parameter \
+                 `usize` const or an entry's unchanged count parameter \
                  `n: usize` (§3.4 of {BOUND_PLAN}){help}"
             ),
         )
@@ -1781,8 +1791,7 @@ fn bound_arithmetic(name: &Ident, binary: &BinaryExpr) -> syn::Error {
         format!(
             "arithmetic on `{name}` in a range's bound\n\
              \n\
-             note: a bound that is a value — an enclosing fold's index, or an entry's count \
-             parameter — stands alone: the program computes a bound in an `f32` lane, where a \
+             note: a bound that is a value — an entry's count parameter — stands alone: the program computes a bound in an `f32` lane, where a \
              sum of two counts can round to another count and the fold run the wrong number \
              of trips with no NaN to say so, until bounds are typed integers (§1.4 of \
              {BOUND_PLAN})\n\
@@ -1800,7 +1809,7 @@ fn bound_arithmetic(name: &Ident, binary: &BinaryExpr) -> syn::Error {
 type CheckedOp = fn(u64, u64) -> Option<u64>;
 
 /// What a range's bound is (plan §3.4): a count evaluated here, or a name the
-/// program binds — an enclosing fold's index or an entry's count parameter —
+/// program binds — an entry's unchanged count parameter —
 /// whose value is a leaf of the program, read per trip or per call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Count {
@@ -2019,8 +2028,7 @@ impl UsizeScope for RangeScope<'_> {
             format!(
                 "a range's bound is a count, and this is not one\n\
                  \n\
-                 note: a bound is an integer literal, a `usize` const, an enclosing fold's index \
-                 or an entry's count parameter `n: usize`; literals and `usize` consts combine \
+                 note: a bound is an integer literal, a `usize` const or an entry's unchanged count parameter `n: usize`; literals and `usize` consts combine \
                  by `+ - * /` and parentheses (§3.4 of {BOUND_PLAN})"
             ),
         )
@@ -2976,18 +2984,21 @@ mod tests {
         assert!(!err.contains("help:"), "got: {err}");
     }
 
-    /// A bound may be a name the program binds, alone: an enclosing fold's
-    /// index, or an entry's count parameter, at either end or both. A fold's
-    /// index may shadow the count that bounds it, inside its body only, as in
-    /// Rust.
+    /// A value bound is an unchanged entry count. An enclosing fold's index is
+    /// refused so user folds have rectangular iteration spaces.
     #[test]
-    fn a_range_bound_may_be_an_enclosing_index_or_a_count_parameter() {
-        accepted(quote! {
-            || (0..4).map(|i| (0..i).map(|j| (j as f32) * X).sum::<f32>()).sum()
-        });
-        accepted(quote! {
-            || (0..4).map(|i| (i..4).map(|j| j as f32).sum::<f32>()).sum()
-        });
+    fn a_range_bound_may_be_a_count_parameter_but_not_an_enclosing_index() {
+        for input in [
+            quote! { || (0..4).map(|i| (0..i).map(|j| (j as f32) * X).sum::<f32>()).sum() },
+            quote! { || (0..4).map(|i| (i..4).map(|j| j as f32).sum::<f32>()).sum() },
+        ] {
+            let err = refusal(input);
+            assert!(
+                err.contains("fold index used as a range bound")
+                    && err.contains("constant or an unchanged uniform count"),
+                "got: {err}"
+            );
+        }
         accepted(quote! { pub fn f(n: usize) -> f32 { (0..n).map(|i| X * (i as f32)).sum() } });
         accepted(quote! {
             pub fn f(n: usize) -> f32 { (n..8).map(|i| i as f32).sum::<f32>() + (n as f32) }
@@ -2997,10 +3008,7 @@ mod tests {
         });
         accepted(quote! { pub fn f(n: usize) -> f32 { (0..(n)).map(|n| n as f32).sum() } });
         accepted(quote! {
-            fn tri(x: f32) -> f32 {
-                (0..4).map(|i| (0..i).map(|j| x * (j as f32)).sum::<f32>()).sum()
-            }
-            pub fn f() -> f32 { tri(X) }
+            || (0..4).map(|i| (0..3).map(|j| (i as f32) + (j as f32)).sum::<f32>()).sum()
         });
         accepted(quote! {
             pub fn f(k: impl Fn(f32, f32) -> f32, n: usize) -> f32 {
@@ -3015,11 +3023,13 @@ mod tests {
     /// beside a value or not, is known at expansion and is not.
     #[test]
     fn arithmetic_on_a_value_bound_is_refused_until_bounds_are_integers() {
-        let cases: [(TokenStream, &str); 4] = [
-            (
-                quote! { || (0..4).map(|i| (0..i + 1).map(|j| j as f32).sum::<f32>()).sum() },
-                "`i`",
-            ),
+        let index_err =
+            refusal(quote! { || (0..4).map(|i| (0..i + 1).map(|j| j as f32).sum::<f32>()).sum() });
+        assert!(
+            index_err.contains("fold index used as a range bound"),
+            "got: {index_err}"
+        );
+        let cases: [(TokenStream, &str); 3] = [
             (
                 quote! { pub fn f(n: usize) -> f32 { (0..n - 1).map(|i| i as f32).sum() } },
                 "`n`",
@@ -3058,9 +3068,6 @@ mod tests {
         for input in [
             quote! { pub fn f(n: usize) -> bool { (0..n).any(|i| X < i as f32) } },
             quote! { pub fn f(n: usize) -> bool { (n..4).all(|i| X < i as f32) } },
-            quote! {
-                || (0..4).map(|i| if (0..i).any(|j| X < j as f32) { 1.0 } else { 0.0 }).sum()
-            },
         ] {
             let err = refusal(input);
             assert!(
@@ -3068,6 +3075,13 @@ mod tests {
                 "got: {err}"
             );
         }
+        let err = refusal(quote! {
+            || (0..4).map(|i| if (0..i).any(|j| X < j as f32) { 1.0 } else { 0.0 }).sum()
+        });
+        assert!(
+            err.contains("fold index used as a range bound"),
+            "got: {err}"
+        );
     }
 
     /// A known range runs forwards; a reversed one is refused, saying it
@@ -3315,7 +3329,13 @@ mod tests {
         // among the names they read, and an enclosing index is.
         let err = refusal(quote! { || (0..i).map(|i| i as f32).sum() });
         assert!(err.contains("cannot find `i`"), "got: {err}");
-        accepted(quote! { || (0..4).map(|i| (0..i).map(|i| i as f32).sum::<f32>()).sum() });
+        let err = refusal(quote! {
+            || (0..4).map(|i| (0..i).map(|i| i as f32).sum::<f32>()).sum()
+        });
+        assert!(
+            err.contains("fold index used as a range bound"),
+            "got: {err}"
+        );
         let err = refusal(quote! { || (0..4).map(|X| X).sum() });
         assert!(
             err.contains("a fold's index `X` shadows the intrinsic"),
