@@ -19,9 +19,8 @@ New, untested-by-mutation files from the series:
 value-bounded fold in its domain guard) and `pixelflow-ir/src/lit.rs` (161
 lines — the typed-literal `Lit::Real`/`Lit::Mask`, from the same period's
 "a constant is a typed literal" commit, #1431). Both already carry their own
-`mod tests` (white-box, same relationship `register_file.rs`'s tests had to
-their file in the 10-10 pass — reached only through the file's own
-`pub(crate)` surface, not private internals a public accessor should front).
+`mod tests`. The new `Lit` test uses the public `ExprArena::push_lit` API to
+check its documented interning contract.
 Also swept `desloppify/src/review/module.rs` (171 lines, new in the same
 window's desloppify refactor, #1442/#1444/#1445) — no tests at all, reached
 only as `pub(super)` plumbing from `plan.rs`/`identify.rs`/`synthesize.rs`.
@@ -44,19 +43,15 @@ Installed fresh (consistent with every prior pass).
 
 34 mutants, first sweep: **22 caught, 6 unviable, 4 missed, 2 timeouts.**
 
-**`guard.rs:84`, real gap, closed.** `guard()`'s domain match has
-`(Some(low), Some(high)) if low != high => { in_domain(low) & in_domain(high) }`,
-falling through to the single-term arm when `low == high` (same `ExprId`,
-e.g. `Bound::Value(u)` used for both ends) to avoid wrapping one test in a
-redundant self-`BitAnd`. Deleting the guard survived because the existing
-`two_value_bounds_are_each_in_the_domain` test's `low == high` half only
-asserted `count_of(domain, Le) == 2` — and the arena interns by content, so
-`in_domain(low)` and `in_domain(high)` on the same id produce the *same two*
-`Le` nodes either way; the mutant's extra `BitAnd(x, x)` wrapper is invisible
-to a node-count check that doesn't count `BitAnd`. Added
-`a_value_bound_shared_by_lo_and_hi_is_not_joined_to_itself`, asserting
-`count_of(domain, OpKind::BitAnd) == 2` (`in_domain`'s own two joins, no
-outer one) — catches it.
+**`guard.rs:84`, as-if equivalent.** Deleting the `low != high` check
+adds `BitAnd(x, x)` when both bounds name the same value. That extra node
+has the same value as `x`; the existing test correctly observes the domain
+of one bound. A count of `BitAnd` nodes would kill the mutant, but it would
+assert an intermediate shape solely to preserve an optimization. The accepted
+`docs/process/2026-10-13-tests-check-the-as-if-contract.md` explicitly
+places that kind of claim in benchmarks rather than unit tests. No test was
+added for this mutant. If the redundant join has a material cost, measure the
+compiled kernel against a baseline in the benchmark gate.
 
 **`guard.rs:67`, confirmed equivalent.** `has_a_value_bound` replaced with
 `true` survives because `guard()` re-derives the same answer from the node's
@@ -67,8 +62,8 @@ Same shape as 10-10's line-199 finding (`select.rs`'s dead rematerializable
 branch): the check is an optimization to skip a call, not a correctness
 gate, so there is nothing to test that isn't testing dead code.
 
-**`lit.rs:88`, both `eq` mutants, timeout — explained, and now also caught
-directly.** Neither was closed by a new assertion catching it as a *failure*;
+**`lit.rs:88`, both `eq` mutants, timeout — explained, and caught
+directly in an isolated test.** Neither was closed by a new assertion catching it as a *failure*;
 cargo-mutants still reports `TIMEOUT` for both. Tracked it down by hand:
 applying `fn eq(&self, other: &Self) -> bool { false }` and running the
 crate's full suite single-threaded (`cargo test -p pixelflow-ir --lib --
@@ -134,8 +129,8 @@ function in a tool that isn't part of the rendering pipeline.
 
 ## Verified
 
-- `cargo test -p pixelflow-ir --lib`: pass (312 tests, including the two new
-  ones).
+- `cargo test -p pixelflow-ir --lib`: pass (311 tests, including the new
+  interning test).
 - `cargo test --workspace --lib --bins`: pass.
 - `cargo fmt --all -- --check`: clean (after `cargo fmt -p pixelflow-ir`).
 - `cargo clippy -p pixelflow-ir --all-targets --all-features -- -D warnings`:
@@ -147,10 +142,9 @@ function in a tool that isn't part of the rendering pipeline.
   lint a prior green CI run never saw. Out of scope here; worth its own pass
   if it also reproduces on a clean checkout of `main`.
 - `cargo mutants -p pixelflow-ir -f pixelflow-ir/src/passes/guard.rs -f pixelflow-ir/src/lit.rs`:
-  34 mutants, 23 caught, 6 unviable, 2 timeouts (both explained above), 3
-  missed (97 and 104, confirmed non-correctness/unreachable above; 67,
-  confirmed equivalent above) — down from 4 missed before the `guard.rs:84`
-  fix.
+  34 mutants, 22 caught, 6 unviable, 2 timeouts (both explained above), 4
+  missed (guard.rs:84 and :67, both as-if equivalent; lit.rs:97 and :104,
+  non-correctness/unreachable as explained above).
 - `cargo mutants -p desloppify -f desloppify/src/review/module.rs`: 30
   mutants, 26 caught, 3 unviable, 1 missed (line 159, real, deferred above).
 
