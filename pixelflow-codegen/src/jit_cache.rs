@@ -54,7 +54,7 @@ use crate::emit;
 use crate::emit::CompiledKernel;
 use crate::error::CompileError;
 use pixelflow_ir::LatticeShape;
-use pixelflow_ir::arena::{BufferDecl, ExprNode, UniformDecl};
+use pixelflow_ir::arena::{BufferDecl, UniformDecl};
 use pixelflow_ir::key::{Canonical, canonical};
 
 static CACHE: OnceLock<Mutex<HashMap<CacheKey, Arc<CompiledKernel>>>> = OnceLock::new();
@@ -113,7 +113,7 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // Guarded rather than called unconditionally: the pass's own identity
     // path still clones the arena, and this runs on every compile including
     // the cache hits.
-    let holds_a_ref = arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_)));
+    let holds_a_ref = arena.names_a_kernel();
     let expanded = holds_a_ref.then(|| pixelflow_ir::passes::expand_refs_owned(arena, root));
     let (linked_arena, linked_root) = match &expanded {
         Some((linked, linked_root)) => (linked, *linked_root),

@@ -120,6 +120,12 @@ pub enum Shape<'a, R> {
     /// (The `Ref` in [`Ir::Ref`] is unrelated — that is how a representation
     /// *names* one of its own nodes; this is a name for a whole kernel.)
     Ref(KernelKey),
+    /// A kernel named by content, read at the warp `(cx, cy)` —
+    /// [`ExprNode::Apply`](crate::arena::ExprNode::Apply). Like a [`Shape::Ref`]
+    /// its body is not in this term, so an e-graph insert declines it until
+    /// something resolves it; unlike one, it has two children, which is why
+    /// it is not a leaf.
+    Apply(KernelKey, R, R),
     /// An operation over `children`.
     Op(OpKind, Children<'a, R>),
     /// A fold: `⊕_{k} body[fold.binder() := k]` over its range's visited

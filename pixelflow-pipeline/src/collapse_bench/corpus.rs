@@ -299,7 +299,7 @@ pub fn encode(kernel: &CollapseKernel) -> String {
             ),
             // A key names an entry in this process's `KernelStore`, which a
             // corpus file outlives; expand references before dumping one.
-            ExprNode::Ref(k) => panic!(
+            ExprNode::Ref(k) | ExprNode::Apply(k, ..) => panic!(
                 "{}: corpus kernels must be self-contained, but this one holds Ref({k:?}) — \
                  a name for a kernel interned in this process only",
                 kernel.name

@@ -544,9 +544,9 @@ fn node(arena: &ExprArena, id: ExprId) -> TokenStream {
         // time — a runtime value, and the key it carries names a store
         // in the *build host's* process, which the compiled program is
         // not. Emitting one would name nothing.
-        ExprNode::Ref(k) => {
+        ExprNode::Ref(k) | ExprNode::Apply(k, ..) => {
             panic!(
-                "kernel! produced ExprNode::Ref({k:?}) — a reference names a kernel \
+                "kernel! produced a reference to {k:?} — a reference names a kernel \
                  interned in this process, which the emitted program does not share"
             )
         }
