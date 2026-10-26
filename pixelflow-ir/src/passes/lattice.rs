@@ -32,6 +32,13 @@ use crate::fold::{Binder, Bound, Fold, KNOWN_RANGE, Monoid};
 use crate::kind::OpKind;
 use crate::variance::LatticeShape;
 
+/// Binder slots the collapse scaffold adds around every kernel: row, column,
+/// and lane.
+pub const COLLAPSE_BINDERS: usize = 3;
+
+/// Maximum number of user folds that may be live when a kernel is collapsed.
+pub const KERNEL_BINDER_CAPACITY: usize = Binder::COUNT - COLLAPSE_BINDERS;
+
 /// What [`legalize`](super::legalize) wraps a kernel for: the domain it
 /// tabulates, and the lane width the target executes the innermost fold by.
 ///
@@ -143,6 +150,8 @@ pub fn collapse(arena: &mut ExprArena, root: ExprId, domain: Domain) -> ExprId {
         col_fold,
     )
 }
+
+const _: () = assert!(Binder::COUNT >= COLLAPSE_BINDERS);
 
 /// The full pass order, named once so every panic message in this file spells
 /// it identically.
