@@ -144,7 +144,7 @@ pub fn legalize(
 /// Compile an [`ExprArena`] DAG into a
 /// **collapse** kernel for a lattice of `shape`: the kernel is wrapped in the
 /// lattice's folds by
-/// [`legalization`], and every fold is emitted as a loop
+/// `legalization`, and every fold is emitted as a loop
 /// inside the code — one call fills the whole extent with no per-row or
 /// per-batch Rust↔JIT boundary. Matches the
 /// `KernelFn` ABI `(ctx, out, pitch)`.
