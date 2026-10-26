@@ -41,7 +41,7 @@ audit series. §8 marks the depth per row.
 | `docs/plans/` | 38 | 38 | plans of record, pre-registrations, scoping |
 | `docs/plans/archive/` | 2 | 2 | the deleted RL training path |
 | `docs/results/` | 181 | 69 | measurements, audits, triage; 112 of these are `.csv`/`.json`/`.jsonl` row data |
-| `docs/bugs/` | 26 | 26 | 23 of them one scheduled test-quality audit series |
+| historical checked-in bug reports (since removed; live tracking is in Linear) | 26 | 26 | 23 of them one scheduled test-quality audit series |
 | `docs/archive/` | 2 | 2 | GNN vision, NNUE curriculum |
 | `docs/superpowers/` | 5 | 5 | April 2026 four-team pipeline rewrite |
 | `docs/templates/` | 1 | 1 | `../process/DESIGN_DOC.md` |
@@ -260,7 +260,7 @@ than a log line. Fixed and pinned (#1216).
 
 `docs/process/POSTSUBMIT.md` documents a genuinely strong pipeline: 5× flake detection per (OS, suite), ISA
 matrix, benchmark regression against a `gh-pages` baseline, and **automatic revert** on consistent
-failure. The `docs/bugs/` directory is 23 documents of one scheduled test-quality audit series running
+failure. The since-removed checked-in bug directory was 23 documents of one scheduled test-quality audit series running
 from 2026-07-20 to 2026-09-07.
 
 **State:** the process apparatus is more mature than most of what it guards. See §5 for the two places
