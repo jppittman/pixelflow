@@ -13,7 +13,7 @@ mod lower;
 mod ownership;
 mod scopes;
 mod tree;
-pub(crate) use lattice::{Collapse, Domain, Pack};
+pub(crate) use lattice::{Collapse, Domain, Factored};
 pub(crate) use layout::Layout;
 pub(crate) use lower::arena_to_schedule;
 pub(crate) use ownership::Own;

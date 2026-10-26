@@ -263,12 +263,6 @@ fn latency_prior_cost(arena: &ExprArena, root: ExprId) -> usize {
             // Priced as the node it is, which is what `CostModel` says about
             // it — see `node_op_cost`'s note on why that is a sentinel.
             ExprNode::Reduce { .. } => Some(pixelflow_ir::OpKind::Reduce),
-            // Same again: `insert` declines a `Write`, which is built after
-            // extraction in any case.
-            ExprNode::Write { .. } => panic!(
-                "latency_prior_cost: a Write — insert declines a Write, so one here \
-                 means this arena never went through the pipeline"
-            ),
         };
         if let Some(op) = op {
             total += costs.cost(op);

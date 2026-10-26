@@ -2381,10 +2381,7 @@ pub(crate) mod production_telemetry {
                 // A fold survives extraction now; the legalizer unrolls it
                 // afterwards, and this walk prices the node it is.
                 ExprNode::Reduce { .. } => Some(OpKind::Reduce),
-                other @ (ExprNode::Param(_)
-                | ExprNode::Nary(..)
-                | ExprNode::Ref(_)
-                | ExprNode::Write { .. }) => {
+                other @ (ExprNode::Param(_) | ExprNode::Nary(..) | ExprNode::Ref(_)) => {
                     panic!("extracted arena contains {other:?}")
                 }
             };

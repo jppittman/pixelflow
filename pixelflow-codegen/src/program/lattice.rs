@@ -1,30 +1,23 @@
-//! The lattice's own two folds: the CPU backend's traversal.
+//! The CPU's factorization of the lattice: rows, batches and lanes.
 //!
-//! `collapse(extent)` wraps a kernel in the row/column/lane folds a
-//! collapse *is*; `pack(lanes)` strip-mines the column fold to a target's
-//! lane width. Both are arena-level transforms, and
-//! the CPU chain runs them between `legalize_front` and `legalize_back`
-//! (`pipeline.rs`) — see `pixelflow_ir::passes`'s module doc for why they sit
-//! there in the full pass order. The traversal is the backend's schedule, so
-//! it lives here and not in the target-agnostic IR
-//! (docs/language/2026-10-15-kernels-evaluate-kernels.md §3).
+//! The lattice is the kernel's domain; how a backend walks it is the
+//! backend's schedule (docs/language/2026-10-15-kernels-evaluate-kernels.md §3,
+//! docs/codegen/2026-10-15-a-schedule-is-a-factorization.md). The CPU's walk
+//! is a [`Traversal`] — three binders, an extent, and the tier's lane width —
+//! and this module holds no arena node for it: [`Collapse`] only spells the
+//! kernel's coordinates through the traversal's binders, and `Lower` writes
+//! the loops themselves into the schedule ([`Traversal::pieces`]).
 //!
 //! ```text
-//! collapse(f) = fold_{j∈[0,h)} fold_{i∈[0,w)} fold_{l∈[0,1)}
-//!                  Write(row=j, col=i, lane=l, f(x0 + i + l, y0 + j))
-//! pack(L)     = fold_j (   fold_{i∈[0,w−r) step L}   fold_{l∈[0,L)} Write(…)
-//!                        ; fold_{i∈[w−r,w−r+1)}      fold_{l∈[0,r)} Write(…) )
+//! collapse(f) = f(x0 + i + l, y0 + j)             i, j, l the traversal's binders
+//! walk        = fold_{j∈[0,h)} (   fold_{i∈[0,w−r) step L} store L lanes
+//!                                ; fold_{i∈[w−r,w−r+1)}    store r lanes )
 //!                 (the first arm only when w − r > 0, the second only when r > 0,
 //!                  the `;` only when both exist)
 //! ```
 //!
-//! `w × h` is the extent, `q = w / L`, `r = w % L`; every fold is over
-//! [`Monoid::SEQ`], the unit monoid; `;` is [`OpKind::Seq`]. `collapse` builds
-//! a *degenerate* `[0,1)` lane fold rather than none at all, so `Write`
-//! always has all three binders and `pack` only ever rebuilds the two inner
-//! folds around it, with new ranges, or drops one — the `Write` node itself
-//! is shared and untouched. This is the monadic reading — a `SEQ` fold is `for_`, `Seq` is
-//! `>>` — and `pack` is exactly the chunking law
+//! `w × h` is the extent, `L` the lanes, `r = w % L`. This is the monadic
+//! reading of the chunking law
 //! `for_ [0,w) f = for_ [0,w−r) step L (\i -> for_ [0,L) (\l -> f(i+l))) >>
 //! for_ [w−r] (\i -> for_ [0,r) (\l -> f(i+l)))`
 //! (docs/archive/plans/2026-09-16-collapse-is-a-fold.md §2.1–§2.4).
@@ -32,43 +25,10 @@
 use crate::error::CompileError;
 use crate::pass::Pass;
 use pixelflow_ir::LatticeShape;
-use pixelflow_ir::arena::{COORD_AXES, ExprArena, ExprId, ExprNode, UniformDecl};
-use pixelflow_ir::fold::{Binder, Bound, Fold, KNOWN_RANGE, Monoid};
+use pixelflow_ir::arena::{COORD_AXES, ExprArena, ExprId, ExprNode, UniformDecl, UniformId};
+use pixelflow_ir::fold::{Binder, Fold, Monoid};
 use pixelflow_ir::kind::OpKind;
-
-/// [`collapse`] as a stage: the arena a kernel lives in, wrapped in the
-/// lattice's three folds over `domain`.
-pub(crate) struct Collapse {
-    /// The extent and the origin.
-    pub(crate) domain: Domain,
-}
-
-impl Pass for Collapse {
-    type Input = (ExprArena, ExprId);
-    type Output = (ExprArena, ExprId);
-
-    fn run(self, (mut arena, root): Self::Input) -> Result<Self::Output, CompileError> {
-        let root = collapse(&mut arena, root, self.domain);
-        Ok((arena, root))
-    }
-}
-
-/// [`pack`] as a stage: [`Collapse`]'s column fold strip-mined to `lanes`, the
-/// width of the tier the process chose.
-pub(crate) struct Pack {
-    /// Lanes per batch: [`pack`]'s `L`.
-    pub(crate) lanes: u32,
-}
-
-impl Pass for Pack {
-    type Input = (ExprArena, ExprId);
-    type Output = (ExprArena, ExprId);
-
-    fn run(self, (mut arena, root): Self::Input) -> Result<Self::Output, CompileError> {
-        let root = pack(&mut arena, root, self.lanes);
-        Ok((arena, root))
-    }
-}
+use pixelflow_ir::variance::Variance;
 
 /// The domain a collapse tabulates a kernel over: its extent, and the origin
 /// the call supplies. `LatticeShape` is "the compile-time half of
@@ -82,19 +42,115 @@ pub(crate) struct Domain {
     pub(crate) origin: [UniformDecl; COORD_AXES],
 }
 
-/// Wrap the kernel at `root` in the lattice's three folds — row, column,
-/// lane — around one [`Write`](ExprNode::Write), and return the new root
-/// (the row fold) in the same arena. Target-agnostic: no lane width appears
-/// (that is [`pack`]'s one parameter).
+/// How the CPU walks a lattice: the binders its row, column and lane loops
+/// count with, the extent, and the lanes per batch.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Traversal {
+    /// The row loop's binder.
+    pub(crate) row: Binder,
+    /// The column loop's binder.
+    pub(crate) col: Binder,
+    /// The lane binder: executed by lanes, never a loop counter.
+    pub(crate) lane: Binder,
+    /// Samples per axis, `[w, h]`.
+    pub(crate) extent: [u32; COORD_AXES],
+    /// Lanes per batch: the tier's width in `f32`s.
+    pub(crate) lanes: u32,
+}
+
+/// One store loop of a [`Traversal`]'s row: the column fold's binder, stride
+/// and range, and the lanes it stores per trip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Piece {
+    /// The column fold: strided by the lane width for full batches.
+    pub(crate) col: Fold,
+    /// The column fold's range, `[lo, hi)`.
+    pub(crate) range: [u64; 2],
+    /// Lanes stored per trip: the batch, or the row's remainder.
+    pub(crate) lanes: u32,
+}
+
+impl Traversal {
+    /// The variance of the traversal's three binders together: what a value
+    /// reads when it is read inside all three loops.
+    pub(crate) fn variance(&self) -> Variance {
+        [self.row, self.col, self.lane]
+            .into_iter()
+            .fold(Variance::CONST, |v, binder| {
+                v.union(Variance::from_var(binder.var()))
+            })
+    }
+
+    /// The column loops a row is, in order: the full batches, then the
+    /// remainder. A loop exists only when it has trips: the batches when
+    /// `w − r > 0`, the remainder when `r > 0`. When `w < L` there is no full
+    /// batch, so the whole column is the remainder.
+    ///
+    /// # Panics
+    ///
+    /// If the lattice has no column, or no lane.
+    pub(crate) fn pieces(&self) -> Vec<Piece> {
+        assert!(self.lanes != 0, "a traversal needs a nonzero lane count");
+        let width = u64::from(self.extent[0]);
+        let lanes = u64::from(self.lanes);
+        let remainder = width % lanes;
+        let batches = (width > remainder).then(|| Piece {
+            col: Fold::strided(Monoid::SEQ, self.col, lanes),
+            range: [0, width - remainder],
+            lanes: self.lanes,
+        });
+        let tail = (remainder > 0).then(|| Piece {
+            col: Fold::new(Monoid::SEQ, self.col),
+            range: [width - remainder, width - remainder + 1],
+            lanes: remainder as u32,
+        });
+        let pieces: Vec<Piece> = batches.into_iter().chain(tail).collect();
+        assert!(!pieces.is_empty(), "the lattice has no column");
+        pieces
+    }
+}
+
+/// A legalized kernel with the traversal that walks it: the arena holds only
+/// the kernel, spelled through the traversal's binders.
+pub(crate) struct Factored {
+    pub(crate) arena: ExprArena,
+    pub(crate) root: ExprId,
+    pub(crate) traversal: Traversal,
+}
+
+/// [`collapse`] as a stage: choose the traversal's binders and spell the
+/// kernel's coordinates through them. `lanes` is the width of the tier the
+/// process chose.
+pub(crate) struct Collapse {
+    /// The extent and the origin.
+    pub(crate) domain: Domain,
+    /// Lanes per batch.
+    pub(crate) lanes: u32,
+}
+
+impl Pass for Collapse {
+    type Input = (ExprArena, ExprId);
+    type Output = Factored;
+
+    fn run(self, (mut arena, root): Self::Input) -> Result<Self::Output, CompileError> {
+        assert!(self.lanes != 0, "collapse: lanes must be nonzero");
+        let (root, traversal) = collapse(&mut arena, root, self.domain, self.lanes);
+        Ok(Factored {
+            arena,
+            root,
+            traversal,
+        })
+    }
+}
+
+/// Spell the kernel at `root` through a traversal's three binders and return
+/// the new root with the traversal. No loop is built here; `Lower` writes them.
 ///
-/// `f ↦ fold_j fold_i fold_l Write(row=j, col=i, lane=l, f.at(x0+i+l, y0+j))`,
-/// the lane fold degenerate at `[0,1)` so `Write` always has all three
-/// binders and [`pack`] only ever reshapes ranges (module doc). `x0`/`y0` are
-/// `domain.origin`, declared as uniforms; the warped `x` is built
-/// `Add(Add(Uniform(x0), Var(col)), Var(lane))` — `(x0 + col)` is
-/// lane-uniform and hoists to the batch scope — and `y` is
-/// `Add(Uniform(y0), Var(row))`. Building the warp this way and substituting
-/// it for `Var(0)`/`Var(1)` is exactly `Kernel::at`.
+/// `f ↦ f.at(x0+i+l, y0+j)`. `x0`/`y0` are `domain.origin`, declared as
+/// uniforms; the warped `x` is built `Add(Add(Uniform(x0), Var(col)),
+/// Var(lane))` — `(x0 + col)` is lane-uniform and hoists to the batch scope —
+/// and `y` is `Add(Uniform(y0), Var(row))`. Building the warp this way and
+/// substituting it for `Var(0)`/`Var(1)` is exactly `Kernel::at`.
 ///
 /// # Panics
 ///
@@ -105,13 +161,17 @@ pub(crate) struct Domain {
 ///   would silently never reach it. A `Dwrt` must be taken with respect to
 ///   `Var(0)` before this pass substitutes that variable away, or the
 ///   chain-rule factor it needs is gone. Run `expand_refs`, then
-///   `lower_dwrt`, first — see
-///   `pipeline.rs` for the order.
+///   `lower_dwrt`, first — see `pipeline.rs` for the order.
 /// - If fewer than three binder slots are free — neither bound by a
 ///   reachable `Reduce` nor read by a reachable `Var` in the binder range: a
 ///   kernel already nesting three folds of its own leaves nothing for the
 ///   lattice.
-fn collapse(arena: &mut ExprArena, root: ExprId, domain: Domain) -> ExprId {
+fn collapse(
+    arena: &mut ExprArena,
+    root: ExprId,
+    domain: Domain,
+    lanes: u32,
+) -> (ExprId, Traversal) {
     let taken = reachable_taken_binders(arena, root);
     let mut free = (0..Binder::COUNT as u8).filter(|&slot| !taken[slot as usize]);
     let mut next_binder = |which: &str| {
@@ -128,8 +188,7 @@ fn collapse(arena: &mut ExprArena, root: ExprId, domain: Domain) -> ExprId {
     let col = next_binder("col");
     let lane = next_binder("lane");
 
-    let x0_id = arena.uniform_slot_for(domain.origin[0]);
-    let y0_id = arena.uniform_slot_for(domain.origin[1]);
+    let [x0_id, y0_id] = domain.origin.map(|decl| origin_slot(arena, decl));
     let x0 = arena.push_uniform(x0_id);
     let y0 = arena.push_uniform(y0_id);
 
@@ -139,38 +198,35 @@ fn collapse(arena: &mut ExprArena, root: ExprId, domain: Domain) -> ExprId {
 
     // `(x0 + i)` first, then `+ l`: the inner sum reads no lane index, so it
     // is lane-uniform and hoists to the batch scope by the same variance bit
-    // step 6 reads to choose a broadcast load over a gather.
+    // that chooses a broadcast load over a gather.
     let x0_plus_i = arena.push_binary(OpKind::Add, x0, i);
     let x = arena.push_binary(OpKind::Add, x0_plus_i, l);
     let y = arena.push_binary(OpKind::Add, y0, j);
 
     let body = arena.substitute_vars_with(root, &[(0, x), (1, y)]);
-    let write = arena.push_write(row, col, lane, body);
+    let traversal = Traversal {
+        row,
+        col,
+        lane,
+        extent: domain.shape.extent(),
+        lanes,
+    };
+    (body, traversal)
+}
 
-    let [w, h] = domain.shape.extent();
-    let lane_fold = arena.push_reduce(
-        Fold::new(Monoid::SEQ, lane),
-        Bound::Lit(0),
-        Bound::Lit(1),
-        write,
-    );
-    let col_fold = arena.push_reduce(
-        Fold::new(Monoid::SEQ, col),
-        Bound::Lit(0),
-        Bound::Lit(u64::from(w)),
-        lane_fold,
-    );
-    arena.push_reduce(
-        Fold::new(Monoid::SEQ, row),
-        Bound::Lit(0),
-        Bound::Lit(u64::from(h)),
-        col_fold,
-    )
+/// The slot naming `decl`'s instance in `arena`, declared if this is the first
+/// time that identity has been seen. Two declarations of one identity are one
+/// slot, so a kernel that already names the origin shares it.
+fn origin_slot(arena: &mut ExprArena, decl: UniformDecl) -> UniformId {
+    match arena.uniforms().iter().position(|d| d.id == decl.id) {
+        Some(slot) => UniformId(slot as u64),
+        None => arena.declare_uniform(decl),
+    }
 }
 
 /// The full pass order, named once so every panic message in this file spells
 /// it identically.
-const PASS_ORDER: &str = "expand_refs -> lower_dwrt -> collapse -> pack -> expand_gather \
+const PASS_ORDER: &str = "expand_refs -> lower_dwrt -> collapse -> expand_gather \
      -> expand_transcendentals -> guard";
 
 /// Which binder slots [`collapse`] must not choose — bound by a reachable
@@ -215,192 +271,11 @@ fn reachable_taken_binders(arena: &ExprArena, root: ExprId) -> [bool; Binder::CO
     taken
 }
 
-/// Strip-mine [`collapse`]'s column fold by `lanes`, under the row fold. Let
-/// `r = w mod lanes`. A main fold exists only when `w − r > 0`: it steps by
-/// `lanes` over `[0, w−r)` with a full lane fold `[0, lanes)` inside it. A
-/// remainder exists only when `r > 0`: `[w−r, w−r+1)` × `[0, r)`. When both
-/// exist the remainder is sequenced after the main fold with [`OpKind::Seq`].
-/// The `Write` [`collapse`] built is the same `ExprId` in every arm: only the
-/// two inner folds around it are rebuilt, never the body they wrap (module doc
-/// — the chunking law for `for_`).
-///
-/// When `w < lanes` there is no full batch, so there is no main fold: the whole
-/// column is the remainder. A fold over nothing is not built to be skipped.
-///
-/// # Panics
-///
-/// - If `root` is not exactly the shape [`collapse`] builds — three nested
-///   `Reduce`s over [`Monoid::SEQ`] (row, then col, then a lane fold over
-///   `[0,1)`) wrapping a `Write` whose `row`/`col`/`lane` equal the three
-///   folds' binders, in that order. Naming a pipeline-order bug: `pack` must
-///   run directly on `collapse`'s own output.
-/// - If `lanes == 0`, or the column fold is empty.
-fn pack(arena: &mut ExprArena, root: ExprId, lanes: u32) -> ExprId {
-    assert!(lanes != 0, "pack: lanes must be nonzero");
-
-    let (row_fold, col_fold, lane_fold, write) = collapse_shape(arena, root);
-    let (row, col, lane) = (row_fold.binder, col_fold.binder, lane_fold.binder);
-
-    let w = arena
-        .known_range(col_fold.id)
-        .expect(KNOWN_RANGE)
-        .range()
-        .end;
-    let h = arena
-        .known_range(row_fold.id)
-        .expect(KNOWN_RANGE)
-        .range()
-        .end;
-    let lanes = u64::from(lanes);
-    let r = w % lanes;
-
-    let main = (w > r).then(|| {
-        let lane_main = arena.push_reduce(
-            Fold::new(Monoid::SEQ, lane),
-            Bound::Lit(0),
-            Bound::Lit(lanes),
-            write,
-        );
-        arena.push_reduce(
-            Fold::strided(Monoid::SEQ, col, lanes),
-            Bound::Lit(0),
-            Bound::Lit(w - r),
-            lane_main,
-        )
-    });
-    let remainder = (r > 0).then(|| {
-        let lane_rem = arena.push_reduce(
-            Fold::new(Monoid::SEQ, lane),
-            Bound::Lit(0),
-            Bound::Lit(r),
-            write,
-        );
-        arena.push_reduce(
-            Fold::new(Monoid::SEQ, col),
-            Bound::Lit(w - r),
-            Bound::Lit(w - r + 1),
-            lane_rem,
-        )
-    });
-    let body = match (main, remainder) {
-        (Some(main), Some(remainder)) => arena.push_binary(OpKind::Seq, main, remainder),
-        (Some(only), None) | (None, Some(only)) => only,
-        (None, None) => panic!("pack: the lattice has no column"),
-    };
-
-    arena.push_reduce(
-        Fold::new(Monoid::SEQ, row),
-        Bound::Lit(0),
-        Bound::Lit(h),
-        body,
-    )
-}
-
-/// One of [`collapse`]'s folds read back out of the arena: the node that holds
-/// it, which is where its range is read ([`ExprArena::known_range`]), and the
-/// binder its `Write` reads.
-#[derive(Clone, Copy)]
-struct CollapseFold {
-    id: ExprId,
-    binder: Binder,
-}
-
-/// Read [`collapse`]'s three folds and its shared `Write` back out of `root`,
-/// or panic naming the shape `pack` expects — see [`pack`]'s own doc.
-fn collapse_shape(
-    arena: &ExprArena,
-    root: ExprId,
-) -> (CollapseFold, CollapseFold, CollapseFold, ExprId) {
-    const SHAPE: &str = "pack expects collapse's shape: three nested Reduces \
-        over Monoid::SEQ — row, then col, then a lane fold over [0,1) — \
-        wrapping a Write whose row/col/lane equal the three folds' binders, \
-        in that order";
-
-    let row_id = root;
-    let ExprNode::Reduce {
-        fold: row_fold,
-        body: col_id,
-        ..
-    } = arena.node(row_id)
-    else {
-        panic!("{SHAPE} (root is not a Reduce)");
-    };
-
-    let ExprNode::Reduce {
-        fold: col_fold,
-        body: lane_id,
-        ..
-    } = arena.node(col_id)
-    else {
-        panic!("{SHAPE} (the row fold's body is not a range Reduce)");
-    };
-
-    let ExprNode::Reduce {
-        fold: lane_fold,
-        body: write,
-        ..
-    } = arena.node(lane_id)
-    else {
-        panic!("{SHAPE} (the col fold's body is not a range Reduce)");
-    };
-
-    let ExprNode::Write {
-        row: w_row,
-        col: w_col,
-        lane: w_lane,
-        ..
-    } = arena.node(write)
-    else {
-        panic!("{SHAPE} (the lane fold's body is not a Write)");
-    };
-    let write_binders = (w_row, w_col, w_lane);
-
-    for fold in [row_fold, col_fold, lane_fold] {
-        assert_eq!(
-            fold.monoid(),
-            Monoid::SEQ,
-            "{SHAPE} (every fold must be over Monoid::SEQ)"
-        );
-    }
-    assert_eq!(
-        arena.known_range(row_id).expect(KNOWN_RANGE).range().start,
-        0,
-        "{SHAPE} (the row fold must start at 0)"
-    );
-    assert_eq!(
-        arena.known_range(col_id).expect(KNOWN_RANGE).range().start,
-        0,
-        "{SHAPE} (the col fold must start at 0)"
-    );
-    assert_eq!(
-        arena.known_range(lane_id).expect(KNOWN_RANGE).range(),
-        0..1,
-        "{SHAPE} (the lane fold must be collapse's degenerate [0,1))"
-    );
-    assert_eq!(
-        write_binders,
-        (row_fold.binder(), col_fold.binder(), lane_fold.binder()),
-        "{SHAPE} (the Write's binders must equal the three folds', in order)"
-    );
-
-    let read = |id: ExprId, fold: Fold| CollapseFold {
-        id,
-        binder: fold.binder(),
-    };
-    (
-        read(row_id, row_fold),
-        read(col_id, col_fold),
-        read(lane_id, lane_fold),
-        write,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use pixelflow_ir::arena::{BufferDecl, BufferIdentity, UniformIdentity};
-    use pixelflow_ir::fold::KnownRange;
-    use pixelflow_ir::variance::{Variance, compute_arena_variance};
+    use pixelflow_ir::variance::compute_arena_variance;
     use pixelflow_ir::{Kernel, key::KernelKey};
 
     /// Two uniforms, freshly minted, for `Domain::origin` — no test cares
@@ -418,9 +293,23 @@ mod tests {
         ]
     }
 
-    /// The range of the fold at `id`.
-    fn range_of(arena: &ExprArena, id: ExprId) -> KnownRange {
-        arena.known_range(id).expect(KNOWN_RANGE)
+    fn domain(extent: [u32; 2]) -> Domain {
+        Domain {
+            shape: LatticeShape::new(extent),
+            origin: mint_origin(),
+        }
+    }
+
+    /// A traversal of `extent` at `lanes`, for the tests of its pieces.
+    fn traversal(extent: [u32; 2], lanes: u32) -> Traversal {
+        let slot = |n| Binder::from_slot(n).expect("the slot exists");
+        Traversal {
+            row: slot(0),
+            col: slot(1),
+            lane: slot(2),
+            extent,
+            lanes,
+        }
     }
 
     /// Whether `Var(target)` is reachable from `root` — the check
@@ -434,7 +323,7 @@ mod tests {
             if core::mem::replace(&mut seen[idx], true) {
                 continue;
             }
-            if matches!(arena.node(id), ExprNode::Var(v) if v == target) {
+            if matches!(arena.node(id), ExprNode::Var(i) if i == target) {
                 return true;
             }
             stack.extend(arena.children(id));
@@ -442,121 +331,29 @@ mod tests {
         false
     }
 
-    /// Whether an `OpKind::Seq` node is reachable from `root`.
-    fn reachable_seq(arena: &ExprArena, root: ExprId) -> bool {
-        let mut seen = vec![false; arena.len()];
-        let mut stack = vec![root];
-        while let Some(id) = stack.pop() {
-            let idx = id.0 as usize;
-            if core::mem::replace(&mut seen[idx], true) {
-                continue;
-            }
-            if matches!(arena.node(id), ExprNode::Binary(OpKind::Seq, _, _)) {
-                return true;
-            }
-            stack.extend(arena.children(id));
-        }
-        false
-    }
-
-    /// `X * 2 + Y` at a `5 × 3` lattice: the exact shape `collapse` must
-    /// build, checked node by node, plus the two side effects — the two
-    /// uniforms, and that no coordinate `Var` survives.
+    /// `collapse` builds no loop: the kernel comes back as a value over the
+    /// traversal's binders, with no coordinate `Var` left, and the traversal
+    /// carries the extent and lanes it was asked for.
     #[test]
-    fn collapse_wraps_a_kernel_in_three_seq_folds_around_one_write() {
-        let k = Kernel::x().mul(&Kernel::constant(2.0)).add(&Kernel::y());
+    fn collapse_spells_the_coordinates_through_the_binders() {
+        let k = Kernel::x().add(&Kernel::y());
         let (arena, root) = k.parts();
         let mut arena = arena.clone();
-        let domain = Domain {
-            shape: LatticeShape::new([5, 3]),
-            origin: mint_origin(),
-        };
-        let new_root = collapse(&mut arena, root, domain);
+        let (body, t) = collapse(&mut arena, root, domain([8, 3]), 4);
 
-        let ExprNode::Reduce {
-            fold: row_fold,
-            body: col_id,
-            ..
-        } = arena.node(new_root)
-        else {
-            panic!("collapse's root must be a Reduce");
-        };
-        assert_eq!(row_fold.monoid(), Monoid::SEQ);
-        assert_eq!(range_of(&arena, new_root).range(), 0..3);
+        assert!(!matches!(arena.node(body), ExprNode::Reduce { .. }));
+        assert!(!reachable_var(&arena, body, 0), "X is substituted away");
+        assert!(!reachable_var(&arena, body, 1), "Y is substituted away");
+        assert_eq!((t.extent, t.lanes), ([8, 3], 4));
 
-        let ExprNode::Reduce {
-            fold: col_fold,
-            body: lane_id,
-            ..
-        } = arena.node(col_id)
-        else {
-            panic!("the row fold's body must be a Reduce");
-        };
-        assert_eq!(col_fold.monoid(), Monoid::SEQ);
-        assert_eq!(range_of(&arena, col_id).range(), 0..5);
-
-        let ExprNode::Reduce {
-            fold: lane_fold,
-            body: write,
-            ..
-        } = arena.node(lane_id)
-        else {
-            panic!("the col fold's body must be a Reduce");
-        };
-        assert_eq!(lane_fold.monoid(), Monoid::SEQ);
-        assert_eq!(range_of(&arena, lane_id).range(), 0..1);
-
-        let ExprNode::Write {
-            row,
-            col,
-            lane,
-            value,
-        } = arena.node(write)
-        else {
-            panic!("the lane fold's body must be a Write");
-        };
+        let v = compute_arena_variance(&arena)[body.0 as usize];
         assert_eq!(
-            (row, col, lane),
-            (row_fold.binder(), col_fold.binder(), lane_fold.binder()),
-            "the Write's binders must be the three folds' own, in order"
+            v,
+            t.variance(),
+            "the value depends on all three binders, via x and y, and nothing else"
         );
-
-        assert_eq!(arena.uniforms().len(), 2, "x0 and y0, and nothing else");
-        assert!(
-            !reachable_var(&arena, new_root, 0),
-            "no X survives collapse"
-        );
-        assert!(
-            !reachable_var(&arena, new_root, 1),
-            "no Y survives collapse"
-        );
-
-        let x0_pos = arena
-            .uniforms()
-            .iter()
-            .position(|d| d.id == domain.origin[0].id)
-            .expect("x0 declared");
-        let y0_pos = arena
-            .uniforms()
-            .iter()
-            .position(|d| d.id == domain.origin[1].id)
-            .expect("y0 declared");
-        let expected_x = alloc::format!(
-            "add(add(Uniform({x0_pos}), Var({})), Var({}))",
-            col_fold.binder().var(),
-            lane_fold.binder().var()
-        );
-        let expected_y = alloc::format!("add(Uniform({y0_pos}), Var({}))", row_fold.binder().var());
-        let shown = alloc::format!("{}", arena.display(value));
-        assert!(shown.contains(&expected_x), "shown: {shown}");
-        assert!(shown.contains(&expected_y), "shown: {shown}");
     }
 
-    /// `sum_over(4, |i| X + i)` binds slot 0 for its own fold before
-    /// `collapse` ever runs, so the lattice must take 1, 2, 3 — and the
-    /// kernel's own fold must still read its own binder afterward: no
-    /// capture, mirroring `variance.rs`'s
-    /// `six_nested_binders_each_take_a_slot`.
     #[test]
     fn collapse_takes_the_slots_the_kernel_leaves_free() {
         let k = Kernel::sum_over(4, |i| Kernel::x().add(i));
@@ -572,81 +369,21 @@ mod tests {
             "test setup: the kernel's own fold binds slot 0"
         );
 
-        let domain = Domain {
-            shape: LatticeShape::new([2, 2]),
-            origin: mint_origin(),
-        };
-        let new_root = collapse(&mut arena, root, domain);
-
-        let (row_fold, col_fold, lane_fold, write) = collapse_shape(&arena, new_root);
+        let (body, t) = collapse(&mut arena, root, domain([2, 2]), 4);
         assert_eq!(
-            [
-                row_fold.binder.slot(),
-                col_fold.binder.slot(),
-                lane_fold.binder.slot()
-            ],
+            [t.row.slot(), t.col.slot(), t.lane.slot()],
             [1, 2, 3],
             "slot 0 is taken, so the lattice takes 1, 2, 3 in ascending order"
         );
-
-        let ExprNode::Write { value, .. } = arena.node(write) else {
-            panic!("collapse must build a Write");
-        };
         assert!(
-            reachable_var(&arena, value, Binder::from_slot(0).expect("slot 0").var()),
+            reachable_var(&arena, body, Binder::from_slot(0).expect("slot 0").var()),
             "the kernel's own fold must still read its own binder after collapse"
-        );
-    }
-
-    /// After collapsing `X + Y`, every bit is accounted for: the root is
-    /// fully bound, the `Write` and the value it stores depend on exactly
-    /// the three binders — via `x`/`y` for the value — and neither depends
-    /// on a coordinate, because none survives.
-    #[test]
-    fn every_binder_is_bound_at_the_root_and_read_by_the_write() {
-        let k = Kernel::x().add(&Kernel::y());
-        let (arena, root) = k.parts();
-        let mut arena = arena.clone();
-        let domain = Domain {
-            shape: LatticeShape::new([4, 4]),
-            origin: mint_origin(),
-        };
-        let new_root = collapse(&mut arena, root, domain);
-
-        let (row_fold, col_fold, lane_fold, write) = collapse_shape(&arena, new_root);
-        let ExprNode::Write { value, .. } = arena.node(write) else {
-            panic!("collapse must build a Write");
-        };
-
-        let v = compute_arena_variance(&arena);
-        assert_eq!(
-            v[new_root.0 as usize],
-            Variance::CONST,
-            "every binder is bound by the time the root is reached"
-        );
-
-        let all_three = Variance::from_var(row_fold.binder.var())
-            .union(Variance::from_var(col_fold.binder.var()))
-            .union(Variance::from_var(lane_fold.binder.var()));
-        assert_eq!(
-            v[write.0 as usize], all_three,
-            "the store reads all three binders for its address"
-        );
-        assert_eq!(
-            v[value.0 as usize], all_three,
-            "the value depends on all three, via x and y, and nothing else"
-        );
-        assert!(
-            v[value.0 as usize]
-                .intersection(Variance::COORDS)
-                .is_const(),
-            "no coordinate bit survives collapse"
         );
     }
 
     /// A lane-uniform read stays lane-uniform through collapse: `Gather(buf,
     /// 0.5, Y)`'s row-only address carries only the row bit; `Gather(buf, X,
-    /// Y)` carries all three. This is the bit step 6 reads to choose a
+    /// Y)` carries all three. This is the bit lowering reads to choose a
     /// broadcast load over a gather.
     #[test]
     fn a_row_only_read_stays_lane_uniform_through_collapse() {
@@ -668,197 +405,44 @@ mod tests {
         let all_three_read = arena.push_ternary(OpKind::Gather, buf2, x2, y2);
 
         let root = arena.push_binary(OpKind::Add, row_only, all_three_read);
-
-        let domain = Domain {
-            shape: LatticeShape::new([4, 4]),
-            origin: mint_origin(),
-        };
-        let new_root = collapse(&mut arena, root, domain);
-
-        let (row_fold, col_fold, lane_fold, write) = collapse_shape(&arena, new_root);
-        let ExprNode::Write { value, .. } = arena.node(write) else {
-            panic!("collapse must build a Write");
-        };
-        let ExprNode::Binary(OpKind::Add, new_row_only, new_all_three) = arena.node(value) else {
-            panic!("the value must still be Add(row_only, all_three_read)");
-        };
+        let (body, t) = collapse(&mut arena, root, domain([4, 4]), 4);
 
         let v = compute_arena_variance(&arena);
-        let (row, col, lane) = (
-            row_fold.binder.var(),
-            col_fold.binder.var(),
-            lane_fold.binder.var(),
-        );
-
-        assert!(v[new_row_only.0 as usize].depends_on(row));
-        assert!(v[new_row_only.0 as usize].is_invariant_in(col));
-        assert!(v[new_row_only.0 as usize].is_invariant_in(lane));
-
-        assert!(v[new_all_three.0 as usize].depends_on(row));
-        assert!(v[new_all_three.0 as usize].depends_on(col));
-        assert!(v[new_all_three.0 as usize].depends_on(lane));
+        let ExprNode::Binary(OpKind::Add, row_read, full_read) = arena.node(body) else {
+            panic!("the sum survives collapse");
+        };
+        assert_eq!(v[row_read.0 as usize], Variance::from_var(t.row.var()));
+        assert_eq!(v[full_read.0 as usize], t.variance());
     }
 
-    /// `w = 8`, `L = 4`: an exact multiple, so `pack` builds one strided fold
-    /// and no remainder — no `Seq` anywhere reachable, and the `Write` is
-    /// shared with what `collapse` built, not copied.
+    /// An exact multiple of the lanes is all full batches: no remainder.
     #[test]
-    fn pack_strip_mines_an_exact_multiple_with_no_remainder() {
-        let k = Kernel::x().add(&Kernel::y());
-        let (arena, root) = k.parts();
-        let mut arena = arena.clone();
-        let domain = Domain {
-            shape: LatticeShape::new([8, 3]),
-            origin: mint_origin(),
-        };
-        let collapsed = collapse(&mut arena, root, domain);
-        let (_, _, _, write_before) = collapse_shape(&arena, collapsed);
-
-        let packed = pack(&mut arena, collapsed, 4);
-
-        let ExprNode::Reduce {
-            fold: row_fold,
-            body: row_body,
-            ..
-        } = arena.node(packed)
-        else {
-            panic!("packed root must be the row fold");
-        };
-        assert_eq!(row_fold.monoid(), Monoid::SEQ);
-        assert_eq!(range_of(&arena, packed).range(), 0..3);
-
-        let ExprNode::Reduce { body: lane_id, .. } = arena.node(row_body) else {
-            panic!("the row fold's body must be the strided col fold");
-        };
-        let col_range = range_of(&arena, row_body);
-        assert_eq!(col_range.range(), 0..8);
-        assert_eq!(col_range.stride(), 4);
-        assert_eq!(col_range.len(), 2);
-
-        let ExprNode::Reduce { body: write, .. } = arena.node(lane_id) else {
-            panic!("the col fold's body must be the lane fold");
-        };
-        let lane_range = range_of(&arena, lane_id);
-        assert_eq!(lane_range.range(), 0..4);
-        assert_eq!(lane_range.stride(), 1);
-
-        assert_eq!(write, write_before, "pack shares collapse's Write");
-        assert!(!reachable_seq(&arena, packed), "no remainder means no Seq");
+    fn an_exact_multiple_has_no_remainder() {
+        let t = traversal([8, 2], 4);
+        let pieces = t.pieces();
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].range, [0, 8]);
+        assert_eq!(pieces[0].lanes, 4);
+        assert_eq!(pieces[0].col, Fold::strided(Monoid::SEQ, t.col, 4));
     }
 
-    /// `w = 10`, `L = 4`: `r = 2`, so `pack` sequences a main fold over
-    /// `[0,8)` and a remainder over `[8,9) × [0,2)` — both lane folds sharing
-    /// the one `Write`, and the whole tree still fully bound.
+    /// The remainder comes after the batches, one trip of `r` lanes at `w − r`.
     #[test]
-    fn pack_sequences_the_remainder_after_the_main_fold() {
-        let k = Kernel::x().add(&Kernel::y());
-        let (arena, root) = k.parts();
-        let mut arena = arena.clone();
-        let domain = Domain {
-            shape: LatticeShape::new([10, 2]),
-            origin: mint_origin(),
-        };
-        let collapsed = collapse(&mut arena, root, domain);
-        let (_, _, _, write_before) = collapse_shape(&arena, collapsed);
-
-        let packed = pack(&mut arena, collapsed, 4);
-
-        let ExprNode::Reduce { body: row_body, .. } = arena.node(packed) else {
-            panic!("packed root must be the row fold");
-        };
-        assert_eq!(range_of(&arena, packed).range(), 0..2);
-
-        let ExprNode::Binary(OpKind::Seq, main, rem) = arena.node(row_body) else {
-            panic!("a nonzero remainder must sequence main then remainder");
-        };
-
-        let ExprNode::Reduce {
-            body: main_lane_id, ..
-        } = arena.node(main)
-        else {
-            panic!("main must be the strided col fold");
-        };
-        assert_eq!(range_of(&arena, main).range(), 0..8);
-        assert_eq!(range_of(&arena, main).stride(), 4);
-        let ExprNode::Reduce {
-            body: main_write, ..
-        } = arena.node(main_lane_id)
-        else {
-            panic!("main's body must be the lane fold");
-        };
-        assert_eq!(range_of(&arena, main_lane_id).range(), 0..4);
-
-        let ExprNode::Reduce {
-            body: rem_lane_id, ..
-        } = arena.node(rem)
-        else {
-            panic!("rem must be the [8,9) col fold");
-        };
-        assert_eq!(range_of(&arena, rem).range(), 8..9);
-        assert_eq!(range_of(&arena, rem).stride(), 1);
-        let ExprNode::Reduce {
-            body: rem_write, ..
-        } = arena.node(rem_lane_id)
-        else {
-            panic!("rem's body must be the lane fold");
-        };
-        assert_eq!(range_of(&arena, rem_lane_id).range(), 0..2);
-
-        assert_eq!(main_write, write_before);
-        assert_eq!(
-            rem_write, write_before,
-            "both lane folds' body is the same Write"
-        );
-
-        let v = compute_arena_variance(&arena);
-        assert_eq!(v[packed.0 as usize], Variance::CONST);
+    fn the_remainder_follows_the_batches() {
+        let pieces = traversal([10, 1], 4).pieces();
+        assert_eq!(pieces.len(), 2);
+        assert_eq!((pieces[0].range, pieces[0].lanes), ([0, 8], 4));
+        assert_eq!((pieces[1].range, pieces[1].lanes), ([8, 9], 2));
     }
 
-    /// `w = 3`, `L = 4`: a row narrower than one batch. There is no main fold
-    /// to build, and the whole row is the remainder, `[0,1) × [0,3)`.
+    /// A row narrower than a batch is all remainder.
     #[test]
-    fn pack_of_a_row_narrower_than_a_batch_is_all_remainder() {
-        let k = Kernel::x().add(&Kernel::y());
-        let (arena, root) = k.parts();
-        let mut arena = arena.clone();
-        let domain = Domain {
-            shape: LatticeShape::new([3, 1]),
-            origin: mint_origin(),
-        };
-        let collapsed = collapse(&mut arena, root, domain);
-
-        let packed = pack(&mut arena, collapsed, 4);
-
-        let ExprNode::Reduce { body: row_body, .. } = arena.node(packed) else {
-            panic!("packed root must be the row fold");
-        };
-
-        let ExprNode::Reduce {
-            body: rem_lane_id, ..
-        } = arena.node(row_body)
-        else {
-            panic!("the row fold's body must be the remainder, with no main fold");
-        };
-        assert_eq!(range_of(&arena, row_body).range(), 0..1);
-        let ExprNode::Reduce { .. } = arena.node(rem_lane_id) else {
-            panic!("rem's body must be the lane fold");
-        };
-        assert_eq!(range_of(&arena, rem_lane_id).range(), 0..3);
+    fn a_row_narrower_than_a_batch_is_all_remainder() {
+        let pieces = traversal([3, 1], 4).pieces();
+        assert_eq!(pieces.len(), 1);
+        assert_eq!((pieces[0].range, pieces[0].lanes), ([0, 1], 3));
     }
 
-    /// `pack` on anything but `collapse`'s own output is a pipeline-order
-    /// bug, refused by shape rather than guessed at.
-    #[test]
-    #[should_panic(expected = "pack expects collapse's shape")]
-    fn pack_refuses_a_foreign_root() {
-        let k = Kernel::x().add(&Kernel::y());
-        let (arena, root) = k.parts();
-        let mut arena = arena.clone();
-        let _ = pack(&mut arena, root, 4);
-    }
-
-    /// A `Ref` reaching `collapse` is a name `substitute_vars_with` would
-    /// carry through unresolved — refused rather than silently wrong.
     #[test]
     #[should_panic(expected = "is a Ref reachable from root")]
     fn collapse_refuses_a_ref() {
@@ -869,12 +453,7 @@ mod tests {
         let mut arena = ExprArena::new();
         let r = arena.push_ref(key);
         let root = arena.push_binary(OpKind::Add, r, r);
-
-        let domain = Domain {
-            shape: LatticeShape::new([2, 2]),
-            origin: mint_origin(),
-        };
-        let _ = collapse(&mut arena, root, domain);
+        let _ = collapse(&mut arena, root, domain([2, 2]), 4);
     }
 
     /// A `Dwrt` reaching `collapse` has not been taken with respect to
@@ -887,11 +466,6 @@ mod tests {
         let x = arena.push_var(0);
         let wrt = arena.push_const(0.0);
         let root = arena.push_binary(OpKind::Dwrt, x, wrt);
-
-        let domain = Domain {
-            shape: LatticeShape::new([2, 2]),
-            origin: mint_origin(),
-        };
-        let _ = collapse(&mut arena, root, domain);
+        let _ = collapse(&mut arena, root, domain([2, 2]), 4);
     }
 }

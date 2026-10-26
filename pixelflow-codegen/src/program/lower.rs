@@ -9,11 +9,12 @@
 use alloc::vec::Vec;
 
 use pixelflow_ir::arena::{ExprId, ExprNode, UniformId};
-use pixelflow_ir::fold::{Binder, Bound, BoundEnd, BoundRefusal, KNOWN_RANGE, KnownRange};
+use pixelflow_ir::fold::{Binder, Bound, BoundEnd, BoundRefusal, Fold, KnownRange, Monoid};
 use pixelflow_ir::kind::OpKind;
 use pixelflow_ir::variance::{Variance, compute_arena_variance};
 use pixelflow_ir::{Lit, ShiftCount};
 
+use super::lattice::Traversal;
 use super::{CompareOp, Def, Legal, ScheduledOp, ValueId, lane_pattern, legal, not_legal};
 
 /// Mark nodes reachable from `root` via DFS.
@@ -222,19 +223,22 @@ fn shift_immediate(op: OpKind, count: f32) -> u8 {
 /// construction). We filter to reachable nodes, remap `ExprId` to `ValueId`,
 /// and translate `ExprNode` to `ScheduledOp`.
 ///
-/// The arena is a legalized one: wrapped in the lattice's folds, with no
-/// coordinate `Var` left. Two of its shapes are not copied one to one:
+/// The arena is a legalized one with no coordinate `Var` left; `traversal`
+/// is how the CPU walks the lattice it is spelled through. The arena holds
+/// only the kernel: the traversal's loops are written here, after the
+/// kernel's defs, as the schedule the arena used to carry as nodes.
 ///
-/// - **The lane fold is inlined.** A `Reduce` whose body is a `Write` naming
-///   the fold's binder as its lane is the fold executed by lanes; it has no
-///   loop, so its body is not carved into a scope of its own — its `Write`
-///   becomes the fold's own def, in its parent's schedule, with the fold's
-///   trip count folded in as the store width, and the arena's `Write` node
-///   itself gets no `ValueId` (nothing but a lane fold names one). Two lane
-///   folds sharing one `Write` — a row's main batches and its remainder —
-///   are two `Write` defs of different widths reading one value.
+/// - **The lane fold is a store.** The lane binder's fold is executed by
+///   lanes; it has no loop, so it is a [`ScheduledOp::Write`] def of the
+///   kernel's value with the fold's trip count as the store width. A row's
+///   main batches and its remainder are two `Write` defs of different widths
+///   reading one value, each the body of its column fold, sequenced by a
+///   [`ScheduledOp::Seq`] under the row fold.
 /// - **The lane binder is a constant.** Its `Var` becomes
 ///   [`ScheduledOp::Lanes`], the iota every lane-varying value is built on.
+///
+/// `None` is an arena with no lattice (the lowering tests' raw arenas):
+/// nothing is stored, and every read stays a gather.
 ///
 /// A fold whose bound is a value arrives inside its guard (`passes::legalize_back`'s
 /// last pass): its bounds are operands ([`operands`](super::operands)), and it
@@ -269,36 +273,20 @@ pub(crate) fn arena_to_schedule(
     arena: &pixelflow_ir::arena::ExprArena,
     root: pixelflow_ir::arena::ExprId,
     origin: [UniformId; 2],
+    traversal: Option<&Traversal>,
 ) -> Vec<Def> {
     let len = arena.len();
     let mut reachable = alloc::vec![false; len];
     mark_reachable(arena, root, &mut reachable);
 
-    // The lane binder: the one every reachable `Write` names as its lane.
-    // One slot, by construction (`program::lattice::pack` builds both lane
-    // folds on `collapse`'s), asserted rather than assumed. The same scan
-    // reads which binders the lattice's folds bind (a `Write` names all
-    // three), and which folds have a bound that is a value.
-    let mut lane: Option<Binder> = None;
-    let mut lattice = Variance::CONST;
+    // The lane binder and the binders the lattice's loops bind, from the
+    // traversal; and the folds that have a bound that is a value, from a scan.
+    let lane = traversal.map(|t| t.lane);
+    let lattice = traversal.map_or(Variance::CONST, Traversal::variance);
     let mut value_folds = Vec::new();
     for (idx, _) in reachable.iter().enumerate().filter(|(_, r)| **r) {
         let id = ExprId(idx as u32);
         match arena.node(id) {
-            ExprNode::Write {
-                row, col, lane: l, ..
-            } => {
-                match lane {
-                    None => lane = Some(l),
-                    Some(seen) => assert_eq!(
-                        seen, l,
-                        "two Writes name different lane binders; a lattice has one lane fold"
-                    ),
-                }
-                for binder in [row, col, l] {
-                    lattice = lattice.union(Variance::from_var(binder.var()));
-                }
-            }
             ExprNode::Reduce { lo, hi, .. } if lo.value().is_some() || hi.value().is_some() => {
                 value_folds.push(id);
             }
@@ -317,8 +305,7 @@ pub(crate) fn arena_to_schedule(
     let lane_uniform =
         |idx: ExprId| lane.is_some_and(|lane| variance[idx.0 as usize].is_invariant_in(lane.var()));
 
-    // ExprId to ValueId mapping. u64::MAX = unmapped (unreachable, or a
-    // `Write` node, whose defs are its lane folds').
+    // ExprId to ValueId mapping. u64::MAX = unmapped (unreachable).
     let mut id_map = alloc::vec![ValueId(u64::MAX); len];
     let mut schedule = Vec::new();
     let mut next_id = 0;
@@ -337,11 +324,7 @@ pub(crate) fn arena_to_schedule(
         }
         let expr_id = ExprId(idx as u32);
         let node = arena.node(expr_id);
-        // Before the `Write` skip: a store of the fold itself is a read of it.
         folds.read_by(arena, expr_id);
-        if let ExprNode::Write { .. } = node {
-            continue;
-        }
 
         let map_child = |child: ExprId| -> ValueId {
             let mapped = id_map[child.0 as usize];
@@ -454,7 +437,6 @@ pub(crate) fn arena_to_schedule(
                  either eliminates Dwrt or refuses to compile, so a survivor \
                  means this schedule was built without the lowering pipeline."
             ),
-            ExprNode::Binary(OpKind::Seq, a, b) => ScheduledOp::Seq(map_child(a), map_child(b)),
             ExprNode::Binary(op, a, b) => match CompareOp::of(op) {
                 Some(compare) => ScheduledOp::Compare(compare, map_child(a), map_child(b)),
                 None => ScheduledOp::Binary(legal(op), map_child(a), map_child(b)),
@@ -484,25 +466,6 @@ pub(crate) fn arena_to_schedule(
             // variance for it is `CONST` already: the identity's.
             ExprNode::Reduce { fold, .. } if is_empty_fold(arena, expr_id) => {
                 ScheduledOp::Const(lane_pattern(fold.monoid().identity()))
-            }
-            // The lane fold, executed by lanes: its body is the store, and
-            // the store is this def, with the fold's trip count as its width.
-            ExprNode::Reduce { fold, body, .. } if matches!(arena.node(body), ExprNode::Write { lane, .. } if lane == fold.binder()) =>
-            {
-                let ExprNode::Write {
-                    row, col, value, ..
-                } = arena.node(body)
-                else {
-                    unreachable!("matched a Write above")
-                };
-                ScheduledOp::Write {
-                    row,
-                    col,
-                    lane: fold.binder(),
-                    lanes: u32::try_from(arena.known_range(expr_id).expect(KNOWN_RANGE).len())
-                        .expect("a lane fold's trip count is a lane count"),
-                    value: map_child(value),
-                }
             }
             // A surviving fold: `body` was already walked above (it is an
             // ordinary child, scheduled before its parent by the arena's own
@@ -539,7 +502,6 @@ pub(crate) fn arena_to_schedule(
                     body: map_child(body),
                 }
             }
-            ExprNode::Write { .. } => unreachable!("a Write node is skipped above"),
         };
         // Numbered after the op is built: a `Uniform` may have pushed its
         // block's `Context` def just above, and ids follow schedule order.
@@ -553,17 +515,79 @@ pub(crate) fn arena_to_schedule(
         });
     }
     folds.assert_every_fold_was_read();
-    // A `Write` whose lane fold nothing reached is a lane fold that is not
-    // where `pack` put it — under a column fold — and the schedule would
-    // be silently store-free.
-    assert!(
-        lane.is_none()
-            || schedule
-                .iter()
-                .any(|d| matches!(d.op, ScheduledOp::Write { .. })),
-        "arena_to_schedule: a Write is reachable but no lane fold names it"
-    );
+    if let Some(traversal) = traversal {
+        let value = id_map[root.0 as usize];
+        write_traversal(&mut schedule, traversal, value, variance[root.0 as usize]);
+    }
     schedule
+}
+
+/// The traversal's loops, after the kernel's defs: for each of the row's
+/// pieces ([`Traversal::pieces`]) a `Write` of `value` (the lane fold,
+/// executed by lanes) under its column fold, the pieces sequenced under the
+/// row fold. `kernel` is what the kernel's value varies with; each def's
+/// variance is the fold's rule (`transfer` in `pixelflow-ir`'s `variance.rs`):
+/// what its body reads, less the binder it closes.
+fn write_traversal(
+    schedule: &mut Vec<Def>,
+    traversal: &Traversal,
+    value: ValueId,
+    kernel: Variance,
+) {
+    let bit = |binder: Binder| Variance::from_var(binder.var());
+    let mut push = |op: ScheduledOp, variance: Variance| {
+        let id = ValueId(schedule.len() as u64);
+        schedule.push(Def {
+            value: id,
+            op,
+            variance,
+        });
+        (id, variance)
+    };
+    // A store reads its three binders for the address, so it sits inside all
+    // three loops; the lane fold it is closes the lane binder.
+    let stored = kernel.union(traversal.variance());
+    let mut pieces = Vec::new();
+    for piece in traversal.pieces() {
+        let (write, in_lane) = push(
+            ScheduledOp::Write {
+                row: traversal.row,
+                col: traversal.col,
+                lane: traversal.lane,
+                lanes: piece.lanes,
+                value,
+            },
+            stored.without(bit(traversal.lane)),
+        );
+        let [lo, hi] = piece.range;
+        pieces.push(push(
+            ScheduledOp::Reduce {
+                fold: piece.col,
+                lo: Bound::Lit(lo),
+                hi: Bound::Lit(hi),
+                body: write,
+            },
+            in_lane.without(bit(traversal.col)),
+        ));
+    }
+    let (walk, variance) = pieces
+        .into_iter()
+        .reduce(|(main, main_variance), (tail, tail_variance)| {
+            push(
+                ScheduledOp::Seq(main, tail),
+                main_variance.union(tail_variance),
+            )
+        })
+        .expect("a traversal has a piece");
+    let _ = push(
+        ScheduledOp::Reduce {
+            fold: Fold::new(Monoid::SEQ, traversal.row),
+            lo: Bound::Lit(0),
+            hi: Bound::Lit(u64::from(traversal.extent[1])),
+            body: walk,
+        },
+        variance.without(bit(traversal.row)),
+    );
 }
 
 #[cfg(test)]
@@ -596,7 +620,7 @@ mod tests {
         let i = a.push_var(Binder::from_slot(0).expect("slot 0 exists").var());
         let v = a.push_const(0.0);
         let root = a.push_binary(OpKind::Dwrt, i, v);
-        let _ = arena_to_schedule(&a, root, RAW_ORIGIN);
+        let _ = arena_to_schedule(&a, root, RAW_ORIGIN, None);
     }
 
     /// A coordinate `Var` is the survivor the collapse ABI added: the
@@ -609,7 +633,7 @@ mod tests {
         let x = a.push_var(0);
         let two = a.push_const(2.0);
         let root = a.push_binary(OpKind::Mul, x, two);
-        let _ = arena_to_schedule(&a, root, RAW_ORIGIN);
+        let _ = arena_to_schedule(&a, root, RAW_ORIGIN, None);
     }
 
     /// A placeholder is a fold index that escaped its builder: `Variance::of_var`
@@ -628,7 +652,7 @@ mod tests {
         );
         let two = a.push_const(2.0);
         let root = a.push_binary(OpKind::Mul, index, two);
-        let _ = arena_to_schedule(&a, root, RAW_ORIGIN);
+        let _ = arena_to_schedule(&a, root, RAW_ORIGIN, None);
     }
 
     /// And the same for a `Ref`: its body is not in this arena at all, so a
@@ -641,7 +665,7 @@ mod tests {
             .mul(&pixelflow_ir::Kernel::constant(3.0))
             .by_ref();
         let (arena, root) = named.parts();
-        let _ = arena_to_schedule(arena, root, RAW_ORIGIN);
+        let _ = arena_to_schedule(arena, root, RAW_ORIGIN, None);
     }
 
     /// The uniform slots after the one a test below declares for a count, so
@@ -690,7 +714,7 @@ mod tests {
     #[test]
     fn a_value_bound_is_an_operand_of_its_fold() {
         let (a, _, _, root) = a_guarded_fold(BoundEnd::Hi, the_count);
-        let schedule = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM);
+        let schedule = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM, None);
 
         let reduce = schedule
             .iter()
@@ -722,7 +746,7 @@ mod tests {
         let (mut a, _, fold, _) = a_guarded_fold(BoundEnd::Hi, the_count);
         let one = a.push_const(1.0);
         let root = a.push_binary(OpKind::Add, fold, one);
-        let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM);
+        let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM, None);
     }
 
     /// An `If`'s false arm is not its true arm: the guard skips the loop for
@@ -734,7 +758,7 @@ mod tests {
         let zero = a.push_const(0.0);
         let runs = a.push_binary(OpKind::Lt, zero, count);
         let root = a.push_ternary(OpKind::If, runs, zero, fold);
-        let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM);
+        let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM, None);
     }
 
     /// Two `If`s that both read the fold as their true arm each pass the
@@ -750,7 +774,7 @@ mod tests {
         let runs = a.push_binary(OpKind::Lt, one, count);
         let other = a.push_ternary(OpKind::If, runs, fold, one);
         let root = a.push_binary(OpKind::Add, guarded, other);
-        let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM);
+        let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM, None);
     }
 
     /// A value-bounded fold that is the root has no reader at all.
@@ -758,7 +782,7 @@ mod tests {
     #[should_panic(expected = "is read by nothing")]
     fn a_value_bounded_fold_nothing_reads_fails_loudly() {
         let (a, _, fold, _) = a_guarded_fold(BoundEnd::Hi, the_count);
-        let _ = arena_to_schedule(&a, fold, AFTER_ONE_UNIFORM);
+        let _ = arena_to_schedule(&a, fold, AFTER_ONE_UNIFORM, None);
     }
 
     /// The fold's own guard is in the arena but unreachable from the root:
@@ -769,7 +793,7 @@ mod tests {
         let (mut a, _, fold, guarded) = a_guarded_fold(BoundEnd::Hi, the_count);
         let one = a.push_const(1.0);
         let _stale = a.push_binary(OpKind::Add, fold, one);
-        let _ = arena_to_schedule(&a, guarded, AFTER_ONE_UNIFORM);
+        let _ = arena_to_schedule(&a, guarded, AFTER_ONE_UNIFORM, None);
     }
 
     /// L3 after collapse: a bound reads no coordinate, and collapse spells the
@@ -778,15 +802,12 @@ mod tests {
     /// a guard's mask within a batch; `row` and `col` would vary it between
     /// batches, which is refused all the same. `collapse` picks its binders
     /// from slots nothing else uses, so no pipeline builds this; it is built by
-    /// hand, through the term vocabulary, because the arena's own `push_write`
-    /// is not for a crate that is not the IR.
+    /// hand, with the traversal named beside it.
     ///
-    /// `Σ_{i<row} i` stored at `(row, col, lane)`, `row` being the lattice's.
+    /// `Σ_{i<row} i`, `row` being the lattice's.
     #[test]
     #[should_panic(expected = "a lattice binder's")]
     fn a_bound_on_a_lattice_binder_fails_loudly() {
-        use pixelflow_ir::{Ir, Shape};
-
         let slot = |n| Binder::from_slot(n).expect("the slot exists");
         let (i, row, col, lane) = (slot(0), slot(1), slot(2), slot(3));
         let mut a = ExprArena::new();
@@ -800,20 +821,15 @@ mod tests {
         );
         let zero = a.push_const(0.0);
         let runs = a.push_binary(OpKind::Lt, zero, rows);
-        let value = a.push_ternary(OpKind::If, runs, fold, zero);
-        let store = a.embed(Shape::Write {
+        let root = a.push_ternary(OpKind::If, runs, fold, zero);
+        let traversal = Traversal {
             row,
             col,
             lane,
-            value,
-        });
-        let root = a.push_reduce(
-            Fold::new(Monoid::SEQ, lane),
-            Bound::Lit(0),
-            Bound::Lit(4),
-            store,
-        );
-        let _ = arena_to_schedule(&a, root, RAW_ORIGIN);
+            extent: [4, 1],
+            lanes: 4,
+        };
+        let _ = arena_to_schedule(&a, root, RAW_ORIGIN, Some(&traversal));
     }
 
     /// What lowering a fold bounded at `at` by `end(count)` panics with, or
@@ -824,7 +840,7 @@ mod tests {
     ) -> Option<String> {
         let (a, _, _, root) = a_guarded_fold(at, end);
         let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM);
+            let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM, None);
         }))
         .err()?;
         let message = match payload.downcast::<String>() {
@@ -918,6 +934,6 @@ mod tests {
             let zero = a.push_const(0.0);
             a.push_binary(OpKind::Lt, zero, count)
         });
-        let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM);
+        let _ = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM, None);
     }
 }

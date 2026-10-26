@@ -67,12 +67,6 @@ pub enum Declined {
     /// and declines it: inlining inside saturation is a rule that does not
     /// exist (docs/language/2026-09-09-composition-is-linking.md §3).
     Ref(pixelflow_ir::KernelKey),
-    /// A `Write` — the store the lattice's folds wrap a kernel in
-    /// (docs/archive/plans/2026-09-16-collapse-is-a-fold.md §2.4). Declined for a
-    /// standing reason: an effect is not a value, so no rule may rewrite
-    /// it, and it is built by the legalize passes *after* extraction, so a
-    /// term carrying one into saturation skipped the pipeline.
-    Write,
 }
 
 /// Insert the subgraph reachable from `root` into `egraph`, returning the
@@ -133,7 +127,6 @@ pub fn insert<I: Ir>(
                         (Vocabulary::Runtime, Some(_)) => egraph.add(ENode::Ref { key }),
                         _ => return Err(Declined::Ref(key)),
                     },
-                    Shape::Write { .. } => return Err(Declined::Write),
                     Shape::Buffer(decl) => egraph.add(ENode::Buffer(decl)),
                     Shape::Uniform(decl) => egraph.add(ENode::Uniform(decl)),
                     Shape::Op(kind, children) => {
@@ -284,7 +277,6 @@ pub fn inserted_class_count<I: Ir>(term: &I, root: I::Ref) -> usize {
                 stack.extend(lo.value());
                 stack.extend(hi.value());
             }
-            Shape::Write { value, .. } => stack.push(value),
             _ => {}
         }
     }

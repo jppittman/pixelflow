@@ -57,11 +57,11 @@ for (§4); that is the input of `select` (§10).
   `tests/collapse_paths.rs` and `tests/value_bounds_jit.rs`.
 
 ## Behind
-- `collapse` and `pack` run here (`lattice.rs`; the `Collapse` and `Pack`
-  stages of `pipeline.rs`) but still as arena folds, so `Nest` receives the
-  lattice already folded into the arena; `ScheduledOp::Write`, `Seq`, `Lanes` and the
-  lane-fold inlining in `lower.rs` carry that CPU schedule. They move into
-  `Nest` (`docs/codegen/2026-10-15-a-schedule-is-a-factorization.md` §1, §4).
+- `Lower` writes the traversal's loops (`lattice.rs`'s `Traversal`) as
+  `ScheduledOp::Write`/`Reduce`/`Seq` defs, so `Nest` receives them as a
+  schedule rather than a factorization; `Lanes` and the lane-fold-as-store
+  carry that CPU schedule. They move into `Nest`
+  (`docs/codegen/2026-10-15-a-schedule-is-a-factorization.md` §1, §4).
 - `ScheduledOp::Context(u16)` and `Write { lanes: u32 }` are narrower than the
   control plane's 64 bits with no measurement cited; no plan closes it.
 

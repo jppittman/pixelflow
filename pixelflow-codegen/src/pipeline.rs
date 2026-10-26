@@ -12,7 +12,7 @@
 use crate::emit::{self, CompileResult};
 use crate::error::CompileError;
 use crate::pass::Pass;
-use crate::program::{Collapse, Def, Domain, Layout, Nest, Own, Pack, arena_to_schedule};
+use crate::program::{Collapse, Def, Domain, Factored, Layout, Nest, Own, arena_to_schedule};
 use core::marker::PhantomData;
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{ExprArena, ExprId, UniformDecl, UniformId, UniformIdentity};
@@ -70,29 +70,33 @@ impl<'a> Pass for Front<'a> {
 struct Back;
 
 impl Pass for Back {
-    type Input = (ExprArena, ExprId);
-    type Output = (ExprArena, ExprId);
+    type Input = Factored;
+    type Output = Factored;
 
-    fn run(self, (arena, root): Self::Input) -> Result<Self::Output, CompileError> {
-        Ok(pixelflow_ir::passes::legalize_back(&arena, root))
+    fn run(self, factored: Self::Input) -> Result<Self::Output, CompileError> {
+        let (arena, root) = pixelflow_ir::passes::legalize_back(&factored.arena, factored.root);
+        Ok(Factored {
+            arena,
+            root,
+            ..factored
+        })
     }
 }
 
 /// The CPU's legalization of a collapse of a lattice of `shape` on a target of
-/// `lanes` lanes: the kernel comes back wrapped in the lattice's folds, every
-/// op a backend can emit. The lattice's traversal sits between the IR's two
+/// `lanes` lanes: the kernel comes back spelled through the CPU's traversal,
+/// every op a backend can emit. The traversal sits between the IR's two
 /// halves of legalization (`pixelflow_ir::passes`'s module doc for why).
 fn legalization<'a>(
     shape: LatticeShape,
     lanes: u32,
-) -> impl Pass<Input = (&'a ExprArena, ExprId), Output = (ExprArena, ExprId)> {
+) -> impl Pass<Input = (&'a ExprArena, ExprId), Output = Factored> {
     let domain = Domain {
         shape,
         origin: origin(),
     };
     Front(PhantomData)
-        .then(Collapse { domain })
-        .then(Pack { lanes })
+        .then(Collapse { domain, lanes })
         .then(Back)
 }
 
@@ -101,17 +105,27 @@ fn legalization<'a>(
 struct Lower;
 
 impl Pass for Lower {
-    type Input = (ExprArena, ExprId);
+    type Input = Factored;
     type Output = Vec<Def>;
 
-    fn run(self, (arena, root): Self::Input) -> Result<Self::Output, CompileError> {
-        Ok(arena_to_schedule(&arena, root, origin_slots(&arena)))
+    fn run(self, factored: Self::Input) -> Result<Self::Output, CompileError> {
+        let Factored {
+            arena,
+            root,
+            traversal,
+        } = factored;
+        Ok(arena_to_schedule(
+            &arena,
+            root,
+            origin_slots(&arena),
+            Some(&traversal),
+        ))
     }
 }
 
 /// The kernel at `root` as the CPU compiles it for a lattice of `shape`, one
-/// step before scheduling: wrapped in the lattice's folds at this host's lane
-/// width, every op legal. For tools that read the arena a compile would
+/// step before scheduling: spelled through the traversal's binders at this
+/// host's lane width, every op legal. For tools that read the arena a compile would
 /// lower (telemetry dumps, cost examples) without emitting it.
 ///
 /// # Errors
@@ -123,7 +137,8 @@ pub fn legalize(
     shape: LatticeShape,
 ) -> Result<(ExprArena, ExprId), CompileError> {
     let lanes = (crate::jit_vector_bytes() / core::mem::size_of::<f32>()) as u32;
-    legalization(shape, lanes).run((arena, root))
+    let factored = legalization(shape, lanes).run((arena, root))?;
+    Ok((factored.arena, factored.root))
 }
 
 /// Compile an [`ExprArena`] DAG into a
@@ -346,6 +361,7 @@ pub(crate) mod tests {
         );
     }
 
+    use crate::program::ScheduledOp;
     use pixelflow_ir::arena::ExprNode;
     use pixelflow_ir::fold::{Binder, Bound, Fold, KNOWN_RANGE, Monoid};
     use pixelflow_ir::{Lit, OpKind};
@@ -399,23 +415,23 @@ pub(crate) mod tests {
             outer_body,
         );
 
-        let (legalized, new_root) = legalization(LatticeShape::new([4, 1]), FOUR_LANES)
+        let Factored {
+            arena: legalized,
+            root: new_root,
+            ..
+        } = legalization(LatticeShape::new([4, 1]), FOUR_LANES)
             .run((&a, root))
             .expect("legalize");
-        // The lattice's row, column and lane folds around the kernel's two.
+        // The arena holds the kernel's two folds and no loop of the lattice's.
         assert_eq!(
             reachable_reduces(&legalized, new_root),
-            5,
-            "both folds must survive legalization, inside the lattice's three"
+            2,
+            "both folds must survive legalization, and the traversal adds none"
         );
         let ExprNode::Reduce { fold, .. } = legalized.node(new_root) else {
-            panic!("root must be the lattice's row fold");
+            panic!("root must be the kernel's outer fold");
         };
-        assert_eq!(fold.monoid(), Monoid::SEQ);
-        assert_eq!(
-            legalized.known_range(new_root).expect(KNOWN_RANGE).range(),
-            0..1
-        );
+        assert_eq!(fold.monoid(), Monoid::SUM);
         // A fold's range is read through the arena, which panics on any other
         // node: keep the shape check first.
         let ranges_over = |id: ExprId, range: std::ops::Range<u64>| {
@@ -439,8 +455,8 @@ pub(crate) mod tests {
     }
 
     /// `legalize` of `X + Σ_{k<u} k` at `[4, 2]` with four lanes: the kernel
-    /// comes back wrapped in the lattice's three folds, whose ranges are
-    /// literal, and the `Write`'s value reads the sum only through its guard.
+    /// reads the sum only through its guard, and the schedule is walked by the
+    /// lattice's two loops around one store.
     #[test]
     fn legalization_guards_a_value_bounded_fold_inside_the_lattice() {
         let mut a = ExprArena::new();
@@ -457,7 +473,11 @@ pub(crate) mod tests {
         let x = a.push_var(0);
         let root = a.push_binary(OpKind::Add, x, sum);
 
-        let (legalized, new_root) = legalization(LatticeShape::new([4, 2]), FOUR_LANES)
+        let Factored {
+            arena: legalized,
+            root: new_root,
+            ..
+        } = legalization(LatticeShape::new([4, 2]), FOUR_LANES)
             .run((&a, root))
             .expect("legalize");
 
@@ -472,31 +492,20 @@ pub(crate) mod tests {
                 stack.extend(legalized.children(id));
             }
         }
-        let (valued, lattice): (Vec<ExprId>, Vec<ExprId>) = reachable
+        let valued: Vec<ExprId> = reachable
             .iter()
             .copied()
             .filter(|id| matches!(legalized.node(*id), ExprNode::Reduce { .. }))
-            .partition(|id| legalized.known_range(*id).is_none());
+            .collect();
         assert_eq!(
             valued.len(),
             1,
             "the kernel's fold is the one whose range is a value"
         );
-        assert_eq!(lattice.len(), 3, "the row, column and lane folds");
-        for fold in lattice {
-            let range = legalized.known_range(fold).expect(KNOWN_RANGE);
-            assert!(!range.is_empty());
-        }
+        assert!(legalized.known_range(valued[0]).is_none());
 
-        let write = reachable
-            .iter()
-            .find_map(|id| match legalized.node(*id) {
-                ExprNode::Write { value, .. } => Some(value),
-                _ => None,
-            })
-            .expect("the lattice's store");
-        let ExprNode::Binary(OpKind::Add, _, guarded) = legalized.node(write) else {
-            panic!("the store's value is `x + sum`");
+        let ExprNode::Binary(OpKind::Add, _, guarded) = legalized.node(new_root) else {
+            panic!("the kernel's value is `x + sum`");
         };
         let ExprNode::Ternary(OpKind::If, _, ran, nan) = legalized.node(guarded) else {
             panic!("the sum reaches the store through its guard");
@@ -509,6 +518,18 @@ pub(crate) mod tests {
             panic!("the guard's true arm is the range test");
         };
         assert_eq!(fold, valued[0]);
+
+        let schedule = schedule_for(&a, root, LatticeShape::new([4, 2]), FOUR_LANES);
+        let count =
+            |keep: fn(&ScheduledOp) -> bool| schedule.iter().filter(|d| keep(&d.op)).count();
+        assert_eq!(count(|op| matches!(op, ScheduledOp::Write { .. })), 1);
+        assert_eq!(
+            count(
+                |op| matches!(op, ScheduledOp::Reduce { fold, .. } if fold.monoid() == Monoid::SEQ)
+            ),
+            2,
+            "the row and column loops"
+        );
     }
 
     /// The backstop for an arena that never became a `Kernel`.

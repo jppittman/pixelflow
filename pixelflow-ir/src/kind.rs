@@ -231,9 +231,10 @@ op_table! {
     /// no value, and nothing may read one — so it is a monoid whose identity
     /// is nothing: [`Monoid::SEQ`](crate::fold::Monoid::SEQ), the algebra
     /// of the folds a lattice is (docs/archive/plans/2026-09-16-collapse-is-a-fold.md
-    /// §2.4). Constructible only by those legalize passes: `kernel!` cannot
-    /// name it and the e-graph's vocabularies decline it, as they do a
-    /// `Write`. A backend that meets one as an instruction emits no bytes.
+    /// §2.4). The CPU backend writes those folds itself (`pixelflow-codegen`'s
+    /// `Traversal`), so no arena holds one: `kernel!` cannot name it and the
+    /// e-graph's vocabularies decline it. A backend that meets one as an
+    /// instruction emits no bytes.
     Seq = 52,
 
     // --- Reinterpretation (Real ↔ Int, the same bits) ---

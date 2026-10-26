@@ -33,8 +33,10 @@ except for the process-global store a `Ref` names into.
   construction unchanged, so the chain rule holds under a warp and a fold's
   shape is extraction's to choose.
 - No schedule: the lattice's traversal is the backend's. `collapse` and `pack`
-  moved to `pixelflow-codegen`; `legalize_front`/`legalize_back` surround them.
-  `Write` and `Seq` remain here and move out (DENOTATION §7; schedule note §1).
+  moved to `pixelflow-codegen`, which writes the row, column and lane loops
+  itself; `legalize_front`/`legalize_back` surround them. `ExprNode::Write` is
+  gone. `OpKind::Seq`/`Monoid::SEQ` remain, the unit monoid the loops are over
+  (DENOTATION §7; schedule note §1).
 - No `std` outside `store`.
 
 ## Contract

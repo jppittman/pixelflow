@@ -27,7 +27,7 @@
 //! written down.
 
 use crate::arena::{BufferDecl, UniformDecl};
-use crate::fold::{Binder, Bound, Fold};
+use crate::fold::{Bound, Fold};
 use crate::key::KernelKey;
 use crate::kind::OpKind;
 use crate::lit::Lit;
@@ -137,16 +137,6 @@ pub enum Shape<'a, R> {
         lo: Bound<R>,
         hi: Bound<R>,
         body: R,
-    },
-    /// A store — mirrors [`ExprNode::Write`](crate::arena::ExprNode::Write).
-    /// One child, the value; the binders are metadata, as a fold's are. An
-    /// e-graph `insert` declines one: an effect is not a value any rule may
-    /// rewrite, and nothing before the legalize passes can hold one anyway.
-    Write {
-        row: Binder,
-        col: Binder,
-        lane: Binder,
-        value: R,
     },
 }
 

@@ -35,11 +35,6 @@ pub(crate) fn program_digest(arena: &ExprArena, root: ExprId) -> u64 {
             | ExprNode::Ternary(op, ..)
             | ExprNode::Nary(op, _) => (6, Some(op), 0),
             ExprNode::Reduce { .. } => (7, None, arena.fold_header(id).to_bits()),
-            ExprNode::Write { row, col, lane, .. } => (
-                8,
-                None,
-                u128::from(row.var()) | u128::from(col.var()) << 8 | u128::from(lane.var()) << 16,
-            ),
         };
         feed(&[variant]);
         feed(&op.map_or(0, |op| op as u64).to_le_bytes());
