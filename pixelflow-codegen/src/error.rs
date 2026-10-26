@@ -14,6 +14,9 @@ use core::fmt;
 /// [`jit_cache::compile`](crate::jit_cache::compile) can fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompileError {
+    /// The mandatory optimizer could not admit or differentiate the program.
+    Optimization(pixelflow_search::runtime::OptimizationError),
+
     /// [`pixelflow_ir::passes::legalize`] refused to lower part of the
     /// expression — e.g. differentiating a read of a table, or a construct
     /// with no derivative rule. The message names which; it is legalize's own
@@ -37,6 +40,7 @@ pub enum CompileError {
 impl fmt::Display for CompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Optimization(error) => write!(f, "optimization failed: {error:?}"),
             Self::Legalize(msg) => write!(f, "expression cannot be legalized: {msg}"),
             Self::BudgetExceeded(msg) => write!(f, "compile budget exceeded: {msg}"),
             Self::Mmap => write!(f, "mmap failed"),

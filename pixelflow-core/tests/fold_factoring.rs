@@ -143,7 +143,7 @@ fn assert_extracts_factored(name: &str, kernel: &Kernel, distributor: OpKind, mo
     let (arena, root) = kernel.parts();
     let shape = LatticeShape::new([WIDTH as u32, HEIGHT as u32]);
     let optimized = optimize_runtime_arena(arena, root, shape)
-        .unwrap_or_else(|| panic!("{name}: the runtime tier declined the kernel"));
+        .unwrap_or_else(|_| panic!("{name}: the runtime tier declined the kernel"));
     let (arena, root) = (&optimized.0, optimized.1);
     let is_fold = |id: ExprId| matches!(arena.node(id), ExprNode::Reduce { fold, .. } if fold.monoid() == monoid);
     let factored = reachable(arena, root).into_iter().any(|id| {

@@ -130,7 +130,7 @@ fn a_glyph_costs_no_more_than_it_did() {
         // caller would then compile an arena that still holds a fold, which
         // the emitter has no instruction for.
         let optimized = pixelflow_search::runtime::optimize_runtime_arena(arena, root, shape)
-            .unwrap_or_else(|| panic!("{ch}@{px}: the runtime pipeline declined"));
+            .unwrap_or_else(|_| panic!("{ch}@{px}: the runtime pipeline declined"));
         let (out, out_root) = &*optimized;
         let nodes = reachable(out, *out_root);
 
