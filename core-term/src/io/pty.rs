@@ -114,8 +114,7 @@ impl NixPty {
     /// `openpty(3)` is not thread-safe on macOS, and racing calls fail
     /// intermittently with a corrupted (negative) errno that surfaces as
     /// `Errno::UnknownErrno` — 107 failures in 57,600 calls at 48 threads
-    /// on 12 cores, versus 0 when serialized. See
-    /// `docs/bugs/2026-07-21-openpty-not-thread-safe.md`.
+    /// on 12 cores, versus 0 when serialized.
     ///
     /// The terminal satisfies this structurally rather than by locking:
     /// `main` spawns the single PTY before the troupe's threads exist and
