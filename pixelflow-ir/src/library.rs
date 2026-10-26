@@ -53,6 +53,64 @@ pub trait Terms: sealed::Sealed {
 
     /// `op(a, b)`, for `[a, b]`.
     fn binary(&mut self, op: OpKind, operands: [Self::Term; 2]) -> Self::Term;
+
+    /// `op(a, b, c)`, for `[a, b, c]`.
+    fn ternary(&mut self, op: OpKind, operands: [Self::Term; 3]) -> Self::Term;
+
+    /// `a + b`.
+    fn add(&mut self, a: Self::Term, b: Self::Term) -> Self::Term {
+        self.binary(OpKind::Add, [a, b])
+    }
+
+    /// `a − b`.
+    fn sub(&mut self, a: Self::Term, b: Self::Term) -> Self::Term {
+        self.binary(OpKind::Sub, [a, b])
+    }
+
+    /// `a · b`.
+    fn mul(&mut self, a: Self::Term, b: Self::Term) -> Self::Term {
+        self.binary(OpKind::Mul, [a, b])
+    }
+
+    /// `a / b`, an exact quotient.
+    fn div(&mut self, a: Self::Term, b: Self::Term) -> Self::Term {
+        self.binary(OpKind::Div, [a, b])
+    }
+
+    /// `max(a, b)`.
+    fn max(&mut self, a: Self::Term, b: Self::Term) -> Self::Term {
+        self.binary(OpKind::Max, [a, b])
+    }
+
+    /// `a > b`, as a mask.
+    fn gt(&mut self, a: Self::Term, b: Self::Term) -> Self::Term {
+        self.binary(OpKind::Gt, [a, b])
+    }
+
+    /// `a < b`, as a mask.
+    fn lt(&mut self, a: Self::Term, b: Self::Term) -> Self::Term {
+        self.binary(OpKind::Lt, [a, b])
+    }
+
+    /// The bitwise and of two masks.
+    fn and(&mut self, a: Self::Term, b: Self::Term) -> Self::Term {
+        self.binary(OpKind::BitAnd, [a, b])
+    }
+
+    /// `√a`.
+    fn sqrt(&mut self, a: Self::Term) -> Self::Term {
+        self.unary(OpKind::Sqrt, a)
+    }
+
+    /// `mask ? if_true : if_false`.
+    fn select(
+        &mut self,
+        mask: Self::Term,
+        if_true: Self::Term,
+        if_false: Self::Term,
+    ) -> Self::Term {
+        self.ternary(OpKind::If, [mask, if_true, if_false])
+    }
 }
 
 impl sealed::Sealed for ExprArena {}
@@ -70,6 +128,10 @@ impl Terms for ExprArena {
 
     fn binary(&mut self, op: OpKind, [a, b]: [ExprId; 2]) -> ExprId {
         self.push_binary(op, a, b)
+    }
+
+    fn ternary(&mut self, op: OpKind, [a, b, c]: [ExprId; 3]) -> ExprId {
+        self.push_ternary(op, a, b, c)
     }
 }
 

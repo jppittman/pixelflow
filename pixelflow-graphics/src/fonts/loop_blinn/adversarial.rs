@@ -64,7 +64,7 @@ use std::sync::Arc;
 
 use super::*;
 use pixelflow_core::{FastMathGuard, PlaneRegion, Uniform, UniformBlock};
-use pixelflow_ir::{ExprNode, LatticeShape};
+use pixelflow_ir::{ExprNode, LatticeShape, OpKind};
 use pixelflow_search::runtime::optimize_runtime_arena;
 
 /// Texels per frame row.
