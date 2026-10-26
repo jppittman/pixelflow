@@ -18,7 +18,7 @@
 #
 # SCOPE -- every document under docs/ except the dated evidence in results/,
 # every module's intent.md, and the agent instructions
-# at the repository root (../CLAUDE.md, ../AGENTS.md, ../GEMINI.md), which every
+# at the repository root (CLAUDE.md, AGENTS.md, GEMINI.md), which every
 # session reads before anything else. Those are the documents a reader *acts
 # on*, so a dead path in one sends somebody to a file that is not there.
 # `docs/results/` is dated evidence: a July measurement naming a file deleted
@@ -135,7 +135,7 @@ done < <(
   # directory) -- plus the loose docs at the root of docs/, which are a mix of
   # design notes and analyses that a reader acts on the same way, and the
   # agent instructions, which a session acts on before it reads any of them.
-  # ../CLAUDE.md said a glyph was closed by a test that had been deleted, and
+  # CLAUDE.md said a glyph was closed by a test that had been deleted, and
   # this check, scoped to docs/ alone, passed.
   #
   # `docs/results/` stays out deliberately: it is dated evidence, and a July
@@ -144,7 +144,7 @@ done < <(
   {
     find docs -name '*.md' ! -path 'docs/results/*' ! -name 'README.md'
     find . -name 'intent.md' -not -path './target*' | sed 's|^\./||'
-    printf '%s\n' ../CLAUDE.md ../AGENTS.md ../GEMINI.md
+    printf '%s\n' CLAUDE.md AGENTS.md GEMINI.md
   } | sort
 )
 

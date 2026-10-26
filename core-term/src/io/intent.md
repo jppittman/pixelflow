@@ -46,6 +46,10 @@ scheduler can interrupt. It moves bytes and a window size; what they mean is
   platform split is files; `io`'s old violations are baselined in
   `scripts/cfg_encapsulation_baseline.txt`.
 
+## Behind
+- The single-spawner rule is a caller contract: `spawn_with_config` does not
+  prevent concurrent calls, so callers must serialize PTY creation.
+
 ## Decided in
 `docs/archive/designs/pty-actor-troupe.md`,
 `docs/process/2026-10-15-intent-lives-with-the-module.md`.
