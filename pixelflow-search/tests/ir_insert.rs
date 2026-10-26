@@ -194,25 +194,6 @@ fn a_reference_is_declined_by_every_vocabulary() {
     }
 }
 
-/// `Seq`, the unit monoid's combine, is declined as an op no vocabulary
-/// resolves.
-#[test]
-fn a_seq_is_declined_by_every_vocabulary() {
-    let mut seq_arena = ExprArena::new();
-    let x = seq_arena.push_var(0);
-    let y = seq_arena.push_var(1);
-    let seq = seq_arena.push_binary(OpKind::Seq, x, y);
-
-    for vocab in [Vocabulary::Runtime, Vocabulary::Templates] {
-        let mut eg = EGraph::new();
-        assert_eq!(
-            insert(&seq_arena, seq, &mut eg, vocab),
-            Err(Declined::Op(OpKind::Seq)),
-            "{vocab:?} must decline Seq"
-        );
-    }
-}
-
 /// And the runtime tier as a whole does not decline it: the referent is a
 /// unit, saturated and extracted by itself and linked back in, so its body is
 /// optimized exactly as the spliced composition's would be and no `Ref`

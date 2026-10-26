@@ -60,14 +60,6 @@ impl Monoid {
     /// Mask `∧`, identity all-set — the universal quantifier over a bounded
     /// domain.
     pub const ALL: Self = Self(OpKind::BitAnd);
-    /// Sequencing, the **unit monoid**: combine is "then", identity is
-    /// nothing. The algebra a lattice's folds are over — rows, batches and
-    /// lanes wrapped around a store
-    /// (docs/archive/plans/2026-09-16-collapse-is-a-fold.md §2.4). A fold over it
-    /// goes through the fold machinery unchanged; what its combine emits is
-    /// no bytes, and the accumulator it would seed with
-    /// [`identity`](Self::identity) is one nothing ever reads.
-    pub const SEQ: Self = Self(OpKind::Seq);
 
     /// The combining operation. Crate-private: the op set is an IR concept,
     /// and consumers name algebras, not opcodes.
@@ -116,8 +108,7 @@ impl Monoid {
     /// Whether a fold under this algebra may take a bound that is a value:
     /// one whose sort has an answer for a bound outside the domain, NaN
     /// (docs/language/2026-10-20-a-bound-is-a-value.md §1.4). `ANY` and `ALL`
-    /// fold masks, which have none (decision 8, open); `SEQ` is the lattice's,
-    /// whose ranges stay constant (§4, "Deferred").
+    /// fold masks, which have none (decision 8, open).
     pub(crate) const fn takes_a_value_bound(self) -> bool {
         matches!(
             self.0,
@@ -446,8 +437,7 @@ pub enum BoundRefusal {
     BoundOutOfDomain { end: BoundEnd, literal: f32 },
     /// A bound of a sort the fold cannot take (§1.4): a mask, which names no
     /// count, at either end under any fold; or any value bound under `ANY`,
-    /// `ALL` or `SEQ`, whose sorts have no out-of-domain answer (decision 8) or
-    /// whose ranges stay constant (the lattice's). The fold is in the panic's
+    /// `ALL`, whose sorts have no out-of-domain answer (decision 8). The fold is in the panic's
     /// context, not here: the mask case has no algebra to blame.
     ///
     /// The sort is read off the term as written where a fold is built: a mask
@@ -484,7 +474,7 @@ impl core::fmt::Display for BoundRefusal {
             Self::BoundSort { end } => write!(
                 f,
                 "BoundSort: a fold's {end} bound has a sort the fold cannot take: a mask names \
-                 no count, and an ANY, ALL or SEQ fold takes literal bounds only (§1.4 and \
+                 no count, and an ANY or ALL fold takes literal bounds only (§1.4 and \
                  decision 8 of {PLAN})"
             ),
             Self::BoundVaries { end, reads } => write!(
@@ -825,8 +815,8 @@ impl FoldHeader {
     ///
     /// On a literal pair `KnownRange::new` refuses (backwards, ending past
     /// [`Fold::EXACT_BOUND`], a stride that does not divide the span), with its
-    /// messages. On a value bound the fold cannot take: under `ANY`, `ALL` or
-    /// `SEQ` ([`BoundRefusal::BoundSort`]); at a stride other than 1, which
+    /// messages. On a value bound the fold cannot take: under `ANY` or
+    /// `ALL` ([`BoundRefusal::BoundSort`]); at a stride other than 1, which
     /// only a known range it divides may have; or beside a literal past
     /// [`Fold::EXACT_BOUND`].
     #[must_use]
@@ -1015,7 +1005,7 @@ impl FoldHeader {
     /// or one past [`Fold::EXACT_BOUND`], a literal range [`KnownRange::admits`]
     /// does not (reversed, or ending past the bound) or that the stride does
     /// not divide exactly, or a value bound (`VALUE_FIELD`, a count field of
-    /// all ones) its fold cannot take: under `ANY`, `ALL` or `SEQ`, at a stride
+    /// all ones) its fold cannot take: under `ANY` or `ALL`, at a stride
     /// other than 1, or beside a literal past the bound.
     ///
     /// Total, and the exact inverse of [`FoldHeader::to_bits`]: a corrupt
@@ -1150,11 +1140,11 @@ fn write_bound(f: &mut core::fmt::Formatter<'_>, bound: Bound<()>) -> core::fmt:
 
 /// The message of an `expect` on a range a site's folds always have. A site
 /// that reads a range and has no answer of its own for an unknown one reads it
-/// where every fold is literal: a lattice's fold (`SEQ`, which takes literal
-/// bounds only), a production glyph's before B2, or a test's own literal fold.
+/// where every fold is literal: a production glyph's before B2, or a test's
+/// own literal fold.
 /// One grep target for the steps that make the `None` reachable there.
-pub const KNOWN_RANGE: &str = "this fold's bounds are literals: a lattice's fold, a production \
-     glyph's before B2, or a test's (docs/language/2026-10-20-a-bound-is-a-value.md)";
+pub const KNOWN_RANGE: &str = "this fold's bounds are literals: a production glyph's \
+     before B2, or a test's (docs/language/2026-10-20-a-bound-is-a-value.md)";
 
 /// A fold's range when it is known: the indices `lo, lo + stride, …` below
 /// `hi`. The view every reader of a range reads.
@@ -1527,7 +1517,6 @@ mod tests {
             Monoid::MIN,
             Monoid::ANY,
             Monoid::ALL,
-            Monoid::SEQ,
         ] {
             assert_eq!(Monoid::unmarshal(monoid.marshal()), Some(monoid));
         }
@@ -1687,22 +1676,6 @@ mod tests {
         assert_eq!(halved.len(), 499_500);
         let back = FoldHeader::from_bits(wide.to_bits()).expect("a header's own bits name it");
         assert_eq!(back, wide);
-    }
-
-    /// The unit monoid: a fold over it is a loop whose combine says nothing.
-    #[test]
-    fn seq_is_a_monoid_whose_combine_is_sequencing() {
-        let b = Binder::from_slot(0).expect("slot 0 exists");
-        let fold = Fold::new(Monoid::SEQ, b);
-        assert_eq!(fold.combine_op(), OpKind::Seq);
-        assert_eq!(fold.monoid(), Monoid::SEQ);
-        // The seed of an accumulator no combine ever reads.
-        assert_eq!(Monoid::SEQ.identity(), Lit::Real(0.0));
-        assert_eq!(Monoid::of(OpKind::Seq), Some(Monoid::SEQ));
-        let seq = header(fold, 0, 4);
-        let back = FoldHeader::from_bits(seq.to_bits()).expect("a SEQ fold round-trips");
-        assert_eq!(back, seq);
-        assert_eq!(back.fold(), fold);
     }
 
     #[test]
@@ -2023,7 +1996,7 @@ mod tests {
     /// A fold over an arithmetic algebra takes a bound that is a value at
     /// stride one: its header holds the mark of a child, knows no range, and is
     /// priced at the estimate; the algebras whose sorts have no out-of-domain
-    /// answer (`ANY`, `ALL`) and the lattice's (`SEQ`) take none.
+    /// answer (`ANY`, `ALL`) take none.
     #[test]
     fn a_value_bound_takes_an_arithmetic_fold_at_stride_one() {
         for monoid in [Monoid::SUM, Monoid::PRODUCT, Monoid::MIN, Monoid::MAX] {
@@ -2034,7 +2007,7 @@ mod tests {
             assert_eq!(value.hi(), Bound::Value(()));
             assert_eq!(value.priced_trips(), Fold::ESTIMATED_TRIPS);
         }
-        for monoid in [Monoid::ANY, Monoid::ALL, Monoid::SEQ] {
+        for monoid in [Monoid::ANY, Monoid::ALL] {
             assert!(!monoid.takes_a_value_bound());
         }
     }
@@ -2058,17 +2031,6 @@ mod tests {
             Fold::new(Monoid::ALL, b(0)),
             Bound::Value(()),
             Bound::Lit(3),
-        );
-    }
-
-    /// The lattice's folds keep constant ranges.
-    #[test]
-    #[should_panic(expected = "BoundSort")]
-    fn a_value_bound_on_a_seq_fold_is_refused() {
-        let _refused = FoldHeader::new(
-            Fold::new(Monoid::SEQ, b(0)),
-            Bound::Lit(0),
-            Bound::Value(()),
         );
     }
 
@@ -2230,7 +2192,7 @@ mod tests {
             FoldHeader::from_bits(fold)
         };
         assert!(marked(Monoid::SUM, 1, 0, None).is_some(), "the control");
-        for monoid in [Monoid::ANY, Monoid::ALL, Monoid::SEQ] {
+        for monoid in [Monoid::ANY, Monoid::ALL] {
             assert_eq!(marked(monoid, 1, 0, None), None, "{monoid:?}");
         }
         assert_eq!(marked(Monoid::SUM, 2, 0, None), None, "stride 2");
@@ -2263,7 +2225,6 @@ mod tests {
             Monoid::MAX,
             Monoid::ANY,
             Monoid::ALL,
-            Monoid::SEQ,
         ] {
             for stride in [1, 2] {
                 for (lo, hi) in [
@@ -2306,7 +2267,6 @@ mod tests {
             Monoid::MAX,
             Monoid::ANY,
             Monoid::ALL,
-            Monoid::SEQ,
         ] {
             for (lo, hi) in shapes {
                 let holds_a_value = lo.value().is_some() || hi.value().is_some();

@@ -820,7 +820,7 @@ impl Kernel {
     /// ([`BoundRefusal::BoundSort`]); and, from the fold
     /// [`ExprArena::close_over`] builds, on a bound reading a coordinate
     /// ([`BoundRefusal::BoundVaries`], L3), on a value bound under `ANY`, `ALL`
-    /// or `SEQ` ([`BoundRefusal::BoundSort`]), and when the body binds every
+    /// ([`BoundRefusal::BoundSort`]), and when the body binds every
     /// slot.
     ///
     /// ```
@@ -2055,14 +2055,6 @@ mod tests {
         let _refused = Kernel::over_values(Monoid::ALL, &Kernel::constant(0.0), &n, |i| {
             i.lt(&Kernel::x())
         });
-    }
-
-    /// The lattice's folds keep constant ranges.
-    #[test]
-    #[should_panic(expected = "BoundSort")]
-    fn over_values_refuses_a_value_bound_on_seq() {
-        let n = Uniform::new(3.0).kernel();
-        let _refused = Kernel::over_values(Monoid::SEQ, &Kernel::constant(0.0), &n, affine);
     }
 
     /// The monoid is `FoldHeader::new`'s to refuse, not an up-front check: a

@@ -87,7 +87,6 @@ pub fn template_may_name(kind: OpKind) -> bool {
         | OpKind::Gather
         | OpKind::RawGather
         | OpKind::Reduce
-        | OpKind::Seq
         | OpKind::Tuple
         | OpKind::TruncToInt
         | OpKind::IntToFloat

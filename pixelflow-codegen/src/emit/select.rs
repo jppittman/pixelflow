@@ -12,13 +12,13 @@ use super::{Edges, Entry, Function, IsaBackend, LaneOp, Pointer, Store, Target, 
 use crate::error::CompileError;
 use crate::pass::Pass;
 use crate::program::{
-    BinaryOp, CompareOp, Def, Flow, IfArm, Item, ScheduledOp, Scope, ScopedSchedule, ValueId,
-    lane_pattern, legal,
+    BinaryOp, CompareOp, Def, Flow, IfArm, Item, Looping, ScheduledOp, Scope, ScopedSchedule,
+    ValueId, lane_pattern, legal,
 };
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use pixelflow_ir::fold::{Binder, Bound, Fold, KnownRange, Monoid};
+use pixelflow_ir::fold::{Binder, Bound};
 
 /// The step beside a value bound: `FoldHeader::new` admits no other there.
 const UNIT_STRIDE: u64 = 1;
@@ -78,7 +78,7 @@ struct Selector<'s, B: IsaBackend> {
 /// [`ScheduledOp::Reduce`].
 #[derive(Clone, Copy)]
 struct Looped {
-    fold: Fold,
+    looping: Looping,
     lo: Bound<ValueId>,
     hi: Bound<ValueId>,
     body: ValueId,
@@ -182,14 +182,28 @@ impl<B: IsaBackend> Selector<'_, B> {
                 B::store(&mut self.b, store);
                 return Ok(());
             }
-            &ScheduledOp::Reduce { fold, lo, hi, body } => {
+            &ScheduledOp::Reduce {
+                looping,
+                lo,
+                hi,
+                body,
+            } => {
                 let j = scoped
                     .folds
                     .iter()
                     .position(|f| f.parent == scope && f.reduce == def.value)
                     .unwrap_or_else(|| panic!("{:?} opens no fold in its scope", def.value));
                 self.scheduled[scope_ix(scope)] += 1;
-                match self.fold(scope, j, Looped { fold, lo, hi, body })? {
+                match self.fold(
+                    scope,
+                    j,
+                    Looped {
+                        looping,
+                        lo,
+                        hi,
+                        body,
+                    },
+                )? {
                     Some(result) => result,
                     None => return Ok(()),
                 }
@@ -287,13 +301,19 @@ impl<B: IsaBackend> Selector<'_, B> {
         j: usize,
         looped: Looped,
     ) -> Result<Option<B::Lane>, CompileError> {
-        let Looped { fold, lo, hi, body } = looped;
-        let range = KnownRange::of(fold, lo, hi);
+        let Looped {
+            looping,
+            lo,
+            hi,
+            body,
+        } = looped;
+        let range = looping.range(lo, hi);
         assert!(
-            range.is_none_or(|range| !range.is_empty()),
+            range.is_none_or(|range| !range.empty),
             "an empty fold is its monoid's identity before it reaches selection"
         );
-        let accumulates = fold.monoid() != Monoid::SEQ;
+        let accumulation = looping.accumulation();
+        let accumulates = accumulation.is_some();
 
         let lo = match lo {
             Bound::Lit(_) => self.bound(lo)?,
@@ -303,10 +323,9 @@ impl<B: IsaBackend> Selector<'_, B> {
                 self.binary(BinaryOp::Add, seed, zero)?
             }
         };
-        let seeds: Vec<B::Lane> = if accumulates {
-            alloc::vec![lo, self.constant(lane_pattern(fold.monoid().identity()))?]
-        } else {
-            alloc::vec![lo]
+        let seeds: Vec<B::Lane> = match accumulation {
+            Some(fold) => alloc::vec![lo, self.constant(lane_pattern(fold.monoid().identity()))?],
+            None => alloc::vec![lo],
         };
         let names: Vec<_> = seeds.iter().map(|&seed| B::lane_name(seed)).collect();
         let classes: Vec<_> = names.iter().map(|name| name.class).collect();
@@ -316,7 +335,7 @@ impl<B: IsaBackend> Selector<'_, B> {
             Some(&(index, trips)) => (Some(index), trips),
             None => (None, Trips::ONCE),
         };
-        let trips = Trips::of(range).nested_in(parent_trips);
+        let trips = Trips::of(range.map(|range| range.trips)).nested_in(parent_trips);
         let index = self.b.open_loop(head.label(), parent_loop, trips);
         let head_label = head.label();
         let params: Vec<B::Lane> = head.params().iter().map(|&p| B::param_lane(p)).collect();
@@ -328,17 +347,19 @@ impl<B: IsaBackend> Selector<'_, B> {
         self.b.enter(head);
 
         let binder = params[0];
-        self.binders.push((fold.binder(), binder));
+        self.binders.push((looping.binder(), binder));
         self.loops.push((index, trips));
         let result = self.scope(Scope::Fold(j), accumulates.then_some(body))?;
         self.loops.pop();
         self.binders.pop();
 
-        let accumulated = match result {
-            Some(body) => Some(self.binary(legal(fold.combine_op()), params[1], body)?),
-            None => None,
+        let accumulated = match (accumulation, result) {
+            (Some(fold), Some(body)) => {
+                Some(self.binary(legal(fold.combine_op()), params[1], body)?)
+            }
+            _ => None,
         };
-        let stride = range.map_or(UNIT_STRIDE, KnownRange::stride);
+        let stride = range.map_or(UNIT_STRIDE, |range| range.stride);
         let stride = self.constant(stride as f32)?;
         let step = self.binary(BinaryOp::Add, binder, stride)?;
         // After the body's frame has popped: a value `hi` resolves in the
