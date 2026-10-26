@@ -69,8 +69,8 @@ use crate::{BOUND_PLAN, PLAN};
 use pixelflow_ir::arena::{
     Axis, ExprArena, ExprId, FoldTerms, IndexSpaceFull, OpenFold, UniformDecl, UniformIdentity,
 };
+use pixelflow_ir::arena::{COLLAPSE_BINDERS, KERNEL_BINDER_CAPACITY};
 use pixelflow_ir::library;
-use pixelflow_ir::passes::lattice::KERNEL_BINDER_CAPACITY;
 use pixelflow_ir::{Binder, Bound, Fold, KnownRange, Monoid, OpKind};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -658,7 +658,7 @@ impl<S: Site> Lowering<'_, S> {
                 "folds nested more than {} deep: collapse reserves {} of the IR's {} binder \
                  slots for its row, column, and lane folds",
                 KERNEL_BINDER_CAPACITY,
-                pixelflow_ir::passes::lattice::COLLAPSE_BINDERS,
+                COLLAPSE_BINDERS,
                 Binder::COUNT,
             ));
         }

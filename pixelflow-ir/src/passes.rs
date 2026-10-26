@@ -1,37 +1,34 @@
 //! IR-to-IR transforms: legalization.
 //!
-//! [`legalize`] runs seven passes, each `(arena, root) -> (arena, root)`, each
-//! turning nodes no backend can emit into nodes every backend can:
+//! Legalization is two halves, [`legalize_front`] and [`legalize_back`], each
+//! `(arena, root) -> (arena, root)`, each turning nodes no backend can emit
+//! into nodes every backend can. A backend's traversal of the lattice goes
+//! between them (the CPU's is `pixelflow-codegen`'s `Collapse` and `Pack`),
+//! because the lattice's traversal is the backend's schedule and not the
+//! language's (docs/language/2026-10-15-kernels-evaluate-kernels.md §3).
 //!
-//! | pass | consumes | produces |
-//! |---|---|---|
-//! | [`expand_refs`] | `Ref` | the referent, spliced in |
-//! | [`lower_dwrt`] | `Dwrt` | arithmetic, and *re-introduces* transcendentals |
-//! | [`lattice::collapse`] | a kernel over `X`/`Y` | the same kernel wrapped in the lattice's row/col/lane folds around one `Write` |
-//! | [`lattice::pack`] | `collapse`'s degenerate `[0,1)` lane fold | the same folds strip-mined to the target's lane width |
-//! | [`expand_gather`] | `Gather` | index arithmetic + `RawGather` |
-//! | [`expand_transcendentals`] | `Sin`..`Pow` | arithmetic + bit-manip atoms |
-//! | `guard` (crate-private, `passes/guard.rs`) | a `Reduce` with a value bound | `If(dom, If(Lt(lo, hi), Reduce, identity), NaN)`: NaN unless every value bound is a count, an integer in `0..=2²⁴`, and the identity over an empty range (L5, L2) |
+//! | pass | half | consumes | produces |
+//! |---|---|---|---|
+//! | [`expand_refs`] | front | `Ref` | the referent, spliced in |
+//! | [`lower_dwrt`] | front | `Dwrt` | arithmetic, and *re-introduces* transcendentals |
+//! | [`expand_gather`] | back | `Gather` | index arithmetic + `RawGather` |
+//! | [`expand_transcendentals`] | back | `Sin`..`Pow` | arithmetic + bit-manip atoms |
+//! | `guard` (crate-private, `passes/guard.rs`) | back | a `Reduce` with a value bound | `If(dom, If(Lt(lo, hi), Reduce, identity), NaN)`: NaN unless every value bound is a count, an integer in `0..=2²⁴`, and the identity over an empty range (L5, L2) |
 //!
 //! The order in that table is the order they must run: differentiating a `sin`
 //! produces a `cos`, so `lower_dwrt` has to go before the pass that expands
-//! them; you cannot differentiate a *name*, so `expand_refs` goes before
-//! everything; a derivative is taken with respect to `X` before `collapse`
-//! substitutes `X` away, and a read's address arithmetic is built
-//! over the lattice's binders after it, so the two lattice passes sit between
+//! them; you cannot differentiate a name, so `expand_refs` goes before
+//! everything; a derivative is taken with respect to `X` before the
+//! traversal substitutes `X` away, and a read's address arithmetic is built
+//! over the traversal's binders after it
 //! (docs/archive/plans/2026-09-16-collapse-is-a-fold.md §2.3). The guard goes
 //! last, so no pass after it rebuilds the `If` lowering relies on. Every pass
-//! but the guard and the two lattice passes is idempotent: the guard wraps every
-//! value-bounded fold it meets, its own output's included, `collapse` wraps its
-//! input in the lattice's folds, and `pack` takes `collapse`'s own output and
-//! nothing else, so `legalize` runs each of the three once. Every pass but the
-//! lattice passes has an identity fast-path, so running one that has nothing to
-//! do is free (the guard leaves a kernel whose bounds are all literals
-//! untouched); the two lattice passes always wrap: after them no coordinate
-//! `Var` exists and the root is a `Reduce` over the unit monoid whose body is a
-//! `Write`. That is the shape every backend emits, and the only shape.
+//! but the guard is idempotent: the guard wraps every value-bounded fold it
+//! meets, its own output's included. Every pass has an identity fast-path, so
+//! running one that has nothing to do is free (the guard leaves a kernel whose
+//! bounds are all literals untouched).
 //!
-//! **`Reduce` is legal in the arena and [`legalize`] leaves every one
+//! **`Reduce` is legal in the arena and [`legalize_back`] leaves every one
 //! standing**, nested or not: codegen emits a surviving fold as a loop, and a
 //! fold inside a fold's body as a loop inside a loop. There is no pass that
 //! unrolls one: a fold a caller wants gone is halved away by the e-graph's
@@ -51,8 +48,8 @@
 //! The expansions deliberately avoid `MulAdd` and `If`, staying inside the
 //! differentiable primitive set so `lower_dwrt` can still get through them.
 //!
-//! They may use `If`. [`legalize`] runs `lower_dwrt` *before*
-//! `expand_transcendentals` — the chain rule manufactures `Sin`/`Cos` nodes
+//! They may use `If`. [`legalize_front`] runs `lower_dwrt` *before*
+//! [`legalize_back`] runs `expand_transcendentals` — the chain rule manufactures `Sin`/`Cos` nodes
 //! that the transcendental pass must still lower — so an expansion is only ever
 //! evaluated, never differentiated, and derivatives are taken against the
 //! symbolic rules in `diff_node` instead. (`lower_dwrt` carries an `If` rule
@@ -68,67 +65,57 @@ use alloc::borrow::Cow;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-/// The lattice's own two folds — `collapse(extent)`, `pack(lanes)` — as
-/// legalize passes. See the module doc above for their place in the order.
-pub mod lattice;
-
 mod guard;
 
-/// Run every legalization pass, in the one order they compose in, for the
-/// collapse `collapse` describes: the kernel comes back wrapped in the
-/// lattice's folds, strip-mined to the target's lane width.
+/// The legalization that comes before a backend's traversal: names and
+/// derivatives. `expand_refs`, then `lower_dwrt`.
 ///
-/// This is the whole pipeline. It was previously four calls copied into each
-/// compile entry, which is how two since-deleted entries came to run none of
-/// them, and how the deleted
-/// `CompileWorkspace` came to run none of them *and* skip the guard that
-/// refuses a surviving `Dwrt`. An order that has to be retyped is an order
-/// that can be forgotten.
-///
-/// A fold whose bound is a value comes back inside its guard: NaN where a
-/// bound is not a count (an integer in `0..=2²⁴`), and the monoid's identity
-/// where the range is empty.
+/// A backend wraps the kernel in its lattice's traversal between this and
+/// [`legalize_back`]: a derivative is taken with respect to `X` before the
+/// traversal substitutes `X` away, and a read's address arithmetic is built
+/// over the traversal's binders after it. The traversal is the backend's
+/// schedule, so it is not in this crate (docs/language/2026-10-15-kernels-evaluate-kernels.md
+/// §3); the CPU's is `pixelflow-codegen`'s `Collapse` and `Pack`.
 ///
 /// # Errors
 ///
 /// Propagates [`lower_dwrt_owned`]'s error for expressions with no derivative
 /// rule — bound-memory reads, integer/bit ops, reductions.
-pub fn legalize(
+pub fn legalize_front(
     arena: &ExprArena,
     root: ExprId,
-    collapse: &lattice::Collapse,
 ) -> Result<(ExprArena, ExprId), &'static str> {
     // `expand_refs` before anything else: every pass below reads structure,
     // and a reference has none to read — you cannot differentiate a name.
     let (arena, root) = expand_refs_owned(arena, root);
     // `lower_dwrt` next: differentiating a `sin` manufactures a `cos`, so it
     // has to precede the pass that expands them.
-    let (mut arena, root) = lower_dwrt_owned(&arena, root)?;
-    // The lattice, as folds: after `collapse` no coordinate `Var` exists,
-    // and `pack` strip-mines its column fold to the width the caller's
-    // target executes by lanes. Before `expand_gather`, so a read's address
-    // arithmetic is built over the binders and its variance read off them.
-    let root = lattice::collapse(&mut arena, root, collapse.domain);
-    let root = lattice::pack(&mut arena, root, collapse.lanes);
-    // No reduce pass. A `Reduce` is legal for codegen (stage 2c —
-    // `pixelflow-codegen` emits a surviving fold as a loop), and since
-    // `extract_folds` (`program/scopes.rs`) carves a fold inside a fold's body as a loop inside a
-    // loop, so is the shape `Kernel::by_ref` produces whenever two folds are
-    // composed by name and `expand_refs` splices one into the other. That
-    // shape was the last thing unrolled here (`expand_nested_reduce`, now
-    // deleted), and for a glyph it was the winding fold: N copies of a body
-    // the language had written once, N being the piece count.
-    //
-    // Declining to unroll is the whole of the trade stage 2c was for. Over a
-    // 95-glyph tile-16 atlas, same host, before and after 2c's one level:
-    // emit 4,640 ms -> 1,431 ms, the emitted atlas 21.1 MB -> 15.8 MB, and
-    // `'@'` alone 655,866 B -> 478,404 B. Saturation is unmoved (2,534 ms ->
-    // 2,569 ms), which is the point of legalizing last.
-    let (arena, root) = expand_gather_owned(&arena, root);
+    lower_dwrt_owned(&arena, root)
+}
+
+/// The legalization that comes after a backend's traversal: `expand_gather`,
+/// `expand_transcendentals`, and the guard that ends the chain.
+///
+/// A fold whose bound is a value comes back inside its guard: NaN where a
+/// bound is not a count (an integer in `0..=2²⁴`), and the monoid's identity
+/// where the range is empty.
+///
+/// A fold that survives stays standing — no pass unrolls one — for codegen
+/// to emit as a loop, and `extract_folds` (`program/scopes.rs`) carves a fold
+/// inside a fold's body as a loop inside a loop, which is the shape
+/// `Kernel::by_ref` produces when `expand_refs` splices one fold into
+/// another. Declining to unroll is the whole of the trade stage 2c was for.
+/// Over a 95-glyph tile-16 atlas, same host, before and after 2c's one level:
+/// emit 4,640 ms -> 1,431 ms, the emitted atlas 21.1 MB -> 15.8 MB, and `'@'`
+/// alone 655,866 B -> 478,404 B. Saturation is unmoved (2,534 ms -> 2,569 ms),
+/// which is the point of legalizing last.
+#[must_use]
+pub fn legalize_back(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
+    let (arena, root) = expand_gather_owned(arena, root);
     let (arena, root) = expand_transcendentals_owned(&arena, root);
     // The guard is last: nothing after it rebuilds the `If` that holds a
     // value-bounded fold's loop, and lowering asserts that shape.
-    Ok(guard::guard_value_bounds_owned(arena, root))
+    guard::guard_value_bounds_owned(arena, root)
 }
 
 /// Whether `op` is a unary transcendental this pass expands.
@@ -1495,7 +1482,7 @@ fn expand_sin_phase(arena: &mut ExprArena, x: ExprId, phase: f32) -> ExprId {
 
 /// `acc·x + add` as one `MulAdd` node.
 ///
-/// Nothing downstream would fuse this for us: [`legalize`] is the last thing to
+/// Nothing downstream would fuse this for us: [`legalize_back`] is the last thing to
 /// touch the arena, and the only thing that becomes an FMA instruction is an
 /// `OpKind::MulAdd` node already in it. So a Horner chain emitted as
 /// `Add(Mul(..))` reaches the emitter unfused — 5 mul + 5 add for `sin`, where
@@ -1945,200 +1932,6 @@ impl Optimize for LowerDwrt {
             Ok(new_root) => Rewritten::Changed(owned, new_root),
             Err(_) => Rewritten::Declined,
         }
-    }
-}
-
-#[cfg(test)]
-mod nested_reduce_tests {
-    use super::*;
-    use crate::fold::{Binder, Bound, Fold, KNOWN_RANGE, Monoid};
-
-    /// Every `Reduce` reachable from `root`.
-    fn reachable_reduces(arena: &ExprArena, root: ExprId) -> usize {
-        let mut seen = alloc::vec![false; arena.len()];
-        let mut stack = alloc::vec![root];
-        let mut count = 0;
-        while let Some(id) = stack.pop() {
-            if core::mem::replace(&mut seen[id.0 as usize], true) {
-                continue;
-            }
-            if matches!(arena.node(id), ExprNode::Reduce { .. }) {
-                count += 1;
-            }
-            stack.extend(arena.children(id));
-        }
-        count
-    }
-
-    /// A `Reduce` whose body reads another `Reduce`'s result reaches the
-    /// backend as written: two folds, one inside the other, both inside the
-    /// lattice's three. This used to be the one shape `legalize` still
-    /// unrolled (`expand_nested_reduce`, deleted), because codegen carved
-    /// fold bodies out one level at a time; it carves a fold inside a fold
-    /// now, and the pass went with the restriction it existed for.
-    ///
-    /// `inner = sum_{i<3}(X+i)`; `outer = sum_{j<2}(inner+j)`.
-    #[test]
-    fn legalize_leaves_a_nested_reduce_standing_inside_the_lattices_folds() {
-        use crate::arena::{UniformDecl, UniformIdentity};
-        use crate::variance::LatticeShape;
-
-        let mut a = ExprArena::new();
-        let x = a.push_var(0);
-        let inner_binder = Binder::from_slot(0).expect("slot 0 exists");
-        let i = a.push_var(inner_binder.var());
-        let inner_body = a.push_binary(OpKind::Add, x, i);
-        let inner = a.push_reduce(
-            Fold::new(Monoid::SUM, inner_binder),
-            Bound::Lit(0),
-            Bound::Lit(3),
-            inner_body,
-        );
-
-        let outer_binder = Binder::from_slot(1).expect("slot 1 exists");
-        let j = a.push_var(outer_binder.var());
-        let outer_body = a.push_binary(OpKind::Add, inner, j);
-        let root = a.push_reduce(
-            Fold::new(Monoid::SUM, outer_binder),
-            Bound::Lit(0),
-            Bound::Lit(2),
-            outer_body,
-        );
-
-        let origin = |default| UniformDecl {
-            id: UniformIdentity::mint(),
-            default,
-        };
-        let collapse = lattice::Collapse {
-            domain: lattice::Domain {
-                shape: LatticeShape::new([4, 1]),
-                origin: [origin(0.0), origin(0.0)],
-            },
-            lanes: 4,
-        };
-        let (legalized, new_root) = legalize(&a, root, &collapse).expect("legalize");
-        // The lattice's row, column and lane folds around the kernel's two.
-        assert_eq!(
-            reachable_reduces(&legalized, new_root),
-            5,
-            "both folds must survive legalization, inside the lattice's three"
-        );
-        let ExprNode::Reduce { fold, .. } = legalized.node(new_root) else {
-            panic!("root must be the lattice's row fold");
-        };
-        assert_eq!(fold.monoid(), Monoid::SEQ);
-        assert_eq!(
-            legalized.known_range(new_root).expect(KNOWN_RANGE).range(),
-            0..1
-        );
-        // A fold's range is read through the arena, which panics on any other
-        // node: keep the shape check first.
-        let ranges_over = |id: ExprId, range: core::ops::Range<u64>| {
-            matches!(legalized.node(id), ExprNode::Reduce { .. })
-                && legalized.known_range(id).expect(KNOWN_RANGE).range() == range
-        };
-        let outer = (0..legalized.len())
-            .map(|k| ExprId(k as u32))
-            .find(|id| ranges_over(*id, 0..2))
-            .expect("the outer kernel fold survives");
-        let ExprNode::Reduce { body, .. } = legalized.node(outer) else {
-            unreachable!()
-        };
-        let ExprNode::Binary(OpKind::Add, lhs, _) = legalized.node(body) else {
-            panic!("the outer body must still be `inner + j`");
-        };
-        assert!(
-            ranges_over(lhs, 0..3),
-            "the inner Reduce must be the outer body's own operand, not unrolled into it"
-        );
-    }
-}
-
-#[cfg(test)]
-mod guard_tests {
-    use super::*;
-    use crate::fold::{Binder, Bound, Fold, KNOWN_RANGE, Monoid};
-    use crate::lit::Lit;
-
-    /// `legalize` of `X + Σ_{k<u} k` at `[4, 2]` with four lanes: the kernel
-    /// comes back wrapped in the lattice's three folds, whose ranges are
-    /// literal, and the `Write`'s value reads the sum only through its guard.
-    #[test]
-    fn legalize_guards_a_value_bounded_fold_inside_the_lattice() {
-        use crate::variance::LatticeShape;
-
-        let mut a = ExprArena::new();
-        let slot = a.declare_uniform(crate::Uniform::new(8.0).decl());
-        let u = a.push_uniform(slot);
-        let binder = Binder::from_slot(0).expect("slot 0 exists");
-        let k = a.push_var(binder.var());
-        let sum = a.push_reduce(
-            Fold::new(Monoid::SUM, binder),
-            Bound::Lit(0),
-            Bound::Value(u),
-            k,
-        );
-        let x = a.push_var(0);
-        let root = a.push_binary(OpKind::Add, x, sum);
-
-        let origin = |default| crate::Uniform::new(default).decl();
-        let collapse = lattice::Collapse {
-            domain: lattice::Domain {
-                shape: LatticeShape::new([4, 2]),
-                origin: [origin(0.0), origin(0.0)],
-            },
-            lanes: 4,
-        };
-        let (legalized, new_root) = legalize(&a, root, &collapse).expect("legalize");
-
-        // An arena keeps the nodes a rebuild replaced, so only what the root
-        // reaches is the legalized kernel.
-        let mut seen = alloc::vec![false; legalized.len()];
-        let mut stack = alloc::vec![new_root];
-        let mut reachable = Vec::new();
-        while let Some(id) = stack.pop() {
-            if !core::mem::replace(&mut seen[id.0 as usize], true) {
-                reachable.push(id);
-                stack.extend(legalized.children(id));
-            }
-        }
-        let (valued, lattice): (Vec<ExprId>, Vec<ExprId>) = reachable
-            .iter()
-            .copied()
-            .filter(|id| matches!(legalized.node(*id), ExprNode::Reduce { .. }))
-            .partition(|id| legalized.known_range(*id).is_none());
-        assert_eq!(
-            valued.len(),
-            1,
-            "the kernel's fold is the one whose range is a value"
-        );
-        assert_eq!(lattice.len(), 3, "the row, column and lane folds");
-        for fold in lattice {
-            let range = legalized.known_range(fold).expect(KNOWN_RANGE);
-            assert!(!range.is_empty());
-        }
-
-        let write = reachable
-            .iter()
-            .find_map(|id| match legalized.node(*id) {
-                ExprNode::Write { value, .. } => Some(value),
-                _ => None,
-            })
-            .expect("the lattice's store");
-        let ExprNode::Binary(OpKind::Add, _, guarded) = legalized.node(write) else {
-            panic!("the store's value is `x + sum`");
-        };
-        let ExprNode::Ternary(OpKind::If, _, ran, nan) = legalized.node(guarded) else {
-            panic!("the sum reaches the store through its guard");
-        };
-        assert!(matches!(
-            legalized.node(nan),
-            ExprNode::Const(Lit::Real(v)) if v.is_nan()
-        ));
-        let ExprNode::Ternary(OpKind::If, _, fold, _) = legalized.node(ran) else {
-            panic!("the guard's true arm is the range test");
-        };
-        assert_eq!(fold, valued[0]);
     }
 }
 

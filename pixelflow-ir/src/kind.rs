@@ -207,7 +207,7 @@ op_table! {
     /// [`Fold`](crate::fold::Fold) in the node, and a known bound is the node's
     /// data too, not children — see `fold.rs` for the `Const`-child encoding
     /// it replaced. Legal through codegen, which emits a surviving fold as a
-    /// loop (`passes::legalize` leaves every one standing).
+    /// loop (`passes::legalize_back` leaves every one standing).
     Reduce = 49,
 
     // --- Uniforms (per-call scalars) ---

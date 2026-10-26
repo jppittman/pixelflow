@@ -14,7 +14,7 @@ use core::fmt;
 /// [`jit_cache::compile`](crate::jit_cache::compile) can fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompileError {
-    /// [`pixelflow_ir::passes::legalize`] refused to lower part of the
+    /// [`pixelflow_ir::passes::legalize_back`] refused to lower part of the
     /// expression — e.g. differentiating a read of a table, or a construct
     /// with no derivative rule. The message names which; it is legalize's own
     /// message, carried here rather than restated, since this crate does not

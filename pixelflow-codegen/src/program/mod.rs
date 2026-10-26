@@ -7,11 +7,13 @@
 //! produces and what allocation and emission consume, which is why it lives
 //! under neither. The stages that build it are [`Nest`], [`Own`] and [`Layout`].
 
+mod lattice;
 mod layout;
 mod lower;
 mod ownership;
 mod scopes;
 mod tree;
+pub(crate) use lattice::{Collapse, Domain, Pack};
 pub(crate) use layout::Layout;
 pub(crate) use lower::arena_to_schedule;
 pub(crate) use ownership::Own;
@@ -232,7 +234,7 @@ impl BinaryOp {
     }
 }
 
-/// The legal op `op` is. `passes::legalize` leaves only these, so none is a
+/// The legal op `op` is. `passes::legalize_back` leaves only these, so none is a
 /// bad kernel: it is a bypassed pipeline, and nothing a caller could act on.
 pub(crate) fn legal<T: Legal>(op: OpKind) -> T {
     T::of(op).unwrap_or_else(|| not_legal(op))
@@ -242,7 +244,7 @@ pub(crate) fn legal<T: Legal>(op: OpKind) -> T {
 #[inline(never)]
 fn not_legal(op: OpKind) -> ! {
     panic!(
-        "{op:?} is not a backend-legal op -- `passes::legalize` \
+        "{op:?} is not a backend-legal op -- `passes::legalize_back` \
          leaves only backend-legal ops, so the pipeline was bypassed, not the kernel \
          refused"
     )

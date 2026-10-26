@@ -23,7 +23,6 @@
 
 use pixelflow_graphics::fonts::{Font, GlyphAtlas};
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
-use pixelflow_ir::passes::lattice::{Collapse, Domain};
 use pixelflow_ir::{Bound, LatticeShape};
 
 const FONT_PATH: &str = concat!(
@@ -85,15 +84,12 @@ fn dump_production_glyph_arenas() {
             // shape (docs/archive/plans/2026-09-16-collapse-is-a-fold.md) — at
             // whatever shape production bakes this glyph at, `tile_px ×
             // tile_px`.
-            let collapse = Collapse {
-                domain: Domain {
-                    shape: LatticeShape::new([tile_px as u32, tile_px as u32]),
-                    origin: [0.0, 0.0].map(|default| pixelflow_ir::Uniform::new(default).decl()),
-                },
-                lanes: (pixelflow_codegen::jit_vector_bytes() / 4) as u32,
-            };
-            let (arena, root) = pixelflow_ir::passes::legalize(arena, root, &collapse)
-                .expect("legalize glyph arena");
+            let (arena, root) = pixelflow_codegen::legalize(
+                arena,
+                root,
+                LatticeShape::new([tile_px as u32, tile_px as u32]),
+            )
+            .expect("legalize glyph arena");
             let name = format!("glyph{tile_px}:U+{:04X}", ch as u32);
             let path = dir.join(format!("glyph{tile_px}_U{:04X}.arena", ch as u32));
             dump_arena(&arena, root, &name, &path);

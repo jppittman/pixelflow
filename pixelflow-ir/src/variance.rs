@@ -493,7 +493,7 @@ pub(crate) fn variance_from(arena: &ExprArena, root: ExprId) -> Variance {
 /// (`docs/archive/plans/2026-09-01-loop-aware-codegen.md`).
 ///
 /// An axis of extent 1 is a per-call constant; an axis of larger extent is a
-/// binder the emitted code loops over: `passes::lattice::collapse` wraps the
+/// binder the emitted code loops over: `program::lattice::collapse` wraps the
 /// kernel in one fold per axis, and codegen emits each as a loop.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct LatticeShape([u32; crate::arena::COORD_AXES]);

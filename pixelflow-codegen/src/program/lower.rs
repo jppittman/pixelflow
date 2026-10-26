@@ -67,7 +67,7 @@ enum ValueFold {
 /// The folds whose bound is a value that the schedule reaches, and who reads
 /// each: the single-reader property placement rests on.
 ///
-/// A fold whose bound is a value arrives inside the guard `passes::legalize`
+/// A fold whose bound is a value arrives inside the guard `passes::legalize_back`
 /// ends with, `If(dom, If(Lt(lo, hi), fold, identity), NaN)`, and the fold's
 /// one reader is the inner `If`, as its true arm. That makes the fold the
 /// arm's alone to own, so its loop sits in an arm block and runs only for a
@@ -114,7 +114,7 @@ impl ValueFolds {
                 ValueFold::ReadBy(first) => panic!(
                     "arena_to_schedule: {fold:?}, a fold whose bound is a value, is read by \
                      {first:?} and by {reader:?}: exactly one reader, an If's true arm, is the \
-                     guard that owns it (passes::legalize ends with the guard, L5)"
+                     guard that owns it (passes::legalize_back ends with the guard, L5)"
                 ),
                 ValueFold::Unread => self.readers[fold.0 as usize] = ValueFold::ReadBy(reader),
             }
@@ -127,7 +127,7 @@ impl ValueFolds {
                 as_an_arm,
                 "arena_to_schedule: {fold:?}, a fold whose bound is a value, is read by \
                  {reader:?} other than as an If's true arm: an arena that was not legalized \
-                 (passes::legalize ends with the guard that owns such a fold, L5)"
+                 (passes::legalize_back ends with the guard that owns such a fold, L5)"
             );
         }
     }
@@ -146,7 +146,7 @@ impl ValueFolds {
         if let Some(fold) = unread {
             panic!(
                 "arena_to_schedule: ExprId({fold}), a fold whose bound is a value, is read by \
-                 nothing: an arena that was not legalized (passes::legalize ends with the \
+                 nothing: an arena that was not legalized (passes::legalize_back ends with the \
                  guard that owns such a fold, L5)"
             );
         }
@@ -236,7 +236,7 @@ fn shift_immediate(op: OpKind, count: f32) -> u8 {
 /// - **The lane binder is a constant.** Its `Var` becomes
 ///   [`ScheduledOp::Lanes`], the iota every lane-varying value is built on.
 ///
-/// A fold whose bound is a value arrives inside its guard (`passes::legalize`'s
+/// A fold whose bound is a value arrives inside its guard (`passes::legalize_back`'s
 /// last pass): its bounds are operands ([`operands`](super::operands)), and it
 /// is read only as an `If`'s true arm.
 ///
@@ -275,7 +275,7 @@ pub(crate) fn arena_to_schedule(
     mark_reachable(arena, root, &mut reachable);
 
     // The lane binder: the one every reachable `Write` names as its lane.
-    // One slot, by construction (`passes::lattice::pack` builds both lane
+    // One slot, by construction (`program::lattice::pack` builds both lane
     // folds on `collapse`'s), asserted rather than assumed. The same scan
     // reads which binders the lattice's folds bind (a `Write` names all
     // three), and which folds have a bound that is a value.
@@ -466,7 +466,7 @@ pub(crate) fn arena_to_schedule(
                 ScheduledOp::If(map_child(a), map_child(b), map_child(c))
             }
             ExprNode::Ternary(op, ..) => not_legal(op),
-            // Same unreachable precondition as `Dwrt` above: `passes::legalize`
+            // Same unreachable precondition as `Dwrt` above: `passes::legalize_back`
             // runs `expand_refs` first in every compile entry point, so a
             // reference here means this schedule was built without the
             // lowering pipeline. Refusing is not a limitation to lift — a
@@ -601,7 +601,7 @@ mod tests {
 
     /// A coordinate `Var` is the survivor the collapse ABI added: the
     /// lattice's folds substitute `X` and `Y` away, so one reaching the
-    /// scheduler is an arena that never went through `passes::lattice`.
+    /// scheduler is an arena that never went through `program::lattice`.
     #[test]
     #[should_panic(expected = "is a coordinate")]
     fn a_surviving_coordinate_fails_loudly() {
@@ -659,7 +659,7 @@ mod tests {
     /// A count, a fold bounded at `at` by `end(count)`, and a guard around it:
     /// `If(Lt(0, count), Σ_i i, 0)`, as `(arena, count, fold, root)`. The fold's
     /// other bound is a literal: `0` below, [`OTHER_END`] above. The `If`'s test
-    /// is a stand-in, not the `Lt(lo, hi)` that `passes::legalize` builds:
+    /// is a stand-in, not the `Lt(lo, hi)` that `passes::legalize_back` builds:
     /// lowering asks only that the fold has one reader, an `If`'s true arm.
     ///
     /// The body is the binder's own `Var`, not `X`: a coordinate is a

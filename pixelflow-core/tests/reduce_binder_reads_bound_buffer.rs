@@ -217,15 +217,9 @@ fn legalize_keeps_a_bare_reduce_and_its_size_does_not_track_the_extent() {
         // are wrapped around the kernel here, and every one of them is a
         // `Monoid::SEQ` fold, which is how the count below tells them apart
         // from the kernel's.
-        let collapse = pixelflow_ir::passes::lattice::Collapse {
-            domain: pixelflow_ir::passes::lattice::Domain {
-                shape: pixelflow_ir::LatticeShape::new([1, 1]),
-                origin: [0.0, 0.0].map(|default| pixelflow_ir::Uniform::new(default).decl()),
-            },
-            lanes: 4,
-        };
         let (legalized, new_root) =
-            pixelflow_ir::passes::legalize(arena, root, &collapse).expect("legalize");
+            pixelflow_codegen::legalize(arena, root, pixelflow_ir::LatticeShape::new([1, 1]))
+                .expect("legalize");
         let after = legalized.len();
         // From the root, not over every node: each rewrite appends and leaves
         // what it replaced behind, so the raw array still holds the pre-pass
