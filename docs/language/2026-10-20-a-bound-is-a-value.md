@@ -739,25 +739,25 @@ still in the key (§3.5). Ruling 6 lands with B2; decision 4's interim is refuse
 - **B0.** T3 lands (the typed-arena series; Linear JP-95). T6 and the bound retyping follow on that
   series' schedule and delete §4's integrality conjunct and `BoundArithmetic`; nothing in
   B needs them, since B3's bounds are leaves.
-- **B1 (Linear JP-44). Item 2, re-derived against this note** (decision 3), and §1.3's denotation built:
+- **B1 (Linear JP-22). Item 2, re-derived against this note** (decision 3), and §1.3's denotation built:
   the binder `i : L`, its bounds `0` and `Extent(p)` (or decision 9's range node), lifts
   named. An `L → T` binder supplied per call; its extent a value off the key; `bind` checks
   the runtime extent and refuses one past 2²⁴; `lower_gather` stops baking extents and its
   implicit clamp gives way to named lifts. §5's B1 rows.
-- **B2 (JP-45). A glyph is a call.** `glyph(pieces, box)`, one program per tile extent; the
+- **B2 (JP-24). A glyph is a call.** `glyph(pieces, box)`, one program per tile extent; the
   bucketing, padding and `row_at` indirection deleted. Gate: `tests/freetype_oracle.rs` and
   `glyph_atlas_golden.rs` within tolerance; bit-exact pins (`kernel_glyph_optimize.rs`,
   `glyph_optimization_cost.rs`) re-baselined in their own commit; A0's numbers after,
   with **1** program per tile extent. §5's B2 rows.
-- **B3 (JP-46). A run is a call.** `spans`, the outer fold over `G` and the inner fold over
+- **B3 (JP-22). A run is a call.** `spans`, the outer fold over `G` and the inner fold over
   `Lattice(count(g))` reading `pieces ∘ ι_g` (§1.3); `Glyph::over` concatenates tables
   host-side with `Glyph::empty()` its unit (`tests/run_is_a_glyph.rs`). Gate: B2's, plus
   one program for strings of different lengths, and a malformed span reads NaN. L3's walk
   resolves each `Ref` a bound reaches through the referent's whole arena, on every push; no
   production bound holds a `Ref` before this step. A referent's variance belongs to the
   referent, so memoize it per referent when B3's profile asks.
-- **B4 (JP-47). `FontPrograms` goes** (decision 7); its tests move to B2's program.
-- **B5 (JP-48). The `kernel!` surface for a fold over a discrete kernel** (decision 1); the glyph
+- **B4 (JP-25). `FontPrograms` goes** (decision 7); its tests move to B2's program.
+- **B5 (JP-22). The `kernel!` surface for a fold over a discrete kernel** (decision 1); the glyph
   is then written in `kernel!` again. Depends on O3 (the-language-is-kernel `:215-218`):
   an entry that takes a kernel has no `Args` record and re-lowers per host call, which
   would be one lowering per glyph, the opposite of ruling 6.
