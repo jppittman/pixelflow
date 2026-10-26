@@ -29,6 +29,8 @@
 use crate::arena::{Axis, ExprArena, ExprId};
 use crate::kind::OpKind;
 
+pub use crate::kernel::{BuiltTerm, KernelBuilder};
+
 /// Keeps [`Terms`] the IR's: a composite is defined here, over the
 /// representations the IR has, and a third is added here too.
 pub(crate) mod sealed {
