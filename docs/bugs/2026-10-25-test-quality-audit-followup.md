@@ -62,27 +62,21 @@ Same shape as 10-10's line-199 finding (`select.rs`'s dead rematerializable
 branch): the check is an optimization to skip a call, not a correctness
 gate, so there is nothing to test that isn't testing dead code.
 
-**`lit.rs:88`, both `eq` mutants, timeout — explained, and caught
-directly in an isolated test.** Neither was closed by a new assertion catching it as a *failure*;
-cargo-mutants still reports `TIMEOUT` for both. Tracked it down by hand:
-applying `fn eq(&self, other: &Self) -> bool { false }` and running the
-crate's full suite single-threaded (`cargo test -p pixelflow-ir --lib --
---test-threads=1`) shows the hang is in an unrelated test,
-`passes::dwrt_tests::deep_chain_does_not_overflow_the_stack` — a deep chain's
-stack-safety depends on the arena's interning collapsing structurally-equal
-nodes back to one id; break `Eq` and every node in the chain looks unique,
-so the thing the test holds bounded stops being bounded. `cargo-mutants`
-classifies a mutant by whether the *whole test binary* exits in time, so one
-hanging test anywhere in the crate pins the verdict to `TIMEOUT` no matter
-how fast a different test fails — the same "timeout is concerning
-independent of mutation testing" shape the 2026-07-20 pass flagged in
-`actor-scheduler`'s `kubelet.rs`/`spsc.rs`. Added
-`a_repeated_literal_interns_to_one_node_and_a_distinct_one_to_another`
-anyway: it exercises the identical root cause (the same two `eq` mutants) but
-fails in milliseconds with a legible message, rather than making whoever
-runs this crate's tests next wait out a stack-safety test's hang to learn
-the same thing. Confirmed by hand-applying the mutation and running `cargo
-test -p pixelflow-ir --lib lit::` alone: `FAILED` immediately, no timeout.
+**`lit.rs:88`, both `eq` mutants, timeout in the full suite.** Applying
+`fn eq(&self, other: &Self) -> bool { false }` and running the crate's full
+suite single-threaded (`cargo test -p pixelflow-ir --lib --
+--test-threads=1`) hangs in
+`passes::dwrt_tests::deep_chain_does_not_overflow_the_stack`. Its bounded
+chain depends on interning structurally equal nodes; with broken equality,
+the arena keeps adding nodes. `cargo-mutants` classifies the whole test
+binary, so this hang remains a `TIMEOUT` even when an earlier equality test
+fails. The existing `reals_compare_by_bits_so_signed_zeros_differ_and_nan_is_itself`
+already catches the equality mutation in isolation. The new
+`a_repeated_literal_interns_to_one_node_and_a_distinct_one_to_another` test
+pins the arena's separately documented interning contract and makes the
+consequence of broken literal equality explicit. With the mutation applied,
+`cargo test -p pixelflow-ir --lib lit::` fails immediately; the full mutant
+run still times out until the deep-chain test's own behavior is addressed.
 
 **`lit.rs:97`, `Hash::hash` → no-op, missed, not fixed.** A constant hash
 for every `Lit` degrades every hash-keyed interning table (`hash-memo`
@@ -127,12 +121,14 @@ disagree) and regenerating `tests/golden/transcript.txt`
 golden by hand rather than trusting a mechanical diff on a 171-line budget
 function in a tool that isn't part of the rendering pipeline.
 
-## Verified
+## Runs and outcomes
 
-- `cargo test -p pixelflow-ir --lib`: pass (311 tests, including the new
-  interning test).
-- `cargo test --workspace --lib --bins`: pass.
-- `cargo fmt --all -- --check`: clean (after `cargo fmt -p pixelflow-ir`).
+- `cargo test -p pixelflow-ir --lib`: pass on the original audit head (312
+  tests, including the interning test and the since-removed guard assertion).
+  The amended head is covered by Presubmit Tests.
+- `cargo test --workspace --lib --bins`: pass on the original audit head.
+- `cargo fmt --all -- --check`: clean on the original audit head (after
+  `cargo fmt -p pixelflow-ir`).
 - `cargo clippy -p pixelflow-ir --all-targets --all-features -- -D warnings`:
   3 pre-existing errors (`arena.rs:1142`, `dag.rs:226`, `dag.rs:579`, all
   `must_use_candidate`), identical with and without this change (confirmed
@@ -142,9 +138,12 @@ function in a tool that isn't part of the rendering pipeline.
   lint a prior green CI run never saw. Out of scope here; worth its own pass
   if it also reproduces on a clean checkout of `main`.
 - `cargo mutants -p pixelflow-ir -f pixelflow-ir/src/passes/guard.rs -f pixelflow-ir/src/lit.rs`:
-  34 mutants, 22 caught, 6 unviable, 2 timeouts (both explained above), 4
-  missed (guard.rs:84 and :67, both as-if equivalent; lit.rs:97 and :104,
-  non-correctness/unreachable as explained above).
+  initial sweep had 34 mutants, 22 caught, 6 unviable, 2 timeouts and 4
+  missed. A follow-up on the original audit head added a guard node-count
+  assertion and caught `guard.rs:84`; that assertion was removed because it
+  tested intermediate shape. The amended head was not rerun under
+  `cargo-mutants`; the two `Lit::Eq` mutants were separately confirmed to
+  fail the isolated `lit::` tests, while the full suite still times out.
 - `cargo mutants -p desloppify -f desloppify/src/review/module.rs`: 30
   mutants, 26 caught, 3 unviable, 1 missed (line 159, real, deferred above).
 
