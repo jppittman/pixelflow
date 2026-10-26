@@ -64,6 +64,7 @@ use crate::lit::Lit;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 enum NodeData {
     Var(u8),
+    Placeholder(u64),
     Const(Lit),
     Param(u8),
     Buffer(BufferId),
@@ -156,7 +157,7 @@ pub struct OpenFold {
 }
 
 impl OpenFold {
-    /// The fold's index, as the body reads it: a placeholder `Var` until
+    /// The fold's index, as the body reads it: a placeholder identity until
     /// [`ExprArena::close_fold`] chooses the binder and renames it.
     #[must_use]
     pub fn index(&self) -> ExprId {
@@ -408,6 +409,8 @@ pub enum ExprNode {
     /// coordinates and the binders are not a hole to grow into, they are where
     /// Z and W used to be and nothing may claim them.
     Var(u8),
+    /// A fold index whose owning construction scope has not closed it yet.
+    Placeholder(u64),
     /// A literal: a number or a mask. See [`Lit`].
     Const(Lit),
     Param(u8),
@@ -714,6 +717,10 @@ impl ExprArena {
         self.intern(NodeData::Var(i), &[])
     }
 
+    pub(crate) fn push_placeholder(&mut self, identity: u64) -> ExprId {
+        self.intern(NodeData::Placeholder(identity), &[])
+    }
+
     /// The retired coordinate axis reachable from `root`, if any — the guard
     /// [`Kernel::from_parts`](crate::Kernel::from_parts) and
     /// `emit::compile` apply before an arena can become a compiled kernel.
@@ -785,9 +792,13 @@ impl ExprArena {
         }
         let mut reached = alloc::vec![false; root.0 as usize + 1];
         let mut stack = alloc::vec![root];
+        let mut has_placeholder = false;
         while let Some(id) = stack.pop() {
             if core::mem::replace(&mut reached[id.0 as usize], true) {
                 continue;
+            }
+            if matches!(self.node(id), ExprNode::Placeholder(_)) {
+                has_placeholder = true;
             }
             stack.extend(self.children(id));
         }
@@ -818,6 +829,7 @@ impl ExprArena {
             };
         }
         match free[root.0 as usize] {
+            [0, 0] if has_placeholder => Some(REDUCE_BINDER_BASE),
             [0, 0] => None,
             [0, high] => Some(128 + high.trailing_zeros() as u8),
             [low, _] => Some(low.trailing_zeros() as u8),
@@ -1166,6 +1178,7 @@ impl ExprArena {
         let n = self.builder.dag().get(id.0);
         match *n {
             NodeData::Var(i) => ExprNode::Var(i),
+            NodeData::Placeholder(identity) => ExprNode::Placeholder(identity),
             NodeData::Const(lit) => ExprNode::Const(lit),
             NodeData::Param(i) => ExprNode::Param(i),
             NodeData::Buffer(b) => ExprNode::Buffer(b),
@@ -1275,7 +1288,7 @@ impl ExprArena {
     #[must_use]
     pub fn kind(&self, id: ExprId) -> OpKind {
         match *self.builder.dag().get(id.0) {
-            NodeData::Var(_) => OpKind::Var,
+            NodeData::Var(_) | NodeData::Placeholder(_) => OpKind::Var,
             NodeData::Const(_) | NodeData::Param(_) => OpKind::Const,
             NodeData::Buffer(_) => OpKind::Buffer,
             NodeData::Uniform(_) => OpKind::Uniform,
@@ -1306,6 +1319,7 @@ impl ExprArena {
         let n = self.builder.dag().get(id.0);
         match *n {
             NodeData::Var(_)
+            | NodeData::Placeholder(_)
             | NodeData::Const(_)
             | NodeData::Param(_)
             | NodeData::Buffer(_)
@@ -1374,6 +1388,7 @@ impl ExprArena {
         while let Some((id, d)) = stack.pop() {
             match &self.node(id) {
                 ExprNode::Var(_)
+                | ExprNode::Placeholder(_)
                 | ExprNode::Const(_)
                 | ExprNode::Param(_)
                 | ExprNode::Buffer(_)
@@ -1423,7 +1438,7 @@ impl ExprArena {
 
         while let Some(id) = stack.pop() {
             match &self.node(id) {
-                ExprNode::Var(_) => return true,
+                ExprNode::Var(_) | ExprNode::Placeholder(_) => return true,
                 ExprNode::Const(_)
                 | ExprNode::Param(_)
                 | ExprNode::Buffer(_)
@@ -1476,6 +1491,7 @@ impl ExprArena {
                     stack.push(*b);
                 }
                 ExprNode::Var(_)
+                | ExprNode::Placeholder(_)
                 | ExprNode::Const(_)
                 | ExprNode::Param(_)
                 | ExprNode::Buffer(_)
@@ -1520,6 +1536,7 @@ impl ExprArena {
             count += 1;
             match &self.node(id) {
                 ExprNode::Var(_)
+                | ExprNode::Placeholder(_)
                 | ExprNode::Const(_)
                 | ExprNode::Param(_)
                 | ExprNode::Buffer(_)
@@ -1612,6 +1629,7 @@ impl ExprArena {
                     };
                     let new_id = match other.node(id) {
                         ExprNode::Var(i) => self.push_var(i),
+                        ExprNode::Placeholder(identity) => self.push_placeholder(identity),
                         ExprNode::Const(v) => self.push_lit(v),
                         ExprNode::Param(i) => self.push_param(i),
                         // Content-addressed, so a reference means the same
@@ -1752,7 +1770,7 @@ impl ExprArena {
         let binder = self.lowest_free_binder(&roots).ok_or(IndexSpaceFull)?;
         let fold = Fold::new(monoid, binder);
 
-        use crate::expr::{ExprBuilderExt, from_arena_roots, substitute_vars, to_arena_roots};
+        use crate::expr::{ExprBuilderExt, close_placeholder, from_arena_roots, to_arena_roots};
         let (open, tables) = from_arena_roots(self, &roots);
         let mut closed = Builder::new();
         let index = closed.push_var(binder.var());
@@ -1761,7 +1779,7 @@ impl ExprArena {
         // refuses it (L3). An enclosing fold's placeholder is left as it is.
         let renamed: Vec<Id> = open
             .entries()
-            .map(|root| substitute_vars(&mut closed, root, &[(placeholder.var(), index)]))
+            .map(|root| close_placeholder(&mut closed, root, placeholder.identity(), index))
             .collect();
         let closed = closed.finish(&renamed);
         let entries: Vec<_> = closed.entries().collect();
@@ -1799,7 +1817,7 @@ impl ExprArena {
         let placeholder = Placeholder::nth(depth).filter(|_| depth < Binder::COUNT)?;
         let copy = self.clone();
         let enclosing = core::mem::replace(self, copy);
-        let index = self.push_var(placeholder.var());
+        let index = self.push_placeholder(placeholder.identity());
         Some(OpenFold {
             enclosing,
             placeholder,
@@ -1946,6 +1964,7 @@ impl ExprArena {
                             Some(replacement) => replacement,
                             None => self.push_var(i),
                         },
+                        ExprNode::Placeholder(identity) => self.push_placeholder(identity),
                         ExprNode::Const(v) => self.push_lit(v),
                         ExprNode::Param(i) => self.push_param(i),
                         ExprNode::Buffer(b) => self.push_buffer(b),
@@ -2111,6 +2130,7 @@ impl ExprArena {
                 |old: ExprId| dense[old.0 as usize].expect("relink: child densified before parent");
             let new_id = match &node {
                 ExprNode::Var(i) => out.push_var(*i),
+                ExprNode::Placeholder(identity) => out.push_placeholder(*identity),
                 ExprNode::Const(v) => out.push_lit(*v),
                 ExprNode::Param(i) => out.push_param(*i),
                 ExprNode::Buffer(b) => out.push_buffer(buffer_slot(*b)),
@@ -2162,6 +2182,7 @@ impl ExprArena {
                 Task::WriteStr(s) => f.write_str(s)?,
                 Task::Visit(id) => match &self.node(id) {
                     ExprNode::Var(i) => write!(f, "Var({})", i)?,
+                    ExprNode::Placeholder(identity) => write!(f, "Placeholder({identity})")?,
                     ExprNode::Const(v) => write!(f, "Const({})", v)?,
                     ExprNode::Param(i) => write!(f, "Param({})", i)?,
                     ExprNode::Buffer(b) => write!(f, "Buffer({})", b.0)?,
@@ -2420,17 +2441,16 @@ mod tests {
         let placeholder = Placeholder::nth(n).expect("a placeholder");
         let mut a = ExprArena::new();
         let (x, y) = (a.push_var(Axis::X.var()), a.push_var(Axis::Y.var()));
-        let p = a.push_var(placeholder.var());
+        let p = a.push_placeholder(placeholder.identity());
         let xp = a.push_binary(OpKind::Mul, x, p);
         let body = a.push_binary(OpKind::Add, xp, y);
         (a, body, placeholder)
     }
 
-    /// Whether a `Var` at or past the first placeholder is anywhere in `a`.
+    /// Whether an unclosed placeholder is anywhere in `a`.
     fn holds_a_placeholder(a: &ExprArena) -> bool {
-        let first = Placeholder::nth(0).expect("a placeholder").var();
         a.nodes()
-            .any(|(_, node)| matches!(node, ExprNode::Var(v) if v >= first))
+            .any(|(_, node)| matches!(node, ExprNode::Placeholder(_)))
     }
 
     /// The `slot`-th binder.
@@ -2463,7 +2483,7 @@ mod tests {
             Bound::Lit(3),
             x,
         );
-        let p = a.push_var(placeholder.var());
+        let p = a.push_placeholder(placeholder.identity());
         let body = a.push_binary(OpKind::Mul, inner, p);
 
         let (closed, root) = a
@@ -2848,7 +2868,8 @@ mod tests {
         });
         let enclosing = a.push_var(b(1).var());
         let uniform = a.push_uniform(decl);
-        let placeholder = a.push_var(Placeholder::nth(0).expect("a placeholder").var());
+        let placeholder =
+            a.push_placeholder(Placeholder::nth(0).expect("a placeholder").identity());
         for bound in [enclosing, uniform, placeholder] {
             let fold = a.push_reduce(sum(0), Bound::Lit(0), Bound::Value(bound), body);
             let ExprNode::Reduce { hi, .. } = a.node(fold) else {
@@ -2980,7 +3001,7 @@ mod tests {
     #[should_panic(expected = "BoundVaries")]
     fn close_over_refuses_a_bound_reading_its_own_placeholder() {
         let (mut a, body, placeholder) = open_body(0);
-        let own = a.push_var(placeholder.var());
+        let own = a.push_placeholder(placeholder.identity());
         let _refused = a.close_over(
             body,
             placeholder,
@@ -3168,7 +3189,7 @@ mod tests {
         assert_eq!(a.free_index(beside), Some(binder.var()));
 
         let placeholder = Placeholder::nth(0).expect("a placeholder");
-        let p = a.push_var(placeholder.var());
+        let p = a.push_placeholder(placeholder.identity());
         let both = a.push_binary(OpKind::Add, beside, p);
         assert_eq!(
             a.free_index(both),
@@ -3176,7 +3197,7 @@ mod tests {
             "the lowest free index, the binder below the placeholder"
         );
         let open = a.push_binary(OpKind::Add, fold, p);
-        assert_eq!(a.free_index(open), Some(placeholder.var()));
+        assert_eq!(a.free_index(open), Some(REDUCE_BINDER_BASE));
     }
 
     // ───────────────────── open_fold / close_fold ─────────────────────

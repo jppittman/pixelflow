@@ -114,6 +114,9 @@ fn named_op(kind: OpKind) -> OpKind {
 
 fn expr_to_egraph(arena: &ExprArena, id: ExprId, egraph: &mut EGraph) -> crate::egraph::EClassId {
     match arena.node(id) {
+        ExprNode::Placeholder(identity) => {
+            panic!("fold index scope {identity} reached the pict rewrite tests")
+        }
         ExprNode::Var(idx) => egraph.add(ENode::Var(idx)),
         ExprNode::Const(val) => egraph.add(ENode::Const(val)),
         ExprNode::Ref(k) => panic!("Ref({k:?}) reached the pict rewrite tests"),

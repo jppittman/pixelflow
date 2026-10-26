@@ -155,6 +155,9 @@ fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Pat
         }
         let id = ExprId(idx as u32);
         match arena.node(id) {
+            ExprNode::Placeholder(identity) => {
+                panic!("dump: fold index scope {identity} escaped without its binder")
+            }
             ExprNode::Var(i) => writeln!(out, "V {i}"),
             ExprNode::Const(v) => writeln!(out, "C {}", v.bits()),
             ExprNode::Buffer(b) => writeln!(out, "B {}", b.0),

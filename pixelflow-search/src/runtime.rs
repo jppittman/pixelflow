@@ -2382,6 +2382,7 @@ pub(crate) mod production_telemetry {
                 // afterwards, and this walk prices the node it is.
                 ExprNode::Reduce { .. } => Some(OpKind::Reduce),
                 other @ (ExprNode::Param(_)
+                | ExprNode::Placeholder(_)
                 | ExprNode::Nary(..)
                 | ExprNode::Ref(_)
                 | ExprNode::Write { .. }) => {

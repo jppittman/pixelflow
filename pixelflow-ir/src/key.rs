@@ -372,6 +372,9 @@ impl<'a> Walk<'a> {
     fn encode(&mut self, id: ExprId) {
         self.scratch.clear();
         match self.arena.node(id) {
+            ExprNode::Placeholder(identity) => {
+                panic!("KernelKey: fold index scope {identity} escaped without its binder")
+            }
             ExprNode::Var(i) => {
                 self.scratch.push(0);
                 self.scratch.push(i);

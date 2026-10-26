@@ -79,6 +79,7 @@ pub fn pattern_match_arena(
     while let Some((e_id, t_id)) = stack.pop() {
         let t_node = template.node(t_id);
         match t_node {
+            ExprNode::Placeholder(_) => return None,
             // Var(n) is a metavariable: bind or check consistency.
             ExprNode::Var(n) => {
                 if let Some(&existing) = bindings.get(&n) {
@@ -219,6 +220,7 @@ pub fn substitute_template_arena(
         let idx = id.0 as usize;
         let node = template.node(*id).clone();
         let mapped = match node {
+            ExprNode::Placeholder(_) => return None,
             ExprNode::Var(n) => {
                 // Fail if the variable has no binding.
                 *bindings.get(&n)?

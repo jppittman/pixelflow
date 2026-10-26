@@ -68,7 +68,7 @@ fn match_root(
         // in the graph) and no rule this harness generates ever produces
         // one — `compose_rules` always composes at an Op position. Refuse
         // rather than guess a binding with no class to bind it to.
-        ExprData::Var(_) => false,
+        ExprData::Var(_) | ExprData::Placeholder(_) => false,
         ExprData::Const(lit) => node.is_lit(lit),
         ExprData::Param(_)
         | ExprData::Buffer(_)
@@ -88,6 +88,7 @@ fn root_shapes_of(pat: Node<'_, ExprData>) -> RootShapes {
         ExprData::Const(_) => RootShapes::kind(OpKind::Const),
         ExprData::Op(kind) => RootShapes::kind(kind),
         ExprData::Var(_)
+        | ExprData::Placeholder(_)
         | ExprData::Param(_)
         | ExprData::Buffer(_)
         | ExprData::Uniform(_)
@@ -105,6 +106,7 @@ fn match_class(
 ) -> bool {
     match *pat {
         ExprData::Var(mv) => bind_var(mv, class, egraph, bindings),
+        ExprData::Placeholder(_) => false,
         ExprData::Const(lit) => egraph.contains_lit(class, lit),
         ExprData::Param(_)
         | ExprData::Buffer(_)
@@ -161,6 +163,7 @@ fn collect_metavars(node: Node<'_, ExprData>, out: &mut std::collections::BTreeS
             out.insert(mv);
         }
         ExprData::Const(_)
+        | ExprData::Placeholder(_)
         | ExprData::Param(_)
         | ExprData::Buffer(_)
         | ExprData::Uniform(_)

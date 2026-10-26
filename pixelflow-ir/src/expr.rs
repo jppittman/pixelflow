@@ -27,6 +27,8 @@ pub enum ExprData {
     /// Bound variable: coordinate (0 for X, 1 for Y), reduction binder (from
     /// 4, one per slot of the binder space), or rewrite rule metavariable.
     Var(u8),
+    /// A fold index while its owning construction scope is open.
+    Placeholder(u64),
     /// A literal: a number or a mask.
     Const(Lit),
     /// Unbound scalar slot (0..): a leaf with no value, which kernel
@@ -107,6 +109,7 @@ impl ExprData {
 /// Construction helpers on [`Builder<ExprData>`].
 pub(crate) trait ExprBuilderExt {
     fn push_var(&mut self, var: u8) -> Id;
+    fn push_placeholder(&mut self, placeholder: u64) -> Id;
     fn push_const(&mut self, val: f32) -> Id;
     fn push_lit(&mut self, lit: Lit) -> Id;
     fn push_param(&mut self, param: u8) -> Id;
@@ -124,6 +127,10 @@ impl ExprBuilderExt for Builder<ExprData> {
     #[inline]
     fn push_var(&mut self, var: u8) -> Id {
         self.push_unique(ExprData::Var(var), &[])
+    }
+
+    fn push_placeholder(&mut self, placeholder: u64) -> Id {
+        self.push_unique(ExprData::Placeholder(placeholder), &[])
     }
 
     #[inline]
@@ -268,6 +275,38 @@ pub(crate) fn substitute_vars(
     table[root].expect("root must have been copied")
 }
 
+/// Copy a subgraph, closing one construction-scoped fold index.
+pub(crate) fn close_placeholder(
+    builder: &mut Builder<ExprData>,
+    root: Node<'_, ExprData>,
+    placeholder: u64,
+    replacement: Id,
+) -> Id {
+    let mut table = root.dag().side_table(None);
+    let mut stack = alloc::vec![(root, false)];
+    while let Some((node, expanded)) = stack.pop() {
+        if table[node].is_some() {
+            continue;
+        }
+        if !expanded {
+            stack.push((node, true));
+            for child in node.children() {
+                stack.push((child, false));
+            }
+            continue;
+        }
+        let id = match *node {
+            ExprData::Placeholder(identity) if identity == placeholder => replacement,
+            _ => {
+                let children: Vec<_> = node.children().map(|child| table[child].unwrap()).collect();
+                builder.push_unique(*node, &children)
+            }
+        };
+        table[node] = Some(id);
+    }
+    table[root].expect("root must have been copied")
+}
+
 // ────────────────────────────────────────── Legacy Arena Bridge ───────────────
 
 /// Convert an `ExprArena` and root `ExprId` into a `(Rooted<ExprData>, Environment)`.
@@ -320,6 +359,7 @@ pub fn from_arena_roots(
                     .collect();
                 let new_id = match arena.node(id) {
                     ExprNode::Var(i) => b.push_var(i),
+                    ExprNode::Placeholder(identity) => b.push_placeholder(identity),
                     ExprNode::Const(v) => b.push_lit(v),
                     ExprNode::Param(i) => b.push_param(i),
                     ExprNode::Buffer(buf) => b.push_buffer(buf),
@@ -386,6 +426,7 @@ pub fn to_arena_roots(
             .collect();
         let id = match *node {
             ExprData::Var(i) => arena.push_var(i),
+            ExprData::Placeholder(identity) => arena.push_placeholder(identity),
             ExprData::Const(lit) => arena.push_lit(lit),
             ExprData::Param(i) => arena.push_param(i),
             ExprData::Buffer(b) => arena.push_buffer(b),

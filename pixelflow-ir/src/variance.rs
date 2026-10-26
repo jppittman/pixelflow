@@ -360,6 +360,7 @@ fn transfer(arena: &ExprArena, id: ExprId, child: impl Fn(ExprId) -> Variance) -
         // varies with nothing; anything past those is not a variable this
         // analysis knows.
         ExprNode::Var(idx) => Variance::of_var(idx),
+        ExprNode::Placeholder(_) => Variance::CONST,
         ExprNode::Const(_) => Variance::CONST,
         // A buffer leaf is constant; a Gather's variance is the union of
         // its index expressions (handled by the Ternary arm below).
@@ -910,17 +911,11 @@ mod tests {
     /// the placeholders, which this analysis does not know.
     #[test]
     fn of_var_names_a_coordinate_and_a_binder_and_no_placeholder() {
-        use crate::fold::Placeholder;
-
         assert_eq!(Variance::of_var(0), Variance::X);
         assert_eq!(Variance::of_var(1), Variance::Y);
         assert_eq!(Variance::of_var(2), Variance::from_var(2));
         assert_eq!(Variance::of_var(4), Variance::from_var(4));
         assert_eq!(Variance::of_var(63), Variance::from_var(63));
-        let first = Placeholder::nth(0).expect("the first placeholder");
-        let last = Placeholder::nth(Placeholder::COUNT - 1).expect("the last placeholder");
-        assert_eq!(Variance::of_var(first.var()), Variance::CONST);
-        assert_eq!(Variance::of_var(last.var()), Variance::CONST);
         assert_eq!(Variance::of_var(128), Variance::ALL);
         assert_eq!(Variance::of_var(255), Variance::ALL);
     }

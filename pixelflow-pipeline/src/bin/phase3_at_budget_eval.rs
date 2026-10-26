@@ -431,6 +431,7 @@ const POLY_OPS: &[OpKind] = &[
 fn non_leaf_op(node: &ExprNode) -> Option<OpKind> {
     match node {
         ExprNode::Var(_)
+        | ExprNode::Placeholder(_)
         | ExprNode::Const(_)
         | ExprNode::Param(_)
         | ExprNode::Buffer(_)

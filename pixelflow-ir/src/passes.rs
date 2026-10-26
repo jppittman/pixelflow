@@ -236,6 +236,7 @@ fn copy_node(
 ) -> ExprId {
     match node {
         ExprNode::Var(i) => arena.push_var(*i),
+        ExprNode::Placeholder(identity) => arena.push_placeholder(*identity),
         ExprNode::Const(v) => arena.push_lit(*v),
         ExprNode::Param(i) => arena.push_param(*i),
         // Same arena, so the buffer and uniform tables (and ids) stay valid.
@@ -674,6 +675,7 @@ impl Rules<'_> {
 fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
     match *node {
         ExprNode::Var(_)
+        | ExprNode::Placeholder(_)
         | ExprNode::Const(_)
         | ExprNode::Param(_)
         | ExprNode::Buffer(_)
@@ -727,6 +729,7 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
     let Rules { var, memo, .. } = *rules;
     match arena.node(id).clone() {
         ExprNode::Var(i) => Ok(arena.push_const(if i == var { 1.0 } else { 0.0 })),
+        ExprNode::Placeholder(_) => Err("lower_dwrt: an open fold index has no derivative"),
         // Constants, scalar params (baked before evaluation) and uniforms
         // (invariant across the lattice) are coordinate-independent.
         ExprNode::Const(_) | ExprNode::Param(_) | ExprNode::Uniform(_) => Ok(arena.push_const(0.0)),

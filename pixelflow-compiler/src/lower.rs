@@ -972,9 +972,9 @@ mod tests {
     use super::*;
     use crate::parser::parse;
     use crate::sema::Ty;
+    use pixelflow_ir::Lit;
     use pixelflow_ir::arena::{ExprNode, UniformId};
     use pixelflow_ir::fold::KNOWN_RANGE;
-    use pixelflow_ir::{Lit, Placeholder};
     use quote::quote;
 
     /// Lower a block straight from the parser, with no `sema` in front: what
@@ -1168,10 +1168,9 @@ mod tests {
     /// Whether any node in the arena — reachable or not — is a
     /// placeholder index.
     fn holds_a_placeholder(arena: &ExprArena) -> bool {
-        let first = Placeholder::nth(0).expect("a placeholder").var();
         arena
             .nodes()
-            .any(|(_, node)| matches!(node, ExprNode::Var(v) if v >= first))
+            .any(|(_, node)| matches!(node, ExprNode::Placeholder(_)))
     }
 
     /// A fold is one `Reduce` over its range, its body reading the binder's
