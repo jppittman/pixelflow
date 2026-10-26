@@ -17,7 +17,7 @@
 
 use pixelflow_codegen::emit::compile;
 use pixelflow_codegen::jit_vector_bytes;
-use pixelflow_ir::fold::{Binder, Fold, Monoid};
+use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 use pixelflow_ir::{ExprArena, ExprId, LatticeShape, OpKind};
 
 const ROWS: u32 = 2;
@@ -25,7 +25,7 @@ const WIDTH: usize = 64;
 const ORIGIN: [f32; 2] = [0.1, 0.3];
 /// The true arm is taken where `X < THRESHOLD`: columns 0 through 20.
 const THRESHOLD: f32 = 21.0;
-const TRIPS: u32 = 4;
+const TRIPS: u64 = 4;
 /// Each `f32` op rounds once, half an ulp of its result. The chain's error is
 /// a few of those, all at the largest magnitude it reaches, so this many ulps
 /// of that magnitude is the documented tolerance; the chain has no
@@ -49,7 +49,12 @@ fn kernel() -> (ExprArena, ExprId) {
     let branch = a.push_ternary(OpKind::If, mask, cubic, three);
 
     let term = a.push_binary(OpKind::Add, v, i);
-    let fold = a.push_reduce(Fold::new(Monoid::SUM, binder, 0..TRIPS), term);
+    let fold = a.push_reduce(
+        Fold::new(Monoid::SUM, binder),
+        Bound::Lit(0),
+        Bound::Lit(TRIPS),
+        term,
+    );
 
     let root = a.push_binary(OpKind::Add, branch, fold);
     (a, root)

@@ -59,11 +59,11 @@ They are grouped here because the terminal is their consumer.
   earns no block, and every call ran every glyph's uniform-only work, 1.1
   ms a call for DejaVu's ASCII at 16 px against 0.8–13 µs for a glyph
   alone).
-- **Follows:** choosing the program is choosing by a structural parameter,
-  the piece count, which is what structural means. No program holds more
-  than one glyph, so O1's units and the class limit are not the font's
-  concern. A zoom recompiles one program per count. Bucketing counts to
-  share programs is a cache policy, not adopted (JP: unbucketed).
+- **Follows:** choosing the program is choosing by the piece count, a
+  host-side choice. No program holds more than one glyph, so O1's units and
+  the class limit are not the font's concern. A zoom recompiles one program
+  per count. Bucketing counts to share programs is a cache policy, not
+  adopted (JP: unbucketed).
 - **Lives:** `FontPrograms`, `GlyphRows`
   (`pixelflow-graphics/src/fonts/loop_blinn/program.rs`); the-language-is-kernel
   §1.7, D9, C1. The frame still draws from the atlas until C2.

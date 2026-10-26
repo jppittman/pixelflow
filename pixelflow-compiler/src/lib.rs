@@ -63,7 +63,7 @@ use pixelflow_search::Saturate;
 use proc_macro::TokenStream;
 
 /// The `kernel!` macro: the language, as a block of items or as a closure. An
-/// entry with no structural or kernel-typed parameter and no `Dwrt` is
+/// entry with no kernel-typed parameter and no `Dwrt` is
 /// saturated at macro-expansion time; any other entry is optimized when it is
 /// baked (see *Pipeline*).
 ///
@@ -148,8 +148,8 @@ use proc_macro::TokenStream;
 /// `.fold(f32::INFINITY, f32::min)` and `.fold(f32::NEG_INFINITY, f32::max)`
 /// are Π, min and max, and `(a..b).any(|i| m)` and `.all(|i| m)` are ∃ and ∀
 /// of `bool`s. An empty range gives the monoid's identity. The bounds are
-/// constant — integers, `usize` consts and an entry's structural parameters
-/// — and the index `i` is a `usize`, which a body reads only as `i as f32`:
+/// literals, `usize` consts, entry count parameters or enclosing fold indices;
+/// the index `i` is a `usize`, which a body reads only as `i as f32`:
 /// there is no arithmetic on an index and nothing to index. A fold lowers to
 /// one `Reduce`, the node `Kernel::over` builds; unrolling it is the
 /// e-graph's choice, at bake time. A closure is the body of a fold and
@@ -249,14 +249,11 @@ use proc_macro::TokenStream;
 ///
 /// # Binding times
 ///
-/// Every value a program reads is bound at one of three times (§1.4):
+/// Every value a program reads is bound at its use (§1.4):
 ///
-/// - **Structural**: an entry's `const N: usize` generics. The host function
-///   is generic over them, and each value is its own program — a count in a
-///   fold's range, or `N as f32`. A helper takes none; it reads its entry's
-///   through an argument.
-/// - **Uniform**: every parameter. An `f32` is one uniform and a record is
-///   one per field; the kernel an entry returns declares them in that order,
+/// - **Uniform**: every scalar and count parameter. An `f32` or `usize`
+///   count is one uniform and a record is one per field; the kernel an entry
+///   returns declares them in that order,
 ///   each with the call's value as its default, and baking it draws the
 ///   call. The value is an argument of the program, never folded into it, so
 ///   every call of an entry is one program: compiled once, and rebound per
@@ -282,24 +279,24 @@ use proc_macro::TokenStream;
 ///     /// An axis-aligned box: a record.
 ///     pub struct Bounds { pub x0: f32, pub y0: f32, pub x1: f32, pub y1: f32 }
 ///
-///     /// `N` rings about the box's corner, `fg` on `bg`.
-///     pub fn rings<const N: usize>(b: Bounds, fg: f32, bg: f32) -> f32 {
+///     /// `count` rings about the box's corner, `fg` on `bg`.
+///     pub fn rings(count: usize, b: Bounds, fg: f32, bg: f32) -> f32 {
 ///         let dx = X - b.x0;
 ///         let dy = Y - b.y0;
 ///         let r = (dx * dx + dy * dy).sqrt();
 ///         let within = (X <= b.x1) & (Y <= b.y1);
-///         let n: f32 = (0..N).map(|i| if r < (i as f32) + 1.0 { 1.0 } else { 0.0 }).sum();
-///         if within { fg * n / (N as f32) } else { bg }
+///         let n: f32 = (0..count).map(|i| if r < (i as f32) + 1.0 { 1.0 } else { 0.0 }).sum();
+///         if within { fg * n / (count as f32) } else { bg }
 ///     }
 /// }
 ///
 /// let lattice = Lattice::frame(64, 64);
 /// let b = Bounds { x0: 8.0, y0: 8.0, x1: 40.0, y1: 40.0 };
-/// let once = lattice.bake(&rings::<4>(b, 1.0, 0.0));            // one call, baked
+/// let once = lattice.bake(&rings(4, b, 1.0, 0.0));            // one call, baked
 ///
-/// let program = Manifold::compile(&rings::<4>(b, 1.0, 0.0), lattice.extent);
+/// let program = Manifold::compile(&rings(4, b, 1.0, 0.0), lattice.extent);
 /// let mut block = program.block();
-/// RingsArgs::<4> { b, fg: 0.5, bg: 0.25 }.write_into(&mut block)?;
+/// RingsArgs { count: 4, b, fg: 0.5, bg: 0.25 }.write_into(&mut block)?;
 /// let again = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
 /// # Ok::<(), pixelflow_core::ArityMismatch>(())
 /// ```
@@ -313,9 +310,7 @@ use proc_macro::TokenStream;
 ///    inlined, its parameters declared as uniforms
 /// 4. **Optimization**: e-graph saturation + latency-prior extraction, on
 ///    the arena. A kernel carrying a `Dwrt` declines here and is optimized
-///    at bake time instead, so composition still gets the chain rule; so is
-///    an entry with structural parameters, a template until it is
-///    instantiated.
+///    at bake time instead, so composition still gets the chain rule.
 /// 5. **Emission**: the arena becomes code that rebuilds it at load time,
 ///    the call's values as its uniforms' defaults
 ///

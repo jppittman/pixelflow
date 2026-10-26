@@ -102,7 +102,7 @@ pub fn latency_prior_cycles() -> OpMap<usize> {
     OpMap::from_fn(|op| match op {
         OpKind::Var => 0,     // free
         OpKind::Const => 0,   // free
-        OpKind::Param => 0,   // free: a leaf, substituted away before codegen
+        OpKind::Param => 0,   // free: a leaf
         OpKind::Add => 4,     // measured 4.0 (anchor)
         OpKind::Sub => 4,     // measured 4.0
         OpKind::Mul => 5,     // measured 5.3
@@ -146,6 +146,13 @@ pub fn latency_prior_cycles() -> OpMap<usize> {
         OpKind::Shr => 1,
         OpKind::BitAnd => 1,
         OpKind::BitOr => 1,
+        // A reinterpretation is the same register: `program/lower.rs` maps
+        // the node to its operand and no backend emits anything for it. Zero
+        // is its price, not the absence of one — a positive cost would steer
+        // extraction away from a form that spells out a reinterpretation the
+        // hardware performs for free either way.
+        OpKind::Bits => 0,
+        OpKind::Float => 0,
         OpKind::Dwrt => LEGALIZATION_PRICE,
         OpKind::Buffer => 0,     // leaf, free
         OpKind::Gather => 10,    // memory read
@@ -384,34 +391,46 @@ impl CostModel {
             // claim/price audit catches outright. Nothing unrolls a surviving
             // fold afterwards now: codegen emits it as a loop.
             //
-            // So the node's own share is `fold_cost` with the body free.
+            // So the node's own share is `fold_cost` with the body free. Its
+            // trips are the header's (`FoldHeader::priced_trips`): the range's
+            // length, or the estimate when a bound is a value; the extractor
+            // prices a fold whose bounds it chose as literals through the fold
+            // over them (`ENode::literal_twin`).
             //
             // An unpriceable monoid keeps the sentinel: extraction must not
             // choose a fold whose combiner has no operation to emit.
-            ENode::Reduce { fold: range, .. } => {
-                match super::fold_rules::combiner_op(range.monoid()) {
-                    Some(_) => self.fold_cost(*range, 0),
+            ENode::Reduce { header, .. } => {
+                let fold = header.fold();
+                match super::fold_rules::combiner_op(fold.monoid()) {
+                    Some(_) => self.fold_cost(fold, header.priced_trips(), 0),
                     None => usize::MAX / 4,
                 }
             }
         }
     }
 
-    /// **What one evaluation of `fold` costs**, when one evaluation of its
-    /// body costs `body`: the body once per trip, and the combiner between
-    /// consecutive trips — `len · body + (len − 1) · combine`.
+    /// **What one evaluation of `fold` costs**, when it runs `trips` times and
+    /// one evaluation of its body costs `body`: the body once per trip, and
+    /// the combiner between consecutive trips —
+    /// `trips · body + (trips − 1) · combine`.
     ///
     /// The one formula for a fold's price. The extractor reaches it in two
     /// halves, because a node's own cost cannot see its children's:
-    /// [`node_op_cost`](Self::node_op_cost) is `fold_cost(fold, 0)`, the
-    /// combiner chain, and the DP multiplies the body's price by the trip
+    /// [`node_op_cost`](Self::node_op_cost) is `fold_cost(fold, trips, 0)`,
+    /// the combiner chain, and the DP multiplies the body's price by the trip
     /// count where it has that price in hand (`extract.rs`'s `below`).
+    ///
+    /// `trips` is read off the node that holds the fold
+    /// ([`FoldHeader::priced_trips`](pixelflow_ir::FoldHeader::priced_trips)):
+    /// its range's length when the range is known, else
+    /// [`Fold::ESTIMATED_TRIPS`]; the extractor reads it off a fold's literal
+    /// twin when it chose the fold's bounds as literals.
     ///
     /// Saturating: a nest of long folds over an expensive body is a price
     /// past any budget, not an overflow.
     #[must_use]
-    pub fn fold_cost(&self, fold: Fold, body: usize) -> usize {
-        let trips = fold.len() as usize;
+    pub fn fold_cost(&self, fold: Fold, trips: u64, body: usize) -> usize {
+        let trips = usize::try_from(trips).unwrap_or(usize::MAX);
         let combines = trips.saturating_sub(1);
         trips
             .saturating_mul(body)
@@ -493,6 +512,11 @@ mod every_op_is_priceable {
             OpKind::IntToFloat,
         ] {
             assert_eq!(cycles[op], 1, "{op:?} is a single instruction");
+        }
+
+        // The reinterpretations are no instruction at all.
+        for op in [OpKind::Bits, OpKind::Float] {
+            assert_eq!(cycles[op], 0, "{op:?} is the same register");
         }
     }
 
@@ -716,23 +740,22 @@ mod cost_model_accessors {
     /// A fold's price is [`CostModel::fold_cost`]. The extractor's DP reaches
     /// it in two halves — `node_op_cost` is the combiner chain, and the DP adds
     /// the body once per trip. Pinned: with no rewrite rule to choose another
-    /// form, `Σ_{j<40} |X − j|` is priced exactly `fold_cost(fold, − + |·|)`.
+    /// form, `Σ_{j<40} |X − j|` is priced exactly `fold_cost(fold, 40, − + |·|)`.
     #[test]
     fn the_extractor_prices_a_fold_at_fold_cost() {
         use crate::egraph::extract::extract_dag;
         use crate::egraph::{Vocabulary, insert};
         use pixelflow_ir::ExprArena;
-        use pixelflow_ir::fold::{Binder, Fold, Monoid};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 
         let binder = Binder::from_slot(0).expect("a live binder");
-        let fold = Fold::new(Monoid::SUM, binder, 0..40);
-        let range = fold;
+        let fold = Fold::new(Monoid::SUM, binder);
         let mut a = ExprArena::new();
         let x = a.push_var(0);
         let j = a.push_var(binder.var());
         let diff = a.push_binary(OpKind::Sub, x, j);
         let body = a.push_unary(OpKind::Abs, diff);
-        let root = a.push_reduce(fold, body);
+        let root = a.push_reduce(fold, Bound::Lit(0), Bound::Lit(40), body);
 
         let mut egraph = EGraph::new();
         let class = insert(&a, root, &mut egraph, Vocabulary::Runtime).expect("a fold inserts");
@@ -741,11 +764,62 @@ mod cost_model_accessors {
         let cost = dag.total_cost;
 
         let body_cost = model.cost(OpKind::Sub) + model.cost(OpKind::Abs);
-        assert_eq!(cost, model.fold_cost(range, body_cost));
+        assert_eq!(cost, model.fold_cost(fold, 40, body_cost));
         assert_eq!(
-            model.node_op_cost(&ENode::Reduce { fold, body: class }),
-            model.fold_cost(range, 0),
+            model.node_op_cost(&ENode::reduce(fold, Bound::Lit(0), Bound::Lit(40), class)),
+            model.fold_cost(fold, 40, 0),
             "the node's own share is the fold with its body free"
+        );
+    }
+
+    /// A fold whose range is not known is priced at the estimate. The node's
+    /// own share is the combiner chain over `ESTIMATED_TRIPS`, and the
+    /// extractor totals `Σ_{j<u} |X − j|` at `fold_cost(fold, 32, − + |·|)`:
+    /// the uniform bound costs nothing, and no rule here gives the fold
+    /// another form.
+    #[test]
+    fn a_fold_whose_range_is_not_known_is_priced_at_the_estimate() {
+        use crate::egraph::extract::extract_dag;
+        use crate::egraph::{Vocabulary, insert};
+        use pixelflow_ir::ExprArena;
+        use pixelflow_ir::arena::{UniformDecl, UniformIdentity};
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
+
+        let binder = Binder::from_slot(0).expect("a live binder");
+        let fold = Fold::new(Monoid::SUM, binder);
+        let decl = UniformDecl {
+            id: UniformIdentity::mint(),
+            default: 40.0,
+        };
+        let mut a = ExprArena::new();
+        let u = a.declare_uniform(decl);
+        let bound = a.push_uniform(u);
+        let x = a.push_var(0);
+        let j = a.push_var(binder.var());
+        let diff = a.push_binary(OpKind::Sub, x, j);
+        let body = a.push_unary(OpKind::Abs, diff);
+        let root = a.push_reduce(fold, Bound::Lit(0), Bound::Value(bound), body);
+
+        let mut egraph = EGraph::new();
+        let class = insert(&a, root, &mut egraph, Vocabulary::Runtime).expect("a fold inserts");
+        let model = CostModel::latency_prior();
+        let body_cost = model.cost(OpKind::Sub) + model.cost(OpKind::Abs);
+
+        let uniform = egraph.add(ENode::Uniform(decl));
+        assert_eq!(
+            model.node_op_cost(&ENode::reduce(
+                fold,
+                Bound::Lit(0),
+                Bound::Value(uniform),
+                class
+            )),
+            model.fold_cost(fold, Fold::ESTIMATED_TRIPS, 0),
+            "the node's own share is the combiner chain over the estimate"
+        );
+        let dag = extract_dag(&egraph, class, &model);
+        assert_eq!(
+            dag.total_cost,
+            model.fold_cost(fold, Fold::ESTIMATED_TRIPS, body_cost)
         );
     }
 

@@ -176,15 +176,10 @@ fn extract_mul(egraph: &EGraph, class: EClassId) -> Option<(EClassId, EClassId)>
 }
 
 fn is_one(egraph: &EGraph, class: EClassId) -> bool {
-    for node in egraph.nodes(class) {
-        if let ENode::Const(bits) = node {
-            let v = f32::from_bits(*bits);
-            if (v - 1.0).abs() < 1e-10 {
-                return true;
-            }
-        }
-    }
-    false
+    egraph
+        .nodes(class)
+        .filter_map(ENode::as_f32)
+        .any(|v| (v - 1.0).abs() < 1e-10)
 }
 
 fn extract_sqrt(egraph: &EGraph, class: EClassId) -> Option<EClassId> {

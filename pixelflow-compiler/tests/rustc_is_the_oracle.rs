@@ -625,13 +625,14 @@ fn a_range_from_consts_folds_as_rustcs_does() {
     assert_eq!(bake(&k), 24.0, "3 · (3 + 4 + … + 13) / 11");
 }
 
-// ─────────────── B3: records, and structural counts ───────────────
+// ─────────────── B3: records, and counts ───────────────
 //
 // A record (docs/language/2026-09-25-the-language-is-kernel.md §1.3) is a Rust
 // struct of `f32` fields, and the macro emits it as one: so the oracle for a
 // record's field arithmetic is the same tokens over the host struct itself.
-// A structural parameter (§1.4) is a Rust const generic, and the oracle for
-// a range over one is the same iterator in a host `fn` generic over it.
+// A count known at expansion is a `usize` const, and the oracle for a range
+// over one, and for the count as a value, is the same tokens over Rust
+// `const`s; a count passed per call is the next section's.
 
 kernel! {
     /// An affine map of the plane.
@@ -688,56 +689,195 @@ fn a_records_field_arithmetic_is_rustcs() {
 
 kernel! {
     const FIRST: usize = 1;
+    const N: usize = 4;
+    const ONE: usize = 1;
 
-    /// A helper reads its entry's structural parameter as an argument.
+    /// A helper reads a count as an argument.
     fn per(n: f32, total: f32) -> f32 { total / n }
 
-    /// The mean of `X·i` over `i ∈ [FIRST, FIRST + N)`: `N` in a range's
-    /// const arithmetic, and as a value.
-    pub fn mean_index<const N: usize>() -> f32 {
+    /// The mean of `X·i` over `i ∈ [FIRST, FIRST + N)`: `N` in a range's const
+    /// arithmetic, and as a value.
+    pub fn mean_index() -> f32 {
         per(N as f32, (FIRST..FIRST + N).map(|i| X * (i as f32)).sum::<f32>())
+    }
+
+    /// The same over a count of one: a one-term range.
+    pub fn mean_index_one() -> f32 {
+        per(ONE as f32, (FIRST..FIRST + ONE).map(|i| X * (i as f32)).sum::<f32>())
     }
 }
 
-fn rust_mean_index<const N: usize>(x: f32) -> f32 {
+fn rust_mean_index(x: f32) -> f32 {
     const RUST_FIRST: usize = 1;
-    (RUST_FIRST..RUST_FIRST + N)
+    const RUST_N: usize = 4;
+    (RUST_FIRST..RUST_FIRST + RUST_N)
         .map(|i| x * (i as f32))
         .sum::<f32>()
-        / (N as f32)
+        / (RUST_N as f32)
 }
 
-/// A range over a structural parameter, and the parameter as a value, mean
-/// what the same tokens in a host `fn` generic over it mean, at each
-/// instantiation: each is its own program, and each sum is exact.
+fn rust_mean_index_one(x: f32) -> f32 {
+    const RUST_FIRST: usize = 1;
+    const RUST_ONE: usize = 1;
+    (RUST_FIRST..RUST_FIRST + RUST_ONE)
+        .map(|i| x * (i as f32))
+        .sum::<f32>()
+        / (RUST_ONE as f32)
+}
+
+/// A range in a count's const arithmetic, and the count as a value through a
+/// helper, mean what the same tokens over Rust `const`s mean, for a count of
+/// four and a count of one; each sum is exact.
 #[test]
-fn a_structural_count_folds_as_rustcs_const_generic_does() {
+fn a_count_in_a_ranges_const_arithmetic_folds_as_rustcs_does() {
     for (x, y) in FOLD_SAMPLES {
         assert_eq!(
-            Lattice::eval_at(&mean_index::<1>(), x, y),
-            rust_mean_index::<1>(x)
+            Lattice::eval_at(&mean_index(), x, y),
+            rust_mean_index(x),
+            "at ({x}, {y})"
         );
         assert_eq!(
-            Lattice::eval_at(&mean_index::<3>(), x, y),
-            rust_mean_index::<3>(x)
-        );
-        assert_eq!(
-            Lattice::eval_at(&mean_index::<4>(), x, y),
-            rust_mean_index::<4>(x)
+            Lattice::eval_at(&mean_index_one(), x, y),
+            rust_mean_index_one(x),
+            "at ({x}, {y})"
         );
     }
     // X = 3: (1 + 2 + 3 + 4) · 3 / 4.
-    assert_eq!(bake(&mean_index::<4>()), 7.5);
+    assert_eq!(bake(&mean_index()), 7.5);
+    // X = 3: 1 · 3 / 1.
+    assert_eq!(bake(&mean_index_one()), 3.0);
+}
+
+// ─────────────── values as bounds ───────────────
+//
+// A fold's bound may be a value (docs/language/2026-10-20-a-bound-is-a-value.md
+// §3.4): an enclosing fold's index — a triangular `0..i` — or an entry's count
+// parameter `n: usize`, bound per call. Rust's iterator over the same tokens is
+// the oracle, the count a `usize` argument of the host `fn`.
+
+kernel! {
+    /// Σ_{i<4} Σ_{j<i} (X·j + i): an inner fold bounded by the outer index.
+    pub fn triangle() -> f32 {
+        (0..4).map(|i| (0..i).map(|j| X * (j as f32) + (i as f32)).sum::<f32>()).sum()
+    }
+
+    /// Σ_{i<n} X·i, the count a per-call value.
+    pub fn sum_to(n: usize) -> f32 {
+        (0..n).map(|i| X * (i as f32)).sum()
+    }
+
+    /// Σ_{i<n} Σ_{j<i} (X·j + i): a count bounding the fold an index bounds.
+    pub fn triangle_to(n: usize) -> f32 {
+        (0..n).map(|i| (0..i).map(|j| X * (j as f32) + (i as f32)).sum::<f32>()).sum()
+    }
+
+    /// Σ_{n≤i<8} X·i: a count at the first end.
+    pub fn sum_from(n: usize) -> f32 {
+        (n..8).map(|i| X * (i as f32)).sum()
+    }
+
+    /// Σ_{lo≤i<hi} (X·i + Y): two counts, a pair that may run backwards.
+    pub fn sum_between(lo: usize, hi: usize) -> f32 {
+        (lo..hi).map(|i| X * (i as f32) + Y).sum()
+    }
+}
+
+fn rust_triangle(x: f32) -> f32 {
+    (0..4)
+        .map(|i| (0..i).map(|j| x * (j as f32) + (i as f32)).sum::<f32>())
+        .sum()
+}
+
+fn rust_sum(n: usize, x: f32) -> f32 {
+    (0..n).map(|i| x * (i as f32)).sum()
+}
+
+fn rust_triangle_to(n: usize, x: f32) -> f32 {
+    (0..n)
+        .map(|i| (0..i).map(|j| x * (j as f32) + (i as f32)).sum::<f32>())
+        .sum()
+}
+
+fn rust_sum_from(n: usize, x: f32) -> f32 {
+    (n..8).map(|i| x * (i as f32)).sum()
+}
+
+fn rust_sum_between(lo: usize, hi: usize, x: f32, y: f32) -> f32 {
+    (lo..hi).map(|i| x * (i as f32) + y).sum()
+}
+
+/// A fold bounded by the index of the fold around it, `Σ_i Σ_{j<i}`, means
+/// what the same iterator means; every sum is exact.
+#[test]
+fn a_triangular_fold_folds_as_rustcs_does() {
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(
+            Lattice::eval_at(&triangle(), x, y),
+            rust_triangle(x),
+            "at ({x}, {y})"
+        );
+    }
+    // X = 3: 0 + 1 + (2 + 5) + (3 + 6 + 9).
+    assert_eq!(bake(&triangle()), 26.0);
+}
+
+/// A count passed per call bounds a fold as Rust's `0..n` does, at every
+/// count — the empty one too, whose zero may differ from rustc's in sign,
+/// which `==` cannot see (`a_fold_over_an_empty_range_is_the_identity_as_in_rustc`)
+/// — and bounds the outer fold of a triangle.
+#[test]
+fn a_per_call_count_folds_as_rustcs_does() {
+    for n in [0, 1, 3, 7] {
+        for (x, y) in FOLD_SAMPLES {
+            assert_eq!(
+                Lattice::eval_at(&sum_to(n), x, y),
+                rust_sum(n, x),
+                "n = {n}, at ({x}, {y})"
+            );
+            assert_eq!(
+                Lattice::eval_at(&triangle_to(n), x, y),
+                rust_triangle_to(n, x),
+                "n = {n}, at ({x}, {y})"
+            );
+        }
+    }
+    // X = 3: 3 · (0 + 1 + … + 6).
+    assert_eq!(bake(&sum_to(7)), 63.0);
+}
+
+/// Counts at either end, and a pair that runs backwards per call: Rust's
+/// `5..2` is empty, and so is the fold at these samples (L2, which holds up to
+/// the optimizer's algebraic rules at NaN and infinity, BACKLOG E9).
+#[test]
+fn a_range_between_counts_folds_as_rustcs_does() {
+    for n in [0, 3, 8, 10] {
+        for (x, y) in FOLD_SAMPLES {
+            assert_eq!(
+                Lattice::eval_at(&sum_from(n), x, y),
+                rust_sum_from(n, x),
+                "n = {n}, at ({x}, {y})"
+            );
+        }
+    }
+    for (lo, hi) in [(0, 0), (2, 5), (5, 2), (3, 3), (0, 7)] {
+        for (x, y) in FOLD_SAMPLES {
+            assert_eq!(
+                Lattice::eval_at(&sum_between(lo, hi), x, y),
+                rust_sum_between(lo, hi, x, y),
+                "{lo}..{hi}, at ({x}, {y})"
+            );
+        }
+    }
 }
 
 kernel! {
-    /// Two ranges over structural parameters, one inside the other: `M` rows
-    /// of `N` terms, and `N` as a value.
-    pub fn grid<const M: usize, const N: usize>() -> f32 {
-        (0..M)
-            .map(|i| (0..N).map(|j| X * (i as f32) + Y * (j as f32)).sum::<f32>())
+    /// Two per-call count bounds, one inside the other: `m` rows
+    /// of `n` terms, and `n` as a value.
+    pub fn grid(m: usize, n: usize) -> f32 {
+        (0..m)
+            .map(|i| (0..n).map(|j| X * (i as f32) + Y * (j as f32)).sum::<f32>())
             .sum::<f32>()
-            + (N as f32)
+            + (n as f32)
     }
 }
 
@@ -748,24 +888,23 @@ fn rust_grid<const M: usize, const N: usize>(x: f32, y: f32) -> f32 {
         + (N as f32)
 }
 
-/// Two structural ranges are two holes: the rows and the terms are not
-/// interchangeable, and the instantiations (2, 5), (5, 2) and (3, 3) are
-/// three programs that each mean the host `fn` generic over the same pair.
+/// Two count bounds retain their distinct uniforms: (2, 5), (5, 2) and
+/// (3, 3) are calls to one program shape with different values.
 #[test]
-fn two_structural_ranges_fold_as_rustcs_const_generics_do() {
+fn two_count_ranges_fold_as_rustcs_do() {
     for (x, y) in FOLD_SAMPLES {
         assert_eq!(
-            Lattice::eval_at(&grid::<2, 5>(), x, y),
+            Lattice::eval_at(&grid(2, 5), x, y),
             rust_grid::<2, 5>(x, y),
             "(2, 5) at ({x}, {y})"
         );
         assert_eq!(
-            Lattice::eval_at(&grid::<5, 2>(), x, y),
+            Lattice::eval_at(&grid(5, 2), x, y),
             rust_grid::<5, 2>(x, y),
             "(5, 2) at ({x}, {y})"
         );
         assert_eq!(
-            Lattice::eval_at(&grid::<3, 3>(), x, y),
+            Lattice::eval_at(&grid(3, 3), x, y),
             rust_grid::<3, 3>(x, y),
             "(3, 3) at ({x}, {y})"
         );
@@ -773,15 +912,12 @@ fn two_structural_ranges_fold_as_rustcs_const_generics_do() {
 }
 
 kernel! {
-    /// A known fold beside an open one: `0..3` and the empty `2..2` and
-    /// `0..0` are fixed in the template, `0..N` is filled by the
-    /// instantiation. The empty `0..0` is the open fold's own placeholder
-    /// range, so only its stride tells the two apart.
-    pub fn mixed<const N: usize>() -> f32 {
+    /// Known folds beside one whose upper bound is a per-call count.
+    pub fn mixed(n: usize) -> f32 {
         (0..3).map(|i| X * (i as f32)).sum::<f32>()
             + (2..2).map(|k| Y * (k as f32)).sum::<f32>()
             + (0..0).map(|i| X * (i as f32) + 100.0).sum::<f32>()
-            + (0..N).map(|j| Y * (j as f32)).sum::<f32>()
+            + (0..n).map(|j| Y * (j as f32)).sum::<f32>()
     }
 }
 
@@ -792,23 +928,23 @@ fn rust_mixed<const N: usize>(x: f32, y: f32) -> f32 {
         + (0..N).map(|j| y * (j as f32)).sum::<f32>()
 }
 
-/// A known fold is never read as the template's hole, and an open one is
-/// never read as known: `N` fills only `0..N`, at an empty instantiation too.
+/// Known folds keep their literal bounds beside a value-bound fold,
+/// including when the value is zero.
 #[test]
 fn a_known_fold_beside_an_open_one_folds_as_rustcs_does() {
     for (x, y) in FOLD_SAMPLES {
         assert_eq!(
-            Lattice::eval_at(&mixed::<0>(), x, y),
+            Lattice::eval_at(&mixed(0), x, y),
             rust_mixed::<0>(x, y),
             "N = 0 at ({x}, {y})"
         );
         assert_eq!(
-            Lattice::eval_at(&mixed::<2>(), x, y),
+            Lattice::eval_at(&mixed(2), x, y),
             rust_mixed::<2>(x, y),
             "N = 2 at ({x}, {y})"
         );
         assert_eq!(
-            Lattice::eval_at(&mixed::<5>(), x, y),
+            Lattice::eval_at(&mixed(5), x, y),
             rust_mixed::<5>(x, y),
             "N = 5 at ({x}, {y})"
         );
@@ -881,6 +1017,11 @@ kernel! {
         (0..3).map(|i| k(X + (i as f32), Y)).sum()
     }
 
+    /// D4 under a count: a kernel applied in a fold whose range the host passes.
+    pub fn over_n_columns(k: impl Fn(f32, f32) -> f32, n: usize) -> f32 {
+        (0..n).map(|i| k(X + (i as f32), Y)).sum()
+    }
+
     /// A kernel passed on in one arm and applied in the other: two paths,
     /// as rustc's move check follows them.
     pub fn one_arm_passes(k: impl Fn(f32, f32) -> f32, r: f32) -> f32 {
@@ -906,6 +1047,10 @@ fn rust_summed(a: impl Fn(f32, f32) -> f32, b: impl Fn(f32, f32) -> f32, x: f32,
 
 fn rust_over_columns(k: impl Fn(f32, f32) -> f32, x: f32, y: f32) -> f32 {
     (0..3).map(|i| k(x + (i as f32), y)).sum()
+}
+
+fn rust_over_n_columns(k: impl Fn(f32, f32) -> f32, n: usize, x: f32, y: f32) -> f32 {
+    (0..n).map(|i| k(x + (i as f32), y)).sum()
 }
 
 fn rust_one_arm_passes(k: impl Fn(f32, f32) -> f32, r: f32, x: f32, y: f32) -> f32 {
@@ -995,6 +1140,24 @@ fn an_argument_holding_a_fold_inside_a_fold_is_rusts() {
             .sum::<f32>();
     assert_eq!(captured, 156.0);
     assert_ne!(bake(&written), captured);
+}
+
+/// A kernel applied in a fold over a per-call count means the same closure
+/// called over Rust's `0..n`: the entry is staged, and its count a uniform of
+/// the program its host function builds.
+#[test]
+fn a_per_call_count_around_an_application_is_rusts() {
+    let (k, rust_k) = plane();
+    for n in [0, 1, 4] {
+        let written = over_n_columns(&k, n);
+        for (x, y) in FOLD_SAMPLES {
+            assert_eq!(
+                Lattice::eval_at(&written, x, y),
+                rust_over_n_columns(rust_k, n, x, y),
+                "n = {n}, at ({x}, {y})"
+            );
+        }
+    }
 }
 
 /// A kernel moved in one arm of an `if` and applied in the other is a

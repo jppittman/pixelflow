@@ -26,4 +26,5 @@ pixelflow-ir = { path = "../pixelflow-ir" }
 pixelflow-search = { path = "../pixelflow-search" }
 
 [dev-dependencies]
+pixelflow-codegen = { path = "../pixelflow-codegen" }
 pixelflow-core = { path = "../pixelflow-core" }

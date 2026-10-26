@@ -1088,6 +1088,51 @@ mod tests {
         }
     }
 
+    /// A value bound is a child of its fold, so the dump names it: the `R`
+    /// line is the header's bits, the body, then the bound's child.
+    #[test]
+    fn the_dump_writes_a_value_bounds_child() {
+        use pixelflow_core::{Kernel, Monoid, Uniform};
+        let count = Uniform::new(3.0);
+        let kernel =
+            Kernel::over_values(Monoid::SUM, &Kernel::constant(0.0), &count.kernel(), |i| {
+                Kernel::x().mul(i)
+            });
+        let (arena, root) = kernel.parts();
+        // Per-process, as the corpus tests' paths are: two test processes at
+        // once must not write and remove one file between them.
+        let path = std::env::temp_dir().join(format!(
+            "the_dump_writes_a_value_bounds_child_{}.arena",
+            std::process::id()
+        ));
+        dump_arena(arena, root, "value-bound", &path);
+        let text = std::fs::read_to_string(&path).expect("read the dump back");
+        std::fs::remove_file(&path).expect("remove the dump");
+
+        let nodes: Vec<Vec<&str>> = text
+            .lines()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>())
+            .filter(|f| !matches!(f[0], "#" | "name" | "buf" | "uni" | "root"))
+            .collect();
+        let uniform = nodes.iter().position(|f| f[0] == "Un").expect("an Un line");
+        let [fold] = nodes
+            .iter()
+            .filter(|f| f[0] == "R")
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("one R line");
+        assert_eq!(
+            fold.len(),
+            4,
+            "R, the header's bits, the body, the bound: {fold:?}"
+        );
+        assert_eq!(
+            fold[3],
+            uniform.to_string(),
+            "the bound's child is the uniform's dense id"
+        );
+    }
+
     /// Text dump of the subgraph reachable from `root`: nodes in ascending
     /// original id order (children precede parents), ids remapped dense,
     /// constants as bit patterns, buffer identities as dense ordinals. The
@@ -1103,6 +1148,7 @@ mod tests {
     ) {
         use core::fmt::Write as _;
         use pixelflow_ir::arena::ExprNode;
+        use pixelflow_ir::Bound;
         let len = arena.len();
         let mut reachable = vec![false; len];
         let mut stack = vec![root];
@@ -1147,7 +1193,7 @@ mod tests {
             let id = pixelflow_ir::ExprId(idx as u32);
             match arena.node(id) {
                 ExprNode::Var(i) => writeln!(out, "V {i}"),
-                ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
+                ExprNode::Const(v) => writeln!(out, "C {}", v.bits()),
                 ExprNode::Buffer(b) => writeln!(out, "B {}", b.0),
                 ExprNode::Uniform(u) => writeln!(out, "Un {}", u.0),
                 ExprNode::Unary(k, a) => writeln!(out, "U {k:?} {}", d(&dense, a)),
@@ -1164,8 +1210,20 @@ mod tests {
                 // A fold survives the runtime tier now — it is representable
                 // in the e-graph and legalized after extraction — so the dump
                 // has a line for it rather than a panic.
-                ExprNode::Reduce { fold, body } => {
-                    writeln!(out, "R {} {}", fold.to_bits(), d(&dense, body))
+                // A value bound's child follows the body, as the header's
+                // marker says (`FoldHeader::to_bits`).
+                ExprNode::Reduce { lo, hi, body, .. } => {
+                    let values: std::string::String = [lo, hi]
+                        .into_iter()
+                        .filter_map(Bound::value)
+                        .map(|child| format!(" {}", d(&dense, child)))
+                        .collect();
+                    writeln!(
+                        out,
+                        "R {} {}{values}",
+                        arena.fold_header(id).to_bits(),
+                        d(&dense, body)
+                    )
                 }
                 other @ (ExprNode::Param(_)
                 | ExprNode::Nary(..)

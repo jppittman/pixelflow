@@ -594,7 +594,7 @@ fn a_turbofish_on_a_call_and_a_block_label_are_refused_rather_than_dropped() {
 fn a_refusal_over_nothing_is_spanned_at_a_token_that_exists() {
     let cases: [(TokenStream, &str); 4] = [
         (
-            quote! { pub fn e<const N: usize>() -> f32 where { X } },
+            quote! { pub fn e() -> f32 where { X } },
             "a `where` clause on",
         ),
         (
@@ -727,24 +727,6 @@ fn a_records_attributes_are_kept() {
         .collect();
     assert_eq!(paths, ["doc", "allow", "cfg_attr"]);
     assert_eq!(row.fields[0].attrs.len(), 1, "the field's `allow`");
-}
-
-/// An entry's generics are its structural parameters, in declaration
-/// order; a helper has none.
-#[test]
-fn an_entrys_const_generics_are_its_structural_parameters() {
-    let def = parse(quote! {
-        fn h(x: f32) -> f32 { x }
-        pub fn f<const N: usize, const M: usize>(r: f32) -> f32 { h(r) }
-    })
-    .expect("parses");
-    let names: Vec<String> = def.fns()[1]
-        .structural
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    assert_eq!(names, ["N", "M"]);
-    assert!(def.fns()[0].structural.is_empty());
 }
 
 // ───────────────────────────── folds ─────────────────────────────
@@ -893,7 +875,7 @@ fn a_collection_spelled_any_way_is_refused_naming_its_sections() {
     let cases: [(TokenStream, &str); 14] = [
         (quote! { |v: [f32; 2]| X }, "a collection-typed parameter"),
         (
-            quote! { pub struct Row { pub x0: f32 } pub fn f<const N: usize>(pieces: [Row; N]) -> f32 { X } },
+            quote! { pub struct Row { pub x0: f32 } pub fn f(pieces: [Row; 4]) -> f32 { X } },
             "a collection-typed parameter",
         ),
         (
@@ -1118,8 +1100,7 @@ fn a_cast_to_anything_but_f32_is_refused() {
 }
 
 /// A `fn` signature carries nothing the language cannot honor: an
-/// entry's generics are `const N: usize` and nothing else, and a helper
-/// has none — it reads its entry's through its arguments.
+/// neither an entry nor a helper takes generics; counts are entry parameters.
 #[test]
 fn a_fn_signature_is_plain() {
     let err = refusal(quote! {
@@ -1127,19 +1108,25 @@ fn a_fn_signature_is_plain() {
         pub fn f() -> f32 { X }
     });
     assert!(
-        err.contains("generics on a helper") && err.contains("pass `n as f32`"),
+        err.contains("a `const` generic") && err.contains("n: usize"),
         "got: {err}"
     );
     let cases: [(TokenStream, &str); 7] = [
-        (quote! { pub fn f<T>() -> f32 { X } }, "B3"),
-        (quote! { pub fn f<'a>() -> f32 { X } }, "lifetime parameter"),
+        (
+            quote! { pub fn f<T>() -> f32 { X } },
+            "nothing in a kernel is generic",
+        ),
+        (
+            quote! { pub fn f<'a>() -> f32 { X } },
+            "nothing in a kernel is generic",
+        ),
         (
             quote! { pub fn f<const N: u32>() -> f32 { X } },
-            "a structural parameter is a `usize`",
+            "a `const` generic",
         ),
         (
             quote! { pub fn f<const N: usize = 4>() -> f32 { X } },
-            "a default for a structural parameter",
+            "a `const` generic",
         ),
         (quote! { pub fn f() { X } }, "declares no return type"),
         (quote! { pub fn f(mut x: f32) -> f32 { x } }, "plain name"),
@@ -1227,12 +1214,11 @@ fn a_method_name_far_from_every_length_gets_no_suggestion() {
 /// A retired method is refused by name, with the way out.
 #[test]
 fn a_retired_method_is_refused() {
-    for input in [
-        quote! { || X.at(Y, X) },
-        quote! { || X.constant() },
-        quote! { || X.collapse() },
-    ] {
+    for input in [quote! { || X.constant() }, quote! { || X.collapse() }] {
         let err = refusal(input);
-        assert!(err.contains("Kernel::at"), "got: {err}");
+        assert!(
+            err.contains("sampled a manifold-typed parameter"),
+            "got: {err}"
+        );
     }
 }

@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use pixelflow_ir::arena::{BufferDecl, BufferIdentity, ExprArena, ExprId};
-use pixelflow_ir::{Binder, Fold, Monoid, OpKind};
+use pixelflow_ir::{Binder, Bound, Fold, Monoid, OpKind};
 use pixelflow_search::egraph::{
     Rewrite, RuleIdx, RuleSet, Saturation, Vocabulary, all_rules, derivative_rules, fold_rules,
     insert, saturate_with_full_budget,
@@ -205,7 +205,9 @@ fn terms(a: &mut ExprArena) -> Vec<ExprId> {
     let var = a.push_const(0.0);
     roots.push(bin(a, OpKind::Dwrt, sq, var));
 
-    // Folds: a table-reading sum, an empty fold, and a factorable one.
+    // Folds: a table-reading sum, an empty fold, a factorable one, and a
+    // triangular one, whose inner bound is the outer index until a peel turns
+    // it into a literal (`KnownBound`'s match).
     let buffer = a.declare_buffer(BufferDecl {
         id: BufferIdentity::mint(),
         width: 8,
@@ -216,9 +218,34 @@ fn terms(a: &mut ExprArena) -> Vec<ExprId> {
     let row = a.push_const(0.0);
     let read = a.push_gather(buffer, i, row);
     let weighted = bin(a, OpKind::Mul, read, x);
-    roots.push(a.push_reduce(Fold::new(Monoid::SUM, binder, 0..4), weighted));
+    roots.push(a.push_reduce(
+        Fold::new(Monoid::SUM, binder),
+        Bound::Lit(0),
+        Bound::Lit(4),
+        weighted,
+    ));
     let constant_body = a.push_const(1.0);
-    roots.push(a.push_reduce(Fold::new(Monoid::SUM, binder, 0..0), constant_body));
+    roots.push(a.push_reduce(
+        Fold::new(Monoid::SUM, binder),
+        Bound::Lit(0),
+        Bound::Lit(0),
+        constant_body,
+    ));
+    let outer = Binder::from_slot(1).expect("a live binder");
+    let outer_index = a.push_var(outer.var());
+    let triangle_body = bin(a, OpKind::Mul, x, i);
+    let triangle = a.push_reduce(
+        Fold::new(Monoid::SUM, binder),
+        Bound::Lit(0),
+        Bound::Value(outer_index),
+        triangle_body,
+    );
+    roots.push(a.push_reduce(
+        Fold::new(Monoid::SUM, outer),
+        Bound::Lit(0),
+        Bound::Lit(3),
+        triangle,
+    ));
     roots
 }
 

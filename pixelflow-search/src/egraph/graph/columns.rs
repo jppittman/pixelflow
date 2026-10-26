@@ -44,8 +44,8 @@
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::ops::{Index, IndexMut};
-use pixelflow_ir::Variance;
 use pixelflow_ir::kind::{OpKind, OpSet};
+use pixelflow_ir::{Lit, Variance};
 
 use crate::egraph::live::{ClassSet, ClassesByKind};
 use crate::egraph::node::{EClassId, ENode};
@@ -165,7 +165,7 @@ index_mut_by!(Slot, Slot, |slot: Slot| slot.0.index());
 pub(super) struct Birth {
     /// The canonical node `add` pushes into the arena.
     pub(super) node: ENode,
-    pub(super) const_fact: Option<u32>,
+    pub(super) const_fact: Option<Lit>,
     pub(super) variance: Variance,
     /// The node's shape, as `ENode::shape` names it: the one kind the
     /// new class starts with.
@@ -275,7 +275,7 @@ pub(crate) struct Columns {
     /// unions, so a guard that scanned the member list saw an empty class and
     /// waved contradictory merges through at exactly the moment congruence
     /// closure does its work. The fact must outlive the members.
-    pub(super) const_fact: Column<Root, Option<u32>>,
+    pub(super) const_fact: Column<Root, Option<Lit>>,
     /// Which binders each class may depend on — the per-class variance fact
     /// (docs/archive/plans/2026-09-23-an-integral-is-a-fold.md §1, §3), kept beside
     /// `const_fact` and out of the member list for the same reason: a guard

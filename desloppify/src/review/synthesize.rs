@@ -5,14 +5,16 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use super::identify::shape;
-use super::{Diagnosis, Finding, Report, Root, Synthesis};
-use crate::agent::{Ask, Question};
+use super::module::{omitted, shape};
+use super::numbering::Numbering;
+use super::reply::{Step, ask};
+use super::{Diagnosis, DiagnosisIx, Finding, FindingIx, Report, Root, Synthesis, ThingIx};
+use crate::agent::Ask;
 use crate::model::ModelLevel;
-use crate::rule::{Rule, Verdict};
+use crate::rule::Verdict;
 
 /// The most outline lines the synthesis is shown, over every module a thing
 /// was named in, the modules with the most symptoms first.
@@ -88,69 +90,72 @@ struct Reply {
     review: String,
 }
 
+/// `thing` is a `T` number, `explains` are `F` numbers.
 #[derive(Deserialize)]
 struct Diagnosed {
-    /// A thing's number, from 1.
     thing: usize,
     diagnosis: String,
     falls_out: String,
-    /// Finding numbers, from 1.
     explains: Vec<usize>,
 }
 
+/// `explains` are `D` numbers: positions in the reply's own `diagnoses`.
 #[derive(Deserialize)]
 struct Rooted {
     root: String,
     falls_out: String,
-    /// Diagnosis numbers, from 1, in the reply's order.
     explains: Vec<usize>,
 }
 
-pub(super) async fn synthesize<A: Ask>(
-    agent: &A,
-    rules: &[Rule],
-    report: &Report,
-) -> Result<Option<Synthesis>> {
+pub(super) async fn synthesize<A: Ask>(agent: &A, report: &Report) -> Result<Option<Synthesis>> {
     if report.findings.is_empty() {
         return Ok(None);
     }
-    let prompt = brief(rules, report)?;
+    let prompt = brief(report)?;
     let schema = schema();
-    let question = Question {
+    let step = Step {
         level: ModelLevel::Frontier,
         system: LEAD,
-        prompt: &prompt,
-        schema: Some(&schema),
+        schema: &schema,
     };
-    let answer = agent.ask(&question).await?;
+    let answer = ask(agent, &step, &prompt).await?;
     let reply: Reply = serde_json::from_str(&answer.text)
         .with_context(|| format!("reply is not a synthesis: {}", answer.text))?;
 
-    let mut diagnoses = Vec::new();
-    for d in reply.diagnoses {
-        let Some(thing) = d.thing.checked_sub(1).filter(|t| *t < report.things.len()) else {
-            bail!(
-                "a diagnosis names T{}; there are {} things",
-                d.thing,
-                report.things.len()
-            );
-        };
-        diagnoses.push(Diagnosis {
-            thing,
-            diagnosis: d.diagnosis,
-            falls_out: d.falls_out,
-            explains: within(&d.explains, report.findings.len()),
-        });
-    }
+    let (findings, things) = (
+        Numbering::findings(report.findings.len()),
+        Numbering::things(report.things.len()),
+    );
+    let diagnosed = Numbering::diagnoses(reply.diagnoses.len());
+    let diagnoses = reply
+        .diagnoses
+        .into_iter()
+        .map(|d| {
+            Ok(Diagnosis {
+                thing: things
+                    .resolve(d.thing, ThingIx)
+                    .context("a diagnosis's thing")?,
+                diagnosis: d.diagnosis,
+                falls_out: d.falls_out,
+                explains: findings
+                    .resolve_all(&d.explains, FindingIx)
+                    .context("a diagnosis's findings")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let roots = reply
         .roots
         .into_iter()
-        .map(|r| Root {
-            root: r.root,
-            falls_out: r.falls_out,
-            explains: within(&r.explains, diagnoses.len()),
+        .map(|r| {
+            Ok(Root {
+                root: r.root,
+                falls_out: r.falls_out,
+                explains: diagnosed
+                    .resolve_all(&r.explains, DiagnosisIx)
+                    .context("a root's diagnoses")?,
+            })
         })
-        .collect();
+        .collect::<Result<_>>()?;
     Ok(Some(Synthesis {
         review: reply.review,
         diagnoses,
@@ -159,20 +164,12 @@ pub(super) async fn synthesize<A: Ask>(
     }))
 }
 
-/// Numbers from 1 as indexes below `count`; a number past it names nothing.
-fn within(numbers: &[usize], count: usize) -> Vec<usize> {
-    numbers
-        .iter()
-        .filter_map(|n| n.checked_sub(1).filter(|i| *i < count))
-        .collect()
-}
-
 /// The rules that found something, the things named, the outlines of their
 /// modules, then the findings by file, each numbered `F1`… in report order.
-fn brief(rules: &[Rule], report: &Report) -> Result<String> {
+fn brief(report: &Report) -> Result<String> {
     let mut brief = String::from("## Rules\n\n");
-    for rule in rules
-        .iter()
+    for rule in report
+        .rules()
         .filter(|r| report.findings.iter().any(|f| f.rule == r.id))
     {
         brief.push_str(&format!("- `{}`: {}\n", rule.id, rule.decision.question));
@@ -186,13 +183,17 @@ fn brief(rules: &[Rule], report: &Report) -> Result<String> {
         }
     }
 
+    let (findings, things) = (
+        Numbering::findings(report.findings.len()),
+        Numbering::things(report.things.len()),
+    );
     if !report.things.is_empty() {
         brief.push_str("\n## Things\n");
         for (n, t) in report.things.iter().enumerate() {
-            let symptoms: Vec<String> = t.explains.iter().map(|i| format!("F{}", i + 1)).collect();
+            let symptoms: Vec<String> = t.explains.iter().map(|i| findings.label(i.0)).collect();
             brief.push_str(&format!(
-                "\n### T{} — {}, {} — {}\n\nFrom first principles:\n{}\n\nSymptoms: {}\n",
-                n + 1,
+                "\n### {} — {}, {} — {}\n\nFrom first principles:\n{}\n\nSymptoms: {}\n",
+                things.label(n),
                 t.thing,
                 t.context,
                 t.component.display(),
@@ -212,12 +213,12 @@ fn brief(rules: &[Rule], report: &Report) -> Result<String> {
             .push((index, finding));
     }
     brief.push_str("\n## Findings\n");
-    for (path, findings) in by_file {
+    for (path, in_file) in by_file {
         brief.push_str(&format!("\n### {}\n\n", path.display()));
-        for (index, f) in findings {
+        for (index, f) in in_file {
             brief.push_str(&format!(
-                "- F{} line {} [{}/{}]: {}\n",
-                index + 1,
+                "- {} line {} [{}/{}]: {}\n",
+                findings.label(index),
                 f.line,
                 f.rule,
                 f.outcome,
@@ -244,7 +245,7 @@ fn outlines(report: &Report) -> Result<String> {
             thing
                 .explains
                 .iter()
-                .map(|&i| report.findings[i].path.as_path()),
+                .map(|&i| report.finding(i).path.as_path()),
         );
     }
     let mut modules: Vec<(&Path, Vec<&Path>)> = symptoms.into_iter().collect();
@@ -254,10 +255,7 @@ fn outlines(report: &Report) -> Result<String> {
     let mut left = MAX_SHAPE_LINES;
     for (component, paths) in modules {
         if left == 0 {
-            outlines.push_str(&format!(
-                "== {} == (omitted: over budget)\n",
-                component.display()
-            ));
+            outlines.push_str(&omitted(component));
             continue;
         }
         let (shape, used) = shape(component, paths.into_iter(), left)?;

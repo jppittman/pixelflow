@@ -25,7 +25,6 @@
 //!
 //! FnItem
 //!   ├── vis                           // `pub` makes an entry; private is a helper
-//!   ├── structural: [name, ...]       // an entry's `const N: usize` parameters
 //!   ├── params: [(name, type), ...]   // scalar, record and kernel parameters
 //!   ├── ret: type                     // declared
 //!   └── body: Expr
@@ -89,7 +88,7 @@
 //! /// other function spelling is `Misspelled(what differs)`; `NotOne` otherwise.
 //! impl FunctionType { fn of(ty: &Type) -> FunctionType; }
 //! /// The one bare name a type is, through a macro's invisible group; `None` for `::p`, a qself, generics.
-//! fn bare_name(ty: &Type) -> Option<&Ident>;  fn is_f32(ty: &Type) -> bool;  fn is_usize(ty: &Type) -> bool;
+//! fn bare_name(ty: &Type) -> Option<&Ident>;  fn is_f32(ty: &Type) -> bool;
 //!
 //! /// A name as the language compares it: `Eq` and `Hash` on the identifier without its `r#`.
 //! impl Name {
@@ -152,7 +151,7 @@ pub(crate) use expr::{
 };
 pub(crate) use name::{LibraryMethod, Method, Name, Projection, same_name};
 pub(crate) use scopes::Scopes;
-pub(crate) use types::{FunctionType, bare_name, is_f32, is_usize};
+pub(crate) use types::{FunctionType, bare_name, is_f32};
 
 /// The plan that owns the constructs the front end refuses by phase: a
 /// refusal of one names the phase that brings it.

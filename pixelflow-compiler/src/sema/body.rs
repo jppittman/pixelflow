@@ -16,7 +16,7 @@ use super::analyze::{
     ConstValue, Items, MethodTyping, RETIRED_COORDINATES, RETIRED_PROJECTION, Signature, Ty,
     method_typing, term_type,
 };
-use super::consts::{RangeScope, folds_nested_too_deep, range_bounds};
+use super::consts::{RangeScope, bound_names, folds_nested_too_deep, range_bounds};
 
 /// The binding class of a symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,10 +31,6 @@ enum SymbolKind {
 
     /// A `const` item, evaluated at expansion.
     Const,
-
-    /// An entry's structural parameter (`const N: usize`): a count, fixed
-    /// when its host function is instantiated.
-    Structural,
 
     /// Local variable introduced by `let`.
     /// Scoped to the containing block.
@@ -59,8 +55,6 @@ pub(super) struct FnAnalyzer<'a> {
     items: &'a Items<'a>,
     /// The `const`s' values, which a fold's bounds are evaluated over.
     consts: &'a HashMap<Name, ConstValue>,
-    /// The `fn`'s structural parameters, which a fold's bounds may name.
-    structural: &'a [Ident],
     role: Role,
     /// What the body is checked against: the `fn`'s name and declared return
     /// type, or nothing for the closure form, whose type is inferred.
@@ -81,7 +75,7 @@ pub(super) struct FnAnalyzer<'a> {
 
 impl<'a> FnAnalyzer<'a> {
     /// The scope a body opens in: the coordinates, the block's `const`s, and
-    /// the `fn`'s own structural and scalar parameters.
+    /// the `fn`'s own parameters.
     pub(super) fn new(
         f: Callable<'a>,
         items: &'a Items<'a>,
@@ -90,7 +84,6 @@ impl<'a> FnAnalyzer<'a> {
         let mut analyzer = FnAnalyzer {
             items,
             consts,
-            structural: f.structural,
             role: f.role,
             declared: f.name.map(|name| (name, items.fns[&Name::of(name)].ret)),
             body: f.body,
@@ -115,9 +108,6 @@ impl<'a> FnAnalyzer<'a> {
                     ty,
                 },
             );
-        }
-        for count in f.structural {
-            analyzer.register_structural(count)?;
         }
         for param in f.params {
             let ty = items.param_type(param, f.role)?;
@@ -166,31 +156,8 @@ impl<'a> FnAnalyzer<'a> {
         Ok(())
     }
 
-    /// Register one of an entry's structural parameters: a count, which a
-    /// range's bounds may name and a body converts by `N as f32`.
-    fn register_structural(&mut self, count: &Ident) -> syn::Result<()> {
-        let name = Name::of(count);
-        let declared = self.symbols.lookup(&name).map(|symbol| symbol.kind);
-        if declared == Some(SymbolKind::Structural) {
-            return Err(syn::Error::new(
-                count.span(),
-                format!("the structural parameter `{name}` is declared twice"),
-            ));
-        }
-        self.refuse_shadowing_an_item(count, "a structural parameter")?;
-        self.symbols.bind(
-            name,
-            Symbol {
-                kind: SymbolKind::Structural,
-                ty: Ty::Usize,
-            },
-        );
-        Ok(())
-    }
-
     /// A parameter or a `let` may not take the name of a coordinate, a
-    /// projection, a `const`, a structural parameter or a `fn` — rustc
-    /// refuses a binding that shadows a const generic, too. A `let` may
+    /// projection, a `const` or a `fn`. A `let` may
     /// shadow a parameter or another `let`, as Rust's does.
     ///
     /// A projection because a call is resolved by its name: a kernel named
@@ -229,7 +196,6 @@ impl<'a> FnAnalyzer<'a> {
         }
         let shadowed = match self.symbols.lookup(&key).map(|s| s.kind) {
             Some(SymbolKind::Const) => Some(format!("the `const {text}` of this block")),
-            Some(SymbolKind::Structural) => Some(format!("the structural parameter `{text}`")),
             _ => None,
         };
         if let Some(shadowed) = shadowed {
@@ -346,12 +312,11 @@ impl<'a> FnAnalyzer<'a> {
         ))
     }
 
-    /// The bounds a fold's range may name: the block's `usize` consts and
-    /// this `fn`'s structural parameters.
+    /// The bounds a fold's range may name: the block's `usize` consts,
+    /// enclosing indices and entry count parameters.
     fn range_scope(&self) -> RangeScope<'a> {
         RangeScope {
             consts: self.consts,
-            structural: self.structural,
         }
     }
 
@@ -361,7 +326,45 @@ impl<'a> FnAnalyzer<'a> {
     /// body sees every enclosing binding, an enclosing fold's index among
     /// them, as a Rust closure does.
     fn type_of_fold(&mut self, fold: &FoldExpr) -> syn::Result<Ty> {
-        range_bounds(&fold.range, self.range_scope())?;
+        for name in bound_names(&fold.range.lo)
+            .into_iter()
+            .chain(bound_names(&fold.range.hi))
+        {
+            let Some(symbol) = self.symbols.lookup(&Name::of(name)) else {
+                return Err(syn::Error::new(
+                    name.span(),
+                    format!("`{name}` is not in scope as a range bound"),
+                ));
+            };
+            if symbol.ty != Ty::Usize {
+                return Err(syn::Error::new(
+                    name.span(),
+                    format!(
+                        "`{name}` is a `{}`, where a range bound is a `usize` count",
+                        self.items.name_of(symbol.ty)
+                    ),
+                ));
+            }
+        }
+        let bounds = range_bounds(&fold.range, self.range_scope())?;
+        if matches!(
+            fold.reduction,
+            crate::ast::Reduction::Any | crate::ast::Reduction::All
+        ) {
+            if let Some(name) = bounds.iter().find_map(super::consts::Count::name) {
+                return Err(syn::Error::new(
+                    name.span(),
+                    format!(
+                        "`{}` over a range bounded by `{name}`, a value: `any` and `all` require bounds known at expansion",
+                        if fold.reduction == crate::ast::Reduction::Any {
+                            "any"
+                        } else {
+                            "all"
+                        }
+                    ),
+                ));
+            }
+        }
         if self.folds_open >= Binder::COUNT {
             return Err(folds_nested_too_deep(fold.span));
         }
@@ -416,7 +419,7 @@ impl<'a> FnAnalyzer<'a> {
                 "`as f32` converts a `usize`, and this expression's type is `{}`\n\
                  \n\
                  note: {why}\n\
-                 note: a `usize` is a fold's index, a `usize` const or a structural parameter, \
+                 note: a `usize` is a fold's index, a `usize` const or an entry count parameter, \
                  converted by name: `i as f32`",
                 self.items.name_of(found)
             ),
@@ -561,9 +564,33 @@ impl<'a> FnAnalyzer<'a> {
     fn type_of_method_call(&mut self, call: &MethodCallExpr) -> syn::Result<Ty> {
         match call.method {
             Method::Clone => self.type_of(&call.receiver),
+            Method::At => self.type_of_at(call),
             Method::Op(op) => self.check_op_method(op, call),
             Method::Library(_) => self.all_f32(call, &format!("`.{}` takes `f32`s", call.name)),
         }
+    }
+
+    /// A field observed at another point keeps its receiver's type.
+    fn type_of_at(&mut self, call: &MethodCallExpr) -> syn::Result<Ty> {
+        let [x, y] = call.args.as_slice() else {
+            unreachable!("Method::At resolves only at two arguments")
+        };
+        let field = self.type_of(&call.receiver)?;
+        match field {
+            Ty::F32 | Ty::Bool => {}
+            Ty::Usize => unreachable!("a count is refused when named in a value position"),
+            Ty::Kernel => {
+                return Err(syn::Error::new(
+                    call.name.span(),
+                    "a kernel is observed by applying it: `k(x, y)` is `k` at `(x, y)`, which is what `k.at(x, y)` would mean",
+                ));
+            }
+            Ty::Record(record) => return Err(self.record_is_not_a_value(&call.receiver, record)),
+        }
+        let what = "`.at` observes a field at two `f32` coordinates";
+        self.expect(x, Ty::F32, what)?;
+        self.expect(y, Ty::F32, what)?;
+        Ok(field)
     }
 
     /// The operands of an `OpKind` method against its typing.
@@ -977,7 +1004,7 @@ impl<'a> FnAnalyzer<'a> {
 }
 
 /// A `usize` where a value is expected. A `usize` — a fold's index, a
-/// `usize` const or a structural parameter — is a value only as `i as f32`:
+/// `usize` const or an entry count parameter — is a value only as `i as f32`:
 /// nothing in the language computes with one, because there is nothing to
 /// index (plan §1.6).
 pub(super) fn a_count_is_not_a_value(name: &Ident) -> syn::Error {
@@ -986,7 +1013,7 @@ pub(super) fn a_count_is_not_a_value(name: &Ident) -> syn::Error {
         format!(
             "mismatched types: `{name}` is a `usize`, where a value is expected\n\
              \n\
-             note: a `usize` (a fold's index, a `usize` const or a structural parameter) \
+             note: a `usize` (a fold's index, a `usize` const or an entry count parameter) \
              becomes a value by an explicit conversion, `{name} as f32`, and by nothing else: \
              there is no arithmetic on a `usize`, no comparison of one, and no table to index \
              (§1.6 of {PLAN})\n\

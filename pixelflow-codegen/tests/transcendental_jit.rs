@@ -10,7 +10,7 @@
 //! semantics — the bytes must also be right.
 
 use pixelflow_codegen::jit_cache;
-use pixelflow_ir::Kernel;
+use pixelflow_ir::{ExprArena, Kernel, Lit};
 
 /// One point of a kernel compiled at [`pixelflow_ir::LatticeShape::POINT`],
 /// read back through the origin block.
@@ -106,7 +106,14 @@ fn assert_tiers_agree_binary(
 
     let results = eval_points(&jit, &inputs);
     for (&(x, y), got) in inputs.iter().zip(results) {
-        let want = op.eval_binary(x, y).expect("oracle covers this op");
+        // The oracle answers with a typed literal and the JIT wrote a lane, so
+        // the comparison is in the lane the literal tabulates to: a real's bits,
+        // a mask's all-ones or all-zero (`Lit::bits`). `Lit::real` would refuse
+        // the comparisons' masks, which is the very answer this test pins.
+        let want = op
+            .eval_binary(Lit::Real(x), Lit::Real(y))
+            .map(|lit| f32::from_bits(lit.bits()))
+            .expect("oracle covers this op");
         assert!(
             agree(got, want),
             "{name}({x}, {y}): JIT gave {got} ({:#010x}), oracle gave {want} ({:#010x}) — \
@@ -178,11 +185,23 @@ fn a_folded_mask_blends_like_a_computed_one() {
     // The folder's answer for `0.5 != nextafter(0.5)` — true, and (since the
     // epsilon fix) reachable for ordinary finite values.
     let near = f32::from_bits(0.5f32.to_bits() + 1);
-    let folded = OpKind::Ne.eval_binary(0.5, near).expect("oracle covers Ne");
+    let folded = OpKind::Ne
+        .eval_binary(Lit::Real(0.5), Lit::Real(near))
+        .expect("oracle covers Ne");
+    assert_eq!(
+        folded,
+        Lit::Mask(true),
+        "the folder's answer is a mask, not a float"
+    );
+    // The literal, as the folder would leave it in an arena: a mask constant,
+    // with no float spelling anywhere.
+    let mut arena = ExprArena::new();
+    let root = arena.push_lit(folded);
+    let folded = Kernel::from_parts(arena, root);
 
     let k = Kernel::x()
         .gt(&Kernel::constant(0.0))
-        .and(&Kernel::constant(folded))
+        .and(&folded)
         .select(&Kernel::constant(7.0), &Kernel::constant(9.0));
     let jit = jit_cache::compile(&k, pixelflow_ir::LatticeShape::POINT)
         .expect("mask kernel compiles")
@@ -213,7 +232,10 @@ fn round_agrees_between_tiers_away_from_ties() {
     assert!(OpKind::Round.fold_is_platform_specific(&[2.5]));
     for x in [2.4f32, 2.6, -2.4, -2.6, 0.2, 7.0, -7.0] {
         let got = eval_point(&jit, x, 0.0);
-        let want = OpKind::Round.eval_unary(x).expect("oracle covers Round");
+        let want = OpKind::Round
+            .eval_unary(Lit::Real(x))
+            .and_then(Lit::real)
+            .expect("oracle covers Round");
         assert_eq!(got, want, "round({x}): JIT {got} vs oracle {want}");
     }
 }
@@ -258,9 +280,12 @@ fn platform_specific_ops_are_classified() {
         !OpKind::MulAdd.fold_is_platform_specific(&fused_differs),
         "a rounding difference is inside the contract and must not block a fold"
     );
+    let [a, b, c] = fused_differs.map(Lit::Real);
     assert_eq!(
-        OpKind::MulAdd.eval_ternary(fused_differs[0], fused_differs[1], fused_differs[2]),
-        Some(fused_differs[0].mul_add(fused_differs[1], fused_differs[2])),
+        OpKind::MulAdd.eval_ternary(a, b, c),
+        Some(Lit::Real(
+            fused_differs[0].mul_add(fused_differs[1], fused_differs[2])
+        )),
         "the folder's answer is the single-rounding one, whatever profile built it"
     );
 }
@@ -281,31 +306,16 @@ fn eq_ne_are_exact_not_epsilon() {
         "and closer than EPSILON"
     );
 
-    let t = OpKind::mask(true);
-    let f = OpKind::mask(false);
-    assert_eq!(
-        OpKind::Eq.eval_binary(0.5, near).map(f32::to_bits),
-        Some(f.to_bits())
-    );
-    assert_eq!(
-        OpKind::Ne.eval_binary(0.5, near).map(f32::to_bits),
-        Some(t.to_bits())
-    );
-    assert_eq!(
-        OpKind::Eq.eval_binary(0.5, 0.5).map(f32::to_bits),
-        Some(t.to_bits())
-    );
+    let (t, f) = (Lit::Mask(true), Lit::Mask(false));
+    let (half, near) = (Lit::Real(0.5), Lit::Real(near));
+    assert_eq!(OpKind::Eq.eval_binary(half, near), Some(f));
+    assert_eq!(OpKind::Ne.eval_binary(half, near), Some(t));
+    assert_eq!(OpKind::Eq.eval_binary(half, half), Some(t));
 
     // NaN: never equal, always unequal — agreed by every emitter.
-    let nan = f32::NAN;
-    assert_eq!(
-        OpKind::Eq.eval_binary(nan, nan).map(f32::to_bits),
-        Some(f.to_bits())
-    );
-    assert_eq!(
-        OpKind::Ne.eval_binary(nan, nan).map(f32::to_bits),
-        Some(t.to_bits())
-    );
+    let nan = Lit::Real(f32::NAN);
+    assert_eq!(OpKind::Eq.eval_binary(nan, nan), Some(f));
+    assert_eq!(OpKind::Ne.eval_binary(nan, nan), Some(t));
 
     // `Kernel` exposes no eq/ne constructor, so there is no JIT side to compare
     // against here — the folder IS the consumer that was wrong, and these
@@ -436,7 +446,8 @@ fn a_negative_zero_shift_count_is_the_count_zero() {
             for x in lanes {
                 let got = eval_point(jit, x, 0.0);
                 let oracle = op
-                    .eval_binary(x, -0.0)
+                    .eval_binary(Lit::Real(x), Lit::Real(-0.0))
+                    .and_then(Lit::real)
                     .expect("the oracle covers the shifts");
                 assert_eq!(
                     got.to_bits(),

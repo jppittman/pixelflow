@@ -372,7 +372,7 @@ pub(crate) enum Reduction {
 /// `operand as f32`, the language's one conversion. The target is always
 /// `f32` — the parser refuses any other — so it is not stored. `sema`
 /// accepts one operand: a `usize`, by name, a fold's index, a `usize` const
-/// or an entry's structural parameter.
+/// or an entry's per-call count parameter.
 #[derive(Debug, Clone)]
 pub(crate) struct CastExpr {
     pub(crate) operand: Box<Expr>,
@@ -384,7 +384,7 @@ impl CastExpr {
     /// The name being converted, through any parentheses, or `None` if the
     /// operand is not a name. Only a name can be a `usize`: nothing in a
     /// body computes one (plan §1.6), so a `usize` expression is always a
-    /// fold's index, a `usize` const or a structural parameter.
+    /// fold's index, a `usize` const or an entry count parameter.
     pub(crate) fn named(&self) -> Option<&Ident> {
         self.operand.named()
     }

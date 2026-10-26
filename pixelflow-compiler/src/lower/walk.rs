@@ -1,14 +1,15 @@
 //! The one walk from an entry's AST to a term at a [`Site`]: bindings in
 //! scope, helpers inlined, `const`s folded, each fold one `Reduce`.
 
-use super::Site;
+use super::{FoldBound, Site};
 use crate::ast::{
     BinaryOp, BlockExpr, Callable, CastExpr, Expr, FieldExpr, FnItem, FoldExpr, LetStmt,
     LibraryMethod, Method, MethodCallExpr, Name, ProjectExpr, Projection, RecordId, Reduction,
     Role, Scopes, Stmt, UnaryOp, same_name,
 };
 use crate::sema::{
-    AnalyzedKernel, ConstValue, Parameter, RangeScope, Scalar, folds_nested_too_deep, range_bounds,
+    AnalyzedKernel, ConstValue, Count, Parameter, RangeScope, Scalar, folds_nested_too_deep,
+    range_bounds,
 };
 use pixelflow_ir::arena::Axis;
 use pixelflow_ir::{Binder, Monoid, OpKind};
@@ -43,7 +44,7 @@ enum Binding<T, A> {
     Value(T),
     /// A fold's index, a `usize`: its placeholder `Var` while the fold's
     /// body is built. A body reads it only as `i as f32`.
-    Index(T),
+    Count(T),
     /// A record: its fields' nodes, in field order — an entry's record
     /// parameter's uniforms, a helper's record argument, or a `let` alias of
     /// either. A record has no node of its own.
@@ -99,6 +100,10 @@ pub(crate) fn lower_entry<S: Site>(
                 name,
                 Binding::Value(site.uniform(Scalar::Param(name.clone()))),
             ),
+            Parameter::Count(name) => (
+                name,
+                Binding::Count(site.uniform(Scalar::Count(name.clone()))),
+            ),
             Parameter::Record { name, id, fields } => {
                 let uniforms = fields
                     .iter()
@@ -117,7 +122,6 @@ pub(crate) fn lower_entry<S: Site>(
         program: Program { analyzed, helpers },
         frame: Frame {
             role: entry.role,
-            structural: entry.structural,
             locals,
         },
         site,
@@ -133,23 +137,21 @@ struct Program<'a> {
     helpers: HashMap<Name, &'a FnItem>,
 }
 
-/// The function being lowered: its structural parameters, and the bindings
+/// The function being lowered: the bindings
 /// in scope — its parameters in the function's own scope, then the
 /// `let`-bound locals and fold indices of the blocks being walked (one scope
 /// per block, and one per fold body, with Rust's lexical scoping). An
 /// entry's parameters are bound to their uniforms and admitted arguments; an
 /// inlined helper's, to its argument nodes and the kernels passed to it.
-struct Frame<'a, S: Site> {
+struct Frame<S: Site> {
     role: Role,
-    /// An entry's structural parameters; a helper has none.
-    structural: &'a [Ident],
     locals: Scopes<Binding<S::Term, S::Argument>>,
 }
 
 /// State threaded through the AST → term walk.
 struct Lowering<'a, S: Site> {
     program: Program<'a>,
-    frame: Frame<'a, S>,
+    frame: Frame<S>,
     site: &'a mut S,
     /// How many folds' bodies are being built, across inlined helpers too:
     /// the depth that picks the next one's placeholder.
@@ -260,7 +262,7 @@ impl<S: Site> Lowering<'_, S> {
     }
 
     /// `⊕_{i ∈ [lo, hi)} body` as one `Reduce` over its [`pixelflow_ir::Fold`]: a
-    /// known range, or one naming the entry's structural parameters.
+    /// known range, or one whose ends are value counts.
     ///
     /// The body is built against the fold's index, a placeholder, and the
     /// fold is closed after it, by the IR's one definition of how a binder
@@ -269,10 +271,31 @@ impl<S: Site> Lowering<'_, S> {
     fn lower_fold(&mut self, fold: &FoldExpr) -> syn::Result<S::Term> {
         let scope = RangeScope {
             consts: &self.program.analyzed.consts,
-            structural: self.frame.structural,
         };
-        let bounds = range_bounds(&fold.range, scope)
-            .expect("sema refuses a range it cannot evaluate, admit or order");
+        let counts = range_bounds(&fold.range, scope)?;
+        let bound = |count: Count| -> syn::Result<FoldBound<S::Term>> {
+            match count {
+                Count::Known(value) => Ok(FoldBound::Known(value)),
+                Count::Name(name) => {
+                    let Binding::Count(term) =
+                        self.frame.locals.lookup(&Name::of(&name)).ok_or_else(|| {
+                            syn::Error::new(
+                                name.span(),
+                                format!("`{name}` is not bound as a count"),
+                            )
+                        })?
+                    else {
+                        return Err(syn::Error::new(
+                            name.span(),
+                            format!("`{name}` is not a count bound"),
+                        ));
+                    };
+                    Ok(FoldBound::Value(term.clone()))
+                }
+            }
+        };
+        let [lo, hi] = counts;
+        let bounds = [bound(lo)?, bound(hi)?];
         // One placeholder per fold open at once, the `n`th for `n` open, so a
         // nested fold's rename never reaches its enclosing fold's index. No
         // more open than the IR has binders: the refusal names the depth,
@@ -287,7 +310,7 @@ impl<S: Site> Lowering<'_, S> {
         self.frame.locals.push_scope();
         self.frame
             .locals
-            .bind(Name::of(&fold.binder), Binding::Index(index));
+            .bind(Name::of(&fold.binder), Binding::Count(index));
         self.open_folds += 1;
         let body = self.lower(&fold.body);
         self.open_folds -= 1;
@@ -297,25 +320,16 @@ impl<S: Site> Lowering<'_, S> {
 
     /// `i as f32`. A fold's index is an `f32` lane already, so its
     /// conversion is its binder's `Var`; a `usize` const is its value's
-    /// `f32`, rounded as Rust's `as` rounds it; a structural parameter is the
-    /// site's [`Site::count`], the same `N as f32` its host function has.
+    /// `f32`, rounded as Rust's `as` rounds it.
     fn lower_cast(&mut self, cast: &CastExpr) -> syn::Result<S::Term> {
         let name = cast
             .named()
             .expect("sema refuses an `as f32` of anything but a name");
         if let Some(binding) = self.frame.locals.lookup(&Name::of(name)) {
-            let Binding::Index(index) = binding else {
+            let Binding::Count(index) = binding else {
                 unreachable!("sema refuses `{name} as f32` where `{name}` is no `usize`");
             };
             return Ok(index.clone());
-        }
-        if let Some(position) = self
-            .frame
-            .structural
-            .iter()
-            .position(|n| same_name(n, name))
-        {
-            return self.site.count(position, name);
         }
         let Some(&ConstValue::Usize(count)) = self.program.analyzed.consts.get(&Name::of(name))
         else {
@@ -348,7 +362,7 @@ impl<S: Site> Lowering<'_, S> {
     fn record_named(&self, expr: &Expr) -> Option<RecordFields<S::Term>> {
         match self.frame.locals.lookup(&Name::of(expr.named()?))? {
             Binding::Record(record, fields) => Some((*record, Rc::clone(fields))),
-            Binding::Value(_) | Binding::Index(_) | Binding::Kernel(_) => None,
+            Binding::Value(_) | Binding::Count(_) | Binding::Kernel(_) => None,
         }
     }
 
@@ -357,7 +371,7 @@ impl<S: Site> Lowering<'_, S> {
     fn kernel_named(&self, expr: &Expr) -> Option<S::Argument> {
         match self.frame.locals.lookup(&Name::of(expr.named()?))? {
             Binding::Kernel(kernel) => Some(kernel.clone()),
-            Binding::Value(_) | Binding::Index(_) | Binding::Record(..) => None,
+            Binding::Value(_) | Binding::Count(_) | Binding::Record(..) => None,
         }
     }
 
@@ -375,6 +389,7 @@ impl<S: Site> Lowering<'_, S> {
         Ok(match call.method {
             // Arena expressions are values, so `.clone()` is the identity.
             Method::Clone => receiver,
+            Method::At => self.site.warp(receiver, [operand(), operand()]),
             // Primitive ops: one `OpKind` per (name, arity), read from the
             // single table `OpKind::from_method_call` resolves against.
             Method::Op(op) => match call.args.len() {
@@ -412,7 +427,7 @@ impl<S: Site> Lowering<'_, S> {
     /// The arguments are lowered in the caller's frame, once each, so an
     /// argument used twice in the body is one node. The body is lowered in a
     /// frame of its own: the helper's parameters are its base scope, and
-    /// nothing of the caller's — no local, no entry parameter, no structural
+    /// nothing of the caller's — no local or entry parameter
     /// parameter — is visible.
     fn inline(&mut self, helper: &FnItem, args: &[Expr]) -> syn::Result<S::Term> {
         assert_eq!(
@@ -432,7 +447,6 @@ impl<S: Site> Lowering<'_, S> {
         }
         let callee = Frame {
             role: Role::Helper,
-            structural: &[],
             locals,
         };
         // The frame is swapped and the fold depth is not: a helper's fold
@@ -464,8 +478,8 @@ impl<S: Site> Lowering<'_, S> {
             };
             return Ok(id.clone());
         }
-        // The same order sema documents: a binding, then a const, then a
-        // structural parameter, then the coordinates. Sema refuses a
+        // The same order sema documents: a binding, then a const, then
+        // the coordinates. Sema refuses a
         // parameter named X or Y, so the two stages agree without one
         // relying on the other's refusal.
         match self.program.analyzed.consts.get(name) {
@@ -475,10 +489,6 @@ impl<S: Site> Lowering<'_, S> {
             }
             None => {}
         }
-        assert!(
-            !self.frame.structural.iter().any(|n| Name::of(n) == *name),
-            "sema refuses the structural parameter `{name}` read as a value"
-        );
         let axis = name
             .coordinate()
             .unwrap_or_else(|| unreachable!("sema refuses the unknown name `{name}`"));

@@ -427,7 +427,7 @@ fn node_label(egraph: &EGraph, class: EClassId, idx: usize) -> String {
     };
     match node {
         ENode::Var(i) => format!("Var({i})"),
-        ENode::Const(bits) => format!("Const({})", f32::from_bits(*bits)),
+        ENode::Const(lit) => format!("Const({lit})"),
         ENode::Buffer(_) => "Buffer".into(),
         ENode::Uniform(_) => "Uniform".into(),
         ENode::Param(i) => format!("Param({i})"),
@@ -439,8 +439,12 @@ fn node_label(egraph: &EGraph, class: EClassId, idx: usize) -> String {
                 .collect();
             format!("{}({})", op.name(), cs.join(","))
         }
-        ENode::Reduce { fold, body } => {
-            format!("Reduce[{fold}]({})", egraph.find(*body).index())
+        ENode::Reduce { header, children } => {
+            let cs: Vec<String> = children
+                .iter()
+                .map(|&c| egraph.find(c).index().to_string())
+                .collect();
+            format!("Reduce[{header}]({})", cs.join(","))
         }
         ENode::Shift {
             direction,

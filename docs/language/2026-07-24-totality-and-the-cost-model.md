@@ -105,13 +105,20 @@ ground and monomorphic.
 
 ## One discipline, four faces
 
-Totality is the single rule — *every domain and every iteration count is a
-static natural number* — showing up in four places:
+Totality is the single rule — *every domain and every iteration count is fixed
+before the loop it bounds starts, and none is a function of a coordinate* — showing
+up in four places. A fold's bounds are each a literal, a value known per call
+(a uniform, so one program serves every count), or an enclosing fold's index,
+so its count is known per call, or once per trip of the enclosing
+fold whose index a bound is ([a bound is a
+value](2026-10-20-a-bound-is-a-value.md)). The other three faces are static
+natural numbers: that plan's B1 makes the discrete-domain and typed-field
+extents values known per call, and bounded iteration's trip count stays static.
 
-| Face | The static nat |
+| Face | Fixed before its loop starts |
 |---|---|
-| discrete domains | extent known at bake |
-| reduction binder `⊕_{i∈D}` | `|D|` static |
+| discrete domains | extent known at bake (static) |
+| reduction binder `⊕_{i∈D}` | `\|D\|`, each bound a literal, a value known per call, or an enclosing fold's index |
 | bounded iteration (the "fixpoint") | trip count static |
 | typed fields | ground extents |
 
@@ -193,11 +200,14 @@ the body, not a new primitive type.)
   job is to *surface* that — a program can be perfectly total and estimated as
   "over budget." Totality gives a number; the budget decides if the number is
   acceptable.
-- **Dynamic behavior survives; only dynamic *bounds* die.** Data-dependent loop
-  counts (ray-march until you hit the surface) become **static max + early-out**:
-  iterate up to `N`, mask off finished lanes. Behavior is data-dependent; cost
-  is the static worst case `N`, which is what the model charges. This is the
-  same trick GPUs already play, so almost no expressiveness is lost.
+- **Dynamic behavior survives; only coordinate-dependent *bounds* die.** A
+  per-call count is a value, not a static max: `Σ_{k<n}` with `n` a uniform is
+  one program for every `n`, priced at the cost model's estimate ([a bound is a
+  value](2026-10-20-a-bound-is-a-value.md) §1.5). A count that varies with the
+  pixel (ray-march until you hit the surface) still becomes **static max +
+  early-out**: iterate up to `N`, mask off finished lanes, and the cost is the
+  static worst case `N`. This is the same trick GPUs already play, so almost no
+  expressiveness is lost.
 
 ## Consequences for the design (the things not to redesign later)
 
@@ -211,6 +221,8 @@ the body, not a new primitive type.)
    lattice becomes the typed discrete field; iteration is a separate, orthogonal
    construct.
 5. Every eliminator that could iterate (`⊕_{i∈D}`, `iterate[N]`, field reify)
-   carries its bound as a static nat, so the cost walk is closed-form.
+   carries a bound fixed before its loop starts, never a coordinate: a
+   fold's bounds are each a literal, a per-call value or an enclosing fold's
+   index, so the cost walk is closed-form in values known per call.
 6. Build the cost model as a re-denotation of the arena into the cost semiring,
    reusing the extents the field types already carry.

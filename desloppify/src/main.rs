@@ -11,8 +11,8 @@ use desloppify::agent::{self, Ask, Usage};
 use desloppify::decide::{self, Decide};
 use desloppify::model::Provider;
 use desloppify::rate_limit::{self, AdaptiveConfig, RateLimiter, SystemClock, TokenBucketConfig};
-use desloppify::review::{Call, Report, Reviewers, Synthesis, identify, plan, review, synthesize};
-use desloppify::rule::{self, Rule};
+use desloppify::review::{Call, DEFAULT_MIN_CONFIDENCE, Report, Session, Synthesis, plan};
+use desloppify::rule;
 use desloppify::skills;
 
 const SECONDS_PER_MINUTE: f64 = 60.0;
@@ -71,8 +71,8 @@ struct Args {
     backend: Backend,
     #[arg(long, value_enum, default_value_t = SystemOne::None)]
     system_one: SystemOne,
-    /// System One answers below this confidence go to the model.
-    #[arg(long, default_value_t = 0.7)]
+    /// System One answers below this confidence (0 to 1) go to the model.
+    #[arg(long, default_value_t = DEFAULT_MIN_CONFIDENCE)]
     min_confidence: f64,
     #[arg(long, value_enum, default_value_t = Limiter::Adaptive)]
     limiter: Limiter,
@@ -115,19 +115,19 @@ struct Args {
 async fn main() -> Result<ExitCode> {
     let args = Args::parse();
     let skills = skills::load(&args.skills)?;
-    let rules = Arc::new(rule::load_dir(&args.rules, &skills)?);
+    let rules = rule::load_dir(&args.rules, &skills)?;
 
     let mut files = Vec::new();
     for path in &args.paths {
         collect(path, &mut files)?;
     }
-    let plan = plan(&rules, &files)?;
+    let calls = plan(rules, &files)?;
 
     match args.backend {
-        Backend::Anthropic => with(api(Provider::Anthropic, &args)?, &args, rules, plan).await,
-        Backend::Gemini => with(api(Provider::Gemini, &args)?, &args, rules, plan).await,
-        Backend::ClaudeCode => with(agent::claude_code(args.jobs), &args, rules, plan).await,
-        Backend::DryRun => with(agent::dry_run(), &args, rules, plan).await,
+        Backend::Anthropic => with(api(Provider::Anthropic, &args)?, &args, calls).await,
+        Backend::Gemini => with(api(Provider::Gemini, &args)?, &args, calls).await,
+        Backend::ClaudeCode => with(agent::claude_code(args.jobs), &args, calls).await,
+        Backend::DryRun => with(agent::dry_run(), &args, calls).await,
     }
 }
 
@@ -135,56 +135,34 @@ fn api(provider: Provider, args: &Args) -> Result<impl Ask> {
     agent::from_env(provider, limiter(args), args.jobs)
 }
 
-async fn with<A: Ask>(
-    ask: A,
-    args: &Args,
-    rules: Arc<Vec<Rule>>,
-    plan: Vec<Call>,
-) -> Result<ExitCode> {
+async fn with<A: Ask>(ask: A, args: &Args, calls: Vec<Call>) -> Result<ExitCode> {
     let Some(out) = &args.out else {
-        return deciding(ask, args, rules, plan).await;
+        return deciding(ask, args, calls).await;
     };
     std::fs::create_dir_all(out)?;
     let journaled = agent::journaled(ask, &out.join(JOURNAL))?;
-    deciding(journaled, args, rules, plan).await
+    deciding(journaled, args, calls).await
 }
 
-async fn deciding<A: Ask>(
-    ask: A,
-    args: &Args,
-    rules: Arc<Vec<Rule>>,
-    plan: Vec<Call>,
-) -> Result<ExitCode> {
+async fn deciding<A: Ask>(ask: A, args: &Args, calls: Vec<Call>) -> Result<ExitCode> {
     match args.system_one {
-        SystemOne::None => run(ask, decide::none(), args, (rules, plan)).await,
+        SystemOne::None => run(Session::new(ask, decide::none()), args, calls).await,
         SystemOne::Jev => {
-            run(
-                ask,
-                decide::jev(decide::JevConfig::from_env(args.jobs)?),
-                args,
-                (rules, plan),
-            )
-            .await
+            let jev = decide::jev(decide::JevConfig::from_env(args.jobs)?);
+            run(Session::new(ask, jev), args, calls).await
         }
-        SystemOne::DryRun => run(ask, decide::dry_run(), args, (rules, plan)).await,
+        SystemOne::DryRun => run(Session::new(ask, decide::dry_run()), args, calls).await,
     }
 }
 
 async fn run<A: Ask, D: Decide>(
-    ask: A,
-    decide: D,
+    session: Session<A, D>,
     args: &Args,
-    (rules, plan): (Arc<Vec<Rule>>, Vec<Call>),
+    calls: Vec<Call>,
 ) -> Result<ExitCode> {
-    let reviewers = Arc::new(Reviewers {
-        ask,
-        decide,
-        min_confidence: args.min_confidence,
-    });
-    let mut report = review(reviewers.clone(), rules.clone(), plan).await?;
-    let identified = identify(&reviewers.ask, &report).await?;
-    report.things = identified.things;
-    report.failures.extend(identified.failures);
+    let session = Arc::new(session.settling_at(args.min_confidence)?);
+    let mut report = session.clone().review(calls).await?;
+    let identify = session.identify(&mut report).await?;
     for failure in &report.failures {
         eprintln!("error: {failure:#}");
     }
@@ -195,12 +173,10 @@ async fn run<A: Ask, D: Decide>(
         None
     } else {
         // Without a lead, the findings and things are still the review.
-        synthesize(&reviewers.ask, &rules, &report)
-            .await
-            .unwrap_or_else(|error| {
-                eprintln!("error: the lead review: {error:#}");
-                None
-            })
+        session.synthesize(&report).await.unwrap_or_else(|error| {
+            eprintln!("error: the lead review: {error:#}");
+            None
+        })
     };
     match &synthesis {
         Some(synthesis) => {
@@ -211,13 +187,13 @@ async fn run<A: Ask, D: Decide>(
         }
         None => print_findings(&report),
     }
-    print_decisions(&rules, &report);
+    print_decisions(&report);
     let after = After {
-        identify: identified.usage,
+        identify,
         lead: synthesis.map(|s| s.usage),
     };
-    print_usage(&rules, &report, &after);
-    let clean = report.findings.is_empty() && report.failures.is_empty();
+    print_usage(&report, &after);
+    let clean = report.findings().is_empty() && report.failures.is_empty();
     Ok(if clean {
         ExitCode::SUCCESS
     } else {
@@ -232,8 +208,8 @@ async fn run<A: Ask, D: Decide>(
 fn write_report(path: &Path, report: &Report, synthesis: Option<&Synthesis>) -> Result<()> {
     let failures: Vec<String> = report.failures.iter().map(|f| format!("{f:#}")).collect();
     let json = serde_json::json!({
-        "findings": report.findings,
-        "things": report.things,
+        "findings": report.findings(),
+        "things": report.things(),
         "diagnoses": synthesis.map(|s| &s.diagnoses),
         "roots": synthesis.map(|s| &s.roots),
         "decisions": report.decisions,
@@ -247,8 +223,8 @@ fn write_report(path: &Path, report: &Report, synthesis: Option<&Synthesis>) -> 
 
 /// How each rule decided its units, and how many went to the model, to
 /// stderr.
-fn print_decisions(rules: &[Rule], report: &Report) {
-    for rule in rules {
+fn print_decisions(report: &Report) {
+    for rule in report.rules() {
         let Some(tally) = report.decisions.get(&rule.id) else {
             continue;
         };
@@ -270,7 +246,7 @@ struct After {
     lead: Option<Usage>,
 }
 
-fn print_usage(rules: &[Rule], report: &Report, after: &After) {
+fn print_usage(report: &Report, after: &After) {
     let row = |usage: &Usage, levels: &str, name: &str| {
         eprintln!(
             "{:>8}  {:>12}  {:>10}  {levels:>6}  {name}",
@@ -282,7 +258,7 @@ fn print_usage(rules: &[Rule], report: &Report, after: &After) {
         "calls", "in tokens", "out tokens"
     );
     let mut total = Usage::default();
-    for rule in rules {
+    for rule in report.rules() {
         let Some(usage) = report.usage.get(&rule.id) else {
             continue;
         };
@@ -305,7 +281,7 @@ fn print_usage(rules: &[Rule], report: &Report, after: &After) {
 /// Each finding as `path:line: [rule/outcome] message`, then each thing
 /// they are about in Markdown.
 fn print_findings(report: &Report) {
-    for f in &report.findings {
+    for f in report.findings() {
         println!(
             "{}:{}: [{}/{}] {}",
             f.path.display(),
@@ -315,12 +291,12 @@ fn print_findings(report: &Report) {
             f.message
         );
     }
-    for t in &report.things {
+    for t in report.things() {
         let symptoms: Vec<String> = t
             .explains
             .iter()
             .map(|&i| {
-                let f = &report.findings[i];
+                let f = report.finding(i);
                 format!("{}:{}", f.path.display(), f.line)
             })
             .collect();

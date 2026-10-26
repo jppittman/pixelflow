@@ -3,7 +3,7 @@
 
 use super::host::EntryContext;
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
-use pixelflow_ir::{Fold, OpKind};
+use pixelflow_ir::{Bound, Fold, FoldHeader, Lit, OpKind};
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::Ident;
@@ -14,11 +14,11 @@ use syn::Ident;
 /// keeps the call site's. A user's tokens interpolated into it keep theirs.
 ///
 /// Mixed-site hygiene covers locals and labels only; an item or a path
-/// resolves at the call site as ever. So a structural parameter or a `const`
+/// resolves at the call site as ever. So a `const`
 /// spelled like an emitted local (`const __lo: usize`) still meets it, and
 /// rustc refuses that loudly (E0530, E0158, E0308 or E0005, by the type of
 /// the `const`); the `__` prefix is what keeps an
-/// unprefixed one from meeting a structural parameter `lo`.
+/// unprefixed one from meeting a user's `lo`.
 macro_rules! emitted {
     ($($tokens:tt)*) => {
         ::quote::quote_spanned!(::proc_macro2::Span::mixed_site()=> $($tokens)*)
@@ -43,48 +43,13 @@ pub(super) fn declare_uniform(slot: &Ident, default: &TokenStream) -> TokenStrea
     }
 }
 
-/// The expression decoding `fold`, which travels as bits because its fields
-/// are private precisely so no caller can assemble one that means nothing.
+/// Decode a fold's header bits. A zero literal range supplies the header's
+/// bounds; the `Fold` itself carries only the monoid, binder and stride.
 pub(super) fn fold_from_bits(fold: Fold) -> TokenStream {
-    let bits = fold.to_bits();
+    let bits = FoldHeader::new(fold, Bound::Lit(0), Bound::Lit(0)).to_bits();
     emitted! {
-        ::pixelflow_core::__macro::ir::fold::Fold::from_bits(#bits)
-            .expect("kernel! emitted a well-formed fold")
-    }
-}
-
-/// An open fold's range, evaluated when the host function is instantiated:
-/// in a `const` block, so rustc checks each operation of the bounds as it
-/// checks any `const`, and refuses — per instantiation — the ranges the IR
-/// refuses ([`Fold::admits`]): one that runs backwards, and one past
-/// [`Fold::EXACT_BOUND`], the last bound a fold's index names exactly.
-/// The bound is the IR's, imported; what the `const` block adds is that the
-/// refusal is rustc's rather than `Fold::new`'s panic.
-///
-/// The refusal is rustc's at monomorphization, which `cargo build` reaches
-/// and `cargo check` (so clippy) does not: a bad instantiation checks clean
-/// and fails to build, in the calling crate, naming the range. It is never
-/// a run-time panic.
-pub(super) fn instantiated_range(range: &crate::sema::StructuralRange) -> TokenStream {
-    let (lo, hi) = (&range.lo, &range.hi);
-    let bound = proc_macro2::Literal::u32_unsuffixed(Fold::EXACT_BOUND);
-    let backwards = format!(
-        "kernel!: the range `{}` runs backwards at this instantiation",
-        range.text()
-    );
-    let past = format!(
-        "kernel!: the range `{}` reaches past 2^24 at this instantiation: a fold's index is an \
-         `f32` lane, which names every integer only that far",
-        range.text()
-    );
-    emitted! {
-        const {
-            let __lo: usize = #lo;
-            let __hi: usize = #hi;
-            ::core::assert!(__lo <= __hi, #backwards);
-            ::core::assert!(__hi <= #bound, #past);
-            (__lo as u32)..(__hi as u32)
-        }
+        ::pixelflow_core::__macro::ir::fold::FoldHeader::from_bits(#bits)
+            .expect("kernel! emitted a well-formed fold header").fold()
     }
 }
 
@@ -100,16 +65,13 @@ pub(super) fn instantiated_range(range: &crate::sema::StructuralRange) -> TokenS
 /// `context`, in order: each with an identity minted per call and the
 /// call's value as its default, so the kernel's arguments are that call's
 /// and its program is every call's — every one declared, read or not, so a
-/// positional binding cannot shift. A template's holes are filled from the
-/// host function's structural parameters: a `Param(k)` is the `k`th one as
-/// an `f32`, and an open fold's range is evaluated per instantiation
-/// ([`instantiated_range`]).
+/// positional binding cannot shift.
 pub(super) fn arena_to_tokens(
     arena: &ExprArena,
     root: ExprId,
     context: &EntryContext,
 ) -> TokenStream {
-    debug_assert_eq!(
+    assert_eq!(
         arena.uniforms().len(),
         context.arguments.len(),
         "lowering declares one uniform per argument, and a relink restores the table"
@@ -166,7 +128,7 @@ fn reached(arena: &ExprArena, root: ExprId) -> Vec<ExprId> {
 }
 
 /// One node, built in `__arena` from the nodes before it.
-fn node(arena: &ExprArena, id: ExprId, context: &EntryContext) -> TokenStream {
+fn node(arena: &ExprArena, id: ExprId, _context: &EntryContext) -> TokenStream {
     match arena.node(id) {
         ExprNode::Var(i) => emitted! { __arena.push_var(#i) },
         // By bit pattern, not as a decimal literal: `quote`'s `f32`
@@ -176,21 +138,16 @@ fn node(arena: &ExprArena, id: ExprId, context: &EntryContext) -> TokenStream {
         // `BitAnd`'s monoid identity and therefore `all_over`'s seed, and
         // the folder produces those. Bits also roundtrip exactly, with
         // no decimal-formatting question to get wrong.
-        ExprNode::Const(v) => {
+        ExprNode::Const(Lit::Real(v)) => {
             let bits = v.to_bits();
             emitted! { __arena.push_const(f32::from_bits(#bits)) }
         }
-        // A template's hole: the structural parameter, as its `f32`, as
-        // Rust's `as` rounds it — which is `N as f32` in the body.
-        ExprNode::Param(k) => {
-            let count = context.structural.get(usize::from(k)).unwrap_or_else(|| {
-                panic!(
-                    "kernel! produced ExprNode::Param({k}) outside a template's \
-                     structural parameters"
-                )
-            });
-            emitted! { __arena.push_const(#count as f32) }
+        ExprNode::Const(Lit::Mask(value)) => {
+            emitted! { __arena.push_lit(::pixelflow_core::__macro::ir::Lit::Mask(#value)) }
         }
+        ExprNode::Param(k) => panic!(
+            "kernel! produced ExprNode::Param({k}) in an expanded entry; the language has no parameter holes"
+        ),
         // No body can spell a buffer: the language has none
         // (docs/DENOTATION.md §11), so one here is a front-end bug. Fail
         // loud rather than emit a node that references a buffer table the
@@ -241,26 +198,18 @@ fn node(arena: &ExprArena, id: ExprId, context: &EntryContext) -> TokenStream {
         // precisely so no caller can assemble one that means nothing —
         // so it travels the way the two cache keys carry it, as bits
         // with a total inverse on the far side.
-        ExprNode::Reduce { fold, body } => {
+        ExprNode::Reduce { fold, lo, hi, body } => {
             let body = node_var(body);
             let decoded = fold_from_bits(fold);
-            // An open fold keeps its monoid and binder, which are
-            // structure, and takes its range from this instantiation.
-            let emitted = match context.lowered.range_of(fold) {
-                None => decoded,
-                Some(range) => {
-                    let range = instantiated_range(range);
-                    emitted! {{
-                        let __placeholder = #decoded;
-                        ::pixelflow_core::__macro::ir::fold::Fold::new(
-                            __placeholder.monoid(),
-                            __placeholder.binder(),
-                            #range,
-                        )
-                    }}
+            let bound = |bound| match bound {
+                Bound::Lit(count) => emitted!(::pixelflow_core::__macro::ir::Bound::Lit(#count)),
+                Bound::Value(term) => {
+                    let term = node_var(term);
+                    emitted!(::pixelflow_core::__macro::ir::Bound::Value(#term))
                 }
             };
-            emitted! { __arena.push_reduce(#emitted, #body) }
+            let (lo, hi) = (bound(lo), bound(hi));
+            emitted! { __arena.push_reduce(#decoded, #lo, #hi, #body) }
         }
         // A store is post-legalize vocabulary: the passes that wrap a
         // kernel in the lattice's folds build one, after extraction,

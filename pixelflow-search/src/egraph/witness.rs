@@ -372,7 +372,7 @@ pub fn induce<I: Ir>(
         }
         let node = match term.project(r) {
             Shape::Var(i) => ENode::Var(i),
-            Shape::Const(v) => ENode::constant(v),
+            Shape::Const(v) => ENode::Const(v),
             Shape::Param(i) => ENode::Param(i),
             Shape::Buffer(d) => ENode::Buffer(d),
             Shape::Uniform(d) => ENode::Uniform(d),
@@ -418,9 +418,9 @@ pub fn induce<I: Ir>(
                     }
                 }
             }
-            Shape::Reduce { fold, body } => {
-                let class = *memo.get(&body).expect("post-order maps children first");
-                ENode::Reduce { fold, body: class }
+            Shape::Reduce { fold, lo, hi, body } => {
+                let class = |r| *memo.get(&r).expect("post-order maps children first");
+                ENode::reduce(fold, lo.map(class), hi.map(class), class(body))
             }
             // Not a term a witness graph holds: only the runtime tier's
             // unit walk admits a reference (as a unit's opaque leaf), so a
@@ -498,9 +498,16 @@ fn post_order_term<I: Ir>(term: &I, root: I::Ref) -> Vec<I::Ref> {
                             }
                         }
                     }
-                    // A fold's one child is its body. Missing it would leave
-                    // the body unmapped and the fold unmatchable.
-                    Shape::Reduce { body, .. } => stack.push(Task::Visit(body)),
+                    // A fold's children are its body and each value bound.
+                    // Missing one would leave it unmapped and the fold
+                    // unmatchable. Reverse, as for an op, so they pop in
+                    // `children()` order: the body, then `lo`'s, then `hi`'s.
+                    Shape::Reduce { body, lo, hi, .. } => {
+                        for child in [hi.value(), lo.value()].into_iter().flatten() {
+                            stack.push(Task::Visit(child));
+                        }
+                        stack.push(Task::Visit(body));
+                    }
                     Shape::Write { value, .. } => stack.push(Task::Visit(value)),
                     _ => {}
                 }

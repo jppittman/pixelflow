@@ -28,7 +28,9 @@ kernel! {
 
     pub fn ring(cx: f32, cy: f32, r: f32) -> f32 { radius2_at(X, Y, cx, cy) - sq(r) }
 
-    /// The same helper over shifted coordinates: today's `.at(X + 1, Y - 1)`.
+    /// The same helper over shifted coordinates: `radius2(cx, cy)` at
+    /// `(X + 1, Y - 1)`. A function is warped by applying it; a field, by
+    /// `.at` (`at_is_contramap.rs`).
     pub fn shifted_radius2(cx: f32, cy: f32) -> f32 { radius2_at(X + 1.0, Y - 1.0, cx, cy) }
 
     pub fn nearest_axis() -> f32 { nearer(X.abs() < Y.abs(), X, Y) }
@@ -95,8 +97,8 @@ fn if_and_select_lower_to_the_same_arena() {
 }
 
 /// A block written where no prelude is in scope: a record, a `pub const`, a
-/// helper, a tuple `let`, a fold over a structural count, the `Args`
-/// record, the closure form, and an entry that takes a kernel — whose host
+/// helper, a tuple `let`, a fold over a `usize` const, a count parameter, the
+/// `Args` record, the closure form, and an entry that takes a kernel — whose host
 /// function runs lowering's steps, a fold's and a library method's and a
 /// derivative's among them. The expansion names every item by path,
 /// so it expands in a `#[no_implicit_prelude]` module as anywhere else —
@@ -111,18 +113,26 @@ mod without_a_prelude {
         /// Half.
         pub const HALF: f32 = 0.5;
 
+        /// How many terms.
+        const N: usize = 3;
+
         fn weighed(m: Mass, r: f32) -> f32 { m.x * r + m.w }
 
         /// The weighed point plus each fold index, plus a half where `v`
         /// is past `X`.
-        pub fn swept<const N: usize>(m: Mass, v: f32, r: f32) -> f32 {
+        pub fn swept(m: Mass, v: f32, r: f32) -> f32 {
             let (a, b) = (r, X);
             (0..N).map(|i| weighed(m, a) + (i as f32)).sum::<f32>()
                 + if b < v { HALF } else { 0.0 }
         }
 
-        /// A kernel applied in a fold over a structural count, weighed.
-        pub fn applied<const N: usize>(k: impl Fn(f32, f32) -> f32, m: Mass) -> f32 {
+        /// The weighed point summed over a count the host passes.
+        pub fn counted(m: Mass, n: usize) -> f32 {
+            (0..n).map(|i| weighed(m, i as f32)).sum::<f32>()
+        }
+
+        /// A kernel applied in a fold over a `usize` const, weighed.
+        pub fn applied(k: impl Fn(f32, f32) -> f32, m: Mass) -> f32 {
             weighed(m, (0..N).map(|i| k(X + (i as f32), Y)).sum::<f32>()) + X.fract() + DX(Y)
         }
     }
@@ -138,34 +148,45 @@ mod without_a_prelude {
 /// from its `Args`.
 #[test]
 fn a_block_expands_where_no_prelude_is_in_scope() {
-    use without_a_prelude::{HALF, Mass, SweptArgs, scaled, swept};
+    use without_a_prelude::{CountedArgs, HALF, Mass, SweptArgs, counted, scaled, swept};
     let m = Mass { x: 1.0, w: 2.0 };
     let (v, r) = (4.0, 0.5);
     let x = 0.5;
     let by_rust: f32 =
         (0..3).map(|i| (m.x * r + m.w) + i as f32).sum::<f32>() + if x < v { HALF } else { 0.0 };
-    let kernel = swept::<3>(m, v, r);
+    let kernel = swept(m, v, r);
     assert_eq!(Lattice::eval_at(&kernel, x, 0.0), by_rust);
 
     let lattice = Lattice::frame(4, 2);
     let program = Manifold::compile(&kernel, lattice.extent);
     let mut block = program.block();
-    let args = SweptArgs::<3> {
+    let args = SweptArgs {
         m: Mass { x: -1.0, w: 4.0 },
         v: 0.125,
         r: 2.0,
     };
     args.write_into(&mut block).expect("swept's own arguments");
     let rebound = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
-    let baked = lattice.bake(&swept::<3>(args.m, args.v, args.r));
+    let baked = lattice.bake(&swept(args.m, args.v, args.r));
     assert_eq!(rebound.buffer(), baked.buffer());
+
+    // Σ_{i<4} (i·m.x + m.w), rebound from its `Args` at another count.
+    let by_rust: f32 = (0..4).map(|i| (i as f32) * m.x + m.w).sum();
+    assert_eq!(Lattice::eval_at(&counted(m, 4), x, 0.0), by_rust);
+    let program = Manifold::compile(&counted(m, 0), lattice.extent);
+    let mut block = program.block();
+    CountedArgs { m, n: 4 }
+        .write_into(&mut block)
+        .expect("counted's own arguments");
+    let rebound = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
+    assert_eq!(rebound.buffer(), lattice.bake(&counted(m, 4)).buffer());
 
     assert_eq!(Lattice::eval_at(&scaled(1.0, 2.0), 0.5, 0.0), 2.5);
 
     // Σ_i (x + i + y) over three, times the weight, plus fract(x) and ∂Y/∂X.
     let k = ::pixelflow_compiler::kernel!(|| X + Y);
     let by_rust: f32 = m.x * (0..3).map(|i| x + i as f32 + 1.0).sum::<f32>() + m.w + x;
-    let applied = without_a_prelude::applied::<3>(&k, m);
+    let applied = without_a_prelude::applied(&k, m);
     assert_eq!(Lattice::eval_at(&applied, x, 1.0), by_rust);
 }
 
@@ -200,7 +221,7 @@ fn an_entry_named_by_a_digit_has_an_args_record() {
 /// A `macro_rules` `$t:ty` reaches `kernel!` as a type inside an invisible
 /// group, and rustc reads the type inside, so every position that names a
 /// type does too: a parameter, a return, a field, a `const`, a `let`, a
-/// structural parameter, a cast and a fold's `::<f32>`.
+/// count parameter, a cast and a fold's `::<f32>`.
 mod typed_by_a_fragment {
     use super::*;
 
@@ -211,8 +232,8 @@ mod typed_by_a_fragment {
                 const FOUR: $count = 4;
                 pub struct Pair { pub a: $real, pub b: $real }
                 fn twice(v: $real) -> $real { v * 2.0 }
-                pub fn spelled<const N: $count>(p: Pair, w: $real) -> $real {
-                    let sum: $real = (0..N).map(|i| X * (i as $real)).sum::<$real>();
+                pub fn spelled(n: $count, p: Pair, w: $real) -> $real {
+                    let sum: $real = (0..n).map(|i| X * (i as $real)).sum::<$real>();
                     twice(sum) + p.a * p.b * w * SCALE + (0..FOUR).map(|i| i as f32).sum::<f32>()
                 }
             }
@@ -231,21 +252,22 @@ mod typed_by_a_fragment {
     #[test]
     fn every_position_reads_the_type_inside_the_group() {
         // X = 3: Σ_{i<3} 3i = 9, doubled 18, + 2·5·7·2 = 140, + (0+1+2+3) = 6.
-        let k = spelled::<3>(Pair { a: 2.0, b: 5.0 }, 7.0);
+        let k = spelled(3, Pair { a: 2.0, b: 5.0 }, 7.0);
         assert_eq!(bake(&k), 18.0 + 140.0 + 6.0);
         assert_eq!(bake(&closure(4.0)), 8.0 + 3.0);
 
         // Rebound from its `Args`, the program is the one built at those values.
         let program = Manifold::compile(&k, [1, 1]);
         let mut block = program.block();
-        SpelledArgs::<3> {
+        SpelledArgs {
+            n: 3,
             p: Pair { a: 3.0, b: 1.0 },
             w: 2.0,
         }
         .write_into(&mut block)
         .expect("spelled's own arguments");
         let rebound = program.bind(&[]).with_uniforms(&block).eval_at(AT.0, AT.1);
-        assert_eq!(rebound, bake(&spelled::<3>(Pair { a: 3.0, b: 1.0 }, 2.0)));
+        assert_eq!(rebound, bake(&spelled(3, Pair { a: 3.0, b: 1.0 }, 2.0)));
     }
 }
 

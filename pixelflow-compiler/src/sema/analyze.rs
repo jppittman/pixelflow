@@ -22,7 +22,7 @@ use super::consts::evaluate_consts;
 /// NaN, and a number used as a mask blends bit patterns.
 ///
 /// The third, `usize`, is a count and not a value. A fold's index is one,
-/// and so are a `usize` const and an entry's structural parameter. A name of
+/// and so are a `usize` const and an entry's per-call count parameter. A name of
 /// this type is refused wherever a value is expected, and converted only by
 /// `i as f32`: the index is an `f32` lane already, so the conversion lowers
 /// to nothing, but writing it is what keeps index arithmetic out of the
@@ -46,7 +46,7 @@ pub(super) enum Ty {
     /// A mask: a comparison produces it, `&` and `|` combine it, an `if`
     /// chooses by it.
     Bool,
-    /// A count: a fold's index, a `usize` const or a structural parameter.
+    /// A count: a fold's index, a `usize` const or an entry parameter.
     /// 64 bits, as `usize` is on every target the language compiles for.
     Usize,
     /// One of the block's records.
@@ -76,7 +76,7 @@ impl Ty {
                     "{what} an `f32` or a `bool`\n\
                      \n\
                      note: a `usize` is a count, not a value: a fold's index, a `usize` const \
-                     or an entry's structural parameter (`pub fn f<const N: usize>`), which a \
+                     or an entry's count parameter (`pub fn f(n: usize)`), which a \
                      body converts by `i as f32`"
                 ),
             )),
@@ -175,6 +175,8 @@ pub(crate) struct AnalyzedKernel {
 pub(crate) enum Parameter<'a> {
     /// An `f32`: one uniform.
     Scalar(&'a Ident),
+    /// A per-call `usize`, carried by one uniform as an `f32` lane.
+    Count(&'a Ident),
     /// One of the block's records, with that record's fields: one uniform per
     /// field.
     Record {
@@ -190,6 +192,8 @@ pub(crate) enum Parameter<'a> {
 pub(crate) enum Scalar {
     /// A parameter: `param`.
     Param(Ident),
+    /// A per-call count, checked before it is converted to `f32`.
+    Count(Ident),
     /// One field of a record parameter: `param.field`.
     Field(Ident, Ident),
 }
@@ -206,14 +210,17 @@ impl AnalyzedKernel {
         params
             .iter()
             .filter(|param| !param.is_kernel())
-            .map(|param| match self.def.record_named(&param.ty) {
-                None => Parameter::Scalar(&param.name),
-                Some(id) => Parameter::Record {
-                    name: &param.name,
-                    id,
-                    fields: self.def.record(id).fields.as_slice(),
+            .map(
+                |param| match (Ty::from_syn(&param.ty), self.def.record_named(&param.ty)) {
+                    (Some(Ty::Usize), _) => Parameter::Count(&param.name),
+                    (_, None) => Parameter::Scalar(&param.name),
+                    (_, Some(id)) => Parameter::Record {
+                        name: &param.name,
+                        id,
+                        fields: self.def.record(id).fields.as_slice(),
+                    },
                 },
-            })
+            )
             .collect()
     }
 }
@@ -524,6 +531,19 @@ impl<'a> Items<'a> {
                      `kernel!` block, or a Rust struct, is not in scope (D6 of {PLAN})"
                 ),
             ));
+        }
+        if Ty::from_syn(&param.ty) == Some(Ty::Usize) {
+            return match (role, &self.def) {
+                (Role::Entry, KernelDef::Items { .. }) => Ok(Ty::Usize),
+                (Role::Entry, KernelDef::Closure(_)) => Err(syn::Error::new_spanned(
+                    &param.ty,
+                    "a count parameter `n: usize` belongs to an item entry; the closure form binds only `f32` values",
+                )),
+                (Role::Helper, _) => Err(syn::Error::new_spanned(
+                    &param.ty,
+                    "a helper's parameter cannot be a count; only an item entry takes `n: usize`",
+                )),
+            };
         }
         let ty = Ty::of_a_value(&param.ty, "a kernel parameter is")?;
         match (role, ty) {

@@ -1,7 +1,6 @@
 //! Sema's contract (`sema/mod.rs`): `analyze` over what `parse` gives,
 //! asserting the `AnalyzedKernel` or the refusal text.
 
-use crate::ast::PLAN;
 use crate::parser::parse;
 use crate::sema::{AnalyzedKernel, analyze};
 use pixelflow_ir::Binder;
@@ -480,31 +479,26 @@ fn every_fold_types_as_its_terms() {
     }
 }
 
-/// Ranges are constant (plan §1.5): a bound naming a fold's index, a
-/// parameter, a `let`, a coordinate or an `f32` const, or built from
-/// anything but integers and `+ - * /`, is refused where it is written.
+/// A bound must be a count: a known `usize`, a count parameter, or an
+/// enclosing fold index. Other types and expressions are refused.
 #[test]
-fn a_range_bound_that_is_not_constant_is_refused() {
-    let cases: [(TokenStream, &str); 9] = [
+fn a_range_bound_that_is_not_a_count_is_refused() {
+    let cases: [(TokenStream, &str); 8] = [
         (
             quote! { |n: f32| (0..n).map(|i| i as f32).sum() },
-            "`n` is not a `const`",
+            "`n` is a `f32`",
         ),
         (
             quote! { || (0..X).map(|i| i as f32).sum() },
-            "`X` is not a `const`",
+            "`X` is a `f32`",
         ),
         (
             quote! { || { let n = 4.0; (0..n).map(|i| i as f32).sum() } },
-            "`n` is not a `const`",
-        ),
-        (
-            quote! { || (0..4).map(|i| (0..i).map(|j| j as f32).sum::<f32>()).sum() },
-            "`i` is not a `const`",
+            "`n` is a `f32`",
         ),
         (
             quote! { const R: f32 = 4.0; pub fn f() -> f32 { (0..R).map(|i| i as f32).sum() } },
-            "`R` is an `f32` const",
+            "`R` is a `f32`",
         ),
         (
             quote! { || (0..4.0).map(|i| i as f32).sum() },
@@ -512,11 +506,11 @@ fn a_range_bound_that_is_not_constant_is_refused() {
         ),
         (
             quote! { || (0..X.floor()).map(|i| i as f32).sum() },
-            "a range's bounds are constant",
+            "a range's bound is a count",
         ),
         (
             quote! { || (0..(1 < 2)).map(|i| i as f32).sum() },
-            "a range's bounds are constant",
+            "a range's bound is a count",
         ),
         (
             quote! { || (0..-1).map(|i| i as f32).sum() },
@@ -527,8 +521,7 @@ fn a_range_bound_that_is_not_constant_is_refused() {
         let err = refusal(input);
         assert!(err.contains(expected), "expected `{expected}`, got: {err}");
     }
-    let err = refusal(quote! { |n: f32| (0..n).map(|i| i as f32).sum() });
-    assert!(err.contains("ranges are constant"), "got: {err}");
+    accepted(quote! { || (0..4).map(|i| (0..i).map(|j| j as f32).sum::<f32>()).sum() });
 }
 
 /// A range runs forwards; a reversed one is refused, saying it would be
@@ -548,17 +541,14 @@ fn a_reversed_range_is_refused_and_an_empty_one_is_not() {
 /// refused — past `u32` too, naming the plan's A5 — and 2²⁴ itself is
 /// the last bound accepted.
 #[test]
-fn a_bound_past_the_exact_index_is_refused_naming_a5() {
+fn a_bound_past_the_exact_index_is_refused() {
     for past in [
         quote! { || (0..16777217).map(|i| i as f32).sum() },
         quote! { || (16777217..16777217).map(|i| i as f32).sum() },
         quote! { || (0..4294967296).map(|i| i as f32).sum() },
     ] {
         let err = refusal(past);
-        assert!(
-            err.contains("past 16777216 (2^24)") && err.contains("A5") && err.contains(PLAN),
-            "got: {err}"
-        );
+        assert!(err.contains("past 16777216 (2^24)"), "got: {err}");
     }
     accepted(quote! { || (16777215..16777216).map(|i| i as f32).sum() });
 }
@@ -707,8 +697,8 @@ fn as_f32_converts_a_usize_and_nothing_else() {
 fn a_usize_is_not_a_declared_value_type() {
     let cases: [(TokenStream, &str); 3] = [
         (
-            quote! { pub fn f(n: usize) -> f32 { X } },
-            "a kernel parameter is an `f32` or a `bool`",
+            quote! { |n: usize| X },
+            "a count parameter `n: usize` belongs to an item entry",
         ),
         (
             quote! { pub fn f() -> usize { 4 } },
@@ -721,11 +711,9 @@ fn a_usize_is_not_a_declared_value_type() {
     ];
     for (input, expected) in cases {
         let err = refusal(input);
-        assert!(
-            err.contains(expected) && err.contains("a `usize` is a count"),
-            "expected `{expected}`, got: {err}"
-        );
+        assert!(err.contains(expected), "expected `{expected}`, got: {err}");
     }
+    accepted(quote! { pub fn f(n: usize) -> f32 { X * (n as f32) } });
 }
 
 /// A fold's index is scoped as a closure's parameter is: it shadows a
@@ -905,45 +893,6 @@ fn an_args_record_name_taken_twice_is_refused() {
         pub struct PlainArgs { pub r: f32 }
         pub fn plain() -> f32 { X }
     });
-}
-
-// ───────────────────────── structural parameters ─────────────────────────
-
-/// A structural parameter is no value, shadows nothing and is shadowed
-/// by nothing, and a helper does not see its entry's.
-#[test]
-fn a_structural_parameter_is_not_a_value_and_is_its_entrys() {
-    let cases: [(TokenStream, &str); 5] = [
-        (
-            quote! { pub fn f<const N: usize>() -> f32 { X * N } },
-            "mismatched types: `N` is a `usize`",
-        ),
-        (
-            quote! { pub fn f<const N: usize>() -> f32 { let N = X; N } },
-            "shadows the structural parameter `N`",
-        ),
-        (
-            quote! { pub fn f<const N: usize>(N: f32) -> f32 { X } },
-            "shadows the structural parameter `N`",
-        ),
-        (
-            quote! { const N: usize = 4; pub fn f<const N: usize>() -> f32 { X } },
-            "shadows the `const N`",
-        ),
-        (
-            quote! {
-                fn h(x: f32) -> f32 { (0..N).map(|i| x).sum() }
-                pub fn f<const N: usize>() -> f32 { h(X) }
-            },
-            "`N` is not a `const`",
-        ),
-    ];
-    for (input, expected) in cases {
-        let err = refusal(input);
-        assert!(err.contains(expected), "expected `{expected}`, got: {err}");
-    }
-    let err = refusal(quote! { pub fn f<const N: usize, const N: usize>() -> f32 { X } });
-    assert!(err.contains("declared twice"), "got: {err}");
 }
 
 // ───────────────────────────── tuple lets ─────────────────────────────

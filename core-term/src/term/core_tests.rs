@@ -401,6 +401,33 @@ fn it_should_overwrite_first_half_of_wide_char_with_ascii() {
     );
 }
 
+/// Same as `it_should_overwrite_first_half_of_wide_char_with_ascii`, but with
+/// a non-ASCII narrow character so the print goes through `print_char`'s own
+/// stale-spacer-clearing logic rather than the identity-ASCII fast path's
+/// `Screen::write_ascii`, which clears it independently.
+#[test]
+fn it_should_overwrite_first_half_of_wide_char_with_a_non_ascii_narrow_char() {
+    let mut term = create_test_emulator(5, 1);
+    term.print_text("世");
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(1, 1),
+    )));
+    term.print_text("é");
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+
+    let glyph_e = get_glyph_from_snapshot(&snapshot, 0, 0).unwrap();
+    match glyph_e {
+        Glyph::Single(cell) => assert_eq!(cell.c, 'é'),
+        _ => panic!("Expected Single 'é' at (0,0)"),
+    }
+    let glyph_after_e = get_glyph_from_snapshot(&snapshot, 0, 1).unwrap();
+    assert!(
+        !matches!(glyph_after_e, Glyph::WideSpacer),
+        "Cell after 'é' should not be a wide_char_spacer, got {:?}",
+        glyph_after_e
+    );
+}
+
 #[test]
 fn it_should_overwrite_second_half_of_wide_char_with_ascii() {
     let mut term = create_test_emulator(5, 1);
@@ -2056,6 +2083,83 @@ fn it_should_switch_to_alternate_screen_buffer_and_back_on_csi_1049() {
     ); // Cursor pos restored
 }
 
+/// CSI ?1047 (AltScreenBufferClear) is the sibling of ?1049 without the
+/// cursor save/restore: it still clears on entry, but on exit it resets the
+/// cursor to (0,0) rather than restoring the saved position.
+#[test]
+fn it_should_switch_to_alternate_screen_buffer_and_back_on_csi_1047() {
+    let mut term = create_test_emulator(5, 2);
+    setup_ed_el_screen(&mut term, 5, 2); // L0: ABCAB, L1: BCDBC, Cursor (0,2)
+    let original_snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    let original_cursor_pos = original_snapshot
+        .cursor_state
+        .as_ref()
+        .map(|cs| (cs.y, cs.x));
+    assert_eq!(original_cursor_pos, Some((1, 2)));
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::SetModePrivate(DecModeConstant::AltScreenBufferClear as u16),
+    )));
+
+    // Switched to alternate screen - verify it's cleared, same as ?1049.
+    let snapshot_asb = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot_asb, &["     ", "     "], Some((0, 0)));
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::ResetModePrivate(DecModeConstant::AltScreenBufferClear as u16),
+    )));
+
+    // Back on normal screen: content is restored (the primary screen was
+    // never touched), but unlike ?1049 the cursor is NOT restored to where
+    // it was before entering — it resets to (0,0).
+    let snapshot_nsb_restored = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot_nsb_restored, &["ABCAB", "BCDBC"], Some((0, 0)));
+}
+
+/// The alt screen buffer persists across an exit/re-entry cycle (it's a
+/// separate grid from the primary one), so entering via ?1047 twice, with
+/// content written on the first visit, is the only way to observe whether
+/// ?1047 actually clears on entry rather than preserving.
+#[test]
+fn it_should_clear_stale_alt_screen_content_on_re_entry_via_csi_1047() {
+    let mut term = create_test_emulator(5, 2);
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::SetModePrivate(DecModeConstant::AltScreenBufferClear as u16),
+    )));
+    term.print_text("Z");
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::ResetModePrivate(DecModeConstant::AltScreenBufferClear as u16),
+    )));
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::SetModePrivate(DecModeConstant::AltScreenBufferClear as u16),
+    )));
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["     ", "     "], Some((0, 0)));
+}
+
+/// Same persistence trick as the ?1047 version above, for ?1049: it must
+/// also clear on entry, not just save/restore the cursor around it.
+#[test]
+fn it_should_clear_stale_alt_screen_content_on_re_entry_via_csi_1049() {
+    let mut term = create_test_emulator(5, 2);
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::SetModePrivate(DecModeConstant::AltScreenBufferSaveRestore as u16),
+    )));
+    term.print_text("Z");
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::ResetModePrivate(DecModeConstant::AltScreenBufferSaveRestore as u16),
+    )));
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::SetModePrivate(DecModeConstant::AltScreenBufferSaveRestore as u16),
+    )));
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(&snapshot, &["     ", "     "], Some((0, 0)));
+}
+
 // Auto Wrap Mode (DECAWM) (CSI ? 7 h/l)
 #[test]
 fn it_should_enable_and_disable_autowrap_mode_on_decawm() {
@@ -2112,6 +2216,30 @@ fn it_should_enable_and_disable_autowrap_mode_on_decawm() {
         &term.get_render_snapshot().expect("Snapshot was None"),
         &["4 6", "7  "],
         Some((1, 1)),
+    );
+}
+
+/// Re-enabling DECAWM must only pend a wrap when the cursor is already past
+/// the line's width — not unconditionally, just because autowrap turned on.
+#[test]
+fn it_should_not_wrap_immediately_when_decawm_is_re_enabled_mid_line() {
+    let mut term = create_test_emulator(3, 2);
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::ResetModePrivate(DecModeConstant::AutoWrapMode as u16),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(1, 2),
+    ))); // (0,1): mid-line, nowhere near the 3-column width.
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::SetModePrivate(DecModeConstant::AutoWrapMode as u16),
+    )));
+    term.print_text("X");
+
+    assert_screen_state(
+        &term.get_render_snapshot().expect("Snapshot was None"),
+        &[" X ", "   "],
+        Some((0, 2)),
     );
 }
 
@@ -2931,6 +3059,72 @@ fn it_should_insert_blank_lines_at_cursor_and_scroll_lines_below_off_the_bottom_
         &snapshot,
         &["AAAAA", "BBBBB", "     ", "     ", "CCCCC"],
         Some((2, 0)),
+    );
+}
+
+/// CSI L (IL) outside the active scrolling region must be a no-op, matching
+/// VT behavior: an insert whose cursor row isn't inside `[scroll_top,
+/// scroll_bot]` does nothing, even though the two bounds are each
+/// individually satisfiable on their own.
+#[test]
+fn it_should_do_nothing_on_csi_l_when_cursor_is_below_the_scrolling_region() {
+    let mut term = create_test_emulator(5, 5);
+    let rows = ["AAAAA", "BBBBB", "CCCCC", "DDDDD", "EEEEE"];
+    for (i, row) in rows.iter().enumerate() {
+        print_str(&mut term, row);
+        if i + 1 < rows.len() {
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
+        }
+    }
+
+    // Region covers physical rows 1-3 (1-based 2-4); row 4 is below it.
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::SetScrollingRegion { top: 2, bottom: 4 },
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(5, 1),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::InsertLine(2),
+    )));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(
+        &snapshot,
+        &["AAAAA", "BBBBB", "CCCCC", "DDDDD", "EEEEE"],
+        Some((4, 0)),
+    );
+}
+
+/// Sibling of the CSI L case above, for CSI M (DL).
+#[test]
+fn it_should_do_nothing_on_csi_m_when_cursor_is_below_the_scrolling_region() {
+    let mut term = create_test_emulator(5, 5);
+    let rows = ["AAAAA", "BBBBB", "CCCCC", "DDDDD", "EEEEE"];
+    for (i, row) in rows.iter().enumerate() {
+        print_str(&mut term, row);
+        if i + 1 < rows.len() {
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::CR)));
+            term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
+        }
+    }
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::SetScrollingRegion { top: 2, bottom: 4 },
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(5, 1),
+    )));
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::DeleteLine(2),
+    )));
+
+    let snapshot = term.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(
+        &snapshot,
+        &["AAAAA", "BBBBB", "CCCCC", "DDDDD", "EEEEE"],
+        Some((4, 0)),
     );
 }
 

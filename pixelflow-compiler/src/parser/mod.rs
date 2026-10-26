@@ -16,13 +16,11 @@
 //!                                            -- a record of `f32` fields
 //!           | VIS? 'const' IDENT ':' 'f32' '=' cexpr ';'
 //!           | VIS? 'const' IDENT ':' 'usize' '=' iexpr ';'
-//!           | VIS 'fn' IDENT structural? '(' params ')' '->' type block
+//!           | VIS 'fn' IDENT '(' params ')' '->' type block
 //!                                            -- an entry
 //!           | 'fn' IDENT '(' params ')' '->' type block
 //!                                            -- a helper: private, no generics
 //! field   ::= VIS? IDENT ':' 'f32'
-//! structural ::= '<' 'const' IDENT ':' 'usize' (',' 'const' IDENT ':' 'usize')* ','? '>'
-//!                                            -- an entry's structural parameters
 //! params  ::= (param (',' param)* ','?)?
 //! param   ::= IDENT ':' type
 //! type    ::= 'f32' | 'bool' | RECORD        -- an entry's `f32`s and records
@@ -39,10 +37,7 @@
 //!           | '(' iexpr ')'                        -- or a `usize` const's
 //!           | IDENT | INTEGER                      -- initializer; each operation
 //!                                                  -- checked as rustc checks it,
-//!                                                  -- at expansion, or when the
-//!                                                  -- host fn is instantiated if
-//!                                                  -- it names a structural
-//!                                                  -- parameter
+//!                                                  -- at expansion
 //!
 //! expr    ::= expr binop expr
 //!           | '-' expr
@@ -55,7 +50,7 @@
 //!           | 'if' expr block 'else' (block | 'if' …)   -- the choice
 //!           | fold
 //!           | IDENT 'as' 'f32'         -- a `usize` (a fold's index, a `usize`
-//!                                      -- const or a structural parameter) as
+//!                                      -- const or an entry count parameter) as
 //!                                      -- a value
 //!           | '(' expr ')'
 //!           | block
@@ -93,7 +88,7 @@
 //!
 //! A `let` is scoped as Rust scopes it ([`crate::ast::Scopes`]), and so is a fold's
 //! index: its body sees the enclosing bindings, an enclosing fold's index
-//! among them. Nothing shadows `X`, `Y`, a `const`, a structural parameter
+//! among them. Nothing shadows `X`, `Y`, a `const`
 //! or a `fn`: a parameter, a `let` or an index of that name is refused. `X`
 //! and `Y` appear only in an entry; a helper takes its coordinates as
 //! arguments
@@ -101,9 +96,8 @@
 //! (plan §1.5) denotes ⊕ of its body over `i ∈ [a, b)`, and its monoid's
 //! identity when the range is empty; the syntax never unrolls it.
 //!
-//! Binding times (plan §1.4). An entry's `const N: usize` generics are
-//! **structural**: each value is its own program, and a body reads one only
-//! as a count. Every parameter is a **uniform**: an `f32` is one, a record is
+//! Binding times (plan §1.4). Every scalar or count parameter is a
+//! **uniform**: an `f32` or `usize` is one, a record is
 //! one per field, and the host function's arguments are their values for
 //! that call — never constants folded in. A record is written by name: a
 //! parameter, a `let` alias of one (`let q = p;`), an argument passed on, or
@@ -124,9 +118,8 @@
 //! Refused here, with a span, at the token: an item that is not a `struct`, a
 //! `const` or a `fn`; a record that is generic, a tuple struct or a unit
 //! struct, and a `repr` or a `cfg` on a record or its field (§1.3); an
-//! attribute other than a doc comment on a `const` or a `fn`; generics on a
-//! helper and on a `const`, and any generic of an entry but a
-//! `const N: usize` without a default; a function, spelled any way, as a
+//! attribute other than a doc comment on a `const` or a `fn`; generics on
+//! any item; a function, spelled any way, as a
 //! parameter of the closure form (rustc's E0562 of an `impl` type: an entry
 //! of the items form takes a kernel);
 //! a `fn` without a declared return type; an `if` without an
@@ -182,8 +175,8 @@
 //! bound past 2²⁴, the last integer bound a fold's index — an `f32` lane —
 //! names exactly, and folds nested deeper than the IR has binders (lowering
 //! refuses the same depth where an inlined helper's fold adds to it). A range
-//! over a structural parameter is refused the same ways when its host
-//! function is instantiated, by rustc, in a `const` block.
+//! over a per-call count is guarded by the IR; the host entry and `Args`
+//! refuse counts past 2²⁴.
 //!
 //! ## Implementation Note
 //!

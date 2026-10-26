@@ -6,7 +6,7 @@ use super::block::{convert_block, plain_name};
 use super::expr::{Nesting, convert_expr};
 use crate::ast::{
     ClosureEntry, ConstItem, Expr, FnItem, FunctionType, KernelDef, PLAN, Param, RecordField,
-    RecordItem, is_usize,
+    RecordItem,
 };
 use proc_macro2::TokenStream;
 use syn::parse::{Parse, ParseStream};
@@ -234,13 +234,7 @@ fn convert_fn(item: syn::ItemFn) -> syn::Result<FnItem> {
             "a variadic parameter list has no meaning in a kernel",
         ));
     }
-    let structural = match item.vis {
-        syn::Visibility::Inherited => {
-            refuse_a_helpers_generics(&sig.generics)?;
-            Vec::new()
-        }
-        _ => structural_parameters(&sig.generics)?,
-    };
+    refuse_generics(&sig.generics)?;
 
     let mut params = Vec::with_capacity(sig.inputs.len());
     for input in sig.inputs {
@@ -267,72 +261,10 @@ fn convert_fn(item: syn::ItemFn) -> syn::Result<FnItem> {
         attrs: item.attrs,
         vis: item.vis,
         name: sig.ident,
-        structural,
         params,
         ret,
         body: Expr::Block(convert_block(*item.block, Nesting::ROOT)?),
     })
-}
-
-/// An entry's structural parameters: its generics, each `const N: usize`
-/// (plan §1.4). A type or lifetime parameter, a const of another type, a
-/// default and a `where` clause are refused: the language's one value bound
-/// when its program is compiled is a count.
-fn structural_parameters(generics: &syn::Generics) -> syn::Result<Vec<syn::Ident>> {
-    refuse_where_clause(
-        generics,
-        "an entry (its structural parameters are `usize`s)",
-    )?;
-    let mut structural = Vec::with_capacity(generics.params.len());
-    for param in &generics.params {
-        let syn::GenericParam::Const(count) = param else {
-            return Err(syn::Error::new_spanned(
-                param,
-                format!(
-                    "a type or lifetime parameter on an entry\n\
-                     \n\
-                     note: an entry's generics are its structural parameters, `const N: usize`, \
-                     and each value is its own program (§1.4 and B3 of {PLAN})"
-                ),
-            ));
-        };
-        refuse_attributes(&count.attrs)?;
-        if !is_usize(&count.ty) {
-            return Err(syn::Error::new_spanned(
-                &count.ty,
-                "a structural parameter is a `usize`: a count, which sizes a program's shape",
-            ));
-        }
-        if let Some(default) = &count.default {
-            return Err(syn::Error::new_spanned(
-                default,
-                "a default for a structural parameter: a call names the program it wants, \
-                 `entry::<4>(…)`",
-            ));
-        }
-        structural.push(count.ident.clone());
-    }
-    Ok(structural)
-}
-
-/// A helper takes no generics: it is inlined into an entry, and reads the
-/// entry's structural parameters only through its arguments — a count as
-/// `n as f32`.
-fn refuse_a_helpers_generics(generics: &syn::Generics) -> syn::Result<()> {
-    if let Some(param) = generics.params.first() {
-        return Err(syn::Error::new_spanned(
-            param,
-            format!(
-                "generics on a helper\n\
-                 \n\
-                 note: a helper is inlined into an entry, and reads the entry's structural \
-                 parameters through its arguments: pass `n as f32`\n\
-                 note: structural parameters are an entry's, `pub fn f<const N: usize>` \
-                 (§1.4 of {PLAN})"
-            ),
-        ));
-    }
-    refuse_generics(generics)
 }
 
 /// A `fn` parameter: a plain name and a scalar type.
@@ -488,14 +420,15 @@ fn refuse_generics(generics: &syn::Generics) -> syn::Result<()> {
     if let Some(param) = generics.params.first() {
         return Err(syn::Error::new_spanned(
             param,
-            format!(
-                "generics in a `kernel!` block\n\
-                 \n\
-                 note: structural parameters, `const N: usize`, are an entry's (§1.4 of {PLAN})"
-            ),
+            match param {
+                syn::GenericParam::Const(_) => {
+                    "a `const` generic in a `kernel!` block: a count that changes per call is an entry parameter `n: usize`"
+                }
+                _ => "generics in a `kernel!` block: nothing in a kernel is generic",
+            },
         ));
     }
-    refuse_where_clause(generics, "a `const` or a helper")
+    refuse_where_clause(generics, "a `kernel!` item")
 }
 
 /// The one refusal of a `where` clause, on whatever `what` is: with no

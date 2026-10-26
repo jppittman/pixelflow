@@ -1034,6 +1034,110 @@ fn lf_scrolls_the_partial_scrolling_region_when_the_cursor_is_at_its_bottom_with
         Some((3, 2)),
     );
 }
+/// Sibling of `lf_scrolls_the_partial_scrolling_region_when_the_cursor_is_at_its_bottom_with_origin_mode_off`,
+/// with origin mode ON instead: LF at the scroll region's bottom row must
+/// still scroll only that region, leaving rows outside it untouched, and the
+/// cursor must stay at the region's logical bottom row (not move past it).
+#[test]
+fn lf_scrolls_the_partial_scrolling_region_when_the_cursor_is_at_its_bottom_with_origin_mode_on() {
+    let cols = 5;
+    let rows = 5;
+    let mut emu = create_test_emulator(cols, rows);
+    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::ResetMode(StandardModeConstant::LinefeedNewlineMode as u16),
+    )));
+
+    // Rows 0 and 4 sit outside the region that's about to be set; address
+    // them directly before origin mode confines CUP to the region.
+    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(1, 1),
+    )));
+    emu.print_text("A");
+    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(5, 1),
+    )));
+    emu.print_text("E");
+
+    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::SetScrollingRegion { top: 2, bottom: 4 },
+    )));
+    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::SetModePrivate(DecModeConstant::Origin as u16),
+    )));
+
+    // Origin-relative addressing: row 1 is the region's top (physical row
+    // 1), row 3 is its bottom (physical row 3).
+    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(1, 1),
+    )));
+    emu.print_text("B");
+    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(2, 1),
+    )));
+    emu.print_text("C");
+    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(3, 1),
+    )));
+    emu.print_text("D");
+
+    let snapshot_before_lf = emu.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(
+        &snapshot_before_lf,
+        &["A    ", "B    ", "C    ", "D    ", "E    "],
+        Some((3, 1)),
+    );
+
+    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
+
+    let snapshot_after_lf = emu.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(
+        &snapshot_after_lf,
+        &["A    ", "C    ", "D    ", "     ", "E    "],
+        Some((3, 1)),
+    );
+}
+
+/// Companion to the scroll-at-bottom test above: under origin mode, LF
+/// issued above the scroll region's logical bottom must just move the
+/// cursor down a row within the region, with no scroll and no content
+/// change anywhere.
+#[test]
+fn lf_moves_down_within_the_region_without_scrolling_with_origin_mode_on_and_not_at_its_bottom() {
+    let cols = 5;
+    let rows = 5;
+    let mut emu = create_test_emulator(cols, rows);
+    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::ResetMode(StandardModeConstant::LinefeedNewlineMode as u16),
+    )));
+    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::SetScrollingRegion { top: 2, bottom: 4 },
+    )));
+    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::SetModePrivate(DecModeConstant::Origin as u16),
+    )));
+
+    // Origin-relative row 2: the region's middle (physical row 2), one row
+    // short of its logical bottom (physical row 3).
+    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(2, 1),
+    )));
+    let before = emu.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(
+        &before,
+        &["     ", "     ", "     ", "     ", "     "],
+        Some((2, 0)),
+    );
+
+    emu.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
+
+    let after = emu.get_render_snapshot().expect("Snapshot was None");
+    assert_screen_state(
+        &after,
+        &["     ", "     ", "     ", "     ", "     "],
+        Some((3, 0)),
+    );
+}
+
 #[test]
 fn it_should_respond_to_primary_device_attributes_query_with_csi_question_mark_6c() {
     let mut term = create_test_emulator(80, 24);
@@ -1615,6 +1719,34 @@ fn cursor_only_movement_marks_its_rows_dirty() {
     );
 }
 
+/// Reverse index (ESC M) when the cursor is below the scroll top just moves
+/// it up a row, with no scroll — the same "cursor-only" shape as
+/// `cursor_only_movement_marks_its_rows_dirty`'s CUU/CUD case, but through
+/// `reverse_index` rather than a CSI cursor-movement command.
+#[test]
+fn reverse_index_without_scrolling_dirties_both_its_rows() {
+    let mut term = create_test_emulator(4, 3);
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::CursorPosition(2, 1),
+    )));
+    let _ = term.get_render_snapshot().expect("snapshot");
+    let clean = term.get_render_snapshot().expect("snapshot");
+    assert!(
+        !clean.lines.iter().any(|l| l.is_dirty),
+        "precondition: an idle terminal snapshots clean"
+    );
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Esc(
+        crate::ansi::commands::EscCommand::ReverseIndex,
+    )));
+    let moved = term.get_render_snapshot().expect("snapshot");
+    assert_eq!(
+        moved.lines.iter().filter(|l| l.is_dirty).count(),
+        2,
+        "the cursor left row 1 and entered row 0: both must redraw"
+    );
+}
+
 // White-box test of `get_render_snapshot`'s documented per-line dirty
 // contract, not a claim any consumer reads per-row state — no production
 // code checks `is_dirty` per row today, only whole-snapshot (`any()`).
@@ -1704,6 +1836,37 @@ fn scroll_viewport_clamps_to_the_available_scrollback() {
     let available = term.scrollback_len();
     term.scroll_viewport(1000);
     assert_eq!(term.viewport_offset(), available);
+}
+
+/// CSI 3J (ED, Ps=3) erases the scrollback — and, per its documented
+/// behavior, the visible screen too, the same as CSI 2J.
+#[test]
+fn csi_3j_clears_the_scrollback_and_the_visible_screen() {
+    let mut term = create_test_emulator(5, 3);
+    for _ in 0..6 {
+        term.interpret_input(EmulatorInput::Ansi(AnsiCommand::C0Control(C0Control::LF)));
+    }
+    term.print_text("X");
+    assert!(
+        term.scrollback_len() > 0,
+        "precondition: scrollback has lines"
+    );
+
+    term.interpret_input(EmulatorInput::Ansi(AnsiCommand::Csi(
+        CsiCommand::EraseInDisplay(3),
+    )));
+
+    assert_eq!(term.scrollback_len(), 0, "CSI 3J must clear the scrollback");
+    let snapshot = term.get_render_snapshot().expect("snapshot");
+    for row in 0..3 {
+        for col in 0..5 {
+            assert_eq!(
+                get_glyph_from_snapshot(&snapshot, row, col).map(|g| g.display_char()),
+                Some(' '),
+                "cell ({row},{col}) should be blank after CSI 3J"
+            );
+        }
+    }
 }
 
 #[test]

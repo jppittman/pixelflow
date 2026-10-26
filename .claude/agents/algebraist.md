@@ -31,10 +31,12 @@ Rust type tree. Key properties:
 1. **Contravariance**: `Kernel::at` is `contramap`. Scaling coordinates by 2x shrinks the
    image by 2x — the direction reverses.
 2. **Pull-based**: nothing computes until a `Lattice` demands it.
-3. **The language is a DAG**: no iteration binder. A fixed-count iteration is unrolled at
-   construction into an ordinary DAG the e-graph can CSE across; a trip count that must
-   change is a recompile through the shape-keyed cache. Nothing that cannot be written as a
-   finite unrolled DAG is a kernel.
+3. **The language is a DAG**: the fold is its one binder, and no fold's bound is a function of a
+   coordinate or of a lattice binder. A bound is a value placed by its variance: a per-call
+   count is a uniform, so one program serves every count; a count is an integer in `0..=2²⁴`,
+   and a fold with a bound that is not one is NaN; whether a constant fold is unrolled is the
+   e-graph's and extraction's choice (`PeelFold`, `HalveFold`). See
+   `docs/language/2026-10-20-a-bound-is-a-value.md`.
 
 ### Core operations
 
@@ -47,9 +49,9 @@ Rust type tree. Key properties:
 | `Kernel::dwrt` (`dx`, `dy`) | derivation | symbolic differentiation, resolved before emission |
 
 **Your job**: keep the basis minimal. `Fix` — iteration as a dimension — used to be here and
-is not: it could not be given a static extent, and the language's answer to iteration is
-unrolling at construction. If you propose a primitive, say what it denotes and why it cannot
-be an unrolled DAG.
+is not: it could not be given a bound fixed before the lattice is traversed, and the language's
+answer to iteration is the fold, which the e-graph may unroll and extraction may keep as a
+loop. If you propose a primitive, say what it denotes and why it cannot be a fold.
 
 ### Composition Laws
 

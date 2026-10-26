@@ -32,7 +32,7 @@ use pixelflow_ir::arena::{
     BufferDecl, BufferId, BufferIdentity, ExprNode, UniformDecl, UniformIdentity,
 };
 use pixelflow_ir::variance::LatticeShape;
-use pixelflow_ir::{ExprArena, ExprId, OpKind};
+use pixelflow_ir::{Bound, ExprArena, ExprId, Lit, OpKind};
 use pixelflow_pipeline::collapse_bench::{self, lanes};
 use pixelflow_pipeline::shader_bench::{NAMED_KERNEL_NAMES, SHADERTOY_KERNEL_NAMES, named_kernel};
 use pixelflow_pipeline::training::{bezier_family, sh_family};
@@ -455,14 +455,15 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
     #[derive(Hash, PartialEq, Eq)]
     enum Key {
         Var(u8),
-        Const(u32),
+        Const(Lit),
         Param(u8),
         Buffer(u16),
         Uniform(u64),
         Op(OpKind, Vec<u32>),
-        /// A fold's identity is its metadata plus its body — the bits are
-        /// the metadata, and two folds sharing them fold the same way.
-        Reduce(u128, u32),
+        /// A fold's identity is its metadata plus its children: the bits are
+        /// the metadata, and the ids are its body and each bound that is a
+        /// value, in that order.
+        Reduce(u128, Vec<u32>),
     }
     type Build = Box<dyn Fn(&mut ExprArena) -> ExprId>;
     let mut interned: HashMap<Key, ExprId> = HashMap::new();
@@ -479,7 +480,7 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
         };
         let (key, build): (Key, Build) = match arena.node(id) {
             ExprNode::Var(i) => (Key::Var(i), Box::new(move |a| a.push_var(i))),
-            ExprNode::Const(v) => (Key::Const(v.to_bits()), Box::new(move |a| a.push_const(v))),
+            ExprNode::Const(v) => (Key::Const(v), Box::new(move |a| a.push_lit(v))),
             ExprNode::Param(i) => (Key::Param(i), Box::new(move |a| a.push_param(i))),
             ExprNode::Buffer(b) => (Key::Buffer(b.0), Box::new(move |a| a.push_buffer(b))),
             ExprNode::Uniform(u) => (Key::Uniform(u.0), Box::new(move |a| a.push_uniform(u))),
@@ -490,11 +491,23 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
             ExprNode::Write { .. } => {
                 panic!("hash_cons: a Write in a corpus arena — corpus arenas are pre-legalize")
             }
-            ExprNode::Reduce { fold, body } => {
+            ExprNode::Reduce { lo, hi, body, .. } => {
                 let body = ExprId(m(body, &map));
+                let header = arena.fold_header(id);
+                let values: Vec<ExprId> = [lo, hi]
+                    .into_iter()
+                    .filter_map(Bound::value)
+                    .map(|child| ExprId(m(child, &map)))
+                    .collect();
+                // The key is the header's bits and the children's ids.
+                let ids = std::iter::once(body)
+                    .chain(values.iter().copied())
+                    .map(|child| child.0)
+                    .collect();
+                let (lo, hi) = header.attach(values);
                 (
-                    Key::Reduce(fold.to_bits(), body.0),
-                    Box::new(move |a: &mut ExprArena| a.push_reduce(fold, body)),
+                    Key::Reduce(header.to_bits(), ids),
+                    Box::new(move |a: &mut ExprArena| a.push_reduce(header.fold(), lo, hi, body)),
                 )
             }
             ExprNode::Unary(k, c) => {
@@ -900,4 +913,53 @@ fn measure(k: &Kernel, rules: &RuleSet) -> String {
     }
     write!(row, ",{rule_hist}").expect("fmt");
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pixelflow_ir::{Binder, Fold, Monoid, Uniform};
+
+    /// `Σ_{i<count} i`, the bound a uniform's slot.
+    fn counted_by(arena: &mut ExprArena, count: ExprId) -> ExprId {
+        let binder = Binder::from_slot(0).expect("the first binder");
+        let index = arena.push_var(binder.var());
+        arena.push_reduce(
+            Fold::new(Monoid::SUM, binder),
+            Bound::Lit(0),
+            Bound::Value(count),
+            index,
+        )
+    }
+
+    /// Two folds that differ only in their bound's child are two nodes, not
+    /// one: the key holds the children's ids beside the header's bits.
+    #[test]
+    fn hash_cons_keeps_a_value_bound() {
+        let mut arena = ExprArena::new();
+        let u = arena.declare_uniform(Uniform::new(3.0).decl());
+        let v = arena.declare_uniform(Uniform::new(5.0).decl());
+        let (u, v) = (arena.push_uniform(u), arena.push_uniform(v));
+        let (by_u, by_v) = (counted_by(&mut arena, u), counted_by(&mut arena, v));
+        let root = arena.push_binary(OpKind::Add, by_u, by_v);
+
+        let (consed, root) = hash_cons(&arena, root);
+
+        let ExprNode::Binary(OpKind::Add, a, b) = consed.node(root) else {
+            panic!("the root is still the sum of the two folds");
+        };
+        assert_ne!(a, b, "folds over different counts merged");
+        for fold in [a, b] {
+            assert!(
+                matches!(
+                    consed.node(fold),
+                    ExprNode::Reduce {
+                        hi: Bound::Value(_),
+                        ..
+                    }
+                ),
+                "a fold kept its value bound"
+            );
+        }
+    }
 }

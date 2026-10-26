@@ -1,26 +1,33 @@
 //! Records, binding times and `Args`
 //! (docs/language/2026-09-25-the-language-is-kernel.md §1.3, §1.4; B3).
 //!
-//! An entry's `const N: usize` generics are **structural**: each value is its
-//! own program. Everything else is a **uniform**: an `f32` parameter is one,
-//! a record parameter one per field, and a call's values are the kernel's
-//! arguments, never its constants. So every call of an entry at one
-//! structural instantiation is one program — one canonical key — and a
-//! program compiled once is rebound per call from the entry's `Args` record,
-//! into a block the caller keeps; so is a program the entry's kernel was
-//! composed into, beside kernels with no arguments of their own.
+//! Every `f32` and record parameter of an entry is a **uniform**: an `f32`
+//! parameter is one, a record parameter one per field, and a call's values
+//! are the kernel's arguments, never its constants. So every call of an entry
+//! that takes no kernel is one program — one canonical key, one compiled
+//! region — and a program compiled once is rebound per call from the entry's
+//! `Args` record, into a block the caller keeps; so is a program the entry's
+//! kernel was composed into, beside kernels with no arguments of their own.
+//! An entry's count parameter, `n: usize`, is a uniform too: one program for
+//! every count, rebound per call, and refused past 2²⁴ where the host writes
+//! it.
 //!
 //! What a record and a count *mean* is pinned against rustc in
 //! `rustc_is_the_oracle.rs`; the refusals are `sema`'s and the parser's unit
 //! tests. This file pins the binding: keys, positions and rebinding.
 
-use pixelflow_compiler::{kernel, kernel_raw};
+use pixelflow_compiler::kernel;
 use pixelflow_core::{ArityMismatch, Kernel, Lattice, Manifold, Uniform};
 use pixelflow_ir::key::canonical;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 kernel! {
     /// An axis-aligned box.
     pub struct Bounds { pub x0: f32, pub y0: f32, pub x1: f32, pub y1: f32 }
+
+    /// How many terms and rings.
+    const N: usize = 4;
 
     fn inside(b: Bounds, x: f32, y: f32) -> bool {
         (x >= b.x0) & (x <= b.x1) & (y >= b.y0) & (y <= b.y1)
@@ -35,21 +42,31 @@ kernel! {
     /// A body that never reads its first parameter.
     pub fn skips(unread: f32, a: f32, c: f32) -> f32 { a * 10.0 + c }
 
-    /// The mean of `X·i` over `i ∈ [0, N)`, scaled: `N` is the program.
-    pub fn ramp<const N: usize>(scale: f32) -> f32 {
+    /// The mean of `X·i` over `i ∈ [0, N)`, scaled.
+    pub fn ramp(scale: f32) -> f32 {
         (0..N).map(|i| X * (i as f32)).sum::<f32>() * scale / (N as f32)
     }
 
-    /// `N` rings about a box's corner, `fg` on `bg`: the shape of the
-    /// macro doc's example, which the doctest compiles. A
+    /// `N` rings about a box's corner, `fg` on `bg`: the macro doc's
+    /// example, compiled, so the doc cannot drift from the language. A
     /// record is its block's: this one could not name `Bounds` from another.
-    pub fn rings<const N: usize>(b: Bounds, fg: f32, bg: f32) -> f32 {
+    pub fn rings(b: Bounds, fg: f32, bg: f32) -> f32 {
         let dx = X - b.x0;
         let dy = Y - b.y0;
         let r = (dx * dx + dy * dy).sqrt();
         let within = (X <= b.x1) & (Y <= b.y1);
         let n: f32 = (0..N).map(|i| if r < (i as f32) + 1.0 { 1.0 } else { 0.0 }).sum();
         if within { fg * n / (N as f32) } else { bg }
+    }
+
+    /// Σ_{i<n} X·i, its count per call.
+    pub fn sum_to(n: usize) -> f32 {
+        (0..n).map(|i| X * (i as f32)).sum()
+    }
+
+    /// A count between a record and a scalar: declared in parameter order.
+    pub fn scaled_sum(b: Bounds, n: usize, s: f32) -> f32 {
+        (0..n).map(|i| (X - b.x0) * (i as f32)).sum::<f32>() * s
     }
 }
 
@@ -72,6 +89,17 @@ fn program_key(k: &Kernel) -> Vec<u8> {
     canonical(arena, root).key
 }
 
+/// The address of the code `k` compiles to at `FRAME`'s shape: one compiled
+/// region per program, shared by every kernel of it.
+fn code_at_frame(k: &Kernel) -> *const u8 {
+    let shape = pixelflow_ir::LatticeShape::new([FRAME.0 as u32, FRAME.1 as u32]);
+    pixelflow_codegen::jit_cache::compile(k, shape)
+        .expect("compile")
+        .kernel
+        .as_bytes()
+        .as_ptr()
+}
+
 /// A record parameter is one uniform per field, in field order, before the
 /// parameters after it: the call's values, in declaration order.
 #[test]
@@ -83,10 +111,10 @@ fn a_record_parameter_is_one_uniform_per_field_in_declaration_order() {
     assert_eq!(Lattice::eval_at(&k, 7.0, 2.0), 0.25, "right of it");
 }
 
-/// Every call of an entry is one program: two calls with different values
-/// share a canonical key. Each structural value is a program of its own.
+/// Every call of this entry is one program: two calls with different values
+/// share a canonical key and a compiled region.
 #[test]
-fn every_call_of_an_entry_at_one_instantiation_is_one_program() {
+fn every_call_of_an_entry_is_one_program() {
     let a = boxed(UNIT, 1.0, 0.0);
     let b = boxed(
         Bounds {
@@ -99,81 +127,10 @@ fn every_call_of_an_entry_at_one_instantiation_is_one_program() {
         0.75,
     );
     assert_eq!(program_key(&a), program_key(&b));
+    assert_eq!(code_at_frame(&a), code_at_frame(&b), "one compiled region");
 
-    assert_eq!(program_key(&ramp::<4>(1.0)), program_key(&ramp::<4>(2.5)));
-    assert_ne!(
-        program_key(&ramp::<4>(1.0)),
-        program_key(&ramp::<5>(1.0)),
-        "a structural value is its own program"
-    );
-}
-
-kernel_raw! {
-    const TWO: usize = 2;
-    const FIVE: usize = 5;
-
-    /// Two ranges over structural parameters, one inside the other — `M`
-    /// rows of `N` terms — and `N` as a value.
-    pub fn grid<const M: usize, const N: usize>() -> f32 {
-        (0..M)
-            .map(|i| (0..N).map(|j| X * (i as f32) + Y * (j as f32)).sum::<f32>())
-            .sum::<f32>()
-            + (N as f32)
-    }
-
-    /// `grid::<2, 5>`, written over ranges known at expansion.
-    pub fn grid_two_by_five() -> f32 {
-        (0..TWO)
-            .map(|i| (0..FIVE).map(|j| X * (i as f32) + Y * (j as f32)).sum::<f32>())
-            .sum::<f32>()
-            + (FIVE as f32)
-    }
-}
-
-/// Each distinct range over structural parameters is a hole of its own. A
-/// template with two, instantiated at `M = 2, N = 5`, is the program written
-/// over `0..2` and `0..5`; at `M = 5, N = 2` it is another. Both are
-/// `kernel_raw!`, so neither key is an optimizer's. Two ranges sharing one
-/// hole would compile a program over one of them twice, with plausible
-/// pixels.
-#[test]
-fn each_structural_range_is_a_hole_of_its_own() {
-    assert_eq!(
-        program_key(&grid::<2, 5>()),
-        program_key(&grid_two_by_five())
-    );
-    assert_ne!(
-        program_key(&grid::<5, 2>()),
-        program_key(&grid::<2, 5>()),
-        "the rows and the terms are not interchangeable"
-    );
-}
-
-/// Structural parameters spelled as the emitted range's bounds once were,
-/// in a module of their own so that the lint their spelling trips is
-/// allowed for them alone.
-#[allow(non_upper_case_globals)]
-mod lower_case {
-    use pixelflow_compiler::kernel;
-
-    kernel! {
-        /// A sum over `[lo, hi)`: the names the emission binds are its own.
-        pub fn span<const lo: usize, const hi: usize>() -> f32 {
-            (lo..hi).map(|i| i as f32).sum::<f32>()
-        }
-    }
-}
-
-/// An open fold's range is evaluated in code the entry's own names cannot
-/// reach: a structural parameter named `lo` or `hi` is the range's bound,
-/// not a pattern the evaluation's binding reads as it.
-#[test]
-fn a_structural_parameter_named_as_the_emissions_locals_is_its_own() {
-    assert_eq!(
-        Lattice::eval_at(&lower_case::span::<2, 5>(), 0.0, 0.0),
-        9.0,
-        "2 + 3 + 4"
-    );
+    assert_eq!(program_key(&ramp(1.0)), program_key(&ramp(2.5)));
+    assert_eq!(code_at_frame(&ramp(1.0)), code_at_frame(&ramp(2.5)));
 }
 
 /// A program compiled once, rebound from two different `Args`, gives the
@@ -209,13 +166,129 @@ fn a_program_compiled_once_is_rebound_from_args() {
         assert_eq!(rebound.buffer(), baked.buffer(), "{args:?}");
     }
 
-    let program = Manifold::compile(&ramp::<4>(0.0), lattice.extent);
+    let program = Manifold::compile(&ramp(0.0), lattice.extent);
     let mut block = program.block();
-    RampArgs::<4> { scale: 2.0 }
+    RampArgs { scale: 2.0 }
         .write_into(&mut block)
         .expect("ramp's own argument");
     let rebound = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
-    assert_eq!(rebound.buffer(), lattice.bake(&ramp::<4>(2.0)).buffer());
+    assert_eq!(rebound.buffer(), lattice.bake(&ramp(2.0)).buffer());
+}
+
+/// One program for every count (L9): a count is a uniform, keyed by its slot,
+/// so two calls with different counts share a canonical key and a compiled
+/// region.
+#[test]
+fn every_count_is_one_program() {
+    assert_eq!(program_key(&sum_to(3)), program_key(&sum_to(7)));
+    assert_eq!(
+        code_at_frame(&sum_to(3)),
+        code_at_frame(&sum_to(7)),
+        "one compiled region"
+    );
+}
+
+/// A count is one uniform, declared in parameter order as the `f32` it names,
+/// and a program compiled at one count is rebound to another from `Args`: the
+/// pixels of baking that call. `2²⁴` itself is a count, and is written.
+#[test]
+fn a_program_compiled_at_one_count_is_rebound_to_another() {
+    let defaults: Vec<f32> = scaled_sum(UNIT, 5, 0.5)
+        .uniforms()
+        .iter()
+        .map(|u| u.default)
+        .collect();
+    assert_eq!(defaults, [2.0, 1.0, 6.0, 4.0, 5.0, 0.5]);
+
+    let lattice = Lattice::frame(FRAME.0, FRAME.1);
+    let program = Manifold::compile(&sum_to(0), lattice.extent);
+    let bound = program.bind(&[]);
+    let mut block = program.block();
+    for n in [7, 0, 3] {
+        SumToArgs { n }
+            .write_into(&mut block)
+            .expect("sum_to's own count");
+        let rebound = lattice.collapse(&bound.clone().with_uniforms(&block));
+        assert_eq!(
+            rebound.buffer(),
+            lattice.bake(&sum_to(n)).buffer(),
+            "n = {n}"
+        );
+    }
+    let at_the_top = sum_to(16_777_216);
+    assert_eq!(at_the_top.uniforms()[0].default, 16_777_216.0);
+    SumToArgs { n: 16_777_216 }
+        .write_into(&mut block)
+        .expect("2^24 is a count");
+    assert_eq!(block.values(), [16_777_216.0]);
+}
+
+/// The host function refuses a count past 2²⁴, as `Kernel::over` refuses a
+/// literal range past it: its uniform would hold `2²⁴`, a count, and the fold
+/// would run one trip short with no NaN to say so (§1.4).
+#[test]
+#[should_panic(expected = "past 16777216 (2^24)")]
+fn the_host_function_refuses_a_count_past_the_domain() {
+    let _refused = sum_to(16_777_217);
+}
+
+/// The `Args` write refuses a count past 2²⁴ before it writes anything (§1.4):
+/// as an `f32`, `2²⁴ + 1` is `2²⁴`, a count, so the program could not tell.
+/// That nothing is written is the order of the expansion, which refuses before
+/// `set_declared` (`emit.rs`'s unit test).
+#[test]
+#[should_panic(expected = "past 16777216 (2^24)")]
+fn the_args_write_refuses_a_count_past_the_domain() {
+    let program = Manifold::compile(&sum_to(0), [1, 1]);
+    let mut block = program.block();
+    let _refused = SumToArgs { n: 16_777_217 }.write_into(&mut block);
+}
+
+/// How long a fold outside its domain may take to answer: it never hangs.
+const HANG: Duration = Duration::from_secs(60);
+
+/// Run `f` on a thread and wait for it a minute: a fold that hangs is a
+/// failed assertion, not a CI timeout. A panic in `f` is the caller's panic,
+/// with its message.
+fn within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        if let Err(gone) = tx.send(f()) {
+            panic!("the test stopped listening before its kernel returned: {gone}");
+        }
+    });
+    match rx.recv_timeout(HANG) {
+        Ok(value) => value,
+        Err(RecvTimeoutError::Timeout) => {
+            panic!("a count outside the domain never hangs: no answer in {HANG:?}")
+        }
+        Err(RecvTimeoutError::Disconnected) => match worker.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => unreachable!("a worker that sent its answer is not disconnected"),
+        },
+    }
+}
+
+/// A block written by position is untyped: any `f32` reaches the count's
+/// slot, and one that names no count makes this fold NaN (L5), the loop not
+/// entered, so nothing hangs. (`2²⁴ + 1` cannot be written this way at all:
+/// no `f32` names it, `value_bounds_jit.rs`'s
+/// `the_f32_nearest_two_to_the_24_plus_one_is_two_to_the_24`.)
+#[test]
+fn a_count_written_raw_outside_the_domain_is_nan() {
+    let values = within(|| {
+        let program = Manifold::compile(&sum_to(0), [1, 1]);
+        let bound = program.bind(&[]);
+        let mut block = program.block();
+        [16_777_218.0, f32::NAN, -1.0, 2.5, f32::INFINITY, 1e30]
+            .into_iter()
+            .map(|raw| {
+                block.set_declared([raw]).expect("one argument");
+                bound.clone().with_uniforms(&block).eval_at(3.0, 0.0)
+            })
+            .collect::<Vec<f32>>()
+    });
+    assert!(values.iter().all(|v| v.is_nan()), "{values:?}");
 }
 
 /// A parameter the body never reads is still declared, so the arguments
@@ -366,7 +439,7 @@ fn the_macro_docs_example_bakes_and_rebinds() {
         x1: 8.0,
         y1: 5.0,
     };
-    let once = lattice.bake(&rings::<4>(b, 1.0, 0.0));
+    let once = lattice.bake(&rings(b, 1.0, 0.0));
     let corner = once.buffer()[0];
     assert!(
         (corner - 0.75).abs() <= 0.75 * RECIP_RELATIVE_TOLERANCE,
@@ -374,9 +447,9 @@ fn the_macro_docs_example_bakes_and_rebinds() {
          up to the tier's reciprocal; got {corner}"
     );
 
-    let program = Manifold::compile(&rings::<4>(b, 1.0, 0.0), lattice.extent);
+    let program = Manifold::compile(&rings(b, 1.0, 0.0), lattice.extent);
     let mut block = program.block();
-    RingsArgs::<4> {
+    RingsArgs {
         b,
         fg: 0.5,
         bg: 0.25,
@@ -384,8 +457,5 @@ fn the_macro_docs_example_bakes_and_rebinds() {
     .write_into(&mut block)
     .expect("rings' own arguments");
     let again = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
-    assert_eq!(
-        again.buffer(),
-        lattice.bake(&rings::<4>(b, 0.5, 0.25)).buffer()
-    );
+    assert_eq!(again.buffer(), lattice.bake(&rings(b, 0.5, 0.25)).buffer());
 }

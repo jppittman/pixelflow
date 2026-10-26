@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{BufferDecl, BufferId, BufferIdentity, ExprArena, ExprId, ExprNode};
-use pixelflow_ir::fold::Fold;
+use pixelflow_ir::fold::{Bound, FoldHeader};
 
 /// One kernel and the lattice it is baked at.
 pub struct CollapseKernel {
@@ -96,8 +96,8 @@ impl Trips {
 // "reading a bound buffer would be unlike anything production bakes" —
 // false since a glyph's winding became a `Kernel::sum_over` over a bound
 // piece table (`pixelflow-graphics`'s `loop_blinn::glyph`), which is exactly
-// this shape. `Param` is still rejected: nothing production bakes carries an
-// unsubstituted macro parameter.
+// this shape. `Param` is still rejected: it has no value, and nothing
+// production bakes carries one.
 //
 // v3 carried a buffer's *shape* only; replay bound every declared buffer to
 // zeros (`dummy_context`) on the premise that "collapse cost depends on the
@@ -110,7 +110,12 @@ impl Trips {
 // `D <slot> <bits>...` — the slot's captured contents, as bit patterns like
 // every other value this format stores, so replay executes the same guard
 // decisions production does.
-const HEADER: &str = "# pixelflow collapse corpus v4";
+//
+// v5 lets an `R` line name a fold's value bounds: the header's bits mark a bound
+// that is a value (a count field of all ones, `FoldHeader::to_bits`) and the line
+// then names that bound's child after the body, `lo`'s first. A v4 `R` line held
+// a fold's body alone, so a fold whose bound is a value had no child to name.
+const HEADER: &str = "# pixelflow collapse corpus v5";
 /// Versions this format replaced, recognised only so [`decode`] can say
 /// *which* mismatch it hit and why regenerating is the fix.
 const SUPERSEDED_HEADERS: &[(&str, &str)] = &[
@@ -127,6 +132,11 @@ const SUPERSEDED_HEADERS: &[(&str, &str)] = &[
         "v3 declared a buffer's shape but not its contents, so replay bound zeros \
          and never exercised the guard skip a real mask fires",
     ),
+    (
+        "# pixelflow collapse corpus v4",
+        "v4's `R` line held a fold's body alone, so a fold whose bound is a value had no child \
+         to name",
+    ),
 ];
 
 /// Write `kernels` into `dir`, one `.collapse` file each.
@@ -141,9 +151,9 @@ const SUPERSEDED_HEADERS: &[(&str, &str)] = &[
 ///
 /// # Panics
 /// If the directory cannot be created, a file cannot be written, or a kernel
-/// holds a `Param` node — a macro front-end placeholder that never survives
-/// to a compiled kernel, so a corpus entry carrying one is a corpus bug, not
-/// a shape production bakes.
+/// holds a `Param` node — a slot with no value, which no compiled kernel
+/// holds, so a corpus entry carrying one is a corpus bug, not a shape
+/// production bakes.
 pub fn write_dir(dir: &Path, kernels: &[CollapseKernel]) {
     std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
     for kernel in kernels {
@@ -222,7 +232,7 @@ pub fn encode(kernel: &CollapseKernel) -> String {
             ExprNode::Uniform(u) => {
                 writeln!(out, "A {}", arena.uniform_decl(u).default.to_bits())
             }
-            ExprNode::Const(v) => writeln!(out, "C {}", v.to_bits()),
+            ExprNode::Const(v) => writeln!(out, "C {}", v.bits()),
             // A declared buffer slot. `id.0` is the *arena's* slot index, not
             // a [`BufferIdentity`] — identities are minted and mean nothing
             // across a decode, but the slot index is what lets several
@@ -265,14 +275,26 @@ pub fn encode(kernel: &CollapseKernel) -> String {
                 }
                 writeln!(out)
             }
-            // The fold as opaque bits — it is metadata, not children, so it
-            // travels as one field rather than as three serialized nodes.
-            ExprNode::Reduce { fold, body } => {
-                writeln!(out, "R {} {}", fold.to_bits(), d(&dense, body))
+            // The fold's header as opaque bits — it is metadata, not children,
+            // so it travels as one field rather than as three serialized
+            // nodes. A bound that is a value is marked in those bits and its
+            // child follows the body, `lo`'s first.
+            ExprNode::Reduce { lo, hi, body, .. } => {
+                let values: String = [lo, hi]
+                    .into_iter()
+                    .filter_map(Bound::value)
+                    .map(|child| format!(" {}", d(&dense, child)))
+                    .collect();
+                writeln!(
+                    out,
+                    "R {} {}{values}",
+                    arena.fold_header(id).to_bits(),
+                    d(&dense, body)
+                )
             }
             ExprNode::Param(i) => panic!(
                 "{}: corpus kernels must be bakeable, but this one holds Param({i}) — a \
-                 macro front-end placeholder, never present in a compiled kernel",
+                 slot with no value, never present in a compiled kernel",
                 kernel.name
             ),
             // A key names an entry in this process's `KernelStore`, which a
@@ -487,13 +509,23 @@ fn decode(path: &Path) -> CollapseKernel {
                 let children: Vec<ExprId> = children.iter().map(|c| id(c)).collect();
                 arena.push_nary(op(k), &children)
             }
-            ["R", bits, body] => {
+            ["R", bits, body, values @ ..] => {
                 let bits: u128 = bits
                     .parse()
                     .unwrap_or_else(|e| panic!("{}: bad fold bits {bits:?}: {e}", path.display()));
-                let fold = Fold::from_bits(bits)
+                let header = FoldHeader::from_bits(bits)
                     .unwrap_or_else(|| panic!("{}: {bits} names no fold", path.display()));
-                arena.push_reduce(fold, id(body))
+                // The header says how many children follow the body.
+                assert_eq!(
+                    values.len(),
+                    header.arity() - 1,
+                    "{}: fold bits {bits} name {} value bounds and the line gives {}",
+                    path.display(),
+                    header.arity() - 1,
+                    values.len()
+                );
+                let (lo, hi) = header.attach(values.iter().map(|v| id(v)));
+                arena.push_reduce(header.fold(), lo, hi, id(body))
             }
             other => panic!("{}: unparseable line {other:?}", path.display()),
         };
@@ -686,6 +718,7 @@ fn invariants(a: &mut ExprArena, n: usize) -> ExprId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pixelflow_ir::fold::{Binder, Fold, Monoid};
 
     #[test]
     fn every_synthetic_kernel_has_a_unique_name_and_a_bakeable_shape() {
@@ -762,6 +795,122 @@ mod tests {
         std::fs::write(
             &path,
             format!("{header}\nname stale\nfamily wide\nextent 8 8\nV 0\nroot 0\n"),
+        )
+        .expect("write");
+        let _ = decode(&path);
+    }
+
+    /// A stale v4 corpus — the format before a fold's value bounds had a child
+    /// to name — must say so too.
+    #[test]
+    #[should_panic(expected = "v4's `R` line held a fold's body alone")]
+    fn a_v4_corpus_names_the_version_it_is() {
+        let dir = std::env::temp_dir().join(format!(
+            "pixelflow-collapse-corpus-v4-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("stale.txt");
+        // Index 3 is v4, per `SUPERSEDED_HEADERS`'s declaration order.
+        let (header, _) = SUPERSEDED_HEADERS[3];
+        std::fs::write(
+            &path,
+            format!("{header}\nname stale\nfamily wide\nextent 8 2\nV 0\nroot 0\n"),
+        )
+        .expect("write");
+        let _ = decode(&path);
+    }
+
+    /// `Σ_{i<n} X·i` with `n` a kernel argument: the fold's `hi` is a value.
+    fn counted_by_an_argument() -> CollapseKernel {
+        let mut arena = ExprArena::new();
+        let count = arena.declare_uniform(pixelflow_ir::Uniform::new(4.0).decl());
+        let hi = arena.push_uniform(count);
+        let binder = Binder::from_slot(0).expect("the first binder");
+        let index = arena.push_var(binder.var());
+        let x = arena.push_var(0);
+        let body = arena.push_binary(OpKind::Mul, x, index);
+        let root = arena.push_reduce(
+            Fold::new(Monoid::SUM, binder),
+            Bound::Lit(0),
+            Bound::Value(hi),
+            body,
+        );
+        CollapseKernel {
+            name: "counted_by_an_argument".to_string(),
+            family: "fold".to_string(),
+            arena,
+            root,
+            extent: [8, 2],
+            buffer_data: Vec::new(),
+        }
+    }
+
+    /// A kernel with an `A` line and `[0, A)` round trips through the fixture
+    /// text. The oracle is the encoding, as for every kernel here: `decode`
+    /// declares each `A` line a fresh uniform, so the two arenas are not
+    /// `subtree_eq` and are the same kernel all the same.
+    #[test]
+    fn a_value_bounded_kernel_round_trips() {
+        let kernel = counted_by_an_argument();
+        let text = encode(&kernel);
+        let fold = text
+            .lines()
+            .find(|line| line.starts_with("R "))
+            .expect("an R line");
+        assert_eq!(
+            fold.split_whitespace().count(),
+            4,
+            "R, the header's bits, the body, the bound's child: {fold}"
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "pixelflow-collapse-corpus-value-bound-{}",
+            std::process::id()
+        ));
+        write_dir(&dir, std::slice::from_ref(&kernel));
+        let decoded = &read_dir(&dir)[0];
+        std::fs::remove_dir_all(&dir).expect("clean up");
+
+        assert_eq!(
+            text,
+            encode(decoded),
+            "a value-bounded kernel did not round trip"
+        );
+        assert!(
+            matches!(
+                decoded.arena.node(decoded.root),
+                ExprNode::Reduce {
+                    lo: Bound::Lit(0),
+                    hi: Bound::Value(_),
+                    ..
+                }
+            ),
+            "the bound is still a value after the round trip"
+        );
+    }
+
+    /// A fold line is refused, naming the file, when it gives a different
+    /// number of value bounds than its header's bits mark.
+    #[test]
+    #[should_panic(expected = "wrong_count.txt: fold bits")]
+    fn a_fold_line_with_too_few_value_bounds_is_refused_naming_the_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "pixelflow-collapse-corpus-value-count-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("wrong_count.txt");
+        let binder = Binder::from_slot(0).expect("the first binder");
+        let bits = FoldHeader::new(
+            Fold::new(Monoid::SUM, binder),
+            Bound::Lit(0),
+            Bound::Value(()),
+        )
+        .to_bits();
+        std::fs::write(
+            &path,
+            format!("{HEADER}\nname bad\nfamily fold\nextent 8 2\nV 0\nR {bits} 0\nroot 1\n"),
         )
         .expect("write");
         let _ = decode(&path);

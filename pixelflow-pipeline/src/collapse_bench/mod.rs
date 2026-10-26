@@ -277,6 +277,13 @@ impl CollapseSession {
 /// each one happened to start.
 const ORIGIN: [f32; 2] = [0.5, 0.5];
 
+/// Why `features_of` may read a trip count as a number: a measurement that
+/// weights a scope by its trips needs them known, and a value-bounded fold has
+/// only an estimate.
+const LITERAL_FOLDS: &str = "a collapse corpus kernel's folds have known ranges: its kernels \
+     are production glyphs and the synthetic families, every bound a literal, until B2 measures a \
+     glyph whose bound is a value";
+
 /// The static half of a row: the emitter's counts, plus what they derive.
 ///
 /// `regalloc::Scope` no longer names a `frame`/`row`/`body` scope directly —
@@ -294,6 +301,11 @@ const ORIGIN: [f32; 2] = [0.5, 0.5];
 /// this: `frame` is `scopes[0]`, `row` is `scopes[1]`, and `body` is every
 /// deeper scope summed together, the way the old innermost bucket covered
 /// every per-SIMD-group op.
+///
+/// # Panics
+///
+/// If a fold's range is not known: its trip count is an estimate there, and no
+/// measurement shows an estimate as a count.
 #[must_use]
 pub fn features_of(result: &CompileResult) -> StaticFeatures {
     let t = &result.traffic;
@@ -310,7 +322,7 @@ pub fn features_of(result: &CompileResult) -> StaticFeatures {
         t.scopes
             .iter()
             .zip(&t.trips)
-            .map(|(s, trips)| pick(s) * trips)
+            .map(|(s, trips)| pick(s) * trips.known().expect(LITERAL_FOLDS))
             .sum()
     };
     StaticFeatures {
@@ -326,7 +338,7 @@ pub fn features_of(result: &CompileResult) -> StaticFeatures {
         carried: t.carried,
         pool: u32::from(t.pool),
         vector_bytes: t.vector_bytes,
-        dyn_memory_ops: t.dynamic_memory_ops(),
+        dyn_memory_ops: t.dynamic_memory_ops().expect(LITERAL_FOLDS),
         dyn_instructions: dyn_weighted(|s| s.instructions),
         dyn_bytes: dyn_weighted(|s| s.bytes),
     }

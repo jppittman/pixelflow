@@ -1,17 +1,16 @@
 //! Deciding the calls.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use super::{Call, Source};
+use super::Call;
+use super::module;
 use crate::language::Language;
 use crate::rule::{Group, Part, Rule, Surroundings, Unit};
-use crate::snippet::{Snippet, outline, snippets};
-
-/// File names that make a file its directory's module root.
-pub(super) const ROOT_FILES: [&str; 3] = ["mod.rs", "lib.rs", "main.rs"];
+use crate::snippet::{Snippet, snippets};
 
 /// What makes two rules' calls about a file the same calls.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -29,10 +28,11 @@ fn seen(rule: &Rule) -> Seen {
     }
 }
 
-pub(super) fn plan(rules: &[Rule], files: &[PathBuf]) -> Result<Vec<Call>> {
+pub(super) fn plan(rules: Vec<Rule>, files: &[PathBuf]) -> Result<Vec<Call>> {
+    let rules: Vec<Arc<Rule>> = rules.into_iter().map(Arc::new).collect();
     let mut calls = Vec::new();
-    // Crate-wide rules gather each file's parts here, keyed by rule and
-    // crate, and become one call per crate once every file is read.
+    // A crate-wide call holds every file's parts, so it can only be built
+    // once the last file is read; each rule gets its own call per crate.
     let mut crates: BTreeMap<(usize, PathBuf), Vec<(PathBuf, Snippet)>> = BTreeMap::new();
     for path in files {
         let Some(language) = Language::of(path) else {
@@ -57,21 +57,24 @@ pub(super) fn plan(rules: &[Rule], files: &[PathBuf]) -> Result<Vec<Call>> {
             }
             if let Seen::Parts(_, Group::Crate) = seen {
                 for &index in &indexes {
-                    let gathered = crates.entry((index, crate_of(path))).or_default();
+                    let gathered = crates.entry((index, module::crate_of(path))).or_default();
                     gathered.extend(snippets.iter().cloned().map(|s| (path.clone(), s)));
                 }
                 continue;
             }
             let root = match context {
                 Surroundings::None => None,
-                Surroundings::ModuleRoot | Surroundings::ModuleIntent => module_root(path)?,
+                Surroundings::ModuleRoot | Surroundings::ModuleIntent => {
+                    module::root_outline(path)?
+                }
             };
             let intent = match context {
-                Surroundings::ModuleIntent => module_intent(path)?,
+                Surroundings::ModuleIntent => module::intent(path)?,
                 Surroundings::None | Surroundings::ModuleRoot => None,
             };
+            let asking: Vec<_> = indexes.iter().map(|&i| rules[i].clone()).collect();
             calls.extend(snippets.into_iter().map(|snippet| Call {
-                rules: indexes.clone(),
+                rules: asking.clone(),
                 path: path.clone(),
                 snippet,
                 root: root.clone(),
@@ -80,87 +83,13 @@ pub(super) fn plan(rules: &[Rule], files: &[PathBuf]) -> Result<Vec<Call>> {
         }
     }
     calls.extend(crates.into_iter().map(|((rule, krate), files)| Call {
-        rules: vec![rule],
+        rules: vec![rules[rule].clone()],
         path: krate,
         snippet: under_headers(files),
         root: None,
         intent: None,
     }));
     Ok(calls)
-}
-
-/// The nearest `intent.md` from `path`'s directory up to its crate root (the
-/// first directory holding a `Cargo.toml`), numbered as a snippet is. A
-/// module without one, or a file outside any crate, gets none.
-fn module_intent(path: &Path) -> Result<Option<Source>> {
-    let mut dir = path.parent();
-    while let Some(d) = dir {
-        let intent = d.join("intent.md");
-        if intent.is_file() {
-            let text = std::fs::read_to_string(&intent)
-                .with_context(|| format!("reading {}", intent.display()))?;
-            let numbered = text
-                .lines()
-                .enumerate()
-                .map(|(i, line)| format!("{:>5} | {line}\n", i + 1))
-                .collect();
-            return Ok(Some(Source {
-                path: intent,
-                text: numbered,
-            }));
-        }
-        if d.join("Cargo.toml").is_file() {
-            return Ok(None);
-        }
-        dir = d.parent();
-    }
-    Ok(None)
-}
-
-/// The outline of the root file of the module `path` belongs to, unless
-/// `path` is one.
-fn module_root(path: &Path) -> Result<Option<Source>> {
-    let is_root = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| ROOT_FILES.contains(&n));
-    if is_root {
-        return Ok(None);
-    }
-    let Some(dir) = path.parent() else {
-        return Ok(None);
-    };
-    // `foo/bar.rs` belongs to `foo/mod.rs`, or to `foo.rs` in the 2018 layout.
-    let candidates = ROOT_FILES
-        .iter()
-        .map(|name| dir.join(name))
-        .chain(std::iter::once(dir.with_extension("rs")));
-    for root in candidates {
-        if !root.is_file() {
-            continue;
-        }
-        let text = std::fs::read_to_string(&root)
-            .with_context(|| format!("reading {}", root.display()))?;
-        let Some(language) = Language::of(&root) else {
-            continue;
-        };
-        let outline =
-            outline(language, &text).with_context(|| format!("parsing {}", root.display()))?;
-        return Ok(Some(Source {
-            path: root,
-            text: outline.numbered,
-        }));
-    }
-    Ok(None)
-}
-
-/// The directory of the nearest `Cargo.toml` above `path`; the current
-/// directory if there is none.
-fn crate_of(path: &Path) -> PathBuf {
-    path.ancestors()
-        .skip(1)
-        .find(|dir| dir.join("Cargo.toml").is_file())
-        .map_or_else(PathBuf::new, Path::to_path_buf)
 }
 
 /// Every file's snippet, each under a `== path ==` header.

@@ -17,19 +17,20 @@
 //!    nowhere downstream; what it buys is that `X.select(Y, 7.0)`, which
 //!    blended a number as a mask, is a type error rather than plausible
 //!    pixels. A third type, `usize`, is a count: a fold's index, a `usize`
-//!    const or an entry's structural parameter. It is never the type of an
-//!    expression — a body names one only to convert it, `i as f32` —
+//!    const or an entry's count parameter.
+//!    A body names one only as a fold bound or to convert it, `i as f32` —
 //!    because nothing in the language computes with an index
 //!    (docs/language/2026-09-25-the-language-is-kernel.md §1.3, §1.6). A
 //!    fourth, a record, is a name for its `f32` fields: written by name,
 //!    read by field, and never computed (Phase D, D7).
 //! 4. **Calls**: a helper is called at its arity with arguments of its
 //!    parameters' types; an entry is not callable; recursion is refused.
-//! 5. **Folds**: a fold's bounds are constant and run forwards
-//!    ([`range_bounds`]), and its body is a term of its monoid, an `f32` or
+//! 5. **Folds**: bounds are known counts, enclosing fold
+//!    indices or entry count parameters ([`range_bounds`]); known bounds run
+//!    forwards, while dynamic order is guarded by the IR. The body is a term of its monoid, an `f32` or
 //!    a `bool`, in a scope where the closure's parameter is the index.
-//! 6. **Binding times** (plan §1.4): an entry's structural parameters are
-//!    counts, and every parameter is a uniform — [`AnalyzedKernel::parameters`]
+//! 6. **Binding times** (plan §1.4): entry count parameters are per-call
+//!    uniforms. [`AnalyzedKernel::parameters`]
 //!    is the order they are declared in.
 //! 7. **Tuple `let`s** (D7's front half): a tuple `let` types every
 //!    expression before it binds any name.
@@ -46,8 +47,7 @@
 //! | Class      | Binding Time        | Arena Representation | Example |
 //! |------------|---------------------|----------------------|---------|
 //! | Intrinsic  | Collapse time       | `Var(0)`, `Var(1)`   | X, Y    |
-//! | Parameter  | Per call (uniform)  | `Uniform(slot)`, one per record field | cx, p |
-//! | Structural | Instantiation       | a count; `N as f32` is `Const(N)` | N |
+//! | Parameter  | Per call (uniform)  | `Uniform(slot)`, one per scalar or record field | cx, n, p |
 //! | Const      | Expansion time      | `Const(v)`, or a count | PI, N |
 //! | Local      | Expression scope    | A shared `ExprId`, or a record's fields | dx, q |
 //! | Index      | A fold's body       | The fold's binder `Var` | i    |
@@ -72,15 +72,14 @@
 //! 3. a fold's index → the fold's binder, a `usize`, visible in the fold's
 //!    body and nowhere else
 //! 4. a `const` → its value
-//! 5. an entry's structural parameter → a count, fixed per instantiation
-//! 6. an intrinsic (X, Y) → a coordinate `Var`, in an entry only: a helper
+//! 5. an intrinsic (X, Y) → a coordinate `Var`, in an entry only: a helper
 //!    takes its coordinates as arguments, so that application is contramap
 //!    (docs/language/2026-09-25-the-language-is-kernel.md §1.2)
-//! 7. otherwise → refused. A kernel body does not capture from the caller's
+//! 6. otherwise → refused. A kernel body does not capture from the caller's
 //!    scope, so a name nothing here binds is an error here, with a span —
 //!    not a capture that lowering then refuses without one.
 //!
-//! Nothing shadows X, Y, a `const`, a structural parameter or a `fn` — a
+//! Nothing shadows X, Y, a `const` or a `fn` — a
 //! parameter, a `let` or a fold's index of that name is refused — so a
 //! coordinate always means the coordinate and an item always means the
 //! item.
@@ -107,35 +106,32 @@
 //!     /// `def` checked and its consts evaluated: every name bound in scope; every expression
 //!     /// `f32` or `bool`, a `usize` only as `i as f32`, a record only by name, a kernel only
 //!     /// applied or passed on once per path; every call a helper at its arity; the call graph
-//!     /// acyclic; every `const` the value rustc gives; every fold's range constant, forward and
-//!     /// admitted; at least one entry. Returns `def` unchanged. Err: the first refusal, at its
+//!     /// acyclic; every `const` the value rustc gives; every fold's bounds admitted at their
+//!     /// binding times; at least one entry. Returns `def` unchanged. Err: the first refusal, at its
 //!     /// construct (a block with no entry has none, and is refused at the invocation).
 //!     fn analyze(def: KernelDef) -> syn::Result<AnalyzedKernel>;
 //!     /// An entry's uniforms in declaration order: an `f32` one, a record one per field, a
 //!     /// kernel-typed one omitted — the one definition of a program's uniform order.
 //!     fn AnalyzedKernel::parameters<'a>(&'a self, params: &'a [Param]) -> Vec<Parameter<'a>>;
-//!     /// `lo..hi` over literals, `usize` consts and `scope.structural`: `Known` when both
-//!     /// evaluate, run forward and `Fold::admits` them; `Structural` when a bound names a
-//!     /// structural parameter (rustc evaluates it at instantiation). Err: not constant,
-//!     /// overflow, backwards, past `Fold::EXACT_BOUND`.
-//!     fn range_bounds(range: &RangeExpr, scope: RangeScope<'_>) -> syn::Result<Bounds>;
+//!     /// `lo..hi` over literals, `usize` consts and value counts.
+//!     /// Known ends run forward and `KnownRange::admits` them; value ends
+//!     /// are checked by the IR guard.
+//!     fn range_bounds(range: &RangeExpr, scope: RangeScope<'_>) -> syn::Result<[Count; 2]>;
 //!     /// The refusal of a fold opened with `Binder::COUNT` already open.
 //!     fn folds_nested_too_deep(span: Span) -> syn::Error;
-//!     /// `lo..hi` as source: the key two folds over one range share.
-//!     fn StructuralRange::text(&self) -> String;
 //! }
 //! /// The AST, validated, and the value of every `const`.
 //! struct AnalyzedKernel { pub(crate) def: KernelDef, pub(crate) consts: HashMap<Name, ConstValue> }
 //! enum ConstValue { F32(f32), Usize(u64) }
 //! /// An entry's parameter as its program sees it: a uniform scalar, or a record of them.
-//! enum Parameter<'a> { Scalar(&'a Ident), Record { name: &'a Ident, id: RecordId, fields: &'a [RecordField] } }
+//! enum Parameter<'a> { Scalar(&'a Ident), Count(&'a Ident), Record { name: &'a Ident, id: RecordId, fields: &'a [RecordField] } }
 //! /// One uniform scalar: a parameter, or one field of a record parameter.
-//! enum Scalar { Param(Ident), Field(Ident, Ident) }
-//! /// A fold's bounds: evaluated at expansion, or when the host function is instantiated.
-//! enum Bounds { Known(Range<u32>), Structural(StructuralRange) }
-//! struct StructuralRange { pub(crate) lo: TokenStream, pub(crate) hi: TokenStream }
-//! /// What a fold's bound may name: a `usize` const, evaluated, or a structural parameter.
-//! struct RangeScope<'a> { pub(crate) consts: &'a HashMap<Name, ConstValue>, pub(crate) structural: &'a [Ident] }
+//! enum Scalar { Param(Ident), Count(Ident), Field(Ident, Ident) }
+//! /// One bound at the binding time where its count becomes available.
+//! enum Count { Known(u64), Name(Ident) }
+//! /// What a fold's bound may name: a `usize` const;
+//! /// value names are checked against the body's scope.
+//! struct RangeScope<'a> { pub(crate) consts: &'a HashMap<Name, ConstValue> }
 //! ```
 
 mod analyze;
@@ -144,4 +140,4 @@ mod calls;
 mod consts;
 
 pub(crate) use analyze::{AnalyzedKernel, ConstValue, Parameter, Scalar, analyze};
-pub(crate) use consts::{Bounds, RangeScope, StructuralRange, folds_nested_too_deep, range_bounds};
+pub(crate) use consts::{Count, RangeScope, folds_nested_too_deep, range_bounds};

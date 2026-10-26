@@ -81,7 +81,7 @@ impl KernelDef {
 ///
 /// It has no name, no visibility and no declared return type, because it
 /// is never a host function: its type is inferred, and it has no
-/// structural parameters, records or helpers to be generic over.
+/// records or helpers.
 #[derive(Debug, Clone)]
 pub(crate) struct ClosureEntry {
     pub(crate) params: Vec<Param>,
@@ -94,15 +94,14 @@ impl ClosureEntry {
         Callable {
             name: None,
             role: Role::Entry,
-            structural: &[],
             params: &self.params,
             body: &self.body,
         }
     }
 }
 
-/// What `sema` and lowering read of a function: its role, its structural
-/// and ordinary parameters, and its body. An item's [`FnItem::callable`] and
+/// What `sema` and lowering read of a function: its role, parameters and
+/// body. An item's [`FnItem::callable`] and
 /// the closure's [`ClosureEntry::callable`] are the two ways to have one, so
 /// a stage that handles an entry handles either spelling of it.
 #[derive(Debug, Clone, Copy)]
@@ -110,8 +109,6 @@ pub(crate) struct Callable<'a> {
     /// The function's name; the closure form has none.
     pub(crate) name: Option<&'a Ident>,
     pub(crate) role: Role,
-    /// An entry's structural parameters; a helper has none.
-    pub(crate) structural: &'a [Ident],
     pub(crate) params: &'a [Param],
     pub(crate) body: &'a Expr,
 }
@@ -189,11 +186,6 @@ pub(crate) struct FnItem {
     /// private `fn` is a helper, inlined at each call.
     pub(crate) vis: syn::Visibility,
     pub(crate) name: Ident,
-    /// An entry's structural parameters, its `const N: usize` generics, in
-    /// declaration order (plan §1.4). Each value is its own program: the
-    /// host function is generic over them, and a body reads one as a count,
-    /// in a range's bounds or as `N as f32`. A helper has none.
-    pub(crate) structural: Vec<Ident>,
     pub(crate) params: Vec<Param>,
     /// The declared return type.
     pub(crate) ret: Type,
@@ -216,7 +208,6 @@ impl FnItem {
         Callable {
             name: Some(&self.name),
             role: self.role(),
-            structural: &self.structural,
             params: &self.params,
             body: &self.body,
         }

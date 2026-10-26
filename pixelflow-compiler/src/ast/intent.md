@@ -34,7 +34,7 @@ which method a name is at an arity, which binding a written name means.
 `mod.rs`, under `# Contract`: every type and function it `pub(crate) use`s.
 `def.rs`: `KernelDef`, `ClosureEntry`, `Callable`, `RecordId`, `RecordItem`,
 `RecordField`, `ConstItem`, `FnItem`, `Role`, `Param`. `types.rs`:
-`FunctionType`, `bare_name`, `is_f32`, `is_usize`. `name.rs`: `Name`,
+`FunctionType`, `bare_name`, `is_f32`. `name.rs`: `Name`,
 `same_name`, `Method`, `LibraryMethod`, `Projection`. `scopes.rs`: `Scopes`.
 `expr.rs`: `Expr`, `FieldExpr`, `LiteralExpr`, `Literal`, `BinaryOp`,
 `BinaryExpr`, `UnaryOp`, `UnaryExpr`, `MethodCallExpr`, `ProjectExpr`,

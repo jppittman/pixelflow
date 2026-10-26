@@ -121,7 +121,7 @@ These points are particularly relevant when working with or generating code usin
         }
         ```
 
-    **Branchless is the limit of this rule.** A fold reduces the live cases; branchless removes them from runtime entirely, because one expression is correct for every input. A comparison yielding an all-ones mask rather than a `bool`, and a language that is a DAG with no iteration binder, are both that — take it wherever the hardware offers it.
+    **Branchless is the limit of this rule.** A fold reduces the live cases; branchless removes them from runtime entirely, because one expression is correct for every input. A comparison yielding an all-ones mask rather than a `bool`, and a language that is a DAG whose one binder, the fold, has no bound that varies with a coordinate, are both that — take it wherever the hardware offers it.
 
     The one thing it does not license is hand-rolling a *worse* branchless form than the instruction already sitting there. The retired `Round` expansion is the worked counter-example: `(x + 0.5).floor()` is two instructions where `roundps` is one, and it isn't any IEEE rounding mode either. Slower *and* wrong is never the trade. See "Floating point at the edges" in `CLAUDE.md`.
 

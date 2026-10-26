@@ -3,8 +3,8 @@
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 use pixelflow_ir::arena::{BufferDecl, UniformDecl};
-use pixelflow_ir::fold::Fold;
-use pixelflow_ir::{KernelKey, OpKind, ShiftCount, Variance};
+use pixelflow_ir::fold::{Bound, Fold, FoldHeader, KnownRange};
+use pixelflow_ir::{KernelKey, Lit, OpKind, ShiftCount, Variance};
 
 use super::shift::ShiftDirection;
 
@@ -72,7 +72,8 @@ impl EClassId {
 pub(crate) const MAX_OPERANDS: usize = 3;
 
 /// The e-classes an operation is applied to: exactly [`OpKind::arity`] of
-/// them, held inline.
+/// them, held inline. A fold's children are held the same way: its body, then
+/// each value bound (`Operands::fold`).
 ///
 /// The live operands are a prefix of a fixed array whose tail is always the
 /// zero class, so two operand lists are equal exactly when their live
@@ -80,18 +81,22 @@ pub(crate) const MAX_OPERANDS: usize = 3;
 /// case for the tail. The derived order is by length, then by the ids; it
 /// reads the tail too, which is sound because the tail is always zero: it
 /// compares equal and decides nothing, so among lists of one length the order
-/// is the live prefix's. The fields are private and the one constructor takes
-/// the operation it is for, so the tail cannot be written and the length is
-/// checked against that operation's arity. The slice view, and `Debug`, are
-/// the live prefix only.
+/// is the live prefix's. The fields are private and there are two
+/// constructors: `Operands::new` takes the operation it is for and checks the
+/// length against that operation's arity, and `Operands::fold` takes a body
+/// and the value bounds and is reached only through [`ENode::reduce`]. Neither
+/// lets the tail be written. The slice view, and `Debug`, are the live prefix
+/// only.
 ///
-/// The operation is not stored here, so the pairing is checked when the
-/// operands are built and not afterwards: a variant's fields are public, and
-/// `ENode::Op` can be written with another node's operands under a different
-/// `op`. [`ENode::apply`] is the constructor that keeps them together.
+/// The operation, or the fold's header, is not stored here, so the pairing is
+/// checked when the operands are built and not afterwards: a variant's fields
+/// are public, and `ENode::Op` can be written with another node's operands
+/// under a different `op`, as `ENode::Reduce` can with a header that counts
+/// other children. [`ENode::apply`] and [`ENode::reduce`] are the
+/// constructors that keep them together.
 ///
 /// A shift has no operands in this sense: its count is a parameter, held by
-/// [`ENode::Shift`], so the constructor refuses `Shl` and `Shr`.
+/// [`ENode::Shift`], so `Operands::new` refuses `Shl` and `Shr`.
 ///
 /// `len` counts slots of an inline array, not anything a program can say: its
 /// range is `MAX_OPERANDS` whatever its width, so a wider count would let no
@@ -138,7 +143,28 @@ impl Operands {
             ids,
         }
     }
+
+    /// A fold's children: its body, then each value bound, `lo`'s before
+    /// `hi`'s. Not an operation's operands (no `OpKind::arity` counts them),
+    /// which is why this is a second constructor beside [`Operands::new`] and
+    /// is reached only through [`ENode::reduce`]. The tail stays the zero
+    /// class, so the derived `Eq`, `Hash` and `Ord` hold as for an operation.
+    pub(crate) fn fold(body: EClassId, lo: Bound<EClassId>, hi: Bound<EClassId>) -> Self {
+        let mut ids = [EClassId(0); MAX_OPERANDS];
+        let mut len = 0;
+        for class in core::iter::once(body).chain(lo.value()).chain(hi.value()) {
+            ids[len] = class;
+            len += 1;
+        }
+        Self {
+            len: len as u8,
+            ids,
+        }
+    }
 }
+
+// A fold is a body and two bounds: it fits the widest operation's slots.
+const _: () = assert!(MAX_OPERANDS >= 3);
 
 impl Deref for Operands {
     type Target = [EClassId];
@@ -162,12 +188,46 @@ impl DerefMut for Operands {
 /// hashing are structural, which is what hash-consing the graph's memo needs.
 /// The order is structural too: variant in declaration order, then fields. It
 /// is a total order to sort and key by, not a measure of the node.
+///
+/// **Width.** 32 bytes, from 24, since a fold's bounds became the node's
+/// (docs/language/2026-10-20-a-bound-is-a-value.md, A2b): a `Reduce` holds a
+/// [`FoldHeader`] (16 bytes: three counts stored in 32 bits, and four bytes)
+/// beside its inline children (16), and a node is as wide as its widest
+/// variant, so every node pays for it, not only folds. Measured with
+/// `size_of`, not budgeted. The header first landed with 64-bit storage, 48
+/// bytes a node; the measurement below is why its storage is 32 bits, and the
+/// reason is written in [`FoldHeader`]'s doc.
+///
+/// The growth was measured (2026-10-22) the way the `EClassId` paragraph above
+/// measured its own: a native release build, interleaved parent/head pairs,
+/// each in its own process, peak RSS read from the parent (`ru_maxrss`, KiB,
+/// shown here divided by 1000), on the cold compile of the 29 programs ASCII
+/// needs and of the n=40 program. The harness is out of tree. The parent is
+/// the tree before this change, after the e-graph arena work, which is why its
+/// base is smaller than the one above.
+///
+/// - Peak RSS, medians: 89.3 to 104.8 MB (+17%) over 8 pairs on the 29
+///   programs, 16.2 to 17.8 MB (+10%) over 10 pairs on n=40.
+/// - Instructions (callgrind, deterministic), the 29 programs: 5,155 M to
+///   5,425 M (+5.2%); `Saturation::saturate` inclusive +7.8%, extraction
+///   inclusive +3.4%.
+/// - Cold time, medians over the same pairs: 789 to 988 ms (+25%) on the 29
+///   programs, against the unchanged binary's own spread of 720 to 966 ms;
+///   61 to 63 ms on n=40, inside its spread (48 to 84 ms). RSS and
+///   instructions are the deterministic signals.
+///
+/// That is the size of growth that kept `EClassId` at `u32` (+18% and +8%).
+/// With the counts stored in 32 bits, the 29-program peak RSS is 95.2 MB
+/// against 90.0 before A2b (+5.8%), measured in 12 rotating rounds of the
+/// three binaries (`FoldHeader`'s doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ENode {
     /// Variable with index (0=X, 1=Y, 2=Z, 3=W, etc.)
     Var(u8),
-    /// Constant value (stored as f32 bits)
-    Const(u32),
+    /// A literal, keyed by its typed value: a real by its bits, a mask by
+    /// its truth. A true mask and the NaN that shares its lane are two
+    /// e-classes, so a rule that fires on the one cannot fire on the other.
+    Const(Lit),
     /// Bound-memory leaf: a buffer declaration, read through a `Gather` node.
     ///
     /// Carries the full [`BufferDecl`] rather than an arena-local `BufferId`
@@ -185,19 +245,12 @@ pub enum ENode {
     /// `Const`, so it is never folded; its gain in the e-graph is CSE of the
     /// arithmetic that depends on it alone.
     Uniform(UniformDecl),
-    /// Unbound scalar slot of a `kernel!` builder, hash-consed by index.
+    /// Unbound scalar slot, hash-consed by index: a leaf with no value.
     ///
-    /// The same opaque leaf as [`ENode::Uniform`], one tier earlier: no rule
-    /// matches it, nothing folds it, its derivative is zero, and its gain in
-    /// the e-graph is CSE of the arithmetic depending on it alone. A builder
-    /// substitutes it away before anything is compiled, so only the macro
-    /// tier's [`Vocabulary::Templates`](super::ops::Vocabulary) may hold one.
-    ///
-    /// Before this leaf existed the e-graph refused `Param` outright, and
-    /// each macro-side caller smuggled one past as something else — as
-    /// `Var(16 + i)` in the compiler's arena bridge, as an opaque synthetic
-    /// identifier in its AST optimizer. Two encodings of one idea, next to
-    /// two worked examples of it.
+    /// An opaque leaf like [`ENode::Uniform`]: no rule matches it, nothing
+    /// folds it, its derivative is zero, and its gain in the e-graph is CSE of
+    /// the arithmetic depending on it alone. Only a
+    /// [`Vocabulary::Templates`](super::ops::Vocabulary) graph may hold one.
     Param(u8),
     /// An operation applied to the classes of its operands.
     Op { op: OpKind, children: Operands },
@@ -223,8 +276,8 @@ pub enum ENode {
         /// The class being shifted.
         operand: EClassId,
     },
-    /// A bounded fold: `⊕_{k} body[fold.binder() := k]`, `k` ranging over
-    /// `fold`'s own visited indices (see `Fold`'s doc, in `pixelflow-ir`).
+    /// A bounded fold: `⊕_{k} body[binder := k]`, `k` ranging over the visited
+    /// indices of the header's range (see `FoldHeader`'s doc, in `pixelflow-ir`).
     ///
     /// The one node in the graph that *binds*, and the reason it can be in
     /// the graph at all: its algebra, binder and range live in the node's
@@ -235,8 +288,28 @@ pub enum ENode {
     /// simply lowered before insertion and the e-graph never saw a fold.
     ///
     /// Hash-consing therefore does what it should: two folds are one node iff
-    /// they fold the same body, under the same algebra, over the same range.
-    Reduce { fold: Fold, body: EClassId },
+    /// they fold the same body, under the same algebra, over the same bounds.
+    ///
+    /// A known bound is the header's, for the reason a shift's count is the
+    /// node's (above). A bound that is a value is a child class, held inline
+    /// in `children` after the body (the body, then `lo`'s, then `hi`'s), so
+    /// [`ENode::children_slice`] lends every one and canonicalization
+    /// rewrites every one: a class held outside that slice would never be
+    /// canonicalized. The header says how many follow the body.
+    ///
+    /// For a bound that is a value the shift's reason is reversed: a rule
+    /// reaching it is the point. `PeelFold`'s substitution turning an inner
+    /// `0..i` into `0..k` is how a range becomes known (L8 of
+    /// docs/language/2026-10-20-a-bound-is-a-value.md, `KnownBound`).
+    ///
+    /// The fields are public, as `Op`'s are; [`ENode::reduce`] is the
+    /// constructor that keeps the header and the children together, and
+    /// [`ENode::as_reduce`] the reader that gives them back as the parts
+    /// they are.
+    Reduce {
+        header: FoldHeader,
+        children: Operands,
+    },
     /// A **unit**: a kernel named by content, optimized by itself and linked
     /// in after extraction (`crate::runtime`;
     /// docs/language/2026-09-25-the-language-is-kernel.md §4, O1). A leaf here,
@@ -260,22 +333,38 @@ pub enum ENode {
 }
 
 impl ENode {
-    /// Create a constant node.
+    /// A real constant.
     pub fn constant(val: f32) -> Self {
-        ENode::Const(val.to_bits())
+        ENode::Const(Lit::Real(val))
     }
 
-    /// Get the constant value if this is a Const node.
-    pub fn as_f32(&self) -> Option<f32> {
+    /// The literal, if this is a `Const` node.
+    pub fn literal(&self) -> Option<Lit> {
         match self {
-            ENode::Const(bits) => Some(f32::from_bits(*bits)),
+            ENode::Const(lit) => Some(*lit),
             _ => None,
         }
     }
 
-    /// Check if this node is a specific constant value.
+    /// The real, if this is a real constant.
+    pub fn as_f32(&self) -> Option<f32> {
+        self.literal().and_then(Lit::real)
+    }
+
+    /// Whether this node is the real constant `val`, as `f32::eq` sees it:
+    /// `0.0` matches `-0.0`, NaN matches nothing. The sense a rule pattern's
+    /// literal has always had.
     pub fn is_const(&self, val: f32) -> bool {
         self.as_f32() == Some(val)
+    }
+
+    /// Whether this node is the literal `lit`: a real as [`Self::is_const`]
+    /// reads it, a mask by its truth.
+    pub fn is_lit(&self, lit: Lit) -> bool {
+        match lit {
+            Lit::Real(val) => self.is_const(val),
+            Lit::Mask(_) => self.literal() == Some(lit),
+        }
     }
 
     /// `op` applied to `operands`, one class per operand.
@@ -292,6 +381,82 @@ impl ENode {
             op,
             children: Operands::new(op, operands),
         }
+    }
+
+    /// The fold `fold` from `lo` to `hi` over `body`. Four arguments, as
+    /// `ExprArena::push_reduce`'s: the node's four fields, and `push_ternary`
+    /// is the precedent for not grouping them.
+    ///
+    /// # Panics
+    ///
+    /// As [`FoldHeader::new`].
+    #[must_use]
+    pub fn reduce(fold: Fold, lo: Bound<EClassId>, hi: Bound<EClassId>, body: EClassId) -> Self {
+        ENode::Reduce {
+            header: FoldHeader::new(fold, lo.erased(), hi.erased()),
+            children: Operands::fold(body, lo, hi),
+        }
+    }
+
+    /// This fold's parts, resolved: `(fold, lo, hi, body)`; `None` if this is
+    /// not a fold. The one reader of a fold's children outside this file: no
+    /// site indexes `children` by position.
+    #[must_use]
+    pub fn as_reduce(&self) -> Option<(Fold, Bound<EClassId>, Bound<EClassId>, EClassId)> {
+        let ENode::Reduce { header, children } = self else {
+            return None;
+        };
+        let (lo, hi) = header.attach(children[1..].iter().copied());
+        Some((header.fold(), lo, hi, children[0]))
+    }
+
+    /// The fold over the counts this fold's value bounds name, when `literal`
+    /// gives a literal for each bound's class and the two make the range
+    /// known: the fold in its literal form, `None` for every other node (one
+    /// that is no fold, a fold over literals, and a fold some bound of which
+    /// names no count: a fraction, a negative, past 2²⁴, a mask). The pair is
+    /// read as `Bound::discover` reads it, so a pair that runs backwards is
+    /// the empty range at its start (L2 of
+    /// docs/language/2026-10-20-a-bound-is-a-value.md).
+    ///
+    /// The one construction of a fold's literal form. `KnownBound` adds the
+    /// result to the fold's class, finding each literal as a class member; the
+    /// extractor never adds it and prices the fold as it, finding each
+    /// literal in the form chosen for the class. What one construction buys
+    /// is that, given the same literal for each bound class, the rule and the
+    /// price build the same fold. Which literal each finds is its own (a
+    /// class member for the rule, the chosen form for the price), and so is
+    /// whether it finds one: the two agree on a fold only where those do
+    /// (docs/language/2026-10-20-a-bound-is-a-value.md §3.2). Known by
+    /// construction, so `ENode::reduce` takes `FoldHeader::new`'s literal
+    /// path.
+    ///
+    /// The guard is inlined at every call site, and the work past it is a
+    /// separate function (`value_bounded_twin`), which the compiler may inline
+    /// as well and does at the price sites; an out-of-line body measured
+    /// worse. Every candidate the extractor prices asks: a leaf and an
+    /// operation answer on the first test, a fold over literals on the second,
+    /// and only a fold with a value bound reaches the rest.
+    #[inline(always)]
+    pub(crate) fn literal_twin(&self, literal: impl Fn(EClassId) -> Option<Lit>) -> Option<ENode> {
+        let ENode::Reduce { header, .. } = self else {
+            return None;
+        };
+        if header.arity() == 1 {
+            return None;
+        }
+        self.value_bounded_twin(literal)
+    }
+
+    /// [`Self::literal_twin`] past its guard: the fold has a value bound.
+    #[inline]
+    fn value_bounded_twin(&self, literal: impl Fn(EClassId) -> Option<Lit>) -> Option<ENode> {
+        let (fold, lo, hi, body) = self.as_reduce()?;
+        let (lo, hi) = Bound::discover(lo, hi, literal).ok()?;
+        let (Bound::Lit(_), Bound::Lit(_)) = (lo, hi) else {
+            return None;
+        };
+        Some(ENode::reduce(fold, lo, hi, body))
     }
 
     /// The operation this node performs, if it is one: an `Op`'s own, or the
@@ -323,11 +488,24 @@ impl ENode {
         }
     }
 
-    /// The fold this node performs, if it is one.
-    pub fn fold(&self) -> Option<Fold> {
+    /// The range of the fold this node performs, when it is known: `Some` when
+    /// both bounds are literals, `None` when either is a value — the case a
+    /// reader's own answer for an unknown range is for (a rule declines, an
+    /// emptiness test is false).
+    ///
+    /// The e-graph's reader of a fold's range, beside the arena's and the
+    /// schedule's. **Per node, not per class:** after `HalveFold` one class
+    /// holds two `Reduce` nodes over different ranges (the original and its
+    /// strided form), so a class has no range of its own — a rule or a price
+    /// reads the node it is looking at.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this is not a [`ENode::Reduce`]: only a fold has a range.
+    pub fn known_range(&self) -> Option<KnownRange> {
         match self {
-            ENode::Reduce { fold, .. } => Some(*fold),
-            _ => None,
+            ENode::Reduce { header, .. } => header.known_range(),
+            other => panic!("known_range: {other:?} is not a Reduce — only a fold has a range"),
         }
     }
 
@@ -351,8 +529,7 @@ impl ENode {
             | ENode::Uniform(_)
             | ENode::Param(_)
             | ENode::Ref { .. } => &[],
-            ENode::Op { children, .. } => children,
-            ENode::Reduce { body, .. } => core::slice::from_ref(body),
+            ENode::Op { children, .. } | ENode::Reduce { children, .. } => children,
             ENode::Shift { operand, .. } => core::slice::from_ref(operand),
         }
     }
@@ -367,8 +544,7 @@ impl ENode {
             | ENode::Uniform(_)
             | ENode::Param(_)
             | ENode::Ref { .. } => &mut [],
-            ENode::Op { children, .. } => children,
-            ENode::Reduce { body, .. } => core::slice::from_mut(body),
+            ENode::Op { children, .. } | ENode::Reduce { children, .. } => children,
             ENode::Shift { operand, .. } => core::slice::from_mut(operand),
         }
     }
@@ -385,10 +561,16 @@ impl ENode {
     /// depends on — the forward transfer function of variance.
     ///
     /// A leaf names its own variable (or none); an operation unions its
-    /// children; a fold removes the index it binds. The one definition both
-    /// consumers read: the e-graph's per-class fact (`EGraph::variance`),
-    /// which feeds it the children's facts, and the extractor's
-    /// `node_variance`, which feeds it the variance of the forms it chose.
+    /// children; a fold removes the index it binds from its body's, and adds
+    /// what its value bounds read, which they read outside that binding (L3 and
+    /// L4 of docs/language/2026-10-20-a-bound-is-a-value.md). The one definition
+    /// both consumers read: the e-graph's per-class
+    /// fact (`EGraph::variance`), which feeds it the children's facts, and the
+    /// extractor's `node_variance`, which feeds it the variance of the forms it
+    /// chose.
+    ///
+    /// The arena's transfer types a fold over a known empty range `CONST`;
+    /// this has no such arm, so it keeps that fold's body less its index.
     ///
     /// Monotone in `child`: a larger answer for a child can only give a
     /// larger answer here, so an over-approximation in gives an
@@ -402,11 +584,12 @@ impl ENode {
         mut child: impl FnMut(EClassId) -> Variance,
     ) -> Variance {
         match self {
-            ENode::Var(v) => var_variance(*v),
+            ENode::Var(v) => Variance::of_var(*v),
             // A buffer's contents are fixed for the kernel's lifetime — a
             // read of one varies with its index, which is the `Gather`'s
-            // other children, unioned by the `Op` arm. A uniform or a
-            // builder's parameter is one number for the whole lattice.
+            // other children, unioned by the `Op` arm. A uniform is one
+            // number for the whole lattice, and a `Param`, which has no
+            // value, is classed with it.
             ENode::Const(_) | ENode::Buffer(_) | ENode::Uniform(_) | ENode::Param(_) => {
                 Variance::CONST
             }
@@ -418,25 +601,14 @@ impl ENode {
                 .fold(Variance::CONST, |acc, &c| acc.union(child(c))),
             ENode::Shift { operand, .. } => child(*operand),
             // The one node that *shrinks* the set: its index is bound, so it
-            // is not free in the result.
-            ENode::Reduce { fold, body } => {
-                child(*body).without(Variance::from_var(fold.binder().var()))
-            }
+            // is not free in the result. Its value bounds are read outside
+            // that binding (L3), so what they read is free in the fold,
+            // unmasked (L4).
+            ENode::Reduce { header, children } => children[1..].iter().fold(
+                child(children[0]).without(Variance::from_var(header.fold().binder().var())),
+                |acc, &bound| acc.union(child(bound)),
+            ),
         }
-    }
-}
-
-/// The variance of a `Var` leaf: its own bit.
-///
-/// 0→X, 1→Y, 2 and 3 the retired axes, then the reduction index slots up to
-/// [`Variance::VARIABLES`]. An index past them is not a variable the bitset
-/// can name, so it is conservatively [`Variance::ALL`] — an answer that can
-/// only decline an invariance, never claim one.
-fn var_variance(v: u8) -> Variance {
-    if v < Variance::VARIABLES {
-        Variance::from_var(v)
-    } else {
-        Variance::ALL
     }
 }
 
@@ -554,8 +726,9 @@ mod tests {
         );
     }
 
-    /// The coordinates and every reduction slot get a bit each; past the
-    /// word the analysis gives up and says everything.
+    /// The coordinates and every reduction slot get a bit each; a placeholder
+    /// (an enclosing fold's index before its slot is chosen) is none; past the
+    /// placeholders the analysis gives up and says everything.
     #[test]
     fn a_var_leaf_names_its_own_bit() {
         let leaf = |v: u8| ENode::Var(v).variance(no_unit, |_| Variance::ALL);
@@ -569,6 +742,90 @@ mod tests {
             leaf(Variance::VARIABLES - 1),
             Variance::from_var(Variance::VARIABLES - 1)
         );
-        assert_eq!(leaf(Variance::VARIABLES), Variance::ALL);
+        // A placeholder is a binder-to-be, never a coordinate (`Variance::of_var`).
+        assert_eq!(leaf(Variance::VARIABLES), Variance::CONST);
+        assert_eq!(leaf(127), Variance::CONST);
+        assert_eq!(leaf(128), Variance::ALL);
+    }
+
+    fn sum(binder_slot: u8) -> Fold {
+        let binder = pixelflow_ir::fold::Binder::from_slot(binder_slot).expect("a binder");
+        Fold::new(pixelflow_ir::fold::Monoid::SUM, binder)
+    }
+
+    /// A value bound is a child after the body, lent by the slice
+    /// canonicalization rewrites, and the node's range is not known.
+    #[test]
+    fn a_fold_node_holds_a_value_bound_after_its_body() {
+        let fold = sum(0);
+        let node = ENode::reduce(fold, Bound::Lit(0), Bound::Value(EClassId(2)), EClassId(1));
+        assert_eq!(node.children_slice(), [EClassId(1), EClassId(2)]);
+        assert_eq!(
+            node.as_reduce(),
+            Some((fold, Bound::Lit(0), Bound::Value(EClassId(2)), EClassId(1)))
+        );
+        assert_eq!(node.known_range(), None);
+    }
+
+    /// L4: a fold varies with its body less its own index, and with what its
+    /// value bounds read, unmasked: a bound reading an enclosing fold's index
+    /// leaves that index free in the fold.
+    #[test]
+    fn a_folds_variance_is_its_bodys_less_its_index_and_its_bounds() {
+        let node = ENode::reduce(
+            sum(0),
+            Bound::Lit(0),
+            Bound::Value(EClassId(2)),
+            EClassId(1),
+        );
+        let body = Variance::X.union(Variance::from_var(4));
+        let bound = Variance::from_var(5);
+        let child = |class: EClassId| if class == EClassId(1) { body } else { bound };
+        assert_eq!(
+            node.variance(no_unit, child),
+            Variance::X.union(Variance::from_var(5))
+        );
+    }
+
+    /// A fold over literals has its body as its only child: the bounds are
+    /// the header's, and `as_reduce` gives the parts back.
+    #[test]
+    fn a_literal_folds_children_are_its_body() {
+        let fold = sum(0);
+        let node = ENode::reduce(fold, Bound::Lit(0), Bound::Lit(8), EClassId(5));
+        assert_eq!(node.children_slice(), [EClassId(5)]);
+        assert_eq!(
+            node.as_reduce(),
+            Some((fold, Bound::Lit(0), Bound::Lit(8), EClassId(5)))
+        );
+        assert_eq!(node.known_range().expect("literal").range(), 0..8);
+        assert_eq!(ENode::Var(0).as_reduce(), None);
+    }
+
+    /// Canonicalization rewrites the slice, so the body must be in it: writing
+    /// through `children_slice_mut` reaches the fold's body.
+    #[test]
+    fn a_folds_body_is_reached_through_the_mutable_slice() {
+        let mut node = ENode::reduce(sum(0), Bound::Lit(0), Bound::Lit(8), EClassId(5));
+        node.children_slice_mut()[0] = EClassId(9);
+        let (_, _, _, body) = node.as_reduce().expect("a fold");
+        assert_eq!(body, EClassId(9));
+    }
+
+    /// What a node costs, pinned as byte counts so a field that grows it
+    /// fails here with a number: facts about the types as measured, not
+    /// budgets their fields were chosen to meet.
+    #[test]
+    fn an_enode_is_measured_not_budgeted() {
+        assert_eq!(
+            core::mem::size_of::<Operands>(),
+            16,
+            "Operands: len(1) + pad(3) + three ids(12)"
+        );
+        assert_eq!(
+            core::mem::size_of::<ENode>(),
+            32,
+            "ENode: the widest variant is Reduce, a FoldHeader(16) and its Operands(16)"
+        );
     }
 }

@@ -68,28 +68,28 @@
   - Families and the `integral`/`area`/`monotone_root` syntax were built and
     then deleted (d8c39481, 5df0ece2).
 - **Follows:** lowering holds no copy of fract, hypot, clamp, the
-  derivative, the binder's choice and rename (`close_over`), or a range's
-  bound (`Fold::admits`) (B5). Production kernels move onto `kernel!` (C1,
+  derivative, the binder's choice and rename (`close_over`), or a known range's
+  admission (`KnownRange::admits`) (B5). Production kernels move onto `kernel!` (C1,
   D-c).
 - **Lives:** `pixelflow-compiler/src/` (`lib.rs`, `parser/`, `sema/`,
   `lower/`, `emit.rs`); the-language-is-kernel §1.1–§1.2. Today
   `kernel_raw!`, `macro_tier()` and `DwrtFree` are still in `lib.rs`, and
   `kernel!` is `expand(input, &mut macro_tier())`: it saturates at expansion
-  unless the term carries a `Dwrt` or structural parameters. That
+  unless the term carries a `Dwrt` or a kernel argument. That
   contradicts "nothing is optimized at expansion". `parse_expr` is still in
   `pixelflow-pipeline/src/training/factored.rs`.
 
 ### Entry, helper, record, Args
 
 - **Is:**
-  - An **entry** is a `pub fn`. The macro emits a host function for it that
-    instantiates the lowered template with its structural values and
-    returns the `Kernel`.
+  - An **entry** is a `pub fn`. The macro emits a host function returning a
+    `Kernel`; one taking a kernel argument runs lowering when called (`Staged`).
   - A **helper** is a private `fn`. Lowering inlines it (β-reduction), and
     it takes coordinates as arguments.
   - A **record** is a `struct` of named `f32` fields. It is flattened at
     lowering into uniforms in declaration order.
-  - **Args** is each entry's record of its non-structural arguments. A
+  - **Args** is each entry's record of its uniform arguments, including
+    `usize` counts. A
     compiled program is bound from `&Args`, so "every argument supplied" is
     a type, not a runtime assert.
 - **Is not:** a helper as an optimization unit (D19, withdrawn 2026-09-29:
@@ -101,7 +101,7 @@
   superseded.
 - **Follows:** X and Y appear only in entries, so a helper cannot read an
   unshifted X by accident. `write_into` streams values by position and
-  checks only the count, so one entry's Args written into another program of
+  checks arity and each count's domain, so one entry's Args written into another program of
   the same arity "binds without a word and draws plausible wrong pixels".
   The block must therefore be typed by its entry (`UniformBlock<A>`) or
   carry a per-entry token. A composed program has no entry of its own, so it
@@ -123,8 +123,9 @@
   - `Ref`, bound at link. A discrete kernel is a kernel, so it binds here too;
     there is no memory to bind (kernels-evaluate-kernels §2).
 
-  An author sees three binding times: **structural**, **uniform** and
-  **kernel-typed**.
+  An author sees two parameter binding times: **uniform** and
+  **kernel-typed**. A count `n: usize` is a uniform, so one program serves
+  every count.
 - **Is not:** kinds of thing that passes may tell apart. "A pass may ask
   when a name is bound and must not care what it names." That is what makes
   `contains_gather` unstatable rather than merely discouraged. Not decided
@@ -132,8 +133,8 @@
   `Uniform` becomes a slot" was superseded on 2026-09-25 ("An f32 argument
   no longer folds into a constant because of its type"). Not a tier.
 - **Follows:** `Gather` leaving the algebra is a consequence of this, not
-  the goal. Invariance is variance. A structural change recompiles and a
-  uniform change never does. A uniform's default stays out of the key, while
+  the goal. Invariance is variance. A uniform change does not recompile.
+  A uniform's default stays out of the key, while
   a discrete kernel's lattice is in it, as an extent is. The instruction chosen for a binding time
   (gather, broadcast, uniform load) is codegen's business.
 - **Lives:** `ExprNode::{Var, Uniform, Ref}` (no `Buffer`: bound buffers are retired, kernels-evaluate-kernels §2)
@@ -141,26 +142,17 @@
   Decided in `2026-09-10-one-name-bound-later.md` §1–§5 (status Draft) and
   the-language-is-kernel §1.4, D1. `pixelflow-compiler/tests/binding_times.rs`.
 
-### Structural parameter
+### Structural parameter (retired)
 
-- **Is:** a parameter bound at instantiation, where each value is a
-  different program: "`const N: usize`, a zoom level's tile extent; the
-  font's shape, meaning which glyphs and how many pieces each". Fold ranges
-  are expressions over literals and structural parameters.
-- **Is not:** a type for a count ("A count of things is not a type. It is
-  how many instances the host composed"). Not a uniform. Not variable at run
-  time. JP may later allow "uniform iterations", which are "no where near
-  the docket".
-- **Follows:** every range is constant, so every read point's range is known
-  at construction, so a new tile extent or zoom recompiles and is cached by
-  key. A font's glyphs are drawn by one program per piece count, chosen by
-  the count, a structural parameter (C1, 2026-10-09); the id tree whose
-  threshold `k` raised "structural or uniform" is superseded.
-- **Lives:** the-language-is-kernel §1.4–§1.5, §1.7, O2; one-pipeline
-  decisions (JP, 2026-09-25). In code, a structural parameter read as a value
-  (`N as f32`) is lowered to a `Param(k)` hole the host function fills
-  (`count` in `pixelflow-compiler/src/lower/site.rs`), so it rides on the leaf
-  the Param entry says has no job left.
+- **Is:** nothing in `kernel!` since a-bound-is-a-value A5 deleted it. A
+  count known at expansion is a literal or `usize` const; one that changes
+  per call is a value bound from an entry's `n: usize` parameter.
+- **Is not:** a parameter binding time. The old `const N: usize` generic
+  made one program per count and left `Param(k)` holes for `N as f32`.
+- **Follows:** `kernel!` refuses generics on every `fn` at parse. Every entry
+  without a kernel argument is offered to the optimizer at expansion.
+- **Lives:** `refuse_generics` (`pixelflow-compiler/src/parser/items.rs`);
+  a-bound-is-a-value §1.2, §3.4, §6 A5.
 
 ### Uniform (the parameter)
 
@@ -248,7 +240,8 @@
 - **Is not:** usable in arithmetic, `let`-bound, returned, used as an `if`
   arm, or stored in a record field; each is a spanned error. Not copyable:
   it is moved, as rustc moves it (E0382/E0507). Not allowed in the closure
-  form. Not a `.at` method.
+  form. Not a `.at` receiver: a kernel is observed by applying it, `k(x, y)`,
+  and `k.at(x, y)` is refused saying so.
 - **Follows:**
   - A composed program declares the entry's uniforms first, then each
     argument's, so slot offsets are prefix sums (O3).
@@ -275,8 +268,9 @@
 - **Is not:** a lattice origin. Not evaluation. Not a resolver of
   derivatives: a `Dwrt` inside survives and follows the warp, so
   `DX(X·X)` at `(2X, Y)` is 24 at x = 3, not 12. Not able to reach through a
-  `Ref` (collapse refuses a reachable `Ref`). Not a method in the target
-  syntax ("There is no `.at` method").
+  `Ref` (collapse refuses a reachable `Ref`). In `kernel!`, `f.at(x, y)`
+  observes any `f32` or `bool` field, including a `let`, helper parameter,
+  kernel application or fold, and keeps its type.
 - **Follows:**
   - The lattice can be index-only.
   - Once a frame offset is in the arena, the optimizer may reassociate it.
@@ -290,8 +284,11 @@
     expand or call chosen at extraction, is unbuilt; tabulation is the
     backend's materialization (kernels-evaluate-kernels §3).
     (composition-is-linking §8).
-- **Lives:** `Kernel::at` and `ExprArena::apply` (`pixelflow-ir/src/kernel.rs`),
-  `ExprArena::substitute_vars_with` (`pixelflow-ir/src/arena.rs`). Decided in
+- **Lives:** `ExprArena::warp` (`pixelflow-ir/src/arena.rs`), used by `.at` at
+  both lowering sites; `ExprArena::apply` (`pixelflow-ir/src/kernel.rs`)
+  splices a kernel before warping it. `Kernel::at` performs the same
+  substitution on a `Kernel` DAG. Pinned in
+  `pixelflow-compiler/tests/at_is_contramap.rs`. Decided in
   `2026-09-06-lattice-is-the-index.md` "The shape" and §9.2, and
   the-language-is-kernel §1.2, D5. Today the pixel-centre ½ is not a
   contramap on the frame path: `PlaneRegion::rows` puts it in the band's
@@ -369,9 +366,8 @@
   `Declined::Param` (`pixelflow-search/src/egraph/insert.rs`). Decided in
   macro-tier-is-arena-native and `2026-09-10-a-surviving-reduce-is-a-loop.md`
   2a″. Today it is still present, `Vocabulary::Templates` still admits it,
-  and it has a new job: the template hole for a structural parameter read
-  as a value (`count` in `pixelflow-compiler/src/lower/site.rs`), which refuses
-  past 256 rather than wrapping.
+  and `kernel!` builds none since a-bound-is-a-value A5 removed its
+  structural-generic path.
 
 ### Binder
 
@@ -496,29 +492,21 @@
 
 ### Range (trip count)
 
-- **Is:** a fold's half-open `[lo, hi)` with a stride, constant at
-  construction. Its ends are expressions over literals and structural
-  parameters. "The rule is that ranges have to be constant" (JP,
-  2026-09-25). The range is the half that carries the load: peeling over a
-  range leaves the body unchanged and therefore shared.
-- **Is not:** a uniform or a runtime value ("a dynamic bound on `Fold` …
-  Refused"; "a data bound is a dynamic trip count, which is refused and
-  becomes a recompile"). Not implicitly zero-based. Not past 2²⁴, where an
-  `f32` index stops being exact. Not a value of its own in the IR yet: "A
-  range is a value", which would let sibling reductions over one range be
-  one loop with one accumulator each, is proposed and unbuilt
-  (a-glyph-is-a-formula §4.2).
-- **Follows:** the trip count is in the kernel's key, so 34 pieces and 11
-  pieces are two compiles. Constructors refuse a range past 2²⁴
-  (`Fold::admits`). The allocator ranks carries by static trip counts.
-  `bucketed_trip_count`'s power-of-two padding existed only because of
-  this, and goes (G3).
-- **Lives:** `Fold { lo, hi, stride }`, `Fold::admits`, `Fold::EXACT_BOUND`
-  (`pixelflow-ir/src/fold.rs`). Decided in a-fold-is-a-node §3,
-  a-surviving-reduce-is-a-loop §1 and §5, and the-language-is-kernel §1.5.
-  Today the ends are `u32`, against the 64-bit rule, and
-  `bucketed_trip_count` still pads in
-  `pixelflow-graphics/src/fonts/loop_blinn.rs`.
+- **Is:** a fold's half-open `[lo, hi)` with a stride; an end is a literal
+  or a value child, including a per-call `n: usize` or enclosing fold index.
+  Peeling over a range leaves the body shared.
+- **Is not:** a coordinate-dependent bound, the fold's own binder, or a
+  range past 2²⁴, where an `f32` index stops being exact. Not implicitly
+  zero-based. A range is not yet its own IR node.
+- **Follows:** known ends are in the key; a value end keys by its child, so
+  one program serves every count. `KnownRange::admits` checks literal ends;
+  the host and `Args` guard count writes, and IR guards dynamic bounds.
+  The allocator estimates trips when the range is unknown.
+- **Lives:** `Fold { monoid, binder, stride }`, `Bound`, `FoldHeader`,
+  `Fold::EXACT_BOUND` and `KnownRange` (`pixelflow-ir/src/fold.rs`); bounds
+  belong to `ExprNode::Reduce`. Decided in a-fold-is-a-node §3,
+  a-surviving-reduce-is-a-loop §1 and §5, the-language-is-kernel §1.5,
+  and a-bound-is-a-value §3.1.
 
 ### Unrolling
 

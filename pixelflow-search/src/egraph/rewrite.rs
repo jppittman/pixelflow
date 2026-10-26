@@ -168,6 +168,12 @@ pub enum RewriteAction {
     /// variant for all of them, replayed by one function, so predicting a
     /// rule's growth and committing it cannot drift apart per rule. See
     /// [`Plan`](super::fold_rules::Plan).
+    ///
+    /// A plan can be declined when it is built: a fold of it whose value bound
+    /// is a class whose fact varies with a coordinate or with the fold's own
+    /// binder (L3 of docs/language/2026-10-20-a-bound-is-a-value.md) is not
+    /// added, and the matched class is not unioned with anything. The nodes
+    /// built before that fold stay, and the prediction counts them.
     Plan(super::fold_rules::Plan),
 
     /// Differentiate: expand `Dwrt(inner, var)` one chain-rule step.

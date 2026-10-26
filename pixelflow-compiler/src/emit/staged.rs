@@ -1,13 +1,11 @@
 //! The second [`Site`]: lowering's steps as the statements that take them,
 //! run when an entry that takes a kernel has its host function called.
 
-use super::arena::{
-    declare_uniform, emitted, fold_from_bits, instantiated_range, local, opkind_to_tokens,
-};
+use super::arena::{declare_uniform, emitted, fold_from_bits, local, opkind_to_tokens};
 use super::host::{argument, kernel_from};
 use crate::ast::Callable;
-use crate::lower::{Site, lower_entry};
-use crate::sema::{AnalyzedKernel, Bounds, Scalar};
+use crate::lower::{FoldBound, Site, lower_entry};
+use crate::sema::{AnalyzedKernel, Scalar};
 use pixelflow_ir::arena::Axis;
 use pixelflow_ir::{Binder, Monoid};
 use proc_macro2::TokenStream;
@@ -88,25 +86,23 @@ impl Staged {
 
     /// The closure an open fold closes into: its monoid, carried as a
     /// fold's bits (as `arena::node` carries a `Fold`), its binder the one
-    /// `close_fold` chooses, and its range — known, or this
-    /// instantiation's ([`instantiated_range`]).
-    fn fold_at(monoid: Monoid, bounds: Bounds) -> TokenStream {
+    /// `close_fold` chooses, and its known or value bounds.
+    fn fold_at(monoid: Monoid, bounds: [FoldBound<Ident>; 2]) -> TokenStream {
         let first = Binder::from_slot(0).expect("the IR has a binder");
-        let monoid_of = fold_from_bits(pixelflow_ir::Fold::new(monoid, first, 0..0));
-        let range = match bounds {
-            Bounds::Known(range) => {
-                let (lo, hi) = (range.start, range.end);
-                emitted!(#lo..#hi)
-            }
-            Bounds::Structural(range) => instantiated_range(&range),
+        let monoid_of = fold_from_bits(pixelflow_ir::Fold::new(monoid, first));
+        let bound = |bound| match bound {
+            FoldBound::Known(count) => emitted!(::pixelflow_core::__macro::ir::Bound::Lit(#count)),
+            FoldBound::Value(term) => emitted!(::pixelflow_core::__macro::ir::Bound::Value(#term)),
         };
-        emitted! {
-            |__binder| ::pixelflow_core::__macro::ir::fold::Fold::new(
-                #monoid_of.monoid(),
-                __binder,
-                #range,
-            )
-        }
+        let [lo, hi] = bounds;
+        let (lo, hi) = (bound(lo), bound(hi));
+        emitted! {{
+            ::pixelflow_core::__macro::ir::arena::FoldTerms {
+                monoid: (#monoid_of).monoid(),
+                lo: #lo,
+                hi: #hi,
+            }
+        }}
     }
 }
 
@@ -181,12 +177,7 @@ impl Site for Staged {
         Ok(argument)
     }
 
-    /// The host function's own `N as f32`: it is generic over `N`.
-    fn count(&mut self, _position: usize, name: &Ident) -> syn::Result<Ident> {
-        Ok(self.step(emitted!(__arena.push_const(#name as f32))))
-    }
-
-    fn open_fold(&mut self, depth: usize, monoid: Monoid, bounds: Bounds) -> Ident {
+    fn open_fold(&mut self, depth: usize, monoid: Monoid, bounds: [FoldBound<Ident>; 2]) -> Ident {
         let fold = self.fresh("__f");
         let depth = proc_macro2::Literal::usize_unsuffixed(depth);
         self.statements.push(emitted! {
@@ -215,5 +206,9 @@ impl Site for Staged {
 
     fn apply(&mut self, kernel: Ident, [x, y]: [Ident; 2]) -> Ident {
         self.step(emitted!(__arena.apply(&#kernel, [#x, #y])))
+    }
+
+    fn warp(&mut self, field: Ident, [x, y]: [Ident; 2]) -> Ident {
+        self.step(emitted!(__arena.warp(#field, [#x, #y])))
     }
 }

@@ -20,8 +20,8 @@ TYPESAFE_API_KEY=...  cargo run -p desloppify -- --system-one jev path/to/src  #
    each type. Rules that see the same unit of the same file share one call.
 2. **Decide, System One** (`decide::Decide`, `--system-one`). One request
    per call carries every rule's question about that unit, each a closed set
-   of outcomes. An answer at or above `--min-confidence` (0.7) settles the
-   rule for the unit. `jev` is TypeSafe AI's Jev, a model that returns
+   of outcomes. An answer at or above `--min-confidence` (0 to 1, default
+   0.7) settles the rule for the unit. `jev` is TypeSafe AI's Jev, a model that returns
    calibrated choices rather than text, at a few cents per million input
    tokens and no output; `none` (the default) skips this step.
 3. **Decide, model** (`agent::Ask`). A question System One did not settle
@@ -47,6 +47,11 @@ TYPESAFE_API_KEY=...  cargo run -p desloppify -- --system-one jev path/to/src  #
    mistaken findings dropped and counted, recurring patterns called out.
    `--findings-only` skips it and prints the raw findings, one
    `path:line: [rule/outcome] message` per line, and the things named.
+
+A number a model echoes back — a symptom, a finding, a thing, a diagnosis —
+is checked against the list it counts: the one a prompt printed, or for a
+root's diagnoses the reply's own. One that names nothing fails that reply (a
+module's naming, or the whole synthesis) instead of shortening it.
 
 Small models make many calls and the large one makes one: each small call
 sees one rule and a little code, or one module, so none forgets a rule, and
@@ -100,8 +105,9 @@ what `main` uses — and nothing is public only so a test can reach it: what
 a rule shows the model is read from the prompts a review sends, path
 scoping from the binary run at the repository root. Time is an injected
 `Clock`, so the limiters are tested without sleeping; `review` is tested
-with a scripted `Ask` and `Decide`; Jev is tested against a local server
-speaking its API.
+with a scripted `Ask` and `Decide`, and every prompt and schema it sends is
+held to a golden transcript; Jev is tested against a local server speaking its
+API.
 
 ## Rules — `rules/<id>.json`
 

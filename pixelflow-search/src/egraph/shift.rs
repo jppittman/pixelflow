@@ -8,7 +8,7 @@
 //! `f32` can be. [`spelled`] checks the spelling, so a node built from it is
 //! already a valid shift.
 
-use pixelflow_ir::{Children, Ir, OpKind, Shape, ShiftCount};
+use pixelflow_ir::{Children, Ir, Lit, OpKind, Shape, ShiftCount};
 
 /// Which way a shift moves the bits of a word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -52,7 +52,7 @@ pub(crate) fn spelled<I: Ir>(
     children: Children<'_, I::Ref>,
 ) -> Option<(I::Ref, ShiftCount)> {
     let (operand, count) = (children.get(0)?, children.get(1)?);
-    let Shape::Const(literal) = term.project(count) else {
+    let Shape::Const(Lit::Real(literal)) = term.project(count) else {
         return None;
     };
     Some((operand, ShiftCount::from_literal(literal)?))

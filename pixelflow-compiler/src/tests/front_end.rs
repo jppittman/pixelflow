@@ -139,8 +139,8 @@ fn a_record_is_repr_c_and_the_expansion_names_no_std_path() {
         pub struct Bounds { pub x0: f32, pub x1: f32 }
         pub const TWO: f32 = 2.0;
         fn sq(x: f32) -> f32 { x * x }
-        pub fn inside<const N: usize>(b: Bounds, r: f32) -> f32 {
-            sq(r) + (0..N).map(|i| X * (i as f32)).sum::<f32>() + b.x0
+        pub fn inside(n: usize, b: Bounds, r: f32) -> f32 {
+            sq(r) + (0..n).map(|i| X * (i as f32)).sum::<f32>() + b.x0
         }
         pub fn glyph(ink: impl Fn(f32, f32) -> f32, b: Bounds) -> f32 {
             if (X > b.x0) & (X < b.x1) { ink(X + 0.5, Y) } else { 0.0 }
@@ -157,21 +157,16 @@ fn a_record_is_repr_c_and_the_expansion_names_no_std_path() {
     );
 }
 
-/// A template's open fold takes its range from the instantiation, in a
-/// `const` block that refuses at the instantiation what `sema` refuses
-/// of a known range.
+/// A per-call count is checked when the host entry is called.
 #[test]
-fn a_template_refuses_at_instantiation_what_sema_refuses_of_a_known_range() {
+fn a_count_parameter_is_guarded_at_the_host_entry() {
     let code = expansion(quote! {
-        pub fn mean<const N: usize>() -> f32 {
-            (0..N).map(|i| X * (i as f32)).sum::<f32>() / (N as f32)
+        pub fn mean(n: usize) -> f32 {
+            (0..n).map(|i| X * (i as f32)).sum::<f32>() / (n as f32)
         }
     });
-    assert!(
-        code.contains("runs backwards at this instantiation"),
-        "{code}"
-    );
-    assert!(code.contains("__hi <= 16777216"), "{code}");
+    assert!(code.contains("n as u64 <="), "{code}");
+    assert!(code.contains("EXACT_BOUND"), "{code}");
 }
 
 /// An optimizer that counts the arenas it is offered, and declines each.
@@ -184,18 +179,17 @@ impl Optimize for Offered {
     }
 }
 
-/// No optimizer sees a template, whose open folds hold placeholder ranges
-/// a rewrite would read as ranges, nor an entry that takes a kernel,
-/// whose program exists only once its host function is called: both are
-/// emitted as lowered. An entry with neither is offered.
+/// An optimizer sees an entry with a per-call count because its bound is
+/// represented as a value child; a kernel argument is staged until the
+/// host call. A plain entry is offered too.
 #[test]
 fn an_optimizer_is_offered_only_entries_it_can_read() {
     let mut offered = Offered(0);
     front_end(
         quote! {
             pub struct Bounds { pub x0: f32, pub x1: f32 }
-            pub fn counted<const N: usize>(r: f32) -> f32 {
-                r + (0..N).map(|i| (i as f32) * X).sum::<f32>()
+            pub fn counted(n: usize, r: f32) -> f32 {
+                r + (0..n).map(|i| (i as f32) * X).sum::<f32>()
             }
             pub fn glyph(ink: impl Fn(f32, f32) -> f32, b: Bounds) -> f32 {
                 if (X > b.x0) & (X < b.x1) { ink(X + 0.5, Y) } else { 0.0 }
@@ -208,5 +202,5 @@ fn an_optimizer_is_offered_only_entries_it_can_read() {
         &mut offered,
     )
     .expect("expands");
-    assert_eq!(offered.0, 1, "`plain` alone");
+    assert_eq!(offered.0, 2, "`plain` and `counted`");
 }

@@ -1,39 +1,31 @@
 //! Counts and `const`s: a `usize` expression checked as rustc's const
 //! evaluator checks it, a fold's bounds, and every `const`'s value.
 
-use crate::ast::{BinaryOp, ConstItem, Expr, Name, PLAN, RangeExpr, UnaryOp, same_name};
-use pixelflow_ir::{Binder, Fold};
+use crate::ast::{BinaryOp, ConstItem, Expr, Name, RangeExpr, UnaryOp};
+use pixelflow_ir::{Binder, Fold, KnownRange};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use std::collections::HashMap;
-use std::ops::Range;
 use syn::Ident;
 
 use super::analyze::{ConstValue, Ty};
 use super::body::a_count_is_not_a_value;
 
-/// A count: a `usize` evaluated at expansion, or one that names an entry's
-/// structural parameters and so has a value only once the host function is
-/// instantiated with them (plan §1.4).
+/// A count: a `usize` evaluated at expansion or read as a value from an
+/// enclosing fold or entry.
 #[derive(Debug, Clone)]
-enum Count {
+pub(crate) enum Count {
     /// Evaluated here, each operation checked.
     Known(u64),
-    /// A Rust `usize` expression over literals and structural parameters:
-    /// rustc evaluates it, per instantiation, in a `const` block, and checks
-    /// each operation there as it checks any `const`.
-    Structural(TokenStream),
+    /// A count bound by a fold or an entry parameter, read as a value.
+    Name(Ident),
 }
 
 impl Count {
-    /// The count as a Rust `usize` expression.
-    fn tokens(&self) -> TokenStream {
+    pub(crate) fn name(&self) -> Option<&Ident> {
         match self {
-            Count::Known(value) => {
-                let value = proc_macro2::Literal::u64_unsuffixed(*value);
-                quote!(#value)
-            }
-            Count::Structural(tokens) => tokens.clone(),
+            Count::Name(name) => Some(name),
+            Count::Known(_) => None,
         }
     }
 }
@@ -45,13 +37,11 @@ type CheckedOp = fn(u64, u64) -> Option<u64>;
 /// Integer arithmetic over counts: what a `usize` const's initializer and a
 /// fold's bounds are built from. Each operation on two known counts is
 /// checked here, as rustc's const evaluator checks it, so a count that would
-/// wrap is an error rather than a different count; one that names a
-/// structural parameter is checked by rustc itself, when the host function
-/// is instantiated.
+/// wrap is an error rather than a different count.
 ///
 /// A trait because its scopes differ only in what a name means: a `const`
 /// being evaluated may name another, evaluated on demand; a fold's bound
-/// names a `usize` const, already evaluated, or a structural parameter.
+/// names a `usize` const, already evaluated, or a value count.
 /// Anything else is not constant.
 trait UsizeScope {
     /// The value of `name` in a `usize` expression, or why it has none.
@@ -97,9 +87,16 @@ trait UsizeScope {
             | BinaryOp::BitAnd
             | BinaryOp::BitOr => return Err(self.not_a_count(binary.span)),
         };
+        if let Some(name) = lhs.name().or_else(|| rhs.name()) {
+            return Err(syn::Error::new(
+                name.span(),
+                format!(
+                    "`{name}` is a value bound, and arithmetic on it is not a `usize` bound; convert it with `{name} as f32` in the fold body"
+                ),
+            ));
+        }
         let (Count::Known(lhs), Count::Known(rhs)) = (&lhs, &rhs) else {
-            let (lhs, rhs) = (lhs.tokens(), rhs.tokens());
-            return Ok(Count::Structural(quote!((#lhs #symbol #rhs))));
+            unreachable!("a value bound in count arithmetic was refused above");
         };
         if binary.op == BinaryOp::Div && *rhs == 0 {
             return Err(syn::Error::new(
@@ -118,49 +115,31 @@ trait UsizeScope {
     }
 }
 
-/// A fold's bounds: evaluated at expansion, or, where they name an entry's
-/// structural parameters, when its host function is instantiated.
-#[derive(Debug, Clone)]
-pub(crate) enum Bounds {
-    /// Both evaluated, the range runs forwards, and the IR admits it
-    /// ([`Fold::admits`]).
-    Known(Range<u32>),
-    /// At least one names a structural parameter.
-    Structural(StructuralRange),
-}
-
-/// `lo..hi` as Rust `usize` expressions over literals and an entry's
-/// structural parameters: what the host function evaluates, per
-/// instantiation, in a `const` block — where rustc checks each operation,
-/// and the refusals [`range_bounds`] makes of a known range (backwards, past
-/// 2²⁴) are made of this one.
-#[derive(Debug, Clone)]
-pub(crate) struct StructuralRange {
-    pub(crate) lo: TokenStream,
-    pub(crate) hi: TokenStream,
-}
-
-impl StructuralRange {
-    /// The range as its source reads, for a diagnostic, and as the key two
-    /// folds over one range share.
-    pub(crate) fn text(&self) -> String {
-        format!("{}..{}", self.lo, self.hi)
+/// The names in a bound, before count arithmetic is evaluated. The analyzer
+/// checks their types in the fold's enclosing scope.
+pub(crate) fn bound_names(bound: &Expr) -> Vec<&Ident> {
+    match bound {
+        Expr::Ident(name) => vec![name],
+        Expr::Paren(inner) => bound_names(inner),
+        Expr::Unary(unary) => bound_names(&unary.operand),
+        Expr::Binary(binary) => {
+            let mut names = bound_names(&binary.lhs);
+            names.extend(bound_names(&binary.rhs));
+            names
+        }
+        _ => Vec::new(),
     }
 }
 
-/// A fold's bounds, each a `usize` built from integer literals, `usize`
-/// consts and the entry's structural parameters, and — when both are known
-/// here — the range running forwards.
+/// A fold's bounds: known or value counts, and — when both are
+/// known here — the range running forwards.
 ///
 /// The one evaluation of them, and the one admission: a range is refused
-/// here when it runs backwards, or when the IR cannot hold it — its ends are
-/// `u32` today (widening them is A5 of the plan, deprioritized), and its
-/// index is an `f32` lane, exact only to [`Fold::EXACT_BOUND`], the tighter
-/// of the two. Lowering reads the range this returns, so the two stages
-/// cannot disagree on one.
+/// here when it runs backwards, or when the IR cannot hold it: its index is
+/// an `f32` lane, exact only to [`Fold::EXACT_BOUND`]. Value bounds are
+/// checked by the IR guard.
 ///
-/// Ranges are constant (plan §1.5): the program's shape is known when it is
-/// compiled, and a structural parameter is part of the program. A reversed
+/// A reversed known
 /// range is refused rather than read as the empty fold it would be in Rust:
 /// an empty range is written `a..a`, and `b..a` is almost always a slip
 /// (clippy's `reversed_empty_ranges` is deny-by-default for the same
@@ -168,51 +147,55 @@ impl StructuralRange {
 ///
 /// # Errors
 ///
-/// A bound that is not a constant `usize` expression, an overflow, or a range
-/// that runs backwards or reaches past [`Fold::EXACT_BOUND`].
-pub(crate) fn range_bounds(range: &RangeExpr, scope: RangeScope<'_>) -> syn::Result<Bounds> {
+/// A bound that is not a permitted count, an overflow, or a known range that
+/// runs backwards or reaches past [`Fold::EXACT_BOUND`].
+pub(crate) fn range_bounds(range: &RangeExpr, scope: RangeScope<'_>) -> syn::Result<[Count; 2]> {
     let mut scope = scope;
     let lo = scope.eval_usize(&range.lo)?;
     let hi = scope.eval_usize(&range.hi)?;
-    let (Count::Known(lo), Count::Known(hi)) = (&lo, &hi) else {
-        return Ok(Bounds::Structural(StructuralRange {
-            lo: lo.tokens(),
-            hi: hi.tokens(),
-        }));
+    let (Count::Known(first), Count::Known(last)) = (&lo, &hi) else {
+        for (end, count) in [("first", &lo), ("last", &hi)] {
+            if let Count::Known(value) = count {
+                if *value > Fold::EXACT_BOUND {
+                    return Err(syn::Error::new(
+                        range.span,
+                        format!(
+                            "the {end} fold bound {value} reaches past {} (2^24): a fold's index is an exact `f32` only through that count",
+                            Fold::EXACT_BOUND
+                        ),
+                    ));
+                }
+            }
+        }
+        return Ok([lo, hi]);
     };
-    if lo > hi {
+    if first > last {
         return Err(syn::Error::new(
             range.span,
             format!(
-                "the range `{lo}..{hi}` runs backwards\n\
+                "the range `{first}..{last}` runs backwards\n\
                  \n\
-                 note: `{lo}..{hi}` holds no index, so a fold over it would be its monoid's \
+                 note: `{first}..{last}` holds no index, so a fold over it would be its monoid's \
                  identity; the empty range is written `a..a`, and a reversed one is refused as \
                  the slip it usually is"
             ),
         ));
     }
-    let admitted = match (u32::try_from(*lo), u32::try_from(*hi)) {
-        (Ok(lo), Ok(hi)) => Some(lo..hi),
-        _ => None,
-    };
-    admitted
-        .filter(Fold::admits)
-        .map(Bounds::Known)
-        .ok_or_else(|| {
+    if !KnownRange::admits(&(*first..*last)) {
+        return Err({
             let bound = Fold::EXACT_BOUND;
             syn::Error::new(
                 range.span,
                 format!(
-                    "the range `{lo}..{hi}` reaches past {bound} (2^24): a fold's index is an \
+                    "the range `{first}..{last}` reaches past {bound} (2^24): a fold's index is an \
                      `f32` lane, which names every integer only that far, so past it indices \
                      would round together and the fold would not be the one written \
-                     (`Fold::EXACT_BOUND`)\n\
-                     note: a fold's ends are also `u32` in the IR today (`Fold`); 64-bit fold \
-                     ends are A5 of {PLAN}, deprioritized, and would not widen the lane"
+                     (`Fold::EXACT_BOUND`)"
                 ),
             )
-        })
+        });
+    }
+    Ok([lo, hi])
 }
 
 /// The refusal of a fold opened with every binder of the IR already taken.
@@ -231,12 +214,11 @@ pub(crate) fn folds_nested_too_deep(span: Span) -> syn::Error {
     )
 }
 
-/// What a fold's bound may name: a `usize` const, already evaluated, or one
-/// of the entry's structural parameters.
+/// What a fold's bound may name: a `usize` const, an enclosing fold index
+/// or an entry count parameter.
 #[derive(Clone, Copy)]
 pub(crate) struct RangeScope<'a> {
     pub(crate) consts: &'a HashMap<Name, ConstValue>,
-    pub(crate) structural: &'a [Ident],
 }
 
 impl UsizeScope for RangeScope<'_> {
@@ -251,35 +233,18 @@ impl UsizeScope for RangeScope<'_> {
                      help: declare the count as `const {name}: usize`"
                 ),
             )),
-            None if self.structural.iter().any(|s| same_name(s, name)) => {
-                Ok(Count::Structural(quote!(#name)))
-            }
-            None => Err(syn::Error::new(
-                name.span(),
-                format!(
-                    "a range's bounds are constant, and `{name}` is not a `const`\n\
-                     \n\
-                     note: a bound is built from integer literals, `usize` consts, the entry's \
-                     structural parameters (`const N: usize`), `+ - * /` and parentheses; a \
-                     fold's index, a parameter, a `let` and a coordinate are not constant\n\
-                     note: ranges are constant: a program's shape is known when it is \
-                     compiled (§1.5 of {PLAN})"
-                ),
-            )),
+            None => Ok(Count::Name(name.clone())),
         }
     }
 
     fn not_a_count(&self, span: Span) -> syn::Error {
         syn::Error::new(
             span,
-            format!(
-                "a range's bounds are constant\n\
-                 \n\
-                 note: a bound is built from integer literals, `usize` consts, the entry's \
-                 structural parameters, `+ - * /` and parentheses\n\
-                 note: ranges are constant: a program's shape is known when it is compiled \
-                 (§1.5 of {PLAN})"
-            ),
+            "a range's bound is a count\n\
+             \n\
+             note: a bound is built from integer literals, `usize` consts, \
+             an enclosing fold's index or a count parameter; \
+             arithmetic on known counts uses `+ - * /` and parentheses",
         )
     }
 }
@@ -354,7 +319,7 @@ impl ConstEvaluator<'_> {
             Expr::Ident(name) => self.f32_named(name),
             Expr::Paren(inner) => self.eval_f32(inner),
             // Rust's own `as`, which rounds to the nearest `f32` as rustc's
-            // does: exact up to 2²⁴. A `const` cannot name a structural
+            // does: exact up to 2²⁴. A `const` cannot name a value
             // parameter — they are an entry's — so a count this does not
             // know is refused rather than assumed away.
             Expr::Cast(cast) => {
@@ -363,7 +328,7 @@ impl ConstEvaluator<'_> {
                 };
                 match self.usize_named(name)? {
                     Count::Known(count) => Ok(count as f32),
-                    Count::Structural(_) => Err(Self::not_constant(cast.span)),
+                    Count::Name(_) => Err(Self::not_constant(cast.span)),
                 }
             }
             Expr::Unary(unary) => match unary.op {
@@ -449,14 +414,14 @@ impl ConstEvaluator<'_> {
         Ok(value)
     }
 
-    /// A `usize` initializer's value, known here. Only a structural parameter
+    /// A `usize` initializer's value, known here. A value count
     /// leaves a count unknown, and a `const` item cannot name one — they are
     /// an entry's — so one that is not known is refused rather than assumed
     /// away.
     fn known_usize(&mut self, expr: &Expr) -> syn::Result<u64> {
         match self.eval_usize(expr)? {
             Count::Known(value) => Ok(value),
-            Count::Structural(_) => Err(Self::not_constant(expr.span())),
+            Count::Name(_) => Err(Self::not_constant(expr.span())),
         }
     }
 

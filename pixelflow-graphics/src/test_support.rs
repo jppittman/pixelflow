@@ -25,7 +25,7 @@ pub(crate) fn program_digest(arena: &ExprArena, root: ExprId) -> u64 {
     for (id, node) in arena.nodes() {
         let (variant, op, payload): (u8, Option<OpKind>, u128) = match node {
             ExprNode::Var(i) => (0, None, u128::from(i)),
-            ExprNode::Const(v) => (1, None, u128::from(v.to_bits())),
+            ExprNode::Const(v) => (1, None, u128::from(v.bits())),
             ExprNode::Param(i) => (2, None, u128::from(i)),
             ExprNode::Buffer(b) => (3, None, u128::from(b.0)),
             ExprNode::Uniform(u) => (4, None, u128::from(u.0)),
@@ -34,7 +34,7 @@ pub(crate) fn program_digest(arena: &ExprArena, root: ExprId) -> u64 {
             | ExprNode::Binary(op, ..)
             | ExprNode::Ternary(op, ..)
             | ExprNode::Nary(op, _) => (6, Some(op), 0),
-            ExprNode::Reduce { fold, .. } => (7, None, fold.to_bits()),
+            ExprNode::Reduce { .. } => (7, None, arena.fold_header(id).to_bits()),
             ExprNode::Write { row, col, lane, .. } => (
                 8,
                 None,
@@ -50,4 +50,42 @@ pub(crate) fn program_digest(arena: &ExprArena, root: ExprId) -> u64 {
     }
     feed(&root.0.to_le_bytes());
     hash
+}
+
+#[test]
+fn a_value_bound_is_in_the_program_digest() {
+    use pixelflow_ir::{Binder, Bound, Fold, Monoid, Uniform};
+
+    /// `Σ_{k<n} k`, with `n` the `slot`-th of two declared uniforms. Both are
+    /// leaves of the arena, so the arenas differ in one child edge and nothing
+    /// else.
+    fn counted_by(slot: usize) -> (ExprArena, ExprId) {
+        let mut arena = ExprArena::new();
+        let slots = [3.0, 5.0].map(|default| arena.declare_uniform(Uniform::new(default).decl()));
+        let counts = slots.map(|slot| arena.push_uniform(slot));
+        let count = counts[slot];
+        let binder = Binder::from_slot(0).expect("the first binder");
+        let index = arena.push_var(binder.var());
+        let root = arena.push_reduce(
+            Fold::new(Monoid::SUM, binder),
+            Bound::Lit(0),
+            Bound::Value(count),
+            index,
+        );
+        (arena, root)
+    }
+
+    let (by_first, first_root) = counted_by(0);
+    let (by_second, second_root) = counted_by(1);
+    assert_ne!(
+        program_digest(&by_first, first_root),
+        program_digest(&by_second, second_root),
+        "the digest reads the bound's child"
+    );
+    let (again, again_root) = counted_by(0);
+    assert_eq!(
+        program_digest(&by_first, first_root),
+        program_digest(&again, again_root),
+        "and is a function of the program"
+    );
 }

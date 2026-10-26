@@ -7,7 +7,7 @@
 
 use super::{
     Block, Class, ClassId, Constant, Constants, Entry, Function, IsaBackend, Label, Labels, Loop,
-    Operand, Pushed, Scope, Selected, Spill, Target, Value, ValueName, operands,
+    Operand, Pushed, Scope, Selected, Spill, Target, Trips, Value, ValueName, operands,
 };
 use crate::error::CompileError;
 use alloc::collections::BTreeMap;
@@ -320,7 +320,7 @@ impl<B: IsaBackend> Builder<B> {
 
     /// Record the loop whose head is `head`, nested in `parent`, returning its
     /// index.
-    pub(super) fn open_loop(&mut self, head: Label, parent: Option<usize>, trips: u64) -> usize {
+    pub(super) fn open_loop(&mut self, head: Label, parent: Option<usize>, trips: Trips) -> usize {
         self.loops.push(Loop {
             head,
             parent,

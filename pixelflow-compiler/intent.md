@@ -16,7 +16,7 @@ that term to is an `Optimize` value, never a branch (§8).
 
 ## Never
 - No construct is defined here: lowering calls `pixelflow_ir::library`, `ExprArena::close_over`,
-  `Fold::admits` and `ExprArena::apply`; a fold lowers to one `Reduce`, never unrolled; a copy is a future divergence.
+  `KnownRange::admits` and `ExprArena::apply`; a fold lowers to one `Reduce`, never unrolled; a copy is a future divergence.
 - No `Dwrt` is resolved, no kernel compiled or evaluated, at expansion:
   `macro_tier` declines an arena carrying one; only `const` items are evaluated.
 - No stage accepts what a later one refuses: a collection type, recursion, `X`
@@ -31,16 +31,16 @@ construct (a block with no entry has none and is refused at the invocation). A m
 is the `# Contract` of its `mod.rs`, which re-exports exactly:
 - `src/ast/mod.rs`, the vocabulary: `PLAN`; `KernelDef`, `ClosureEntry`, `Callable`,
   `RecordId`, `RecordItem`, `RecordField`, `ConstItem`, `FnItem`, `Role`, `Param`;
-  `FunctionType`, `bare_name`, `is_f32`, `is_usize`; `Name`, `same_name`, `Method`,
+  `FunctionType`, `bare_name`, `is_f32`; `Name`, `same_name`, `Method`,
   `LibraryMethod`, `Projection`; `Scopes`; `Expr`, `FieldExpr`, `LiteralExpr`, `Literal`,
   `BinaryOp`, `BinaryExpr`, `UnaryOp`, `UnaryExpr`, `MethodCallExpr`, `ProjectExpr`,
   `CallExpr`, `Arity`, `arity_mismatch`, `IfExpr`, `FoldExpr`, `RangeExpr`, `Reduction`,
   `CastExpr`, `Stmt`, `LetStmt`, `BlockExpr`.
 - `src/parser/mod.rs`: `parse`.
 - `src/sema/mod.rs`: `analyze`, `AnalyzedKernel` (`parameters`), `ConstValue`, `Parameter`,
-  `Scalar`; `range_bounds`, `Bounds`, `StructuralRange` (`text`), `RangeScope`, `folds_nested_too_deep`.
+  `Scalar`; `range_bounds`, `Count`, `RangeScope`, `folds_nested_too_deep`.
 - `src/lower/mod.rs`: `Site`, the one real trait, defined there; `lower_entry`;
-  `Expansion` (`lower`); `Lowered` (`range_of`).
+  `FoldBound`, `Expansion` (`lower`), `Lowered` (`arena`, `root`, `scalars`).
 - `src/emit/mod.rs`: `emit_kernel`. Only `pixelflow-graphics` uses the crate.
 
 ## Enforced by
@@ -60,9 +60,9 @@ is the `# Contract` of its `mod.rs`, which re-exports exactly:
   T4 has `kernel!` emit typed pushes and deletes the duplicate here (typed-arena §2).
 - `macro_tier`, `DwrtFree` and `kernel_raw!` stay in `lib.rs`; the plan optimizes nothing at
   expansion unless the instance is declared, and deletes all three (the-language-is-kernel §1.8, D2,
-  D14). A fold's ends are `u32`, a structural count rides `Param(u8)`, and `src/lower/site.rs`'s
-  `Holes` is a stride in the fold's own bits: template instantiation (§1.4, §1.8, D2, A5) replaces them.
-- A fold's `Bounds` are computed by sema and discarded, so lowering computes them again:
+  D14). Count parameters are uniforms and bound folds by value; no
+  structural placeholder is built.
+- A fold's bounds are computed by sema and discarded, so lowering computes them again:
   `range_bounds` and `RangeScope` are on sema's contract only because the result is not stored on
   the analyzed fold (the-front-ends-stages §4).
 - `node` (`src/emit/arena.rs`) and `Staged` (`src/emit/staged.rs`) are two

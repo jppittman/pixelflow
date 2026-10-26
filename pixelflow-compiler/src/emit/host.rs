@@ -5,7 +5,7 @@
 use super::arena::{arena_to_tokens, emitted};
 use super::staged::Staged;
 use crate::ast::{Callable, ClosureEntry, ConstItem, FnItem, KernelDef, Name, RecordItem, Role};
-use crate::lower::{Expansion, Lowered};
+use crate::lower::Expansion;
 use crate::sema::{AnalyzedKernel, ConstValue, Scalar};
 use pixelflow_ir::optimize::Optimize;
 use proc_macro2::TokenStream;
@@ -23,9 +23,9 @@ use syn::Ident;
 ///   rebound by position, with `UniformBlock::set_declared`.
 ///
 /// For the items form: one struct per record, one `const` per `pub const`,
-/// and for each entry its host `fn`, generic over its structural parameters
-/// and taking its parameters by their declared types — a kernel-typed one as
-/// a `&Kernel` — and its `Args` record. An entry that takes a kernel is
+/// and for each entry its host `fn`, taking its parameters by their declared
+/// types — a kernel-typed one as
+/// a `&Kernel` — and its `Args` record. An entry with kernel parameters is
 /// [`Staged`]: lowered when its host function is called.
 ///
 /// `optimizer` rewrites each lowered arena before it is emitted. It is a
@@ -36,8 +36,7 @@ use syn::Ident;
 /// # Errors
 ///
 /// When lowering refuses what `sema` accepted: folds nested past
-/// `Binder::COUNT`, or more than 256 structural parameters read
-/// as values.
+/// `Binder::COUNT` after a helper is inlined.
 pub(crate) fn emit_kernel(
     analyzed: &AnalyzedKernel,
     optimizer: &mut dyn Optimize,
@@ -63,11 +62,11 @@ pub(crate) fn emit_kernel(
             for entry in fns.iter().filter(|f| f.role() == Role::Entry) {
                 if entry.takes_a_kernel() {
                     let body = Staged::lower(entry.callable(), analyzed)?;
-                    items.extend(emit_entry(entry, &body));
+                    items.extend(emit_entry(entry, &body, analyzed));
                     continue;
                 }
                 let (arena_code, scalars) = entry_arena(entry.callable(), analyzed, optimizer)?;
-                items.extend(emit_entry(entry, &kernel_from(&arena_code)));
+                items.extend(emit_entry(entry, &kernel_from(&arena_code), analyzed));
                 items.extend(emit_args(entry, &scalars));
             }
             Ok(items)
@@ -92,11 +91,7 @@ fn is_pub(vis: &syn::Visibility) -> bool {
 /// scalars the lowering declared its uniforms for, which the host function
 /// and its `Args` record supply by position.
 ///
-/// An entry with structural parameters is a template: its open folds hold
-/// placeholder ranges a rewrite would read as ranges (an empty one, to
-/// `EmptyFold`), so it is emitted as lowered and optimized when its
-/// instantiation is baked — "no optimization runs at expansion unless the
-/// instance is declared" (plan §1.8, Phase E).
+/// Only entries whose IR is fully available at expansion reach this optimizer.
 fn entry_arena(
     entry: Callable<'_>,
     analyzed: &AnalyzedKernel,
@@ -105,13 +100,7 @@ fn entry_arena(
     let lowered = Expansion::lower(entry, analyzed)?;
     let context = EntryContext {
         arguments: lowered.scalars.iter().map(argument).collect(),
-        structural: entry.structural,
-        lowered: &lowered,
     };
-    if !entry.structural.is_empty() {
-        let tokens = arena_to_tokens(&lowered.arena, lowered.root, &context);
-        return Ok((tokens, lowered.scalars));
-    }
 
     // Declining is ordinary and needs no arm: the lowered term stands, and a
     // kernel that reaches the runtime tier unoptimized is optimized there.
@@ -146,18 +135,15 @@ fn entry_arena(
 pub(super) fn argument(scalar: &Scalar) -> TokenStream {
     match scalar {
         Scalar::Param(param) => quote!(#param),
+        Scalar::Count(param) => quote!(#param as f32),
         Scalar::Field(param, field) => quote!(#param.#field),
     }
 }
 
 /// What an entry's arena is emitted against: the argument each declared
-/// uniform defaults to, in declaration order, and — for a template — the
-/// structural parameters, and the lowering whose open folds' ranges
-/// ([`Lowered::range_of`]) its holes are filled from.
-pub(super) struct EntryContext<'a> {
+/// uniform defaults to, in declaration order.
+pub(super) struct EntryContext {
     pub(super) arguments: Vec<TokenStream>,
-    pub(super) structural: &'a [Ident],
-    pub(super) lowered: &'a Lowered,
 }
 
 /// The closure form's expansion: a `Kernel`, or a closure over `f32`s.
@@ -176,8 +162,8 @@ fn emit_closure(entry: &ClosureEntry, arena_code: &TokenStream) -> TokenStream {
 }
 
 /// An entry's expansion: a host function returning a `Kernel` — `body`,
-/// statements that build it — generic over its structural parameters and
-/// taking its parameters by their declared types, with the entry's
+/// statements that build it — taking its parameters by their declared types,
+/// with the entry's
 /// visibility and doc comments.
 ///
 /// A kernel-typed parameter is taken as a `&Kernel`, not a `Kernel`: the
@@ -186,11 +172,10 @@ fn emit_closure(entry: &ClosureEntry, arena_code: &TokenStream) -> TokenStream {
 /// `sum2(&a, &a)`, as `Kernel::at` and `Lattice::bake` take theirs. Owning it would buy the
 /// argument's arena only by building on top of it, which would declare its
 /// uniforms before the entry's own.
-fn emit_entry(entry: &FnItem, body: &TokenStream) -> TokenStream {
+fn emit_entry(entry: &FnItem, body: &TokenStream, analyzed: &AnalyzedKernel) -> TokenStream {
     let attrs = &entry.attrs;
     let vis = &entry.vis;
     let name = &entry.name;
-    let (generics, _) = structural_generics(&entry.structural);
     let params = entry.params.iter().map(|p| {
         let (name, ty) = (&p.name, &p.ty);
         match p.is_kernel() {
@@ -198,17 +183,31 @@ fn emit_entry(entry: &FnItem, body: &TokenStream) -> TokenStream {
             false => quote!(#name: #ty),
         }
     });
+    let guards = analyzed
+        .parameters(&entry.params)
+        .into_iter()
+        .filter_map(|parameter| {
+            let crate::sema::Parameter::Count(count) = parameter else {
+                return None;
+            };
+            let message = count_refusal(entry, count);
+            Some(quote! {
+                ::core::assert!(#count as u64 <= ::pixelflow_core::__macro::ir::Fold::EXACT_BOUND,
+                    #message, #count);
+            })
+        });
     quote! {
         #(#attrs)*
         #[must_use]
-        #vis fn #name #generics ( #(#params),* ) -> ::pixelflow_core::Kernel {
+        #vis fn #name ( #(#params),* ) -> ::pixelflow_core::Kernel {
+            #(#guards)*
             #body
         }
     }
 }
 
 /// An entry's `Args` record (plan §1.4): its parameters as fields, by their
-/// declared types, generic over its structural parameters; and
+/// declared types; and
 /// `write_into`, which writes them — a record's fields in field order —
 /// into a block by the entry's declaration order
 /// (`UniformBlock::set_declared`), as an array literal whose length rustc
@@ -220,7 +219,6 @@ fn emit_args(entry: &FnItem, scalars: &[Scalar]) -> TokenStream {
     }
     let vis = &entry.vis;
     let args = entry.args_record();
-    let (generics, arguments) = structural_generics(&entry.structural);
     let entry_name = entry.name.to_string();
     let record_doc = format!(
         "The arguments of `{entry_name}`: a program compiled from its kernel is rebound per \
@@ -238,14 +236,24 @@ fn emit_args(entry: &FnItem, scalars: &[Scalar]) -> TokenStream {
         let value = argument(scalar);
         quote!(self.#value)
     });
+    let guards = scalars.iter().filter_map(|scalar| {
+        let Scalar::Count(count) = scalar else {
+            return None;
+        };
+        let message = count_refusal(entry, count);
+        Some(quote! {
+            ::core::assert!(self.#count as u64 <= ::pixelflow_core::__macro::ir::Fold::EXACT_BOUND,
+                #message, self.#count);
+        })
+    });
     quote! {
         #[doc = #record_doc]
         #[derive(Clone, Copy, Debug, PartialEq)]
-        #vis struct #args #generics {
+        #vis struct #args {
             #(#fields)*
         }
 
-        impl #generics #args #arguments {
+        impl #args {
             /// This call's values, written into `block` — one made by a
             /// program compiled from this entry's kernel
             /// (`Manifold::block`), kept and rewritten call after call:
@@ -264,22 +272,18 @@ fn emit_args(entry: &FnItem, scalars: &[Scalar]) -> TokenStream {
                 &self,
                 block: &mut ::pixelflow_core::UniformBlock,
             ) -> ::core::result::Result<(), ::pixelflow_core::ArityMismatch> {
+                #(#guards)*
                 block.set_declared([ #(#values),* ])
             }
         }
     }
 }
 
-/// An entry's structural parameters as generics: their declaration,
-/// `<const N: usize, …>`, and their use, `<N, …>` — or nothing, for an
-/// entry with none.
-fn structural_generics(structural: &[Ident]) -> (TokenStream, TokenStream) {
-    if structural.is_empty() {
-        return (TokenStream::new(), TokenStream::new());
-    }
-    (
-        quote!(< #( const #structural: usize ),* >),
-        quote!(< #( #structural ),* >),
+fn count_refusal(entry: &FnItem, count: &Ident) -> String {
+    let bound = pixelflow_ir::Fold::EXACT_BOUND;
+    format!(
+        "kernel!: `{}`'s count `{count}` is {{}}, past {bound} (2^24)",
+        entry.name
     )
 }
 

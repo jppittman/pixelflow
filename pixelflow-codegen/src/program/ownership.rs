@@ -93,14 +93,16 @@ impl Pass for Own {
 /// ids its body names, which the scope's own schedule holds or an enclosing
 /// scope does (`ScopeFold::reads`).
 ///
-/// To [`operands`](crate::program::operands) a `Reduce` def is a leaf: once
-/// `scopes::extract_folds` has carved a fold's body into a scope of its own,
-/// the def is only where the loop opens. But the loop *runs* there, and its
-/// body reads this scope: a sibling fold's result from its accumulator slot, a
-/// value invariant in the fold from the park this scope leaves it in. Without
-/// these edges a guard could skip a fold whose result a sibling fold's body
-/// still reads, or a value a fold reads, which the fold then finds unwritten
-/// (`pixelflow-core/tests/guard_sibling_fold.rs` pins both).
+/// To [`operands`](crate::program::operands) a `Reduce` def reads its value
+/// bounds, the seed and the end its loop reads (none for a literal fold), and
+/// never its body: once `scopes::extract_folds` has carved a fold's body into
+/// a scope of its own, the def is where the loop opens. But the loop *runs*
+/// there, and its body reads this scope: a sibling fold's result from its
+/// accumulator slot, a value invariant in the fold from the park this scope
+/// leaves it in. Without these edges a guard could skip a fold whose result a
+/// sibling fold's body still reads, or a value a fold reads, which the fold
+/// then finds unwritten (`pixelflow-core/tests/guard_sibling_fold.rs` pins
+/// both).
 ///
 /// They take no walk of a body: a fold's schedule keeps its parent's `ValueId`s,
 /// so what it reads from its parent is among the ids it names, and a fold

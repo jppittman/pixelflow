@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use serde::Serialize;
 
-use pixelflow_ir::{ExprArena, ExprNode};
+use pixelflow_ir::{ExprArena, ExprNode, Lit};
 use pixelflow_pipeline::training::corpus::read_corpus;
 use pixelflow_search::egraph::{
     APP_CHECKPOINT_GRID, AnytimeCurveOutput, ApplicationId, Budget, CostModel, EClassId, EGraph,
@@ -154,7 +154,7 @@ fn render_chosen(eg: &EGraph, choices: &[Option<usize>], class: EClassId) -> Str
         .expect("a choice indexes its class's e-nodes")
     {
         ENode::Var(v) => format!("v{v}"),
-        ENode::Const(bits) => format!("{}", f32::from_bits(*bits)),
+        ENode::Const(lit) => format!("{lit}"),
         ENode::Buffer(_) => "buf".to_string(),
         ENode::Uniform(_) => "uniform".to_string(),
         ENode::Param(i) => format!("p{i}"),
@@ -166,8 +166,12 @@ fn render_chosen(eg: &EGraph, choices: &[Option<usize>], class: EClassId) -> Str
                 .collect();
             format!("{op:?}({})", kids.join(", "))
         }
-        ENode::Reduce { fold, body } => {
-            format!("Reduce[{fold}]({})", render_chosen(eg, choices, *body))
+        ENode::Reduce { header, children } => {
+            let kids: Vec<String> = children
+                .iter()
+                .map(|&k| render_chosen(eg, choices, k))
+                .collect();
+            format!("Reduce[{header}]({})", kids.join(", "))
         }
         ENode::Shift {
             direction,
@@ -242,9 +246,9 @@ fn origin_label(eg: &EGraph, rules: &RuleSet, tag: ENodeId) -> String {
 }
 
 fn seed_has_const_one(arena: &ExprArena) -> bool {
-    arena
-        .nodes()
-        .any(|(_, n)| matches!(n, ExprNode::Const(v) if v.to_bits() == 1.0_f32.to_bits()))
+    arena.nodes().any(
+        |(_, n)| matches!(n, ExprNode::Const(Lit::Real(v)) if v.to_bits() == 1.0_f32.to_bits()),
+    )
 }
 
 struct Labels {
@@ -366,7 +370,7 @@ fn tally_expression(
                 extracted: render_chosen(eg, &out.extraction.choices, out.root),
                 const_one_on_path: path.iter().any(|(c, tag)| {
                     let i = eg.tags(*c).position(|t| t == *tag).expect("tag in class");
-                    matches!(eg.nodes(*c).nth(i), Some(&ENode::Const(b)) if b == 1.0_f32.to_bits())
+                    matches!(eg.nodes(*c).nth(i), Some(&ENode::Const(Lit::Real(b))) if b == 1.0)
                 }),
                 strict_credited_rules: BTreeMap::new(),
             });

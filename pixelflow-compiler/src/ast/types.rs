@@ -120,8 +120,3 @@ pub(crate) fn bare_name(ty: &Type) -> Option<&Ident> {
 pub(crate) fn is_f32(ty: &Type) -> bool {
     bare_name(ty).is_some_and(|name| name == "f32")
 }
-
-/// Whether `ty` is exactly `usize`: the one type a structural parameter has.
-pub(crate) fn is_usize(ty: &Type) -> bool {
-    bare_name(ty).is_some_and(|name| name == "usize")
-}

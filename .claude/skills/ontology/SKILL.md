@@ -56,7 +56,7 @@ disagree, the denotation wins and the entry is stale.
 - kernel! (the language)
 - Entry, helper, record, Args
 - Binding time (a name bound later)
-- Structural parameter
+- Structural parameter (retired)
 - Uniform (the parameter)
 - Uniform (adjective: lane-, batch-, row-, frame-uniform). Homonym
 - Kernel-typed parameter

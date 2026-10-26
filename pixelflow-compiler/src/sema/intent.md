@@ -13,7 +13,7 @@ well-formed by construction (DENOTATION §2), or the first refusal at its constr
 - One body's analysis (`body.rs`): `FnAnalyzer`, the binding kinds (`Symbol`,
   `SymbolKind`) over the vocabulary's `Scopes`, a kernel's move check per path.
 - Counts and `const`s (`consts.rs`): a `usize` expression checked as rustc's
-  const evaluator checks it; a fold's `Bounds`, known or structural; every
+  const evaluator checks it; a fold's bounds, known or value; every
   `const`'s value, each operation rounded once in `f32`.
 - The call graph (`calls.rs`): a DAG, or the first edge that closes a cycle.
 - `AnalyzedKernel::parameters`: the one definition of an entry's uniform order.
@@ -29,14 +29,15 @@ well-formed by construction (DENOTATION §2), or the first refusal at its constr
 
 ## Contract
 `mod.rs`, under `# Contract`: `analyze`, `AnalyzedKernel` (with `parameters`),
-`ConstValue`, `Parameter`, `Scalar` from `analyze.rs`; `range_bounds`, `Bounds`,
-`StructuralRange` (with `text`), `RangeScope`, `folds_nested_too_deep` from
+`ConstValue`, `Parameter`, `Scalar` from `analyze.rs`; `range_bounds`, `Count`,
+`RangeScope`, `folds_nested_too_deep` from
 `consts.rs`; each `pub(crate) use`d there.
 
 ## Enforced by
 - Types: `Ty::Bool` against `Ty::F32`, so a number used as a mask is a type
   error; `Scopes<Symbol>` holds every binding, so a name resolves in one place;
-  `Bounds` is `Known` or `Structural`, so lowering reads no unevaluated range.
+  `Count` distinguishes `Known` and `Name`, so lowering keeps
+  each bound at its proper binding time.
 - Visibility: `rg 'pub\(crate\)' pixelflow-compiler/src/sema --glob '!mod.rs'`
   lists only what `mod.rs` re-exports; `Ty` is `pub(super)`.
 - `pixelflow-compiler/src/tests/sema.rs`: fifty-seven tests, each `parse` then
@@ -48,10 +49,11 @@ well-formed by construction (DENOTATION §2), or the first refusal at its constr
 ## Behind
 - The mask/scalar typing duplicates what the typed arena will enforce; T4 of
   `docs/language/2026-10-17-the-arena-is-typed.md` deletes it here, keeping `Usize` and `Record`.
-- A fold's `Bounds` are computed here and discarded, so lowering computes them
+- A fold's bounds are computed here and discarded, so lowering computes them
   again; `range_bounds` and `RangeScope` are on the contract only because the
   result is not stored on the analyzed fold (the-front-ends-stages §4).
-- A fold's ends are `u32` (`range_bounds`), against the 64-bit control plane (A5).
+- A known bound is a `u64`, checked against the exact `f32` index limit;
+  value bounds are checked when their counts are available.
 
 ## Decided in
 `docs/compiler/2026-10-22-the-front-ends-stages-are-its-modules.md` (§1.1 map,

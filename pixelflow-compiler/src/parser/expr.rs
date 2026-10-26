@@ -73,6 +73,42 @@ fn head_span(expr: &syn::Expr) -> Span {
     }
 }
 
+/// Drop the unconverted suffix of a rejected chain without recursing through
+/// its boxes. At the nesting limit that suffix may contain tens of thousands
+/// of `else if`, binary, method or field nodes. Letting Rust drop it as one
+/// `syn::Expr` overflows the compiler thread even though the parser has
+/// already produced its refusal.
+fn drop_rejected_chain(expr: syn::Expr) {
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match expr {
+            syn::Expr::Binary(binary) => {
+                pending.push(*binary.left);
+                pending.push(*binary.right);
+            }
+            syn::Expr::MethodCall(call) => {
+                pending.push(*call.receiver);
+                pending.extend(call.args);
+            }
+            syn::Expr::Field(field) => pending.push(*field.base),
+            syn::Expr::If(expr_if) => {
+                pending.push(*expr_if.cond);
+                if let Some((_, otherwise)) = expr_if.else_branch {
+                    pending.push(*otherwise);
+                }
+            }
+            syn::Expr::Unary(unary) => pending.push(*unary.expr),
+            syn::Expr::Paren(paren) => pending.push(*paren.expr),
+            syn::Expr::Cast(cast) => pending.push(*cast.expr),
+            syn::Expr::Call(call) => {
+                pending.push(*call.func);
+                pending.extend(call.args);
+            }
+            other => drop(other),
+        }
+    }
+}
+
 /// Convert syn::Expr to our AST Expr.
 ///
 /// Only a dispatcher: this is the function every nesting level of a body
@@ -80,7 +116,13 @@ fn head_span(expr: &syn::Expr) -> Span {
 /// each arm is a function of its own with its own temporaries. A refusal's
 /// text is built in [`refuse_expression`], off the recursive path.
 pub(super) fn convert_expr(expr: syn::Expr, nesting: Nesting) -> syn::Result<Expr> {
-    let nesting = nesting.deeper(&expr)?;
+    let nesting = match nesting.deeper(&expr) {
+        Ok(nesting) => nesting,
+        Err(refusal) => {
+            drop_rejected_chain(expr);
+            return Err(refusal);
+        }
+    };
     match expr {
         syn::Expr::Path(expr_path) => convert_path(expr_path),
         syn::Expr::Lit(expr_lit) => convert_lit(expr_lit),
@@ -296,33 +338,75 @@ fn convert_field(expr_field: syn::ExprField, nesting: Nesting) -> syn::Result<Ex
 /// there is no unit for an `if` without one to be — and `if let` is not a
 /// choice between two values.
 fn convert_if(expr_if: syn::ExprIf, nesting: Nesting) -> syn::Result<Expr> {
-    let span = expr_if.if_token.span;
-    if let syn::Expr::Let(pattern) = *expr_if.cond {
-        return Err(syn::Error::new_spanned(
-            pattern,
-            "`if let` in a kernel body\n\
-             \n\
-             note: an `if` chooses between two values by a `bool`; nothing here is a pattern",
-        ));
-    }
-    let Some((_, else_expr)) = expr_if.else_branch else {
-        return Err(syn::Error::new(
-            span,
-            "an `if` without an `else`\n\
-             \n\
-             note: an `if` is the choice between two values, so it needs both; a kernel \
-             body has no unit for the missing arm to be",
-        ));
+    let mut current = expr_if;
+    let mut depth = nesting;
+    let mut arms = Vec::new();
+    let tail = loop {
+        let span = current.if_token.span;
+        let Some((_, else_expr)) = current.else_branch else {
+            return Err(syn::Error::new(
+                span,
+                "an `if` without an `else`\n\
+                 \n\
+                 note: an `if` is the choice between two values, so it needs both; a kernel \
+                 body has no unit for the missing arm to be",
+            ));
+        };
+        let cond = match *current.cond {
+            syn::Expr::Let(pattern) => {
+                drop_rejected_chain(*else_expr);
+                return Err(syn::Error::new_spanned(
+                    pattern,
+                    "`if let` in a kernel body\n\
+                     \n\
+                     note: an `if` chooses between two values by a `bool`; nothing here is a pattern",
+                ));
+            }
+            cond => match convert_expr(cond, depth) {
+                Ok(cond) => cond,
+                Err(error) => {
+                    drop_rejected_chain(*else_expr);
+                    return Err(error);
+                }
+            },
+        };
+        let then_branch = match convert_block(current.then_branch, depth) {
+            Ok(branch) => branch,
+            Err(error) => {
+                drop_rejected_chain(*else_expr);
+                return Err(error);
+            }
+        };
+        arms.push((cond, then_branch, span));
+        match *else_expr {
+            syn::Expr::If(next) => {
+                let next_expr = syn::Expr::If(next);
+                depth = match depth.deeper(&next_expr) {
+                    Ok(depth) => depth,
+                    Err(error) => {
+                        drop_rejected_chain(next_expr);
+                        return Err(error);
+                    }
+                };
+                let syn::Expr::If(next) = next_expr else {
+                    unreachable!("the else branch was an if expression");
+                };
+                current = next;
+            }
+            tail => break convert_expr(tail, depth)?,
+        }
     };
-    let cond = convert_expr(*expr_if.cond, nesting)?;
-    let then_branch = convert_block(expr_if.then_branch, nesting)?;
-    let else_branch = convert_expr(*else_expr, nesting)?;
-    Ok(Expr::If(IfExpr {
-        cond: Box::new(cond),
-        then_branch,
-        else_branch: Box::new(else_branch),
-        span,
-    }))
+    Ok(arms
+        .into_iter()
+        .rev()
+        .fold(tail, |else_branch, (cond, then_branch, span)| {
+            Expr::If(IfExpr {
+                cond: Box::new(cond),
+                then_branch,
+                else_branch: Box::new(else_branch),
+                span,
+            })
+        }))
 }
 
 /// `receiver.method(args)`: a fold's terminal, a method of the language, or
@@ -370,7 +454,7 @@ fn convert_method_call(
 
 /// Methods of `Kernel`, not of the language: a body composes by applying a
 /// kernel-typed parameter, `k(x, y)`, and the host composes `Kernel` values.
-const RETIRED_METHODS: [&str; 3] = ["at", "constant", "collapse"];
+const RETIRED_METHODS: [&str; 2] = ["constant", "collapse"];
 
 /// Maximum per-character difference for a same-length method name to be
 /// suggested as a typo fix (e.g. `sqrtt` -> `sqrt`).
@@ -386,7 +470,8 @@ fn resolve_method(name: &syn::Ident, arity: usize) -> syn::Result<Method> {
             format!(
                 "`.{text}()` inside a kernel body sampled a manifold-typed \
                  parameter, and there are none\n\
-                 help: compose `Kernel` values instead: `Kernel::at` is the warp"
+                 help: every expression is already a field: use it as it stands, or \
+                 observe it elsewhere with `.at(x, y)`"
             ),
         ));
     }

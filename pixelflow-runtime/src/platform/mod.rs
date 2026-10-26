@@ -12,15 +12,7 @@ pub use macos::*;
 #[cfg(target_os = "linux")]
 pub use linux::*;
 
-// Platform-appropriate pixel format
-#[cfg(target_os = "macos")]
-pub type PlatformPixel = pixelflow_graphics::render::color::Rgba8;
-
-#[cfg(target_os = "linux")]
-pub type PlatformPixel = pixelflow_graphics::render::color::Bgra8;
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub type PlatformPixel = pixelflow_graphics::render::color::Rgba8;
+pub use pixelflow_graphics::render::color::PlatformPixel;
 
 pub type PlatformDriver = crate::display::driver::DriverActor<ActivePlatform>;
 

@@ -20,7 +20,8 @@ crate: this cites its README, not DENOTATION.
 - No verdict, outcome, rule id, model, level or System One: the module imports
   only `Rule`, `Unit`, `Group`, `CompiledQuery` and `TARGET_CAPTURE` from
   `rule` and `Language` from `language`.
-- No file is read: both entries take `source: &str`; `review/plan.rs` reads.
+- No file is read: both entries take `source: &str`; `review/plan.rs` and
+  `review/module.rs` read.
 - No query is written here: queries and the test-module test live in
   `language/`; this module reads `@target` and `@cut` and nothing else.
 - No crate is joined here: a `Group::Crate` snippet is one file's parts, and
@@ -31,8 +32,8 @@ crate: this cites its README, not DENOTATION.
 ## Contract
 `mod.rs`: `Snippet` (`first_line`, `numbered`), `snippets` (a rule's units
 in a file) and `outline` (the file with bodies elided); `capture.rs` is the
-implementation, all `pub(super)`. Callers: `review/plan.rs` (`snippets`, and
-`outline` for a module root) and `review/identify.rs` (`outline`).
+implementation, all `pub(super)`. Callers: `review/plan.rs` (`snippets`) and
+`review/module.rs` (`outline`).
 
 ## Enforced by
 - Visibility: `capture.rs` exports `pub(super)` only and `mod snippet;` is not

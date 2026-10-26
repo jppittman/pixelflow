@@ -110,6 +110,49 @@ impl Variance {
         Self(1 << var_idx)
     }
 
+    /// What a `Var` leaf whose index is `index` varies with: its own bit for a
+    /// coordinate, a retired axis or a binder slot (`0..VARIABLES`,
+    /// [`Self::from_var`]); nothing for a placeholder, an enclosing fold's
+    /// index before `ExprArena::close_over` chooses its slot (the
+    /// [`Placeholder::COUNT`](crate::fold::Placeholder::COUNT) indices from
+    /// `VARIABLES`); and every variable for an index past them, which this
+    /// analysis does not know.
+    ///
+    /// A placeholder names no bit because the bit it will have is chosen when
+    /// its fold closes, and is none the term reading it binds or reads
+    /// (`close_over` takes the lowest slot no fold reachable from the body or
+    /// its bounds binds and no `Var` there reads). A placeholder is a
+    /// binder-to-be, never a coordinate, and L3 is checked again when
+    /// `close_over` renames it into a slot and re-pushes the fold. So the one
+    /// question a placeholder's variance is asked — L3's, inside
+    /// `close_over`: does this bound vary with a coordinate, or with its own
+    /// fold's binder? — has the answer no, which is exact, and a triangular
+    /// fold built through the builder is accepted.
+    ///
+    /// That answer is *not* "closed". A placeholder can escape its builder (a
+    /// closure may keep a clone of the index it was given), and the term that
+    /// holds it is open while its variance is empty. So a variance never
+    /// decides that a term is closed: a closedness check asks
+    /// [`ExprArena::free_index`], which counts a placeholder free
+    /// (`Kernel::by_ref`, and the runtime tier's unit walk beside its
+    /// variance assertion). Placement does read a variance, and reads it only
+    /// of a term from which a `Var` that is no fold's binder has already been
+    /// refused (codegen's lowering, in its `Var` arm), so a placeholder is
+    /// never placed as a constant.
+    #[inline]
+    #[must_use]
+    pub const fn of_var(index: u8) -> Self {
+        if index < Self::VARIABLES {
+            return Self::from_var(index);
+        }
+        if (index as usize)
+            < crate::fold::PLACEHOLDER_BASE as usize + crate::fold::Placeholder::COUNT
+        {
+            return Self::CONST;
+        }
+        Self::ALL
+    }
+
     /// Get the raw bits.
     #[inline]
     #[must_use]
@@ -266,7 +309,11 @@ impl core::fmt::Display for Variance {
 
 // ───────────────────── Arena-level variance analysis ─────────────────────
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+
+use crate::arena::{ExprArena, ExprId, ExprNode};
+use crate::fold::KnownRange;
 
 /// A reference denotes what its referent denotes, sampled at the same
 /// coordinates, so it varies exactly as the referent does. Resolving is the
@@ -291,11 +338,92 @@ fn referent_variance(_key: crate::key::KernelKey) -> Variance {
     Variance::ALL
 }
 
+/// What the node at `id` varies with, given what each of its children varies
+/// with: the arena's forward transfer function of variance, and the one
+/// definition its two drivers share — [`compute_arena_variance`], forward over
+/// the whole arena, and [`variance_from`], from one root over what it reaches.
+/// (`pixelflow-search`'s `ENode::variance` is the e-graph's.)
+///
+/// A leaf names its own variable ([`Variance::of_var`]) or none; an operation
+/// unions its children; a fold (L4) unions its bounds with its body less the
+/// index it binds — `(var(body) \ b) ∪ var(lo) ∪ var(hi)`, a literal bound
+/// contributing nothing — and a fold over a known empty range is its monoid's
+/// identity, a constant, whatever its body reads. `ENode::variance` has no
+/// empty arm, so a bound that contains such a fold is `CONST` here and not
+/// there: `EGraph::add`'s backstop can refuse a hand-built bound that
+/// `ExprArena::push_reduce` admitted. Neither `over_values` nor a rule makes
+/// one.
+fn transfer(arena: &ExprArena, id: ExprId, child: impl Fn(ExprId) -> Variance) -> Variance {
+    match arena.node(id) {
+        // A coordinate, a retired axis or a binder slot gets its own bit; a
+        // placeholder (an enclosing fold's index before its fold closes)
+        // varies with nothing; anything past those is not a variable this
+        // analysis knows.
+        ExprNode::Var(idx) => Variance::of_var(idx),
+        ExprNode::Const(_) => Variance::CONST,
+        // A buffer leaf is constant; a Gather's variance is the union of
+        // its index expressions (handled by the Ternary arm below).
+        ExprNode::Buffer(_) => Variance::CONST,
+        // A uniform is invariant on the lattice — that one line is what
+        // moves everything computed from it alone into the per-call
+        // prologue — and unknown on the parameter space, which is why it
+        // is not a `Const`.
+        ExprNode::Uniform(_) => Variance::CONST,
+        ExprNode::Ref(key) => referent_variance(key),
+        ExprNode::Param(_) => {
+            // A `Param` has no value and its derivative is zero, but no hoist
+            // and no bound (L3) may rest on a slot that has none: classed
+            // all-varying, the conservative choice.
+            Variance::ALL
+        }
+        ExprNode::Unary(_, a) => child(a),
+        ExprNode::Binary(_, a, b) => child(a).union(child(b)),
+        ExprNode::Ternary(_, a, b, c) => child(a).union(child(b)).union(child(c)),
+        // A fold over nothing is its monoid's identity, whatever its body
+        // reads (`KnownRange::is_empty`): a constant. Read off the body
+        // instead, every reader would inherit the body's variables, which
+        // lowering never schedules (it schedules the identity in the
+        // fold's place). A range that is not known is not known to be
+        // empty, and falls to the binder arm.
+        ExprNode::Reduce { .. } if arena.known_range(id).is_some_and(KnownRange::is_empty) => {
+            Variance::CONST
+        }
+        // The one node that shrinks the set — it binds its index — and the one
+        // whose bounds are read outside that binding: a bound is fixed before
+        // the fold runs (L3), so what it reads is free in the fold, unmasked.
+        // There is no "malformed binder" case to be conservative about —
+        // `Fold` cannot hold an index that is not a binder.
+        ExprNode::Reduce { fold, lo, hi, body } => {
+            [lo.value(), hi.value()].into_iter().flatten().fold(
+                child(body).without(Variance::from_var(fold.binder().var())),
+                |v, bound| v.union(child(bound)),
+            )
+        }
+        // A store varies with what it stores and with where: its three
+        // binders are read for the address, so it sits inside all three
+        // folds — which is the whole of why the lattice's loops can be
+        // placed by the same rule as everything else.
+        ExprNode::Write {
+            row,
+            col,
+            lane,
+            value,
+        } => child(value)
+            .union(Variance::from_var(row.var()))
+            .union(Variance::from_var(col.var()))
+            .union(Variance::from_var(lane.var())),
+        ExprNode::Nary(..) => arena
+            .children(id)
+            .fold(Variance::CONST, |v, c| v.union(child(c))),
+    }
+}
+
 /// Compute variance for every node in an `ExprArena`.
 ///
 /// Returns a `Vec<Variance>` indexed by `ExprId`. Because the arena is
 /// append-only in topological order, a single forward pass suffices —
 /// when we visit node `i`, all its children `j < i` are already computed.
+/// The forward driver of `transfer`; `variance_from` is the rooted one.
 ///
 /// Cost: O(n) where n = `arena.len()`. No allocations beyond the result vec.
 ///
@@ -307,83 +435,49 @@ fn referent_variance(_key: crate::key::KernelKey) -> Variance {
 /// `pixelflow-codegen`'s lowering (`arena_to_schedule`) reads it once per
 /// compile and carries each node's entry onto the def that node becomes.
 #[must_use]
-pub fn compute_arena_variance(arena: &crate::arena::ExprArena) -> Vec<Variance> {
-    use crate::arena::{ExprId, ExprNode};
-
-    let n = arena.len();
-    let mut result = Vec::with_capacity(n);
-
-    for i in 0..n {
-        let id = ExprId(i as u32);
-        let v = match arena.node(id) {
-            // Coordinates and reduction index slots each get their own bit.
-            // Anything past them is not a variable this analysis knows.
-            ExprNode::Var(idx) => {
-                if idx < Variance::VARIABLES {
-                    Variance::from_var(idx)
-                } else {
-                    Variance::ALL
-                }
-            }
-            ExprNode::Const(_) => Variance::CONST,
-            // A buffer leaf is constant; a Gather's variance is the union of
-            // its index expressions (handled by the Ternary arm below).
-            ExprNode::Buffer(_) => Variance::CONST,
-            // A uniform is invariant on the lattice — that one line is what
-            // moves everything computed from it alone into the per-call
-            // prologue — and unknown on the parameter space, which is why it
-            // is not a `Const`.
-            ExprNode::Uniform(_) => Variance::CONST,
-            ExprNode::Ref(key) => referent_variance(key),
-            ExprNode::Param(_) => {
-                // Parameters are substituted before JIT compilation.
-                // If we see one here, treat conservatively as all-varying.
-                Variance::ALL
-            }
-            ExprNode::Unary(_, child) => result[child.0 as usize],
-            ExprNode::Binary(_, a, b) => result[a.0 as usize].union(result[b.0 as usize]),
-            ExprNode::Ternary(_, a, b, c) => result[a.0 as usize]
-                .union(result[b.0 as usize])
-                .union(result[c.0 as usize]),
-            // A fold over nothing is its monoid's identity, whatever its body
-            // reads (`Fold::is_empty`): a constant. Read off the body instead,
-            // every reader would inherit the body's variables, which lowering
-            // never schedules (it schedules the identity in the fold's place).
-            ExprNode::Reduce { fold, .. } if fold.is_empty() => Variance::CONST,
-            // A binder is the only node that shrinks the set: it binds its
-            // index, so the index is not free in the result. There is no
-            // "malformed binder" case to be conservative about any more —
-            // `Fold` cannot hold an index that is not a binder, so this arm
-            // no longer has to decline an analysis it used to be unable to
-            // trust.
-            ExprNode::Reduce { fold, body } => {
-                result[body.0 as usize].without(Variance::from_var(fold.binder().var()))
-            }
-            // A store varies with what it stores and with where: its three
-            // binders are read for the address, so it sits inside all three
-            // folds — which is the whole of why the lattice's loops can be
-            // placed by the same rule as everything else.
-            ExprNode::Write {
-                row,
-                col,
-                lane,
-                value,
-            } => result[value.0 as usize]
-                .union(Variance::from_var(row.var()))
-                .union(Variance::from_var(col.var()))
-                .union(Variance::from_var(lane.var())),
-            ExprNode::Nary(..) => {
-                let mut v = Variance::CONST;
-                for child in arena.children(id) {
-                    v = v.union(result[child.0 as usize]);
-                }
-                v
-            }
-        };
+pub fn compute_arena_variance(arena: &ExprArena) -> Vec<Variance> {
+    let mut result = Vec::with_capacity(arena.len());
+    for i in 0..arena.len() {
+        let v = transfer(arena, ExprId(i as u32), |c| result[c.0 as usize]);
         result.push(v);
     }
-
     result
+}
+
+/// What the term at `root` varies with: `transfer` run from `root` over what it
+/// reaches, each node once. `compute_arena_variance(arena)[root]`, for the
+/// price of the term rather than of the arena.
+///
+/// The rooted driver exists for L3 (`ExprArena::push_reduce`): a fold's bound is
+/// a leaf at the user surfaces and a few nodes after a rule, the arena holding
+/// it is the whole kernel, and every rebuild re-pushes every value-bounded
+/// fold — `splice_with`, `substitute_vars_with`, `relink`, `to_arena_roots`,
+/// `passes::copy_node`, extraction's `embed`. An arena-sized table per push is
+/// the shape `passes::differentiate` measured at 86 s on a 613-piece text run.
+/// The memo is keyed, not arena-sized, and a `Ref` the term does not reach is
+/// not resolved.
+///
+/// A `Ref` it does reach is resolved through `referent_variance`, which runs
+/// over the referent's whole arena, on every push: no production bound holds
+/// one before B3. A referent's variance belongs to the referent, so memoize it
+/// per referent when B3's profile asks.
+#[must_use]
+pub(crate) fn variance_from(arena: &ExprArena, root: ExprId) -> Variance {
+    let mut memo: BTreeMap<ExprId, Variance> = BTreeMap::new();
+    let mut stack = alloc::vec![(root, false)];
+    while let Some((id, expanded)) = stack.pop() {
+        if memo.contains_key(&id) {
+            continue;
+        }
+        if expanded {
+            let v = transfer(arena, id, |c| memo[&c]);
+            memo.insert(id, v);
+            continue;
+        }
+        stack.push((id, true));
+        stack.extend(arena.children(id).map(|c| (c, false)));
+    }
+    memo[&root]
 }
 
 /// The extents of the lattice a kernel is compiled for: samples per axis,
@@ -790,7 +884,7 @@ mod tests {
         // binder space, and this is the check that keeps them there.
         for i in 0..arena.len() {
             let id = crate::arena::ExprId(i as u32);
-            let ExprNode::Reduce { fold, body } = arena.node(id) else {
+            let ExprNode::Reduce { fold, body, .. } = arena.node(id) else {
                 continue;
             };
             let own = fold.binder().var();
@@ -808,6 +902,105 @@ mod tests {
                 "the fold binding slot {} lost its own index",
                 fold.binder().slot()
             );
+        }
+    }
+
+    /// A `Var` names its own bit below the bitset, nothing as a placeholder (an
+    /// enclosing fold's index before its slot is chosen), and everything past
+    /// the placeholders, which this analysis does not know.
+    #[test]
+    fn of_var_names_a_coordinate_and_a_binder_and_no_placeholder() {
+        use crate::fold::Placeholder;
+
+        assert_eq!(Variance::of_var(0), Variance::X);
+        assert_eq!(Variance::of_var(1), Variance::Y);
+        assert_eq!(Variance::of_var(2), Variance::from_var(2));
+        assert_eq!(Variance::of_var(4), Variance::from_var(4));
+        assert_eq!(Variance::of_var(63), Variance::from_var(63));
+        let first = Placeholder::nth(0).expect("the first placeholder");
+        let last = Placeholder::nth(Placeholder::COUNT - 1).expect("the last placeholder");
+        assert_eq!(Variance::of_var(first.var()), Variance::CONST);
+        assert_eq!(Variance::of_var(last.var()), Variance::CONST);
+        assert_eq!(Variance::of_var(128), Variance::ALL);
+        assert_eq!(Variance::of_var(255), Variance::ALL);
+    }
+
+    /// L4: `var(Reduce) = (var(body) \ b) ∪ var(lo) ∪ var(hi)`. A bound is read
+    /// outside the fold's binding, so what it reads is free in the fold, and a
+    /// fold over a known empty range is a constant, whatever its body reads.
+    #[test]
+    fn a_fold_varies_with_its_bounds_and_its_body_less_its_index() {
+        use crate::fold::{Binder, Bound, Fold, Monoid};
+        use crate::kind::OpKind;
+
+        let mut arena = ExprArena::new();
+        let x = arena.push_var(0);
+        let own = Binder::from_slot(0).expect("slot 0");
+        let index = arena.push_var(own.var());
+        let enclosing = arena.push_var(5);
+        let body = arena.push_binary(OpKind::Mul, index, x);
+        let uniform = {
+            let decl = arena.declare_uniform(crate::Uniform::new(3.0).decl());
+            arena.push_uniform(decl)
+        };
+        let fold = Fold::new(Monoid::SUM, own);
+        let by_uniform = arena.push_reduce(fold, Bound::Lit(0), Bound::Value(uniform), body);
+        let by_index = arena.push_reduce(fold, Bound::Lit(0), Bound::Value(enclosing), body);
+        let empty = arena.push_reduce(fold, Bound::Lit(2), Bound::Lit(2), body);
+
+        let v = compute_arena_variance(&arena);
+        assert_eq!(v[by_uniform.0 as usize], Variance::X);
+        assert_eq!(
+            v[by_index.0 as usize],
+            Variance::X.union(Variance::from_var(5))
+        );
+        assert_eq!(v[empty.0 as usize], Variance::CONST);
+    }
+
+    /// Whether the rooted walk gives, at every node of `arena`, what the
+    /// forward pass does.
+    fn rooted_agrees_with_forward(arena: &ExprArena) -> bool {
+        let forward = compute_arena_variance(arena);
+        (0..arena.len()).all(|i| variance_from(arena, ExprId(i as u32)) == forward[i])
+    }
+
+    /// The rooted walk and the forward pass are one transfer function in two
+    /// traversal orders, so they agree at every node: a fold with a value bound,
+    /// a store, nested binders, and a name.
+    #[test]
+    fn the_rooted_walk_is_the_forward_pass_at_every_node() {
+        use crate::Kernel;
+        use crate::fold::{Binder, Bound, Fold, Monoid};
+        use crate::kind::OpKind;
+
+        let nested = Kernel::sum_over(3, |i| {
+            let i = i.clone();
+            Kernel::sum_over(4, move |j| i.add(j).add(&Kernel::x()))
+        });
+        assert!(rooted_agrees_with_forward(nested.parts().0));
+
+        let slot = |s: u8| Binder::from_slot(s).expect("a binder slot");
+        let mut written = ExprArena::new();
+        let y = written.push_var(1);
+        let lane = written.push_var(slot(2).var());
+        let value = written.push_binary(OpKind::Add, y, lane);
+        written.push_write(slot(0), slot(1), slot(2), value);
+        assert!(rooted_agrees_with_forward(&written));
+
+        let mut folds = ExprArena::new();
+        let x = folds.push_var(0);
+        let index = folds.push_var(slot(0).var());
+        let enclosing = folds.push_var(slot(1).var());
+        let body = folds.push_binary(OpKind::Mul, index, x);
+        let fold = Fold::new(Monoid::SUM, slot(0));
+        folds.push_reduce(fold, Bound::Lit(0), Bound::Value(enclosing), body);
+        folds.push_reduce(fold, Bound::Lit(2), Bound::Lit(2), body);
+        assert!(rooted_agrees_with_forward(&folds));
+
+        #[cfg(feature = "std")]
+        {
+            let named = Kernel::x().sqrt().by_ref().add(&Kernel::y());
+            assert!(rooted_agrees_with_forward(named.parts().0));
         }
     }
 }

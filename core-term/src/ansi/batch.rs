@@ -70,3 +70,106 @@ impl AnsiBatch {
         self.commands.push((self.text.len(), command));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ansi::commands::C0Control;
+
+    /// A sink that records what it was handed and enforces `AnsiSink::text`'s
+    /// own documented contract: a delivered run is never empty.
+    #[derive(Default)]
+    struct Recording {
+        texts: Vec<String>,
+        commands: Vec<AnsiCommand>,
+    }
+
+    impl AnsiSink for Recording {
+        fn text(&mut self, run: &str) {
+            assert!(
+                !run.is_empty(),
+                "AnsiSink::text must never be called with an empty run"
+            );
+            self.texts.push(run.to_string());
+        }
+
+        fn command(&mut self, command: AnsiCommand) {
+            self.commands.push(command);
+        }
+    }
+
+    fn bell() -> AnsiCommand {
+        AnsiCommand::C0Control(C0Control::BEL)
+    }
+
+    #[test]
+    fn it_should_report_empty_for_a_default_batch() {
+        assert!(AnsiBatch::default().is_empty());
+    }
+
+    #[test]
+    fn it_should_report_not_empty_once_text_is_pushed() {
+        let mut batch = AnsiBatch::default();
+        batch.push_str("x");
+        assert!(!batch.is_empty());
+    }
+
+    #[test]
+    fn it_should_report_not_empty_once_a_command_is_pushed() {
+        let mut batch = AnsiBatch::default();
+        batch.push_command(bell());
+        assert!(!batch.is_empty());
+    }
+
+    #[test]
+    fn it_should_not_deliver_an_empty_text_run_between_two_adjacent_commands() {
+        let mut batch = AnsiBatch::default();
+        batch.push_command(bell());
+        batch.push_command(bell());
+
+        let mut sink = Recording::default();
+        batch.drain_into(&mut sink);
+
+        assert_eq!(sink.texts, Vec::<String>::new());
+        assert_eq!(sink.commands, vec![bell(), bell()]);
+    }
+
+    #[test]
+    fn it_should_not_deliver_an_empty_trailing_text_run_after_the_last_command() {
+        let mut batch = AnsiBatch::default();
+        batch.push_str("hi");
+        batch.push_command(bell());
+
+        let mut sink = Recording::default();
+        batch.drain_into(&mut sink);
+
+        assert_eq!(sink.texts, vec!["hi".to_string()]);
+        assert_eq!(sink.commands, vec![bell()]);
+    }
+
+    #[test]
+    fn it_should_deliver_interleaved_text_and_commands_in_order() {
+        let mut batch = AnsiBatch::default();
+        batch.push_str("ab");
+        batch.push_command(bell());
+        batch.push_str("cd");
+
+        let mut sink = Recording::default();
+        batch.drain_into(&mut sink);
+
+        assert_eq!(sink.texts, vec!["ab".to_string(), "cd".to_string()]);
+        assert_eq!(sink.commands, vec![bell()]);
+    }
+
+    #[test]
+    fn it_should_leave_the_batch_empty_after_drain_into() {
+        let mut batch = AnsiBatch::default();
+        batch.push_str("x");
+        batch.push_command(bell());
+
+        let mut sink = Recording::default();
+        batch.drain_into(&mut sink);
+
+        assert!(batch.is_empty());
+    }
+}

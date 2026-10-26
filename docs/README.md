@@ -22,6 +22,7 @@ A live document is one that still decides something or owns open work. Its statu
 - [`language/2026-09-25-the-language-is-kernel.md`](language/2026-09-25-the-language-is-kernel.md) — `Plan of record`. Agreed front-end direction (one kernel! syntax, no tables or arrays, If, kernel-typed args) with C2-E1 still open; partly superseded on If, D1 and P by kernels-evaluate-kernels.
 - [`language/2026-10-15-kernels-evaluate-kernels.md`](language/2026-10-15-kernels-evaluate-kernels.md) — `Accepted`. the binding rulings: If has one shape, kernels evaluate kernels, the schedule is per backend; everything is a kernel
 - [`language/2026-10-17-the-arena-is-typed.md`](language/2026-10-17-the-arena-is-typed.md) — `Proposed`. Implements §2's types in the IR: a signature per op, a type column and typed handles on the arena, typed constants, explicit reinterpretation; deletes the mask and bitwise-domain conventions. Six CLs, byte-identical but the fold binder's.
+- [`language/2026-10-20-a-bound-is-a-value.md`](language/2026-10-20-a-bound-is-a-value.md) — `Plan of record`. A fold's bounds are values placed by their variance, never a function of a coordinate; an index is a discrete kernel's application; a font at a tile extent is one program. Reverses the 2026-10-09 one-program-per-piece-count ruling and CLAUDE.md's recompile-per-count rule.
 
 ### The compiler and the search
 
@@ -74,7 +75,12 @@ A live document is one that still decides something or owns open work. Its statu
 ## Evidence
 
 - [`results/`](results/) — recorded measurements: extraction, rewrite rules, JIT cost, actor benchmarks, the claims ledger. Point-in-time; heed each report's corrections.
-- [`bugs/`](bugs/) — defect reports and the test-quality audit series (2026-07-20 → 2026-09-07, a chain: read the newest, [`bugs/2026-09-07-test-quality-audit-followup.md`](bugs/2026-09-07-test-quality-audit-followup.md), which carries the live backlog). Still open there: [`bugs/2026-07-15-pty-fork-malloc-deadlock.md`](bugs/2026-07-15-pty-fork-malloc-deadlock.md).
+
+Defects, audit follow-ups, status, and priority live in Linear rather than in a
+checked-in bug backlog. Repository documentation records durable design and
+measured results; regression tests live beside the public behavior they
+protect. A proposed test should state an observable, documented API outcome in
+the “it should …” style instead of pinning an implementation detail.
 
 ## Archive
 

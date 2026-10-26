@@ -24,7 +24,8 @@ writes the review.
   or backend names one. Jev's `jev-latest` is System One's, in `decide/`.
 - A module that is handed source never reads a file: `language/` and
   `snippet/` import no `std::fs`; only `skills`, `rule`, `review/plan.rs`,
-  `review/identify.rs`, `review/synthesize.rs`, `agent/journal.rs` and `main.rs` touch the disk.
+  `review/module.rs`, `agent/journal.rs`, `agent/claude_code.rs` (its scratch
+  directory) and `main.rs` touch the disk.
 - No rule's id or outcome is matched in `src/`; judgment lives in the JSON.
 - No `#[test]` or `#[cfg(test)]` module in `src/`; tests live in `tests/`.
 
@@ -35,7 +36,8 @@ its own `intent.md`. The CLI is `src/main.rs` (`Args`): paths to review;
 `--backend` (`anthropic`, `gemini`, `claude-code`, `dry-run`), `--system-one`
 (`none`, `jev`, `dry-run`), `--limiter`, `--min-confidence`, `--jobs`,
 `--findings-only`, `--out`, `--rules`, `--skills`; it calls `skills::load`,
-`rule::load_dir`, `review::{plan, review, identify, synthesize}`.
+`rule::load_dir`, `review::plan` and a `review::Session`'s `review`,
+`identify`, `synthesize`; `--min-confidence` is 0 to 1.
 
 ## Enforced by
 - `desloppify/tests/shipped_rules.rs`: every rule in `rules/` loads, and each
@@ -43,16 +45,18 @@ its own `intent.md`. The CLI is `src/main.rs` (`Args`): paths to review;
 - `desloppify/tests/rule.rs`: the loader refuses each kind of bad rule.
 - `tests/review.rs`, `agent.rs`, `decide.rs`, `rate_limit.rs`: the rest, via
   the production API. `RuleFile` carries `deny_unknown_fields` (a type).
+- `desloppify/tests/transcript.rs`: every prompt, schema, level and reported
+  datum of a scripted review is held to `tests/golden/`, so an edit to one is
+  a visible diff and journals keyed on prompts stay replayable.
 - `.github/workflows/rust.yaml` runs these with the workspace. Nothing checks
   the import and `fs` lines under Never; `grep` does today.
 
 ## Behind
-- `skills/pixelflow-architecture` (46 lines) and `skills/style-guide` (44)
-  are hand-kept distillations of CLAUDE.md (584) and STYLE.md (277), kept
-  so by choice: the whole of either in every rule prompt would cost more
-  than it buys (plan §5, as amended). Only `skills/ontology` is a symlink.
-- Nothing in CI runs desloppify over the tree; only its own tests run. The
-  intent check, `scripts/check-intent.sh`, is called by no workflow yet (§4.2).
+- `skills/pixelflow-architecture` and `skills/style-guide` are hand-kept
+  distillations of CLAUDE.md and STYLE.md, a tenth of their length, kept so
+  by choice: the whole of either in every rule prompt would cost more than
+  it buys (plan §5, as amended). Only `skills/ontology` is a symlink.
+- Nothing in CI runs desloppify over the tree; only its own tests run.
 
 ## Decided in
 `desloppify/README.md`; `docs/process/2026-10-15-intent-lives-with-the-module.md`

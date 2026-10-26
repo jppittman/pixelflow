@@ -1,7 +1,7 @@
 //! The vocabulary's contract (`ast/mod.rs`): the one reading of a bare type
 //! name, and Rust's lexical scoping over any binding.
 
-use crate::ast::{Name, Scopes, bare_name, is_f32, is_usize};
+use crate::ast::{Name, Scopes, bare_name, is_f32};
 use proc_macro2::Span;
 use syn::{Ident, Type};
 
@@ -12,8 +12,8 @@ fn a_bare_name_is_seen_through_a_group_and_nothing_longer() {
     let fragment = proc_macro2::Group::new(proc_macro2::Delimiter::None, quote::quote!(f32));
     let grouped: Type = syn::parse_quote!(#fragment);
     assert!(matches!(grouped, Type::Group(_)));
-    assert!(is_f32(&grouped) && !is_usize(&grouped));
-    assert!(is_usize(&syn::parse_quote!(usize)));
+    assert!(is_f32(&grouped));
+    assert_eq!(bare_name(&syn::parse_quote!(usize)).unwrap(), "usize");
     for refused in [
         syn::parse_quote!(::f32),
         syn::parse_quote!(std::primitive::f32),

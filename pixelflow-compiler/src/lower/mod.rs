@@ -19,8 +19,8 @@
 //! `Kernel`'s methods build through; the coordinates are [`Axis`]'s; a
 //! fold is opened and closed by [`pixelflow_ir::arena::ExprArena::open_fold`] and
 //! [`pixelflow_ir::arena::ExprArena::close_fold`], whose binder is chosen and placeholder renamed
-//! by [`pixelflow_ir::arena::ExprArena::close_over`], as `Kernel::over`'s are; a range is admitted by
-//! [`pixelflow_ir::Fold::admits`], in `sema`; a kernel is applied by
+//! by [`pixelflow_ir::arena::ExprArena::close_over`], as `Kernel::over`'s are; a known range is admitted by
+//! [`pixelflow_ir::KnownRange::admits`], in `sema`; a kernel is applied by
 //! [`pixelflow_ir::arena::ExprArena::apply`]. So each
 //! construction written here and the same one built with the builder are
 //! one program (`tests/the_library_is_the_builders.rs`,
@@ -41,16 +41,12 @@
 //! **Where a term is built is a [`Site`]** (Phase D-a). Lowering is one walk,
 //! and there are two places it can build:
 //!
-//! - [`Expansion`]: an [`ExprArena`](pixelflow_ir::arena::ExprArena), at macro expansion — every entry that
-//!   takes no kernel. Its declarations hold a placeholder default, and
-//!   emission declares each with the call's value; an entry with structural
-//!   parameters lowers to a *template* whose folds over a range that names
-//!   one, and its `N as f32`s, are left open (`site.rs`'s `Holes`, which
-//!   [`Lowered::range_of`] reads) and filled when its host function is
-//!   instantiated.
+//! - [`Expansion`]: an [`ExprArena`](pixelflow_ir::arena::ExprArena), at macro expansion — an entry
+//!   with no kernel parameters. Its declarations hold a
+//!   placeholder default, and emission declares each with the call's value.
 //! - `emit::Staged`: Rust statements that build the arena
 //!   when the entry's host function is called — an entry that takes a
-//!   kernel-typed parameter, whose argument exists only then. Each step is
+//!   kernel-typed parameter. Each step is
 //!   the step [`Expansion`] takes, run later: the same IR calls, in the same
 //!   order.
 //!
@@ -68,9 +64,8 @@
 //! with two implementations that differ only in when a step runs — and the
 //! shape below, implemented by [`lower_entry`], [`Expansion`] and
 //! [`Lowered`], each `pub(crate)` where it is implemented and re-exported
-//! here. What a template leaves open (`Holes`, its placeholder range and
-//! stride) is private to `site.rs`: emission reads an open fold's range
-//! through [`Lowered::range_of`] and nothing else. Every other item under
+//! here. [`FoldBound`] separates known and value bounds before
+//! either site builds a `Reduce`. Every other item under
 //! `lower/` is the implementation and is `pub(super)` or private. Every
 //! fallible entry returns `syn::Result`, `Err` a `syn::Error` spanned at the
 //! construct.
@@ -86,27 +81,31 @@
 //!     fn lower_entry<S: Site>(entry: Callable<'_>, analyzed: &AnalyzedKernel, site: &mut S) -> syn::Result<S::Term>;
 //!     /// `lower_entry` at a fresh arena. Err: `lower_entry`'s, and an entry that takes a kernel.
 //!     fn Expansion::lower(entry: Callable<'_>, analyzed: &AnalyzedKernel) -> syn::Result<Lowered>;
-//!     /// The range of one of this template's open folds; `None` for a known fold; panics on a
-//!     /// placeholder no hole of this entry names.
-//!     fn Lowered::range_of(&self, fold: Fold) -> Option<&StructuralRange>;
 //! }
-//! /// An entry lowered at expansion: its arena and root, its uniform scalars in declaration
-//! /// order, and what the arena leaves open if it is a template.
-//! struct Lowered { pub(crate) arena: ExprArena, pub(crate) root: ExprId, pub(crate) scalars: Vec<Scalar>, holes: Holes /* private */ }
-//! /// The site an entry that takes no kernel is lowered at: an `ExprArena`, at macro expansion.
+//! /// An entry lowered at expansion: its arena and root, its uniform scalars in declaration order.
+//! struct Lowered { pub(crate) arena: ExprArena, pub(crate) root: ExprId, pub(crate) scalars: Vec<Scalar> }
+//! /// The site an entry that takes no kernel parameter is lowered at.
 //! struct Expansion;   // Default; its fields are private
 //! ```
 
 mod site;
 mod walk;
 
-use crate::sema::{Bounds, Scalar};
+use crate::sema::Scalar;
 use pixelflow_ir::arena::Axis;
 use pixelflow_ir::{Monoid, OpKind};
 use syn::Ident;
 
-pub(crate) use site::{Expansion, Lowered};
+pub(crate) use site::Expansion;
+#[cfg(test)]
+pub(crate) use site::Lowered;
 pub(crate) use walk::lower_entry;
+
+/// One bound as lowering knows it: a literal or a term read per call or trip.
+pub(crate) enum FoldBound<T> {
+    Known(u64),
+    Value(T),
+}
 
 /// Somewhere lowering builds a term: each step of the walk, as a call.
 ///
@@ -148,12 +147,6 @@ pub(crate) trait Site {
     ///
     /// Where there is no argument to admit.
     fn kernel_parameter(&mut self, name: &Ident) -> syn::Result<Self::Argument>;
-    /// `name as f32`, the entry's `position`th structural parameter.
-    ///
-    /// # Errors
-    ///
-    /// Where the position has no room.
-    fn count(&mut self, position: usize, name: &Ident) -> syn::Result<Self::Term>;
     /// Open a fold over `bounds` under `monoid`, `depth` folds being open
     /// already: its index ([`pixelflow_ir::arena::ExprArena::open_fold`]).
     ///
@@ -161,9 +154,16 @@ pub(crate) trait Site {
     ///
     /// At `depth` [`pixelflow_ir::Binder::COUNT`] or more: lowering refuses a fold nested
     /// that deep before it opens one.
-    fn open_fold(&mut self, depth: usize, monoid: Monoid, bounds: Bounds) -> Self::Term;
+    fn open_fold(
+        &mut self,
+        depth: usize,
+        monoid: Monoid,
+        bounds: [FoldBound<Self::Term>; 2],
+    ) -> Self::Term;
     /// Close the innermost open fold over `body` ([`pixelflow_ir::arena::ExprArena::close_fold`]).
     fn close_fold(&mut self, body: Self::Term) -> Self::Term;
     /// `kernel` applied at `(x, y)` ([`pixelflow_ir::arena::ExprArena::apply`]).
     fn apply(&mut self, kernel: Self::Argument, at: [Self::Term; 2]) -> Self::Term;
+    /// Observe `field` at another point through the arena's contramap.
+    fn warp(&mut self, field: Self::Term, at: [Self::Term; 2]) -> Self::Term;
 }

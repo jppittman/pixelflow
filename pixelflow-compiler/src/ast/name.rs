@@ -82,6 +82,8 @@ pub(crate) enum Method {
     /// `.clone()`: the identity. An arena expression is a value, so a copy of
     /// one is itself.
     Clone,
+    /// Observe an `f32` or `bool` field at two other coordinates.
+    At,
     /// A primitive: one [`OpKind`], at the arity `OpKind::from_method_call`
     /// admits it.
     Op(OpKind),
@@ -120,6 +122,9 @@ impl Method {
         if name == CLONE && arity == 0 {
             return Some(Self::Clone);
         }
+        if name == "at" && arity == 2 {
+            return Some(Self::At);
+        }
         if let Some(op) = OpKind::from_method_call(name, arity) {
             return Some(Self::Op(op));
         }
@@ -140,7 +145,7 @@ impl Method {
         let libraries = LibraryMethod::ALL
             .into_iter()
             .map(|(_, spelling, arguments)| (spelling, arguments));
-        ops.chain(libraries).chain([(CLONE, 0)])
+        ops.chain(libraries).chain([(CLONE, 0), ("at", 2)])
     }
 }
 

@@ -6,7 +6,30 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use super::Call;
+use crate::agent::{Answer, Ask, Question};
+use crate::model::ModelLevel;
 use crate::rule::{Outcome, Rule, UNSURE, Verdict};
+
+/// One kind of question to a model: the level it is asked at, what it is
+/// told, and the schema its reply is held to.
+pub(super) struct Step<'a> {
+    pub(super) level: ModelLevel,
+    pub(super) system: &'a str,
+    pub(super) schema: &'a serde_json::Value,
+}
+
+/// `prompt`, put to a model as `step` says. No call is made without a
+/// schema.
+pub(super) async fn ask<A: Ask>(agent: &A, step: &Step<'_>, prompt: &str) -> Result<Answer> {
+    agent
+        .ask(&Question {
+            level: step.level,
+            system: step.system,
+            prompt,
+            schema: Some(step.schema),
+        })
+        .await
+}
 
 const DECIDER: &str = "\
 You answer one question about the code you are shown, by choosing exactly one \
@@ -32,33 +55,55 @@ pub(super) fn labels(rule: &Rule) -> Vec<(&str, &str)> {
         .collect()
 }
 
-/// The system prompt for deciding `rule` with a model.
-pub(super) fn decide_preamble(rule: &Rule) -> String {
-    let mut outcomes: String = rule
-        .decision
+/// What a decision chose: one of the rule's outcomes, or that the code shown
+/// is not enough. The closed set a decision's reply is held to, so the schema
+/// and the reading of a reply cannot disagree about it.
+#[derive(Clone, Copy)]
+pub(super) enum Chosen<'r> {
+    Outcome(&'r Outcome),
+    Unsure,
+}
+
+impl<'r> Chosen<'r> {
+    /// The name the reply, the schema and the tally know it by.
+    pub(super) fn name(self) -> &'r str {
+        match self {
+            Self::Outcome(outcome) => &outcome.name,
+            Self::Unsure => UNSURE,
+        }
+    }
+
+    fn meaning(self) -> &'r str {
+        match self {
+            Self::Outcome(outcome) => &outcome.meaning,
+            Self::Unsure => "The code shown is not enough to decide.",
+        }
+    }
+}
+
+/// What a decision may choose: the rule's outcomes, then `unsure`.
+fn choices(rule: &Rule) -> impl Iterator<Item = Chosen<'_>> {
+    rule.decision
         .outcomes
         .iter()
-        .map(|o| format!("- `{}`: {}\n", o.name, o.meaning))
+        .map(Chosen::Outcome)
+        .chain([Chosen::Unsure])
+}
+
+/// The system prompt for deciding `rule` with a model.
+pub(super) fn decide_preamble(rule: &Rule) -> String {
+    let outcomes: String = choices(rule)
+        .map(|c| format!("- `{}`: {}\n", c.name(), c.meaning()))
         .collect();
-    outcomes.push_str(&format!(
-        "- `{UNSURE}`: The code shown is not enough to decide.\n"
-    ));
     format!(
         "{}{DECIDER}\n\nQuestion: {}\n\nOutcomes:\n{outcomes}",
         rule.skills, rule.decision.question
     )
 }
 
-/// The shape a decision's reply must have: one of the rule's outcomes, or
-/// `unsure`.
+/// The shape a decision's reply must have: one of what it may choose.
 pub(super) fn decision_schema(rule: &Rule) -> serde_json::Value {
-    let names: Vec<&str> = rule
-        .decision
-        .outcomes
-        .iter()
-        .map(|o| o.name.as_str())
-        .chain(std::iter::once(UNSURE))
-        .collect();
+    let names: Vec<&str> = choices(rule).map(|c| c.name()).collect();
     serde_json::json!({
         "type": "object",
         "properties": { "outcome": { "type": "string", "enum": names } },
@@ -71,23 +116,13 @@ struct DecisionReply {
     outcome: String,
 }
 
-/// The outcome a decision reply chose: one of `rule`'s, or `None` for
-/// `unsure`.
-pub(super) fn parse_decision<'r>(rule: &'r Rule, reply: &str) -> Result<Option<&'r Outcome>> {
+/// What a decision reply chose.
+pub(super) fn parse_decision<'r>(rule: &'r Rule, reply: &str) -> Result<Chosen<'r>> {
     let reply: DecisionReply =
         serde_json::from_str(reply).with_context(|| format!("reply is not a decision: {reply}"))?;
-    if reply.outcome == UNSURE {
-        return Ok(None);
-    }
-    let Some(outcome) = rule
-        .decision
-        .outcomes
-        .iter()
-        .find(|o| o.name == reply.outcome)
-    else {
-        bail!("`{}` is not one of the rule's outcomes", reply.outcome);
-    };
-    Ok(Some(outcome))
+    choices(rule)
+        .find(|c| c.name() == reply.outcome)
+        .with_context(|| format!("`{}` is not one of the rule's outcomes", reply.outcome))
 }
 
 /// The rule's violation outcomes, in file order.

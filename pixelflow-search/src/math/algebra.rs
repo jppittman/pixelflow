@@ -9,8 +9,8 @@ use std::marker::PhantomData;
 
 use crate::arena_pat;
 use crate::egraph::{EClassId, EGraph, ENode, Rewrite, RewriteAction, RootShapes};
-use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId};
+use pixelflow_ir::{Lit, OpKind};
 
 // ============================================================================
 // InversePair: The Core Algebraic Relationship
@@ -980,7 +980,7 @@ impl Rewrite for ConstantFold {
         // `[x, count]` that it asks of every operation. The arguments are a
         // prefix of an inline array, as a node's operands are: no operation
         // takes more than `MAX_FOLD_ARGUMENTS`, so the prefix always fits.
-        let mut buffer = [0.0f32; MAX_FOLD_ARGUMENTS];
+        let mut buffer = [Lit::Real(0.0); MAX_FOLD_ARGUMENTS];
         let (op, arity) = match node {
             ENode::Op { op, children } => {
                 for (slot, &child_id) in buffer.iter_mut().zip(children.iter()) {
@@ -994,7 +994,7 @@ impl Rewrite for ConstantFold {
                 operand,
             } => {
                 buffer[0] = constant_of(egraph, *operand)?;
-                buffer[1] = count.literal();
+                buffer[1] = Lit::Real(count.literal());
                 let op = direction.op();
                 (op, op.arity())
             }
@@ -1019,7 +1019,14 @@ impl Rewrite for ConstantFold {
         // installs commutativity for them, so a commuted form can still be
         // folded. That is permitted, since the result is unspecified, but this
         // removes the direct path.
-        if op.fold_is_platform_specific(args) {
+        //
+        // The rows are about real values; a mask operand has one answer on
+        // every target, so an argument list with one in it is never refused
+        // here (and `eval_*` decides what the op makes of it).
+        let mut reals = [0.0f32; MAX_FOLD_ARGUMENTS];
+        if let Some(reals) = reals_of(args, &mut reals)
+            && op.fold_is_platform_specific(reals)
+        {
             return None;
         }
 
@@ -1032,25 +1039,35 @@ impl Rewrite for ConstantFold {
         };
 
         // Don't bake in a non-finite result of ARITHMETIC: `1e38 * 1e38` folding
-        // to `inf` freezes an overflow no source constant asked for. Ops in the
-        // bitwise domain are exempt, because for them a non-finite float reading
-        // IS the intended output — a true comparison mask is all-ones, which
-        // reads as NaN by construction (`OpKind::mask`, and the same pattern
-        // `BitAnd`'s monoid identity uses), and the integer-domain primitives
-        // exp/log lower to build exponents out of raw bit patterns. Without the
-        // exemption this guard silently switches off comparison and exp/log
-        // folding while looking like a safety check.
-        if !result.is_finite() && !op.is_bitwise_domain() {
+        // to `inf` freezes an overflow no source constant asked for. A mask is
+        // not a float and the guard never sees one; what is still exempt is the
+        // bitwise domain whose results ride in a real lane by convention — the
+        // integer-domain primitives exp/log lower to, building exponents out of
+        // raw bit patterns, and `If`, which hands an arm through. Without the
+        // exemption this guard silently switches off exp/log folding while
+        // looking like a safety check.
+        if let Lit::Real(real) = result
+            && !real.is_finite()
+            && !op.is_bitwise_domain()
+        {
             return None;
         }
 
-        Some(RewriteAction::Create(ENode::constant(result)))
+        Some(RewriteAction::Create(ENode::Const(result)))
     }
 }
 
-/// The value of the first `Const` in `class`, if it holds one.
-fn constant_of(egraph: &EGraph, class: EClassId) -> Option<f32> {
-    egraph.nodes(class).find_map(ENode::as_f32)
+/// The first literal in `class`, if it holds one.
+fn constant_of(egraph: &EGraph, class: EClassId) -> Option<Lit> {
+    egraph.nodes(class).find_map(ENode::literal)
+}
+
+/// `args` as reals, into `out`, when every one of them is a real.
+fn reals_of<'a>(args: &[Lit], out: &'a mut [f32; MAX_FOLD_ARGUMENTS]) -> Option<&'a [f32]> {
+    for (slot, lit) in out.iter_mut().zip(args) {
+        *slot = lit.real()?;
+    }
+    Some(&out[..args.len()])
 }
 
 // ============================================================================
@@ -1125,17 +1142,23 @@ mod platform_specific_fold_tests {
     use crate::egraph::rewrite::{Rewrite, RewriteAction};
     use crate::egraph::{EGraph, ENode};
 
-    /// Drive `ConstantFold::apply` directly on `op(consts...)` and report
-    /// whether it produced a folded constant.
-    fn folds(op: OpKind, args: &[f32]) -> Option<f32> {
+    /// Drive `ConstantFold::apply` directly on `op(lits...)` and report the
+    /// literal it folded to, if any.
+    fn folds_lit(op: OpKind, args: &[Lit]) -> Option<Lit> {
         let mut eg = EGraph::new();
-        let children: Vec<_> = args.iter().map(|&v| eg.add(ENode::constant(v))).collect();
+        let children: Vec<_> = args.iter().map(|&v| eg.add(ENode::Const(v))).collect();
         let node = ENode::apply(op, &children);
         let id = eg.add(node);
         match ConstantFold.apply(&eg, id, &node) {
-            Some(RewriteAction::Create(ENode::Const(bits))) => Some(f32::from_bits(bits)),
+            Some(RewriteAction::Create(ENode::Const(lit))) => Some(lit),
             _ => None,
         }
+    }
+
+    /// `folds_lit` over reals, for the arithmetic rows.
+    fn folds(op: OpKind, args: &[f32]) -> Option<f32> {
+        let args: Vec<Lit> = args.iter().map(|&v| Lit::Real(v)).collect();
+        folds_lit(op, &args).and_then(Lit::real)
     }
 
     /// The folder gathers an operation's arguments into a buffer of
@@ -1173,15 +1196,13 @@ mod platform_specific_fold_tests {
                 };
                 let id = eg.add(node);
                 let folded = match ConstantFold.apply(&eg, id, &node) {
-                    Some(RewriteAction::Create(ENode::Const(bits))) => Some(f32::from_bits(bits)),
+                    Some(RewriteAction::Create(ENode::Const(lit))) => Some(lit),
                     _ => None,
                 };
-                let expected = direction.op().eval_binary(operand, count.literal());
-                assert_eq!(
-                    folded.map(f32::to_bits),
-                    expected.map(f32::to_bits),
-                    "{direction:?} by {bits}"
-                );
+                let expected = direction
+                    .op()
+                    .eval_binary(Lit::Real(operand), Lit::Real(count.literal()));
+                assert_eq!(folded, expected, "{direction:?} by {bits}");
             }
         }
 
@@ -1291,22 +1312,42 @@ mod platform_specific_fold_tests {
         assert_eq!(folds(OpKind::MulAdd, &[2.0, 3.0, 4.0]), Some(10.0));
     }
 
-    /// A folded comparison and an executed one have to be the same operand.
-    /// `If`/`BitAnd` are bitwise on every backend, so a folded `1.0` would
-    /// blend `7.0` against `9.0` into `4.5`; the mask has to be all-ones.
+    /// A folded comparison is a mask, the literal every backend tabulates as
+    /// the all-ones or all-zero lane an executed comparison writes — never a
+    /// float, so a folded `1.0` can no longer blend `7.0` against `9.0` into
+    /// `4.5`.
     #[test]
-    fn comparison_folds_produce_mask_bit_patterns() {
-        let t = pixelflow_ir::OpKind::mask(true).to_bits();
-        let f = pixelflow_ir::OpKind::mask(false).to_bits();
-        assert_eq!(folds(OpKind::Lt, &[1.0, 2.0]).map(f32::to_bits), Some(t));
-        assert_eq!(folds(OpKind::Lt, &[2.0, 1.0]).map(f32::to_bits), Some(f));
-        assert_eq!(folds(OpKind::Eq, &[2.0, 2.0]).map(f32::to_bits), Some(t));
-        assert_eq!(folds(OpKind::Ne, &[2.0, 2.0]).map(f32::to_bits), Some(f));
-        // And such a mask blends exactly, through the same bitwise formula the
-        // backends emit. (`If` is the consumer this test folds; the
-        // end-to-end path through a real `and` is covered by
-        // `pixelflow-ir/tests/transcendental_jit.rs`.)
-        assert_eq!(folds(OpKind::If, &[f32::from_bits(t), 7.0, 9.0]), Some(7.0));
-        assert_eq!(folds(OpKind::If, &[f32::from_bits(f), 7.0, 9.0]), Some(9.0));
+    fn comparison_folds_produce_masks() {
+        let (t, f) = (Lit::Mask(true), Lit::Mask(false));
+        let real = |v: f32| Lit::Real(v);
+        assert_eq!(folds_lit(OpKind::Lt, &[real(1.0), real(2.0)]), Some(t));
+        assert_eq!(folds_lit(OpKind::Lt, &[real(2.0), real(1.0)]), Some(f));
+        assert_eq!(folds_lit(OpKind::Eq, &[real(2.0), real(2.0)]), Some(t));
+        assert_eq!(folds_lit(OpKind::Ne, &[real(2.0), real(2.0)]), Some(f));
+        // And such a mask selects an arm whole. (`If` is the consumer this
+        // test folds; the end-to-end path through a real `and` is covered by
+        // `pixelflow-codegen/tests/transcendental_jit.rs`.)
+        assert_eq!(
+            folds_lit(OpKind::If, &[t, real(7.0), real(9.0)]),
+            Some(real(7.0))
+        );
+        assert_eq!(
+            folds_lit(OpKind::If, &[f, real(7.0), real(9.0)]),
+            Some(real(9.0))
+        );
+        // The two quantifiers' identities are masks, and conjoin as truths.
+        assert_eq!(folds_lit(OpKind::BitAnd, &[t, f]), Some(f));
+        assert_eq!(folds_lit(OpKind::BitOr, &[t, f]), Some(t));
+    }
+
+    /// The NaN whose lane a true mask shares is a different literal: it is
+    /// not a condition `If` will select by, and it does not fold as one.
+    #[test]
+    fn a_nan_is_not_a_mask_to_the_folder() {
+        let nan = Lit::Real(f32::from_bits(u32::MAX));
+        assert_eq!(
+            folds_lit(OpKind::If, &[nan, Lit::Real(7.0), Lit::Real(9.0)]),
+            None
+        );
     }
 }

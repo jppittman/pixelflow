@@ -41,9 +41,8 @@
 //! value as its default. So the call's values are the kernel's arguments,
 //! never its constants: every call of an entry is one program, keyed and
 //! compiled once, and a compiled program is rebound per call from the
-//! entry's `Args` record. An entry's structural parameters (`const N:
-//! usize`) are the host function's const generics, and each value is its
-//! own program.
+//! entry's `Args` record. A per-call count is a uniform and may bound a fold
+//! without making another program.
 //!
 //! # Contract
 //!
@@ -62,10 +61,10 @@
 //!     /// The tokens that rebuild `analyzed`'s kernels at load time. Closure form: an expression, a
 //!     /// `Kernel` or `move |p: f32, …| -> Kernel`. Items form: a `#[repr(C)]` struct per record, a
 //!     /// host `const` per `pub const`, per entry a `#[must_use]` host `fn` (a kernel param as
-//!     /// `&Kernel`, const generics over structural params) and, when `has_args_record`, its `Args`
+//!     /// `&Kernel`) and, when `has_args_record`, its `Args`
 //!     /// record with `write_into`. Every uniform is declared with the call's value as its default,
-//!     /// in `parameters` order. `optimizer` is offered exactly the entries with no structural and
-//!     /// no kernel-typed parameter; `Declined`/`Unchanged` keep the lowered arena, `Changed` is
+//!     /// in `parameters` order. `optimizer` is offered exactly the entries with no
+//!     /// kernel-typed parameter; `Declined`/`Unchanged` keep the lowered arena, `Changed` is
 //!     /// relinked to declaration order; an entry taking a kernel is `Staged`. No `::std` path.
 //!     /// Deterministic: equal input and optimizer answer, byte-equal tokens. Err: lowering's.
 //!     fn emit_kernel(analyzed: &AnalyzedKernel, optimizer: &mut dyn Optimize) -> syn::Result<TokenStream>;

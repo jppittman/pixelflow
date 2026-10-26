@@ -30,7 +30,7 @@ crate that names a lane or a width.
 ## Contract
 `src/lib.rs` is the whole public surface: `jit_cache` (`compile`, `Linked`,
 `entry_count`), `emit` (`compile`, `CompiledKernel`, `CompileResult`,
-`EmitTraffic`, `ScopeTraffic`), `isa` (`Isa`, `detect`), `jit_vector_bytes`,
+`EmitTraffic`, `ScopeTraffic`, `Trips`), `isa` (`Isa`, `detect`), `jit_vector_bytes`,
 `CompileError`, `fnv1a64`; `Pass` and `program` are crate-private.
 
 ## Enforced by

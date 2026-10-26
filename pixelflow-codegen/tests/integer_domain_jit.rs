@@ -293,6 +293,98 @@ fn int_to_float_reads_the_bits_as_an_integer() {
     );
 }
 
+// ── Bits / Float: a reinterpretation is its operand, bit for bit ─────────────
+
+/// Every kind of pattern a lane can hold, including the ones a *number* would
+/// not survive a round trip through: both NaN signs, both infinities, `-0.0`,
+/// all-ones, a denormal, and the bit patterns `expand_exp2`/`expand_log2`
+/// build their exponent fields from.
+fn every_kind_of_pattern() -> Vec<(u32, u32)> {
+    const SPECIALS: &[u32] = &[
+        0x0000_0000,
+        0x8000_0000,
+        0x3F80_0000,
+        0xBF80_0000,
+        0x7F80_0000,
+        0xFF80_0000,
+        0x7FC0_0000,
+        0xFFC0_0000,
+        0xFFFF_FFFF,
+        0x0000_0001,
+        0x007F_FFFF,
+        0x7F7F_FFFF,
+        127,
+        23,
+    ];
+    let mut inputs: Vec<(u32, u32)> = SPECIALS.iter().map(|&b| (b, 0)).collect();
+    let mut state = SEED;
+    for _ in 0..SAMPLES {
+        inputs.push((xorshift(&mut state), 0));
+    }
+    inputs
+}
+
+/// A `Bits` or `Float` node is its operand: the same 32 bits come out, for
+/// every pattern, on both routes. This observes the value and not the
+/// instruction count (docs/process/2026-10-13-tests-check-the-as-if-contract.md);
+/// that the node costs no instruction is `byte_probe`'s to say.
+#[test]
+fn bits_and_float_are_their_operand() {
+    let inputs = every_kind_of_pattern();
+    check("bits", 1, unary(OpKind::Bits), &inputs, |x, _| x);
+    check("float", 1, unary(OpKind::Float), &inputs, |x, _| x);
+    check(
+        "float_of_bits",
+        1,
+        |arena, ops| {
+            let bits = arena.push_unary(OpKind::Bits, ops[0]);
+            arena.push_unary(OpKind::Float, bits)
+        },
+        &inputs,
+        |x, _| x,
+    );
+    check(
+        "bits_of_float",
+        1,
+        |arena, ops| {
+            let real = arena.push_unary(OpKind::Float, ops[0]);
+            arena.push_unary(OpKind::Bits, real)
+        },
+        &inputs,
+        |x, _| x,
+    );
+}
+
+/// The shape the expansions use — an integer op between the two
+/// reinterpretations — computes exactly what the integer op alone computes:
+/// `Float(Shl(Bits(x), k))` is `x << k`, and the same for `Shr`.
+#[test]
+fn a_reinterpreted_shift_is_the_shift() {
+    const COUNT: u32 = 23;
+    let inputs = every_kind_of_pattern();
+    for (name, op, oracle) in [
+        (
+            "float_shl_bits",
+            OpKind::Shl,
+            (|x: u32| x << COUNT) as fn(u32) -> u32,
+        ),
+        ("float_shr_bits", OpKind::Shr, |x: u32| x >> COUNT),
+    ] {
+        check(
+            name,
+            1,
+            move |arena, ops| {
+                let bits = arena.push_unary(OpKind::Bits, ops[0]);
+                let count = arena.push_const(COUNT as f32);
+                let shifted = arena.push_binary(op, bits, count);
+                arena.push_unary(OpKind::Float, shifted)
+            },
+            &inputs,
+            |x, _| oracle(x),
+        );
+    }
+}
+
 // ── IAdd: integer addition on bit patterns, pairs that do not overflow ───────
 
 #[test]
