@@ -88,11 +88,7 @@
 use super::monotone::MonotoneQuad;
 use super::outline::{Outline, Point, Segment};
 use pixelflow_core::{BoundManifold, DiscreteManifold, Kernel, Lattice, Manifold, Monoid, Uniform};
-use pixelflow_ir::arena::BufferIdentity;
-use pixelflow_ir::library::{self, Terms};
-use pixelflow_ir::{ExprArena, ExprId};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use pixelflow_ir::library::{self, BuiltTerm, KernelBuilder, Terms};
 
 /// How far coverage can reach past the outline, in the frame the kernel is
 /// built in. The pixel is a unit square about the sample, so half a unit is
@@ -626,41 +622,6 @@ fn row_at<'a>(table: &'a Kernel, i: &'a Kernel) -> impl Fn(usize) -> Kernel + 'a
     move |k| table.at(&Kernel::constant(k as f32), i)
 }
 
-/// A term built node by node in one arena, from kernels grafted into it,
-/// carrying the tabulations those kernels carry — so the finished kernel
-/// binds what they bound, as a composition of kernel values would.
-///
-/// A piece's term is built here and not through [`Kernel`]'s methods
-/// because each of those copies its operands' whole graph, so a term built
-/// a method at a time costs the square of its size. The closed form is
-/// about 150 nodes: built by methods, the printable ASCII glyphs at 16 px
-/// took 260–320 ms to build (release, before compiling any), and 50–55 ms
-/// built here — against 70–110 ms for the integral they replace.
-#[derive(Default)]
-struct Grafted {
-    arena: ExprArena,
-    tables: BTreeMap<BufferIdentity, Arc<[f32]>>,
-}
-
-impl Grafted {
-    /// `kernel` spliced into the arena.
-    fn graft(&mut self, kernel: &Kernel) -> ExprId {
-        for (id, data) in kernel.buffer_data() {
-            self.tables.insert(id, Arc::clone(data));
-        }
-        let (from, root) = kernel.parts();
-        self.arena.splice(from, root)
-    }
-
-    /// The kernel rooted at `root`.
-    fn finish(self, root: ExprId) -> Kernel {
-        let kernel = Kernel::from_parts(self.arena, root);
-        self.tables.into_iter().fold(kernel, |kernel, (id, data)| {
-            kernel.with_buffer_data(id, data)
-        })
-    }
-}
-
 /// One coordinate of a piece's arc, measured from its start:
 /// `q(t) = t·(2·step + bend·t)` for `t ∈ [0, 1]`, with `step = p₁ − p₀` and
 /// `bend = (p₂ − p₁) − step` along that axis.
@@ -926,11 +887,11 @@ impl<E: Clone> RisingArc<E> {
 /// `0` — and its mask depends on the row and the piece alone, uniform over
 /// a batch: an `If` a guard may lower to a jump over the whole body.
 fn piece_term(c: Coeff) -> Kernel {
-    let mut term = Grafted::default();
-    let row: [ExprId; PIECE_ROW_COLS] = core::array::from_fn(|k| term.graft(&c(k)));
+    let mut term = KernelBuilder::default();
+    let row: [BuiltTerm; PIECE_ROW_COLS] = core::array::from_fn(|k| term.graft(&c(k)));
     let x = term.graft(&Kernel::x());
     let y = term.graft(&Kernel::y());
-    let arena = &mut term.arena;
+    let arena = &mut term;
 
     let [x0, e0x, e1x, y0, e0y, e1y, sigma, reflect, rows_lo, rows_hi] = row;
     let arc = RisingArc {

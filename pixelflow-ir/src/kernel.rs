@@ -216,6 +216,62 @@ impl Terms for Values {
     }
 }
 
+/// A term of a [`KernelBuilder`]: only meaningful to the builder that made it.
+#[derive(Clone, Copy, Debug)]
+pub struct BuiltTerm(ExprId);
+
+/// Somewhere a kernel is built node by node, in one arena.
+///
+/// `Kernel`'s own methods copy both operands' whole graph per node, so a
+/// term of a few hundred nodes built a method at a time costs the square of
+/// its size. A builder is the other way to compose: kernels are grafted in
+/// once ([`graft`](Self::graft)), the [`Terms`] vocabulary builds on top of
+/// them, and [`finish`](Self::finish) makes the kernel — carrying the
+/// tabulations the grafted kernels carried, as a composition of kernel
+/// values would.
+#[derive(Default)]
+pub struct KernelBuilder {
+    arena: ExprArena,
+    tables: BTreeMap<BufferIdentity, Arc<[f32]>>,
+}
+
+impl KernelBuilder {
+    /// `kernel` spliced into the arena.
+    pub fn graft(&mut self, kernel: &Kernel) -> BuiltTerm {
+        merge_buffer_data(&mut self.tables, &kernel.inner.buffers);
+        let (from, root) = kernel.parts();
+        BuiltTerm(self.arena.splice(from, root))
+    }
+
+    /// The kernel rooted at `root`.
+    #[must_use]
+    pub fn finish(self, root: BuiltTerm) -> Kernel {
+        Kernel::from_parts_carrying(self.arena, root.0, self.tables)
+    }
+}
+
+impl library::sealed::Sealed for KernelBuilder {}
+
+impl Terms for KernelBuilder {
+    type Term = BuiltTerm;
+
+    fn constant(&mut self, value: f32) -> BuiltTerm {
+        BuiltTerm(self.arena.constant(value))
+    }
+
+    fn unary(&mut self, op: OpKind, operand: BuiltTerm) -> BuiltTerm {
+        BuiltTerm(self.arena.unary(op, operand.0))
+    }
+
+    fn binary(&mut self, op: OpKind, [a, b]: [BuiltTerm; 2]) -> BuiltTerm {
+        BuiltTerm(self.arena.binary(op, [a.0, b.0]))
+    }
+
+    fn ternary(&mut self, op: OpKind, [a, b, c]: [BuiltTerm; 3]) -> BuiltTerm {
+        BuiltTerm(self.arena.ternary(op, [a.0, b.0, c.0]))
+    }
+}
+
 impl Kernel {
     fn wrap(
         rooted: Rooted<ExprData>,
@@ -333,7 +389,16 @@ impl Kernel {
     /// thing that becomes machine code.
     #[must_use]
     pub fn from_parts(arena: ExprArena, root: ExprId) -> Self {
-        let kernel = Self::adopt(arena, root, BTreeMap::new());
+        Self::from_parts_carrying(arena, root, BTreeMap::new())
+    }
+
+    /// [`Kernel::from_parts`], carrying `buffers`.
+    fn from_parts_carrying(
+        arena: ExprArena,
+        root: ExprId,
+        buffers: BTreeMap<BufferIdentity, Arc<[f32]>>,
+    ) -> Self {
+        let kernel = Self::adopt(arena, root, buffers);
         let entry = kernel.root();
         assert!(
             entry.retired_axis().is_none(),
