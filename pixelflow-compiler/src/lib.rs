@@ -151,10 +151,11 @@ use proc_macro::TokenStream;
 /// optimizer's algebraic rules, which are not sound at NaN or infinity
 /// (Linear JP-12). Each bound is a
 /// `usize`: an integer, a `usize` const or `+ - * /` over them, known at
-/// expansion; an enclosing fold's index, for a triangular `(0..i)`; or an
-/// entry's count parameter, `n: usize`, bound per call. A bound that is a
-/// name the program binds stands alone — `0..i + 1` waits for bounds typed
-/// as integers — and no bound reads `X` or `Y`. The index `i` is a `usize`,
+/// expansion; or an entry's count parameter, `n: usize`, bound per call and
+/// unchanged. No bound is an enclosing fold's index, so a user fold is
+/// rectangular (Linear JP-7). A bound that is a name the program binds stands
+/// alone — `0..n + 1` waits for bounds typed as integers — and no bound reads
+/// `X` or `Y`. The index `i` is a `usize`,
 /// which a body reads only as `i as f32`: there is no arithmetic on an index
 /// and nothing to index. A fold lowers to one `Reduce`, the node
 /// `Kernel::over` builds, or `Kernel::over_values` for a bound that is a

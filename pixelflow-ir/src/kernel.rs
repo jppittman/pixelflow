@@ -849,8 +849,7 @@ impl Kernel {
     }
 
     /// `⊕_{i ∈ [lo, hi)} body(i)`: [`Kernel::over`] with bounds that are values
-    /// — a per-call count (a [`Uniform`]), an enclosing fold's index (a
-    /// triangular `Σ_i Σ_{j<i}`), or a constant
+    /// — a per-call count (a [`Uniform`]) or a constant
     /// (docs/language/2026-10-20-a-bound-is-a-value.md §1.2).
     ///
     /// A bound that is a value is read per call: `n` a [`Uniform`] is one
@@ -888,7 +887,8 @@ impl Kernel {
     /// naming no count ([`BoundRefusal::BoundOutOfDomain`]) or a mask
     /// ([`BoundRefusal::BoundSort`]); and, from the fold
     /// [`ExprArena::close_over`] builds, on a bound reading a coordinate
-    /// ([`BoundRefusal::BoundVaries`], L3), on a value bound under `ANY`, `ALL`
+    /// ([`BoundRefusal::BoundVaries`], L3), on an index
+    /// ([`BoundRefusal::BoundIndex`]), on a value bound under `ANY` or `ALL`
     /// ([`BoundRefusal::BoundSort`]), and when the body binds every
     /// slot.
     ///
@@ -950,10 +950,22 @@ impl Kernel {
 
     /// Whether `bound`, the fold's `end` bound as a user wrote it, is one
     /// `over_values` takes: a leaf naming a number — a constant naming a count,
-    /// a uniform, an index — and nothing computed (§1.4, until T6).
+    /// or a uniform — and nothing computed (§1.4, until T6).
     fn user_bound(end: BoundEnd, bound: &Kernel) -> Result<(), BoundRefusal> {
         match *bound.root() {
-            ExprData::Var(_) | ExprData::Uniform(_) => Ok(()),
+            ExprData::Uniform(_) => Ok(()),
+            ExprData::Var(var)
+                if Binder::from_var(var).is_some()
+                    || (0..Placeholder::COUNT)
+                        .filter_map(Placeholder::nth)
+                        .any(|placeholder| placeholder.var() == var) =>
+            {
+                Err(BoundRefusal::BoundIndex { end })
+            }
+            ExprData::Var(var) => Err(BoundRefusal::BoundVaries {
+                end,
+                reads: crate::Variance::from_var(var),
+            }),
             ExprData::Const(Lit::Mask(_)) => Err(BoundRefusal::BoundSort { end }),
             ExprData::Const(literal @ Lit::Real(real)) => Fold::count(literal)
                 .map(|_| ())
@@ -2028,40 +2040,16 @@ mod tests {
         assert_eq!(k.uniforms(), [m.decl(), n.decl()]);
     }
 
-    /// L3 admits an enclosing fold's index, through the builder: a triangular
-    /// `Σ_i Σ_{j<i}`. The outer fold binds slot 1, the inner slot 0, and the
-    /// inner bound is the outer's index, bound by the time the root is reached.
+    /// User folds are rectangular: an enclosing index is not a bound accepted
+    /// by the public builder.
     #[test]
-    fn over_values_takes_an_enclosing_index() {
-        let k = Kernel::over(Monoid::SUM, 0..4, |i| {
+    #[should_panic(expected = "BoundIndex")]
+    fn over_values_refuses_an_enclosing_index() {
+        let _refused = Kernel::over(Monoid::SUM, 0..4, |i| {
             Kernel::over_values(Monoid::SUM, &Kernel::constant(0.0), i, |j| {
                 j.mul(&Kernel::x())
             })
         });
-        let (arena, root) = k.parts();
-        let ExprNode::Reduce {
-            fold: outer, body, ..
-        } = arena.node(root)
-        else {
-            panic!("a fold at the root, got {}", arena.display(root));
-        };
-        let ExprNode::Reduce {
-            fold: inner, hi, ..
-        } = arena.node(body)
-        else {
-            panic!("a fold in the body, got {}", arena.display(body));
-        };
-        assert_eq!(outer.binder().slot(), 1);
-        assert_eq!(inner.binder().slot(), 0);
-        let Bound::Value(index) = hi else {
-            panic!("a value bound, got {hi:?}");
-        };
-        assert_eq!(arena.node(index), ExprNode::Var(outer.binder().var()));
-        assert_eq!(arena.free_index(root), None);
-        assert_eq!(
-            crate::variance::compute_arena_variance(arena)[root.0 as usize],
-            crate::Variance::X
-        );
     }
 
     /// Each end is read for itself: a uniform lower bound beside a constant

@@ -11,7 +11,8 @@
 //! program built with the builder are one program, and share a JIT cache
 //! entry. `kernel_raw!` keeps the lowered shape, so each comparison is the
 //! front end's word and not the optimizer's. A bound that is a value — an
-//! entry's count, an enclosing index — is `Kernel::over_values`'s.
+//! entry's count, unchanged — is `Kernel::over_values`'s; neither front end
+//! takes an enclosing index as a bound, so a user fold is rectangular.
 //!
 //! And what it is not: the syntax never unrolls. The e-graph may, when the
 //! kernel is baked (`HalveFold`), and extraction chooses whether it does; the
@@ -238,18 +239,14 @@ fn a_per_call_count_is_over_values() {
     );
 }
 
-/// A triangular fold — the inner bounded by the outer index — is `Kernel::over`
-/// with `Kernel::over_values` inside it, the outer index its `hi`: the inner at
-/// slot 0, the outer at slot 1.
+/// Independent nested folds remain two ordinary `Kernel::over` nodes.
 #[test]
-fn a_triangular_fold_is_over_values_inside_over() {
+fn independent_nested_folds_are_over_inside_over() {
     let written = kernel_raw!(|| (0..4)
-        .map(|i| (0..i).map(|j| X * (j as f32) + Y).sum::<f32>())
+        .map(|i| (0..3).map(|j| X * (j as f32) + (i as f32) + Y).sum::<f32>())
         .sum());
     let built = Kernel::over(Monoid::SUM, 0..4, |i| {
-        Kernel::over_values(Monoid::SUM, &Kernel::constant(0.0), i, |j| {
-            x().mul(j).add(&y())
-        })
+        Kernel::over(Monoid::SUM, 0..3, |j| x().mul(j).add(i).add(&y()))
     });
     assert_same_program(&written, &built);
     let (arena, root) = written.parts();
