@@ -146,7 +146,7 @@ op_table! {
     /// `Select` until docs/language/2026-09-25-the-language-is-kernel.md D18:
     /// that name hid the `if`, and the emitter built on the misreading —
     /// blend by default, a branch bought per node in `emit/guards.rs` —
-    /// cost 73% of a glyph bake (docs/BACKLOG.md, X1).
+    /// cost 73% of a glyph bake.
     If = 36,
 
     // --- Structure ---

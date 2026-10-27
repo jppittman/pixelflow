@@ -45,7 +45,7 @@ the active `*DisplayDriver`); it declares no trait. `ops.rs`: `PlatformOps`,
 ## Behind
 - The seam is not in `mod.rs` (2026-10-15): `PlatformOps` is in `ops.rs`, `Platform`
   in `platform.rs`, and `mod.rs`'s doc still describes a `DisplayDriver`. The
-  behavioral-contracts skill names it; no BACKLOG item or plan closes it.
+  behavioral-contracts skill names it; no Linear issue or plan closes it.
 - `driver.rs` still holds the deprecated `DisplayDriver` trait; only
   `drivers/web/mod.rs` implements it, sending `EngineData::PresentComplete`, which no
   longer exists. The web driver does not build (no wasm32 JIT backend); untracked.

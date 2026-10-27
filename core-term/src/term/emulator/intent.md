@@ -47,7 +47,7 @@ reports_button_motion}`, `mouse::{MouseEncodingParams, MouseEventKind}`. `Termin
 
 ## Behind
 - `mod.rs` holds the snapshot algorithm (`get_render_snapshot`, lines 189-314), against
-  desloppify `mod-rs-is-a-contract`; no plan or BACKLOG item tracks it.
+  desloppify `mod-rs-is-a-contract`; no plan or Linear issue tracks it.
 - `get_render_snapshot(&mut self)` clears the dirt, so the flags live in the snapshot alone
   (`core-term/src/terminal_app.rs`); damage is split over `Screen::dirty` and two marks. Untracked.
 - `scrollback_generation` is bumped by convention ("every new mutation site MUST bump it",

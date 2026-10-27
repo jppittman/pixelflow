@@ -248,7 +248,7 @@ path" (plan §6) refers to: the extent is in the key.
 
 ## 4. What this says about the plan's own figures
 
-1. **Programs: 7 at both tiles, not 6 and 7.** BACKLOG H1 records "95 -> 6 programs at tile 16, 7 at
+1. **Programs: 7 at both tiles, not 6 and 7.** The earlier record (BACKLOG H1, since deleted) said "95 -> 6 programs at tile 16, 7 at
    tile 32" (a September measurement, with cold warm 3.7 s and 12.0 s). On this tree the partition is
    six trip-count buckets, 2 to 64, plus the blank, at *both* tiles; the piece counts do not depend
    on the tile. Hypothesis, unverified: H1 counted the blank at one tile and not the other, or its

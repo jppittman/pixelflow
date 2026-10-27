@@ -46,7 +46,7 @@ crate is where the application's effects run.
 ## Behind
 - The `Message` lane table says Control and Management block "Unlimited" and Data
   "may drop"; `ActorHandle::send` fails "only if the receiver has been dropped".
-  The code times out and Data never drops (2026-10-15; no plan or BACKLOG item).
+  The code times out and Data never drops (2026-10-15; no plan or Linear issue).
 - The `TroupeActor` doc example (handlers returning `()`) and the documented
   `SchedulerParams` defaults (32, 10, 1024) are stale; `DEFAULT` is 118, 36, 332.
 - Two implementations of one priority contract: `ActorScheduler::handle_wake`

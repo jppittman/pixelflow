@@ -50,7 +50,7 @@ implementation, all `pub(super)`. Callers: `review/plan.rs` (`snippets`) and
 ## Behind
 - `Outline` does not skip test modules: a `#[cfg(test)]` module's signatures
   are in the outline, though `Parts` drops its functions (2026-10-15; no plan
-  or BACKLOG item names it, and no test covers it).
+  or Linear issue names it, and no test covers it).
 - `Language::is_test_module` misses `#[cfg(all(test, ...))]`; the cut inherits
   it (`language/intent.md`, Behind).
 

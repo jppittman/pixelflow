@@ -540,17 +540,17 @@ alongside the fix.
 
 ## 10. Open questions
 
-- [ ] **Self-port as a named verb?** First-class `yield`/continuation syntax in the macro, or
+- **Self-port as a named verb?** First-class `yield`/continuation syntax in the macro, or
   just "a port that points home." Vocabulary vs. emergent trick. (The runtime already treats it
   as distinct — it has its own slot — which argues for naming it.)
-- [ ] **Burst cardinality.** A port fires at most once per step; bursts batch into one message
+- **Burst cardinality.** A port fires at most once per step; bursts batch into one message
   (`ScreenOps(batch)`). Confirm no actor needs a port to emit a *variable number of distinct*
   messages per input (which would make that port carry a collection).
-- [ ] **Eliding the wake syscall.** `GreenSender` rings the doorbell on every delivery. The
+- **Eliding the wake syscall.** `GreenSender` rings the doorbell on every delivery. The
   doorbell coalesces, so this is cheap and correct, but a parked/running flag on the host would
   let a producer skip the ring entirely while the host is already sweeping — the trick mio uses
   for its eventfd. Worth measuring before adding.
-- [ ] **`ports!` and three lanes.** The macro still only generates `Out`/`Wiring` from a port
+- **`ports!` and three lanes.** The macro still only generates `Out`/`Wiring` from a port
   declaration; it does not yet touch `Transducer`'s `Control`/`Management`/`Data` associated
   types or the three `step_*` methods, which are still hand-written. Whether that is worth
   generating (e.g. from an `in { control: X, management: Y, data: Z }` block) depends on how

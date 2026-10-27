@@ -223,7 +223,7 @@ Every row is one cause: the binding time of a count is attached to its syntax.
 |---|---|---|
 | ASCII needs **29 programs**, one per piece count, holding **528** `one_piece` copies (Σ n) | quoted from the-language-is-kernel `:1186-1188`; not re-measured ([A0](../results/2026-10-20-production-glyph-baseline.md) §4.4) | `FontPrograms` (`pixelflow-graphics/src/fonts/loop_blinn/program.rs`) has no fold; a count cannot be a uniform, so the count is the structure |
 | `⌨` (347 segments, 262 pieces) is **27,029 defs**, a **75 KiB** frame past NEON's 64 KiB reach (#1414), as a `FontPrograms` program; production's `Glyph::bake` keeps the fold, at 310 defs and a 1.4 KiB frame | quoted from `docs/codegen/2026-09-10-a-surviving-reduce-is-a-loop.md:710-720`, `5574374a`, not re-measured; production's figures are A0 §3.2 | the same: one term per piece, by construction |
-| production pads counts to powers of two (`bucketed_trip_count`, `padding_row`): **95 → 7 programs** at tile 16 and at tile 32, six buckets (2 to 64) and the blank; a new tile extent mints all seven again | A0 §3.1, §3.5 (BACKLOG H1's 6 and 7 are not reproduced) | the trip count is in the fold's `to_bits` (`FoldHeader::to_bits` since A2b), so in the JIT key (`pixelflow-ir/src/key.rs:445-450`) |
+| production pads counts to powers of two (`bucketed_trip_count`, `padding_row`): **95 → 7 programs** at tile 16 and at tile 32, six buckets (2 to 64) and the blank; a new tile extent mints all seven again | A0 §3.1, §3.5 (an earlier record of 6 and 7 is not reproduced) | the trip count is in the fold's `to_bits` (`FoldHeader::to_bits` since A2b), so in the JIT key (`pixelflow-ir/src/key.rs:445-450`) |
 | each bucket **saturates separately** | A0 §3.1: 7 saturations, 6 stopped by the class cap; `pixelflow-search/src/runtime.rs`, `CACHE` keyed on canonical bytes | the same key |
 | a run's program depends on every character's row offset | `loop_blinn.rs:423`, `start..start + count` | data spelled as a constant |
 | `n = 0` is a program of its own, `blank()` | `program.rs:138` | an empty count cannot reach a fold |
@@ -324,7 +324,7 @@ its edge.
   zero (a literal `0`, or one such as `X − X`) then meets the `Mul` annihilator
   (`0·y → 0`), which removes the fold before the guard is placed, so the optimized fold
   is `0` where the fold as written is NaN: the annihilation rule's edge, in
-  `FactorFold`'s doc and BACKLOG E9. `substitute`/`rebuild` (`fold_rules.rs`)
+  `FactorFold`'s doc and Linear JP-12. `substitute`/`rebuild` (`fold_rules.rs`)
   follow L7; `rebuild`'s comment (`fold_rules.rs:600-606`) is rewritten, since its premise
   ("its class's variance excludes it") now rests on L3 and L4 adds the bounds' bits.
   `ENode::variance` follows L4 in the same CL as the IR's; `insert` and `add` refuse L3 as
@@ -496,11 +496,6 @@ one program per font. "Hunk" names an open PR whose diff touches or abuts the li
 | the-language-is-kernel §1.3 `:186` | a count "is how many instances the host composed" | a count is a value | A5 (A1's, after #1431) | none |
 | the-language-is-kernel D1 `:643`, D3 `:645`, D9 `:651` | structural binding time; "a count is how many instances the host composed"; "one per piece count" | a reversal note pointing here | A1, after #1323 | #1323 `:644-650` holds `:645`; `:643`, `:651` abut it |
 | `2026-10-17-the-arena-is-typed.md` §1.1 `Reduce` row, §4 T6 | `Reduce`: `⊕ : S × S → S`, body `: S`; T6 types the binder only | `Reduce` with value bounds `Real × Real × S → S`, `Int × Int × S → S` at T6; T6 retypes the bounds with the binder, lifts `BoundArithmetic`, measured. A known bound is node data, so T6 re-keys no bound literal | A3 | none |
-| BACKLOG plan table; `docs/README.md` "The language" | no row, no entry for this plan | a row ("landed — / next A0, A1"); an entry | A1 | none |
-| BACKLOG `:32` (typed-arena note) | item 2 re-derived after T3 | also: T6 retypes value bounds (this plan, §5) | A3 | none |
-| BACKLOG E6 (`:149`) | a loop and its unrolling tie | the tie narrows to known ranges | A3 | none |
-| BACKLOG C8 (`:163`) | 2²⁴ refused at construction | §1.4: refused at construction for a literal, at the host write for a count, NaN in the language | A4 (NaN), A6 (host write) | none |
-| BACKLOG row 38, H1 (`:101`) | bucketing done; one program per bucket | §4: deleted; one program per tile extent | B2 | none (#1323's is `:114-119`) |
 | ontology `language.md`: "Binding time" `:116`, "Structural parameter" `:144`, "Range (trip count)" `:497` | ranges constant; structural a binding time; a range value "proposed and unbuilt" (`:509`) | §1.1–§1.2; the range value is decision 9 | A4; "Structural parameter" A5 | none |
 | ontology "Fold (Reduce)" `:417` | "its body is its only child" (`:423`); "Is not: Dynamically bounded" (`:437`); "costs `len × body`" (`:450`) | bounds are values; §1.5's cost | A4 | none |
 | ontology "Unrolling" `:523` | unrolling is construction's | extraction's, on known ranges (L6) | A3 | none |
@@ -526,7 +521,7 @@ codegen, `select.rs`, `program/lower.rs`, `program/mod.rs`; the compiler's `emit
 `:670-684`, `pixelflow-ir/intent.md:10-18` and `:53-67`, desloppify's
 `pixelflow-architecture/SKILL.md:34-41`. #1323 touches compiler `emit`/`lower`/`parser`/
 `sema` and the tests `items_block.rs` and a new at_is_contramap.rs; IR `arena.rs`/`kernel.rs`; and
-the docs BACKLOG `:114-119`, the-language-is-kernel `:40-45`, `:164-172`, `:644-650`,
+the docs the-language-is-kernel `:40-45`, `:164-172`, `:644-650`,
 ontology `:248-254`, `:275-282`, `:290-297`. #1432 (T2) touches `kind.rs`, `passes.rs`,
 `program/lower.rs`, both `intent.md`s, `cost.rs` (`:146`, `:494`) and `ops.rs`, and
 shares files with A2–A4 but no hunk. #1427 rewrites the compiler's `ast`/`parser`/`sema`/
@@ -547,19 +542,20 @@ A5's deletion, which removes code #1427 only re-scopes.
 
 ### (A) On main, independent of the typed-arena series
 
+Where each CL stands is tracked in Linear (project *Typed kernel construction*, milestone *Admitted user folds and non-escaping binders*; the A-series below is built unless Linear says otherwise), not in this document. "Outcome" below records what was built and measured, not a status.
+
 - **A0. Re-baseline production.** No code. Cold `GlyphAtlas::warm(' '..='~')` at tiles
   16 and 32, and `⌨`, through `Glyph::bake` (`pixelflow-pipeline/examples/glyph_compile_report.rs`,
   `glyph_phase_split.rs`, `frame_budget.rs`) with `--features saturation-telemetry`:
   programs, saturations, defs, bytes, compile and bake time, both x86 tiers, in a dated
-  `docs/results/` note. Every later number is against it. **Done:**
+  `docs/results/` note. Every later number is against it. **Outcome:**
   [`2026-10-20-production-glyph-baseline.md`](../results/2026-10-20-production-glyph-baseline.md).
   7 programs and 7 saturations per font and tile extent, at tiles 16 and 32; 201-202 defs per
   loop program; 16.9 KB of code over the seven; compile 45-56 ms, bake 0.4-1.0 ms; a new tile
   extent adds 7 programs and 0 saturations. `⌨` (DejaVu; Noto has none) is 262 pieces, 310
   defs, a 1.4 KiB frame.
-- **A1. Docs.** §5's rows marked A1, under the order above; the docs/README.md entry and
-  the BACKLOG plan-table row. Gate: `scripts/check-doc-paths.sh`. **Done** except
-  the-language-is-kernel's D-table rows, after #1323; §1.3's "how many instances the host
+- **A1. Docs.** §5's rows marked A1, under the order above; the docs/README.md entry. Gate: `scripts/check-doc-paths.sh`. The
+  the-language-is-kernel D-table rows follow #1323; §1.3's "how many instances the host
   composed" sentence (§5's `:186`) was A5's, once #1431 had landed.
 - **A2a. One reader of a fold's range.** A `KnownRange` value (`fold.rs`: `lo`, `hi`,
   `stride`) owns `len`, `is_empty`, `peel`, `peel_back`, `halve` and `admits`, and `Fold`
@@ -590,7 +586,7 @@ A5's deletion, which removes code #1427 only re-scopes.
   after its fold (the mean `Σ_{i<n} f / n`), so the parent has it. Gate: byte_probe empty in
   both columns on every row, the mean row included; canonical keys and `KernelKey` digests
   unchanged. Anything that moves is argued in the PR, with the sibling-fold rows
-  (`pixelflow-codegen/tests/support/sibling_rows.rs`) as byte-level arbiter. **Done:**
+  (`pixelflow-codegen/tests/support/sibling_rows.rs`) as byte-level arbiter. **Outcome:**
   byte_probe empty in both columns on every row under `PIXELFLOW_ISA=avx512` and `=avx2`, the
   mean rows included, and the 29 font programs' keys and digests unchanged. The
   bounds are `u64` and the stored header is packed (`FoldHeader` 32 bytes, three counts and
@@ -623,7 +619,7 @@ A5's deletion, which removes code #1427 only re-scopes.
   accepted), `ANY`/`ALL`/`SEQ` under a value bound refused, a non-leaf bound refused at
   `over_values`, L4, L7, L8 (a peel makes the inner bound known), a triangular fold
   whose outer fold `HalveFold` halves (the rule-made `0..(i + s)` accepted), and a rule-made
-  bound whose class fact fails L3 (declined: the fold is not built). **Done:**
+  bound whose class fact fails L3 (declined: the fold is not built). **Outcome:**
   byte_probe empty in both columns under `PIXELFLOW_ISA=avx512` and `=avx2`; the 29 font
   programs' keys, digests and saturation telemetry, the extraction fields included,
   unchanged on every pinned kernel. A placeholder's variance is `CONST` (it is a binder-to-be, never a coordinate,
@@ -675,7 +671,7 @@ A5's deletion, which removes code #1427 only re-scopes.
   `2²⁴ + 2`; a uniform-bounded fold that reads `Y` alone, in the row fold, for the same
   kinds of `n`; a uniform-bounded fold whose body varies with X and whose `hi` is read only
   by the loop (§3.3's placement rule); one program and one code pointer for every `n`.
-  `2²⁴ + 1` is not a case here: no `f32` names it (§1.4). **Done:** byte_probe empty in both
+  `2²⁴ + 1` is not a case here: no `f32` names it (§1.4). **Outcome:** byte_probe empty in both
   columns under `PIXELFLOW_ISA=avx512` and `=avx2`; the 29 font programs' keys, digests and
   saturation telemetry, the extraction fields included, unchanged. The guard is
   `pixelflow_ir::passes::legalize`'s last pass (`passes/guard.rs`); lowering asserts after
@@ -699,7 +695,7 @@ A5's deletion, which removes code #1427 only re-scopes.
   `sema/consts.rs`, `lower/walk.rs` and `emit/arena.rs` unit tests) and docs rewritten. It comes before A6
   because the obvious lowering of a structural bound, a `Param` leaf, is `Variance::ALL`
   (`variance.rs`'s `Param` arm) and L3 refuses it.
-  **Done:** `kernel!` refuses a generic on any `fn` at parse, a `const` one naming §1.2; the
+  **Outcome:** `kernel!` refuses a generic on any `fn` at parse, a `const` one naming §1.2; the
   structural path is deleted (§3.4), and `FoldTerms` lost its stride, which only the template
   set past 1; the template exemption went with it, so A7 is empty (below). The test templates
   that take no kernel (`ramp`, `rings`, `swept`, `mean_index`, and `emit.rs`'s
@@ -714,7 +710,7 @@ A5's deletion, which removes code #1427 only re-scopes.
   gains a triangular case and a per-call count case (`fn rust_sum(n: usize, x: f32)`, in
   decision 2's spelling); the `Args` write refuses `2²⁴ + 1`;
   `tests/fold_is_kernel_over.rs` green; byte_probe empty.
-  **Done:** a bound's names are typed where the fold is written: a literal or a `usize`
+  **Outcome:** a bound's names are typed where the fold is written: a literal or a `usize`
   const (`+ - * /` over them), an enclosing fold's index (a triangular `0..i`), or an
   entry parameter `n: usize` of the items form, a uniform declared in parameter order as
   `n as f32` and read as a bound or by `n as f32`; one program for every `n`. Refused at
@@ -724,7 +720,7 @@ A5's deletion, which removes code #1427 only re-scopes.
   closure form. The host function panics on a count past 2²⁴, and `Args::write_into`
   panics on one before writing anything; a raw block write that names no count makes the
   fold NaN by the guard, up to the optimizer's algebraic rules, which are not sound at NaN
-  (BACKLOG E9). `rustc_is_the_oracle.rs` has the
+  (Linear JP-12). `rustc_is_the_oracle.rs` has the
   triangular and per-call cases, and `fold_is_kernel_over.rs` the same two against
   `over_values`. byte_probe empty in both columns under `PIXELFLOW_ISA=avx512` and
   `=avx2`; the 29 font programs' keys, digests and saturation telemetry, the extraction
@@ -740,28 +736,28 @@ still in the key (§3.5). Ruling 6 lands with B2; decision 4's interim is refuse
 
 ### (B) After T3 and item 2
 
-- **B0.** T3 lands (the typed-arena series). T6 and the bound retyping follow on that
+- **B0.** T3 lands (the typed-arena series; Linear JP-95). T6 and the bound retyping follow on that
   series' schedule and delete §4's integrality conjunct and `BoundArithmetic`; nothing in
   B needs them, since B3's bounds are leaves.
-- **B1. Item 2, re-derived against this note** (decision 3), and §1.3's denotation built:
+- **B1 (Linear JP-22). Item 2, re-derived against this note** (decision 3), and §1.3's denotation built:
   the binder `i : L`, its bounds `0` and `Extent(p)` (or decision 9's range node), lifts
   named. An `L → T` binder supplied per call; its extent a value off the key; `bind` checks
   the runtime extent and refuses one past 2²⁴; `lower_gather` stops baking extents and its
   implicit clamp gives way to named lifts. §5's B1 rows.
-- **B2. A glyph is a call.** `glyph(pieces, box)`, one program per tile extent; the
+- **B2 (JP-24). A glyph is a call.** `glyph(pieces, box)`, one program per tile extent; the
   bucketing, padding and `row_at` indirection deleted. Gate: `tests/freetype_oracle.rs` and
   `glyph_atlas_golden.rs` within tolerance; bit-exact pins (`kernel_glyph_optimize.rs`,
   `glyph_optimization_cost.rs`) re-baselined in their own commit; A0's numbers after,
   with **1** program per tile extent. §5's B2 rows.
-- **B3. A run is a call.** `spans`, the outer fold over `G` and the inner fold over
+- **B3 (JP-22). A run is a call.** `spans`, the outer fold over `G` and the inner fold over
   `Lattice(count(g))` reading `pieces ∘ ι_g` (§1.3); `Glyph::over` concatenates tables
   host-side with `Glyph::empty()` its unit (`tests/run_is_a_glyph.rs`). Gate: B2's, plus
   one program for strings of different lengths, and a malformed span reads NaN. L3's walk
   resolves each `Ref` a bound reaches through the referent's whole arena, on every push; no
   production bound holds a `Ref` before this step. A referent's variance belongs to the
   referent, so memoize it per referent when B3's profile asks.
-- **B4. `FontPrograms` goes** (decision 7); its tests move to B2's program.
-- **B5. The `kernel!` surface for a fold over a discrete kernel** (decision 1); the glyph
+- **B4 (JP-25). `FontPrograms` goes** (decision 7); its tests move to B2's program.
+- **B5 (JP-22). The `kernel!` surface for a fold over a discrete kernel** (decision 1); the glyph
   is then written in `kernel!` again. Depends on O3 (the-language-is-kernel `:215-218`):
   an entry that takes a kernel has no `Args` record and re-lowers per host call, which
   would be one lowering per glyph, the opposite of ruling 6.
