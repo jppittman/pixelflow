@@ -246,7 +246,7 @@ Control creates backpressure by timing out senders who are too aggressive. If th
 ```
 Source → Parser → Sema → Arena lowering → Optimize → Rust TokenStream
             ↓                                 ↓
-       Symbol Table                E-graph + latency prior
+          Scopes                   E-graph + latency prior
 ```
 
 Two representations, the AST and `ExprArena`, and **optimization runs on the arena**.

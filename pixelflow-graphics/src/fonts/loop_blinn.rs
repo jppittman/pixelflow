@@ -88,10 +88,7 @@
 use super::monotone::MonotoneQuad;
 use super::outline::{Outline, Point, Segment};
 use pixelflow_core::{BoundManifold, DiscreteManifold, Kernel, Lattice, Manifold, Monoid, Uniform};
-use pixelflow_ir::arena::BufferIdentity;
-use pixelflow_ir::{library, ExprArena, ExprId, OpKind};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use pixelflow_ir::library::{self, BuiltTerm, KernelBuilder, Terms};
 
 /// How far coverage can reach past the outline, in the frame the kernel is
 /// built in. The pixel is a unit square about the sample, so half a unit is
@@ -625,41 +622,6 @@ fn row_at<'a>(table: &'a Kernel, i: &'a Kernel) -> impl Fn(usize) -> Kernel + 'a
     move |k| table.at(&Kernel::constant(k as f32), i)
 }
 
-/// A term built node by node in one arena, from kernels grafted into it,
-/// carrying the tabulations those kernels carry — so the finished kernel
-/// binds what they bound, as a composition of kernel values would.
-///
-/// A piece's term is built here and not through [`Kernel`]'s methods
-/// because each of those copies its operands' whole graph, so a term built
-/// a method at a time costs the square of its size. The closed form is
-/// about 150 nodes: built by methods, the printable ASCII glyphs at 16 px
-/// took 260–320 ms to build (release, before compiling any), and 50–55 ms
-/// built here — against 70–110 ms for the integral they replace.
-#[derive(Default)]
-struct Grafted {
-    arena: ExprArena,
-    tables: BTreeMap<BufferIdentity, Arc<[f32]>>,
-}
-
-impl Grafted {
-    /// `kernel` spliced into the arena.
-    fn graft(&mut self, kernel: &Kernel) -> ExprId {
-        for (id, data) in kernel.buffer_data() {
-            self.tables.insert(id, Arc::clone(data));
-        }
-        let (from, root) = kernel.parts();
-        self.arena.splice(from, root)
-    }
-
-    /// The kernel rooted at `root`.
-    fn finish(self, root: ExprId) -> Kernel {
-        let kernel = Kernel::from_parts(self.arena, root);
-        self.tables.into_iter().fold(kernel, |kernel, (id, data)| {
-            kernel.with_buffer_data(id, data)
-        })
-    }
-}
-
 /// One coordinate of a piece's arc, measured from its start:
 /// `q(t) = t·(2·step + bend·t)` for `t ∈ [0, 1]`, with `step = p₁ − p₀` and
 /// `bend = (p₂ − p₁) − step` along that axis.
@@ -671,51 +633,51 @@ impl Grafted {
 /// the pixel at most once — and the host's orientation
 /// ([`Piece::oriented`]) is what makes the certified arc the glyph's arc:
 /// for a real row the floor moves nothing.
-#[derive(Clone, Copy)]
-struct Rise {
-    step: ExprId,
-    bend: ExprId,
+#[derive(Clone)]
+struct Rise<E> {
+    step: E,
+    bend: E,
 }
 
-impl Rise {
+impl<E: Clone> Rise<E> {
     /// The rise whose control-polygon steps are `first` and `second`, each
     /// floored at `0`.
-    fn certified(arena: &mut ExprArena, [first, second]: [ExprId; 2]) -> Self {
-        let zero = arena.push_const(0.0);
-        let step = arena.push_binary(OpKind::Max, first, zero);
-        let second = arena.push_binary(OpKind::Max, second, zero);
-        let bend = arena.push_binary(OpKind::Sub, second, step);
+    fn certified<T: Terms<Term = E>>(terms: &mut T, [first, second]: [E; 2]) -> Self {
+        let zero = terms.constant(0.0);
+        let step = terms.max(first, zero.clone());
+        let second = terms.max(second, zero);
+        let bend = terms.sub(second, step.clone());
         Self { step, bend }
     }
 
     /// `2·step + bend·s`: the factor [`Rise::at`] and [`Rise::climb`] share.
-    fn slope_through(self, arena: &mut ExprArena, s: ExprId) -> ExprId {
-        let twice = arena.push_binary(OpKind::Add, self.step, self.step);
-        let bent = arena.push_binary(OpKind::Mul, self.bend, s);
-        arena.push_binary(OpKind::Add, twice, bent)
+    fn slope_through<T: Terms<Term = E>>(&self, terms: &mut T, s: E) -> E {
+        let twice = terms.add(self.step.clone(), self.step.clone());
+        let bent = terms.mul(self.bend.clone(), s);
+        terms.add(twice, bent)
     }
 
     /// `q(t)`.
-    fn at(self, arena: &mut ExprArena, t: ExprId) -> ExprId {
-        let slope = self.slope_through(arena, t);
-        arena.push_binary(OpKind::Mul, t, slope)
+    fn at<T: Terms<Term = E>>(&self, terms: &mut T, t: E) -> E {
+        let slope = self.slope_through(terms, t.clone());
+        terms.mul(t, slope)
     }
 
     /// `Δ(s, t) = q(t) − q(s) = (t − s)·(2·step + bend·(s + t))`: how far
     /// the rise climbs from `s` to `t`, as one product, so an empty span is
     /// exactly `0`.
-    fn climb(self, arena: &mut ExprArena, [s, t]: [ExprId; 2]) -> ExprId {
-        let width = arena.push_binary(OpKind::Sub, t, s);
-        let span = arena.push_binary(OpKind::Add, s, t);
-        let slope = self.slope_through(arena, span);
-        arena.push_binary(OpKind::Mul, width, slope)
+    fn climb<T: Terms<Term = E>>(&self, terms: &mut T, [s, t]: [E; 2]) -> E {
+        let width = terms.sub(t.clone(), s.clone());
+        let span = terms.add(s, t);
+        let slope = self.slope_through(terms, span);
+        terms.mul(width, slope)
     }
 
     /// `clamp(τ(δ), lo, hi)`: where the rise reaches `δ`, held to
     /// `[lo, hi]` — `τ` being [`Rise::monotone_root`].
-    fn reaches(self, arena: &mut ExprArena, delta: ExprId, bounds: [ExprId; 2]) -> ExprId {
-        let root = self.monotone_root(arena, delta);
-        library::clamp(arena, root, bounds)
+    fn reaches<T: Terms<Term = E>>(&self, terms: &mut T, delta: E, bounds: [E; 2]) -> E {
+        let root = self.monotone_root(terms, delta);
+        library::clamp(terms, root, bounds)
     }
 
     /// `τ(δ) = δ / max(step + √max(step² + bend·δ, 0), ROOT_FLOOR)`: the
@@ -760,32 +722,32 @@ impl Rise {
     /// computed once is exact. Measured, a line read through one step column
     /// with `δ/d` extracted a `recip`: `3.9e-2` of coverage wrong at AVX2,
     /// `3.5e-3` at AVX-512 (`adversarial`'s one-step-column case pins it).
-    fn monotone_root(self, arena: &mut ExprArena, delta: ExprId) -> ExprId {
-        let square = arena.push_binary(OpKind::Mul, self.step, self.step);
-        let reach = arena.push_binary(OpKind::Mul, self.bend, delta);
-        let radicand = arena.push_binary(OpKind::Add, square, reach);
-        let real = arena.push_const(RADICAND_FLOOR);
-        let radicand = arena.push_binary(OpKind::Max, radicand, real);
-        let root = arena.push_unary(OpKind::Sqrt, radicand);
-        let denominator = arena.push_binary(OpKind::Add, self.step, root);
-        let floor = arena.push_const(ROOT_FLOOR);
-        let denominator = arena.push_binary(OpKind::Max, denominator, floor);
-        let one = arena.push_const(1.0);
-        let reciprocal = arena.push_binary(OpKind::Div, one, denominator);
-        arena.push_binary(OpKind::Mul, delta, reciprocal)
+    fn monotone_root<T: Terms<Term = E>>(&self, terms: &mut T, delta: E) -> E {
+        let square = terms.mul(self.step.clone(), self.step.clone());
+        let reach = terms.mul(self.bend.clone(), delta.clone());
+        let radicand = terms.add(square, reach);
+        let real = terms.constant(RADICAND_FLOOR);
+        let radicand = terms.max(radicand, real);
+        let root = terms.sqrt(radicand);
+        let denominator = terms.add(self.step.clone(), root);
+        let floor = terms.constant(ROOT_FLOOR);
+        let denominator = terms.max(denominator, floor);
+        let one = terms.constant(1.0);
+        let reciprocal = terms.div(one, denominator);
+        terms.mul(delta, reciprocal)
     }
 }
 
 /// One piece's arc as the kernel reads it: from `(x₀, y₀)`, rising in both
 /// coordinates.
-struct RisingArc {
-    x0: ExprId,
-    y0: ExprId,
-    x: Rise,
-    y: Rise,
+struct RisingArc<E> {
+    x0: E,
+    y0: E,
+    x: Rise<E>,
+    y: Rise<E>,
 }
 
-impl RisingArc {
+impl<E: Clone> RisingArc<E> {
     /// **The area of the pixel about `(x, y)` left of the arc, within the
     /// arc's band of rows**, in closed form.
     ///
@@ -867,47 +829,49 @@ impl RisingArc {
     ///   (`tests/glyph_exact_area.rs`, `tests/glyph_area_edge_cases.rs`),
     ///   and within `2⁻²⁰·(1 + extent)` arc by arc (this module's
     ///   `adversarial` tests, which use a quarter of it).
-    fn pixel_area(&self, arena: &mut ExprArena, [x, y]: [ExprId; 2]) -> ExprId {
-        let zero = arena.push_const(0.0);
-        let one = arena.push_const(1.0);
-        let half = arena.push_const(PIXEL_HALF);
-        let across = arena.push_binary(OpKind::Sub, x, self.x0);
-        let up = arena.push_binary(OpKind::Sub, y, self.y0);
+    fn pixel_area<T: Terms<Term = E>>(&self, terms: &mut T, [x, y]: [E; 2]) -> E {
+        let zero = terms.constant(0.0);
+        let one = terms.constant(1.0);
+        let half = terms.constant(PIXEL_HALF);
+        let across = terms.sub(x, self.x0.clone());
+        let up = terms.sub(y, self.y0.clone());
         // `L − x₀` and `L + 1 − x₀`: the pixel's left and right edges, and
         // its lowest and highest rows, measured from the arc's start.
-        let left = arena.push_binary(OpKind::Sub, across, half);
-        let right = arena.push_binary(OpKind::Add, across, half);
-        let lowest = arena.push_binary(OpKind::Sub, up, half);
-        let highest = arena.push_binary(OpKind::Add, up, half);
+        let left = terms.sub(across.clone(), half.clone());
+        let right = terms.add(across, half.clone());
+        let lowest = terms.sub(up.clone(), half.clone());
+        let highest = terms.add(up, half.clone());
 
-        let t0 = self.y.reaches(arena, lowest, [zero, one]);
-        let t1 = self.y.reaches(arena, highest, [zero, one]);
-        let t_left = self.x.reaches(arena, left, [t0, t1]);
-        let t_right = self.x.reaches(arena, right, [t0, t1]);
+        let t0 = self.y.reaches(terms, lowest, [zero.clone(), one.clone()]);
+        let t1 = self.y.reaches(terms, highest, [zero, one]);
+        let t_left = self
+            .x
+            .reaches(terms, left.clone(), [t0.clone(), t1.clone()]);
+        let t_right = self.x.reaches(terms, right, [t0, t1.clone()]);
 
-        let right_of_the_pixel = self.y.climb(arena, [t_right, t1]);
+        let right_of_the_pixel = self.y.climb(terms, [t_right.clone(), t1]);
 
-        let x_left = self.x.at(arena, t_left);
-        let x_left = arena.push_binary(OpKind::Sub, x_left, left);
-        let x_right = self.x.at(arena, t_right);
-        let x_right = arena.push_binary(OpKind::Sub, x_right, left);
-        let ends = arena.push_binary(OpKind::Add, x_left, x_right);
-        let mean = arena.push_binary(OpKind::Mul, half, ends);
-        let rise = self.y.climb(arena, [t_left, t_right]);
-        let trapezoid = arena.push_binary(OpKind::Mul, mean, rise);
+        let x_left = self.x.at(terms, t_left.clone());
+        let x_left = terms.sub(x_left, left.clone());
+        let x_right = self.x.at(terms, t_right.clone());
+        let x_right = terms.sub(x_right, left);
+        let ends = terms.add(x_left, x_right);
+        let mean = terms.mul(half, ends);
+        let rise = self.y.climb(terms, [t_left.clone(), t_right.clone()]);
+        let trapezoid = terms.mul(mean, rise);
 
-        let x_over_y = arena.push_binary(OpKind::Mul, self.x.step, self.y.bend);
-        let y_over_x = arena.push_binary(OpKind::Mul, self.y.step, self.x.bend);
-        let twist = arena.push_binary(OpKind::Sub, x_over_y, y_over_x);
-        let third = arena.push_const(ONE_THIRD);
-        let k = arena.push_binary(OpKind::Mul, third, twist);
-        let w = arena.push_binary(OpKind::Sub, t_right, t_left);
-        let square = arena.push_binary(OpKind::Mul, w, w);
-        let cube = arena.push_binary(OpKind::Mul, square, w);
-        let bow = arena.push_binary(OpKind::Mul, k, cube);
+        let x_over_y = terms.mul(self.x.step.clone(), self.y.bend.clone());
+        let y_over_x = terms.mul(self.y.step.clone(), self.x.bend.clone());
+        let twist = terms.sub(x_over_y, y_over_x);
+        let third = terms.constant(ONE_THIRD);
+        let k = terms.mul(third, twist);
+        let w = terms.sub(t_right, t_left);
+        let square = terms.mul(w.clone(), w.clone());
+        let cube = terms.mul(square, w);
+        let bow = terms.mul(k, cube);
 
-        let between = arena.push_binary(OpKind::Add, trapezoid, bow);
-        arena.push_binary(OpKind::Add, right_of_the_pixel, between)
+        let between = terms.add(trapezoid, bow);
+        terms.add(right_of_the_pixel, between)
     }
 }
 
@@ -923,27 +887,28 @@ impl RisingArc {
 /// `0` — and its mask depends on the row and the piece alone, uniform over
 /// a batch: an `If` a guard may lower to a jump over the whole body.
 fn piece_term(c: Coeff) -> Kernel {
-    let mut term = Grafted::default();
-    let row: [ExprId; PIECE_ROW_COLS] = core::array::from_fn(|k| term.graft(&c(k)));
+    let mut term = KernelBuilder::default();
+    let row: [BuiltTerm; PIECE_ROW_COLS] = core::array::from_fn(|k| term.graft(&c(k)));
     let x = term.graft(&Kernel::x());
     let y = term.graft(&Kernel::y());
-    let arena = &mut term.arena;
+    let arena = &mut term;
 
+    let [x0, e0x, e1x, y0, e0y, e1y, sigma, reflect, rows_lo, rows_hi] = row;
     let arc = RisingArc {
-        x0: row[COL_X0],
-        y0: row[COL_Y0],
-        x: Rise::certified(arena, [row[COL_E0X], row[COL_E1X]]),
-        y: Rise::certified(arena, [row[COL_E0Y], row[COL_E1Y]]),
+        x0,
+        y0,
+        x: Rise::certified(arena, [e0x, e1x]),
+        y: Rise::certified(arena, [e0y, e1y]),
     };
-    let reflected = arena.push_binary(OpKind::Mul, row[COL_S], y);
+    let reflected = arena.mul(reflect, y);
     let area = arc.pixel_area(arena, [x, reflected]);
-    let signed = arena.push_binary(OpKind::Mul, row[COL_SIGMA], area);
+    let signed = arena.mul(sigma, area);
 
-    let above = arena.push_binary(OpKind::Gt, y, row[COL_ROWS_LO]);
-    let below = arena.push_binary(OpKind::Lt, y, row[COL_ROWS_HI]);
-    let reaches = arena.push_binary(OpKind::BitAnd, above, below);
-    let zero = arena.push_const(0.0);
-    let cut = arena.push_ternary(OpKind::If, reaches, signed, zero);
+    let above = arena.gt(y, rows_lo);
+    let below = arena.lt(y, rows_hi);
+    let reaches = arena.and(above, below);
+    let zero = arena.constant(0.0);
+    let cut = arena.select(reaches, signed, zero);
     term.finish(cut)
 }
 
@@ -1009,12 +974,19 @@ fn piece_row(piece: Piece) -> [f32; PIECE_ROW_COLS] {
 /// changing what the glyph draws.
 ///
 /// Powers of two, per
-/// `docs/graphics/2026-09-09-glyph-as-a-fold-execution.md` §S3's own framing
-/// — see that section, and this crate's measurements in
-/// `docs/BACKLOG.md`, for the trade against a coarser bucket.
+/// `docs/graphics/2026-09-09-glyph-as-a-fold-execution.md` §S3's own framing,
+/// floored at [`MIN_TRIP_BUCKET`]. Measured in
+/// `docs/results/2026-10-26-font-reuse-policy.md`: the floor puts every ASCII
+/// glyph of a monospace face in one program, and a cold warm costs ~35% less
+/// than bare powers of two (six saturations become one) at no measurable bake
+/// cost, since a padding row's term is a literal `0.0`.
 fn bucketed_trip_count(pieces: u32) -> u32 {
-    pieces.next_power_of_two()
+    pieces.next_power_of_two().max(MIN_TRIP_BUCKET)
 }
+
+/// The smallest trip count a glyph's fold is compiled at. Covers every ASCII
+/// glyph in the faces measured (at most 64 pieces), so they share one program.
+const MIN_TRIP_BUCKET: u32 = 64;
 
 /// A row that folds to the identity of [`glyph`]'s sum at every sample:
 /// **all zeros**.
@@ -1115,13 +1087,14 @@ mod tests {
     }
 
     #[test]
-    fn bucketed_trip_count_rounds_up_to_a_power_of_two() {
-        assert_eq!(bucketed_trip_count(1), 1);
-        assert_eq!(bucketed_trip_count(2), 2);
-        assert_eq!(bucketed_trip_count(3), 4);
-        assert_eq!(bucketed_trip_count(4), 4);
-        assert_eq!(bucketed_trip_count(5), 8);
-        assert_eq!(bucketed_trip_count(34), 64);
+    fn bucketed_trip_count_rounds_up_to_a_floored_power_of_two() {
+        assert_eq!(bucketed_trip_count(1), MIN_TRIP_BUCKET);
+        assert_eq!(bucketed_trip_count(MIN_TRIP_BUCKET), MIN_TRIP_BUCKET);
+        assert_eq!(
+            bucketed_trip_count(MIN_TRIP_BUCKET + 1),
+            2 * MIN_TRIP_BUCKET
+        );
+        assert_eq!(bucketed_trip_count(262), 512);
     }
 
     /// A [`padding_row`] changes no bit of the fold. Baking the signed area

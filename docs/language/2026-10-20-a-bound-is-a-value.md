@@ -29,7 +29,7 @@ The rulings, quoted and not re-argued (JP, 2026-10-17 to 2026-10-20):
 
 A value's binding time follows its variance. A fold's follows its syntax: a literal, a
 `const N: usize` that rustc evaluates in a `const` block (`StructuralRange` in
-`pixelflow-compiler/src/sema.rs`, `instantiated_range` in `pixelflow-compiler/src/emit.rs`),
+`pixelflow-compiler/src/sema/consts.rs`, `instantiated_range` in `pixelflow-compiler/src/emit/arena.rs`),
 and the `u32` ends stored in the `Fold` node (`pixelflow-ir/src/fold.rs:289-315`). So a
 count known per call is forced to be known per compile, and every count a program meets
 is a program of its own. The fix: a fold's bounds are operands, placed by the machinery
@@ -519,7 +519,7 @@ is `cargo run -p pixelflow-codegen --example byte_probe`, parent against head, u
 `library.rs`, `lib.rs` and `intent.md`; in search, `fold_rules.rs`, `egraph/node.rs`,
 `graph.rs`, `graph/columns.rs`, `insert.rs`, `extract.rs`, `shift.rs`, `template.rs`,
 `witness.rs`, `math/algebra.rs`, `math/fusion.rs`, `math/trig.rs`, `nnue/mod.rs`; in
-codegen, `select.rs`, `program/lower.rs`, `program/mod.rs`; the compiler's `emit.rs`,
+codegen, `select.rs`, `program/lower.rs`, `program/mod.rs`; the compiler's `emit/arena.rs`,
 `lower.rs`, `sema.rs`; pipeline corpus and training formats and three bins; graphics
 `cell_grid.rs`, `packed.rs`, `test_support.rs`; and the docs `CLAUDE.md:62-72`,
 `DENOTATION.md:443-452`, the-language-is-kernel `:175-181`, ontology `:560-568`, `:586-598` and
@@ -696,7 +696,7 @@ A5's deletion, which removes code #1427 only re-scopes.
 - **A5. `<const N: usize>` is deleted**, and with it §3.4's structural path, which it was
   the only producer of. No production user: tests (`kernel_typed_parameters.rs`,
   `rustc_is_the_oracle.rs`, `items_block.rs`, `binding_times.rs`, and the `parser.rs`,
-  `sema.rs`, `lower.rs` and `emit.rs` unit tests) and docs rewritten. It comes before A6
+  `sema/consts.rs`, `lower/walk.rs` and `emit/arena.rs` unit tests) and docs rewritten. It comes before A6
   because the obvious lowering of a structural bound, a `Param` leaf, is `Variance::ALL`
   (`variance.rs`'s `Param` arm) and L3 refuses it.
   **Done:** `kernel!` refuses a generic on any `fn` at parse, a `const` one naming §1.2; the
