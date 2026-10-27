@@ -488,9 +488,6 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
                 "hash_cons: Ref({k:?}) names a kernel interned in this process; \
                  corpus arenas are self-contained, so expand_refs first"
             ),
-            ExprNode::Write { .. } => {
-                panic!("hash_cons: a Write in a corpus arena — corpus arenas are pre-legalize")
-            }
             ExprNode::Reduce { lo, hi, body, .. } => {
                 let body = ExprId(m(body, &map));
                 let header = arena.fold_header(id);

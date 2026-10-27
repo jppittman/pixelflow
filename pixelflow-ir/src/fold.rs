@@ -62,7 +62,7 @@ impl Monoid {
     pub const ALL: Self = Self(OpKind::BitAnd);
     /// Sequencing, the **unit monoid**: combine is "then", identity is
     /// nothing. The algebra a lattice's folds are over — rows, batches and
-    /// lanes wrapped around a [`Write`](crate::arena::ExprNode::Write)
+    /// lanes wrapped around a store
     /// (docs/archive/plans/2026-09-16-collapse-is-a-fold.md §2.4). A fold over it
     /// goes through the fold machinery unchanged; what its combine emits is
     /// no bytes, and the accumulator it would seed with

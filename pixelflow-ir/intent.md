@@ -32,9 +32,9 @@ except for the process-global store a `Ref` names into.
 - No optimization of an open term: a `Dwrt`, a `Ref` and a fold survive
   construction unchanged, so the chain rule holds under a warp and a fold's
   shape is extraction's to choose.
-- No schedule: the lattice's traversal is the backend's. `collapse` and `pack`
-  moved to `pixelflow-codegen`; `legalize_front`/`legalize_back` surround them.
-  `Write` and `Seq` remain here and move out (DENOTATION §7; schedule note §1).
+- No schedule: the lattice's traversal is the backend's (`pixelflow-codegen`
+  writes the loops; `ExprNode::Write` is gone). `OpKind::Seq`/`Monoid::SEQ`
+  remain, the unit monoid those loops are over (DENOTATION §7).
 - No `std` outside `store`.
 
 ## Contract

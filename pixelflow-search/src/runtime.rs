@@ -2403,8 +2403,7 @@ pub(crate) mod production_telemetry {
                 other @ (ExprNode::Param(_)
                 | ExprNode::Nary(..)
                 | ExprNode::Ref(_)
-                | ExprNode::Apply(..)
-                | ExprNode::Write { .. }) => {
+                | ExprNode::Apply(..)) => {
                     panic!("extracted arena contains {other:?}")
                 }
             };

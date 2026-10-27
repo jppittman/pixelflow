@@ -241,14 +241,6 @@ fn copy_node(
         ExprNode::Reduce { fold, lo, hi, body } => {
             arena.push_reduce(*fold, lo.map(m), hi.map(m), m(*body))
         }
-        // The binders are metadata, copied as a fold's are; the value is
-        // the one child.
-        ExprNode::Write {
-            row,
-            col,
-            lane,
-            value,
-        } => arena.push_write(*row, *col, *lane, m(*value)),
     }
 }
 
@@ -752,8 +744,6 @@ fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
         ExprNode::Nary(_, _) => {}
         // No rule: `diff_node` raises the error for the fold itself.
         ExprNode::Reduce { .. } => {}
-        // An effect has no derivative; `diff_node` refuses it.
-        ExprNode::Write { .. } => {}
     }
 }
 
@@ -999,9 +989,6 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
         // this lowering is a *fallback*; the place for it is the rule set,
         // where the e-graph can also decline it.
         ExprNode::Reduce { .. } => Err("lower_dwrt: no derivative rule for a bounded fold"),
-        // A store is an effect, not a function of the coordinates; and
-        // `lower_dwrt` runs before the passes that build one.
-        ExprNode::Write { .. } => Err("lower_dwrt: no derivative of a store"),
     }
 }
 
