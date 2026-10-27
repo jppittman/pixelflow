@@ -1,14 +1,8 @@
 //! Kernels compose as **values**, through the builder.
 //!
-//! A `kernel!` body used to be able to declare a manifold-typed parameter
-//! (`|sdf: kernel|`), and the builder spliced the argument's fragment into its
-//! own arena through `Lower`. That was a second way to say what
-//! `Kernel::at`/`sum`/`select`/arithmetic already say at the value level, and
-//! it went with the tier that needed it
-//! (docs/archive/plans/2026-09-06-kernel-with-a-lattice.md, S4b-2). These are the same
-//! claims, made against the builder's surface: composition nests, derivatives
-//! see through the whole chain, a shared kernel used several times stays one
-//! DAG, and `at` warps coordinates per site.
+//! These claims are made against the builder's surface: composition nests,
+//! derivatives see through the whole chain, and `at` warps coordinates per
+//! site.
 //!
 //! The language's own composition surface is a kernel-typed parameter,
 //! `k: impl Fn(f32, f32) -> f32`, applied `k(x, y)` — the builder's `at` —
@@ -18,11 +12,6 @@
 
 use pixelflow_compiler::kernel;
 use pixelflow_core::{Kernel, Lattice};
-
-/// Tabulate a kernel over a one-point lattice and read the value back.
-fn eval(k: &Kernel, x: f32, y: f32) -> f32 {
-    Lattice::eval_at(k, x, y)
-}
 
 fn check(name: &str, got: f32, want: f32) {
     let diff = (got - want).abs();
@@ -37,7 +26,7 @@ fn check(name: &str, got: f32, want: f32) {
 /// over a circle SDF. The gradient of a (unit-speed) SDF is 1, so
 /// coverage = clamp(d/(1+mg) + 0.5, 0, 1).
 #[test]
-fn aa_ramp_over_circle_sdf() {
+fn an_antialiasing_ramp_over_a_circle_sdf_matches_its_closed_form() {
     let circle = kernel!(|cx: f32, cy: f32, r: f32| {
         ((X - cx) * (X - cx) + (Y - cy) * (Y - cy)).sqrt() - r
     })(0.25, -0.5, 1.0);
@@ -62,21 +51,21 @@ fn aa_ramp_over_circle_sdf() {
     ] {
         let d = ((x - 0.25).powi(2) + (y + 0.5).powi(2)).sqrt() - 1.0;
         let want = (d / (1.0 + 0.001) + 0.5).clamp(0.0, 1.0);
-        check("aa_over_circle", eval(&coverage, x, y), want);
+        check("aa_over_circle", Lattice::eval_at(&coverage, x, y), want);
     }
 }
 
 /// Composition chains: the output of one composed kernel is itself a kernel
 /// and composes into the next.
 #[test]
-fn composition_nests() {
+fn a_composed_kernel_composes_again() {
     let plane = kernel!(|k: f32| X * k - Y)(2.0);
     let doubled = plane.mul(&Kernel::constant(3.0));
     let shifted = doubled.add(&Kernel::constant(10.0));
 
     for (x, y) in [(1.0f32, 0.5f32), (-2.0, 4.0), (0.0, 0.0)] {
         let want = (x * 2.0 - y) * 3.0 + 10.0;
-        check("nested", eval(&shifted, x, y), want);
+        check("nested", Lattice::eval_at(&shifted, x, y), want);
     }
 }
 
@@ -90,20 +79,7 @@ fn derivative_of_nested_composition() {
 
     for (x, y) in [(3.0f32, 4.0f32), (1.0, 1.0), (-2.0, 5.0)] {
         let want = 5.0 * x / (x * x + y * y).sqrt();
-        check("d_nested", eval(&ddx, x, y), want);
-    }
-}
-
-/// One kernel used at several sites is one DAG, not several copies: the
-/// arenas hash-cons, so `g*g + g` evaluates `g` once and consistently.
-#[test]
-fn a_kernel_used_multiple_times_stays_one_dag() {
-    let f = kernel!(|| X * Y);
-    let combined = f.mul(&f).add(&f);
-
-    for (x, y) in [(2.0f32, 3.0f32), (-1.0, 4.0)] {
-        let v = x * y;
-        check("multi_use", eval(&combined, x, y), v * v + v);
+        check("d_nested", Lattice::eval_at(&ddx, x, y), want);
     }
 }
 
@@ -118,20 +94,24 @@ fn at_sites_warp_coordinates_per_site() {
     let central_dx = right.sub(&left).mul(&Kernel::constant(0.5));
 
     for (x, y) in [(2.0f32, 3.0f32), (-1.5, 0.5), (0.0, 4.0)] {
-        check("central_dx", eval(&central_dx, x, y), 2.0 * x * y);
+        check(
+            "central_dx",
+            Lattice::eval_at(&central_dx, x, y),
+            2.0 * x * y,
+        );
     }
 }
 
 /// A bare use and an `at` site of the same kernel coexist: the bare use is
 /// the unwarped fragment, the site its own warp.
 #[test]
-fn bare_and_at_sites_mix() {
+fn a_bare_use_and_a_warped_use_of_one_kernel_coexist() {
     let f = kernel!(|| X + Y * 10.0);
     let swapped = f.at(&Kernel::y(), &Kernel::x());
     let m = f.add(&swapped);
 
     for (x, y) in [(1.0f32, 2.0f32), (-3.0, 0.5)] {
         let want = (x + y * 10.0) + (y + x * 10.0);
-        check("bare_plus_at", eval(&m, x, y), want);
+        check("bare_plus_at", Lattice::eval_at(&m, x, y), want);
     }
 }

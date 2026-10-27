@@ -11,7 +11,8 @@
 //! program built with the builder are one program, and share a JIT cache
 //! entry. `kernel_raw!` keeps the lowered shape, so each comparison is the
 //! front end's word and not the optimizer's. A bound that is a value — an
-//! entry's count, an enclosing index — is `Kernel::over_values`'s.
+//! entry's count, unchanged — is `Kernel::over_values`'s; neither front end
+//! takes an enclosing index as a bound, so a user fold is rectangular.
 //!
 //! And what it is not: the syntax never unrolls. The e-graph may, when the
 //! kernel is baked (`HalveFold`), and extraction chooses whether it does; the

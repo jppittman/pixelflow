@@ -34,6 +34,7 @@ A live document is one that still decides something or owns open work. Its statu
 - [`compiler/2026-09-07-benchmark-correction.md`](compiler/2026-09-07-benchmark-correction.md) — `Plan of record`. Plan of record for real-shader benchmarking; §E re-validation items 0 and 2-6 remain unrun, and the 2026-10-15 ruling supersedes only two metrics.
 - [`compiler/2026-09-07-demand-is-a-dag-property.md`](compiler/2026-09-07-demand-is-a-dag-property.md) — `Superseded`. Demand-as-DAG-property plan, superseded by the one-conditional and kernels-evaluate-kernels plans; kept in place because BACKLOG C2 (the open '8' waist bug) cites its section 9.
 - [`compiler/2026-09-08-extraction-judge-registration.md`](compiler/2026-09-08-extraction-judge-registration.md) — `Registered`. Pre-registration for a learned per-class node scorer as the extraction DP's local objective; no run yet, §9 results empty.
+- [`compiler/2026-10-22-the-front-ends-stages-are-its-modules.md`](compiler/2026-10-22-the-front-ends-stages-are-its-modules.md) — `Plan of record`. The pixelflow-compiler front end as five modules (ast as the vocabulary; parser, sema, lower, emit as stages), each with its contract in `mod.rs`; layout and visibility only, byte-identical expansions; implementing JP's 2026-10-22 ruling that a model that exists is a module with a tight API.
 - [`research-problems/2026-10-15-the-egraph.md`](research-problems/2026-10-15-the-egraph.md) — `Draft`. The open research problem: what saturation is for when it never finishes — budget allocation, the Guide's inconclusive results, linear vs bilinear unsettled, fonts a held-out domain only.
 
 ### Codegen and the schedule
@@ -74,7 +75,12 @@ A live document is one that still decides something or owns open work. Its statu
 ## Evidence
 
 - [`results/`](results/) — recorded measurements: extraction, rewrite rules, JIT cost, actor benchmarks, the claims ledger. Point-in-time; heed each report's corrections.
-- [`bugs/`](bugs/) — defect reports and the test-quality audit series (2026-07-20 → 2026-09-07, a chain: read the newest, [`bugs/2026-09-07-test-quality-audit-followup.md`](bugs/2026-09-07-test-quality-audit-followup.md), which carries the live backlog). Still open there: [`bugs/2026-07-15-pty-fork-malloc-deadlock.md`](bugs/2026-07-15-pty-fork-malloc-deadlock.md).
+
+Defects, audit follow-ups, status, and priority live in Linear rather than in a
+checked-in bug backlog. Repository documentation records durable design and
+measured results; regression tests live beside the public behavior they
+protect. A proposed test should state an observable, documented API outcome in
+the “it should …” style instead of pinning an implementation detail.
 
 ## Archive
 

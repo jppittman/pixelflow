@@ -1125,8 +1125,8 @@ reference.
   - `core-term/Cargo.toml`;
   - `pixelflow-search/Cargo.toml`.
 - **The front end:**
-  - `ast.rs:43-48`;
+  - `ast/mod.rs:43-48`;
   - `lib.rs:68-70`;
-  - `symbol.rs:9-19`;
-  - `sema.rs:33`;
+  - `sema/mod.rs:46-58`;
+  - `sema/mod.rs:33`;
   - `emit.rs:142-151`.
