@@ -432,6 +432,12 @@ pub fn induce<I: Ir>(
                     mapped: memo.len(),
                 });
             }
+            Shape::Apply(key, ..) => {
+                return Err(TermMiss {
+                    node: format!("{key:?} (an apply; expand_refs first)"),
+                    mapped: memo.len(),
+                });
+            }
             // Nor a `Write`: an effect the legalize passes build after
             // extraction, which `insert` declines on principle.
             Shape::Write { .. } => {

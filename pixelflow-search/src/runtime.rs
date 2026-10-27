@@ -52,8 +52,9 @@
 //! 2. The context cannot change what a unit reads. A unit is **closed**: its
 //!    variance names the coordinates and nothing else, which the unit walk
 //!    asserts, so no binder of the context reaches into it. Nothing before
-//!    the link substitutes a coordinate — `Kernel::at` expands a reference at
-//!    construction, saturation substitutes binders only, and the lattice's
+//!    the link substitutes a coordinate — a reference under a warp is an
+//!    `Apply`, which is expanded before the units are walked and so is never
+//!    a unit; saturation substitutes binders only, and the lattice's
 //!    folds are built by legalization, after the link. A fold around a unit
 //!    picks its binder slot without seeing inside, so after the link an outer
 //!    fold and one inside the unit may share a slot; the inner one rebinds
@@ -378,7 +379,7 @@ impl<'a> Program<'a> {
 /// Whether `arena` holds a reference anywhere — the guard that keeps a term
 /// without one on exactly the path it always took, uncloned.
 fn holds_a_ref(arena: &ExprArena) -> bool {
-    arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_)))
+    arena.names_a_kernel()
 }
 
 /// The keys of the references reachable from `root`, in walk order, each
@@ -405,9 +406,10 @@ fn with_differentiated_refs_linked(
     arena: &ExprArena,
     root: ExprId,
 ) -> (Cow<'_, ExprArena>, ExprId) {
-    let differentiated = differentiated_refs(arena, root);
+    let (arena, root) = with_applies_expanded(arena, root);
+    let differentiated = differentiated_refs(&arena, root);
     if differentiated.is_empty() {
-        return (Cow::Borrowed(arena), root);
+        return (arena, root);
     }
     let bodies: BTreeMap<KernelKey, (ExprArena, ExprId)> = differentiated
         .into_iter()
@@ -418,9 +420,26 @@ fn with_differentiated_refs_linked(
             (key, referent.linked_parts())
         })
         .collect();
-    let mut linked = arena.clone();
+    let mut linked = arena.into_owned();
     let linked_root = pixelflow_ir::passes::link(&mut linked, root, &bodies);
     (Cow::Owned(linked), linked_root)
+}
+
+/// `arena` with every `Apply` expanded: a name read at a warp is not a unit.
+/// A unit is closed and read at its own coordinates, and the substitution an
+/// `Apply` stands for cannot cross the boundary a unit is optimized behind
+/// (Law U, step 2), so it is inlined — which is what `Kernel::at` did at
+/// construction before the choice was deferred to here
+/// (docs/language/2026-09-09-composition-is-linking.md §8). Borrowed when
+/// there is nothing to expand.
+fn with_applies_expanded(arena: &ExprArena, root: ExprId) -> (Cow<'_, ExprArena>, ExprId) {
+    let applies = arena.nodes().any(|(_, n)| matches!(n, ExprNode::Apply(..)));
+    if !applies {
+        return (Cow::Borrowed(arena), root);
+    }
+    let mut expanded = arena.clone();
+    let expanded_root = pixelflow_ir::passes::expand_applies(&mut expanded, root);
+    (Cow::Owned(expanded), expanded_root)
 }
 
 /// The keys of the references reachable from the operand of a `Dwrt`
@@ -2384,6 +2403,7 @@ pub(crate) mod production_telemetry {
                 other @ (ExprNode::Param(_)
                 | ExprNode::Nary(..)
                 | ExprNode::Ref(_)
+                | ExprNode::Apply(..)
                 | ExprNode::Write { .. }) => {
                     panic!("extracted arena contains {other:?}")
                 }
