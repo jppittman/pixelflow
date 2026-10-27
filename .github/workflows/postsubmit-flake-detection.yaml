@@ -90,6 +90,12 @@ jobs:
       #                workflow and triggers the automatic revert
       - name: Run test suite 5 times
         shell: bash
+        # proptest saves a failing case into the checkout's .proptest-regressions
+        # file and replays it first on the next run. The five iterations share
+        # one checkout, so one random failure in iteration 1 would fail 2-5 and
+        # read as consistent breakage (and trigger a revert).
+        env:
+          PROPTEST_DISABLE_FAILURE_PERSISTENCE: "true"
         run: |
           set -o pipefail
           PASSES=0
