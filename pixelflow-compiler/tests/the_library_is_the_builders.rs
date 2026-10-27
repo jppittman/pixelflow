@@ -6,9 +6,9 @@
 //! (docs/language/2026-09-25-the-language-is-kernel.md §1.1, B5).
 //!
 //! `fract`, `hypot` and `clamp` are library, not primitives; `DX`, `DY`
-//! and the Hessian family are `Dwrt` chains, one per axis. Each used to be
-//! written twice, in `kernel!`'s lowering and in `Kernel`'s method, and a
-//! copy is a future divergence (CLAUDE.md). `kernel_raw!` keeps the lowered
+//! and the Hessian family are `Dwrt` chains, one per axis. Each is written
+//! once, in `pixelflow_ir::library`; a copy is a future divergence
+//! (CLAUDE.md). `kernel_raw!` keeps the lowered
 //! shape, so each comparison is the front end's word and not the
 //! optimizer's. `fold_is_kernel_over.rs` pins the folds the same way.
 
@@ -16,28 +16,8 @@ use pixelflow_compiler::kernel_raw;
 use pixelflow_core::Kernel;
 use pixelflow_ir::key::canonical;
 
-/// Whether two kernels are one program: the same canonical key bytes, what
-/// the JIT cache keys on. The tables beside them say which argument each
-/// slot binds, and two instances of one argument are two identities.
-fn assert_same_program(written: &Kernel, built: &Kernel) {
-    let (written_arena, written_root) = written.parts();
-    let (built_arena, built_root) = built.parts();
-    assert_eq!(
-        canonical(written_arena, written_root).key,
-        canonical(built_arena, built_root).key,
-        "written: {}\nbuilt:   {}",
-        written_arena.display(written_root),
-        built_arena.display(built_root),
-    );
-}
-
-fn x() -> Kernel {
-    Kernel::x()
-}
-
-fn y() -> Kernel {
-    Kernel::y()
-}
+mod common;
+use common::{assert_same_program, x, y};
 
 fn k(value: f32) -> Kernel {
     Kernel::constant(value)

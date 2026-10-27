@@ -50,9 +50,9 @@ cannot run), `pub mod ipc` (`SharedRingBuffer::new`, `blocking_read_timeout`,
   the job runs `cargo check`, not clippy.
 - It implements the deprecated `DisplayDriver` (`display/driver.rs`), not
   `PlatformOps`; `lib.rs` holds its two `wasm_bindgen` entry points under a
-  comment saying they belong in the platform. No plan or BACKLOG item owns the
+  comment saying they belong in the platform. No plan or Linear issue owns the
   port.
 
 ## Decided in
 No plan decides this driver. Status: CLAUDE.md ("Workspace Structure"),
-`docs/BACKLOG.md` C9 (the wasm status gate). Crate: `pixelflow-runtime/intent.md`.
+Linear JP-27 (the wasm status gate). Crate: `pixelflow-runtime/intent.md`.

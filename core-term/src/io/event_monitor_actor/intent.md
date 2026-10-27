@@ -46,11 +46,11 @@ private modules with `pub(super)` actors.
 ## Behind
 - `ShutdownMode` has one variant, `Immediate`, so dropping `PtyTroupeHandle`
   loses the writer's queued bytes; the design's §3.5 specified `DrainAll`
-  (2026-10-15; no BACKLOG item).
+  (2026-10-15; no Linear issue).
 - `ParserControl::Reset` is handled and sent by nothing; supervised restart,
   its use, was declined in §5 Phase 3 (2026-10-15).
 - The app sinks are `Box<dyn PtySender>`, dispatched per send; §3.3 left an
-  `ActorHandle` as a follow-up (no BACKLOG item).
+  `ActorHandle` as a follow-up (no Linear issue).
 - `ParserControl`, `ReaderManagement`, `ParserManagement` are `pub` with no
   user outside the module; after a write error the writer latches `broken` and
   drops later writes without telling the app (2026-10-15; no plan).

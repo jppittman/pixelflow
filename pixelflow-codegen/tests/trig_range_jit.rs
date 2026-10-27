@@ -1,6 +1,6 @@
 //! `sin`/`cos`/`tan` range and domain, asserted on emitted machine code.
 //!
-//! Backlog **C1** (`docs/BACKLOG.md`, "Correctness and CI") and CLAUDE.md's
+//! CLAUDE.md's
 //! "Precision is on the table; range is not": `pixelflow-ir/tests/trig_range.rs`
 //! asserted this property through the scalar interpreter (`eval_scalar`) and
 //! was deleted with it (commit `077c1641`, "a glyph is two folds over one

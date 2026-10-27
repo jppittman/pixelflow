@@ -210,6 +210,66 @@ impl Terms for Values {
     fn binary(&mut self, op: OpKind, [a, b]: [Kernel; 2]) -> Kernel {
         a.combine(&b, op)
     }
+
+    fn ternary(&mut self, op: OpKind, [a, b, c]: [Kernel; 3]) -> Kernel {
+        a.combine3(&b, &c, op)
+    }
+}
+
+/// A term of a [`KernelBuilder`]: only meaningful to the builder that made it.
+#[derive(Clone, Copy, Debug)]
+pub struct BuiltTerm(ExprId);
+
+/// Somewhere a kernel is built node by node, in one arena.
+///
+/// `Kernel`'s own methods copy both operands' whole graph per node, so a
+/// term of a few hundred nodes built a method at a time costs the square of
+/// its size. A builder is the other way to compose: kernels are grafted in
+/// once ([`graft`](Self::graft)), the [`Terms`] vocabulary builds on top of
+/// them, and [`finish`](Self::finish) makes the kernel — carrying the
+/// tabulations the grafted kernels carried, as a composition of kernel
+/// values would.
+#[derive(Default)]
+pub struct KernelBuilder {
+    arena: ExprArena,
+    tables: BTreeMap<BufferIdentity, Arc<[f32]>>,
+}
+
+impl KernelBuilder {
+    /// `kernel` spliced into the arena.
+    pub fn graft(&mut self, kernel: &Kernel) -> BuiltTerm {
+        merge_buffer_data(&mut self.tables, &kernel.inner.buffers);
+        let (from, root) = kernel.parts();
+        BuiltTerm(self.arena.splice(from, root))
+    }
+
+    /// The kernel rooted at `root`.
+    #[must_use]
+    pub fn finish(self, root: BuiltTerm) -> Kernel {
+        Kernel::from_parts_carrying(self.arena, root.0, self.tables)
+    }
+}
+
+impl library::sealed::Sealed for KernelBuilder {}
+
+impl Terms for KernelBuilder {
+    type Term = BuiltTerm;
+
+    fn constant(&mut self, value: f32) -> BuiltTerm {
+        BuiltTerm(self.arena.constant(value))
+    }
+
+    fn unary(&mut self, op: OpKind, operand: BuiltTerm) -> BuiltTerm {
+        BuiltTerm(self.arena.unary(op, operand.0))
+    }
+
+    fn binary(&mut self, op: OpKind, [a, b]: [BuiltTerm; 2]) -> BuiltTerm {
+        BuiltTerm(self.arena.binary(op, [a.0, b.0]))
+    }
+
+    fn ternary(&mut self, op: OpKind, [a, b, c]: [BuiltTerm; 3]) -> BuiltTerm {
+        BuiltTerm(self.arena.ternary(op, [a.0, b.0, c.0]))
+    }
 }
 
 impl Kernel {
@@ -329,7 +389,16 @@ impl Kernel {
     /// thing that becomes machine code.
     #[must_use]
     pub fn from_parts(arena: ExprArena, root: ExprId) -> Self {
-        let kernel = Self::adopt(arena, root, BTreeMap::new());
+        Self::from_parts_carrying(arena, root, BTreeMap::new())
+    }
+
+    /// [`Kernel::from_parts`], carrying `buffers`.
+    fn from_parts_carrying(
+        arena: ExprArena,
+        root: ExprId,
+        buffers: BTreeMap<BufferIdentity, Arc<[f32]>>,
+    ) -> Self {
+        let kernel = Self::adopt(arena, root, buffers);
         let entry = kernel.root();
         assert!(
             entry.retired_axis().is_none(),
@@ -713,7 +782,7 @@ impl Kernel {
     /// repeated index in nested folds is a genuine contraction rather than an
     /// accident. It is not a guarantee that the index stays there: a closure
     /// can keep a clone of it, and a later fold that reclaims its placeholder
-    /// captures it, which no check sees (docs/BACKLOG.md C10). An index that
+    /// captures it, which no check sees (Linear JP-8). An index that
     /// has escaped and is not captured is open, and `ExprArena::free_index`
     /// says so. `range` is the literal spelling of a known
     /// range; a bound that is a value is [`Kernel::over_values`]'s. Either way
@@ -797,7 +866,7 @@ impl Kernel {
     /// to wrap and a bound that is no count gives `0` (`FactorFold`'s doc).
     /// Annihilation is one of the algebraic rules unsound at NaN: cancellation
     /// and inverse annihilation drop a fold from an enclosing expression the
-    /// same way (BACKLOG E9).
+    /// same way (Linear JP-12).
     ///
     /// Constness is discovered, not declared: a bound that is a constant naming
     /// a count is the fold's data, so `over_values(⊕, 0, 4, f)` is
@@ -1377,8 +1446,7 @@ mod tests {
     /// meets it in `FoldHeader::new`, whose `KnownRange::new` panics with the
     /// message pinned here; `kernel!` asks `admits` while lowering a literal
     /// range, and refuses in its own words before any header is built. Before,
-    /// `kernel!` refused and this summed the wrong terms without a word
-    /// (docs/BACKLOG.md, C8).
+    /// `kernel!` refused and this summed the wrong terms without a word.
     #[test]
     #[should_panic(expected = "ends at most at 16777216 (2^24)")]
     fn a_fold_past_the_exact_bound_is_refused_by_the_builder_too() {

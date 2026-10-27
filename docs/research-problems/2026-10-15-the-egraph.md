@@ -99,7 +99,7 @@ expressions, the unguided batched algorithm, 2026-08-30) 91.1% of recorded appli
 zero node/edge delta and 90.4% of scored candidates committed nothing
 (`docs/results/2026-08-30-guide-scope-saturation-delta.md`, L030, NEVER TESTED ON REAL). The
 mechanism named there is commutativity, associativity and involution rules re-matching their
-own output. Dirty tracking (BACKLOG E4) skips clean classes but not an already-resolved
+own output. Dirty tracking (Linear JP-18) skips clean classes but not an already-resolved
 (rule, class content) pair. The zero-growth share of the 502 k production applications is
 unmeasured.
 
@@ -299,7 +299,7 @@ often a mask is true (`extract.rs:1646-1670`); `If` frequency is part of this pr
 
 Cost: on the font programs extraction is 21.6% of the cold optimize and 19.2% of the compile
 path, of which `ReachSets::union_below` alone is 13.4% of the optimize (profile sections 3.3,
-5; BACKLOG E3, reach sets are quadratic). These figures predate db126b77.
+5; Linear JP-18, reach sets are quadratic). These figures predate db126b77.
 
 **There are two cost columns and they disagree.** Flat `dag_cost` prices every node once; the
 evals-weighted objective weights each node by how often it is evaluated at the lattice.
@@ -326,7 +326,7 @@ so the objection holds only if extraction is to choose schedules. (iii) L088 ret
 model does 95% of the work". A different learned object, a per-class scorer against a
 uniform-random-among-argmin null, is registered (`docs/compiler/2026-09-08-extraction-judge-registration.md`)
 and has not been run: its results section is empty. Whether any non-additive structure is
-left in extraction (fold unrolled vs loop, BACKLOG E6) is open.
+left in extraction (fold unrolled vs loop, Linear JP-15) is open.
 
 ## 6. Problem 4: matching cost (engineering, not research)
 
@@ -365,7 +365,7 @@ change and needs section 7.
 4. **A corpus admitted by two criteria.** Correctness, by an oracle that is not a same-form
    check (`libm`, FreeType coverage, range bounds); the deleted quarantine compared the JIT with
    a scalar interpreter that ran the same expansion, and CLAUDE.md "Precision is on the table;
-   range is not" records why that is blind (BACKLOG C4). And representativeness: the structural
+   range is not" records why that is blind (Linear JP-29). And representativeness: the structural
    columns of benchmark correction section C (select density, sharing, op mix) within the
    shipped kernels' range.
 5. **Held-out families**, split by generator or shipped family, never by expression:

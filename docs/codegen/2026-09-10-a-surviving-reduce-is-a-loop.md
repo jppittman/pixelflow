@@ -22,7 +22,7 @@ Compiling one glyph at 32 px takes **2.1 s**, and 99.8% of a bake is compile.
 The reason is not that any pass is slow: it is that the emitter is handed
 **34,993 straight-line instructions for one glyph**.
 
-Where they come from, measured (`docs/BACKLOG.md`, X1):
+Where they come from, measured (`docs/results/2026-09-10-glyph-bake-hump.md`):
 
 - a glyph is a fold over N pieces with a ~250-node body;
 - `passes::expand_reduce` unrolls it **unconditionally** into N copies;
@@ -474,7 +474,7 @@ Measured over a 95-glyph tile-16 atlas (`pixelflow-pipeline`'s
 | `'@'` alone | 655,866 B | **478,404 B** | −27% |
 | `'@'` nodes | 7,666 | **2,424** | −68% |
 
-(Both columns measured on the same host in one sitting. BACKLOG's older
+(Both columns measured on the same host in one sitting. The older
 `9643f3b` reading of 3,704 ms for emit was a different machine; the ratio is
 what transfers, not the absolute.)
 
