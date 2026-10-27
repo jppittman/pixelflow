@@ -70,10 +70,9 @@ does not restate it; the Contract section points and lists.
 
 Every crate in the workspace and every `mod.rs` directory under `src/` gets
 one; `tests/support` and `tests/common` directories do not. A flat file that
-offers crate items with no `mod.rs` above it (`pixelflow-ir/src/*.rs`,
-`pixelflow-compiler/src/*.rs`) is a module with no contract yet, as the
-behavioral-contracts skill says; its intent lives in the crate's file until
-it becomes a directory.
+offers crate items with no `mod.rs` above it (`pixelflow-ir/src/*.rs`) is a
+module with no contract yet, as the behavioral-contracts skill says; its
+intent lives in the crate's file until it becomes a directory.
 
 ## 3. The personas fold in
 
