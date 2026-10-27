@@ -397,8 +397,9 @@ tabulated lowering at construction, where nothing downstream can revisit it.
 `pixelflow-pipeline/examples/ref_reuse_cost.rs` composes `K` copies of one
 identical unit (an 8-trip fold with a `sqrt`) at distinct offsets, joined by
 `min` — §3's case for L4 — and collapses a 128×128 frame. Every copy is
-inlined, because `Kernel::at` expands a reference at construction (§8); a
-copy at an offset cannot stay a name until `Apply` exists.
+inlined. When this was measured `Kernel::at` expanded a reference at
+construction; since JP-110 each copy survives construction as an `Apply`
+(§8), but expand is its only lowering, so the compile below is unchanged.
 
 | copies | linked nodes | code bytes | collapse µs |
 |---|---|---|---|
@@ -424,7 +425,8 @@ cache hits and are noise at this size). So:
 - **The prerequisite is `Apply` (§8), not the call.** Without it the
   comparison cannot be built: the only composition that keeps a name is one
   at the *same* coordinates, which `expand_refs`' per-key sharing already
-  collapses to one node.
+  collapses to one node. (JP-110 has since built the node; the call and
+  tabulate lowerings it would choose between remain open.)
 
 No cost-model change follows from this. The pricing question that does —
 how a surviving unit's cost ranks when symbolic in uniforms — is JP-14's
