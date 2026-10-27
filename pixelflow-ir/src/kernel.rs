@@ -971,7 +971,7 @@ impl Kernel {
                 .map(|_| ())
                 .ok_or(BoundRefusal::BoundOutOfDomain { end, literal: real }),
             ExprData::Param(_) | ExprData::Buffer(_) => Err(BoundRefusal::BoundNotANumber { end }),
-            ExprData::Op(_) | ExprData::Reduce(_) | ExprData::Ref(_) => {
+            ExprData::Op(_) | ExprData::Reduce(_) | ExprData::Ref(_) | ExprData::Apply(_) => {
                 Err(BoundRefusal::BoundArithmetic { end })
             }
         }
@@ -1027,20 +1027,18 @@ impl Kernel {
     /// substitution: it is already the same value everywhere.
     #[must_use]
     pub fn at(&self, cx: &Kernel, cy: &Kernel) -> Self {
-        // A warp substitutes the receiver's *coordinate* variables, and a
-        // `Ref` is opaque to substitution — it has no `Var` to rewrite here,
-        // only a name — so leaving one in place would sample the referent at
-        // the outer coordinates and produce plausible, wrong pixels. Expand
-        // first. Identity (a clone) when there is no reference to expand;
-        // when there is, this is the static-linking direction taken, which
-        // is the only direction that exists yet.
-        let linked = self.linked();
+        // A warp substitutes the receiver's *coordinate* variables. A `Ref`
+        // has none to rewrite — only a name — so the substitution carries
+        // it through the warp as an `Apply` of that name, which denotes the
+        // composite without expanding it: the choice to expand, call, or
+        // tabulate is a later pass's, not this constructor's
+        // (docs/language/2026-09-09-composition-is-linking.md §8).
         let mut b = Builder::new();
-        let mut env = linked.inner.env.clone();
+        let mut env = self.inner.env.clone();
         let x = splice(&mut b, &mut env, cx.root(), &cx.inner.env);
         let y = splice(&mut b, &mut env, cy.root(), &cy.inner.env);
-        let root = substitute_vars(&mut b, linked.root(), &[(0, x), (1, y)]);
-        let mut buffers = linked.inner.buffers.clone();
+        let root = substitute_vars(&mut b, self.root(), &[(0, x), (1, y)]);
+        let mut buffers = self.inner.buffers.clone();
         merge_buffer_data(&mut buffers, &cx.inner.buffers);
         merge_buffer_data(&mut buffers, &cy.inner.buffers);
         Self::wrap(b.finish(&[root]), env, buffers)
@@ -1092,16 +1090,16 @@ impl Kernel {
         (&self.inner.legacy.0, self.inner.legacy.1)
     }
 
-    /// [`Kernel::parts`] with every [`Ref`](ExprData::Ref) resolved to its
-    /// referent — the linker's one direction (`expand_refs`), at the arena
+    /// [`Kernel::parts`] with every [`Ref`](ExprData::Ref) and
+    /// [`Apply`](ExprData::Apply) resolved to its referent — the linker's one direction (`expand_refs`), at the arena
     /// level `parts` already returns. A consumer that walks or lowers the
     /// fragment directly instead of composing more `Kernel` (a node-count
     /// measurement, `lower_dwrt_owned`, `arena.buffers()`) wants this one: a
     /// name has no derivative and declares no buffer, so the raw fragment
-    /// `parts()` hands out is not enough for either. `Kernel::at` and
-    /// `Kernel::by_ref` link at the `Kernel` level instead
-    /// ([`linked`](Self::linked)), because they compose further; this is
-    /// the same expansion for the caller that does not.
+    /// `parts()` hands out is not enough for either. Composition does not
+    /// link — `Kernel::at` carries a name through its warp as an `Apply`
+    /// — so this is where the expansion happens, for the caller that stops
+    /// composing.
     #[must_use]
     pub fn linked_parts(&self) -> (ExprArena, ExprId) {
         let (arena, root) = self.parts();
@@ -1173,24 +1171,6 @@ impl Kernel {
             self.inner.env.clone(),
             self.inner.buffers.clone(),
         )
-    }
-
-    /// This kernel with every [`Ref`](ExprData::Ref) resolved to its
-    /// referent — the static-linking direction of `Ref(k) ⟷ body(k)`, and
-    /// the only direction that exists yet.
-    ///
-    /// A cheap clone when there is no reference to expand, which is the
-    /// common case; the scan is over this kernel's own nodes, not its
-    /// referents'.
-    #[must_use]
-    fn linked(&self) -> Self {
-        if !self.dag().iter().any(|n| matches!(*n, ExprData::Ref(_))) {
-            return self.clone();
-        }
-        let (arena, root) = self.parts();
-        let (expanded, expanded_root) = crate::passes::expand_refs_owned(arena, root);
-        let (rooted, env) = from_arena(&expanded, expanded_root);
-        Self::wrap(rooted, env, self.inner.buffers.clone())
     }
 
     // ────────────────────── bound-memory link ──────────────────────
@@ -1772,7 +1752,8 @@ mod tests {
 
     /// At the sample the term is spliced as it stands, so a name in it
     /// stays a name — the reference a glyph's unit is held by (O1 of the
-    /// plan) survives being summed.
+    /// plan) survives being summed. Under a warp it stays a name too: the
+    /// `Apply` of that name, not its body.
     #[cfg(feature = "std")]
     #[test]
     fn at_the_sample_a_name_stays_a_name() {
@@ -1792,10 +1773,101 @@ mod tests {
         });
         let (arena, root) = moved.parts();
         assert!(
-            !arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))),
-            "under a warp the name is expanded: {}",
+            matches!(arena.node(root), ExprNode::Apply(..)),
+            "under a warp the name is applied, not expanded: {}",
             arena.display(root)
         );
+    }
+
+    /// `Ref(k).at(cx, cy)` names the composite and expands to what `k.at`
+    /// builds: the choice to expand is a pass's, and it agrees with the
+    /// constructor that used to make it
+    /// (docs/language/2026-09-09-composition-is-linking.md §8).
+    #[cfg(feature = "std")]
+    #[test]
+    fn at_names_the_composite_and_expansion_agrees_with_inlining() {
+        let body = Kernel::x().mul(&Kernel::constant(3.0)).add(&Kernel::y());
+        let (cx, cy) = (Kernel::y().add(&Kernel::constant(1.0)), Kernel::x());
+        let named = body.by_ref().at(&cx, &cy);
+        let (arena, root) = named.parts();
+        assert!(
+            matches!(arena.node(root), ExprNode::Apply(key, ..) if key == crate::store::KernelStore::intern(&body)),
+            "{}",
+            arena.display(root)
+        );
+        let inlined = body.at(&cx, &cy);
+        let (want, want_root) = inlined.parts();
+        let (got, got_root) = named.linked_parts();
+        assert!(
+            got.subtree_eq(got_root, want, want_root),
+            "expanded {} but inlining gives {}",
+            got.display(got_root),
+            want.display(want_root)
+        );
+    }
+
+    /// Warps compose: a warp of an `Apply` is an `Apply` at the composed
+    /// warp, still unexpanded, and expands to the inlined double warp.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_warp_of_an_apply_is_an_apply_at_the_composed_warp() {
+        let body = Kernel::x().mul(&Kernel::y());
+        let first = (Kernel::x().add(&Kernel::constant(2.0)), Kernel::y());
+        let second = (Kernel::y(), Kernel::x().mul(&Kernel::constant(0.5)));
+        let named = body
+            .by_ref()
+            .at(&first.0, &first.1)
+            .at(&second.0, &second.1);
+        let (arena, root) = named.parts();
+        assert!(matches!(arena.node(root), ExprNode::Apply(..)));
+        let inlined = body.at(&first.0, &first.1).at(&second.0, &second.1);
+        let (want, want_root) = inlined.parts();
+        let (got, got_root) = named.linked_parts();
+        assert!(got.subtree_eq(got_root, want, want_root));
+    }
+
+    /// `Apply(k, X, Y)` is `Ref(k)`: the identity warp is one node.
+    #[cfg(feature = "std")]
+    #[test]
+    fn the_identity_warp_is_the_reference() {
+        let named = Kernel::x().add(&Kernel::y()).by_ref();
+        let same = named.at(&Kernel::x(), &Kernel::y());
+        let (arena, root) = same.parts();
+        assert!(matches!(arena.node(root), ExprNode::Ref(_)));
+    }
+
+    /// Warps that compose to the identity give the bare name back: the swap
+    /// applied twice is `Ref(k)`, not `Apply(k, X, Y)` — one meaning, one node.
+    #[cfg(feature = "std")]
+    #[test]
+    fn warps_composing_to_the_identity_are_the_reference() {
+        let named = Kernel::x().sub(&Kernel::y()).by_ref();
+        let swap = |k: &Kernel| k.at(&Kernel::y(), &Kernel::x());
+        let once = swap(&named);
+        let (arena, root) = once.parts();
+        assert!(matches!(arena.node(root), ExprNode::Apply(..)));
+        let twice = swap(&once);
+        let (arena, root) = twice.parts();
+        assert!(
+            matches!(arena.node(root), ExprNode::Ref(_)),
+            "{}",
+            arena.display(root)
+        );
+    }
+
+    /// A name inside a composition is carried through the warp as well:
+    /// `(Ref k + X).at(cx, cy)` is `Apply(k, cx, cy) + cx`.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_name_inside_a_term_is_warped_with_the_term() {
+        let body = Kernel::x().mul(&Kernel::constant(4.0));
+        let term = body.by_ref().add(&Kernel::x());
+        let (cx, cy) = (Kernel::y(), Kernel::x());
+        let warped = term.at(&cx, &cy);
+        let inlined = body.add(&Kernel::x()).at(&cx, &cy);
+        let (want, want_root) = inlined.parts();
+        let (got, got_root) = warped.linked_parts();
+        assert!(got.subtree_eq(got_root, want, want_root));
     }
 
     /// The arena's own declarations first, then each argument's in its

@@ -116,7 +116,7 @@ fn expr_to_egraph(arena: &ExprArena, id: ExprId, egraph: &mut EGraph) -> crate::
     match arena.node(id) {
         ExprNode::Var(idx) => egraph.add(ENode::Var(idx)),
         ExprNode::Const(val) => egraph.add(ENode::Const(val)),
-        ExprNode::Ref(k) => panic!("Ref({k:?}) reached the pict rewrite tests"),
+        ExprNode::Ref(k) | ExprNode::Apply(k, ..) => panic!("{k:?} reached the pict rewrite tests"),
         ExprNode::Reduce { .. } => panic!("a bounded fold reached the pict rewrite tests"),
         ExprNode::Write { .. } => panic!("a Write reached the pict rewrite tests"),
         ExprNode::Unary(kind, a) => {

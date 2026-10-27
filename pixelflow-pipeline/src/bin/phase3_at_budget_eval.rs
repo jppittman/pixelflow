@@ -435,7 +435,8 @@ fn non_leaf_op(node: &ExprNode) -> Option<OpKind> {
         | ExprNode::Param(_)
         | ExprNode::Buffer(_)
         | ExprNode::Uniform(_)
-        | ExprNode::Ref(_) => None,
+        | ExprNode::Ref(_)
+        | ExprNode::Apply(..) => None,
         ExprNode::Unary(op, _)
         | ExprNode::Binary(op, _, _)
         | ExprNode::Ternary(op, _, _, _)
