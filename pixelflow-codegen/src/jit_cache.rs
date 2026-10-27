@@ -526,32 +526,22 @@ mod tests {
 
     /// A table naming an instance the graph never reads — what `Kernel::at`
     /// leaves behind for every axis the receiver does not read — must link.
-    /// The link omits it; the relink drops it with the garbage. Forced down
-    /// the optimizer's bail path (`RawGather` is post-lowering, so the
-    /// e-graph declines and the input arena, table and all, is what gets
-    /// linked).
+    /// The link omits it; the relink drops it with the garbage.
     #[test]
-    fn a_declared_but_unread_uniform_links_on_the_bail_path() {
+    fn a_declared_but_unread_uniform_links() {
         let decl = |default| UniformDecl {
             id: UniformIdentity::mint(),
             default,
         };
         let (phase, scale) = (decl(0.0), decl(2.0));
         let mut a = ExprArena::new();
-        let buf = a.declare_buffer(BufferDecl {
-            id: BufferIdentity::mint(),
-            width: 4,
-            height: 1,
-        });
         // Declared and read by a node nothing reaches — the `.at` shape.
         let dead = a.declare_uniform(phase);
         let _dead_read = a.push_uniform(dead);
         let live = a.declare_uniform(scale);
         let x = a.push_var(0);
-        let b = a.push_buffer(buf);
-        let g = a.push_binary(OpKind::RawGather, b, x);
         let s = a.push_uniform(live);
-        let root = a.push_binary(OpKind::Mul, g, s);
+        let root = a.push_binary(OpKind::Mul, x, s);
         let k = Kernel::from_parts(a, root);
         assert_eq!(k.uniforms().len(), 2, "the table names both");
 
@@ -561,6 +551,6 @@ mod tests {
             [scale],
             "the link holds what the graph reads"
         );
-        assert_eq!(linked.buffers.len(), 1);
+        assert!(linked.buffers.is_empty());
     }
 }
