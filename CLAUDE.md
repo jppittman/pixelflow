@@ -177,7 +177,7 @@ went with the tiers that held them. A copy is a future divergence.
 - **A kernel with a lattice is the evaluation API**: `Kernel` describes, `Manifold::compile` specializes it at a shape, `Lattice::collapse` tabulates it. There is no per-batch entry and no interpreter.
 - **SIMD as algebra**: users write equations; the compiler owns the loop nest, the hoisting, the pack and the register allocation, and emits the assembly. Lane width is never in the vocabulary.
 - **The Fixed Observer**: Camera is at origin. Movement is achieved by warping coordinate space.
-- **The language is a DAG**: the fold is its one binder, and no fold's bound is a function of a coordinate (X, Y) or of a lattice binder. A bound is a value placed by its variance: a literal is the fold's data, which extraction may unroll; a per-call count is a uniform, computed once per call, so one program serves every count; a count is an integer in `0..=2²⁴`, and a fold with a bound that is not one is NaN, up to the optimizer's rules unsound at NaN (BACKLOG E9) (docs/language/2026-10-20-a-bound-is-a-value.md).
+- **The language is a DAG**: the fold is its one binder, and no fold's bound is a function of a coordinate (X, Y) or of a lattice binder. A bound is a value placed by its variance: a literal is the fold's data, which extraction may unroll; a per-call count is a uniform, computed once per call, so one program serves every count; a count is an integer in `0..=2²⁴`, and a fold with a bound that is not one is NaN, up to the optimizer's rules unsound at NaN (Linear JP-12) (docs/language/2026-10-20-a-bound-is-a-value.md).
 - **Zero allocations** - No per-frame heap allocation (ping-pong buffer strategy).
 - **Platform on main thread** - Especially macOS Cocoa (Apple requirement).
 
@@ -246,7 +246,7 @@ Control creates backpressure by timing out senders who are too aggressive. If th
 ```
 Source → Parser → Sema → Arena lowering → Optimize → Rust TokenStream
             ↓                                 ↓
-       Symbol Table                E-graph + latency prior
+          Scopes                   E-graph + latency prior
 ```
 
 Two representations, the AST and `ExprArena`, and **optimization runs on the arena**.
@@ -452,7 +452,7 @@ docs/codegen/2026-09-22-the-isa-is-decided-at-startup.md.
   docs/language/2026-10-15-kernels-evaluate-kernels.md §1. The version before it
   bought a branch per `If` by pricing mispredicts and searched the schedule for
   contiguous arms (`emit/guards.rs`, deleted): 73% of a glyph bake to find 282
-  bytes (docs/BACKLOG.md, X1).
+  bytes (docs/results/2026-09-10-glyph-bake-hump.md).
 
   Extraction prices `If` as `cost(m) + (cost(a) + cost(b)) / 2 + cost(select)`.
   That cost chooses among equivalent forms; it never changes which batches run

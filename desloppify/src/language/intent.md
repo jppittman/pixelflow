@@ -50,7 +50,7 @@ language of a file).
 - `is_test_module` matches the text `cfg(test)` in the module's attributes
   with spaces removed, so `#[cfg(all(test, ...))]` is not recognised as a
   test module and its functions are reviewed (2026-10-15; no plan or
-  BACKLOG item names it, and no test covers it).
+  Linear issue names it, and no test covers it).
 
 ## Decided in
 `desloppify/README.md`, "Rules" ("Units are per-language tree-sitter queries

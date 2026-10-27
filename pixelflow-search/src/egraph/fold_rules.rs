@@ -511,7 +511,7 @@ pub struct EmptyFold;
 /// no fold is left for the guard `passes::legalize_back` builds to wrap, and a bound
 /// that is no count (NaN, a fraction, past 2²⁴) gives `0` where the fold as
 /// written is NaN. For a finite body the answers agree in the domain. That is
-/// the annihilation rule's edge, not this rule's (BACKLOG E9).
+/// the annihilation rule's edge, not this rule's (Linear JP-12).
 ///
 /// **Floating point.** Min and max with `Add` are exact: `fl(c + f)` is
 /// monotone in `f`, so `min_i fl(c + f_i) = fl(c + min_i f_i)` bit for bit,
@@ -2759,7 +2759,7 @@ mod production_shape_tests {
     /// `pixelflow-codegen/tests/halve_fold_jit.rs`'s device of the same name,
     /// which cannot share this one while `CostModel` has no loop price and no
     /// public materializer takes a `CostFunction`; they fold together when
-    /// that is decided. See also docs/BACKLOG.md E6.
+    /// that is decided. See also Linear JP-15.
     struct LoopsCostMore(CostModel);
 
     impl CostFunction for LoopsCostMore {

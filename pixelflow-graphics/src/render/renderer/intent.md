@@ -44,7 +44,7 @@ returns the setup handle; `RendererSetupHandle::register` returns the handle.
 ## Behind
 - `Pause`, `Resume`, `SetThreadCount` and `GetConfig` have no sender outside
   this directory (2026-10-15); the runtime fixes the count at `spawn_renderer`.
-  No plan or BACKLOG item gives them a user.
+  No plan or Linear issue gives them a user.
 - `RenderControl::Pause` is documented "stop processing Data messages"; the
   code returns the frame unrendered.
 - The adapter is an `Actor` shell over a `Transducer`, spawned by handshake

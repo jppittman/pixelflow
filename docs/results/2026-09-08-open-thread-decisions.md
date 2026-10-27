@@ -1,6 +1,6 @@
 # Decisions owed on #1207 and #1215 — 2026-09-08
 
-Companion to [2026-09-08-open-pr-triage.md](2026-09-08-open-pr-triage.md).
+Companion to the 2026-09-08 open-PR triage (deleted from the tree; see git history).
 
 That sweep closed fifteen of twenty-three review threads on #1207 and three
 of seven on #1215 by deciding them against a source in the tree, and handed

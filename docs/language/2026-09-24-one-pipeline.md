@@ -900,7 +900,7 @@ branch pins and `glyph_branches` did not move.
   721 against 933 for the best unrolled form). The DFS returned the unrolled
   term only because its cycle sentinel mispriced the loop. So whether the
   tree arm's doc (`extract.rs:2011-2015`) stops calling it a control is
-  decided by this CL's own measurement, not assumed; docs/BACKLOG.md E6
+  decided by this CL's own measurement, not assumed; Linear JP-15
   describes the tie for a loop and its unrolling in general, and for a
   table-reading body the prior already separates them.
 - The CL records every production kernel whose extraction changes.
@@ -1125,8 +1125,8 @@ reference.
   - `core-term/Cargo.toml`;
   - `pixelflow-search/Cargo.toml`.
 - **The front end:**
-  - `ast.rs:43-48`;
+  - `ast/mod.rs:43-48`;
   - `lib.rs:68-70`;
-  - `symbol.rs:9-19`;
-  - `sema.rs:33`;
+  - `sema/mod.rs:46-58`;
+  - `sema/mod.rs:33`;
   - `emit.rs:142-151`.
