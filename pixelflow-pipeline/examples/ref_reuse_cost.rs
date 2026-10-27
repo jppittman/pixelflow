@@ -1,45 +1,52 @@
-//! JP-19 (N2/N3, composition L4/L5): the "inline everything" curve that a
-//! preserved reference or a call would have to beat.
+//! JP-19 (N2/N3, composition L4/L5): what inlining an identical unit costs
+//! per copy, across unit sizes — the number a call has to undercut.
 //!
 //! ```text
 //! cargo run --release -p pixelflow-pipeline --example ref_reuse_cost
 //! ```
 //!
 //! A scene composes `K` copies of one **identical** unit (a fold with a
-//! `sqrt` in its body) at `K` distinct offsets and takes their union — the
-//! case `composition-is-linking` §3 says L4 is for. Each offset copy
-//! survives construction as an `Apply` of the one name (§8), but expand is
-//! the only lowering `Apply` has, so every compile entry still inlines every
-//! copy. This prints what that costs, per `K`, as one TSV row:
+//! `sqrt` in its body, `trips` long) at `K` distinct offsets and takes their
+//! union — the case `composition-is-linking` §3 says L4 is for. Each copy is
+//! `unit.by_ref().at(..)`, which since JP-110 survives construction as an
+//! `Apply`; but `expand` is the only lowering `Apply` has, so every compile
+//! entry still inlines it and this measures the inline side of the choice.
+//! There is no call lowering to measure against (L5), so the call side is
+//! not a column: it is the parameter `call_ns` in the doc's break-even
+//! (`composition-is-linking` §9).
 //!
-//! `copies  linked_nodes  compile_ms  code_bytes  collapse_us`
-//!
-//! `code_bytes / copies` is the marginal bytes one more inlined copy costs;
-//! a call is only worth its ABI where that marginal cost times the copies it
-//! removes exceeds the call site's own bytes and the per-call spill.
-//! `linked_nodes` is the arena the e-graph's units are linked into, so a
-//! sub-linear column would mean sharing already happens; a linear one means
-//! it does not and a surviving `Ref` has something to save.
+//! One TSV row per `(unit, copies)`:
+//! `unit copies linked_nodes code_bytes collapse_us`, then one summary row per
+//! `unit` of the marginal cost of one more inlined copy:
+//! `unit marginal_bytes marginal_ns_per_batch`, where a batch is one
+//! `jit_vector_bytes()` of lanes. Compile milliseconds are not reported: at
+//! these sizes they are dominated by structure-keyed cache hits.
 
-use pixelflow_codegen::jit_cache;
+use pixelflow_codegen::{jit_cache, jit_vector_bytes};
 use pixelflow_core::{Kernel, Lattice, Manifold};
 use pixelflow_ir::LatticeShape;
 use std::time::Instant;
 
-/// Fold trips in the unit's body.
-const UNIT_TRIPS: u32 = 8;
-/// Copies measured. Powers of two, so a linear column is easy to read.
-const COPIES: [u32; 5] = [1, 2, 4, 8, 16];
+/// Unit sizes, as fold trips in its body (loop units: bytes stay small, time grows).
+const TRIPS: [u32; 4] = [2, 8, 32, 128];
+/// Straight-line units, as distinct terms (no fold: bytes grow with the size,
+/// the shape of a glyph-scale body).
+const TERMS: [u32; 2] = [16, 64];
+/// Copies measured at each size: one copy, and enough that the slope is the
+/// marginal copy rather than the fixed cost.
+const COPIES: [u32; 3] = [1, 4, 16];
 /// Frame the scene is collapsed over.
 const FRAME: usize = 128;
 /// Timed collapses per row; the median is reported.
 const SAMPLES: usize = 15;
 /// Horizontal / vertical spacing of the copies, in pixels.
 const PITCH: [f32; 2] = [7.0, 5.0];
+/// Bytes in an `f32` lane.
+const LANE_BYTES: usize = 4;
 
 /// The identical unit: `Σ_i sqrt((X − 0.37·i)² + Y² + 1)`.
-fn unit() -> Kernel {
-    Kernel::sum_over(UNIT_TRIPS, |i| {
+fn unit(trips: u32) -> Kernel {
+    Kernel::sum_over(trips, |i| {
         let dx = Kernel::x().sub(&i.mul(&Kernel::constant(0.37)));
         let y = Kernel::y();
         dx.mul(&dx)
@@ -49,9 +56,25 @@ fn unit() -> Kernel {
     })
 }
 
-/// `copies` instances of [`unit`] at distinct offsets, joined by `min`.
-fn scene(copies: u32) -> Kernel {
-    let unit = unit().by_ref();
+/// The straight-line unit: `Σ_j sqrt((X − 0.37·j)² + (Y − 0.11·j)² + 1)`
+/// with `j` a literal, so no two terms are equal and none can share.
+fn wide_unit(terms: u32) -> Kernel {
+    (0..terms)
+        .map(|j| {
+            let dx = Kernel::x().sub(&Kernel::constant(0.37 * j as f32));
+            let dy = Kernel::y().sub(&Kernel::constant(0.11 * j as f32));
+            dx.mul(&dx)
+                .add(&dy.mul(&dy))
+                .add(&Kernel::constant(1.0))
+                .sqrt()
+        })
+        .reduce(|a, b| a.add(&b))
+        .expect("TERMS are nonzero")
+}
+
+/// `copies` instances of `unit` at distinct offsets, joined by `min`.
+fn scene(unit: &Kernel, copies: u32) -> Kernel {
+    let unit = unit.by_ref();
     (0..copies)
         .map(|c| {
             let cx = Kernel::x().sub(&Kernel::constant(PITCH[0] * c as f32));
@@ -67,34 +90,52 @@ fn median(mut samples: Vec<u128>) -> u128 {
     samples[samples.len() / 2]
 }
 
-fn main() {
-    println!("copies\tlinked_nodes\tcompile_ms\tcode_bytes\tcollapse_us");
+/// `(code bytes, median collapse µs)` of one scene.
+fn measure(kernel: &Kernel) -> (usize, u128) {
     let extent = [FRAME as u32, FRAME as u32];
-    for copies in COPIES {
-        let kernel = scene(copies);
-        let (arena, root) = kernel.linked_parts();
-        let linked_nodes = arena.node_count_subtree(root);
+    let linked = jit_cache::compile(kernel, LatticeShape::new(extent)).expect("the scene compiles");
+    let bytes = linked.kernel.as_bytes().len();
 
-        let start = Instant::now();
-        let linked =
-            jit_cache::compile(&kernel, LatticeShape::new(extent)).expect("the scene compiles");
-        let compile_ms = start.elapsed().as_secs_f64() * 1e3;
-        let code_bytes = linked.kernel.as_bytes().len();
+    let bound = Manifold::compile(kernel, extent).bind(&[]);
+    let lattice = Lattice::frame(FRAME, FRAME);
+    std::hint::black_box(lattice.collapse(&bound)); // warm: compiles the stripe shapes
+    let times = (0..SAMPLES)
+        .map(|_| {
+            let t = Instant::now();
+            std::hint::black_box(lattice.collapse(&bound));
+            t.elapsed().as_micros()
+        })
+        .collect();
+    (bytes, median(times))
+}
 
-        let bound = Manifold::compile(&kernel, extent).bind(&[]);
-        let lattice = Lattice::frame(FRAME, FRAME);
-        std::hint::black_box(lattice.collapse(&bound)); // warm: compiles the stripe shapes
-        let times = (0..SAMPLES)
-            .map(|_| {
-                let t = Instant::now();
-                let out = lattice.collapse(&bound);
-                std::hint::black_box(&out);
-                t.elapsed().as_micros()
-            })
-            .collect();
-        println!(
-            "{copies}\t{linked_nodes}\t{compile_ms:.1}\t{code_bytes}\t{}",
-            median(times)
-        );
+fn main() {
+    let batches = (FRAME * FRAME) / (jit_vector_bytes() / LANE_BYTES);
+    println!("unit\tcopies\tlinked_nodes\tcode_bytes\tcollapse_us");
+    let mut marginals = Vec::new();
+    let units = TRIPS
+        .map(|t| (format!("loop{t}"), unit(t)))
+        .into_iter()
+        .chain(TERMS.map(|n| (format!("wide{n}"), wide_unit(n))));
+    for (trips, unit) in units {
+        let mut ends = Vec::new();
+        for copies in COPIES {
+            let kernel = scene(&unit, copies);
+            let (arena, root) = kernel.linked_parts();
+            let nodes = arena.node_count_subtree(root);
+            let (bytes, us) = measure(&kernel);
+            println!("{trips}\t{copies}\t{nodes}\t{bytes}\t{us}");
+            ends.push((copies, bytes, us));
+        }
+        let (c0, b0, u0) = ends[0];
+        let (c1, b1, u1) = ends[ends.len() - 1];
+        let extra = f64::from(c1 - c0);
+        let bytes = (b1 as f64 - b0 as f64) / extra;
+        let ns_per_batch = (u1 as f64 - u0 as f64) * 1e3 / extra / batches as f64;
+        marginals.push((trips, bytes, ns_per_batch));
+    }
+    println!("\nunit\tmarginal_bytes\tmarginal_ns_per_batch");
+    for (trips, bytes, ns) in marginals {
+        println!("{trips}\t{bytes:.0}\t{ns:.1}");
     }
 }

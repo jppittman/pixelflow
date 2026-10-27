@@ -431,3 +431,53 @@ cache hits and are noise at this size). So:
 No cost-model change follows from this. The pricing question that does —
 how a surviving unit's cost ranks when symbolic in uniforms — is JP-14's
 ruling (a-bound-is-a-value §5.1) and is not decided here.
+
+### 9.1 Across unit sizes, and the break-even (JP-19, 2026-10-27)
+
+The ruler now sweeps the unit: fold bodies (`loopN`, N trips: a loop, so bytes
+stay small and time grows) and straight-line bodies (`wideN`, N distinct
+`sqrt` terms: bytes and time both grow, the shape of a glyph-scale unit).
+Marginal cost of one more inlined copy, from the 1-copy and 16-copy scenes:
+
+| unit | bytes / copy | ns / batch / copy |
+|---|---|---|
+| loop2 | 185 | 9 |
+| loop8 | 185 | 31 |
+| loop32 | 227 | 130 |
+| loop128 | 247 | 576 |
+| wide16 | 2,505 | 79 |
+| wide64 | 10,560 | 356 |
+
+(`ns / batch` is per `jit_vector_bytes()` of lanes. The 8-trip fold above is
+unrolled, hence loop2 = loop8 in bytes.)
+
+No call lowering exists (L5), so the call side is a parameter, not a
+measurement. With `c` the call's cost per batch (frame, arguments, result, the
+spill of what the allocator holds across it — §5.2) and `s` its call-site
+bytes, K copies of a unit of `B` bytes and `T` ns per batch:
+
+- bytes saved by calling: `(K−1)·B − K·s`; positive whenever `B > s·K/(K−1)`.
+- execution lost: `c / T` per copy, relative.
+
+Reading the table with `c` of order 10 ns and `s` of order 50 bytes (stated
+assumptions, not measured):
+
+- **Loop units** gain nothing worth a call: they are ~200 bytes already,
+  within a few call sites of `s`, and `c/T` is 100% at loop2 and 2% at
+  loop128 — it is the *trip count*, not the call, that makes them slow.
+- **Straight-line units** are where a call pays: `wide64` saves ~10 KB per
+  extra copy for a `c/T` of ~3%. That is the only regime in which preserving a
+  reference changes anything measurable, and it is a code-size and
+  instruction-cache argument, not an execution one.
+- The choice is therefore a function of `B` (bytes, known after emission) and
+  `K`, not of the e-graph's cost: extraction prices time, and time does not
+  separate the two. This supports §5.2's reading that the decision is
+  codegen's (a unit's emitted size against its call-site count), after
+  extraction, rather than a rewrite.
+
+What this leaves open is `c` and `s`, which need the call lowering, and
+compile time, which this ruler does not report: an e-graph that sees `K`
+inlined copies of a `wide` unit pays for them in saturation, and a preserved
+unit saturates once (`pixelflow_search::runtime`'s units). That, not
+execution, is the likelier win and is measurable today by compiling the
+scene with its `Apply`s held as units; today they are expanded first.
