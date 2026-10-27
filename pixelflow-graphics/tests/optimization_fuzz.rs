@@ -66,6 +66,17 @@ fn approx_eq(a: f32, b: f32) -> bool {
     abs_diff / max_abs < EPSILON
 }
 
+/// Compare a product-sum against its unfused scalar reference.
+///
+/// The kernel rounds `a * b + c` once (FMA); the reference rounds twice. The
+/// two differ by the product's rounding, which is relative to the *operands*,
+/// not to a result that cancels toward zero — so the tolerance is taken against
+/// `magnitude`, the largest term summed, and a relative bound on the result
+/// alone would reject the more accurate answer.
+fn approx_eq_fused(kernel: f32, reference: f32, magnitude: f32) -> bool {
+    approx_eq(kernel, reference) || (kernel - reference).abs() <= EPSILON * magnitude
+}
+
 // ============================================================================
 // Test Cases: Each tests a specific optimization pattern
 // ============================================================================
@@ -137,7 +148,7 @@ proptest! {
         // Reference: unfused multiply-add (may differ by 1 ULP due to FMA)
         let reference = a * b + c;
 
-        prop_assert!(approx_eq(kernel_result, reference),
+        prop_assert!(approx_eq_fused(kernel_result, reference, (a * b).abs().max(c.abs())),
             "fma: kernel={} ref={}", kernel_result, reference);
     }
 
@@ -231,7 +242,7 @@ proptest! {
         let kernel_result = bake(&kernel, x, y);
         let reference = (x + y) * z - w;
 
-        prop_assert!(approx_eq(kernel_result, reference),
+        prop_assert!(approx_eq_fused(kernel_result, reference, ((x + y) * z).abs().max(w.abs())),
             "chain: kernel={} ref={}", kernel_result, reference);
     }
 
@@ -338,5 +349,22 @@ fn regression_sub_then_method() {
         "sub then floor: got {} expected {}",
         result,
         expected
+    );
+}
+
+/// `(x + y) * z - w` cancels to ~1e-5 of its operands here: the fused kernel
+/// and the twice-rounded reference differ by 1e-3 of the result, by far less of
+/// the terms. Postsubmit once rejected the kernel's (more accurate) answer.
+#[test]
+fn regression_chain_cancellation() {
+    let (x, y, z, w) = (27.088913f32, -21.732239f32, 3.0308213f32, 16.235418f32);
+    let kernel = kernel!(|z: f32, w: f32| (X + Y) * z - w)(z, w);
+
+    let kernel_result = bake(&kernel, x, y);
+    let reference = (x + y) * z - w;
+
+    assert!(
+        approx_eq_fused(kernel_result, reference, ((x + y) * z).abs().max(w.abs())),
+        "chain: kernel={kernel_result} ref={reference}"
     );
 }
