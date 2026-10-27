@@ -464,7 +464,7 @@ Decided in: `archive/plans/2026-09-02-optimizer-api.md`,
    the open bug the sort closes.
 2. **Arrow sorts on binders.** `Var`, `Uniform` and a kernel-typed parameter
    are binders of types `Real`, `Real` and `L → Real`; a `Ref` is
-   application of an arrow. BACKLOG N1–N3 in these words.
+   application of an arrow. Linear JP-22 in these words.
 3. **Predicate domains, later.** `{x : ℝ // x ≠ 0}`, `|x| < 2²⁰` for `sin`:
    an e-graph class analysis seeded from declared input domains, with
    rewrites conditional on it.

@@ -291,7 +291,7 @@
   `ExprArena::apply` (`pixelflow-ir/src/kernel.rs`) is a splice and then it.
   `Kernel::at` is the same substitution over a `Kernel`'s DAG, a second
   implementation pinned to the same program by test and recorded as debt
-  (BACKLOG N6). Built on `ExprArena::substitute_vars_with`. Pinned in
+  (Linear JP-109). Built on `ExprArena::substitute_vars_with`. Pinned in
   `pixelflow-compiler/tests/at_is_contramap.rs`. Decided in
   `2026-09-06-lattice-is-the-index.md` "The shape" and §9.2, and
   the-language-is-kernel §1.2, D5. Today the pixel-centre ½ is not a

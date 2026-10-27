@@ -147,14 +147,20 @@ use proc_macro::TokenStream;
 /// `(a..b).map(|i| e).sum()` is Σ of `e` over `i ∈ [a, b)`; `.product()`,
 /// `.fold(f32::INFINITY, f32::min)` and `.fold(f32::NEG_INFINITY, f32::max)`
 /// are Π, min and max, and `(a..b).any(|i| m)` and `.all(|i| m)` are ∃ and ∀
-/// of `bool`s. An empty range gives the monoid's identity. The bounds are
-/// literals, `usize` consts or entry count parameters, unchanged — a user fold
-/// is rectangular, so no bound is an enclosing fold's index; the index `i` is
-/// a `usize`, which a body reads only as `i as f32`:
-/// there is no arithmetic on an index and nothing to index. A fold lowers to
-/// one `Reduce`, the node `Kernel::over` builds; unrolling it is the
-/// e-graph's choice, at bake time. A closure is the body of a fold and
-/// appears nowhere else.
+/// of `bool`s. An empty range gives the monoid's identity, up to the
+/// optimizer's algebraic rules, which are not sound at NaN or infinity
+/// (Linear JP-12). Each bound is a
+/// `usize`: an integer, a `usize` const or `+ - * /` over them, known at
+/// expansion; or an entry's count parameter, `n: usize`, bound per call and
+/// unchanged. No bound is an enclosing fold's index, so a user fold is
+/// rectangular (Linear JP-7). A bound that is a name the program binds stands
+/// alone — `0..n + 1` waits for bounds typed as integers — and no bound reads
+/// `X` or `Y`. The index `i` is a `usize`,
+/// which a body reads only as `i as f32`: there is no arithmetic on an index
+/// and nothing to index. A fold lowers to one `Reduce`, the node
+/// `Kernel::over` builds, or `Kernel::over_values` for a bound that is a
+/// value; unrolling it is the e-graph's choice, at bake time.
+/// A closure is the body of a fold and appears nowhere else.
 ///
 /// `if` is the choice. `.select(a, b)` lowers to the same node; D15 of the
 /// plan removes the spelling.

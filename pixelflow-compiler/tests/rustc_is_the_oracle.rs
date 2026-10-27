@@ -804,7 +804,7 @@ fn a_per_call_count_folds_as_rustcs_does() {
 
 /// Counts at either end, and a pair that runs backwards per call: Rust's
 /// `5..2` is empty, and so is the fold at these samples (L2, which holds up to
-/// the optimizer's algebraic rules at NaN and infinity, BACKLOG E9).
+/// the optimizer's algebraic rules at NaN and infinity, Linear JP-12).
 #[test]
 fn a_range_between_counts_folds_as_rustcs_does() {
     for n in [0, 3, 8, 10] {

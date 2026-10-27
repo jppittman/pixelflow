@@ -45,7 +45,7 @@ rule implements `Rewrite`. `derivative_rules` and `fold_rules` live in `egraph/`
 ## Behind
 - Law 1 has one test for 62 rules (2026-10-15): the sweep above. `trig`,
   `power`, `exp`, `parity` and `fusion` have none, and `Rewrite` carries no
-  domain, so it is prose (`exp_rules`: "Inf/NaN inputs are UB"). No BACKLOG
+  domain, so it is prose (`exp_rules`: "Inf/NaN inputs are UB"). No Linear issue
   item tracks it; the as-if plan (2026-10-13) says what the test is.
 - Docs cite what is gone: `eval_scalar` (deleted) in `round2_rules.rs` and
   `pict_rewrite_tests.rs`, a `round2_oracle_check` and `math::oracle`. The 33

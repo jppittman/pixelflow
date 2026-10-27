@@ -48,7 +48,7 @@ and `Troupe` (`new`, `new_with_wakers`, `new_with_waker`, `exposed`, `play`).
 ## Behind
 - `troupe!` drops any stray token or punctuation it does not recognise, and
   duplicate actor names reach rustc as duplicate fields (2026-10-15; no plan
-  or BACKLOG item).
+  or Linear issue).
 - Generated `Directory::shutdown` discards each send with `let _ =`, which
   `let_underscore_must_use` denies in hand-written code.
 - The `troupe!` doc says `exposed(&self)` (code: `&mut self`) and omits

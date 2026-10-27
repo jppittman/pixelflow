@@ -191,7 +191,7 @@ What this asks of the IR, in order (proposed 2026-10-15, not yet ruled):
 2. **Arrow sorts on binders.** The arena is first-order today; arrows live in
    the Rust `Kernel<D>` wrapper. `Var`, `Uniform` and a discrete-kernel
    parameter are binders of types `Real`, `Real` and `L → Real`; a `Ref` is
-   application of an arrow. This is BACKLOG N1–N3 ("one kind of name",
+   application of an arrow. This is the open work of Linear JP-22 ("one kind of name",
    "composition is linking") stated in these words.
 3. **Predicate domains, later.** A domain that is a set with a predicate
    (`{x : ℝ // x ≠ 0}`; `|x| < 2²⁰` for `sin`) lives naturally in the e-graph's
