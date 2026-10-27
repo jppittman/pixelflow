@@ -7,10 +7,10 @@
 //!
 //! A scene composes `K` copies of one **identical** unit (a fold with a
 //! `sqrt` in its body) at `K` distinct offsets and takes their union — the
-//! case `composition-is-linking` §3 says L4 is for. Today every copy is
-//! inlined: `Kernel::at` expands a reference at construction (§8), so the
-//! offset copy cannot stay a name until an `Apply` node exists. This prints
-//! what that costs, per `K`, as one TSV row:
+//! case `composition-is-linking` §3 says L4 is for. Each offset copy
+//! survives construction as an `Apply` of the one name (§8), but expand is
+//! the only lowering `Apply` has, so every compile entry still inlines every
+//! copy. This prints what that costs, per `K`, as one TSV row:
 //!
 //! `copies  linked_nodes  compile_ms  code_bytes  collapse_us`
 //!

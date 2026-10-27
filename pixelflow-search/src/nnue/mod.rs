@@ -123,6 +123,14 @@ pub fn pattern_match_arena(
                 ExprNode::Ref(e_k) if k == e_k => {}
                 _ => return None,
             },
+            // The same name at warps that match.
+            ExprNode::Apply(k, t_x, t_y) => match arena.node(e_id) {
+                ExprNode::Apply(e_k, e_x, e_y) if k == e_k => {
+                    stack.push((e_x, t_x));
+                    stack.push((e_y, t_y));
+                }
+                _ => return None,
+            },
             // Structural match: op must match, push children onto the stack.
             ExprNode::Unary(t_op, t_a) => match arena.node(e_id) {
                 ExprNode::Unary(e_op, e_a) if e_op == t_op => {
@@ -231,8 +239,8 @@ pub fn substitute_template_arena(
                 "ExprNode::Uniform({}) in a rewrite template — uniforms are not rewritable",
                 u.0
             ),
-            ExprNode::Ref(k) => panic!(
-                "ExprNode::Ref({k:?}) in a rewrite template — a reference names a                  kernel this rewrite cannot see; expand_refs first"
+            ExprNode::Ref(k) | ExprNode::Apply(k, ..) => panic!(
+                "{k:?} in a rewrite template — a reference names a                  kernel this rewrite cannot see; expand_refs first"
             ),
             ExprNode::Reduce { .. } => panic!(
                 "a fold in a rewrite template — templates are arithmetic, and a \
@@ -878,7 +886,9 @@ impl BwdGenerator {
                 // A key names a kernel interned in *this* process, and a
                 // corpus outlives the process — same refusal `corpus.rs`
                 // makes when it serializes one.
-                Shape::Ref(k) => panic!("junkify: Ref({k:?}) in a corpus expression"),
+                Shape::Ref(k) | Shape::Apply(k, ..) => {
+                    panic!("junkify: {k:?} names a kernel in a corpus expression")
+                }
                 Shape::Reduce { fold, lo, hi, body } => {
                     let remapped = |r: ExprId| remap[r.0 as usize];
                     self.arena.embed(Shape::Reduce {
