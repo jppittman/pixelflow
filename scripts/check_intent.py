@@ -49,7 +49,7 @@ _NAMES: set[str] | None = None
 
 
 def tracked_basenames() -> set[str]:
-    """Every tracked file's basename. A doc cites `emit.rs` or
+    """Every tracked file's basename. A doc cites `lower.rs` or
     `postsubmit-flake-detection.yaml` by name as often as by path, and a
     basename that exists somewhere in the tree is enough to show the file does."""
     global _NAMES

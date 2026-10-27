@@ -7,19 +7,19 @@
 //! ```text
 //! Source (macro input)
 //!     │
-//!     ▼ Parser (parser.rs)
-//! AST (ast.rs)
+//!     ▼ Parser (parser/)
+//! AST (ast/)
 //!     │
-//!     ▼ Semantic Analysis (sema.rs)
-//! Analyzed AST + Symbol Table
+//!     ▼ Semantic Analysis (sema/)
+//! Analyzed AST
 //!     │
-//!     ▼ Arena lowering (lower.rs)
+//!     ▼ Arena lowering (lower/)
 //! ExprArena
 //!     │
 //!     ▼ `impl Optimize`  — `kernel!` saturates, `kernel_raw!` is `Identity`
 //! ExprArena
 //!     │
-//!     ▼ Emission (emit.rs)
+//!     ▼ Emission (emit/)
 //! Rust TokenStream that rebuilds a `Kernel` at load time
 //! ```
 //!
@@ -29,38 +29,32 @@
 //! then (`emit::Staged`, Phase D-a of
 //! docs/language/2026-09-25-the-language-is-kernel.md).
 //!
-//! Two representations, the surface AST and the IR. It used to be five: the
-//! optimizer ran
-//! on the *AST*, so `kernel!` went AST → e-graph → extracted DAG → back to an
-//! AST nothing had written (synthesized `let` bindings naming shared
-//! subexpressions, opaque placeholder identifiers standing in for terms the
-//! e-graph could not hold) → and only then to the arena the e-graph had
-//! already built and thrown away. Each of those boundaries is a place two
-//! stages can disagree about what the language is, and three such
-//! disagreements were found in one week — every one of them a stage accepting
-//! what a later stage refused. See
-//! docs/archive/plans/2026-09-08-macro-tier-is-arena-native.md.
+//! Two representations, the surface AST and the IR, and optimization runs on
+//! the IR. Every further representation is a boundary where two stages can
+//! disagree about what the language is, each disagreement a stage accepting
+//! what a later one refuses; so no stage re-synthesizes an AST from an
+//! optimized term. See docs/archive/plans/2026-09-08-macro-tier-is-arena-native.md.
 //!
-//! There is **one backend**, and it produces a [`Kernel`] — an arena fragment,
-//! the language's own value. Nothing is compiled at macro-expansion time and
-//! nothing is compiled at construction: a `Kernel` becomes machine code when a
-//! consumer compiles it at a lattice's shape and collapses it
-//! (`Lattice::bake`), which is the only way a kernel turns into numbers.
+//! There is **one backend**, and it produces a `pixelflow_core::Kernel` — an
+//! arena fragment, the language's own value. Nothing is compiled at
+//! macro-expansion time and nothing is compiled at construction: a `Kernel`
+//! becomes machine code when a consumer compiles it at a lattice's shape and
+//! collapses it (`Lattice::bake`), which is the only way a kernel turns into
+//! numbers.
 //!
 //! So there are two macros, and the only difference between them is the
 //! [`Optimize`] value they hand the same `expand`:
 //! [`kernel!`](macro@kernel) saturates, [`kernel_raw!`](macro@kernel_raw)
 //! passes [`Identity`]. Not optimizing is a value here, not a branch that
 //! declines to call a function, which is what that type exists to say.
-//!
-//! [`Kernel`]: pixelflow_core::Kernel
 
 mod ast;
 mod emit;
 mod lower;
 mod parser;
 mod sema;
-mod symbol;
+#[cfg(test)]
+mod tests;
 
 use pixelflow_ir::OpKind;
 use pixelflow_ir::arena::{ExprArena, ExprId, ExprNode};
@@ -68,15 +62,10 @@ use pixelflow_ir::optimize::{Identity, Optimize, Rewritten};
 use pixelflow_search::Saturate;
 use proc_macro::TokenStream;
 
-/// The plan that owns the constructs the front end refuses by phase: a
-/// refusal of one names the phase that brings it.
-pub(crate) const PLAN: &str = "docs/language/2026-09-25-the-language-is-kernel.md";
-
-/// The plan that made a fold's bound a value.
-pub(crate) const BOUND_PLAN: &str = "docs/language/2026-10-20-a-bound-is-a-value.md";
-
-/// The `kernel!` macro: the language, as a block of items or as a closure,
-/// optimized by the e-graph at macro-expansion time.
+/// The `kernel!` macro: the language, as a block of items or as a closure. An
+/// entry with no kernel-typed parameter and no `Dwrt` is
+/// saturated at macro-expansion time; any other entry is optimized when it is
+/// baked (see *Pipeline*).
 ///
 /// # The items form
 ///
@@ -106,7 +95,7 @@ pub(crate) const BOUND_PLAN: &str = "docs/language/2026-10-20-a-bound-is-a-value
 ///   `pub const` is also emitted as a host `pub const`. A constant of a
 ///   program is spelled this way, and no other.
 ///
-/// ```ignore
+/// ```no_run
 /// use pixelflow_compiler::kernel;
 /// use pixelflow_core::{Kernel, Lattice};
 ///
@@ -150,7 +139,7 @@ pub(crate) const BOUND_PLAN: &str = "docs/language/2026-10-20-a-bound-is-a-value
 /// `>=`, `==`, `!=`) gives a `bool`; `&` and `|` combine two `bool`s; an
 /// `if c { a } else { b }` chooses by one, and both arms have the same type.
 /// A `bool` where an `f32` is expected, or the reverse, is a type error at
-/// expansion: `X.select(Y, 7.0)` used to blend a number as a mask. The IR
+/// expansion: `X.select(Y, 7.0)` would blend a number as a mask. The IR
 /// keeps one lane for both; the type lives in the front end.
 ///
 /// # Folds
@@ -172,8 +161,8 @@ pub(crate) const BOUND_PLAN: &str = "docs/language/2026-10-20-a-bound-is-a-value
 /// value; unrolling it is the e-graph's choice, at bake time.
 /// A closure is the body of a fold and appears nowhere else.
 ///
-/// `if` is the choice. `.select(a, b)` still lowers to the same node this
-/// phase, and Phase B of the plan removes it.
+/// `if` is the choice. `.select(a, b)` lowers to the same node; D15 of the
+/// plan removes the spelling.
 ///
 /// A `let` binds a name, or takes a tuple apart where it is written:
 /// `let (x, y) = (X + 0.5, Y + 0.5);` binds each name to its expression, every
@@ -191,7 +180,7 @@ pub(crate) const BOUND_PLAN: &str = "docs/language/2026-10-20-a-bound-is-a-value
 ///
 /// # The closure form
 ///
-/// ```ignore
+/// ```text
 /// kernel!(|param1: f32, param2: f32, ...| expression)
 /// ```
 ///
@@ -200,12 +189,15 @@ pub(crate) const BOUND_PLAN: &str = "docs/language/2026-10-20-a-bound-is-a-value
 ///
 /// - Zero params → a `Kernel` value.
 /// - N params → a closure `move |p0: f32, ...| -> Kernel`, every parameter a
-///   uniform, as an entry's are. A count parameter, `n: usize`, is an entry's
-///   of the items form: the closure form takes `f32`s. It has no `Args`
-///   record: a program compiled from it is rebound by position,
-///   `block.set_declared([p0, ...])`.
+///   uniform, as an entry's are. It has no `Args` record: a program compiled
+///   from it is rebound by position, `block.set_declared([p0, ...])`.
 ///
-/// ```ignore
+/// The closure form takes no kernel-typed parameter: rustc refuses
+/// `impl Trait` in a closure's parameters (E0562).
+///
+/// ```no_run
+/// # use pixelflow_compiler::kernel;
+/// # use pixelflow_core::{Kernel, Lattice};
 /// let circle = kernel!(|cx: f32, cy: f32, r: f32| {
 ///     let dx = X - cx;
 ///     let dy = Y - cy;
@@ -216,10 +208,12 @@ pub(crate) const BOUND_PLAN: &str = "docs/language/2026-10-20-a-bound-is-a-value
 /// let plane = Lattice::frame(64, 64).bake(&unit_circle);
 /// ```
 ///
-/// Derivatives (`DX`/`DY`) become symbolic `Dwrt` nodes, resolved by the
-/// e-graph here when it can and by codegen otherwise. The closure form takes
-/// no kernel-typed parameter: rustc refuses `impl Trait` in a closure's
-/// parameters (E0562).
+/// The five derivative projections (`DX`, `DY`, `DXX`, `DXY`, `DYY`) lower to
+/// `Dwrt` chains (`V` is the value itself: `V(e)` is `e`, and lowers to no
+/// node) that the macro tier never resolves: a kernel carrying one is not saturated
+/// at expansion, and the runtime tier lowers it when the kernel is baked,
+/// after composition, so a `Kernel::at` warp reaches the differentiated
+/// operand (`tests/derivative_under_warp.rs`).
 ///
 /// # Kernel-typed parameters
 ///
@@ -242,7 +236,8 @@ pub(crate) const BOUND_PLAN: &str = "docs/language/2026-10-20-a-bound-is-a-value
 /// another (D4). An argument is closed and reads no table, or the call
 /// panics.
 ///
-/// ```ignore
+/// ```no_run
+/// # use pixelflow_compiler::kernel;
 /// kernel! {
 ///     pub fn sum2(a: impl Fn(f32, f32) -> f32, b: impl Fn(f32, f32) -> f32) -> f32 {
 ///         a(X, Y) + b(X, Y)
@@ -260,23 +255,21 @@ pub(crate) const BOUND_PLAN: &str = "docs/language/2026-10-20-a-bound-is-a-value
 ///
 /// # Binding times
 ///
-/// An entry's parameters are bound at one of two times (§1.4):
+/// Every value a program reads is bound at its use (§1.4):
 ///
-/// - **Uniform**: every `f32`, count and record parameter. An `f32` is one
-///   uniform, a count (`n: usize`) one holding `n as f32`, and a record one
-///   per field; the kernel an entry returns declares them in that order,
+/// - **Uniform**: every scalar and count parameter. An `f32` or `usize`
+///   count is one uniform and a record is one per field; the kernel an entry
+///   returns declares them in that order,
 ///   each with the call's value as its default, and baking it draws the
 ///   call. The value is an argument of the program, never folded into it, so
-///   every call of an entry that takes no kernel is one program: compiled
-///   once, and rebound per call from the entry's `Args` record —
-///   `<Entry in UpperCamelCase>Args`, its parameters as fields, written into
-///   a block the program made with `write_into`, which allocates nothing
-///   once the block is the caller's alone. A kernel the entry's is composed
-///   into still rebinds from it, its declarations the entry's in order
-///   beside argument-free kernels; beside other arguments the number of
-///   arguments differs, and `write_into` refuses. A count past 2²⁴ is refused where the host
-///   writes it: the host function panics, and so does `write_into`, writing
-///   nothing. A constant is a `const` item.
+///   every call of an entry is one program: compiled once, and rebound per
+///   call from the entry's `Args` record — `<Entry in UpperCamelCase>Args`,
+///   its parameters as fields, written into a block the program made with
+///   `write_into`, which allocates nothing once the block is the caller's
+///   alone. A kernel the entry's is composed into still rebinds from it, its
+///   declarations the entry's in order beside argument-free kernels; beside
+///   other arguments the count differs, and `write_into` refuses. A
+///   constant is a `const` item.
 /// - **Kernel-typed**: an argument the host passes when it calls the entry.
 ///   The composed program declares the entry's own uniforms first, in
 ///   declaration order, then each argument's, in parameter order and that
@@ -284,12 +277,7 @@ pub(crate) const BOUND_PLAN: &str = "docs/language/2026-10-20-a-bound-is-a-value
 ///   once, where it first appears. Its key is the composed term's. It has
 ///   no `Args` record: binding a composed program is O3 of the plan.
 ///
-/// A count known at expansion — a fold's bound, or `N as f32` — is built from
-/// literals and `usize` consts with `+ - * /`; one that changes per call is an
-/// entry parameter `n: usize`. Neither makes a program of its own, and no `fn`
-/// takes generics (docs/language/2026-10-20-a-bound-is-a-value.md §1.2, §3.4).
-///
-/// ```ignore
+/// ```no_run
 /// use pixelflow_compiler::kernel;
 /// use pixelflow_core::{Lattice, Manifold};
 ///
@@ -297,28 +285,26 @@ pub(crate) const BOUND_PLAN: &str = "docs/language/2026-10-20-a-bound-is-a-value
 ///     /// An axis-aligned box: a record.
 ///     pub struct Bounds { pub x0: f32, pub y0: f32, pub x1: f32, pub y1: f32 }
 ///
-///     /// How many rings.
-///     const N: usize = 4;
-///
-///     /// `N` rings about the box's corner, `fg` on `bg`.
-///     pub fn rings(b: Bounds, fg: f32, bg: f32) -> f32 {
+///     /// `count` rings about the box's corner, `fg` on `bg`.
+///     pub fn rings(count: usize, b: Bounds, fg: f32, bg: f32) -> f32 {
 ///         let dx = X - b.x0;
 ///         let dy = Y - b.y0;
 ///         let r = (dx * dx + dy * dy).sqrt();
 ///         let within = (X <= b.x1) & (Y <= b.y1);
-///         let n: f32 = (0..N).map(|i| if r < (i as f32) + 1.0 { 1.0 } else { 0.0 }).sum();
-///         if within { fg * n / (N as f32) } else { bg }
+///         let n: f32 = (0..count).map(|i| if r < (i as f32) + 1.0 { 1.0 } else { 0.0 }).sum();
+///         if within { fg * n / (count as f32) } else { bg }
 ///     }
 /// }
 ///
 /// let lattice = Lattice::frame(64, 64);
 /// let b = Bounds { x0: 8.0, y0: 8.0, x1: 40.0, y1: 40.0 };
-/// let once = lattice.bake(&rings(b, 1.0, 0.0));            // one call, baked
+/// let once = lattice.bake(&rings(4, b, 1.0, 0.0));            // one call, baked
 ///
-/// let program = Manifold::compile(&rings(b, 1.0, 0.0), lattice.extent);
+/// let program = Manifold::compile(&rings(4, b, 1.0, 0.0), lattice.extent);
 /// let mut block = program.block();
-/// RingsArgs { b, fg: 0.5, bg: 0.25 }.write_into(&mut block)?;
+/// RingsArgs { count: 4, b, fg: 0.5, bg: 0.25 }.write_into(&mut block)?;
 /// let again = lattice.collapse(&program.bind(&[]).with_uniforms(&block));
+/// # Ok::<(), pixelflow_core::ArityMismatch>(())
 /// ```
 ///
 /// # Pipeline
@@ -347,17 +333,18 @@ pub fn kernel(input: TokenStream) -> TokenStream {
 ///
 /// # Use Cases
 ///
-/// - Benchmarking an exact expression form: `X * Y + Z` against
-///   `(X).mul_add(Y, Z)`, which `kernel!` would fuse into the same node.
-/// - Corpus generation, where the input to the optimizer is the subject.
+/// - Benchmarking an exact expression form: `X * Y + z` against
+///   `X.mul_add(Y, z)`, which `kernel!` would fuse into the same node.
 /// - Debugging: what the front end built, before anything rewrote it.
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
+/// use pixelflow_compiler::kernel_raw;
+///
 /// // Two different arenas — mul then add, against one MulAdd.
-/// let unoptimized = kernel_raw!(|| X * Y + Z);
-/// let explicit_fma = kernel_raw!(|| (X).mul_add(Y, Z));
+/// let unoptimized = kernel_raw!(|z: f32| X * Y + z)(0.5);
+/// let explicit_fma = kernel_raw!(|z: f32| X.mul_add(Y, z))(0.5);
 /// ```
 #[proc_macro]
 pub fn kernel_raw(input: TokenStream) -> TokenStream {
@@ -371,9 +358,9 @@ pub fn kernel_raw(input: TokenStream) -> TokenStream {
 /// intact is what makes the chain rule work under composition — `Kernel::at`
 /// warps by substituting into `Var` leaves, so the warp reaches a surviving
 /// `Dwrt`'s operand and differentiates the warped function. Resolving
-/// derivatives here instead was a miscompilation, and `tests/
-/// derivative_under_warp.rs` pins that. The runtime tier lowers them at bake
-/// time, after composition, in `legalize`'s order.
+/// derivatives here would be a miscompilation under composition, and
+/// `tests/derivative_under_warp.rs` pins that. The runtime tier lowers them at
+/// bake time, after composition, in `legalize`'s order.
 fn macro_tier() -> impl Optimize {
     DwrtFree(Saturate::macro_tier())
 }
@@ -382,19 +369,11 @@ fn macro_tier() -> impl Optimize {
 ///
 /// Saturation would resolve one — the chain rule is in the rule set, and a
 /// `Dwrt` node is priced so the extractor never keeps it — which at expansion
-/// time is exactly the miscompilation above. Measured, not assumed: dropping
-/// this wrapper puts `derivative_under_warp.rs` back to 12 where the chain
-/// rule says 24.
-///
-/// It declines the *whole* kernel rather than the `Dwrt` subterm, and that
-/// costs something. For `'8'` at 17 px the bake-time arena goes from 2964
-/// nodes to 3318 — 12% — because the glyph's fragments now reach the runtime
-/// tier unfused and one saturation does not recover what two did. Correctness
-/// is not negotiable against 12%, so this ships, but the price is real and it
-/// is not the floor: what this kernel actually wants is saturation with the
-/// derivative rules *withheld*, which would fuse it without resolving
-/// anything. That needs a rule-set the search crate does not currently
-/// expose, so it is denoted here and not built.
+/// time is the miscompilation `macro_tier` describes. It declines the *whole*
+/// kernel rather than the `Dwrt` subterm, so a kernel carrying one reaches the
+/// runtime tier unfused and is saturated once, there. Saturation with the
+/// derivative rules withheld would fuse it without resolving anything; the
+/// search crate exposes no such rule set.
 struct DwrtFree<P>(P);
 
 impl<P: Optimize> Optimize for DwrtFree<P> {
@@ -409,163 +388,23 @@ impl<P: Optimize> Optimize for DwrtFree<P> {
     }
 }
 
-/// Parse, analyze, lower, optimize, emit — the whole front end. The macros
-/// differ only in the optimizer they hand it.
-fn expand(input: TokenStream, optimizer: &mut dyn Optimize) -> TokenStream {
-    let tokens = proc_macro2::TokenStream::from(input);
-    let analyzed = match parser::parse(tokens).and_then(sema::analyze) {
-        Ok(a) => a,
-        Err(e) => return e.to_compile_error().into(),
-    };
-    match emit::emit_kernel(&analyzed, optimizer) {
-        Ok(tokens) => tokens.into(),
-        Err(e) => syn::Error::new(proc_macro2::Span::call_site(), e)
-            .to_compile_error()
-            .into(),
-    }
+/// Parse, analyze, lower, optimize, emit — the whole front end, over
+/// `proc_macro2` tokens so that a test can run the pipeline the macros run.
+/// The macros differ only in the optimizer they hand it.
+///
+/// A refusal is a span and a claim, whichever stage makes it.
+fn front_end(
+    input: proc_macro2::TokenStream,
+    optimizer: &mut dyn Optimize,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let analyzed = parser::parse(input).and_then(sema::analyze)?;
+    emit::emit_kernel(&analyzed, optimizer)
 }
 
-/// Every method name the front end advertises must survive both macros.
-///
-/// This class of bug shipped once. `sema` accepted `.round()`, `.log10()`
-/// and `.pow()` — ordinary `OpKind`s, so `known_method_names()` returned
-/// them — while arena lowering had no arm for any of the three; and the
-/// mirror-image gap hid `fract`/`hypot`/`clamp`, whose e-graph decomposition
-/// `sema` rejected the names for, leaving it unreachable from either macro.
-/// Both halves are a disagreement *between pipeline stages*, so no test of a
-/// single stage can see them: the stage under test is the one that is right.
-///
-/// Nor can sampling see them. A method is exercised only if some test
-/// happens to write a kernel calling it, and `kernel_macro.rs`'s cases are
-/// hand-picked — every one of those six was already covered at the SIMD
-/// backend, in codegen, and on the `Kernel` value API, and still nobody had
-/// written `X.round()` inside a `kernel!` body.
-///
-/// So run the real pipeline, both macros' versions of it, over the whole
-/// advertised surface. Adding an op to `OpKind::is_dsl_method` or a name to
-/// `LIBRARY_METHODS` without a path through every stage fails here, for
-/// whoever adds it.
-#[cfg(test)]
-mod every_advertised_method_compiles {
-    use crate::lower::LIBRARY_METHODS;
-    use crate::sema::{MethodTyping, method_typing};
-    use crate::{Identity, Optimize, emit, macro_tier, parser, sema};
-    use pixelflow_ir::{OpKind, known_method_names};
-    use proc_macro2::Span;
-    use quote::quote;
-    use syn::Ident;
-
-    /// Which macro's pipeline to run. `kernel!` saturates the e-graph between
-    /// sema and lowering; `kernel_raw!` goes straight across. The difference
-    /// between them is where the `hypot`/`fract` asymmetry lived, so both are
-    /// swept.
-    #[derive(Clone, Copy, Debug)]
-    enum Macro {
-        Kernel,
-        KernelRaw,
-    }
-
-    /// Expand a well-typed call of `method` through `which` macro's own
-    /// pipeline — the same calls [`kernel`] and [`kernel_raw`] make — and
-    /// report whether it yields code.
-    ///
-    /// Well-typed by `sema`'s own typing of the op: an `f32` operand is `X`,
-    /// a `bool` one is `X.lt(X)`. The sweep asks the stage under test what
-    /// it takes, which is fine for what this checks — that every stage has
-    /// a path for every advertised name — and the typing itself is pinned
-    /// by `sema`'s tests.
-    fn expand(which: Macro, method: &str, arg_count: usize) -> Result<(), String> {
-        let name = Ident::new(method, Span::call_site());
-        let number = quote!(X);
-        let mask = quote!(X.lt(X));
-        let (receiver, args): (proc_macro2::TokenStream, Vec<proc_macro2::TokenStream>) =
-            match OpKind::from_method_call(method, arg_count).map(method_typing) {
-                Some(MethodTyping::Choice) => (mask, vec![number.clone(), number]),
-                Some(MethodTyping::Comparison) | Some(MethodTyping::Arithmetic) | None => {
-                    (number.clone(), vec![number; arg_count])
-                }
-            };
-        let body = quote! { || #receiver.#name(#(#args),*) };
-
-        let def = parser::parse(body).map_err(|e| e.to_string())?;
-        let analyzed = sema::analyze(def).map_err(|e| e.to_string())?;
-        let mut kernel_optimizer;
-        let mut raw_optimizer;
-        let optimizer: &mut dyn Optimize = match which {
-            Macro::Kernel => {
-                kernel_optimizer = macro_tier();
-                &mut kernel_optimizer
-            }
-            Macro::KernelRaw => {
-                raw_optimizer = Identity;
-                &mut raw_optimizer
-            }
-        };
-        emit::emit_kernel(&analyzed, optimizer).map(|_| ())
-    }
-
-    /// Every `(method, arg_count)` the front end accepts: the primitive ops
-    /// `sema` validates against, plus the library compositions.
-    fn advertised() -> impl Iterator<Item = (&'static str, usize)> {
-        known_method_names()
-            .map(|name| {
-                let op = OpKind::from_name(name)
-                    .expect("known_method_names() only yields names from_name parses");
-                // Arity counts the receiver as the first operand.
-                (name, op.arity() - 1)
-            })
-            .chain(LIBRARY_METHODS.iter().copied())
-    }
-
-    #[test]
-    fn through_the_kernel_macros_pipeline() {
-        for (method, arg_count) in advertised() {
-            assert_eq!(
-                expand(Macro::Kernel, method, arg_count),
-                Ok(()),
-                "`kernel!(|| X.{method}(..))` is advertised but does not compile"
-            );
-        }
-    }
-
-    #[test]
-    fn through_the_kernel_raw_macros_pipeline() {
-        for (method, arg_count) in advertised() {
-            assert_eq!(
-                expand(Macro::KernelRaw, method, arg_count),
-                Ok(()),
-                "`kernel_raw!(|| X.{method}(..))` is advertised but does not compile"
-            );
-        }
-    }
-
-    /// The converse guard: a name nothing advertises must still be refused,
-    /// so the sweeps above cannot be satisfied by accepting everything.
-    #[test]
-    fn a_name_the_front_end_does_not_advertise_is_still_refused() {
-        assert!(expand(Macro::Kernel, "not_a_real_method", 0).is_err());
-        // A real op at the wrong arity is just as unadvertised.
-        assert!(expand(Macro::Kernel, "sqrt", 2).is_err());
-    }
-
-    /// A recognized name at the wrong arity must say so.
-    ///
-    /// Refusing it is not enough, and refusing it was all the test above
-    /// checked. `sema` validates name and arity together — which is what makes
-    /// `.sqrt(1.0)` a hard error instead of something that fails three stages
-    /// later — but the failure then fell into the typo-suggestion path, which
-    /// dutifully searched for a name close to `sqrt`, found `sqrt`, and
-    /// emitted `unknown method 'sqrt'; did you mean 'sqrt'?`.
-    #[test]
-    fn a_known_name_at_the_wrong_arity_reports_the_arity() {
-        let err = expand(Macro::Kernel, "sqrt", 2).expect_err("wrong arity must fail");
-        assert!(
-            err.contains("takes 0 arguments"),
-            "expected an arity diagnostic, got: {err}"
-        );
-        assert!(
-            !err.contains("did you mean"),
-            "a recognized name must not be sent to the typo search: {err}"
-        );
-    }
+/// [`front_end`] as a procedural macro: a refusal is the `compile_error!`
+/// at its span.
+fn expand(input: TokenStream, optimizer: &mut dyn Optimize) -> TokenStream {
+    front_end(input.into(), optimizer)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }
