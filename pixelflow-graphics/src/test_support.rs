@@ -30,6 +30,7 @@ pub(crate) fn program_digest(arena: &ExprArena, root: ExprId) -> u64 {
             ExprNode::Buffer(b) => (3, None, u128::from(b.0)),
             ExprNode::Uniform(u) => (4, None, u128::from(u.0)),
             ExprNode::Ref(key) => (5, None, u128::from(key.bits())),
+            ExprNode::Apply(key, ..) => (9, None, u128::from(key.bits())),
             ExprNode::Unary(op, _)
             | ExprNode::Binary(op, ..)
             | ExprNode::Ternary(op, ..)

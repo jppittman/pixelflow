@@ -484,7 +484,7 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
             ExprNode::Param(i) => (Key::Param(i), Box::new(move |a| a.push_param(i))),
             ExprNode::Buffer(b) => (Key::Buffer(b.0), Box::new(move |a| a.push_buffer(b))),
             ExprNode::Uniform(u) => (Key::Uniform(u.0), Box::new(move |a| a.push_uniform(u))),
-            ExprNode::Ref(k) => panic!(
+            ExprNode::Ref(k) | ExprNode::Apply(k, ..) => panic!(
                 "hash_cons: Ref({k:?}) names a kernel interned in this process; \
                  corpus arenas are self-contained, so expand_refs first"
             ),

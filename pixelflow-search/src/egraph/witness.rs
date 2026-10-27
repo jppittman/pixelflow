@@ -432,6 +432,12 @@ pub fn induce<I: Ir>(
                     mapped: memo.len(),
                 });
             }
+            Shape::Apply(key, ..) => {
+                return Err(TermMiss {
+                    node: format!("{key:?} (an apply; expand_refs first)"),
+                    mapped: memo.len(),
+                });
+            }
         };
         let Some(&(class, idx)) = table.get(&node) else {
             return Err(TermMiss {
