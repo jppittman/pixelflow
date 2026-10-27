@@ -74,6 +74,7 @@ fn match_root(
         | ExprData::Buffer(_)
         | ExprData::Uniform(_)
         | ExprData::Ref(_)
+        | ExprData::Apply(_)
         | ExprData::Reduce(_) => false,
         ExprData::Op(_) => match_op(egraph, pat, node, bindings),
     }
@@ -93,6 +94,7 @@ fn root_shapes_of(pat: Node<'_, ExprData>) -> RootShapes {
         | ExprData::Buffer(_)
         | ExprData::Uniform(_)
         | ExprData::Ref(_)
+        | ExprData::Apply(_)
         | ExprData::Reduce(_) => RootShapes::nothing(),
     }
 }
@@ -112,6 +114,7 @@ fn match_class(
         | ExprData::Buffer(_)
         | ExprData::Uniform(_)
         | ExprData::Ref(_)
+        | ExprData::Apply(_)
         | ExprData::Reduce(_) => false,
         ExprData::Op(_) => {
             for node in egraph.nodes(class) {
@@ -168,7 +171,7 @@ fn collect_metavars(node: Node<'_, ExprData>, out: &mut std::collections::BTreeS
         | ExprData::Buffer(_)
         | ExprData::Uniform(_)
         | ExprData::Ref(_) => {}
-        ExprData::Reduce(_) | ExprData::Op(_) => {
+        ExprData::Reduce(_) | ExprData::Op(_) | ExprData::Apply(_) => {
             for c in node.children() {
                 collect_metavars(c, out);
             }

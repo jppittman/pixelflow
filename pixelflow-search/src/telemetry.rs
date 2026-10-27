@@ -270,6 +270,12 @@ fn latency_prior_cost(arena: &ExprArena, root: ExprId) -> usize {
                 "latency_prior_cost: a Write — insert declines a Write, so one here \
                  means this arena never went through the pipeline"
             ),
+            // And an `Apply`: `insert` declines one too, and the runtime tier
+            // expands every `Apply` before it walks its units.
+            ExprNode::Apply(key, ..) => panic!(
+                "latency_prior_cost: {key:?} applied at a warp — insert declines an \
+                 Apply, so one here means this arena never went through the pipeline"
+            ),
         };
         if let Some(op) = op {
             total += costs.cost(op);

@@ -1735,8 +1735,8 @@ fn instantiate_template<S: NodeSink>(
                 u.0
             )
         }
-        ExprData::Ref(k) => {
-            panic!("instantiate_template: Ref({k:?}) in a rewrite RHS template")
+        ExprData::Ref(k) | ExprData::Apply(k) => {
+            panic!("instantiate_template: {k:?} names a kernel in a rewrite RHS template")
         }
         ExprData::Reduce(header) => {
             let mut kids = node
