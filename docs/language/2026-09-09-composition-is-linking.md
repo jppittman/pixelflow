@@ -529,3 +529,39 @@ Consequences for the design question:
   the budget per unit with no call at all. That is measurable with a small
   change and is the next JP-19 step; the call lowering (L5) is only about the
   bytes in §9.1.
+
+### 9.3 Held as a unit (JP-111, 2026-10-27)
+
+The runtime tier no longer expands every `Apply` before the unit walk. An
+`Apply` whose warp is closed over the coordinates (literals and `X`/`Y` only) and
+whose referent declares no uniform or buffer is *lifted*
+(`passes::lift_applies`): its composite is interned as a kernel of its own, the
+term around holds that name as a `Ref` leaf, and after extraction the leaf
+links to `Apply(k, cx, cy)` over `k`'s one optimized body. Anything else is
+expanded as before. The one-key JIT cache rule is untouched: `jit_cache`
+keys the kernel with names expanded, before the optimizer runs.
+
+The ruler (`ref_reuse_cost`, before → after, 16 copies):
+
+| unit | code bytes | cold compile ms |
+|---|---|---|
+| loop8 | 3,160 → 3,192 | 5.6 → 5.4 |
+| loop128 | 4,284 → 5,264 | 9.2 → 8.0 |
+| wide16 | 39,216 → 18,824 | 24 → 19 |
+| wide64 | 164,584 → 83,604 | 113 → 41 |
+
+and the saturation record shows the unit saturated once with its whole
+budget (a 13-class unit: 2000 classes, ~8k applications) where the inlined scene
+gave each copy ~1/45th of that. Compile time is flat in the copy count for loop
+units (4.2 → 5.4 ms from 1 to 16 copies) and 5× not 16× for `wide64`; code for the
+straight-line unit halves, because the optimizer now sees the whole unit rather
+than a starved share of it. This is §9.2's "share after inlining, scoped to the
+inlined body", done at the unit boundary and without a call.
+
+What it costs: a lifted leaf is named by its composite, so each distinct warp
+interns one kernel in the store per compile (a canonical walk of the unit's size);
+the extraction around the leaf prices it at the leaf's variance and nothing else,
+as for any unit (`CostModel::node_op_cost`). Not done: a warp that reads a
+uniform or a binder, or a referent that declares a uniform or buffer, still
+inlines — a bare composite kernel cannot carry those slots — and L5 (a call)
+remains open for the code-size case in §9.1.
