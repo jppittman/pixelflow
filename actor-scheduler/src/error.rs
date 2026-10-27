@@ -72,3 +72,24 @@ pub enum DrainStatus {
     /// Channel disconnected (senders dropped)
     Disconnected,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_says_the_send_timed_out_when_the_lane_stayed_full() {
+        assert_eq!(
+            SendError::Timeout.to_string(),
+            "timeout sending message to actor"
+        );
+    }
+
+    #[test]
+    fn display_says_the_channel_disconnected_when_the_receiver_is_gone() {
+        assert_eq!(
+            SendError::Disconnected.to_string(),
+            "actor channel disconnected"
+        );
+    }
+}

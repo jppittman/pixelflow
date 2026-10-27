@@ -391,3 +391,41 @@ is coordinate substitution; there is no load, no index operator, no table
 type. What leaks is one constructor: `DiscreteManifold::kernel_for` builds a
 fragment holding `ExprNode::Buffer` and `OpKind::Gather`, committing to the
 tabulated lowering at construction, where nothing downstream can revisit it.
+
+## 9. L4/L5 measured: the inline-everything curve (JP-19, 2026-10-26)
+
+`pixelflow-pipeline/examples/ref_reuse_cost.rs` composes `K` copies of one
+identical unit (an 8-trip fold with a `sqrt`) at distinct offsets, joined by
+`min` — §3's case for L4 — and collapses a 128×128 frame. Every copy is
+inlined, because `Kernel::at` expands a reference at construction (§8); a
+copy at an offset cannot stay a name until `Apply` exists.
+
+| copies | linked nodes | code bytes | collapse µs |
+|---|---|---|---|
+| 1 | 27 | 388 | 38 |
+| 2 | 55 | 556 | 70 |
+| 4 | 111 | 924 | 141 |
+| 8 | 223 | 1672 | 270 |
+| 16 | 447 | 3156 | 547 |
+
+Everything is linear: ~28 nodes, ~185 bytes and ~34 µs per additional copy
+(compile milliseconds are not tabulated; they are dominated by structure-keyed
+cache hits and are noise at this size). So:
+
+- **Nothing shares today.** Identical referents at different offsets are
+  different programs once `at` has substituted, so the e-graph has nothing to
+  find and a surviving `Ref` has something to save.
+- **What a call can buy is code size, not time.** A copy costs ~185 bytes and
+  ~2 ns per pixel here; a call site (arguments, call, result, the spill of
+  whatever the allocator holds across it — §5.2) is the same order as the
+  body. For a body this small a call loses on execution and saves only a few
+  KB. The case is a body whose bytes dominate (a glyph-scale unit, the
+  thousands of bytes), which this ruler does not yet contain.
+- **The prerequisite is `Apply` (§8), not the call.** Without it the
+  comparison cannot be built: the only composition that keeps a name is one
+  at the *same* coordinates, which `expand_refs`' per-key sharing already
+  collapses to one node.
+
+No cost-model change follows from this. The pricing question that does —
+how a surviving unit's cost ranks when symbolic in uniforms — is JP-14's
+ruling (a-bound-is-a-value §5.1) and is not decided here.

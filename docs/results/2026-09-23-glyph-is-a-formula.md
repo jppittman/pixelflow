@@ -200,7 +200,7 @@ entries, but 21 entries the arm does not own sit in the middle of its run,
 so one branch cannot span it. That cut is where a pixel stops paying for a
 piece whose band misses its row — FreeType's perimeter shape — and it is
 the next thing between this and FreeType's speed: the order-refusal in
-`pixelflow-codegen/src/emit/guards.rs` (docs/BACKLOG.md, X1), or the
+`pixelflow-codegen/src/emit/guards.rs` (docs/results/2026-09-10-glyph-bake-hump.md), or the
 demand regions of D1. The run's box was not guarded before either.
 
 ## 7. Not measured, not done

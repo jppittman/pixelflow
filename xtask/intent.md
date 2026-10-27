@@ -46,7 +46,7 @@ builds and lints once, then runs each tier; off x86-64 it prints a note, exits 0
 
 ## Behind
 - `bake-eigen` writes `coeffs.rs` into a `subdiv` module of `pixelflow-graphics`
-  that is gone, so it emits a file nothing declares. No plan or BACKLOG item closes it.
+  that is gone, so it emits a file nothing declares. No plan or Linear issue closes it.
 - CLAUDE.md writes `cargo xtask isa-matrix`; `.cargo/config.toml` has no `xtask`
   alias, so the working form is `cargo run -p xtask -- isa-matrix`.
 - Ten `#[cfg(...)]` sites on items in `main.rs` are baselined in

@@ -51,7 +51,7 @@ from `mod.rs`.
 - The runtime's real injection seam is `PlatformOps` behind `PlatformActor`, driven
   by a mock in `tests/platform_actor_tests.rs`. A test of an engine actor takes
   that shape, not a recorder in `src/`.
-- No plan or BACKLOG item names this module yet.
+- No plan or Linear issue names this module yet.
 
 ## Decided in
 `desloppify/skills/behavioral-contracts/SKILL.md` ("Tests only ever see the

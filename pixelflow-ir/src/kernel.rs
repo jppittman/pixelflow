@@ -782,7 +782,7 @@ impl Kernel {
     /// repeated index in nested folds is a genuine contraction rather than an
     /// accident. It is not a guarantee that the index stays there: a closure
     /// can keep a clone of it, and a later fold that reclaims its placeholder
-    /// captures it, which no check sees (docs/BACKLOG.md C10). An index that
+    /// captures it, which no check sees (Linear JP-8). An index that
     /// has escaped and is not captured is open, and `ExprArena::free_index`
     /// says so. `range` is the literal spelling of a known
     /// range; a bound that is a value is [`Kernel::over_values`]'s. Either way
@@ -866,7 +866,7 @@ impl Kernel {
     /// to wrap and a bound that is no count gives `0` (`FactorFold`'s doc).
     /// Annihilation is one of the algebraic rules unsound at NaN: cancellation
     /// and inverse annihilation drop a fold from an enclosing expression the
-    /// same way (BACKLOG E9).
+    /// same way (Linear JP-12).
     ///
     /// Constness is discovered, not declared: a bound that is a constant naming
     /// a count is the fold's data, so `over_values(⊕, 0, 4, f)` is
@@ -1426,8 +1426,7 @@ mod tests {
     /// meets it in `FoldHeader::new`, whose `KnownRange::new` panics with the
     /// message pinned here; `kernel!` asks `admits` while lowering a literal
     /// range, and refuses in its own words before any header is built. Before,
-    /// `kernel!` refused and this summed the wrong terms without a word
-    /// (docs/BACKLOG.md, C8).
+    /// `kernel!` refused and this summed the wrong terms without a word.
     #[test]
     #[should_panic(expected = "ends at most at 16777216 (2^24)")]
     fn a_fold_past_the_exact_bound_is_refused_by_the_builder_too() {
