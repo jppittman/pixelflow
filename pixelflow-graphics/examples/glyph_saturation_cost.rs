@@ -72,12 +72,11 @@ fn main() {
             let ms = t0.elapsed().as_secs_f64() * 1e3;
 
             let (out, out_root) = match optimized.as_deref() {
-                Some((a, r)) => (a.clone(), *r),
-                // The pipeline declined outright — which after the reorder
-                // would mean the emitter gets an un-legalized arena, so it is
-                // worth seeing rather than averaging away.
-                None => {
-                    println!("{ch}\t{size}\t{built}\tDECLINED\t{ms:.1}\t?");
+                Ok((a, r)) => (a.clone(), *r),
+                // The pipeline refused outright — the compile would fail with
+                // this error, so it is worth seeing rather than averaging away.
+                Err(error) => {
+                    println!("{ch}\t{size}\t{built}\tREFUSED {error:?}\t{ms:.1}\t?");
                     continue;
                 }
             };
