@@ -41,7 +41,7 @@
 ## Behind
 - 2026-10-15: `mod.rs` and `manifold.rs` still draw `compile ──bind(buffers)──▶
   bound ──collapse`; `Lattice::collapse` takes a `BoundManifold`. Closed by
-  kernels-evaluate-kernels §2 (BACKLOG N1, N4).
+  kernels-evaluate-kernels §2 (JP-22).
 - `DiscreteManifold::kernel` and `BilinearSampler::kernel` are read at an `R²`
   coordinate, flooring and clamping in the `Gather`; §6 puts the lift in the
   caller (D10 deletes the sampler).

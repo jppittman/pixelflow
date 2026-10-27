@@ -107,8 +107,8 @@ The arena holds the judgment two ways, and both are needed:
 
 The untyped `ExprId(pub u32)` the e-graph and the passes use internally stays
 as the column's index; the typed handle is `ExprId<S>(ExprId)` and nothing
-else. (The `pub u32` and the control-plane width are BACKLOG items of their
-own; this note does not widen them, and does not need to.)
+else. (The `pub u32` and the control-plane width are Linear issues of their
+own (JP-11); this note does not widen them, and does not need to.)
 
 The `ExprNode` size assertion (`≤ 32` bytes, `arena.rs:464`) is a tripwire,
 not a budget. `Const(Lit)` is eight bytes and fits. If a step here trips it,
@@ -227,7 +227,7 @@ follow T3 in order.
 ## 5. Item 2, and why it waits
 
 Arrow types on binders: `Var`, `Uniform`, `Param`, `Buffer` and `Ref` are five
-spellings of "a name bound later" (BACKLOG N1), and under the types they are
+spellings of "a name bound later" (Linear JP-22), and under the types they are
 one binder table whose entries have types `Real` (a coordinate, a uniform, a
 `kernel!` parameter), `L → Real` (a discrete kernel supplied at call time: the
 cell table, the frame, a glyph's piece table) and `D → T` for a `Ref`'s
@@ -250,7 +250,7 @@ stands.
 - Not predicate domains (§2's item 3). A domain with a predicate is an
   e-graph class analysis, later, and needs these types under it first.
 - Not a width change. `ExprId(pub u32)`, `Fold`'s `u32` ends and `Binder`'s
-  `u8` are BACKLOG items against the 64-bit control plane and land on their
+  `u8` are Linear issues (JP-11) against the 64-bit control plane and land on their
   own; this note neither widens nor depends on them.
 - Not the schedule. Where the lattice folds live (§3 of the ruling) is
   orthogonal: they are `Reduce` nodes and get a type like any other.

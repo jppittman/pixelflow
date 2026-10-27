@@ -49,11 +49,11 @@ concurrently); the data `Choice`, `Decided`, `Decisions`; `JevConfig` and
 - A returned label is not checked against the question's labels. `Jev` passes
   the server's `choice` through, and `review/run.rs` treats an unknown label as
   unsettled, so "one of that question's labels" is held by the caller, not by
-  `Decide`. No plan or BACKLOG item names it.
+  `Decide`. No plan or Linear issue names it.
 - `Choice::name` unique within a request is stated in a doc comment and not
   checked; the review satisfies it with rule ids.
 - `JevConfig` has public fields, `api_key` among them, and derives `Debug`.
 
 ## Decided in
 `desloppify/README.md` (How a review runs, steps 2 and 3; Layout; Backends).
-No plan in `docs/plans` or BACKLOG item names this module.
+No plan in `docs/plans` or Linear issue names this module.

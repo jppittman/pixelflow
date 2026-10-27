@@ -382,7 +382,7 @@ So the language has none:
   docs. CLAUDE.md needs a section, "Select contains an if", to explain what
   the name hides. The emitter was built on the misreading, blend by default
   with a branch bought per select (`emit/guards.rs`, since deleted), and that cost 73% of a
-  glyph bake (docs/BACKLOG.md X1) and the slowness of runs. The name is the
+  glyph bake (docs/results/2026-09-10-glyph-bake-hump.md) and the slowness of runs. The name is the
   bug (A6).
 
 ### 1.7 A font at a zoom level is one program per piece count
@@ -792,7 +792,7 @@ and no digests are committed (one-pipeline §5, gate policy).
   and `derivative`, written once over the sites a term is built in and
   built through by `Kernel`'s methods, lowering and the integrals' closed
   forms; `Axis`; `ExprArena::close_over` and `Placeholder`; the 2²⁴ bound
-  in `RangeFold` (docs/BACKLOG.md C8); `IntervalFold::pixel`. Keys and
+  in `RangeFold` ; `IntervalFold::pixel`. Keys and
   bytes unchanged. (`RangeFold` is `Fold` again, and `IntervalFold` is
   gone, since the integral's deletion.)
 - **B6.** **Withdrawn** with the integrals (§1.5, D19). It was: helpers as
@@ -1307,7 +1307,7 @@ Phase D proposes the edits.
   `RangeFold` accepted any `u32` end, so a builder fold past 2²⁴ summed the
   wrong terms without a word, while `kernel!` refused such a bound at
   lowering. B5 moved the refusal into `RangeFold` (`RangeFold::admits`),
-  which both front ends build through (docs/BACKLOG.md, C8); it is
+  which both front ends build through ; it is
   `Fold::admits` since `RangeFold` folded back into `Fold` with the
   integral's deletion.
 - **The integral closed only under budget (F).** A glyph written as the

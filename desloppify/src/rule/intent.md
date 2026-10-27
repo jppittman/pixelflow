@@ -45,13 +45,13 @@ and `snippet/` read them.
 
 ## Behind
 - `Decision::outcomes` says "each in file order"; `fine` and `violations` are
-  `BTreeMap`s, so the order is by outcome name. No plan or BACKLOG item.
+  `BTreeMap`s, so the order is by outcome name. No plan or Linear issue.
 - An outcome named twice is refused across `fine` and `violations` only;
   twice inside one object, serde_json keeps the last and the rule loads. No
-  plan or BACKLOG item.
+  plan or Linear issue.
 - `"context": "module_root"` with `"group": "crate"` loads, and the planner
   gives the crate call no root (`review/plan.rs`), so the context is dropped
-  silently. No plan or BACKLOG item.
+  silently. No plan or Linear issue.
 - `Surroundings::ModuleIntent` stops at the crate's `Cargo.toml`; a module
   whose intent lives in a parent crate gets none, and nothing says which
   crate a nested `Cargo.toml` makes the boundary.
