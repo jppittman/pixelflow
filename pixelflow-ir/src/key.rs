@@ -372,9 +372,13 @@ impl<'a> Walk<'a> {
     fn encode(&mut self, id: ExprId) {
         self.scratch.clear();
         match self.arena.node(id) {
-            ExprNode::Placeholder(identity) => {
-                panic!("KernelKey: fold index scope {identity} escaped without its binder")
-            }
+            // A key names a closed program, and an escaped fold index is a
+            // read of an index no fold inside it binds: refused here, at
+            // interning, before any unit walk sees it.
+            ExprNode::Placeholder(identity) => panic!(
+                "KernelKey: the kernel reads an index no fold inside it binds (fold index \
+                 scope {identity} escaped without its binder)"
+            ),
             ExprNode::Var(i) => {
                 self.scratch.push(0);
                 self.scratch.push(i);

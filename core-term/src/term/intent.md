@@ -46,8 +46,8 @@ Option<EmulatorAction>` and `get_render_snapshot() -> Option<TerminalSnapshot>`
   and calls inherent methods; the trait impl only forwards to inherent methods
   of the same names, the second door `behavior-through-the-trait` names. It
   also has public methods the trait lacks (`print_text`, `cell_at`,
-  `scroll_viewport`, `encode_mouse_event` and eleven more). No plan or BACKLOG
-  item tracks either.
+  `scroll_viewport`, `encode_mouse_event` and eleven more). No plan or Linear
+  issue tracks either.
 - `get_render_snapshot` takes `&mut self` because it records
   `last_snapshot_view` and `last_cursor_mark`, so a query advances damage state.
 - `screen.rs`, `layout.rs` and `charset.rs` carry `#[cfg(test)]` modules inside

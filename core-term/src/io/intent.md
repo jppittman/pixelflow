@@ -47,13 +47,9 @@ scheduler can interrupt. It moves bytes and a window size; what they mean is
   `scripts/cfg_encapsulation_baseline.txt`.
 
 ## Behind
-- Nothing forbids `fork` mechanically: only a doc on `spawn_with_config`.
-- `pty.rs` says no integration test spawns a PTY; `tests/clear_command_integration.rs`
-  does, outside `OPENPTY_TEST_LOCK` (`cfg(test)` only), alone in its binary.
-- `docs/bugs/2026-07-15-pty-fork-malloc-deadlock.md` still reads "not yet
-  fixed"; `posix_spawn` fixed it.
+- The single-spawner rule is a caller contract: `spawn_with_config` does not
+  prevent concurrent calls, so callers must serialize PTY creation.
 
 ## Decided in
-`docs/archive/designs/pty-actor-troupe.md`, `docs/bugs/2026-07-15-pty-fork-malloc-deadlock.md`,
-`docs/bugs/2026-07-21-openpty-not-thread-safe.md`,
+`docs/archive/designs/pty-actor-troupe.md`,
 `docs/process/2026-10-15-intent-lives-with-the-module.md`.

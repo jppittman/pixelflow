@@ -50,9 +50,9 @@ the tokens it cost), possibly failing (desloppify/README.md, "Backends" and
 ## Behind
 - `mod.rs` says `dry_run` answers every call `[]`; `dry_run.rs` answers an
   object whose enum properties take their first value, as the README says.
-  Both docs are stale (2026-10-15; no plan or BACKLOG item names it).
+  Both docs are stale (2026-10-15; no plan or Linear issue names it).
 - `RigAgent::ask` and `ClaudeCode::ask` need a network or the CLI and have no
-  test (no plan or BACKLOG item names it).
+  test (no plan or Linear issue names it).
 
 ## Decided in
 desloppify/README.md ("Backends", "Layout", "Rate limiting"); no plan names it.

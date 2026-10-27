@@ -3,9 +3,9 @@
 **Date:** 2026-09-10
 **Verified against:** `3a4c4e3247c90bc1dd980e268f2edec505dd6fd1` ("perf(codegen): the guard
 partition is one pass, not a search", 2026-09-10)
-**Moved from:** `docs/BACKLOG.md`, "The hump". The H-row index (H1–H5) and each item's current
-status stay in `docs/BACKLOG.md` — that table **is** the index. This document is the narrative
-and measurements the index now points to; nothing below has been revised in the move.
+**Moved from:** the repo's former backlog file, "The hump" (the H1–H5 rows). Item status is tracked in Linear
+(project *Font coverage and rendering evidence*), not here. This document is the narrative and
+measurements; nothing below has been revised in the move.
 
 ---
 
@@ -33,7 +33,7 @@ glyph   px    cold_ms    warm_ms compile_ms compile%
     m   32      639.4        1.6      637.8   99.8%
 ```
 
-Two consequences, both of which move items in `docs/BACKLOG.md`'s hump table:
+Two consequences, both of which moved items in the former backlog's hump table:
 
 - **H1 alone is the fix.** 95 compiles → 1 takes ~31 s to ~2 s; the 95
   collapses that remain total well under a tenth of a second.
@@ -111,7 +111,7 @@ area has already produced three constants whose stated derivations did not
 survive measurement (`EXTENT_SLOP`, `CLUSTER_ROUNDS_PER_SELECT`,
 `DISC_BAND_ULPS`). **Do not fix this with a size cutoff.**
 
-See **H5** in `docs/BACKLOG.md`'s index, and note that **D5 deletes the
+See **H5** (the former backlog's index), and note that **D5 deletes the
 question**: with a demand predicate, values of equal demand are contiguous
 *by construction*, so there is nothing to cluster and no round count to
 choose. That plan is no longer only an elegance argument — it is the largest

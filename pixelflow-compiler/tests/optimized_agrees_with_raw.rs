@@ -27,7 +27,7 @@
 //!   `pixelflow-search/src/math/algebra.rs`), and `Recip` is a hardware estimate:
 //!   `rcpps` is ~12 bits (CLAUDE.md, "Floating point at the edges"), whose
 //!   documented maximum relative error is 1.5·2⁻¹², so the bound is `2⁻¹¹`.
-//! - `sin` is `TRIG_DOMAIN`'s documented worst case, 1.5e-6 absolute
+//! - `sin` and `cos` are `TRIG_DOMAIN`'s documented worst case, 1.5e-6 absolute
 //!   (`pixelflow-ir/src/passes.rs`, `expand_sin_phase`), times four.
 //! - `exp` is `exp2`'s documented polynomial truncation, 1.6e-4 relative on
 //!   `[0, 1)` (`EXP2_POLY` in `pixelflow-ir/src/passes.rs`), times two.
@@ -202,9 +202,10 @@ fn abs_and_neg_agree() {
 }
 
 /// The argument `(X − 32)·0.1` spans `[−3.2, 3.1]`, both signs, well inside
-/// `TRIG_DOMAIN`.
+/// `TRIG_DOMAIN`. `cos` is `sin` a quarter turn on, so it is held to the same
+/// documented bound.
 #[test]
-fn sin_agrees_within_domain() {
+fn sin_and_cos_agree_within_domain() {
     let c = f64::from(0.1f32);
     check(
         "sin",
@@ -212,6 +213,15 @@ fn sin_agrees_within_domain() {
         &kernel_raw!(|| ((X - 32.0) * 0.1).sin() + Y * 0.25),
         move |x, y| {
             let want = ((x - 32.0) * c).sin() + y * 0.25;
+            (want, SIN_TOL + four_ulps(1.0 + y * 0.25))
+        },
+    );
+    check(
+        "cos",
+        &kernel!(|| ((X - 32.0) * 0.1).cos() + Y * 0.25),
+        &kernel_raw!(|| ((X - 32.0) * 0.1).cos() + Y * 0.25),
+        move |x, y| {
+            let want = ((x - 32.0) * c).cos() + y * 0.25;
             (want, SIN_TOL + four_ulps(1.0 + y * 0.25))
         },
     );

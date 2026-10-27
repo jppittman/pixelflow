@@ -6,16 +6,11 @@
 //! Each test writes the body twice, once in `kernel!` and once as an ordinary
 //! Rust closure over `(x, y)`, and compares the baked value to the closure's.
 //!
-//! The failing cases were measured defects (Phase A1 of
-//! docs/language/2026-09-25-the-language-is-kernel.md; probe p6 is the first
-//! test): lowering's `locals` was one flat map that no block ever popped, so
-//! an inner `let` overwrote an outer one for the rest of the kernel; `sema`'s
-//! table deleted a shadowed parameter outright; and a literal was parsed as
-//! `f64` and then cast, rounding twice where rustc rounds once. Each test's
-//! doc gives the value it used to produce. The bodies that must not compile at
-//! all — an out-of-scope local (p15), `let X` (p5) — are refused by `sema`,
-//! and pinned by its unit tests, as the literals the parser refuses are by
-//! the parser's.
+//! Each test pins a law rustc states: a `let` is scoped to its block, a
+//! shadowed parameter is visible again after the block, a literal rounds once.
+//! The bodies that must not compile at all — an out-of-scope local, `let X` —
+//! are refused by `sema` and pinned by its unit tests, as the literals the
+//! parser refuses are by the parser's.
 //
 // The oracle closures are the kernel bodies' own text, so clippy's style
 // advice about them (`let_and_return`) would change the thing being compared.
@@ -24,17 +19,11 @@
 use pixelflow_compiler::kernel;
 use pixelflow_core::{Kernel, Lattice};
 
-/// The sample the defects were measured at: `X = 3`, `Y = 5`, so every
-/// binding in the bodies below has a distinct value.
-const AT: (f32, f32) = (3.0, 5.0);
+mod common;
+use common::{AT, bake};
 
-fn bake(k: &Kernel) -> f32 {
-    Lattice::eval_at(k, AT.0, AT.1)
-}
-
-/// p6. An inner `let` shadows only inside its own block. Before the fix the
-/// inner `a` replaced the outer one for the rest of the kernel, and this gave
-/// `Y + Y = 10`.
+/// An inner `let` shadows only inside its own block: `({ let a = Y; a }) + a`
+/// is `Y + X`, not `Y + Y`.
 #[test]
 fn an_inner_let_shadows_only_inside_its_block() {
     let k = kernel!(|| {
@@ -55,11 +44,8 @@ fn an_inner_let_shadows_only_inside_its_block() {
     assert_eq!(bake(&k), 8.0);
 }
 
-/// The same leak, through a parameter. A `let` that shadows a parameter in an
-/// inner block must leave the parameter visible after that block. Before the
-/// fix `sema` dropped the name `r` altogether when the inner block ended, and
-/// lowering then found the leaked local: `X + X = 6`, where rustc says
-/// `X + r = 13`.
+/// A `let` that shadows a parameter in an inner block leaves the parameter
+/// visible after that block: rustc says `X + r = 13`.
 #[test]
 fn a_parameter_is_visible_again_after_the_block_that_shadowed_it() {
     let k = kernel!(|r: f32| ({
@@ -96,8 +82,7 @@ fn a_let_in_the_same_block_sees_the_binding_it_shadows() {
 }
 
 /// A block nested two deep binds the same name at every level; each use sees
-/// the innermost binding in scope at that point, and nothing else. Before the
-/// fix every use after the innermost `let` read it, and this gave 190.
+/// the innermost binding in scope at that point, and nothing else.
 #[test]
 fn each_use_sees_the_innermost_binding_in_scope() {
     let k = kernel!(|| {
@@ -133,8 +118,7 @@ fn each_use_sees_the_innermost_binding_in_scope() {
 ///
 /// The literal is `1 + 2⁻²⁴ + 10⁻²⁹`: just above the midpoint between `1.0`
 /// and the next `f32`, `1 + 2⁻²³`. Parsed straight to `f32` it rounds up. Parsed
-/// to `f64` first — which the front end used to do — the `10⁻²⁹` is far below
-/// an `f64` ulp, so it lands *exactly on* the midpoint, and the cast to `f32`
+/// to `f64` first, the `10⁻²⁹` is far below an `f64` ulp, so it lands *exactly on* the midpoint, and the cast to `f32`
 /// then breaks the tie to even: `1.0`, a value one `f32` ulp from what was
 /// written.
 #[test]
@@ -223,8 +207,10 @@ fn an_else_if_chain_chooses_as_rustcs_does() {
 // The block below is the host `fn`, `const` and `if` of a glyph's coverage
 // clamp (plan §1.7), written once in `kernel!` and once in Rust.
 kernel! {
-    const SNAP: f32 = 1.0 / 1024.0;
+    // Declared before the const it names: a const resolves by name, not by
+    // position.
     pub const NEARLY_ONE: f32 = 1.0 - SNAP;
+    const SNAP: f32 = 1.0 / 1024.0;
 
     /// A helper: a function of its argument, inlined at each call.
     fn coverage(f: f32) -> f32 {
@@ -267,6 +253,31 @@ fn a_helper_and_a_const_mean_what_rusts_do() {
                 "at ({x}, {y}) × {scale}"
             );
         }
+    }
+}
+
+kernel! {
+    fn sq(x: f32) -> f32 { x * x }
+
+    /// The helper's parameter and the caller's local share a name and not a
+    /// value.
+    pub fn square_beside_a_local() -> f32 {
+        let x = X;
+        sq(Y) + x
+    }
+}
+
+fn rust_sq(x: f32) -> f32 {
+    x * x
+}
+
+/// A helper's parameter is the argument it is called with, not a binding of
+/// the same name in the caller: `sq`'s `x` is `Y` where `f`'s is `X`.
+#[test]
+fn a_helpers_parameter_is_not_the_callers_local_of_the_same_name() {
+    let k = square_beside_a_local();
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(Lattice::eval_at(&k, x, y), rust_sq(y) + x, "at ({x}, {y})");
     }
 }
 
@@ -319,6 +330,30 @@ fn a_const_never_contracts_as_rustc_never_does() {
         "one rounding: 2^-24"
     );
     assert_eq!(Lattice::eval_at(&contracted(), 0.0, 0.0), RUST_CONTRACTION);
+}
+
+kernel! {
+    const LARGE_COUNT: usize = 16777217;
+    pub const HALF: f32 = 1.0 / (LARGE_COUNT as f32);
+    pub const INF: f32 = 1.0 / 0.0;
+    pub fn scaled() -> f32 { X * HALF }
+}
+
+/// A `usize` const `as f32` rounds as Rust's `as` does: `2²⁴ + 1` is not an
+/// `f32`, and its nearest is `2²⁴`.
+#[test]
+fn a_usize_const_as_f32_rounds_as_rusts_as_does() {
+    assert_eq!(HALF, 1.0 / (16_777_217_usize as f32));
+    assert_eq!(
+        Lattice::eval_at(&scaled(), AT.0, AT.1),
+        AT.0 * (1.0 / (16_777_217_usize as f32))
+    );
+}
+
+/// A `const` that is not finite survives the expansion as it is.
+#[test]
+fn a_non_finite_const_is_the_host_const() {
+    assert_eq!(INF, f32::INFINITY);
 }
 
 // ───────────────────── B2: folds over constant ranges ─────────────────────
@@ -496,8 +531,8 @@ fn a_helpers_fold_inside_a_fold_captures_nothing_as_in_rustc() {
 /// A fold's index is scoped to the fold's body, as a closure's parameter is:
 /// it shadows a `let` and a parameter of its name inside the body, and past
 /// the fold the name means them again. Were the index's scope left open past
-/// the body — the p6 leak, through a fold — `a` and `r` after the fold would
-/// name the index, and the kernel would not compile.
+/// the body, `a` and `r` after the fold would name the index, and the kernel
+/// would not compile.
 #[test]
 fn a_fold_index_shadows_only_inside_its_body() {
     let k = kernel!(|r: f32| {
@@ -559,13 +594,15 @@ fn a_fold_over_an_empty_range_is_the_identity_as_in_rustc() {
 
 // A range from `usize` consts, evaluated at expansion as rustc evaluates the
 // same `const`s, and a `usize` const converted by `as f32` in the body: the
-// mean of `X·i` over `i ∈ [LO, HI)`.
-const RUST_LO: usize = 2;
-const RUST_TERMS: usize = 3;
+// mean of `X·i` over `i ∈ [LO, HI)`. The consts use integer division,
+// multiplication and subtraction: `LO = 7 / 2` is 3, not 3.5, and the range
+// is `3..14`.
+const RUST_LO: usize = 7 / 2;
+const RUST_TERMS: usize = RUST_LO * 4 - 1;
 const RUST_HI: usize = RUST_LO + RUST_TERMS;
 kernel! {
-    const LO: usize = 2;
-    const TERMS: usize = 3;
+    const LO: usize = 7 / 2;
+    const TERMS: usize = LO * 4 - 1;
     pub const HI: usize = LO + TERMS;
     pub fn mean_over_consts() -> f32 {
         (LO..HI).map(|i| X * (i as f32)).sum::<f32>() / (TERMS as f32)
@@ -577,6 +614,7 @@ kernel! {
 #[test]
 fn a_range_from_consts_folds_as_rustcs_does() {
     assert_eq!(HI, RUST_HI);
+    assert_eq!((RUST_LO, RUST_HI), (3, 14));
     let k = mean_over_consts();
     let rust = |x: f32, _y: f32| {
         (RUST_LO..RUST_HI).map(|i| x * (i as f32)).sum::<f32>() / (RUST_TERMS as f32)
@@ -584,7 +622,7 @@ fn a_range_from_consts_folds_as_rustcs_does() {
     for (x, y) in FOLD_SAMPLES {
         assert_eq!(Lattice::eval_at(&k, x, y), rust(x, y), "at ({x}, {y})");
     }
-    assert_eq!(bake(&k), 9.0, "3 · (2 + 3 + 4) / 3");
+    assert_eq!(bake(&k), 24.0, "3 · (3 + 4 + … + 13) / 11");
 }
 
 // ─────────────── B3: records, and counts ───────────────
@@ -809,7 +847,7 @@ fn a_per_call_count_folds_as_rustcs_does() {
 
 /// Counts at either end, and a pair that runs backwards per call: Rust's
 /// `5..2` is empty, and so is the fold at these samples (L2, which holds up to
-/// the optimizer's algebraic rules at NaN and infinity, BACKLOG E9).
+/// the optimizer's algebraic rules at NaN and infinity, Linear JP-12).
 #[test]
 fn a_range_between_counts_folds_as_rustcs_does() {
     for n in [0, 3, 8, 10] {
@@ -829,6 +867,87 @@ fn a_range_between_counts_folds_as_rustcs_does() {
                 "{lo}..{hi}, at ({x}, {y})"
             );
         }
+    }
+}
+
+kernel! {
+    /// Two per-call count bounds, one inside the other: `m` rows
+    /// of `n` terms, and `n` as a value.
+    pub fn grid(m: usize, n: usize) -> f32 {
+        (0..m)
+            .map(|i| (0..n).map(|j| X * (i as f32) + Y * (j as f32)).sum::<f32>())
+            .sum::<f32>()
+            + (n as f32)
+    }
+}
+
+fn rust_grid<const M: usize, const N: usize>(x: f32, y: f32) -> f32 {
+    (0..M)
+        .map(|i| (0..N).map(|j| x * (i as f32) + y * (j as f32)).sum::<f32>())
+        .sum::<f32>()
+        + (N as f32)
+}
+
+/// Two count bounds retain their distinct uniforms: (2, 5), (5, 2) and
+/// (3, 3) are calls to one program shape with different values.
+#[test]
+fn two_count_ranges_fold_as_rustcs_do() {
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(
+            Lattice::eval_at(&grid(2, 5), x, y),
+            rust_grid::<2, 5>(x, y),
+            "(2, 5) at ({x}, {y})"
+        );
+        assert_eq!(
+            Lattice::eval_at(&grid(5, 2), x, y),
+            rust_grid::<5, 2>(x, y),
+            "(5, 2) at ({x}, {y})"
+        );
+        assert_eq!(
+            Lattice::eval_at(&grid(3, 3), x, y),
+            rust_grid::<3, 3>(x, y),
+            "(3, 3) at ({x}, {y})"
+        );
+    }
+}
+
+kernel! {
+    /// Known folds beside one whose upper bound is a per-call count.
+    pub fn mixed(n: usize) -> f32 {
+        (0..3).map(|i| X * (i as f32)).sum::<f32>()
+            + (2..2).map(|k| Y * (k as f32)).sum::<f32>()
+            + (0..0).map(|i| X * (i as f32) + 100.0).sum::<f32>()
+            + (0..n).map(|j| Y * (j as f32)).sum::<f32>()
+    }
+}
+
+fn rust_mixed<const N: usize>(x: f32, y: f32) -> f32 {
+    (0..3).map(|i| x * (i as f32)).sum::<f32>()
+        + (2..2).map(|k| y * (k as f32)).sum::<f32>()
+        + (0..0).map(|i| x * (i as f32) + 100.0).sum::<f32>()
+        + (0..N).map(|j| y * (j as f32)).sum::<f32>()
+}
+
+/// Known folds keep their literal bounds beside a value-bound fold,
+/// including when the value is zero.
+#[test]
+fn a_known_fold_beside_an_open_one_folds_as_rustcs_does() {
+    for (x, y) in FOLD_SAMPLES {
+        assert_eq!(
+            Lattice::eval_at(&mixed(0), x, y),
+            rust_mixed::<0>(x, y),
+            "N = 0 at ({x}, {y})"
+        );
+        assert_eq!(
+            Lattice::eval_at(&mixed(2), x, y),
+            rust_mixed::<2>(x, y),
+            "N = 2 at ({x}, {y})"
+        );
+        assert_eq!(
+            Lattice::eval_at(&mixed(5), x, y),
+            rust_mixed::<5>(x, y),
+            "N = 5 at ({x}, {y})"
+        );
     }
 }
 
@@ -1058,4 +1177,37 @@ fn a_kernel_passed_on_in_one_arm_is_rusts() {
             "at ({x}, {y})"
         );
     }
+}
+
+kernel! {
+    /// Parameters spelled like the emission's own locals: the arena it builds,
+    /// its root, a node's variable and a uniform's slot.
+    pub fn named_like_the_emission(__arena: f32, __root: f32, __e0: f32, __u0: f32) -> f32 {
+        __arena * X + __root * Y + __e0 - __u0
+    }
+
+    /// The same for an entry that takes a kernel, which names its steps
+    /// `__t0`, `__u1`, `__k2`, … as it goes.
+    pub fn staged_named_like_the_emission(
+        __t0: impl Fn(f32, f32) -> f32,
+        __u1: f32,
+        __arena: f32,
+    ) -> f32 {
+        __t0(X, Y) * __u1 + __arena
+    }
+}
+
+/// A name the emission uses for its own locals means what rustc says it means
+/// when the program spells it: the emitted `__arena` is not the entry's
+/// parameter of that name, so a program may call its parameters anything.
+#[test]
+fn a_parameter_named_like_an_emitted_local_means_what_rustc_says() {
+    let rust = |x: f32, y: f32, a: f32, r: f32, e: f32, u: f32| a * x + r * y + e - u;
+    let k = named_like_the_emission(2.0, 3.0, 5.0, 7.0);
+    assert_eq!(bake(&k), rust(AT.0, AT.1, 2.0, 3.0, 5.0, 7.0));
+    assert_eq!(bake(&k), 2.0 * 3.0 + 3.0 * 5.0 + 5.0 - 7.0);
+
+    let ink = Kernel::x().add(&Kernel::y());
+    let k = staged_named_like_the_emission(&ink, 2.0, 10.0);
+    assert_eq!(bake(&k), (AT.0 + AT.1) * 2.0 + 10.0);
 }

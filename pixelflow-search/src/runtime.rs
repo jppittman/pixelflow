@@ -1134,12 +1134,12 @@ mod tests {
 
     /// **A fold index that escaped its builder is no unit.** The closure given
     /// to `Kernel::sum_over` keeps a clone of the index; interned, it is a
-    /// kernel that reads an index no fold binds, which `Kernel::by_ref` would
-    /// refuse and `KernelStore::intern` + `ExprArena::push_ref` do not. Its
-    /// variance is empty (a placeholder is a binder-to-be, never a coordinate:
-    /// `Variance::of_var`), so the variance assertion alone admits it and the
-    /// unit walk would hand the e-graph an open term, as a unit. Law U's check
-    /// is `free_index`.
+    /// kernel that reads an index no fold binds. Its variance is empty (a
+    /// placeholder is a binder-to-be, never a coordinate), so the variance
+    /// assertion alone would admit it and the unit walk would hand the e-graph
+    /// an open term, as a unit. Since the index is a `Placeholder` node of its
+    /// own, the refusal comes first at `KernelStore::intern`: a key names only
+    /// a closed program. Law U's own check, `free_index`, stays behind it.
     #[test]
     #[should_panic(expected = "an index no fold inside it binds")]
     fn a_unit_that_reads_an_escaped_fold_index_is_refused() {
