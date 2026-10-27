@@ -481,3 +481,51 @@ inlined copies of a `wide` unit pays for them in saturation, and a preserved
 unit saturates once (`pixelflow_search::runtime`'s units). That, not
 execution, is the likelier win and is measurable today by compiling the
 scene with its `Apply`s held as units; today they are expanded first.
+
+### 9.2 Compile time: the budget caps the cost and the quality pays (JP-19, 2026-10-27)
+
+JP's constraint: sharing across plain composition globally is whole-program
+optimization (fat LTO) — compile time explodes — so sharing belongs *after* a
+kernel is inlined, scoped to that body. The ruler now reports cold compile
+(`cold_compile_ms`: every row's unit carries a fresh literal, so no saturation-
+or JIT-cache hit) and, built with `--features pixelflow-search/saturation-telemetry`,
+the saturation record of each compile.
+
+The finding is not the one fat LTO predicts. Compile time does **not**
+explode with `K`; it is held down by the budget, and what falls is the search
+each copy gets. Every one of the 19 saturations stopped at `class_cap`. For the
+2-trip unit (16 classes inserted alone):
+
+| copies | classes inserted | applications | wall |
+|---|---|---|---|
+| 1 | 16 | 16,463 | 76 ms |
+| 4 | 52 | 10,020 | 27 ms |
+| 16 | 194 | 5,796 | 5 ms |
+
+Sixteen times the work gets a third of the applications, so each copy is
+searched ~45× less than the same unit saturated alone — and the scene "compiles
+faster" because it is optimized less. (Wide units, whose caps scale with the
+input, do grow: `wide64` 7 → 31 → 120 ms for 1 → 4 → 16 copies, 6 → 28 → 165 KB
+of code — linear in the copies, not superlinear.)
+
+So the inline-everything cost is paid in **quality**, not seconds, and it is
+exactly the whole-program pathology JP names: the e-graph holds the copies in
+one search space and the budget is split across them. A unit saturated once and
+linked (`runtime`'s Law U, which a held `Apply` would reach) gets the full
+budget per distinct unit and costs the outer term only its own few classes.
+That, not the call, is the case for keeping the name through extraction.
+
+Consequences for the design question:
+
+- **Share after inlining, scoped to the inlined body** (JP): agreed by the
+  numbers. Sharing across plain composition would put every copy in one
+  e-graph — the 194-class row — and is where the per-copy search collapses.
+  Hash-consing at link time (`link` splices into a hash-consed arena) is the
+  scoped form and already exists.
+- **The unit boundary is what protects the optimizer's budget**, independently
+  of whether a unit is emitted inline or called. `Apply` being expanded before
+  the unit walk (JP-110) forfeits it; holding the `Apply` as a unit until
+  after extraction, then expanding (the "expand" lowering, late), would keep
+  the budget per unit with no call at all. That is measurable with a small
+  change and is the next JP-19 step; the call lowering (L5) is only about the
+  bytes in §9.1.
