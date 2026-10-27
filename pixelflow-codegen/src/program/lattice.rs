@@ -24,9 +24,10 @@
 
 use crate::error::CompileError;
 use crate::pass::Pass;
+use crate::program::Looping;
 use pixelflow_ir::LatticeShape;
 use pixelflow_ir::arena::{COORD_AXES, ExprArena, ExprId, ExprNode, UniformDecl, UniformId};
-use pixelflow_ir::fold::{Binder, Fold, Monoid};
+use pixelflow_ir::fold::Binder;
 use pixelflow_ir::kind::OpKind;
 use pixelflow_ir::variance::Variance;
 
@@ -62,8 +63,8 @@ pub(crate) struct Traversal {
 /// and range, and the lanes it stores per trip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Piece {
-    /// The column fold: strided by the lane width for full batches.
-    pub(crate) col: Fold,
+    /// The column loop: strided by the lane width for full batches.
+    pub(crate) col: Looping,
     /// The column fold's range, `[lo, hi)`.
     pub(crate) range: [u64; 2],
     /// Lanes stored per trip: the batch, or the row's remainder.
@@ -95,12 +96,18 @@ impl Traversal {
         let lanes = u64::from(self.lanes);
         let remainder = width % lanes;
         let batches = (width > remainder).then(|| Piece {
-            col: Fold::strided(Monoid::SEQ, self.col, lanes),
+            col: Looping::Sweep {
+                binder: self.col,
+                stride: lanes,
+            },
             range: [0, width - remainder],
             lanes: self.lanes,
         });
         let tail = (remainder > 0).then(|| Piece {
-            col: Fold::new(Monoid::SEQ, self.col),
+            col: Looping::Sweep {
+                binder: self.col,
+                stride: 1,
+            },
             range: [width - remainder, width - remainder + 1],
             lanes: remainder as u32,
         });
@@ -423,7 +430,13 @@ mod tests {
         assert_eq!(pieces.len(), 1);
         assert_eq!(pieces[0].range, [0, 8]);
         assert_eq!(pieces[0].lanes, 4);
-        assert_eq!(pieces[0].col, Fold::strided(Monoid::SEQ, t.col, 4));
+        assert_eq!(
+            pieces[0].col,
+            Looping::Sweep {
+                binder: t.col,
+                stride: 4
+            }
+        );
     }
 
     /// The remainder comes after the batches, one trip of `r` lanes at `w − r`.

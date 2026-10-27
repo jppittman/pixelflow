@@ -213,10 +213,9 @@ fn legalize_keeps_a_bare_reduce_and_its_size_does_not_track_the_extent() {
         let kernel = Kernel::sum_over(extent, |i| table.at(&Kernel::constant(0.0), i));
         let (arena, root) = kernel.parts();
         let before = arena.len();
-        // Legalized for a lattice, as a compile does: the lattice's own folds
-        // are wrapped around the kernel here, and every one of them is a
-        // `Monoid::SEQ` fold, which is how the count below tells them apart
-        // from the kernel's.
+        // Legalized for a lattice, as a compile does. The lattice's loops are
+        // the backend's, not the arena's, so every `Reduce` left is the
+        // kernel's own.
         let (legalized, new_root) =
             pixelflow_codegen::legalize(arena, root, pixelflow_ir::LatticeShape::new([1, 1]))
                 .expect("legalize");
@@ -231,9 +230,7 @@ fn legalize_keeps_a_bare_reduce_and_its_size_does_not_track_the_extent() {
             if std::mem::replace(&mut seen[id.0 as usize], true) {
                 continue;
             }
-            if let pixelflow_ir::arena::ExprNode::Reduce { fold, .. } = legalized.node(id)
-                && fold.monoid() != pixelflow_ir::fold::Monoid::SEQ
-            {
+            if let pixelflow_ir::arena::ExprNode::Reduce { .. } = legalized.node(id) {
                 reduces += 1;
             }
             stack.extend(legalized.children(id));

@@ -248,7 +248,7 @@ pub(crate) mod tests {
         let mut written = scoped.folds.iter().filter(|fold| {
             sits_in(fold).iter().any(|def| {
                 def.value == fold.reduce
-                    && matches!(def.op, ScheduledOp::Reduce { fold, .. } if fold.monoid() == Monoid::SUM)
+                    && matches!(def.op, ScheduledOp::Reduce { looping, .. } if looping.accumulation().is_some_and(|fold| fold.monoid() == Monoid::SUM))
             })
         });
         let fold = written.next().expect("the kernel's own fold survives");
@@ -524,9 +524,13 @@ pub(crate) mod tests {
             |keep: fn(&ScheduledOp) -> bool| schedule.iter().filter(|d| keep(&d.op)).count();
         assert_eq!(count(|op| matches!(op, ScheduledOp::Write { .. })), 1);
         assert_eq!(
-            count(
-                |op| matches!(op, ScheduledOp::Reduce { fold, .. } if fold.monoid() == Monoid::SEQ)
-            ),
+            count(|op| matches!(
+                op,
+                ScheduledOp::Reduce {
+                    looping: crate::program::Looping::Sweep { .. },
+                    ..
+                }
+            )),
             2,
             "the row and column loops"
         );

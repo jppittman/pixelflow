@@ -9,13 +9,13 @@
 use alloc::vec::Vec;
 
 use pixelflow_ir::arena::{ExprId, ExprNode, UniformId};
-use pixelflow_ir::fold::{Binder, Bound, BoundEnd, BoundRefusal, Fold, KnownRange, Monoid};
+use pixelflow_ir::fold::{Binder, Bound, BoundEnd, BoundRefusal, KnownRange};
 use pixelflow_ir::kind::OpKind;
 use pixelflow_ir::variance::{Variance, compute_arena_variance};
 use pixelflow_ir::{Lit, ShiftCount};
 
 use super::lattice::Traversal;
-use super::{CompareOp, Def, Legal, ScheduledOp, ValueId, lane_pattern, legal, not_legal};
+use super::{CompareOp, Def, Legal, Looping, ScheduledOp, ValueId, lane_pattern, legal, not_legal};
 
 /// Mark nodes reachable from `root` via DFS.
 ///
@@ -496,7 +496,7 @@ pub(crate) fn arena_to_schedule(
                     );
                 }
                 ScheduledOp::Reduce {
-                    fold,
+                    looping: Looping::Fold(fold),
                     lo: lo.map(map_child),
                     hi: hi.map(map_child),
                     body: map_child(body),
@@ -562,7 +562,7 @@ fn write_traversal(
         let [lo, hi] = piece.range;
         pieces.push(push(
             ScheduledOp::Reduce {
-                fold: piece.col,
+                looping: piece.col,
                 lo: Bound::Lit(lo),
                 hi: Bound::Lit(hi),
                 body: write,
@@ -581,7 +581,10 @@ fn write_traversal(
         .expect("a traversal has a piece");
     let _ = push(
         ScheduledOp::Reduce {
-            fold: Fold::new(Monoid::SEQ, traversal.row),
+            looping: Looping::Sweep {
+                binder: traversal.row,
+                stride: 1,
+            },
             lo: Bound::Lit(0),
             hi: Bound::Lit(u64::from(traversal.extent[1])),
             body: walk,

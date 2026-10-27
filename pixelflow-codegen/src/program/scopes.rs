@@ -211,7 +211,7 @@ fn extract_folds_bound_by(
 
     for def in schedule.iter().rev() {
         let ScheduledOp::Reduce {
-            fold,
+            looping,
             body: body_vid,
             ..
         } = def.op
@@ -286,7 +286,7 @@ fn extract_folds_bound_by(
             .filter(|d| mark[d.value.0 as usize])
             .cloned()
             .collect();
-        let inside = bound.union(Variance::from_var(fold.binder().var()));
+        let inside = bound.union(Variance::from_var(looping.binder().var()));
         let (fold_schedule, children) =
             extract_folds_bound_by(fold_schedule, variance, inside, &placeholder_here);
         // What the parent computes is read, not recomputed: the closure's
