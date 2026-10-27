@@ -274,7 +274,7 @@ impl<B: IsaBackend> Selector<'_, B> {
     /// the unit monoid has no accumulator and returns `None`.
     ///
     /// A value bound starts the counter at its lane plus zero and ends it at
-    /// its lane. The guard around this fold (an `If`'s arm, `passes::legalize`)
+    /// its lane. The guard around this fold (an `If`'s arm, `passes::legalize_back`)
     /// made the range non-empty and within `[0, 2²⁴]`, so the do-while runs
     /// `hi − lo` trips; the counter and the end stay `f32` lanes, and no count
     /// becomes an integer on any tier. The zero is what makes the count `-0.0`

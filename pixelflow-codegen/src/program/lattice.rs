@@ -1,11 +1,13 @@
-//! The lattice's own two folds, as legalize passes.
+//! The lattice's own two folds: the CPU backend's traversal.
 //!
 //! `collapse(extent)` wraps a kernel in the row/column/lane folds a
 //! collapse *is*; `pack(lanes)` strip-mines the column fold to a target's
 //! lane width. Both are arena-level transforms, and
-//! [`legalize`](super::legalize) runs them between `lower_dwrt` and
-//! `expand_gather` — see [`super`]'s module doc for why they sit there in the
-//! full pass order.
+//! the CPU chain runs them between `legalize_front` and `legalize_back`
+//! (`pipeline.rs`) — see `pixelflow_ir::passes`'s module doc for why they sit
+//! there in the full pass order. The traversal is the backend's schedule, so
+//! it lives here and not in the target-agnostic IR
+//! (docs/language/2026-10-15-kernels-evaluate-kernels.md §3).
 //!
 //! ```text
 //! collapse(f) = fold_{j∈[0,h)} fold_{i∈[0,w)} fold_{l∈[0,1)}
@@ -27,30 +29,45 @@
 //! for_ [w−r] (\i -> for_ [0,r) (\l -> f(i+l)))`
 //! (docs/archive/plans/2026-09-16-collapse-is-a-fold.md §2.1–§2.4).
 
-use crate::arena::{COORD_AXES, ExprArena, ExprId, ExprNode, UniformDecl};
-use crate::fold::{Binder, Bound, Fold, KNOWN_RANGE, Monoid};
-use crate::kind::OpKind;
-use crate::variance::LatticeShape;
+use crate::error::CompileError;
+use crate::pass::Pass;
+use pixelflow_ir::LatticeShape;
+use pixelflow_ir::arena::{COORD_AXES, ExprArena, ExprId, ExprNode, UniformDecl};
+use pixelflow_ir::fold::{Binder, Bound, Fold, KNOWN_RANGE, Monoid};
+use pixelflow_ir::kind::OpKind;
 
-/// Binder slots the collapse scaffold adds around every kernel: row, column,
-/// and lane.
-pub const COLLAPSE_BINDERS: usize = 3;
-
-/// Maximum number of user folds that may be live when a kernel is collapsed.
-pub const KERNEL_BINDER_CAPACITY: usize = Binder::COUNT - COLLAPSE_BINDERS;
-
-/// What [`legalize`](super::legalize) wraps a kernel for: the domain it
-/// tabulates, and the lane width the target executes the innermost fold by.
-///
-/// The lanes are the one thing codegen tells the IR about a target, and they
-/// are a parameter rather than a constant because `pixelflow-ir` never names
-/// a width (CLAUDE.md, "SIMD is an implementation detail").
-#[derive(Clone, Copy, Debug)]
-pub struct Collapse {
+/// [`collapse`] as a stage: the arena a kernel lives in, wrapped in the
+/// lattice's three folds over `domain`.
+pub(crate) struct Collapse {
     /// The extent and the origin.
-    pub domain: Domain,
+    pub(crate) domain: Domain,
+}
+
+impl Pass for Collapse {
+    type Input = (ExprArena, ExprId);
+    type Output = (ExprArena, ExprId);
+
+    fn run(self, (mut arena, root): Self::Input) -> Result<Self::Output, CompileError> {
+        let root = collapse(&mut arena, root, self.domain);
+        Ok((arena, root))
+    }
+}
+
+/// [`pack`] as a stage: [`Collapse`]'s column fold strip-mined to `lanes`, the
+/// width of the tier the process chose.
+pub(crate) struct Pack {
     /// Lanes per batch: [`pack`]'s `L`.
-    pub lanes: u32,
+    pub(crate) lanes: u32,
+}
+
+impl Pass for Pack {
+    type Input = (ExprArena, ExprId);
+    type Output = (ExprArena, ExprId);
+
+    fn run(self, (mut arena, root): Self::Input) -> Result<Self::Output, CompileError> {
+        let root = pack(&mut arena, root, self.lanes);
+        Ok((arena, root))
+    }
 }
 
 /// The domain a collapse tabulates a kernel over: its extent, and the origin
@@ -58,11 +75,11 @@ pub struct Collapse {
 /// `pixelflow_core::Lattice`, origin erased"; this puts the origin back as
 /// two uniforms.
 #[derive(Clone, Copy, Debug)]
-pub struct Domain {
+pub(crate) struct Domain {
     /// Samples per axis, `[w, h]`: the two outer folds' trip counts.
-    pub shape: LatticeShape,
+    pub(crate) shape: LatticeShape,
     /// `[x0, y0]`: the lattice position of sample `(0, 0)`, bound per call.
-    pub origin: [UniformDecl; COORD_AXES],
+    pub(crate) origin: [UniformDecl; COORD_AXES],
 }
 
 /// Wrap the kernel at `root` in the lattice's three folds — row, column,
@@ -77,7 +94,7 @@ pub struct Domain {
 /// `Add(Add(Uniform(x0), Var(col)), Var(lane))` — `(x0 + col)` is
 /// lane-uniform and hoists to the batch scope — and `y` is
 /// `Add(Uniform(y0), Var(row))`. Building the warp this way and substituting
-/// it for `Var(0)`/`Var(1)` is exactly [`Kernel::at`](crate::Kernel::at).
+/// it for `Var(0)`/`Var(1)` is exactly `Kernel::at`.
 ///
 /// # Panics
 ///
@@ -88,13 +105,13 @@ pub struct Domain {
 ///   would silently never reach it. A `Dwrt` must be taken with respect to
 ///   `Var(0)` before this pass substitutes that variable away, or the
 ///   chain-rule factor it needs is gone. Run `expand_refs`, then
-///   [`lower_dwrt`](super::lower_dwrt), first — see
-///   [`legalize`](super::legalize) for the order.
+///   `lower_dwrt`, first — see
+///   `pipeline.rs` for the order.
 /// - If fewer than three binder slots are free — neither bound by a
 ///   reachable `Reduce` nor read by a reachable `Var` in the binder range: a
 ///   kernel already nesting three folds of its own leaves nothing for the
 ///   lattice.
-pub fn collapse(arena: &mut ExprArena, root: ExprId, domain: Domain) -> ExprId {
+fn collapse(arena: &mut ExprArena, root: ExprId, domain: Domain) -> ExprId {
     let taken = reachable_taken_binders(arena, root);
     let mut free = (0..Binder::COUNT as u8).filter(|&slot| !taken[slot as usize]);
     let mut next_binder = |which: &str| {
@@ -151,12 +168,10 @@ pub fn collapse(arena: &mut ExprArena, root: ExprId, domain: Domain) -> ExprId {
     )
 }
 
-const _: () = assert!(Binder::COUNT >= COLLAPSE_BINDERS);
-
 /// The full pass order, named once so every panic message in this file spells
 /// it identically.
 const PASS_ORDER: &str = "expand_refs -> lower_dwrt -> collapse -> pack -> expand_gather \
-     -> expand_transcendentals";
+     -> expand_transcendentals -> guard";
 
 /// Which binder slots [`collapse`] must not choose — bound by a reachable
 /// `Reduce`, or read by a reachable `Var` in the binder range — found in one
@@ -165,8 +180,8 @@ const PASS_ORDER: &str = "expand_refs -> lower_dwrt -> collapse -> pack -> expan
 /// [`collapse`]'s own doc for why each is refused).
 fn reachable_taken_binders(arena: &ExprArena, root: ExprId) -> [bool; Binder::COUNT] {
     let mut taken = [false; Binder::COUNT];
-    let mut seen = alloc::vec![false; arena.len()];
-    let mut stack = alloc::vec![root];
+    let mut seen = vec![false; arena.len()];
+    let mut stack = vec![root];
     while let Some(id) = stack.pop() {
         let idx = id.0 as usize;
         if core::mem::replace(&mut seen[idx], true) {
@@ -220,7 +235,7 @@ fn reachable_taken_binders(arena: &ExprArena, root: ExprId) -> [bool; Binder::CO
 ///   folds' binders, in that order. Naming a pipeline-order bug: `pack` must
 ///   run directly on `collapse`'s own output.
 /// - If `lanes == 0`, or the column fold is empty.
-pub fn pack(arena: &mut ExprArena, root: ExprId, lanes: u32) -> ExprId {
+fn pack(arena: &mut ExprArena, root: ExprId, lanes: u32) -> ExprId {
     assert!(lanes != 0, "pack: lanes must be nonzero");
 
     let (row_fold, col_fold, lane_fold, write) = collapse_shape(arena, root);
@@ -383,10 +398,10 @@ fn collapse_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::{BufferDecl, BufferIdentity, UniformIdentity};
-    use crate::fold::KnownRange;
-    use crate::variance::{Variance, compute_arena_variance};
-    use crate::{Kernel, key::KernelKey};
+    use pixelflow_ir::arena::{BufferDecl, BufferIdentity, UniformIdentity};
+    use pixelflow_ir::fold::KnownRange;
+    use pixelflow_ir::variance::{Variance, compute_arena_variance};
+    use pixelflow_ir::{Kernel, key::KernelKey};
 
     /// Two uniforms, freshly minted, for `Domain::origin` — no test cares
     /// about their default beyond "some value", so `0.0` throughout.
@@ -412,8 +427,8 @@ mod tests {
     /// `variance.rs`'s `six_nested_binders_each_take_a_slot` uses to confirm
     /// no rename captured an index it should not have.
     fn reachable_var(arena: &ExprArena, root: ExprId, target: u8) -> bool {
-        let mut seen = alloc::vec![false; arena.len()];
-        let mut stack = alloc::vec![root];
+        let mut seen = vec![false; arena.len()];
+        let mut stack = vec![root];
         while let Some(id) = stack.pop() {
             let idx = id.0 as usize;
             if core::mem::replace(&mut seen[idx], true) {
@@ -429,8 +444,8 @@ mod tests {
 
     /// Whether an `OpKind::Seq` node is reachable from `root`.
     fn reachable_seq(arena: &ExprArena, root: ExprId) -> bool {
-        let mut seen = alloc::vec![false; arena.len()];
-        let mut stack = alloc::vec![root];
+        let mut seen = vec![false; arena.len()];
+        let mut stack = vec![root];
         while let Some(id) = stack.pop() {
             let idx = id.0 as usize;
             if core::mem::replace(&mut seen[idx], true) {

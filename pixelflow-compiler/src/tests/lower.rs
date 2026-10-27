@@ -5,7 +5,7 @@ use crate::ast::Role;
 use crate::lower::{Expansion, Lowered};
 use crate::parser::parse;
 use pixelflow_ir::arena::ExprNode;
-use pixelflow_ir::passes::lattice::KERNEL_BINDER_CAPACITY;
+use pixelflow_ir::arena::KERNEL_BINDER_CAPACITY;
 use quote::quote;
 
 /// `sema` counts the folds one body nests; a helper's fold inlined into

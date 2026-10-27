@@ -11,9 +11,8 @@
 use pixelflow_ir::arena::{Axis, ExprArena, ExprId, ExprNode};
 use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 use pixelflow_ir::key::canonical;
-use pixelflow_ir::passes::lattice::{Collapse, Domain};
-use pixelflow_ir::passes::legalize;
-use pixelflow_ir::variance::{LatticeShape, Variance, compute_arena_variance};
+use pixelflow_ir::passes::{legalize_back, legalize_front};
+use pixelflow_ir::variance::{Variance, compute_arena_variance};
 use pixelflow_ir::{Kernel, KernelKey, Lit, OpKind, Uniform};
 
 /// The `slot`-th binder.
@@ -252,15 +251,8 @@ fn legalize_guards_what_over_values_built() {
         Kernel::x().mul(i)
     });
     let (arena, root) = sum.parts();
-    let origin = |default| Uniform::new(default).decl();
-    let collapse = Collapse {
-        domain: Domain {
-            shape: LatticeShape::new([4, 2]),
-            origin: [origin(0.0), origin(0.0)],
-        },
-        lanes: 4,
-    };
-    let (legalized, root) = legalize(arena, root, &collapse).expect("a kernel with no Dwrt");
+    let (legalized, root) = legalize_front(arena, root).expect("a kernel with no Dwrt");
+    let (legalized, root) = legalize_back(&legalized, root);
 
     let reachable = reachable(&legalized, root);
     let valued: Vec<ExprId> = reachable

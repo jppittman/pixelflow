@@ -442,7 +442,7 @@ pub enum BoundRefusal {
     /// a literal (a count the host writes is refused at the write, before it is
     /// a value); every other constructor
     /// keeps such a literal as a value bound, whose guard makes the fold NaN
-    /// (`passes::legalize`'s guard), so a literal a rule made never panics.
+    /// (`passes::legalize_back`'s guard), so a literal a rule made never panics.
     BoundOutOfDomain { end: BoundEnd, literal: f32 },
     /// A bound of a sort the fold cannot take (§1.4): a mask, which names no
     /// count, at either end under any fold; or any value bound under `ANY`,

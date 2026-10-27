@@ -112,6 +112,17 @@ fn dag_children(n: Node<'_, NodeData>) -> impl Iterator<Item = ExprId> + '_ {
 /// (docs/archive/plans/2026-09-06-lattice-is-the-index.md).
 pub const COORD_AXES: usize = 2;
 
+/// Binder slots a backend's lattice traversal reserves around every kernel
+/// (the CPU's: row, column and lane), so a kernel may nest only
+/// [`KERNEL_BINDER_CAPACITY`] folds of its own. The language's side of a
+/// contract the backend's traversal (`pixelflow-codegen`'s `Collapse`) keeps.
+pub const COLLAPSE_BINDERS: usize = 3;
+
+/// Maximum number of user folds that may be live when a kernel is collapsed.
+pub const KERNEL_BINDER_CAPACITY: usize = Binder::COUNT - COLLAPSE_BINDERS;
+
+const _: () = assert!(Binder::COUNT >= COLLAPSE_BINDERS);
+
 /// One of the [`COORD_AXES`]: the `Var` a kernel reads a coordinate
 /// through, and the axis a derivative is taken along.
 ///
@@ -900,7 +911,7 @@ impl ExprArena {
     /// through the handle that minted it — the default travels with the
     /// identity in one `Copy` value — so it is a corrupt graph, and an
     /// assertion rather than a silent alias onto whichever arrived first.
-    pub(crate) fn uniform_slot_for(&mut self, decl: UniformDecl) -> UniformId {
+    pub fn uniform_slot_for(&mut self, decl: UniformDecl) -> UniformId {
         match self.uniforms.iter().position(|d| d.id == decl.id) {
             Some(i) => {
                 assert_eq!(
@@ -991,7 +1002,7 @@ impl ExprArena {
     /// ([`Bound::discover`]), so every constructor — a builder, a copier,
     /// extraction's `embed` — holds a known bound as data. A `Const` naming no
     /// count (not an integer, or outside `0..=Fold::EXACT_BOUND`) stays a value
-    /// bound, whose guard makes the fold NaN (L5: the guard `passes::legalize`
+    /// bound, whose guard makes the fold NaN (L5: the guard `passes::legalize_back`
     /// ends with): a literal a rule or the folder made never panics here.
     /// `Kernel::over_values` refuses one by name
     /// ([`BoundRefusal::BoundOutOfDomain`](crate::fold::BoundRefusal::BoundOutOfDomain)),
@@ -1063,16 +1074,11 @@ impl ExprArena {
     /// A store of `value` at the lattice position the three binders name —
     /// see [`ExprNode::Write`].
     ///
-    /// Crate-private: only the legalize passes that wrap a kernel in the
-    /// lattice's folds may build one. Nothing a `Kernel` can say, and
+    /// Public for the backend that owns the lattice's traversal
+    /// (`pixelflow-codegen`'s `Collapse`): only a pass that wraps a kernel in
+    /// the lattice's folds builds one. Nothing a `Kernel` can say, and
     /// nothing the e-graph will hold.
-    pub(crate) fn push_write(
-        &mut self,
-        row: Binder,
-        col: Binder,
-        lane: Binder,
-        value: ExprId,
-    ) -> ExprId {
+    pub fn push_write(&mut self, row: Binder, col: Binder, lane: Binder, value: ExprId) -> ExprId {
         self.intern(NodeData::Write(row, col, lane), &[value])
     }
 
@@ -2006,7 +2012,7 @@ impl ExprArena {
     /// `Var(i)` it meets, so substituting a slot a nested fold binds would
     /// replace that fold's own index — capture, plausible wrong pixels. Its
     /// callers substitute coordinates (`ExprArena::apply`,
-    /// `passes::lattice::collapse`), retired axes (`pixelflow-pipeline`'s
+    /// `program::lattice::collapse`), retired axes (`pixelflow-pipeline`'s
     /// `bind_retired_axes`), or a rewrite template's metavariables
     /// (`template.rs`'s `shift_vars` and `canonicalize_vars`, over templates
     /// that hold no fold), none of which a fold binds. This is not the plan's
