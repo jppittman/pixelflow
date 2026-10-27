@@ -57,11 +57,11 @@ for (§4); that is the input of `select` (§10).
   `tests/collapse_paths.rs` and `tests/value_bounds_jit.rs`.
 
 ## Behind
-- `Lower` writes the traversal's loops (`lattice.rs`'s `Traversal`) as
-  `ScheduledOp::Write`/`Reduce`/`Seq` defs, so `Nest` receives them as a
-  schedule rather than a factorization; `Lanes` and the lane-fold-as-store
-  carry that CPU schedule. They move into `Nest`
-  (`docs/codegen/2026-10-15-a-schedule-is-a-factorization.md` §1, §4).
+- `Nest` writes the traversal's loops as `ScheduledOp::Write`/`Reduce`/`Seq`
+  defs and then carves them like any fold, rather than holding the lattice as
+  a factorization of its own; `Lanes` and the lane-fold-as-store carry that CPU
+  schedule. A tiling or a second factorization is a second `impl`, not yet
+  a seam (`docs/codegen/2026-10-15-a-schedule-is-a-factorization.md` §1, §4).
 - `ScheduledOp::Context(u16)` and `Write { lanes: u32 }` are narrower than the
   control plane's 64 bits with no measurement cited; no plan closes it.
 
