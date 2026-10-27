@@ -22,7 +22,7 @@ push — or lowering's refusal.
 
 ## Never
 - No lowering and no checking: the walk is `lower_entry`'s, run through
-  `Expansion` or `Staged`; a node no body can spell (`Buffer`, `Ref`, `Write`) is a panic.
+  `Expansion` or `Staged`; a node no body can spell (`Buffer`, `Ref`) is a panic.
 - No optimization: `optimizer` is a value handed in; `Declined` needs no arm.
 - No `::std` path, so a `no_std` crate expands any block; a constant and a
   fold header travel as bits.

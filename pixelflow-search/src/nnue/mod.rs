@@ -172,8 +172,6 @@ pub fn pattern_match_arena(
             // rather than a pattern to match. A fold in the *target* still
             // matches nothing, which is what this arm says.
             ExprNode::Reduce { .. } => return None,
-            // Nor a store: post-legalize vocabulary no template names.
-            ExprNode::Write { .. } => return None,
         }
     }
 
@@ -247,10 +245,6 @@ pub fn substitute_template_arena(
             ExprNode::Reduce { .. } => panic!(
                 "a fold in a rewrite template — templates are arithmetic, and a \
                  fold binds; its decompositions are rules of their own"
-            ),
-            ExprNode::Write { .. } => panic!(
-                "a Write in a rewrite template — a store is an effect the legalize \
-                 passes build after extraction, and no rule rewrites into one"
             ),
             ExprNode::Unary(op, t_a) => {
                 let a = ExprId(remap[t_a.0 as usize]);
@@ -904,8 +898,6 @@ impl BwdGenerator {
                         body: remapped(body),
                     })
                 }
-                // A corpus expression is pre-legalize by construction.
-                Shape::Write { .. } => panic!("junkify: a Write in a corpus expression"),
                 Shape::Op(op, children) => match children {
                     Children::Zero => panic!("junkify: op with 0 children"),
                     Children::One(a) => self.arena.push_unary(op, remap[a.0 as usize]),

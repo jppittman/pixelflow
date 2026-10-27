@@ -8,7 +8,7 @@ use crate::ast::{
     ProjectExpr, Projection, RecordId, Role, Scopes, Stmt, UnaryOp, arity_mismatch, same_name,
 };
 use pixelflow_ir::OpKind;
-use pixelflow_ir::passes::lattice::KERNEL_BINDER_CAPACITY;
+use pixelflow_ir::arena::KERNEL_BINDER_CAPACITY;
 use proc_macro2::Span;
 use std::collections::HashMap;
 use syn::Ident;

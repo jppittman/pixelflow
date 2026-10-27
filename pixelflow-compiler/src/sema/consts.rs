@@ -2,7 +2,7 @@
 //! evaluator checks it, a fold's bounds, and every `const`'s value.
 
 use crate::ast::{BinaryOp, ConstItem, Expr, Name, RangeExpr, UnaryOp};
-use pixelflow_ir::passes::lattice::{COLLAPSE_BINDERS, KERNEL_BINDER_CAPACITY};
+use pixelflow_ir::arena::{COLLAPSE_BINDERS, KERNEL_BINDER_CAPACITY};
 use pixelflow_ir::{Binder, Fold, KnownRange};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;

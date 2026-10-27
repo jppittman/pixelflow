@@ -41,17 +41,6 @@ impl Ir for ExprArena {
                 Shape::Op(op, Children::Many(slice))
             }
             ExprNode::Reduce { fold, lo, hi, body } => Shape::Reduce { fold, lo, hi, body },
-            ExprNode::Write {
-                row,
-                col,
-                lane,
-                value,
-            } => Shape::Write {
-                row,
-                col,
-                lane,
-                value,
-            },
         }
     }
 
@@ -85,12 +74,6 @@ impl Ir for ExprArena {
                 },
             },
             Shape::Reduce { fold, lo, hi, body } => self.push_reduce(fold, lo, hi, body),
-            Shape::Write {
-                row,
-                col,
-                lane,
-                value,
-            } => self.push_write(row, col, lane, value),
         }
     }
 }
@@ -156,9 +139,6 @@ impl ExprArena {
                         .into_iter()
                         .filter(|k| memo[k.0 as usize].is_none())
                         .collect(),
-                    Shape::Write { value, .. } if memo[value.0 as usize].is_none() => {
-                        alloc::vec![value]
-                    }
                     _ => Vec::new(),
                 };
                 if !pending.is_empty() {
@@ -198,20 +178,6 @@ impl ExprArena {
                         lo: lo.map(child),
                         hi: hi.map(child),
                         body: child(body),
-                    })
-                }
-                Shape::Write {
-                    row,
-                    col,
-                    lane,
-                    value,
-                } => {
-                    let value = memo[value.0 as usize].expect("rebuild_into: value before write");
-                    out.embed(Shape::Write {
-                        row,
-                        col,
-                        lane,
-                        value,
                     })
                 }
             };

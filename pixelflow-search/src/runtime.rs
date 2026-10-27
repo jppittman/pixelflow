@@ -1230,7 +1230,7 @@ mod tests {
     }
 
     /// **A decline narrows.** A unit the e-graph cannot hold — here, one
-    /// holding a `Seq`, an op no vocabulary resolves — is linked as written,
+    /// holding a `Tuple`, an op no vocabulary resolves — is linked as written,
     /// while the unit beside it is still optimized: one declining unit no
     /// longer costs the program every other unit's optimization.
     #[test]
@@ -1238,8 +1238,8 @@ mod tests {
         let mut sequenced = ExprArena::new();
         let x = sequenced.push_var(0);
         let y = sequenced.push_var(1);
-        let seq = sequenced.push_binary(OpKind::Seq, x, y);
-        let declines = Kernel::from_parts(sequenced, seq);
+        let tuple = sequenced.push_nary(OpKind::Tuple, &[x, y]);
+        let declines = Kernel::from_parts(sequenced, tuple);
         // X·0 + Y: folds to Y, which only an optimized unit can say.
         let folds = Kernel::x().mul(&Kernel::constant(0.0)).add(&Kernel::y());
         let program = declines.by_ref().add(&folds.by_ref());
@@ -1256,7 +1256,7 @@ mod tests {
         assert!(
             kinds
                 .iter()
-                .any(|n| matches!(n, ExprNode::Binary(OpKind::Seq, ..))),
+                .any(|n| matches!(n, ExprNode::Nary(OpKind::Tuple, ..))),
             "the declining unit is linked as written: {}",
             out.display(*out_root)
         );
@@ -2403,8 +2403,7 @@ pub(crate) mod production_telemetry {
                 other @ (ExprNode::Param(_)
                 | ExprNode::Nary(..)
                 | ExprNode::Ref(_)
-                | ExprNode::Apply(..)
-                | ExprNode::Write { .. }) => {
+                | ExprNode::Apply(..)) => {
                     panic!("extracted arena contains {other:?}")
                 }
             };

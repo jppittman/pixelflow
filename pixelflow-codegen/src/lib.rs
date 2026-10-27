@@ -24,6 +24,7 @@ pub mod isa;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub mod jit_cache;
 pub use error::CompileError;
+pub use pipeline::legalize;
 /// The digest the byte probes print and `pixelflow-pipeline`'s content identities are built from; the definition lives in `pixelflow-ir`.
 pub use pixelflow_ir::key::fnv1a64;
 

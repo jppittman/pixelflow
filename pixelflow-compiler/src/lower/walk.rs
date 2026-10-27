@@ -12,7 +12,7 @@ use crate::sema::{
     range_bounds,
 };
 use pixelflow_ir::arena::Axis;
-use pixelflow_ir::passes::lattice::KERNEL_BINDER_CAPACITY;
+use pixelflow_ir::arena::KERNEL_BINDER_CAPACITY;
 use pixelflow_ir::{Monoid, OpKind};
 use std::collections::HashMap;
 use std::rc::Rc;

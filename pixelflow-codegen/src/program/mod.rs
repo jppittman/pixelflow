@@ -7,11 +7,13 @@
 //! produces and what allocation and emission consume, which is why it lives
 //! under neither. The stages that build it are [`Nest`], [`Own`] and [`Layout`].
 
+mod lattice;
 mod layout;
 mod lower;
 mod ownership;
 mod scopes;
 mod tree;
+pub(crate) use lattice::{Collapse, Domain, Factored};
 pub(crate) use layout::Layout;
 pub(crate) use lower::arena_to_schedule;
 pub(crate) use ownership::Own;
@@ -20,9 +22,17 @@ pub(crate) use scopes::Nest;
 use alloc::vec::Vec;
 
 use pixelflow_ir::Lit;
-use pixelflow_ir::fold::{Binder, Bound, Fold};
+use pixelflow_ir::fold::{Binder, Bound, Fold, KnownRange};
 use pixelflow_ir::kind::OpKind;
 use pixelflow_ir::variance::Variance;
+
+/// What [`Nest`] factors: the kernel's flat schedule, the id of its value, and
+/// the traversal whose loops go around that value.
+pub(crate) struct Lowered {
+    pub(crate) schedule: Vec<Def>,
+    pub(crate) value: ValueId,
+    pub(crate) traversal: lattice::Traversal,
+}
 
 /// The lane a literal tabulates to, as the `f32` a [`ScheduledOp::Const`]
 /// carries: a real is itself, a true mask is the all-ones lane and a false
@@ -148,11 +158,73 @@ pub(crate) enum ScheduledOp {
     /// the loop is entered, and `hi` is read at its latch, both in the scope
     /// this def sits in. Selection reads a known range with `KnownRange::of`.
     Reduce {
-        fold: Fold,
+        looping: Looping,
         lo: Bound<ValueId>,
         hi: Bound<ValueId>,
         body: ValueId,
     },
+}
+
+/// How a [`ScheduledOp::Reduce`] counts and what it carries.
+///
+/// Either a fold the kernel wrote, which combines each trip's body into an
+/// accumulator, or a sweep the backend wrote: the lattice's row and column
+/// loops, which carry nothing and exist for the stores in their bodies.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Looping {
+    /// A fold of the kernel's: its binder, stride and algebra.
+    Fold(Fold),
+    /// A traversal loop of the backend's: its binder and stride.
+    Sweep { binder: Binder, stride: u64 },
+}
+
+impl Looping {
+    /// The binder the loop counts with.
+    pub(crate) fn binder(self) -> Binder {
+        match self {
+            Self::Fold(fold) => fold.binder(),
+            Self::Sweep { binder, .. } => binder,
+        }
+    }
+
+    /// The fold whose algebra the loop accumulates under, if it carries one.
+    pub(crate) fn accumulation(self) -> Option<Fold> {
+        match self {
+            Self::Fold(fold) => Some(fold),
+            Self::Sweep { .. } => None,
+        }
+    }
+
+    /// The trips of the loop over `[lo, hi)`, or `None` when a bound is a
+    /// value.
+    pub(crate) fn range(self, lo: Bound<ValueId>, hi: Bound<ValueId>) -> Option<Counted> {
+        match self {
+            Self::Fold(fold) => KnownRange::of(fold, lo, hi).map(|range| Counted {
+                trips: range.len(),
+                stride: range.stride(),
+                empty: range.is_empty(),
+            }),
+            Self::Sweep { stride, .. } => {
+                let (lo, hi) = (lo.lit()?, hi.lit()?);
+                Some(Counted {
+                    trips: (hi - lo) / stride,
+                    stride,
+                    empty: hi <= lo,
+                })
+            }
+        }
+    }
+}
+
+/// A loop whose bounds are literals, as selection reads it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Counted {
+    /// How many times the body runs.
+    pub(crate) trips: u64,
+    /// The step between indices.
+    pub(crate) stride: u64,
+    /// Whether the loop runs no trip.
+    pub(crate) empty: bool,
 }
 
 /// The ops a backend selects, as types: [`ScheduledOp`] carries these and not
@@ -232,7 +304,7 @@ impl BinaryOp {
     }
 }
 
-/// The legal op `op` is. `passes::legalize` leaves only these, so none is a
+/// The legal op `op` is. `passes::legalize_back` leaves only these, so none is a
 /// bad kernel: it is a bypassed pipeline, and nothing a caller could act on.
 pub(crate) fn legal<T: Legal>(op: OpKind) -> T {
     T::of(op).unwrap_or_else(|| not_legal(op))
@@ -242,7 +314,7 @@ pub(crate) fn legal<T: Legal>(op: OpKind) -> T {
 #[inline(never)]
 fn not_legal(op: OpKind) -> ! {
     panic!(
-        "{op:?} is not a backend-legal op -- `passes::legalize` \
+        "{op:?} is not a backend-legal op -- `passes::legalize_back` \
          leaves only backend-legal ops, so the pipeline was bypassed, not the kernel \
          refused"
     )

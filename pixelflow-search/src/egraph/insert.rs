@@ -73,12 +73,6 @@ pub enum Declined {
     /// (`pixelflow_ir::passes::expand_applies`), which the runtime tier does
     /// before it inserts.
     Apply(pixelflow_ir::KernelKey),
-    /// A `Write` — the store the lattice's folds wrap a kernel in
-    /// (docs/archive/plans/2026-09-16-collapse-is-a-fold.md §2.4). Declined for a
-    /// standing reason: an effect is not a value, so no rule may rewrite
-    /// it, and it is built by the legalize passes *after* extraction, so a
-    /// term carrying one into saturation skipped the pipeline.
-    Write,
 }
 
 /// Insert the subgraph reachable from `root` into `egraph`, returning the
@@ -140,7 +134,6 @@ pub fn insert<I: Ir>(
                         _ => return Err(Declined::Ref(key)),
                     },
                     Shape::Apply(key, ..) => return Err(Declined::Apply(key)),
-                    Shape::Write { .. } => return Err(Declined::Write),
                     Shape::Buffer(decl) => egraph.add(ENode::Buffer(decl)),
                     Shape::Uniform(decl) => egraph.add(ENode::Uniform(decl)),
                     Shape::Op(kind, children) => {
@@ -291,7 +284,6 @@ pub fn inserted_class_count<I: Ir>(term: &I, root: I::Ref) -> usize {
                 stack.extend(lo.value());
                 stack.extend(hi.value());
             }
-            Shape::Write { value, .. } => stack.push(value),
             _ => {}
         }
     }

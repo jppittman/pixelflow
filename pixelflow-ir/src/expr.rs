@@ -362,12 +362,6 @@ pub fn from_arena_roots(
                     ExprNode::Ref(key) => b.push_ref(key),
                     ExprNode::Apply(key, _, _) => b.push_apply(key, child_ids[0], child_ids[1]),
                     ExprNode::Reduce { .. } => b.push_reduce(arena.fold_header(id), &child_ids),
-                    // Post-legalize only: no `Kernel` holds a store, and a
-                    // term language a `Kernel` is made of has no word for one.
-                    ExprNode::Write { .. } => panic!(
-                        "a Write reached a Kernel's DAG: it is built by the legalize \
-                         passes after extraction, and nothing before them may hold one"
-                    ),
                     ExprNode::Unary(op, _)
                     | ExprNode::Binary(op, _, _)
                     | ExprNode::Ternary(op, _, _, _)

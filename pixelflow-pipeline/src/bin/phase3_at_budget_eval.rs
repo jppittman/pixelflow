@@ -442,7 +442,6 @@ fn non_leaf_op(node: &ExprNode) -> Option<OpKind> {
         | ExprNode::Ternary(op, _, _, _)
         | ExprNode::Nary(op, _) => Some(*op),
         ExprNode::Reduce { .. } => Some(OpKind::Reduce),
-        ExprNode::Write { .. } => None,
     }
 }
 
