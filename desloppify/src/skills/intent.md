@@ -46,7 +46,7 @@ desloppify is not a pixelflow crate, so this cites its README, not DENOTATION.
   (intent-lives-with-the-module §5, 2026-10-15).
 - desloppify/README.md lists three skills (`style-guide`,
   `pixelflow-architecture`, `behavioral-contracts`) and omits `ontology`,
-  which is loadable and named by no shipped rule. No plan or BACKLOG item
+  which is loadable and named by no shipped rule. No plan or Linear issue
   closes this.
 
 ## Decided in

@@ -56,7 +56,7 @@ under a cost. `Optimizer::run` is its one entry; the five laws of §8 are its co
   reversing guide that does not exist; the plan's `optimizer_laws.rs` was deleted. L4 has no test.
 - L5's argmin half is violated and two docs lag the code: DENOTATION §8 and the `Optimizer::cost` doc say
   sharing is never priced, but `extract_dag_over` also runs `shared_dag_dp_pass` and keeps the cheaper by
-  `dag_cost`. Both arms are greedy (BACKLOG E5); a fold over a known range ties its unrolling and insertion
+  `dag_cost`. Both arms are greedy (JP-15); a fold over a known range ties its unrolling and insertion
   order decides (E6); `Reranker` has no implementation outside tests.
 - A value bound's pick is unconstrained: a class read as a bound can settle on a member that reads a coordinate,
   and `ExprArena::push_reduce` refuses it by name; pinned in `fold_rules.rs`, left loud until a kernel hits it.

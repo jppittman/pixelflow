@@ -52,7 +52,7 @@ DENOTATION.
 - Nothing tests the concurrency line of the contract (slots booked in call
   order); `tests/rate_limit.rs` is single-threaded.
 - `adaptive` asserts its config; `token_bucket` validates nothing, so a zero
-  `refill` divides by zero in `wait`. No plan or BACKLOG item names either.
+  `refill` divides by zero in `wait`. No plan or Linear issue names either.
 
 ## Decided in
 `desloppify/README.md` "Rate limiting"; introduced in #1319 (`f93dc7d9`). No

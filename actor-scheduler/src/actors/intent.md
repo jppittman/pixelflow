@@ -46,11 +46,11 @@ effective on the next wait, and `stop(self)`). Callers today:
 
 ## Behind
 - Nothing checks that `actors/` stays `std`-only and free of domain concepts; the
-  `mod.rs` doc and review are the guard (2026-10-15; no plan or BACKLOG item).
+  `mod.rs` doc and review are the guard (2026-10-15; no plan or Linear issue).
 - A `Timer` is one OS thread per clock. The Draft transducer design puts timers
   in a reactor on the System lane (§3.3); no reactor exists in
   `actor-scheduler/src` (2026-10-15; that design is open).
-- The ontology has no entry for `Timer` (2026-10-15; no plan or BACKLOG item).
+- The ontology has no entry for `Timer` (2026-10-15; no plan or Linear issue).
 
 ## Decided in
 `docs/runtime/actor-scheduler-mealy-transducer.md` (Draft; §3.3, and its note

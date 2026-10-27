@@ -48,7 +48,7 @@ uniforms and a shape.
   (the-language-is-kernel D13: it leaves core; the plan is Proposed).
 - `build_scene` in `core-term/src/terminal_app.rs` allocates the cell table
   on every drawn frame (one-pipeline U3). The cell table as a discrete kernel
-  (kernels-evaluate-kernels §2) closes it; no BACKLOG item tracks it.
+  (kernels-evaluate-kernels §2) closes it; no Linear issue tracks it.
 - `AppEvent` and `RenderRequest` in `core-term/src/messages.rs` are used
   nowhere else, and `core-term/src/color.rs` names a `pixelflow-render` that
   does not exist; no plan names them.

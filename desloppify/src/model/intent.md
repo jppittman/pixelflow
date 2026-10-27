@@ -45,7 +45,7 @@ is the human reading of `Provider::model`.
 ## Behind
 - No test pins the ladder: nothing fails if an id in `Provider::model` is
   misspelled or retired (three Gemini ids are `-preview` names), so the first
-  real call finds out. No plan or BACKLOG item covers it.
+  real call finds out. No plan or Linear issue covers it.
 - `Provider` derives `clap::ValueEnum`, but `main.rs` selects a backend
   through its own `Backend` enum and never parses a `Provider`; the derive is
   unused.

@@ -17,7 +17,7 @@
 //! **What the halving side hands the JIT.** Under the production latency
 //! prior a loop and its unrolling cost the same, so extraction keeps the
 //! first node the class held — the `Reduce` — and the chain the rules built
-//! is never the term anyone compiles (docs/BACKLOG.md, E6). A test that
+//! is never the term anyone compiles (Linear JP-15). A test that
 //! extracted under that prior and compiled the result would compile a loop
 //! and say nothing about `HalveFold`. So the extraction here prices a loop
 //! out ([`LoopsCostMore`]): the chain is priced for, not asserted, and the

@@ -53,16 +53,16 @@ language op goes in `pixelflow-ir`, not here.
 ## Behind
 - `BoundManifold`, `Manifold::bind` and `MAX_BOUND_BUFFERS` are public and
   `collapse` takes the bound form, though a bound buffer is not a concept
-  (DENOTATION §6, §11); closed by kernels-evaluate-kernels §2 (BACKLOG N1, N4).
+  (DENOTATION §6, §11); closed by kernels-evaluate-kernels §2 (JP-22).
 - `CellGridProgram` is terminal-shaped geometry in a crate that may hold none;
   it leaves core (the-language-is-kernel D13).
 - `#![no_std]` is not whole: `src/lattice/manifold.rs` takes `extern crate std`
   for its `RwLock` and `HashMap`; the crate does not build for wasm32
   (`scripts/wasm_status_baseline.txt`).
 - `Lattice::extent` is `[u32; 2]`, against the 64-bit control plane; no plan
-  or BACKLOG row closes it.
+  or Linear issue closes it.
 - The traversal reaches the kernel as IR folds; it moves into the CPU backend
-  (kernels-evaluate-kernels §3, BACKLOG H6).
+  (kernels-evaluate-kernels §3, JP-16).
 
 ## Decided in
 `docs/DENOTATION.md` §5, §6, §11; `docs/archive/plans/2026-09-06-kernel-with-a-lattice.md`,
