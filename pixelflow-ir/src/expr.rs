@@ -272,6 +272,15 @@ pub(crate) fn substitute_vars(
                 };
                 let (cx, cy) = (at(Axis::X), at(Axis::Y));
                 builder.push_apply(key, cx, cy)
+            } else if let ExprData::Apply(key) = *node {
+                // The warps compose, and a composite that is the identity
+                // is the bare name again: through `push_apply`, not copied.
+                let mut warp = node
+                    .children()
+                    .map(|c| table[c].expect("child must have been copied"));
+                let cx = warp.next().expect("an Apply node has two children");
+                let cy = warp.next().expect("an Apply node has two children");
+                builder.push_apply(key, cx, cy)
             } else {
                 let child_ids: Vec<Id> = node
                     .children()

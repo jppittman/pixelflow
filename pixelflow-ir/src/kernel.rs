@@ -1825,6 +1825,25 @@ mod tests {
         assert!(matches!(arena.node(root), ExprNode::Ref(_)));
     }
 
+    /// Warps that compose to the identity give the bare name back: the swap
+    /// applied twice is `Ref(k)`, not `Apply(k, X, Y)` — one meaning, one node.
+    #[cfg(feature = "std")]
+    #[test]
+    fn warps_composing_to_the_identity_are_the_reference() {
+        let named = Kernel::x().sub(&Kernel::y()).by_ref();
+        let swap = |k: &Kernel| k.at(&Kernel::y(), &Kernel::x());
+        let once = swap(&named);
+        let (arena, root) = once.parts();
+        assert!(matches!(arena.node(root), ExprNode::Apply(..)));
+        let twice = swap(&once);
+        let (arena, root) = twice.parts();
+        assert!(
+            matches!(arena.node(root), ExprNode::Ref(_)),
+            "{}",
+            arena.display(root)
+        );
+    }
+
     /// A name inside a composition is carried through the warp as well:
     /// `(Ref k + X).at(cx, cy)` is `Apply(k, cx, cy) + cx`.
     #[cfg(feature = "std")]
