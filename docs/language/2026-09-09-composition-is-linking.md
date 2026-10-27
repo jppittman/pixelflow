@@ -505,7 +505,7 @@ each copy gets. Every one of the 19 saturations stopped at `class_cap`. For the
 Sixteen times the work gets a third of the applications, so each copy is
 searched ~45× less than the same unit saturated alone — and the scene "compiles
 faster" because it is optimized less. (Wide units, whose caps scale with the
-input, do grow: `wide64` 7 → 31 → 120 ms for 1 → 4 → 16 copies, 6 → 28 → 165 KB
+input, do grow: `wide64` 7 → 31 → 120 ms for 1 → 4 → 16 copies, 6 → 37 → 165 KB
 of code — linear in the copies, not superlinear.)
 
 So the inline-everything cost is paid in **quality**, not seconds, and it is
