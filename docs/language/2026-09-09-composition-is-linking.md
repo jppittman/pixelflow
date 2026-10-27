@@ -356,6 +356,26 @@ the graph, priced by extraction.
 > only for a batch-uniform mask; commits "retire the guard-arm scope", "retire ExprNode::Guard"). The `Apply` design does not
 > depend on it: `KernelKey` stays, as `Ref` still names a kernel by it.
 
+> **2026-10-26 (JP-110): the node is built, with one lowering.** `ExprNode::Apply(KernelKey, cx, cy)`
+> exists (`ExprData::Apply` on the `Kernel` DAG, `Shape::Apply` in the term
+> language). `Kernel::at` and `ExprArena::warp` no longer call `linked()` /
+> `expand_refs`: substitution carries a `Ref` through a warp as an `Apply` at the
+> substituted coordinates (a `Ref` is the identity warp, and `Apply(k, X, Y)` is
+> pushed as `Ref(k)`, so a meaning has one node). Its key is derived from the
+> parts, tag 14 in `pixelflow-ir/src/key.rs`: the referent's key and the two
+> warp children's canonical ids, so naming the composite needs no expansion, and
+> `jit_cache::compile` still keys the kernel with every name expanded
+> (`expand_refs` handles an `Apply`), so the compile cache stays one key per
+> program. Variance is the referent's with each coordinate it reads replaced by
+> its warp's.
+>
+> Only **expand** is implemented: `passes::expand_refs` (every compile entry)
+> and `passes::expand_applies` (the runtime tier, before the unit walk — a unit
+> is closed and read at its own coordinates, which an `Apply` is not). The
+> e-graph declines an `Apply` (`Declined::Apply`), so an inlined-versus-referenced
+> comparison (JP-19) is made by what survives construction, and extraction does
+> not yet price the choice. **call** (L5) and **tabulate** (L6) remain open.
+
 ### What this reorders
 
 **L6 is not independent, and its row in the backlog reads as though it is.**
@@ -377,8 +397,9 @@ tabulated lowering at construction, where nothing downstream can revisit it.
 `pixelflow-pipeline/examples/ref_reuse_cost.rs` composes `K` copies of one
 identical unit (an 8-trip fold with a `sqrt`) at distinct offsets, joined by
 `min` — §3's case for L4 — and collapses a 128×128 frame. Every copy is
-inlined, because `Kernel::at` expands a reference at construction (§8); a
-copy at an offset cannot stay a name until `Apply` exists.
+inlined. When this was measured `Kernel::at` expanded a reference at
+construction; since JP-110 each copy survives construction as an `Apply`
+(§8), but expand is its only lowering, so the compile below is unchanged.
 
 | copies | linked nodes | code bytes | collapse µs |
 |---|---|---|---|
@@ -404,7 +425,8 @@ cache hits and are noise at this size). So:
 - **The prerequisite is `Apply` (§8), not the call.** Without it the
   comparison cannot be built: the only composition that keeps a name is one
   at the *same* coordinates, which `expand_refs`' per-key sharing already
-  collapses to one node.
+  collapses to one node. (JP-110 has since built the node; the call and
+  tabulate lowerings it would choose between remain open.)
 
 No cost-model change follows from this. The pricing question that does —
 how a surviving unit's cost ranks when symbolic in uniforms — is JP-14's

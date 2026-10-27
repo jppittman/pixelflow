@@ -7,7 +7,7 @@
 
 use alloc::vec::Vec;
 
-use crate::arena::{BufferDecl, BufferId, RETIRED_COORD_AXES, UniformDecl, UniformId};
+use crate::arena::{Axis, BufferDecl, BufferId, RETIRED_COORD_AXES, UniformDecl, UniformId};
 use crate::dag::{Builder, Dag, Id, Node, SideTable};
 use crate::fold::FoldHeader;
 use crate::key::KernelKey;
@@ -63,6 +63,9 @@ pub enum ExprData {
     /// contain. What it names is a *kernel*, which is what makes it the one
     /// of the three that can be resolved back into graph.
     Ref(KernelKey),
+    /// A named kernel evaluated at warped coordinates: `⟦k⟧[X := cx, Y := cy]`.
+    /// Two children, the warp. See [`ExprNode::Apply`](crate::arena::ExprNode::Apply).
+    Apply(KernelKey),
 }
 
 impl ExprData {
@@ -118,6 +121,7 @@ pub(crate) trait ExprBuilderExt {
     fn push_nary(&mut self, op: OpKind, children: &[Id]) -> Id;
     fn push_reduce(&mut self, header: FoldHeader, children: &[Id]) -> Id;
     fn push_ref(&mut self, key: KernelKey) -> Id;
+    fn push_apply(&mut self, key: KernelKey, cx: Id, cy: Id) -> Id;
 }
 
 impl ExprBuilderExt for Builder<ExprData> {
@@ -187,6 +191,16 @@ impl ExprBuilderExt for Builder<ExprData> {
     fn push_ref(&mut self, key: KernelKey) -> Id {
         self.push_unique(ExprData::Ref(key), &[])
     }
+
+    #[inline]
+    fn push_apply(&mut self, key: KernelKey, cx: Id, cy: Id) -> Id {
+        // `Apply(k, X, Y)` is `Ref(k)`: one meaning, one node.
+        let reads = |id: Id, axis: Axis| matches!(*self.dag().get(id.index()).get(), ExprData::Var(v) if v == axis.var());
+        if reads(cx, Axis::X) && reads(cy, Axis::Y) {
+            return self.push_ref(key);
+        }
+        self.push_unique(ExprData::Apply(key), &[cx, cy])
+    }
 }
 
 // ────────────────────────────────────────── Splicing & Transforms ─────────────
@@ -246,6 +260,27 @@ pub(crate) fn substitute_vars(
                 } else {
                     builder.push_unique(*node, &[])
                 }
+            } else if let ExprData::Ref(key) = *node {
+                // A name reads the coordinates and nothing else, so under a
+                // warp it is `Apply` at the warped coordinates: the
+                // composite is named, not expanded. With no coordinate
+                // substituted both are the axis itself and `push_apply`
+                // gives the `Ref` back.
+                let mut at = |axis: Axis| match subs.iter().find(|(v, _)| *v == axis.var()) {
+                    Some(&(_, repl)) => repl,
+                    None => builder.push_var(axis.var()),
+                };
+                let (cx, cy) = (at(Axis::X), at(Axis::Y));
+                builder.push_apply(key, cx, cy)
+            } else if let ExprData::Apply(key) = *node {
+                // The warps compose, and a composite that is the identity
+                // is the bare name again: through `push_apply`, not copied.
+                let mut warp = node
+                    .children()
+                    .map(|c| table[c].expect("child must have been copied"));
+                let cx = warp.next().expect("an Apply node has two children");
+                let cy = warp.next().expect("an Apply node has two children");
+                builder.push_apply(key, cx, cy)
             } else {
                 let child_ids: Vec<Id> = node
                     .children()
@@ -325,6 +360,7 @@ pub fn from_arena_roots(
                     ExprNode::Buffer(buf) => b.push_buffer(buf),
                     ExprNode::Uniform(uni) => b.push_uniform(uni),
                     ExprNode::Ref(key) => b.push_ref(key),
+                    ExprNode::Apply(key, _, _) => b.push_apply(key, child_ids[0], child_ids[1]),
                     ExprNode::Reduce { .. } => b.push_reduce(arena.fold_header(id), &child_ids),
                     // Post-legalize only: no `Kernel` holds a store, and a
                     // term language a `Kernel` is made of has no word for one.
@@ -391,6 +427,7 @@ pub fn to_arena_roots(
             ExprData::Buffer(b) => arena.push_buffer(b),
             ExprData::Uniform(u) => arena.push_uniform(u),
             ExprData::Ref(key) => arena.push_ref(key),
+            ExprData::Apply(key) => arena.push_apply(key, child_ids[0], child_ids[1]),
             ExprData::Reduce(header) => {
                 let (lo, hi) = header.attach(child_ids[1..].iter().copied());
                 arena.push_reduce(header.fold(), lo, hi, child_ids[0])

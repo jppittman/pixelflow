@@ -312,7 +312,7 @@ impl core::fmt::Display for Variance {
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use crate::arena::{ExprArena, ExprId, ExprNode};
+use crate::arena::{Axis, ExprArena, ExprId, ExprNode};
 use crate::fold::KnownRange;
 
 /// A reference denotes what its referent denotes, sampled at the same
@@ -370,6 +370,20 @@ fn transfer(arena: &ExprArena, id: ExprId, child: impl Fn(ExprId) -> Variance) -
         // is not a `Const`.
         ExprNode::Uniform(_) => Variance::CONST,
         ExprNode::Ref(key) => referent_variance(key),
+        // The referent's variance with its coordinates replaced by the
+        // warp's: an axis the referent reads contributes what its warp
+        // varies with, and an axis it does not read contributes nothing —
+        // `Apply(k, cx, cy)` is `k` at `(cx, cy)`, not at the outer sample.
+        ExprNode::Apply(key, cx, cy) => {
+            let referent = referent_variance(key);
+            let coordinates =
+                Variance::of_var(Axis::X.var()).union(Variance::of_var(Axis::Y.var()));
+            let warp = [(Axis::X, cx), (Axis::Y, cy)]
+                .into_iter()
+                .filter(|(axis, _)| referent.depends_on(axis.var()))
+                .fold(Variance::CONST, |v, (_, c)| v.union(child(c)));
+            referent.without(coordinates).union(warp)
+        }
         ExprNode::Param(_) => {
             // A `Param` has no value and its derivative is zero, but no hoist
             // and no bound (L3) may rest on a slot that has none: classed
@@ -704,6 +718,49 @@ mod tests {
             super::compute_arena_variance(&orphaned)[orphan.0 as usize],
             Variance::ALL
         );
+    }
+
+    /// An `Apply` varies as its referent does *at the warp*: the axes the
+    /// referent reads are replaced by what the warp varies with, and an axis
+    /// it does not read contributes nothing.
+    #[cfg(feature = "std")]
+    #[test]
+    fn an_apply_varies_with_its_warp_where_the_referent_reads_it() {
+        use crate::kernel::Kernel;
+
+        let cases = [
+            // Reads X only: the warp's X varies as Y, its Y is never read.
+            (Kernel::x().sqrt(), Kernel::y(), Kernel::x(), Variance::Y),
+            // Reads Y only.
+            (Kernel::y().neg(), Kernel::y(), Kernel::x(), Variance::X),
+            // Reads nothing: constant under any warp.
+            (
+                Kernel::constant(4.0),
+                Kernel::x(),
+                Kernel::y(),
+                Variance::CONST,
+            ),
+            // Reads X, warped to a constant.
+            (
+                Kernel::x().sqrt(),
+                Kernel::constant(2.0),
+                Kernel::x(),
+                Variance::CONST,
+            ),
+            // Both axes, swapped.
+            (
+                Kernel::x().add(&Kernel::y().mul(&Kernel::y())),
+                Kernel::y(),
+                Kernel::x(),
+                Variance::X.union(Variance::Y),
+            ),
+        ];
+        for (referent, cx, cy, expected) in cases {
+            let applied = referent.by_ref().at(&cx, &cy);
+            let (arena, root) = applied.parts();
+            let v = super::compute_arena_variance(arena);
+            assert_eq!(v[root.0 as usize], expected, "{}", arena.display(root));
+        }
     }
 
     #[test]

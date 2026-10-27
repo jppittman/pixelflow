@@ -69,6 +69,9 @@ enum NodeData {
     Buffer(BufferId),
     Uniform(UniformId),
     Ref(KernelKey),
+    /// A kernel named by content, evaluated at warped coordinates; the two
+    /// DAG edges are the warp's `cx`, `cy`. See [`ExprNode::Apply`].
+    Apply(KernelKey),
     Unary(OpKind),
     Binary(OpKind),
     Ternary(OpKind),
@@ -443,6 +446,17 @@ pub enum ExprNode {
     /// expand it, refuse it, or hold it as an opaque leaf the way the runtime
     /// tier's e-graph holds a unit — never walk through it.
     Ref(KernelKey),
+    /// A kernel named by content, evaluated at warped coordinates: the
+    /// composite `k ∘ (cx, cy)` (docs/language/2026-09-09-composition-is-linking.md
+    /// §8). What `Kernel::at` leaves of a [`Ref`](Self::Ref) instead of
+    /// expanding it at construction, so the choice to expand, call, or
+    /// tabulate is made later, by a pass that can price it.
+    ///
+    /// `⟦Apply(k, cx, cy)⟧ = ⟦k⟧[X := ⟦cx⟧, Y := ⟦cy⟧]`. The warp is two
+    /// DAG children, so every substitution over the arena reaches it and
+    /// composes with it; `Ref(k)` is `Apply(k, X, Y)` with the identity warp.
+    /// [`expand_refs`](crate::passes::expand_refs) is the one lowering today.
+    Apply(KernelKey, ExprId, ExprId),
     Unary(OpKind, ExprId),
     Binary(OpKind, ExprId, ExprId),
     Ternary(OpKind, ExprId, ExprId, ExprId),
@@ -938,6 +952,19 @@ impl ExprArena {
         self.intern(NodeData::Ref(key), &[])
     }
 
+    /// Push an `Apply(key, cx, cy)` — the kernel `key` names, evaluated at
+    /// the coordinates `cx`, `cy` (see [`ExprNode::Apply`]).
+    ///
+    /// `Apply(k, X, Y)` is `Ref(k)` — the identity warp — so it is pushed as
+    /// one: a meaning has one node.
+    pub fn push_apply(&mut self, key: KernelKey, cx: ExprId, cy: ExprId) -> ExprId {
+        let reads = |id: ExprId, axis: Axis| self.node(id) == ExprNode::Var(axis.var());
+        if reads(cx, Axis::X) && reads(cy, Axis::Y) {
+            return self.push_ref(key);
+        }
+        self.intern(NodeData::Apply(key), &[cx, cy])
+    }
+
     /// Get the declaration for a uniform slot.
     ///
     /// # Panics
@@ -1178,6 +1205,12 @@ impl ExprArena {
             NodeData::Buffer(b) => ExprNode::Buffer(b),
             NodeData::Uniform(u) => ExprNode::Uniform(u),
             NodeData::Ref(k) => ExprNode::Ref(k),
+            NodeData::Apply(k) => {
+                let mut kids = dag_children(n);
+                let cx = kids.next().expect("an Apply node has two DAG children");
+                let cy = kids.next().expect("an Apply node has two DAG children");
+                ExprNode::Apply(k, cx, cy)
+            }
             NodeData::Unary(op) => {
                 let mut kids = dag_children(n);
                 let a = kids.next().expect("a Unary node has one DAG child");
@@ -1294,6 +1327,10 @@ impl ExprArena {
             | NodeData::Binary(op)
             | NodeData::Ternary(op)
             | NodeData::Nary(op) => op,
+            NodeData::Apply(key) => panic!(
+                "ExprArena::kind: {key:?} applied to a warp is a reference to a kernel, \
+                 not an operation; run passes::expand_refs before asking for a kind"
+            ),
             NodeData::Reduce(_) => OpKind::Reduce,
             // A store is an effect, not an operation: it computes nothing a
             // cost table could price or an arithmetic rule could rewrite,
@@ -1318,6 +1355,12 @@ impl ExprArena {
             | NodeData::Buffer(_)
             | NodeData::Uniform(_)
             | NodeData::Ref(_) => ExprChildren::Zero,
+            NodeData::Apply(_) => {
+                let mut kids = dag_children(n);
+                let cx = kids.next().expect("an Apply node has two DAG children");
+                let cy = kids.next().expect("an Apply node has two DAG children");
+                ExprChildren::Two(cx, cy)
+            }
             NodeData::Unary(_) => {
                 let mut kids = dag_children(n);
                 ExprChildren::One(kids.next().expect("a Unary node has one DAG child"))
@@ -1391,7 +1434,7 @@ impl ExprArena {
                 ExprNode::Unary(_, a) => {
                     stack.push((*a, d + 1));
                 }
-                ExprNode::Binary(_, a, b) => {
+                ExprNode::Binary(_, a, b) | ExprNode::Apply(_, a, b) => {
                     stack.push((*a, d + 1));
                     stack.push((*b, d + 1));
                 }
@@ -1422,6 +1465,17 @@ impl ExprArena {
         max_depth
     }
 
+    /// Whether any node of this arena names a kernel by content — a
+    /// [`Ref`](ExprNode::Ref) or an [`Apply`](ExprNode::Apply) — which every
+    /// pass that reads structure must expand, refuse, or hold as a unit. The
+    /// guard that keeps a term with no name on exactly the path it always
+    /// took, uncloned.
+    #[must_use]
+    pub fn names_a_kernel(&self) -> bool {
+        self.nodes()
+            .any(|(_, n)| matches!(n, ExprNode::Ref(_) | ExprNode::Apply(..)))
+    }
+
     /// Returns `true` if the subtree rooted at `root` contains at least one `Var` node.
     #[must_use]
     pub fn has_var(&self, root: ExprId) -> bool {
@@ -1437,7 +1491,7 @@ impl ExprArena {
                 | ExprNode::Uniform(_)
                 | ExprNode::Ref(_) => {}
                 ExprNode::Unary(_, a) => stack.push(*a),
-                ExprNode::Binary(_, a, b) => {
+                ExprNode::Binary(_, a, b) | ExprNode::Apply(_, a, b) => {
                     stack.push(*a);
                     stack.push(*b);
                 }
@@ -1488,6 +1542,10 @@ impl ExprArena {
                 | ExprNode::Buffer(_)
                 | ExprNode::Uniform(_)
                 | ExprNode::Ref(_) => {}
+                ExprNode::Apply(_, a, b) => {
+                    stack.push(*a);
+                    stack.push(*b);
+                }
                 ExprNode::Unary(_, a) => stack.push(*a),
                 ExprNode::Binary(_, a, b) => {
                     stack.push(*a);
@@ -1533,7 +1591,7 @@ impl ExprArena {
                 | ExprNode::Uniform(_)
                 | ExprNode::Ref(_) => {}
                 ExprNode::Unary(_, a) => stack.push(*a),
-                ExprNode::Binary(_, a, b) => {
+                ExprNode::Binary(_, a, b) | ExprNode::Apply(_, a, b) => {
                     stack.push(*a);
                     stack.push(*b);
                 }
@@ -1624,6 +1682,7 @@ impl ExprArena {
                         // Content-addressed, so a reference means the same
                         // kernel in every arena and needs no remapping.
                         ExprNode::Ref(k) => self.push_ref(k),
+                        ExprNode::Apply(k, cx, cy) => self.push_apply(k, m(cx), m(cy)),
                         ExprNode::Buffer(b) => {
                             let slot = match buf_map[b.0 as usize] {
                                 Some(slot) => slot,
@@ -1921,11 +1980,13 @@ impl ExprArena {
     /// closing is the lowest one nothing in the body binds — `f`'s folds
     /// included ([`ExprArena::close_over`]).
     ///
-    /// **A name is expanded first.** A substitution cannot reach through a
-    /// [`ExprNode::Ref`] — it has no `Var` to rewrite here, only a key — so
-    /// left in place it would sample its referent at the *outer*
-    /// coordinates: plausible pixels, wrong ones. At `(X, Y)` there is
-    /// nothing to substitute and `root` is returned as it stands, a name
+    /// **A name is carried through the warp, not expanded.** A substitution
+    /// cannot reach through a [`ExprNode::Ref`] — it has no `Var` to rewrite
+    /// here, only a key — but it reads the coordinates, so under a warp it is
+    /// the [`ExprNode::Apply`] of that key at the warped coordinates: the
+    /// composite, named. Left as a `Ref` it would sample its referent at the
+    /// *outer* coordinates: plausible pixels, wrong ones. At `(X, Y)` there
+    /// is nothing to substitute and `root` is returned as it stands, a name
     /// still a name and still its own optimization unit.
     pub fn warp(&mut self, root: ExprId, [u, v]: [ExprId; 2]) -> ExprId {
         let at_the_sample = self.node(u) == ExprNode::Var(Axis::X.var())
@@ -1933,8 +1994,7 @@ impl ExprArena {
         if at_the_sample {
             return root;
         }
-        let linked = crate::passes::expand_refs(self, root);
-        self.substitute_vars_with(linked, &[(Axis::X.var(), u), (Axis::Y.var(), v)])
+        self.substitute_vars_with(root, &[(Axis::X.var(), u), (Axis::Y.var(), v)])
     }
 
     /// Rebuild the subgraph at `root`, replacing every `Var(i)` for which
@@ -1999,7 +2059,22 @@ impl ExprArena {
                         ExprNode::Param(i) => self.push_param(i),
                         ExprNode::Buffer(b) => self.push_buffer(b),
                         ExprNode::Uniform(u) => self.push_uniform(u),
-                        ExprNode::Ref(k) => self.push_ref(k),
+                        // A name reads the coordinates and nothing else, so
+                        // under a substitution of them it is `Apply` at the
+                        // substituted coordinates: named, not expanded. With
+                        // neither axis in `subs` it is the `Ref` again.
+                        ExprNode::Ref(k) => {
+                            let at = |this: &mut Self, axis: Axis| match lookup(axis.var()) {
+                                Some(replacement) => replacement,
+                                None => this.push_var(axis.var()),
+                            };
+                            let (cx, cy) = (at(self, Axis::X), at(self, Axis::Y));
+                            self.push_apply(k, cx, cy)
+                        }
+                        ExprNode::Apply(k, cx, cy) => {
+                            let (cx, cy) = (m(cx), m(cy));
+                            self.push_apply(k, cx, cy)
+                        }
                         ExprNode::Unary(op, a) => {
                             let a = m(a);
                             self.push_unary(op, a)
@@ -2165,6 +2240,7 @@ impl ExprArena {
                 ExprNode::Buffer(b) => out.push_buffer(buffer_slot(*b)),
                 ExprNode::Uniform(u) => out.push_uniform(uniform_slot(*u)),
                 ExprNode::Ref(k) => out.push_ref(*k),
+                ExprNode::Apply(k, cx, cy) => out.push_apply(*k, m(*cx), m(*cy)),
                 ExprNode::Unary(op, a) => out.push_unary(*op, m(*a)),
                 ExprNode::Binary(op, a, b) => out.push_binary(*op, m(*a), m(*b)),
                 ExprNode::Ternary(op, a, b, c) => out.push_ternary(*op, m(*a), m(*b), m(*c)),
@@ -2216,6 +2292,13 @@ impl ExprArena {
                     ExprNode::Buffer(b) => write!(f, "Buffer({})", b.0)?,
                     ExprNode::Uniform(u) => write!(f, "Uniform({})", u.0)?,
                     ExprNode::Ref(k) => write!(f, "Ref({:#018x})", k.bits())?,
+                    ExprNode::Apply(k, cx, cy) => {
+                        stack.push(Task::WriteStr(")"));
+                        stack.push(Task::Visit(*cy));
+                        stack.push(Task::WriteStr(", "));
+                        stack.push(Task::Visit(*cx));
+                        write!(f, "Apply({:#018x}, ", k.bits())?;
+                    }
                     ExprNode::Unary(op, a) => {
                         stack.push(Task::WriteStr(")"));
                         stack.push(Task::Visit(*a));
@@ -2344,6 +2427,13 @@ impl ExprArena {
                     if sk != ok {
                         return false;
                     }
+                }
+                (ExprNode::Apply(sk, s_x, s_y), ExprNode::Apply(ok, o_x, o_y)) => {
+                    if sk != ok {
+                        return false;
+                    }
+                    stack.push((*s_x, *o_x));
+                    stack.push((*s_y, *o_y));
                 }
                 (ExprNode::Unary(s_op, s_a), ExprNode::Unary(o_op, o_a)) => {
                     if s_op != o_op {

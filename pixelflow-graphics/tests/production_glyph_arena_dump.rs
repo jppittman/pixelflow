@@ -178,6 +178,7 @@ fn dump_arena(arena: &ExprArena, root: ExprId, name: &str, path: &std::path::Pat
             other @ (ExprNode::Param(_)
             | ExprNode::Nary(..)
             | ExprNode::Ref(_)
+            | ExprNode::Apply(..)
             | ExprNode::Write { .. }) => {
                 panic!("{name}: production arena contains {other:?}, which optimize_runtime_arena bails on")
             }
