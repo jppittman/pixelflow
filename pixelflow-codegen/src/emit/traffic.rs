@@ -25,7 +25,7 @@ use super::{FileId, IsaBackend};
 use crate::program::Scope;
 use alloc::vec::Vec;
 use core::fmt;
-use pixelflow_ir::fold::{Fold, KnownRange};
+use pixelflow_ir::fold::Fold;
 
 /// Emitted traffic within one scope of the nest.
 ///
@@ -93,9 +93,9 @@ impl Trips {
 
     /// The trips of a fold whose range is `range` (`None` when a bound is a
     /// value), on their own and not yet nested in any loop.
-    pub(in crate::emit) fn of(range: Option<KnownRange>) -> Self {
-        match range {
-            Some(range) => Self::Known(range.len()),
+    pub(in crate::emit) fn of(counted: Option<u64>) -> Self {
+        match counted {
+            Some(trips) => Self::Known(trips),
             None => Self::Estimated(Fold::ESTIMATED_TRIPS),
         }
     }

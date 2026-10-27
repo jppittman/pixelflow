@@ -3,7 +3,7 @@
 
 use crate::parser::parse;
 use crate::sema::{AnalyzedKernel, analyze};
-use pixelflow_ir::passes::lattice::KERNEL_BINDER_CAPACITY;
+use pixelflow_ir::arena::KERNEL_BINDER_CAPACITY;
 use proc_macro2::TokenStream;
 use quote::quote;
 

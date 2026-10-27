@@ -152,7 +152,7 @@ pub(crate) trait Site {
     ///
     /// # Panics
     ///
-    /// At `depth` [`pixelflow_ir::passes::lattice::KERNEL_BINDER_CAPACITY`] or more:
+    /// At `depth` [`pixelflow_ir::arena::KERNEL_BINDER_CAPACITY`] or more:
     /// lowering refuses a fold nested that deep before it opens one.
     fn open_fold(
         &mut self,

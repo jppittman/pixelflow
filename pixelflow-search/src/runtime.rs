@@ -1264,8 +1264,8 @@ mod tests {
         let mut sequenced = ExprArena::new();
         let x = sequenced.push_var(0);
         let y = sequenced.push_var(1);
-        let seq = sequenced.push_binary(OpKind::Seq, x, y);
-        let declines = Kernel::from_parts(sequenced, seq);
+        let tuple = sequenced.push_nary(OpKind::Tuple, &[x, y]);
+        let declines = Kernel::from_parts(sequenced, tuple);
         let declined_key = KernelStore::intern(&declines);
         // X·0 + Y: folds to Y, which only an optimized unit can say.
         let folds = Kernel::x().mul(&Kernel::constant(0.0)).add(&Kernel::y());
@@ -1275,7 +1275,7 @@ mod tests {
             optimize_runtime_arena(arena, root, LatticeShape::POINT).err(),
             Some(OptimizationError::Admission {
                 unit: Some(declined_key),
-                reason: Declined::Op(OpKind::Seq),
+                reason: Declined::Op(OpKind::Tuple),
             })
         );
     }
@@ -2416,8 +2416,7 @@ pub(crate) mod production_telemetry {
                 other @ (ExprNode::Param(_)
                 | ExprNode::Nary(..)
                 | ExprNode::Ref(_)
-                | ExprNode::Apply(..)
-                | ExprNode::Write { .. }) => {
+                | ExprNode::Apply(..)) => {
                     panic!("extracted arena contains {other:?}")
                 }
             };

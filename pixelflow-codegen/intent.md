@@ -41,9 +41,10 @@ crate that names a lane or a width.
   through the API: `tests/jit_cache_sharing.rs`, `tests/trig_range_jit.rs`.
 
 ## Behind
-- Rows, batches and lanes are folds `pixelflow_ir::passes::legalize` wraps the
-  kernel in before `Lower`: the CPU schedule sits in a target-agnostic crate
-  (2026-10-15). `Nest` should factor the lattice (schedule note §1–§2).
+- The traversal is a `Traversal` value (`program/lattice.rs`) that `Lower`
+  writes as `Write`/`Reduce`/`Seq` defs after the kernel's; `Nest` should
+  factor the lattice itself (schedule note §1–§2). The loops are still folds
+  over `Monoid::SEQ`, an `OpKind::Seq` in `pixelflow-ir`.
 - No `cpu/` module: the chain's front is `pipeline.rs`, its back
   `emit::native` (schedule note §4, `Proposed`).
 - Memory reads remain though the language has none: `ScheduledOp::Gather`,
