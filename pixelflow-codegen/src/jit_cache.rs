@@ -88,7 +88,7 @@ pub struct Linked {
 ///
 /// # Errors
 ///
-/// Whatever [`emit::compile`] reports for the (optimized) arena.
+/// Whatever optimization or [`emit::compile`] reports.
 ///
 /// # Panics
 ///
@@ -134,12 +134,8 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // extraction (`pixelflow_search::runtime`'s units;
     // docs/language/2026-09-25-the-language-is-kernel.md §4, O1).
     //
-    // It bails for constructs the e-graph does not model
-    // (`egraph::insert`'s `Declined`: a `Param`, an op
-    // `Vocabulary::Runtime` does not admit, such as a `RawGather`) in a
-    // term with no unit; those still compile — from the *expanded* arena, so
-    // a reference never reaches the emitter — just without the extra fusion,
-    // and saturation telemetry records the decline. A `Reduce` is modelled —
+    // A construct the e-graph does not model is a compile error rather than
+    // permission to emit the source term. A `Reduce` is modelled —
     // it enters the e-graph as itself, and a fold extraction keeps is
     // emitted as a loop.
     //
@@ -148,11 +144,10 @@ pub fn compile(kernel: &pixelflow_ir::Kernel, shape: LatticeShape) -> Result<Lin
     // walk order — without touching a node, so the bytes of a kernel that
     // declares neither a buffer nor a uniform are exactly what they were.
     let emit_fn = || {
-        let optimized = pixelflow_search::runtime::optimize_runtime_arena(arena, root, shape);
-        let (arena, root) = optimized
-            .as_deref()
-            .map(|(a, r)| (a, *r))
-            .unwrap_or((linked_arena, linked_root));
+        let optimized = pixelflow_search::runtime::optimize_runtime_arena(arena, root, shape)
+            .map_err(CompileError::Optimization)?;
+        let (arena, root) = optimized.as_ref();
+        let root = *root;
         if buffers.is_empty() && uniforms.is_empty() {
             return emit::compile(arena, root, shape);
         }
@@ -531,32 +526,22 @@ mod tests {
 
     /// A table naming an instance the graph never reads — what `Kernel::at`
     /// leaves behind for every axis the receiver does not read — must link.
-    /// The link omits it; the relink drops it with the garbage. Forced down
-    /// the optimizer's bail path (`RawGather` is post-lowering, so the
-    /// e-graph declines and the input arena, table and all, is what gets
-    /// linked).
+    /// The link omits it; the relink drops it with the garbage.
     #[test]
-    fn a_declared_but_unread_uniform_links_on_the_bail_path() {
+    fn a_declared_but_unread_uniform_links() {
         let decl = |default| UniformDecl {
             id: UniformIdentity::mint(),
             default,
         };
         let (phase, scale) = (decl(0.0), decl(2.0));
         let mut a = ExprArena::new();
-        let buf = a.declare_buffer(BufferDecl {
-            id: BufferIdentity::mint(),
-            width: 4,
-            height: 1,
-        });
         // Declared and read by a node nothing reaches — the `.at` shape.
         let dead = a.declare_uniform(phase);
         let _dead_read = a.push_uniform(dead);
         let live = a.declare_uniform(scale);
         let x = a.push_var(0);
-        let b = a.push_buffer(buf);
-        let g = a.push_binary(OpKind::RawGather, b, x);
         let s = a.push_uniform(live);
-        let root = a.push_binary(OpKind::Mul, g, s);
+        let root = a.push_binary(OpKind::Mul, x, s);
         let k = Kernel::from_parts(a, root);
         assert_eq!(k.uniforms().len(), 2, "the table names both");
 
@@ -566,6 +551,6 @@ mod tests {
             [scale],
             "the link holds what the graph reads"
         );
-        assert_eq!(linked.buffers.len(), 1);
+        assert!(linked.buffers.is_empty());
     }
 }
