@@ -25,6 +25,7 @@ impl Ir for ExprArena {
             ExprNode::Buffer(b) => Shape::Buffer(*self.buffer_decl(b)),
             ExprNode::Uniform(u) => Shape::Uniform(*self.uniform_decl(u)),
             ExprNode::Ref(k) => Shape::Ref(k),
+            ExprNode::Apply(k, cx, cy) => Shape::Apply(k, cx, cy),
             ExprNode::Unary(op, a) => Shape::Op(op, Children::One(a)),
             ExprNode::Binary(op, a, b) => Shape::Op(op, Children::Two(a, b)),
             ExprNode::Ternary(op, a, b, c) => Shape::Op(op, Children::Three(a, b, c)),
@@ -68,6 +69,7 @@ impl Ir for ExprArena {
                 self.push_uniform(slot)
             }
             Shape::Ref(key) => self.push_ref(key),
+            Shape::Apply(key, cx, cy) => self.push_apply(key, cx, cy),
             Shape::Op(op, children) => match children {
                 Children::Zero => {
                     panic!("ExprArena::embed: {op:?} with no children — no arena node has arity 0")
@@ -150,6 +152,10 @@ impl ExprArena {
                         .flatten()
                         .filter(|k| memo[k.0 as usize].is_none())
                         .collect(),
+                    Shape::Apply(_, cx, cy) => [cx, cy]
+                        .into_iter()
+                        .filter(|k| memo[k.0 as usize].is_none())
+                        .collect(),
                     Shape::Write { value, .. } if memo[value.0 as usize].is_none() => {
                         alloc::vec![value]
                     }
@@ -168,6 +174,12 @@ impl ExprArena {
                 Shape::Buffer(d) => out.embed(Shape::Buffer(d)),
                 Shape::Uniform(d) => out.embed(Shape::Uniform(d)),
                 Shape::Ref(k) => out.embed(Shape::Ref(k)),
+                Shape::Apply(k, cx, cy) => {
+                    let child = |k: ExprId| {
+                        memo[k.0 as usize].expect("rebuild_into: warp built before apply")
+                    };
+                    out.embed(Shape::Apply(k, child(cx), child(cy)))
+                }
                 Shape::Op(op, kids) => {
                     let mapped: Vec<O::Ref> = kids
                         .iter()
