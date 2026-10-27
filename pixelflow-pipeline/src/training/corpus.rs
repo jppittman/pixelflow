@@ -274,10 +274,6 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
                          kernel interned in this process — a corpus outlives the process, so \
                          the key would read back naming nothing"
                     ),
-                    ExprNode::Write { .. } => panic!(
-                        "reachable_subtree: expression holds a Write — a corpus entry is \
-                         pre-legalize, and a store is built after extraction"
-                    ),
                     ExprNode::Unary(op, a) => out_arena.push_unary(op, map(a)),
                     ExprNode::Binary(op, a, b) => out_arena.push_binary(op, map(a), map(b)),
                     ExprNode::Ternary(op, a, b, c) => {
@@ -441,12 +437,6 @@ fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<(
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Ref({k:?}) has no corpus encoding: it names a process-local kernel"),
-            ));
-        }
-        ExprNode::Write { .. } => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a Write has no corpus encoding: a corpus entry is pre-legalize",
             ));
         }
     }

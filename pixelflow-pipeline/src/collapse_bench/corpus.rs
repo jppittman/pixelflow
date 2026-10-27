@@ -307,12 +307,6 @@ pub fn encode(kernel: &CollapseKernel) -> String {
                  a name for a kernel interned in this process only",
                 kernel.name
             ),
-            // A corpus kernel is pre-legalize by construction; a store is
-            // built after extraction and has no line here.
-            ExprNode::Write { .. } => panic!(
-                "{}: corpus kernels are pre-legalize, but this one holds a Write",
-                kernel.name
-            ),
         }
         .expect("fmt");
         dense[idx] = next;

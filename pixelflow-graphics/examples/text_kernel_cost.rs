@@ -25,8 +25,6 @@ use std::time::Instant;
 use pixelflow_core::Kernel;
 use pixelflow_graphics::fonts::{text, Font};
 use pixelflow_ir::arena::{ExprArena, ExprId};
-use pixelflow_ir::passes::lattice::{Collapse, Domain};
-use pixelflow_ir::passes::legalize;
 use pixelflow_ir::LatticeShape;
 
 const FONT_BYTES: &[u8] = include_bytes!("../assets/DejaVuSansMono-Fallback.ttf");
@@ -80,14 +78,8 @@ fn main() {
             / PIECE_ROW_COLS;
         let (linked, linked_root) = kernel.linked_parts();
         let t1 = Instant::now();
-        let collapse = Collapse {
-            domain: Domain {
-                shape: MEASURE_SHAPE,
-                origin: [0.0, 0.0].map(|default| pixelflow_ir::Uniform::new(default).decl()),
-            },
-            lanes: (pixelflow_codegen::jit_vector_bytes() / 4) as u32,
-        };
-        let (legal, legal_root) = legalize(arena, root, &collapse).expect("legalize");
+        let (legal, legal_root) =
+            pixelflow_codegen::legalize(arena, root, MEASURE_SHAPE).expect("legalize");
         let legalize_t = t1.elapsed();
         println!(
             "{n:>5}  {:>12}  {:>9}  {:>9}  {pieces:>6}  {:>15}  {:>19}  {:>11}",

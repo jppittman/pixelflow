@@ -20,7 +20,7 @@
 //!
 //! There is no collapse scaffold. A kernel reaches this module already
 //! wrapped in the lattice's folds — rows, columns, lanes — by
-//! [`pixelflow_ir::passes::legalize`], so the emitted function is one scope
+//! [`pixelflow_ir::passes::legalize_back`], so the emitted function is one scope
 //! (what runs once per call) with folds nested in it, every one a loop of
 //! blocks: preheader, head, latch, exit. The lane fold is the one the `Write`
 //! inside names as its lane, and it is executed *by lanes*: its binder is the
@@ -29,7 +29,7 @@
 //! (docs/archive/plans/2026-09-16-collapse-is-a-fold.md §2.2).
 //!
 //! A fold whose bound is a value arrives inside the guard
-//! [`pixelflow_ir::passes::legalize`] builds (an `If`'s arm): its counter
+//! [`pixelflow_ir::passes::legalize_back`] builds (an `If`'s arm): its counter
 //! starts at `lo`'s lane (plus zero, so a `-0.0` count starts at the integer 0
 //! a literal seeds) and its latch compares against `hi`'s, and the arm is
 //! skipped when the range is empty or a bound is not a count in `[0, 2²⁴]` (a
@@ -959,7 +959,7 @@ mod tests {
         }
     }
 
-    /// `passes::legalize` leaves every `Reduce` standing, so a fold reaches
+    /// `passes::legalize_back` leaves every `Reduce` standing, so a fold reaches
     /// the emitter as a loop; this builds one by hand and compiles it.
     ///
     /// `SUM` over four terms, matched against the closed form
@@ -1738,7 +1738,7 @@ mod tests {
         /// them all in registers, which is what makes the tests below about a
         /// *spilled* value rather than about an arithmetic identity. Defining
         /// them all before consuming any is not enough on its own —
-        /// `passes::lattice::collapse` rebuilds the arena from the root, and
+        /// `program::lattice::collapse` rebuilds the arena from the root, and
         /// the order it hands the scheduler is its own.
         fn filler(a: &mut ExprArena, seed: ExprId) -> ExprId {
             let terms: alloc::vec::Vec<ExprId> = (0..FILLER)
@@ -2113,7 +2113,7 @@ mod tests {
     /// Forty terms, **paired by a permutation** so that each is read twice,
     /// far apart: no evaluation order keeps them all in registers. Pushing
     /// them all before consuming any is no longer enough on its own, because
-    /// `passes::lattice::collapse` rebuilds the arena from the root and the
+    /// `program::lattice::collapse` rebuilds the arena from the root and the
     /// order it hands the scheduler is its own.
     #[test]
     fn a_deep_spill_frame_compiles_correctly() {

@@ -438,14 +438,6 @@ pub fn induce<I: Ir>(
                     mapped: memo.len(),
                 });
             }
-            // Nor a `Write`: an effect the legalize passes build after
-            // extraction, which `insert` declines on principle.
-            Shape::Write { .. } => {
-                return Err(TermMiss {
-                    node: "Write (insert declines a Write)".to_string(),
-                    mapped: memo.len(),
-                });
-            }
         };
         let Some(&(class, idx)) = table.get(&node) else {
             return Err(TermMiss {
@@ -514,7 +506,6 @@ fn post_order_term<I: Ir>(term: &I, root: I::Ref) -> Vec<I::Ref> {
                         }
                         stack.push(Task::Visit(body));
                     }
-                    Shape::Write { value, .. } => stack.push(Task::Visit(value)),
                     _ => {}
                 }
             }

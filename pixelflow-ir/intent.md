@@ -32,9 +32,9 @@ except for the process-global store a `Ref` names into.
 - No optimization of an open term: a `Dwrt`, a `Ref` and a fold survive
   construction unchanged, so the chain rule holds under a warp and a fold's
   shape is extraction's to choose.
-- No schedule: the lattice's traversal is the backend's. `passes::lattice`
-  (`collapse`, `pack`), `Write` and `Seq` are the CPU schedule in the wrong
-  crate and move out (DENOTATION §7; the schedule note §1).
+- No schedule: the lattice's traversal is the backend's (`pixelflow-codegen`
+  writes the loops; `ExprNode::Write` is gone). `OpKind::Seq`/`Monoid::SEQ`
+  remain, the unit monoid those loops are over (DENOTATION §7).
 - No `std` outside `store`.
 
 ## Contract
@@ -71,7 +71,7 @@ crates depend on it (`pixelflow-codegen`, `pixelflow-search`,
   are ruled (kernels-evaluate-kernels §2) and wait on the arena-is-typed T3.
 - `Var(u8)` means an axis or a binder by range; `Binder` a `u8`, against the
   64-bit control-plane rule.
-- `Buffer`, `BoundManifold`'s link tables and `passes::lattice` are in the
+- `Buffer` and `BoundManifold`'s link tables are in the
   tree and not concepts (DENOTATION §11).
 
 ## Decided in

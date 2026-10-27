@@ -156,7 +156,7 @@ op_table! {
     // These let exp/ln/log lower to arithmetic: each maps 1:1 to a single
     // hardware instruction. A lane is read as an i32 where noted; the
     // reinterpretation that gets it there is an op of its own, `Bits`, and
-    // `Float` is the one back (codes 53 and 54 below).
+    // `Float` is the one back (codes 52 and 53 below).
     /// Truncate f32 lanes to i32 (`cvttps2dq` / `fcvtzs`): a *conversion*,
     /// which changes the bits. The reinterpretation is [`OpKind::Bits`].
     TruncToInt = 38,
@@ -207,7 +207,7 @@ op_table! {
     /// [`Fold`](crate::fold::Fold) in the node, and a known bound is the node's
     /// data too, not children — see `fold.rs` for the `Const`-child encoding
     /// it replaced. Legal through codegen, which emits a surviving fold as a
-    /// loop (`passes::legalize` leaves every one standing).
+    /// loop (`passes::legalize_back` leaves every one standing).
     Reduce = 49,
 
     // --- Uniforms (per-call scalars) ---
@@ -226,16 +226,6 @@ op_table! {
     /// `Vocabulary::Runtime` declines it.
     Param = 51,
 
-    // --- Effects (post-legalize) ---
-    /// Sequencing: evaluate the left, then the right. Unit-typed — it has
-    /// no value, and nothing may read one — so it is a monoid whose identity
-    /// is nothing: [`Monoid::SEQ`](crate::fold::Monoid::SEQ), the algebra
-    /// of the folds a lattice is (docs/archive/plans/2026-09-16-collapse-is-a-fold.md
-    /// §2.4). Constructible only by those legalize passes: `kernel!` cannot
-    /// name it and the e-graph's vocabularies decline it, as they do a
-    /// `Write`. A backend that meets one as an instruction emits no bytes.
-    Seq = 52,
-
     // --- Reinterpretation (Real ↔ Int, the same bits) ---
     /// Read a real lane's bits as an integer: `Bits : Real → Int`. The value
     /// is the same 32 bits in the same register, so it compiles to **zero
@@ -249,13 +239,13 @@ op_table! {
     /// Never folded here: a fold would change the literal's *type*, and
     /// until the arena carries one (docs/language/2026-10-17-the-arena-is-typed.md
     /// T3) there is no typed literal to write.
-    Bits = 53,
+    Bits = 52,
     /// Read an integer lane's bits as a real: `Float : Int → Real`, the
     /// inverse of [`OpKind::Bits`], and like it zero instructions: the node is
     /// its operand. `expand_exp2` builds `2^k` as `Float((k + 127) << 23)`.
     /// Not a conversion: [`OpKind::IntToFloat`] computes a different pattern.
     /// Never folded, for `Bits`'s reason.
-    Float = 54,
+    Float = 53,
 }
 
 impl OpKind {
@@ -274,9 +264,6 @@ impl OpKind {
             // tabulates as the all-clear and all-set lanes.
             Self::BitOr => Some(Lit::Mask(false)),
             Self::BitAnd => Some(Lit::Mask(true)),
-            // The unit monoid's identity is nothing. As the lane a fold's
-            // accumulator is seeded with, that is a zero no combine reads.
-            Self::Seq => Some(Lit::Real(0.0)),
             _ => None,
         }
     }
@@ -465,8 +452,7 @@ impl OpKind {
             | Self::BitAnd
             | Self::BitOr
             | Self::Dwrt
-            | Self::RawGather
-            | Self::Seq => 2,
+            | Self::RawGather => 2,
 
             Self::MulAdd | Self::If | Self::Gather => 3,
 
@@ -542,7 +528,6 @@ impl OpKind {
             Self::Reduce => "reduce",
             Self::Uniform => "uniform",
             Self::Param => "param",
-            Self::Seq => "seq",
             Self::Bits => "bits",
             Self::Float => "float",
         }
@@ -605,7 +590,6 @@ impl OpKind {
             "reduce" => Some(Self::Reduce),
             "uniform" => Some(Self::Uniform),
             "param" => Some(Self::Param),
-            "seq" => Some(Self::Seq),
             "bits" => Some(Self::Bits),
             "float" => Some(Self::Float),
             _ => None,
@@ -616,7 +600,7 @@ impl OpKind {
     /// set [`OpKind::from_method_call`] resolves into.
     ///
     /// Stricter than "not structural". The structural ops — leaves, memory,
-    /// binders, `Dwrt` and `Seq` — have no method spelling at all; beyond
+    /// binders, and `Dwrt` — have no method spelling at all; beyond
     /// them, [`Self::Add`]/[`Self::Sub`]/[`Self::Mul`]/[`Self::Div`] are real
     /// ops but are spelled `+ - * /`, never `.add(y)`, and
     /// [`Self::TruncToInt`]/[`Self::IAdd`]/[`Self::Shl`]/[`Self::Shr`]/
@@ -699,8 +683,6 @@ impl OpKind {
             // Reduction is lowered (unrolled) away before costing; price the
             // node itself at zero so a stray one never dominates extraction.
             Self::Reduce => 0,
-            // Sequencing computes nothing.
-            Self::Seq => 0,
             Self::Neg | Self::Abs | Self::Floor | Self::Ceil | Self::Round => 1,
             Self::Add
             | Self::Sub
@@ -820,7 +802,6 @@ impl OpKind {
                 | Self::Reduce
                 | Self::Uniform
                 | Self::Param
-                | Self::Seq
         )
     }
 
@@ -1489,7 +1470,6 @@ mod method_names {
             OpKind::RawGather,
             OpKind::Uniform,
             OpKind::Reduce,
-            OpKind::Seq,
         ] {
             assert!(
                 !names.contains(op.name()),
@@ -1685,7 +1665,6 @@ mod algebraic_properties {
         OpKind::Reduce,
         OpKind::Uniform,
         OpKind::Param,
-        OpKind::Seq,
     ];
 
     #[test]
@@ -1749,18 +1728,6 @@ mod algebraic_properties {
         assert!(!OpKind::Float.is_bitwise_domain(), "its result is a number");
     }
 
-    /// `Seq` has a name and an arity like any op, and no way in from a
-    /// `kernel!` body: the surface set refuses it, so a store's sequencing
-    /// is spelled only by the passes that build one.
-    #[test]
-    fn seq_is_a_binary_op_no_kernel_body_can_call() {
-        assert_eq!(OpKind::Seq.arity(), 2);
-        assert_eq!(OpKind::from_name("seq"), Some(OpKind::Seq));
-        assert_eq!(OpKind::from_method_call("seq", 1), None);
-        assert!(OpKind::Seq.is_monoid(), "the unit monoid's combine");
-        assert!(!OpKind::Seq.is_seed_op());
-    }
-
     #[test]
     fn match_each_ops_actual_operand_count() {
         for op in OpKind::all() {
@@ -1816,8 +1783,7 @@ mod algebraic_properties {
                 | OpKind::BitAnd
                 | OpKind::BitOr
                 | OpKind::Dwrt
-                | OpKind::RawGather
-                | OpKind::Seq => 2,
+                | OpKind::RawGather => 2,
 
                 OpKind::MulAdd | OpKind::If | OpKind::Gather => 3,
 

@@ -47,8 +47,8 @@ Values are names, registers are resources, `encode` makes no choice; a lane is
   `edges_x86_64.rs`, `cross_tier.rs`, run per tier by xtask's `isa-matrix`.
 
 ## Behind
-- The lattice's rows, batches and lanes are folds `pixelflow_ir::passes::lattice`
-  (`collapse`, `pack`) wraps the kernel in, `native` handing the front
+- The lattice's rows, batches and lanes are loops `program/lattice.rs`'s
+  `Traversal` describes and `Lower` writes, `native` handing the front
   `lanes_of::<B>()`: the CPU schedule is upstream of its backend (kernels-evaluate-kernels §3).
 - A branch displacement past its field panics (`DispField::write`,
   `patch_rel32`) rather than returning `Err`; no plan names it.

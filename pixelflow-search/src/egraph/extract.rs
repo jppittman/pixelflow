@@ -1662,7 +1662,7 @@ fn weighted_own<C: CostFunction>(costs: &C, node: &ENode, weight: u64) -> usize 
 ///
 /// A fold `⊕_{[lo,hi)} f` evaluates `f` once per index, and codegen emits a
 /// surviving fold as a loop that runs its body exactly that many times
-/// (`pixelflow_ir::passes::legalize`), so its body is charged `len` times.
+/// (`pixelflow_ir::passes::legalize_back`), so its body is charged `len` times.
 /// Pricing it once would tell the extractor a 34-piece fold costs what one
 /// piece costs, which is how an unpriced fold turns the e-graph's unrolling
 /// (`PeelFold`, `HalveFold`) off — it would keep every fold, unconditionally,

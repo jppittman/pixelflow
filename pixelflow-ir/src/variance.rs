@@ -414,19 +414,6 @@ fn transfer(arena: &ExprArena, id: ExprId, child: impl Fn(ExprId) -> Variance) -
                 |v, bound| v.union(child(bound)),
             )
         }
-        // A store varies with what it stores and with where: its three
-        // binders are read for the address, so it sits inside all three
-        // folds — which is the whole of why the lattice's loops can be
-        // placed by the same rule as everything else.
-        ExprNode::Write {
-            row,
-            col,
-            lane,
-            value,
-        } => child(value)
-            .union(Variance::from_var(row.var()))
-            .union(Variance::from_var(col.var()))
-            .union(Variance::from_var(lane.var())),
         ExprNode::Nary(..) => arena
             .children(id)
             .fold(Variance::CONST, |v, c| v.union(child(c))),
@@ -508,7 +495,7 @@ pub(crate) fn variance_from(arena: &ExprArena, root: ExprId) -> Variance {
 /// (`docs/archive/plans/2026-09-01-loop-aware-codegen.md`).
 ///
 /// An axis of extent 1 is a per-call constant; an axis of larger extent is a
-/// binder the emitted code loops over: `passes::lattice::collapse` wraps the
+/// binder the emitted code loops over: `program::lattice::collapse` wraps the
 /// kernel in one fold per axis, and codegen emits each as a loop.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct LatticeShape([u32; crate::arena::COORD_AXES]);
@@ -868,37 +855,6 @@ mod tests {
         assert_eq!(v[root.0 as usize], Variance::X);
     }
 
-    /// A store varies with what it stores and with the three binders it
-    /// stores under — it is inside all three lattice folds by its bits,
-    /// which is what places it by the same rule as everything else.
-    #[test]
-    fn a_write_varies_with_its_value_and_its_binders() {
-        use crate::fold::Binder;
-        use crate::kind::OpKind;
-
-        let slot = |s: u8| Binder::from_slot(s).expect("a binder slot");
-        let (row, col, lane) = (slot(0), slot(1), slot(2));
-        let mut arena = crate::arena::ExprArena::new();
-        let y = arena.push_var(1);
-        let l = arena.push_var(lane.var());
-        let value = arena.push_binary(OpKind::Add, y, l);
-        let write = arena.push_write(row, col, lane, value);
-
-        let v = super::compute_arena_variance(&arena);
-        assert_eq!(
-            v[value.0 as usize],
-            Variance::Y.union(Variance::from_var(lane.var()))
-        );
-        assert_eq!(
-            v[write.0 as usize],
-            Variance::Y
-                .union(Variance::from_var(row.var()))
-                .union(Variance::from_var(col.var()))
-                .union(Variance::from_var(lane.var())),
-            "the store reads every binder for its address"
-        );
-    }
-
     /// Folds nest past four. Each level takes the lowest free slot, so six
     /// nested sums bind six slots — the fifth and sixth were unrepresentable
     /// when the bitset was a byte — and every one is bound by the time the
@@ -1032,13 +988,6 @@ mod tests {
         assert!(rooted_agrees_with_forward(nested.parts().0));
 
         let slot = |s: u8| Binder::from_slot(s).expect("a binder slot");
-        let mut written = ExprArena::new();
-        let y = written.push_var(1);
-        let lane = written.push_var(slot(2).var());
-        let value = written.push_binary(OpKind::Add, y, lane);
-        written.push_write(slot(0), slot(1), slot(2), value);
-        assert!(rooted_agrees_with_forward(&written));
-
         let mut folds = ExprArena::new();
         let x = folds.push_var(0);
         let index = folds.push_var(slot(0).var());

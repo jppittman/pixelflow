@@ -6,7 +6,7 @@
 //! `floor(v) == v`. Then the fold is `⊕_{k ∈ [lo, hi)}`, the monoid's identity
 //! over a range that runs backwards; and for any other `v` — a fraction, a
 //! negative, NaN, an infinity, `2^24 + 2` — the fold is NaN. The guard that
-//! says so is `passes::legalize`'s last pass, and the oracles here are
+//! says so is `passes::legalize_back`'s last pass, and the oracles here are
 //! explicit folds in scalar Rust, from the monoid's identity.
 //!
 //! Every count is an integer below `2^24` and every sample is an integer, so

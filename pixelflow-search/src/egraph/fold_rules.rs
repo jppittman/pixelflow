@@ -32,7 +32,7 @@
 //! odd level the recursion hits (`log n` of them at most), not a fallback
 //! that reverts to unrolling one term at a time. No lowering pass unrolls a
 //! fold outside the graph: codegen emits one that survives extraction as a
-//! loop (`pixelflow_ir::passes::legalize` leaves it standing).
+//! loop (`pixelflow_ir::passes::legalize_back` leaves it standing).
 //!
 //! ## A right-hand side is a plan
 //!
@@ -508,7 +508,7 @@ pub struct EmptyFold;
 /// **Under [`Monoid::SUM`], a `c` the graph proves zero takes its fold with
 /// it**: a literal `0`, or a class merged with one, such as `X − X`. The `Mul`
 /// annihilator (`0·y → 0`, `OpKind::annihilator`) rewrites `c · Σ f` to `0`, so
-/// no fold is left for the guard `passes::legalize` builds to wrap, and a bound
+/// no fold is left for the guard `passes::legalize_back` builds to wrap, and a bound
 /// that is no count (NaN, a fraction, past 2²⁴) gives `0` where the fold as
 /// written is NaN. For a finite body the answers agree in the domain. That is
 /// the annihilation rule's edge, not this rule's (Linear JP-12).
@@ -549,7 +549,7 @@ pub struct FactorFold;
 /// literal naming no count — a fraction, a negative, past 2²⁴ — is no count,
 /// and a mask is no count of any sort: the rule declines on both (L5 of
 /// docs/language/2026-10-20-a-bound-is-a-value.md: such a fold is NaN, by the
-/// guard `passes::legalize` ends with). A pair it makes known runs forwards (L2
+/// guard `passes::legalize_back` ends with). A pair it makes known runs forwards (L2
 /// of the same plan: `[k, j)` with `k > j` is the empty range at `k`), which
 /// [`EmptyFold`] then closes.
 ///
@@ -1817,7 +1817,7 @@ mod tests {
     }
 
     /// A literal that is no count is no count: a fraction, and a count past the
-    /// domain, decline (L5: such a fold is NaN, by the guard `passes::legalize`
+    /// domain, decline (L5: such a fold is NaN, by the guard `passes::legalize_back`
     /// ends with).
     #[test]
     fn known_bound_declines_a_count_out_of_domain() {

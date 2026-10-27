@@ -194,35 +194,6 @@ fn a_reference_is_declined_by_every_vocabulary() {
     }
 }
 
-/// A `Write` is declined for a standing reason: an effect is not a value
-/// any rule may rewrite, and the legalize passes build one *after*
-/// extraction (docs/archive/plans/2026-09-16-collapse-is-a-fold.md §2.4), so a term
-/// carrying one into saturation skipped the pipeline. `Seq`, the unit
-/// monoid's combine, is declined as an op no vocabulary resolves.
-#[test]
-fn a_write_and_a_seq_are_declined_by_every_vocabulary() {
-    let (arena, write) = pixelflow_ir::internal_test_support::write_fixture();
-    let mut seq_arena = ExprArena::new();
-    let x = seq_arena.push_var(0);
-    let y = seq_arena.push_var(1);
-    let seq = seq_arena.push_binary(OpKind::Seq, x, y);
-
-    for vocab in [Vocabulary::Runtime, Vocabulary::Templates] {
-        let mut eg = EGraph::new();
-        assert_eq!(
-            insert(&arena, write, &mut eg, vocab),
-            Err(Declined::Write),
-            "{vocab:?} must decline a Write"
-        );
-        let mut eg = EGraph::new();
-        assert_eq!(
-            insert(&seq_arena, seq, &mut eg, vocab),
-            Err(Declined::Op(OpKind::Seq)),
-            "{vocab:?} must decline Seq"
-        );
-    }
-}
-
 /// And the runtime tier as a whole does not decline it: the referent is a
 /// unit, saturated and extracted by itself and linked back in, so its body is
 /// optimized exactly as the spliced composition's would be and no `Ref`

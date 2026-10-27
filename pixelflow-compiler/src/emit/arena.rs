@@ -214,15 +214,6 @@ fn node(arena: &ExprArena, id: ExprId, _context: &EntryContext) -> TokenStream {
             let (lo, hi) = (bound(lo), bound(hi));
             emitted! { __arena.push_reduce(#decoded, #lo, #hi, #body) }
         }
-        // A store is post-legalize vocabulary: the passes that wrap a
-        // kernel in the lattice's folds build one, after extraction,
-        // and no kernel! body can spell it.
-        ExprNode::Write { .. } => {
-            panic!(
-                "kernel! produced ExprNode::Write — a store has no surface syntax; \
-                 the legalize passes build one after extraction"
-            )
-        }
     }
 }
 
