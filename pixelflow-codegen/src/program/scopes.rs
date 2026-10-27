@@ -7,14 +7,10 @@
 
 use alloc::vec::Vec;
 
-use pixelflow_ir::fold::{Binder, Bound};
-use pixelflow_ir::variance::Variance;
-
-use super::lattice::Traversal;
 use super::ownership::Positions;
 use super::{
-    Def, Looping, Lowered, ScheduledOp, Scope, ScopeFold, ScopeRegion, ScopedSchedule, ValueId,
-    all_operands, structural_children,
+    Def, ScheduledOp, Scope, ScopeFold, ScopeRegion, ScopedSchedule, ValueId, all_operands,
+    structural_children,
 };
 use crate::error::CompileError;
 use crate::pass::Pass;
@@ -32,23 +28,14 @@ use crate::pass::Pass;
 /// included, so a per-call value is computed per call and a per-row one per
 /// row (docs/archive/plans/2026-09-16-collapse-is-a-fold.md §2.2) — asked as one
 /// question of the variance rather than as a tier per loop.
-///
-/// The factorization is the first thing `Nest` does: the lattice's row, column
-/// and lane loops are written around the kernel's value
-/// ([`write_traversal`]), so the carving below sees them as it sees any fold.
 pub(crate) struct Nest;
 
 impl Pass for Nest {
-    type Input = Lowered;
+    type Input = Vec<Def>;
     type Output = ScopedSchedule<()>;
 
-    fn run(self, lowered: Lowered) -> Result<ScopedSchedule<()>, CompileError> {
-        let Lowered {
-            mut schedule,
-            value,
-            traversal,
-        } = lowered;
-        write_traversal(&mut schedule, &traversal, value);
+    fn run(self, schedule: Vec<Def>) -> Result<ScopedSchedule<()>, CompileError> {
+        use pixelflow_ir::variance::Variance;
         // The carving asks for an operand's variance by `ValueId` at every
         // level of the nest, so one table, from the full schedule before it
         // is split. Lowering numbers its defs `0..len`, so every slot is
@@ -108,76 +95,6 @@ impl<A> ScopedSchedule<A> {
             }
         }
     }
-}
-
-/// The traversal's loops, after the kernel's defs: for each of the row's
-/// pieces ([`Traversal::pieces`]) a `Write` of `value` under its column loop,
-/// the pieces sequenced under the row loop. The lane fold is a store: it is
-/// executed by lanes and has no loop, so it is a `Write` of the kernel's value
-/// with the piece's trip count as the store width, and a row's main batches and
-/// remainder are two `Write`s of different widths reading one value. Each
-/// def's variance is the fold's rule (`transfer` in `pixelflow-ir`'s
-/// `variance.rs`): what its body reads, less the binder it closes; the kernel's
-/// own is the variance of `value`'s def.
-fn write_traversal(schedule: &mut Vec<Def>, traversal: &Traversal, value: ValueId) {
-    let kernel = schedule[value.0 as usize].variance;
-    let bit = |binder: Binder| Variance::from_var(binder.var());
-    let mut push = |op: ScheduledOp, variance: Variance| {
-        let id = ValueId(schedule.len() as u64);
-        schedule.push(Def {
-            value: id,
-            op,
-            variance,
-        });
-        (id, variance)
-    };
-    // A store reads its three binders for the address, so it sits inside all
-    // three loops; the lane fold it is closes the lane binder.
-    let stored = kernel.union(traversal.variance());
-    let mut pieces = Vec::new();
-    for piece in traversal.pieces() {
-        let (write, in_lane) = push(
-            ScheduledOp::Write {
-                row: traversal.row,
-                col: traversal.col,
-                lane: traversal.lane,
-                lanes: piece.lanes,
-                value,
-            },
-            stored.without(bit(traversal.lane)),
-        );
-        let [lo, hi] = piece.range;
-        pieces.push(push(
-            ScheduledOp::Reduce {
-                looping: piece.col,
-                lo: Bound::Lit(lo),
-                hi: Bound::Lit(hi),
-                body: write,
-            },
-            in_lane.without(bit(traversal.col)),
-        ));
-    }
-    let (walk, variance) = pieces
-        .into_iter()
-        .reduce(|(main, main_variance), (tail, tail_variance)| {
-            push(
-                ScheduledOp::Seq(main, tail),
-                main_variance.union(tail_variance),
-            )
-        })
-        .expect("a traversal has a piece");
-    let _ = push(
-        ScheduledOp::Reduce {
-            looping: Looping::Sweep {
-                binder: traversal.row,
-                stride: 1,
-            },
-            lo: Bound::Lit(0),
-            hi: Bound::Lit(u64::from(traversal.extent[1])),
-            body: walk,
-        },
-        variance.without(bit(traversal.row)),
-    );
 }
 
 /// The lane binders a scope binds by holding a store: the lane fold is

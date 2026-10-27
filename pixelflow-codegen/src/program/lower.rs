@@ -224,16 +224,21 @@ fn shift_immediate(op: OpKind, count: f32) -> u8 {
 /// and translate `ExprNode` to `ScheduledOp`.
 ///
 /// The arena is a legalized one with no coordinate `Var` left; `traversal`
-/// is how the CPU walks the lattice it is spelled through, which lowering
-/// reads for the binders the kernel is spelled in. The schedule holds only the
-/// kernel, with the [`ValueId`] of its value beside it: [`Nest`](super::Nest)
-/// factors the lattice around that value.
+/// is how the CPU walks the lattice it is spelled through. The arena holds
+/// only the kernel: the traversal's loops are written here, after the
+/// kernel's defs, as the schedule the arena used to carry as nodes.
 ///
+/// - **The lane fold is a store.** The lane binder's fold is executed by
+///   lanes; it has no loop, so it is a [`ScheduledOp::Write`] def of the
+///   kernel's value with the fold's trip count as the store width. A row's
+///   main batches and its remainder are two `Write` defs of different widths
+///   reading one value, each the body of its column fold, sequenced by a
+///   [`ScheduledOp::Seq`] under the row fold.
 /// - **The lane binder is a constant.** Its `Var` becomes
 ///   [`ScheduledOp::Lanes`], the iota every lane-varying value is built on.
 ///
 /// `None` is an arena with no lattice (the lowering tests' raw arenas):
-/// every read stays a gather.
+/// nothing is stored, and every read stays a gather.
 ///
 /// A fold whose bound is a value arrives inside its guard (`passes::legalize_back`'s
 /// last pass): its bounds are operands ([`operands`](super::operands)), and it
@@ -269,7 +274,7 @@ pub(crate) fn arena_to_schedule(
     root: pixelflow_ir::arena::ExprId,
     origin: [UniformId; 2],
     traversal: Option<&Traversal>,
-) -> (Vec<Def>, ValueId) {
+) -> Vec<Def> {
     let len = arena.len();
     let mut reachable = alloc::vec![false; len];
     mark_reachable(arena, root, &mut reachable);
@@ -510,7 +515,82 @@ pub(crate) fn arena_to_schedule(
         });
     }
     folds.assert_every_fold_was_read();
-    (schedule, id_map[root.0 as usize])
+    if let Some(traversal) = traversal {
+        let value = id_map[root.0 as usize];
+        write_traversal(&mut schedule, traversal, value, variance[root.0 as usize]);
+    }
+    schedule
+}
+
+/// The traversal's loops, after the kernel's defs: for each of the row's
+/// pieces ([`Traversal::pieces`]) a `Write` of `value` (the lane fold,
+/// executed by lanes) under its column fold, the pieces sequenced under the
+/// row fold. `kernel` is what the kernel's value varies with; each def's
+/// variance is the fold's rule (`transfer` in `pixelflow-ir`'s `variance.rs`):
+/// what its body reads, less the binder it closes.
+fn write_traversal(
+    schedule: &mut Vec<Def>,
+    traversal: &Traversal,
+    value: ValueId,
+    kernel: Variance,
+) {
+    let bit = |binder: Binder| Variance::from_var(binder.var());
+    let mut push = |op: ScheduledOp, variance: Variance| {
+        let id = ValueId(schedule.len() as u64);
+        schedule.push(Def {
+            value: id,
+            op,
+            variance,
+        });
+        (id, variance)
+    };
+    // A store reads its three binders for the address, so it sits inside all
+    // three loops; the lane fold it is closes the lane binder.
+    let stored = kernel.union(traversal.variance());
+    let mut pieces = Vec::new();
+    for piece in traversal.pieces() {
+        let (write, in_lane) = push(
+            ScheduledOp::Write {
+                row: traversal.row,
+                col: traversal.col,
+                lane: traversal.lane,
+                lanes: piece.lanes,
+                value,
+            },
+            stored.without(bit(traversal.lane)),
+        );
+        let [lo, hi] = piece.range;
+        pieces.push(push(
+            ScheduledOp::Reduce {
+                looping: piece.col,
+                lo: Bound::Lit(lo),
+                hi: Bound::Lit(hi),
+                body: write,
+            },
+            in_lane.without(bit(traversal.col)),
+        ));
+    }
+    let (walk, variance) = pieces
+        .into_iter()
+        .reduce(|(main, main_variance), (tail, tail_variance)| {
+            push(
+                ScheduledOp::Seq(main, tail),
+                main_variance.union(tail_variance),
+            )
+        })
+        .expect("a traversal has a piece");
+    let _ = push(
+        ScheduledOp::Reduce {
+            looping: Looping::Sweep {
+                binder: traversal.row,
+                stride: 1,
+            },
+            lo: Bound::Lit(0),
+            hi: Bound::Lit(u64::from(traversal.extent[1])),
+            body: walk,
+        },
+        variance.without(bit(traversal.row)),
+    );
 }
 
 #[cfg(test)]
@@ -637,7 +717,7 @@ mod tests {
     #[test]
     fn a_value_bound_is_an_operand_of_its_fold() {
         let (a, _, _, root) = a_guarded_fold(BoundEnd::Hi, the_count);
-        let (schedule, _) = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM, None);
+        let schedule = arena_to_schedule(&a, root, AFTER_ONE_UNIFORM, None);
 
         let reduce = schedule
             .iter()
