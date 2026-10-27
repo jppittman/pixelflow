@@ -455,7 +455,7 @@ pub(crate) fn arena_to_schedule(
             // surviving reference is a *call*, and codegen emits one flat
             // function per kernel with no ABI for one
             // (docs/language/2026-09-09-composition-is-linking.md §5.2).
-            ExprNode::Ref(key) => panic!(
+            ExprNode::Ref(key) | ExprNode::Apply(key, ..) => panic!(
                 "arena_to_schedule: {key:?} names a kernel whose body is not in \
                  this arena. expand_refs runs first in every compile entry \
                  point, so a survivor means this schedule was built without \

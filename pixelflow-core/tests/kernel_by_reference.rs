@@ -204,3 +204,27 @@ fn a_fold_around_a_unit_that_rebinds_its_slot() {
         assert_eq!(*v, 12.0 * x + 3.0, "sample {i}");
     }
 }
+
+/// `Kernel::at` leaves a named kernel named: the composite is an `Apply`
+/// (docs/language/2026-09-09-composition-is-linking.md §8), and the compile
+/// that expands it renders what warping the body renders. Warped twice, and
+/// under a derivative, because the warps compose and the chain rule has to
+/// reach the referent through them.
+#[test]
+fn an_applied_name_renders_what_the_warped_body_renders() {
+    let body = Kernel::x()
+        .mul(&Kernel::x())
+        .add(&Kernel::y().mul(&Kernel::constant(3.5)));
+    let first = |k: &Kernel| k.at(&Kernel::y(), &Kernel::x().add(&Kernel::constant(2.0)));
+    let second = |k: &Kernel| k.at(&Kernel::x().mul(&Kernel::constant(0.5)), &Kernel::y());
+
+    let named = second(&first(&body.by_ref()));
+    let (arena, root) = named.parts();
+    assert!(
+        matches!(arena.node(root), pixelflow_ir::ExprNode::Apply(..)),
+        "the warp must leave the name applied, not expanded: {}",
+        arena.display(root)
+    );
+    assert_eq!(render(&named), render(&second(&first(&body))));
+    assert_eq!(render(&named.dx()), render(&second(&first(&body)).dx()));
+}

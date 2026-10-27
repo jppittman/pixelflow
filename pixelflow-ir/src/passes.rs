@@ -57,7 +57,7 @@
 //!
 //! Nothing re-fuses `mul`+`add` into `MulAdd` afterwards — see `horner_step`.
 
-use crate::arena::{ExprArena, ExprId, ExprNode};
+use crate::arena::{Axis, ExprArena, ExprId, ExprNode};
 use crate::kind::OpKind;
 use crate::lit::Lit;
 use crate::variance::Variance;
@@ -229,6 +229,7 @@ fn copy_node(
         ExprNode::Buffer(b) => arena.push_buffer(*b),
         ExprNode::Uniform(u) => arena.push_uniform(*u),
         ExprNode::Ref(k) => arena.push_ref(*k),
+        ExprNode::Apply(k, cx, cy) => arena.push_apply(*k, m(*cx), m(*cy)),
         ExprNode::Unary(op, a) => arena.push_unary(*op, m(*a)),
         ExprNode::Binary(op, a, b) => arena.push_binary(*op, m(*a), m(*b)),
         ExprNode::Ternary(op, a, b, c) => arena.push_ternary(*op, m(*a), m(*b), m(*c)),
@@ -279,7 +280,7 @@ fn copy_node(
 /// `Kernel::by_ref`, which interns before it names, so an unresolvable key is
 /// a corrupt graph rather than a condition to recover from.
 pub fn expand_refs(arena: &mut ExprArena, root: ExprId) -> ExprId {
-    link_with(arena, root, |key| {
+    link_with(arena, root, Names::All, |key| {
         let (body, body_root) = expanded_referent(key);
         Some((Cow::Owned(body), body_root))
     })
@@ -307,9 +308,9 @@ pub fn link(
     root: ExprId,
     bodies: &BTreeMap<crate::key::KernelKey, (ExprArena, ExprId)>,
 ) -> ExprId {
-    link_with(arena, root, |key| {
+    link_with(arena, root, Names::All, |key| {
         let (body, body_root) = bodies.get(&key)?;
-        if !body.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))) {
+        if !body.names_a_kernel() {
             return Some((Cow::Borrowed(body), *body_root));
         }
         let mut linked = body.clone();
@@ -318,19 +319,64 @@ pub fn link(
     })
 }
 
-/// The walk [`expand_refs`] and [`link`] share: each reachable `Ref` whose
-/// key `referent` answers is replaced by that body, spliced once per key.
+/// Which names a linker walk resolves.
+#[derive(Clone, Copy)]
+enum Names {
+    /// Every [`ExprNode::Ref`] and [`ExprNode::Apply`].
+    All,
+    /// Only an [`ExprNode::Apply`]: a bare `Ref` stays a name — and, in the
+    /// runtime tier, a unit.
+    Applied,
+}
+
+/// The walk [`expand_refs`], [`expand_applies`] and [`link`] share: each
+/// reachable name whose key `referent` answers is replaced by that body,
+/// spliced once per key.
+///
+/// An `Apply(k, cx, cy)` is its referent's body with the coordinates
+/// replaced by the warp: `⟦k⟧[X := ⟦cx⟧, Y := ⟦cy⟧]`. The body is spliced
+/// once per key, as for a `Ref`; the substitution is per `Apply`, because
+/// the warp is. A name left inside the body is carried through the warp as
+/// an `Apply` of its own (`ExprArena::substitute_vars_with`), never sampled
+/// at the outer coordinates.
 fn link_with<'b>(
     arena: &mut ExprArena,
     root: ExprId,
+    names: Names,
     mut referent: impl FnMut(crate::key::KernelKey) -> Option<(Cow<'b, ExprArena>, ExprId)>,
 ) -> ExprId {
     let mut spliced: BTreeMap<crate::key::KernelKey, Option<ExprId>> = BTreeMap::new();
-    rebuild_arena(arena, root, |arena, node, _m| match node {
-        ExprNode::Ref(key) => *spliced.entry(*key).or_insert_with(|| {
-            referent(*key).map(|(body, body_root)| arena.splice(&body, body_root))
-        }),
-        _ => None,
+    rebuild_arena(arena, root, |arena, node, m| {
+        let mut body_of = |arena: &mut ExprArena, key: crate::key::KernelKey| {
+            *spliced.entry(key).or_insert_with(|| {
+                referent(key).map(|(body, body_root)| arena.splice(&body, body_root))
+            })
+        };
+        match (node, names) {
+            (ExprNode::Ref(key), Names::All) => body_of(arena, *key),
+            (ExprNode::Apply(key, cx, cy), _) => body_of(arena, *key).map(|body| {
+                arena
+                    .substitute_vars_with(body, &[(Axis::X.var(), m(*cx)), (Axis::Y.var(), m(*cy))])
+            }),
+            _ => None,
+        }
+    })
+}
+
+/// Replace every [`ExprNode::Apply`] reachable from `root` with its referent
+/// at the warp — [`expand_refs`] for the names that are read at warped
+/// coordinates, leaving a bare [`ExprNode::Ref`] a name.
+///
+/// The "expand" lowering of `Apply`
+/// (docs/language/2026-09-09-composition-is-linking.md §8), and the only one
+/// today. The runtime tier runs it before saturation: a unit is a closed
+/// term read at its own coordinates, and an `Apply` is not one, so it is
+/// inlined — every name under it with it, which is what `Kernel::at` did at
+/// construction before the choice was deferred.
+pub fn expand_applies(arena: &mut ExprArena, root: ExprId) -> ExprId {
+    link_with(arena, root, Names::Applied, |key| {
+        let (body, body_root) = expanded_referent(key);
+        Some((Cow::Owned(body), body_root))
     })
 }
 
@@ -367,7 +413,7 @@ fn expanded_referent(key: crate::key::KernelKey) -> (ExprArena, ExprId) {
 /// fast-path when the arena holds no `Ref`, otherwise clone-and-expand.
 #[must_use]
 pub fn expand_refs_owned(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
-    if !arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))) {
+    if !arena.names_a_kernel() {
         return (arena.clone(), root);
     }
     let mut owned = arena.clone();
@@ -657,7 +703,8 @@ fn push_deriv_children(node: &ExprNode, stack: &mut Vec<ExprId>) {
         | ExprNode::Param(_)
         | ExprNode::Buffer(_)
         | ExprNode::Uniform(_)
-        | ExprNode::Ref(_) => {}
+        | ExprNode::Ref(_)
+        | ExprNode::Apply(..) => {}
         ExprNode::Unary(op, a) => match op {
             // d = 0 without touching the operand.
             OpKind::Floor | OpKind::Ceil | OpKind::Round => {}
@@ -712,6 +759,9 @@ fn diff_node(arena: &mut ExprArena, id: ExprId, rules: &Rules) -> Result<ExprId,
         // referent — `expand_refs`, which every pipeline runs before this —
         // and you differentiate the referent instead.
         ExprNode::Ref(_) => Err("lower_dwrt: cannot differentiate a Ref; run expand_refs first"),
+        ExprNode::Apply(..) => {
+            Err("lower_dwrt: cannot differentiate an Apply; run expand_refs first")
+        }
 
         ExprNode::Unary(op, a) => {
             // Step functions and int-domain ops never mark their operand in
@@ -1884,7 +1934,7 @@ pub struct ExpandRefs;
 
 impl Optimize for ExpandRefs {
     fn optimize(&mut self, arena: &ExprArena, root: ExprId) -> Rewritten {
-        if !arena.nodes().any(|(_, n)| matches!(n, ExprNode::Ref(_))) {
+        if !arena.names_a_kernel() {
             return Rewritten::Unchanged;
         }
         let mut owned = arena.clone();

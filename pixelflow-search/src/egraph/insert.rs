@@ -67,6 +67,12 @@ pub enum Declined {
     /// and declines it: inlining inside saturation is a rule that does not
     /// exist (docs/language/2026-09-09-composition-is-linking.md §3).
     Ref(pixelflow_ir::KernelKey),
+    /// A kernel named by content and read at a warp. A unit is a closed
+    /// term read at its own coordinates, and an `Apply` is not one: nothing
+    /// in the graph may hold it until a pass has chosen to expand it
+    /// (`pixelflow_ir::passes::expand_applies`), which the runtime tier does
+    /// before it inserts.
+    Apply(pixelflow_ir::KernelKey),
 }
 
 /// Insert the subgraph reachable from `root` into `egraph`, returning the
@@ -127,6 +133,7 @@ pub fn insert<I: Ir>(
                         (Vocabulary::Runtime, Some(_)) => egraph.add(ENode::Ref { key }),
                         _ => return Err(Declined::Ref(key)),
                     },
+                    Shape::Apply(key, ..) => return Err(Declined::Apply(key)),
                     Shape::Buffer(decl) => egraph.add(ENode::Buffer(decl)),
                     Shape::Uniform(decl) => egraph.add(ENode::Uniform(decl)),
                     Shape::Op(kind, children) => {

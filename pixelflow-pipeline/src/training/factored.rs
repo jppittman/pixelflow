@@ -616,7 +616,7 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
                          no block to read it from",
                         u.0
                     ),
-                    ExprNode::Ref(k) => panic!(
+                    ExprNode::Ref(k) | ExprNode::Apply(k, ..) => panic!(
                         "ExprNode::Ref({k:?}) reached arena_to_kernel_code — kernel code has \
                          no syntax for a reference; expand_refs first"
                     ),

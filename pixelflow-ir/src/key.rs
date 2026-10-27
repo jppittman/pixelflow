@@ -446,6 +446,17 @@ impl<'a> Walk<'a> {
                 self.scratch.push(9);
                 self.scratch.extend_from_slice(&key_of.bits().to_le_bytes());
             }
+            // The same name read at warped coordinates: the referent's key
+            // and the warp's canonical ids, so the composite is keyed from
+            // its parts and naming it needs no expansion. Content
+            // addressing composes (docs/language/2026-09-09-composition-is-linking.md
+            // §8). Tag 14: 13 is the mask literal's.
+            ExprNode::Apply(key_of, cx, cy) => {
+                self.scratch.push(14);
+                self.scratch.extend_from_slice(&key_of.bits().to_le_bytes());
+                self.push_child(cx);
+                self.push_child(cy);
+            }
             // The fold's header is metadata, so it is *in the tag bytes*
             // rather than encoded as three child nodes; a bound that is a
             // value writes its header field's marker and its child's key after
@@ -985,6 +996,36 @@ mod tests {
             canonical(&host, ref_a).key,
             canonical(&twin, ref_a_again).key
         );
+    }
+
+    /// An `Apply` is keyed by the name it applies *and* the warp it applies
+    /// it at, from the parts — no expansion — so the same name at two warps
+    /// is two kernels, the same name at the same warp is one, and neither is
+    /// the bare name.
+    #[test]
+    fn an_apply_is_keyed_by_its_name_and_its_warp() {
+        let (a, ra) = circle(false);
+        let key = KernelKey::of(&a, ra);
+
+        let build = |warp: &dyn Fn(&mut ExprArena) -> [ExprId; 2]| {
+            let mut host = ExprArena::new();
+            let [cx, cy] = warp(&mut host);
+            let root = host.push_apply(key, cx, cy);
+            canonical(&host, root).key
+        };
+        let shifted = |host: &mut ExprArena| {
+            let (x, y) = (host.push_var(0), host.push_var(1));
+            let one = host.push_const(1.0);
+            [host.push_binary(OpKind::Add, x, one), y]
+        };
+        let swapped = |host: &mut ExprArena| [host.push_var(1), host.push_var(0)];
+
+        assert_eq!(build(&shifted), build(&shifted));
+        assert_ne!(build(&shifted), build(&swapped));
+
+        let mut host = ExprArena::new();
+        let bare = host.push_ref(key);
+        assert_ne!(build(&shifted), canonical(&host, bare).key);
     }
 
     /// Nothing bounds a program's argument count — a glyph carries ten

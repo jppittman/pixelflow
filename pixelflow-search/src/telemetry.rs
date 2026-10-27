@@ -263,6 +263,12 @@ fn latency_prior_cost(arena: &ExprArena, root: ExprId) -> usize {
             // Priced as the node it is, which is what `CostModel` says about
             // it — see `node_op_cost`'s note on why that is a sentinel.
             ExprNode::Reduce { .. } => Some(pixelflow_ir::OpKind::Reduce),
+            // An `Apply`: `insert` declines one, and the runtime tier
+            // expands every `Apply` before it walks its units.
+            ExprNode::Apply(key, ..) => panic!(
+                "latency_prior_cost: {key:?} applied at a warp — insert declines an \
+                 Apply, so one here means this arena never went through the pipeline"
+            ),
         };
         if let Some(op) = op {
             total += costs.cost(op);
