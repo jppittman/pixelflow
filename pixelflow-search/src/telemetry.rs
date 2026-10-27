@@ -248,6 +248,7 @@ fn latency_prior_cost(arena: &ExprArena, root: ExprId) -> usize {
             | ExprNode::Ternary(op, _, _, _)
             | ExprNode::Nary(op, _) => Some(op),
             ExprNode::Var(_)
+            | ExprNode::Placeholder(_)
             | ExprNode::Const(_)
             | ExprNode::Param(_)
             | ExprNode::Buffer(_)

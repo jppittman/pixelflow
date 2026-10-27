@@ -234,27 +234,24 @@ pub(crate) const PLACEHOLDER_BASE: u8 = crate::variance::Variance::VARIABLES;
 /// A fold's index while its body is built, before its [`Binder`] is chosen.
 ///
 /// The binder is chosen after the body exists — the lowest slot no fold in
-/// the body binds — so the body is built against a placeholder `Var` and
-/// the placeholder renamed once the slot is known
+/// the body binds — so the body is built against a placeholder identity and
+/// that identity is closed into a `Var` once the slot is known
 /// ([`ExprArena::close_over`], the one place that is done). A placeholder
-/// must be unique among the binders being built *at once*: a nested fold
-/// renames every occurrence of its own, so if it shared one with the fold
-/// enclosing it, it would capture the outer index — `Σ_i Σ_j f(i, j)` would
-/// become `Σ_i Σ_j f(j, j)`. How one is kept unique is the builder's: a
-/// `Kernel` claims one from a set shared across threads, `kernel!`'s
-/// lowering takes one per fold it has open.
+/// is not a `Var`: its independent identity is what prevents a later fold
+/// from capturing an index that escaped an earlier construction scope. A
+/// `Kernel` mints a never-reissued identity; `kernel!` lowering owns one
+/// deterministic identity per fold it has open.
 ///
 /// A type rather than a `Var` index so that closing over anything else — an
 /// `X`, which would bind the coordinate — is unrepresentable.
 ///
 /// [`ExprArena::close_over`]: crate::ExprArena::close_over
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Placeholder(u8);
+pub struct Placeholder(u64);
 
 impl Placeholder {
-    /// How many binders may be under construction at once, across every
-    /// builder: the placeholders past the binders' index space a `u64` set can
-    /// track, which is more than the [`Binder::COUNT`] a program can nest.
+    /// How many deterministic identities syntax lowering reserves. Runtime
+    /// construction mints identities beyond this range.
     pub const COUNT: usize = u64::BITS as usize;
 
     /// The `n`th placeholder, or `None` past [`Placeholder::COUNT`].
@@ -263,21 +260,22 @@ impl Placeholder {
         if n >= Self::COUNT {
             return None;
         }
-        PLACEHOLDER_BASE
-            .checked_add(u8::try_from(n).ok()?)
-            .map(Self)
+        Some(Self(n as u64))
     }
 
-    /// The `Var` index a body reads this placeholder through.
+    /// The construction identity a body reads this placeholder through.
     #[must_use]
-    pub fn var(self) -> u8 {
+    pub(crate) fn identity(self) -> u64 {
         self.0
+    }
+
+    pub(crate) const fn from_identity(identity: u64) -> Self {
+        Self(identity)
     }
 }
 
-// A program nests at most `Binder::COUNT` folds, so a builder that takes one
-// placeholder per fold it has open never runs out before the index space
-// does.
+// A program nests at most `Binder::COUNT` folds, so syntax lowering's reserved
+// identities never run out before the binder space does.
 const _: () = assert!(Placeholder::COUNT >= Binder::COUNT);
 
 /// A fold's bound: an integer known when the node is built, or the value of
@@ -1647,19 +1645,13 @@ mod tests {
         );
     }
 
-    /// Every placeholder is past every binder — a rename of one never
-    /// reaches a slot an inner fold chose — and there are as many as a
-    /// `u64` set tracks.
+    /// Placeholders have identities of their own rather than occupying the
+    /// finite `Var` namespace.
     #[test]
-    fn a_placeholder_is_past_every_binder() {
+    fn placeholders_have_distinct_identities() {
         let first = Placeholder::nth(0).expect("a placeholder");
-        assert_eq!(first.var(), crate::Variance::VARIABLES);
-        assert!(Binder::all().all(|binder| binder.var() < first.var()));
         let last = Placeholder::nth(Placeholder::COUNT - 1).expect("the last placeholder");
-        assert_eq!(
-            usize::from(last.var() - first.var()),
-            Placeholder::COUNT - 1
-        );
+        assert_ne!(first.identity(), last.identity());
         assert_eq!(Placeholder::nth(Placeholder::COUNT), None);
     }
 

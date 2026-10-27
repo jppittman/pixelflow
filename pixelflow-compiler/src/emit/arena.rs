@@ -131,6 +131,9 @@ fn reached(arena: &ExprArena, root: ExprId) -> Vec<ExprId> {
 fn node(arena: &ExprArena, id: ExprId, _context: &EntryContext) -> TokenStream {
     match arena.node(id) {
         ExprNode::Var(i) => emitted! { __arena.push_var(#i) },
+        ExprNode::Placeholder(identity) => {
+            panic!("emit: fold index scope {identity} escaped without its binder")
+        }
         // By bit pattern, not as a decimal literal: `quote`'s `f32`
         // impl goes through `Literal::f32_suffixed`, which asserts
         // `is_finite()` — and non-finite constants are ordinary here. A

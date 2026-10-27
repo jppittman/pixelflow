@@ -590,6 +590,9 @@ pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
                 let start = result_stack.len().saturating_sub(arity);
                 let args: Vec<String> = result_stack.drain(start..).collect();
                 let emitted = match arena.node(node) {
+                    ExprNode::Placeholder(identity) => panic!(
+                        "arena_to_kernel_code: fold index scope {identity} escaped without its binder"
+                    ),
                     ExprNode::Var(0) => "X".into(),
                     ExprNode::Var(1) => "Y".into(),
                     ExprNode::Var(2) => "Z".into(),
