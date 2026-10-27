@@ -32,6 +32,15 @@ twenty words of their own, and several of those — `Registered`, `Plan of recor
 vocabulary was wrong, not the authors.** Describe archival relationships with
 `Supersedes:` / `Superseded by:` in addition to the status, not instead of it.
 
+### Work lives in Linear, not here
+
+The repository is not an issue tracker. A design doc may carry a task breakdown (the
+steps, their order, their gates), and each step names its Linear issue (`JP-NN`). It
+does not carry checkboxes, "done/next" columns, or any other record of where the work
+stands: that state is Linear's, and a copy in a document goes stale the day it is
+written. Open design questions are plain bullets; the issue that will resolve one
+names it.
+
 ### Why `Verified against` is required
 
 A status document pinned to a moving base is stale by default, and the fix is not
@@ -149,5 +158,5 @@ _End-to-end validation._
 ## 7. Open Questions
 _Decisions that need input before proceeding._
 
-- [ ] Question 1?
-- [ ] Question 2?
+- Question 1?
+- Question 2?

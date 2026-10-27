@@ -45,7 +45,7 @@ here can change what a kernel means.
 - `mod.rs` and `../lib.rs` still list a `quarantine` module that does not exist.
   `bezier_family.rs` documents `Quarantine` against `eval_scalar`; neither is
   defined anywhere in the tree, and its `oracle_tests` holds one test (a lerp
-  count), not the per-form reference it promises. Closes with BACKLOG C4.
+  count), not the per-form reference it promises. Closes with JP-29.
 - `Fence` has no caller outside `split.rs`'s tests; `gen_bench_corpus` went (C4).
 - `mint.rs` and `../journal.rs` cite `MintMetadata` and `weights_identity`, gone
   with the extraction head (2026-09-01). `r2g.rs` says the mint "may not have
