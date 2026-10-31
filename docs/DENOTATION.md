@@ -65,8 +65,10 @@ value](language/2026-10-20-a-bound-is-a-value.md)), each fixed before the
 lattice is traversed. Every program's cost is a closed-form function of values
 known before the traversal, computable without running it; nothing evaluates it
 per call, and the static model prices a fold whose range is not a known
-constant at its uniform's declared count, else at an estimate
-(`Fold::ESTIMATED_TRIPS`). "Estimatable by the cost
+constant at an estimate (`Fold::ESTIMATED_TRIPS`) — never at a uniform's
+declared default, which the program's key leaves out (a uniform is a slot, not a
+value, so one program serves every count): a price that read it would make the
+emitted code depend on whichever default compiled first. "Estimatable by the cost
 model", "a valid shader" and "`bake` terminates" are one property. Total is not
 cheap: totality gives a number, and a value-bounded program is priced at the
 estimate, never reported over budget.
