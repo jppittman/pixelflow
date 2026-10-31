@@ -479,8 +479,8 @@ fn every_fold_types_as_its_terms() {
     }
 }
 
-/// A bound must be a count: a known `usize`, a count parameter, or an
-/// enclosing fold index. Other types and expressions are refused.
+/// A bound must be a count: a known `usize` or an unchanged count parameter.
+/// Other types and expressions are refused.
 #[test]
 fn a_range_bound_that_is_not_a_count_is_refused() {
     let cases: [(TokenStream, &str); 8] = [
@@ -521,7 +521,40 @@ fn a_range_bound_that_is_not_a_count_is_refused() {
         let err = refusal(input);
         assert!(err.contains(expected), "expected `{expected}`, got: {err}");
     }
-    accepted(quote! { || (0..4).map(|i| (0..i).map(|j| j as f32).sum::<f32>()).sum() });
+}
+
+/// A user fold is rectangular: an enclosing fold's index is no bound, at
+/// either end, alone or under arithmetic, while an inner fold over a constant
+/// range may still read the outer index in its body (§4 of
+/// docs/language/2026-10-25-kernel-staging-and-rectangular-folds.md).
+#[test]
+fn an_enclosing_fold_index_is_no_range_bound() {
+    for input in [
+        quote! { || (0..4).map(|i| (0..i).map(|j| j as f32).sum::<f32>()).sum() },
+        quote! { || (0..4).map(|i| (i..4).map(|j| j as f32).sum::<f32>()).sum() },
+        quote! { || (0..4).map(|i| (0..i + 1).map(|j| j as f32).sum::<f32>()).sum() },
+        quote! { || (0..4).map(|i| (0..i).map(|i| i as f32).sum::<f32>()).sum() },
+        quote! {
+            pub fn f(n: usize) -> f32 {
+                (0..n).map(|i| (0..i).map(|j| j as f32).sum::<f32>()).sum()
+            }
+        },
+    ] {
+        let err = refusal(input);
+        assert!(
+            err.contains("fold index used as a range bound")
+                && err.contains("constant or an unchanged uniform count"),
+            "got: {err}"
+        );
+    }
+    accepted(quote! {
+        || (0..4).map(|i| (0..3).map(|j| (i as f32) + (j as f32)).sum::<f32>()).sum()
+    });
+    accepted(quote! {
+        pub fn f(n: usize) -> f32 {
+            (0..4).map(|i| (0..n).map(|j| (i as f32) * (j as f32)).sum::<f32>()).sum()
+        }
+    });
 }
 
 /// A range runs forwards; a reversed one is refused, saying it would be

@@ -218,8 +218,8 @@ pub(crate) fn folds_nested_too_deep(span: Span) -> syn::Error {
     )
 }
 
-/// What a fold's bound may name: a `usize` const, an enclosing fold index
-/// or an entry count parameter.
+/// What a fold's bound may name: a `usize` const or an entry count
+/// parameter.
 #[derive(Clone, Copy)]
 pub(crate) struct RangeScope<'a> {
     pub(crate) consts: &'a HashMap<Name, ConstValue>,
@@ -246,8 +246,8 @@ impl UsizeScope for RangeScope<'_> {
             span,
             "a range's bound is a count\n\
              \n\
-             note: a bound is built from integer literals, `usize` consts, \
-             an enclosing fold's index or a count parameter; \
+             note: a bound is built from integer literals and `usize` consts, \
+             or is an unchanged count parameter; \
              arithmetic on known counts uses `+ - * /` and parentheses",
         )
     }
