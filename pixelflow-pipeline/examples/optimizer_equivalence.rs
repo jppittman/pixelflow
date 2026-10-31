@@ -47,13 +47,19 @@ fn main() {
         let started = std::time::Instant::now();
         let optimized = optimize_runtime_arena(&arena, root, LatticeShape::POINT);
         let elapsed = started.elapsed();
-        let Some(optimized) = optimized else {
-            // A kernel the runtime optimizer declines (a `Dwrt` it cannot
+        let optimized = match optimized {
+            Ok(optimized) => optimized,
+            // A kernel the runtime optimizer refuses (a `Dwrt` it cannot
             // lower) is reported rather than skipped: a refactor that turns a
-            // successful optimization into a declined one is exactly the kind
+            // successful optimization into a refused one is exactly the kind
             // of change this harness exists to catch.
-            println!("{name:<22} {input_nodes:>5} {:>5} {:>18}", "-", "DECLINED");
-            continue;
+            Err(error) => {
+                println!(
+                    "{name:<22} {input_nodes:>5} {:>5} {:>18} {error:?}",
+                    "-", "REFUSED"
+                );
+                continue;
+            }
         };
         let (out_arena, out_root) = optimized.as_ref();
         let d = digest(out_arena, *out_root);
