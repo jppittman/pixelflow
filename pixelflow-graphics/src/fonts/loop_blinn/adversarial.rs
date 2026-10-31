@@ -335,7 +335,7 @@ fn assert_no_estimate(name: &str, kernel: &Kernel) {
     let (arena, root) = kernel.linked_parts();
     let shape = LatticeShape::new([WIDTH as u32, ROWS as u32]);
     let optimized = optimize_runtime_arena(&arena, root, shape)
-        .unwrap_or_else(|| panic!("{name}: the runtime tier declined the term"));
+        .unwrap_or_else(|_| panic!("{name}: the runtime tier declined the term"));
     let estimate = reaches(&optimized.0, optimized.1, |node| {
         matches!(node, ExprNode::Unary(OpKind::Recip | OpKind::Rsqrt, _))
     });
@@ -1063,7 +1063,7 @@ impl ChordTerm {
         let kernel = piece_term(&read);
         let (arena, root) = kernel.linked_parts();
         let optimized = optimize_runtime_arena(&arena, root, LatticeShape::new([1, 1]))
-            .unwrap_or_else(|| panic!("{name}: the runtime tier declined the term"));
+            .unwrap_or_else(|_| panic!("{name}: the runtime tier declined the term"));
         let estimate = reaches(&optimized.0, optimized.1, |node| {
             matches!(node, ExprNode::Unary(OpKind::Recip | OpKind::Rsqrt, _))
         });

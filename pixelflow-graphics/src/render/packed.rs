@@ -401,7 +401,7 @@ mod tests {
                 let (arena, root) = kernel.parts();
                 let optimized =
                     optimize_runtime_arena(arena, root, pixelflow_ir::LatticeShape::new(FRAME))
-                        .unwrap_or_else(|| {
+                        .unwrap_or_else(|_| {
                             panic!("colour {which}, shifts {shifts:?}: the program declined")
                         });
                 let (out, out_root) = &*optimized;

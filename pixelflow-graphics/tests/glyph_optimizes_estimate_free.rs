@@ -73,7 +73,7 @@ fn assert_optimizes_estimate_free(name: &str, glyph: &Glyph, tile: u32) {
     let (arena, root) = kernel.linked_parts();
     let shape = LatticeShape::new([tile, tile]);
     let optimized = optimize_runtime_arena(&arena, root, shape)
-        .unwrap_or_else(|| panic!("{name}: the runtime tier declined the glyph"));
+        .unwrap_or_else(|_| panic!("{name}: the runtime tier declined the glyph"));
     let (out, out_root) = &*optimized;
     assert_eq!(
         estimates_and_derivatives(out, *out_root),
