@@ -16,7 +16,7 @@ under a cost. `Optimizer::run` is its one entry; the five laws of §8 are its co
 - The budget: `Budget` resolves to `Limits` (iterations, minted ids, applications); `SaturationConfig`
   picks the tier from the input.
 - Extraction and cost: the tree and shared DP arms and their arbiter, `Selection`. `cost(If) = cost(m) +
-  (cost(a)+cost(b))/2 + cost(select)`; a fold costs `n·body + (n−1)·combine`, plus its value bounds once;
+  (cost(a)+cost(b))/2 + cost(select)`; a fold costs `n·body + (n−1)·combine`, plus its value bounds once, its body a scope that shares nothing with the code around it;
   `n` is read off its node when its range is known (`ENode::known_range`, per node: after `HalveFold` a class
   holds two ranges), else off its bounds' chosen forms (`ENode::priced_literal`: a constant, or a uniform's declared count), else `Fold::ESTIMATED_TRIPS`; a surviving `Dwrt`
   costs `LEGALIZATION_PRICE`. The fold rewrites and the chain rule are here; other rule bodies are `crate::math`.
@@ -54,9 +54,11 @@ under a cost. `Optimizer::run` is its one entry; the five laws of §8 are its co
 ## Behind
 - `optimizer.rs` line 34 cites a `laws.rs` that is not in the tree; `guided.rs` cites an L4 test with a
   reversing guide that does not exist; the plan's `optimizer_laws.rs` was deleted. L4 has no test.
-- L5's argmin half is violated and two docs lag the code: DENOTATION §8 and the `Optimizer::cost` doc say
-  sharing is never priced, but `extract_dag_over` also runs `shared_dag_dp_pass` and keeps the cheaper by
-  `dag_cost`. Both arms are greedy (JP-15); a fold over a known range ties its unrolling and insertion
+- L5's argmin half is violated and a doc lags the code: the `Optimizer::cost` doc says sharing is never
+  priced, but `extract_dag_over` also runs `shared_dag_dp_pass` and keeps the cheaper by `dag_cost`. Both arms
+  are greedy (JP-15, E5: a richer graph can extract a worse term). A fold body is a priced *scope* in the DAG
+  column and the shared DP alike (paid `trips` times, nothing shared across its boundary, no hoisting credit);
+  an `If`'s arms are paid in full in the DAG column while the tree column averages them; a fold over a known range ties its unrolling and insertion
   order decides (E6); `Reranker` has no implementation outside tests.
 - A value bound's pick is unconstrained: a class read as a bound can settle on a member that reads a coordinate,
   and `ExprArena::push_reduce` refuses it by name; pinned in `fold_rules.rs`, left loud until a kernel hits it.
