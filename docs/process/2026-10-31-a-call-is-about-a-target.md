@@ -107,7 +107,7 @@ name in it: "crate boundary" (a crate's), "module root" (a module's) — parts.
 
 ```
 Tree      = (Files : FinSet Path, manifests : FinSet Path)
-Crate     = a manifest m; members(m) = { f | nearest manifest above f = m }
+Crate     = a manifest m; members(m) = { f | crate_of(f) = m }
 Module    = (dir, root : Path + None, intent : Path + None, members : FinSet Path)
 Located   = Crate × Module                      what a file resolves to
 Resolved  = Located + Unresolved                I1
@@ -115,90 +115,205 @@ Layout    = ModFile | Sibling | CrateEntry      how root is spelled
 Conflict  = ModFile × Sibling                   I3: both exist
 Scope     = File | Crate
 Target    = File(f, Located) | Crate(Crate)     select(scope, f)
-Rendering = List (Header × List (LineNo × Text)) × List Omitted
+Section   = Path × (LineNo ⇀ Text) × Context    one shown file
+Rendering = List Section × FinSet Path          sections, omitted
 ```
 
-`μ(resolve) : Tree → Path → Resolved + Conflict`. It is a *function of the
-tree* (I4): it reads no clock, no cwd, no cache.
+`μ(resolve) : Tree → Path → Resolved + Conflict`.
+`μ(select) : Scope → Path → Resolved → Target`.
+`μ(cover) : Target → FinSet Path`.
+`μ(render) : Target → Budget → Rendering`.
+`μ(cite) : Rendering → (Path × LineNo) ⇀ Text`.
+`μ(cluster) : Finding → Module = module(target(finding))`.
 
-`μ(select) : Scope → Path → Resolved → Target`. A file scope's target is the
-file with its location; a crate scope's target is the location's crate.
+### What is true, before any law is written
 
-`μ(cover) : Target → FinSet Path`. `cover(File(f, _)) = {f}`;
-`cover(Crate(c)) = members(c)`. Context — the root's outline and the intent —
-is *not* in `cover`; it rides on a file target as what is shown but not
-reviewed.
+The eight invariants of pass 1 are not eight facts. They are consequences
+of six pieces of structure the problem already has, and each piece of
+structure names the type that carries it. A law that follows from the
+structure needs a test; a law the type makes unrepresentable needs none.
 
-`μ(render) : Target → Budget → Rendering`, a function, which is I7 for free:
-same inputs, same bytes. No other input exists.
+**S1. The ancestors of a path form a chain.** The file tree under the
+prefix order is a rooted forest, so for any file `f` the set
+`anc(f) = {f, parent(f), parent(parent(f)), …}` is totally ordered. Hence
+"the nearest ancestor satisfying `P`" is `max {a ∈ anc(f) | P(a)}` — a
+maximum over a chain — and is therefore **unique or absent, never
+ambiguous**. Every walk the problem needs is this one operation with a
+different `P`: the crate is `nearest(is_manifest)`, the module root is
+`nearest(has_root)`, the intent is `nearest(has_intent)`. I1's "exactly
+one" is not a rule to enforce; it is what a maximum over a chain *is*.
 
-`μ(cite) : Rendering → (Path, LineNo) → Text + NotShown`. The line a model
-names is looked up in what was rendered, not in the file on disk.
+  *Carried by:* one function `nearest : (Path → Bool) → Path → Option<Path>`
+  over one chain. Four walks (`crate_of`, `containing`, `root_outline`,
+  `intent`) are four spellings of it, and three of them can disagree only
+  because they are not it.
 
-`μ(cluster) : Finding → Module = module(target(finding))`, I8.
+**S2. Containment is an interval on the chain.** I2 — "a module root is
+never past the crate boundary" — says `module_of(f)` lies in the interval
+`[crate_of(f), f]` of the chain. The module walk is `nearest(has_root)`
+*on the chain truncated at the manifest*, not on the whole chain. A root
+found above the manifest is not a root the problem recognises.
+
+  *Carried by:* `resolve` computes the chain once, cuts it at the first
+  manifest, and finds root and intent on the cut chain. Past-the-boundary is
+  unrepresentable; L2 needs no runtime check. (`intent` today walks up and
+  stops at `Cargo.toml`; `root_outline` looks only at the file's own
+  directory and its sibling; `containing` walks all the way up with no
+  boundary at all. Three different truncations of the same chain.)
+
+**S3. `crate_of` and `module_of` are quotient maps, and one refines the
+other.** A function `g : Files → X` partitions its domain into fibres
+`g⁻¹(x)`. `crate_of` partitions files into crates; `module_of` partitions
+them into modules; and because `module_of(f)` is found on the chain cut
+at `crate_of(f)`, every module fibre lies inside one crate fibre: the
+module partition **refines** the crate partition. So
+
+```
+Files ──module_of──▶ Modules ──crate_of_module──▶ Crates
+  └────────────────── crate_of ─────────────────────┘      commutes
+```
+
+I8 — a finding's module equals its target's module — is the statement that
+clustering uses *this* quotient map and no other. Today `identify`
+clusters by `containing(path)` and `synthesize` outlines by the thing's
+`component`, two maps that agree on most inputs and not on a nested
+directory without a root file.
+
+  *Carried by:* `Located = Crate × Module` is the pair of fibre
+  representatives, computed once; `cluster` is the projection
+  `Located → Module`, a field read. Two call sites cannot read two maps.
+
+**S4. Root layout is a cardinality split, not a choice.** For a directory
+`d` the root candidates are `R(d) = {d/mod.rs, sibling(d)} ∩ Files` (and at
+a crate root, the entry file). "The root of `d`" is a *function* only if
+`|R(d)| ≤ 1`. The problem's own word for `|R(d)| = 2` is *conflict*: the
+relation is not functional there, and the answer is to say so. Any
+expression that picks one — `first().or(sibling)` — is a non-injective map
+from `{0, 1, 2}` candidates onto `{none, one}` and discards exactly the
+case the practitioner needs to see.
+
+  *Carried by:* the sum `Option<Layout> + Conflict`, i.e.
+  `Result<Option<Layout>, Conflict>`: three outcomes for three
+  cardinalities. I3 is the type's shape, not a guard. This is the one law
+  the current code actively violates.
+
+**S5. A rendering is a restriction, not a reindexing.** A file is a total
+function `lines(f) : [1..n] → Text`. What a model is shown of it is a
+**sub-function** — an outline elides bodies, a budget elides tails — so a
+`Section` is a partial function `LineNo ⇀ Text` whose graph is a subset of
+`lines(f)`'s graph. "Absolute line numbers" means the domain is the
+original index set, never a renumbering from 1; "each line a model cites
+maps back" (L5) means `cite(r, (p, n)) = lines(p)(n)` whenever `(p, n) ∈
+dom(r)`. And `cite` has the same shape as the numbering check the module
+already does for findings, things and diagnoses: **a model's reference is a
+position in what it was shown**, and validity is membership in the domain.
+L5 is the finding-number law applied to lines.
+
+  *Carried by:* `Section.lines : Vec<(u64, String)>` rather than a
+  `String` with a `first_line` offset (today's `Snippet`, which encodes a
+  reindexing and so cannot be looked up); `cite` is a `get`; a reply's
+  `(path, line)` is resolved through it exactly as a `FindingIx` is
+  resolved through `Numbering`, and fails its reply by name when absent.
+
+**S6. Rendering is a monoid homomorphism from a set of files.** `Rendering`
+under concatenation of sections is a monoid (the free monoid on `Section`,
+paired with set union on `omitted`). Rendering a crate target is the fold
+of a one-file renderer over the members in path order:
+
+```
+render(Crate(c), b) = ⊕_{f ∈ sort(members(c))} render_file(f, b_f)
+```
+
+Two things fall out. First, *each member appears once* (I5) because
+`members(c)` is a **set** — a list built as `roots ++ ranked` can hold the
+root twice, and `dedup()` on neighbours is an apology for that list not
+being a set. Second, I6 — nothing omitted silently — is the partition
+equation `shown(r) ⊎ omitted(r) = cover(T)`: a disjoint union that equals
+the cover. And I7, byte-identical text for the same target, is simply that
+`render` is a function of `(Tree, Target, Budget)` and nothing else; it
+needs no `dedup` and no journal-stabilising comment to stay true.
+
+  *Carried by:* `Rendering` constructed only by `render`, which partitions
+  `cover(T)` into `sections` and `omitted`; the header and gutter are
+  written by `Rendering::to_prompt` and nowhere else; `render` takes a
+  `&Tree` snapshot and touches no `std::fs`, so purity (L4, L7) is visible
+  in the signature.
 
 ### Laws
 
-- **L1 (one place).** `resolve` is total on `Files` and single-valued:
-  `∀ f ∈ Files. ∃! r. resolve(f) = r`.
-- **L2 (containment).** `resolve(f) = Located(c, m) ⟹ f ∈ members(m) ∧
-  members(m) ⊆ members(c) ∧ root(m) ∈ dir(f) ∪ {sibling(dir(f))}`.
-- **L3 (no guess).** `ModFile(d) ∈ Files ∧ Sibling(d) ∈ Files ⟹ resolve(f)
-  = Conflict` for every `f` under `d`.
-- **L4 (purity).** `resolve` is a function `Tree → Path → _`; two calls on
-  the same tree agree. (Equivalent: it may be memoised, and nothing observes
-  the difference.)
-- **L5 (round trip).** `(h, (n, t)) ∈ render(T, b) ⟹ lines(path(h))[n] = t`.
-  Each path appears in exactly one header; each `n` under it at most once.
-- **L6 (nothing silent).** `f ∈ cover(T) ∧ f ∉ headers(render(T, b)) ⟹ f ∈
-  omitted(render(T, b))`.
-- **L7 (determinism).** `render` is a function; stated as a law so a test
-  pins it: `render(T, b) = render(T, b)` across two constructions of `T`
-  from the same tree.
-- **L8 (clustering agrees with context).** For a finding `φ` from target
-  `T`: `module(φ) = module(T)`, and the context shown for `T` was
-  `root(module(T))`, `intent(module(T))`.
+Each law names the structure it follows from and how it is held.
+
+| Law | Statement | From | Held by |
+|---|---|---|---|
+| L1 one place | `∀ f ∈ Files. ∃! r. resolve(f) = r` | S1 | the type: `nearest` over a chain |
+| L2 containment | `crate_of(f) ≤ module_of(f) ≤ f` on the chain | S2 | the type: the chain is cut at the manifest |
+| L3 no guess | `\|R(d)\| = 2 ⟹ resolve = Conflict` | S4 | the type: `Result<Option<Layout>, Conflict>` |
+| L4 purity | `resolve` is a function of `Tree` | S1, S6 | signature `fn(&Tree, …)`; test |
+| L5 round trip | `(p, n) ∈ dom(r) ⟹ cite(r, p, n) = lines(p)(n)` | S5 | `Section` is a restriction; test |
+| L6 nothing silent | `shown(r) ⊎ omitted(r) = cover(T)` | S6 | `render` partitions; test |
+| L7 determinism | `render(T, b)` is a function | S6 | signature; test replaces the golden comment |
+| L8 cluster = context | `module(φ) = module(target(φ))` | S3 | `Located` is read, never recomputed |
+
+Four laws are discharged by types and need no runtime guard; four are
+pinned by one test each (pass 3). None is kept by a comment.
 
 ### Type class morphisms
 
 `Target` has an equality, and it is the equality of its meaning: two
-targets are the same iff they cover the same files with the same context.
-That equality is the planner's key, so "two rules share a call" is
-`target₁ = target₂ ∧ seen₁ = seen₂`, with no side map for crates.
+targets are equal iff they cover the same files with the same context.
+Since `cover` and context are functions of the target's fields, derived
+structural `Eq`/`Ord` *is* that equality. It is the planner's key, so "two
+rules share a call" is `target₁ = target₂ ∧ seen₁ = seen₂`, with no side
+map for crates.
 
-`Rendering` is a monoid under concatenation of headed sections, and
-`render(Crate(c))` is the fold of `render` over `members(c)` in path
-order — a crate rendering is *made of* file renderings, so a crate target
-cannot have a second way of writing a header.
+`Rendering` is a monoid and `render` on a crate target is the monoid
+homomorphism from the sorted member list that extends `render_file` (S6).
+A crate rendering is *made of* file renderings, so a crate target cannot
+have a second way of writing a header.
+
+`cover` is monotone: `cover(File(f, at)) = {f} ⊆ members(at.krate) =
+cover(Crate(at.krate))`. Targets are partially ordered by coverage and the
+crate target is the join of its file targets. Nothing today uses this
+order, but it is why a crate-wide call is the same sort of thing as a file
+call, one step up, and not a side path.
 
 ### What is not a concept
 
 - **A bare path as the identity of a call.** A path is the name of a file;
   a target is the place a question is about. A call holds a target.
 - **"Crate-wide" as a flag or a side path.** It is `Scope::Crate`, a value
-  of the same sort as `Scope::File`, selected once.
-- **A pre-numbered string.** Lines carry their numbers as data in a
-  `Rendering`; the gutter is written by `render` and nowhere else.
+  of the same sort as `Scope::File`, selected once (S3's order).
+- **A pre-numbered string.** Lines carry their numbers as data (S5); the
+  gutter is written by `to_prompt` and nowhere else.
 - **The current directory.** A file under no manifest is `Unresolved`, a
   value, not a fallback to wherever the process happens to be.
 - **A root outline walk apart from resolution.** The root is a field of
-  the module `resolve` returned.
+  the module `resolve` returned (S1).
 - **A journal key kept stable by rendering a file twice.** L7 keeps keys
   stable; duplication is a workaround for a renderer that was not a
-  function.
+  function (S6).
+- **A second walk with its own boundary.** There is one chain and one cut
+  (S2).
 
 ### The opinion in the types
 
-- `Target` is an enum with two variants; `Scope` is an enum with two
-  variants; "which is it" is a `match` at the one place a call is built.
-- `Located` holds the crate *and* the module, so a finding's module is a
-  field read and cannot disagree with the context (L8 by construction).
-- `Conflict` is a variant of resolution's result, not a log line.
-- `Unresolved` is a variant, not `PathBuf::new()` or `"."`.
-- `Rendering` holds `(Header, Vec<(LineNo, Text)>)`, so a cited line is a
-  lookup that can fail by name (L5), and the only `format!` of a gutter is
-  inside `render`.
-- `Budget` is a newtype; a rendering under a budget records what it omitted.
+| Structure | Type that carries it | What becomes unrepresentable |
+|---|---|---|
+| S1 one chain | `fn nearest(pred, path) -> Option<Path>`; `resolve` calls it thrice on one chain | two walks disagreeing |
+| S2 interval | the chain is cut at the manifest before root/intent are sought | a root past the crate boundary |
+| S3 refinement | `Located { krate, module }`, one value per file; `cluster` is a projection | clustering and context reading different maps |
+| S4 cardinality | `Result<Option<Layout>, Conflict>` | silently preferring `mod.rs` |
+| S5 restriction | `Section { path, lines: Vec<(u64, String)>, context: bool }`; `cite` is a lookup | a cited line that was never shown |
+| S6 homomorphism | `Rendering` built only by `render` over a `BTreeSet<Path>` | a file shown twice; an omission unsaid |
+| purity | `resolve`/`render` take `&Tree`; `Tree::scan` is the one `std::fs` reader | a result that depends on cwd or on when it ran |
+| `Unresolved` | a variant of `Resolved` | `PathBuf::new()` meaning "no crate" |
+| `Target` | an enum of two variants, `Eq + Ord` derived | a call whose place is a comment |
+
+Prioritised by whether the wrong value is *silently* representable: S4
+(wrong root, plausible prompt), S3 (wrong cluster, plausible review) and
+S5 (wrong line, plausible finding) are the three the types must take.
+Purity and the interval are cheap to carry and are carried; the rest are
+one test each.
 
 ### Consequences to closure
 
