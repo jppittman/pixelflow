@@ -333,6 +333,9 @@ pub(crate) fn arena_to_schedule(
         };
 
         let sched_op = match node {
+            ExprNode::Placeholder(identity) => {
+                panic!("arena_to_schedule: fold index scope {identity} escaped without its binder")
+            }
             ExprNode::Var(i) => match Binder::from_var(i) {
                 None if i < Variance::VARIABLES => panic!(
                     "arena_to_schedule: Var({i}) is a coordinate or a retired axis, which \
@@ -556,25 +559,6 @@ mod tests {
         let x = a.push_var(0);
         let two = a.push_const(2.0);
         let root = a.push_binary(OpKind::Mul, x, two);
-        let _ = arena_to_schedule(&a, root, RAW_ORIGIN, None);
-    }
-
-    /// A placeholder is a fold index that escaped its builder: `Variance::of_var`
-    /// types it as constant, so placement would not tell it from a uniform, and
-    /// the refusal is this `Var` arm's. It answers for the open term before
-    /// anything is scheduled, whatever the variance says, and as an open
-    /// kernel, not as a schedule built without the lowering pipeline.
-    #[test]
-    #[should_panic(expected = "so the kernel is open")]
-    fn a_surviving_placeholder_fails_loudly() {
-        let mut a = ExprArena::new();
-        let index = a.push_var(
-            pixelflow_ir::fold::Placeholder::nth(0)
-                .expect("placeholder 0 exists")
-                .var(),
-        );
-        let two = a.push_const(2.0);
-        let root = a.push_binary(OpKind::Mul, index, two);
         let _ = arena_to_schedule(&a, root, RAW_ORIGIN, None);
     }
 

@@ -1705,6 +1705,9 @@ fn instantiate_template<S: NodeSink>(
     use pixelflow_ir::expr::ExprData;
 
     match *node {
+        ExprData::Placeholder(identity) => {
+            panic!("instantiate_template: open fold index scope {identity} in a rewrite template")
+        }
         ExprData::Var(mv) => {
             let mv = mv as usize;
             assert!(

@@ -252,6 +252,9 @@ pub fn reachable_subtree(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId)
                         .expect("reachable_subtree: child must be emitted before its parent")
                 };
                 let new_id = match arena.node(id) {
+                    ExprNode::Placeholder(identity) => panic!(
+                        "reachable_subtree: fold index scope {identity} escaped without its binder"
+                    ),
                     ExprNode::Var(i) => out_arena.push_var(i),
                     ExprNode::Const(v) => out_arena.push_lit(v),
                     ExprNode::Param(i) => out_arena.push_param(i),
@@ -350,6 +353,9 @@ fn write_entry(w: &mut impl Write, name: &str, arena: &ExprArena, root: ExprId) 
 
 fn write_node(w: &mut impl Write, arena: &ExprArena, id: ExprId) -> io::Result<()> {
     match arena.node(id) {
+        ExprNode::Placeholder(identity) => {
+            panic!("write_node: fold index scope {identity} escaped without its binder")
+        }
         ExprNode::Var(i) => {
             w.write_all(&[TAG_VAR, i])?;
         }

@@ -221,6 +221,9 @@ pub fn encode(kernel: &CollapseKernel) -> String {
         }
         let id = ExprId(idx as u32);
         match arena.node(id) {
+            ExprNode::Placeholder(identity) => {
+                panic!("corpus: fold index scope {identity} escaped without its binder")
+            }
             ExprNode::Var(i) => writeln!(out, "V {i}"),
             // A kernel argument. The format knows about one because, with
             // two coordinate axes, a `Uniform` is the *only* leaf that is

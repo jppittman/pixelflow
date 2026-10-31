@@ -24,6 +24,7 @@ pub(crate) fn program_digest(arena: &ExprArena, root: ExprId) -> u64 {
     };
     for (id, node) in arena.nodes() {
         let (variant, op, payload): (u8, Option<OpKind>, u128) = match node {
+            ExprNode::Placeholder(identity) => (9, None, u128::from(identity)),
             ExprNode::Var(i) => (0, None, u128::from(i)),
             ExprNode::Const(v) => (1, None, u128::from(v.bits())),
             ExprNode::Param(i) => (2, None, u128::from(i)),
