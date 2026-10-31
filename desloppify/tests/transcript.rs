@@ -312,7 +312,7 @@ fn reply(question: &Question<'_>) -> String {
         .collect();
     json!({
         "diagnoses": diagnoses,
-        "roots": [{"root": "r", "falls_out": "f", "explains": [1, things]}],
+        "roots": [{"root": "r", "falls_out": "f", "brief": "b", "explains": [1, things]}],
         "review": "# Review\n",
     })
     .to_string()

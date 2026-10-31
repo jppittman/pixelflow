@@ -45,7 +45,18 @@ roots: the deepest models whose absence makes several diagnoses true at once \
 — a missing phase, a missing type, a wrong boundary — each with the \
 diagnoses it explains and its consequences to closure.\n\
 \n\
+A root is not fixed finding by finding; it is designed again from its \
+meaning. For each root, write the brief that design starts from: the thing \
+in its domain's words, then — read off the findings and the descriptions, \
+not the code's names — its nouns, the categories those nouns fall into \
+(nouns always said together are one), its verbs with the nouns they relate, \
+and its invariants in one sentence each. The brief is the problem in plain \
+English, as a practitioner would state it, with no identifier from the code \
+in it.\n\
+\n\
 Then write the review the author will read, in Markdown: the roots first, \
+each ending with its brief under the line \"Run `/denotational-design` from \
+this brief:\", \
 then the diagnoses, each with the findings it explains by `path:line`, \
 briefly; then the remaining findings grouped by file, most serious first. \
 Merge findings that are the same problem under different rules or lines, \
@@ -73,9 +84,10 @@ fn schema() -> serde_json::Value {
                 "properties": {
                     "root": { "type": "string" },
                     "falls_out": { "type": "string" },
+                    "brief": { "type": "string" },
                     "explains": { "type": "array", "items": { "type": "integer" } }
                 },
-                "required": ["root", "falls_out", "explains"]
+                "required": ["root", "falls_out", "brief", "explains"]
             } },
             "review": { "type": "string" }
         },
@@ -104,6 +116,7 @@ struct Diagnosed {
 struct Rooted {
     root: String,
     falls_out: String,
+    brief: String,
     explains: Vec<usize>,
 }
 
@@ -150,6 +163,7 @@ pub(super) async fn synthesize<A: Ask>(agent: &A, report: &Report) -> Result<Opt
             Ok(Root {
                 root: r.root,
                 falls_out: r.falls_out,
+                brief: r.brief,
                 explains: diagnosed
                     .resolve_all(&r.explains, DiagnosisIx)
                     .context("a root's diagnoses")?,

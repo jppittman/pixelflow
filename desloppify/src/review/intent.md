@@ -18,7 +18,7 @@ small models make many calls, and the one frontier call sees everything.
   names nothing fails its reply instead of shortening it.
 - What a module is on disk (`module.rs`): its roots, `intent.md`, outline.
 - `identify.rs` names and describes what findings are about with small calls;
-  `synthesize.rs` has one Frontier call diagnose, root and write the review.
+  `synthesize.rs` has one Frontier call diagnose, root (each with a brief) and write the review.
 - Concurrency and order: every unit, rule and module is asked at once; the
   findings are in one total order, so the same answers give the same prompt.
 

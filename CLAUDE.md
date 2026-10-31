@@ -31,6 +31,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
   So: **when you extend a type's meaning, extend its type.** The escape hatch — "reinterpret is free", "this operand must be a literal", "these coordinates are in the caller's space" — is the moment to pay. Afterwards it is a bug hunt rather than a refactor, and the fix arrives as a runtime guard defending what a type should have made unrepresentable. Prioritize by whether a wrong value would be *silently* representable: a domain confusion produces plausible pixels and deserves a type; an out-of-range index that panics on the next line does not.
 
+  The procedure is `.claude/skills/denotational-design/SKILL.md`: the problem in plain English (Abbott), a meaning and a law for each of its nouns and verbs (Elliott), then code in which the algebra is invisible (Pike). Run it forward before building anything new, and backward when symptoms converge — a desloppify review's roots each carry the brief it starts from, and a `/simplify` run that keeps meeting the same recurring parameters or name family is the same signal.
+
 ### Floating point at the edges
 
 **Rust already ships reasonably fast IEEE-754 arithmetic.** `f32::min`,
