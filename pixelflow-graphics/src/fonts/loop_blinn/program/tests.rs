@@ -200,7 +200,7 @@ fn every_count_s_program_optimizes_estimate_free() {
         for &count in &counts {
             let (arena, root) = program(count).linked_parts();
             let optimized = optimize_runtime_arena(&arena, root, LatticeShape::new([size, size]))
-                .unwrap_or_else(|| {
+                .unwrap_or_else(|_| {
                     panic!("{count} pieces at {size} px: the runtime tier declined the program")
                 });
             let (out, out_root) = &*optimized;
@@ -268,7 +268,7 @@ fn the_optimizer_selects_what_it_selected() {
         .map(|(count, side)| {
             let (arena, root) = program(count).linked_parts();
             let optimized = optimize_runtime_arena(&arena, root, LatticeShape::new([side, side]))
-                .unwrap_or_else(|| panic!("{count} pieces at {side} px: the program declined"));
+                .unwrap_or_else(|_| panic!("{count} pieces at {side} px: the program declined"));
             let (out, out_root) = &*optimized;
             (count, side, program_digest(out, *out_root))
         })
