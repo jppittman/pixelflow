@@ -769,13 +769,13 @@ mod cost_model_accessors {
         );
     }
 
-    /// A fold bounded by a uniform is priced at the uniform's declared count,
-    /// not at the estimate: the node's own share is the combiner chain over
-    /// the declared 40, and the extractor totals `Σ_{j<u} |X − j|` at
-    /// `fold_cost(fold, 40, − + |·|)`. The uniform bound costs nothing, and no
-    /// rule here gives the fold another form.
+    /// A fold whose range is not known is priced at the estimate. The node's
+    /// own share is the combiner chain over `ESTIMATED_TRIPS`, and the
+    /// extractor totals `Σ_{j<u} |X − j|` at `fold_cost(fold, 32, − + |·|)`:
+    /// the uniform bound costs nothing, and no rule here gives the fold
+    /// another form.
     #[test]
-    fn a_fold_over_a_uniform_count_is_priced_at_its_declared_count() {
+    fn a_fold_whose_range_is_not_known_is_priced_at_the_estimate() {
         use crate::egraph::extract::extract_dag;
         use crate::egraph::{Vocabulary, insert};
         use pixelflow_ir::ExprArena;
@@ -784,10 +784,9 @@ mod cost_model_accessors {
 
         let binder = Binder::from_slot(0).expect("a live binder");
         let fold = Fold::new(Monoid::SUM, binder);
-        let declared = 40;
         let decl = UniformDecl {
             id: UniformIdentity::mint(),
-            default: declared as f32,
+            default: 40.0,
         };
         let mut a = ExprArena::new();
         let u = a.declare_uniform(decl);
@@ -812,13 +811,12 @@ mod cost_model_accessors {
                 class
             )),
             model.fold_cost(fold, Fold::ESTIMATED_TRIPS, 0),
-            "the node alone cannot see its bound, so its own share is the estimate's"
+            "the node's own share is the combiner chain over the estimate"
         );
         let dag = extract_dag(&egraph, class, &model);
         assert_eq!(
             dag.total_cost,
-            model.fold_cost(fold, declared, body_cost),
-            "the settled uniform's declared count prices the fold"
+            model.fold_cost(fold, Fold::ESTIMATED_TRIPS, body_cost)
         );
     }
 
