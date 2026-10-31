@@ -77,4 +77,5 @@ asked), `Finding`, `Thing`, `Diagnosis`, `Root`, `Synthesis` and the positions
 
 ## Decided in
 `desloppify/README.md` ("How a review runs", "Layout"); §4 of
-`docs/process/2026-10-15-intent-lives-with-the-module.md`.
+`docs/process/2026-10-15-intent-lives-with-the-module.md`;
+`docs/process/2026-10-31-a-call-is-about-a-target.md` (a call holds a target; not built).
