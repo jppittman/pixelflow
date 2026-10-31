@@ -18,8 +18,8 @@
   exception. "Each split rested on a statement that was true on the day it
   was written about the other side's state. When the other side changed, the
   reason expired and the split stayed" (one-pipeline §2).
-- **Lives:** `.claude/skills/denotational-diagnosis/SKILL.md` (step 7,
-  "Refuse exceptions", and the section "Signs it is not");
+- **Lives:** `.claude/skills/denotational-design/SKILL.md` (pass 2, step 7,
+  "Refuse exceptions", and pass 4's "Signs it is not");
   `docs/archive/plans/2026-09-01-register-allocation-escape-hatches.md` ("a list of
   invariants a person maintains that a type could maintain instead");
   `desloppify/rules/carve-out.json`. Exceptions known to be live today:
