@@ -431,3 +431,101 @@ cache hits and are noise at this size). So:
 No cost-model change follows from this. The pricing question that does —
 how a surviving unit's cost ranks when symbolic in uniforms — is JP-14's
 ruling (a-bound-is-a-value §5.1) and is not decided here.
+
+### 9.1 Across unit sizes, and the break-even (JP-19, 2026-10-27)
+
+The ruler now sweeps the unit: fold bodies (`loopN`, N trips: a loop, so bytes
+stay small and time grows) and straight-line bodies (`wideN`, N distinct
+`sqrt` terms: bytes and time both grow, the shape of a glyph-scale unit).
+Marginal cost of one more inlined copy, from the 1-copy and 16-copy scenes:
+
+| unit | bytes / copy | ns / batch / copy |
+|---|---|---|
+| loop2 | 185 | 9 |
+| loop8 | 185 | 31 |
+| loop32 | 227 | 130 |
+| loop128 | 247 | 576 |
+| wide16 | 2,505 | 79 |
+| wide64 | 10,560 | 356 |
+
+(`ns / batch` is per `jit_vector_bytes()` of lanes. The 8-trip fold above is
+unrolled, hence loop2 = loop8 in bytes.)
+
+No call lowering exists (L5), so the call side is a parameter, not a
+measurement. With `c` the call's cost per batch (frame, arguments, result, the
+spill of what the allocator holds across it — §5.2) and `s` its call-site
+bytes, K copies of a unit of `B` bytes and `T` ns per batch:
+
+- bytes saved by calling: `(K−1)·B − K·s`; positive whenever `B > s·K/(K−1)`.
+- execution lost: `c / T` per copy, relative.
+
+Reading the table with `c` of order 10 ns and `s` of order 50 bytes (stated
+assumptions, not measured):
+
+- **Loop units** gain nothing worth a call: they are ~200 bytes already,
+  within a few call sites of `s`, and `c/T` is 100% at loop2 and 2% at
+  loop128 — it is the *trip count*, not the call, that makes them slow.
+- **Straight-line units** are where a call pays: `wide64` saves ~10 KB per
+  extra copy for a `c/T` of ~3%. That is the only regime in which preserving a
+  reference changes anything measurable, and it is a code-size and
+  instruction-cache argument, not an execution one.
+- The choice is therefore a function of `B` (bytes, known after emission) and
+  `K`, not of the e-graph's cost: extraction prices time, and time does not
+  separate the two. This supports §5.2's reading that the decision is
+  codegen's (a unit's emitted size against its call-site count), after
+  extraction, rather than a rewrite.
+
+What this leaves open is `c` and `s`, which need the call lowering, and
+compile time, which this ruler does not report: an e-graph that sees `K`
+inlined copies of a `wide` unit pays for them in saturation, and a preserved
+unit saturates once (`pixelflow_search::runtime`'s units). That, not
+execution, is the likelier win and is measurable today by compiling the
+scene with its `Apply`s held as units; today they are expanded first.
+
+### 9.2 Compile time: the budget caps the cost and the quality pays (JP-19, 2026-10-27)
+
+JP's constraint: sharing across plain composition globally is whole-program
+optimization (fat LTO) — compile time explodes — so sharing belongs *after* a
+kernel is inlined, scoped to that body. The ruler now reports cold compile
+(`cold_compile_ms`: every row's unit carries a fresh literal, so no saturation-
+or JIT-cache hit) and, built with `--features pixelflow-search/saturation-telemetry`,
+the saturation record of each compile.
+
+The finding is not the one fat LTO predicts. Compile time does **not**
+explode with `K`; it is held down by the budget, and what falls is the search
+each copy gets. Every one of the 19 saturations stopped at `class_cap`. For the
+2-trip unit (16 classes inserted alone):
+
+| copies | classes inserted | applications | wall |
+|---|---|---|---|
+| 1 | 16 | 16,463 | 76 ms |
+| 4 | 52 | 10,020 | 27 ms |
+| 16 | 194 | 5,796 | 5 ms |
+
+Sixteen times the work gets a third of the applications, so each copy is
+searched ~45× less than the same unit saturated alone — and the scene "compiles
+faster" because it is optimized less. (Wide units, whose caps scale with the
+input, do grow: `wide64` 7 → 31 → 120 ms for 1 → 4 → 16 copies, 6 → 37 → 165 KB
+of code — linear in the copies, not superlinear.)
+
+So the inline-everything cost is paid in **quality**, not seconds, and it is
+exactly the whole-program pathology JP names: the e-graph holds the copies in
+one search space and the budget is split across them. A unit saturated once and
+linked (`runtime`'s Law U, which a held `Apply` would reach) gets the full
+budget per distinct unit and costs the outer term only its own few classes.
+That, not the call, is the case for keeping the name through extraction.
+
+Consequences for the design question:
+
+- **Share after inlining, scoped to the inlined body** (JP): agreed by the
+  numbers. Sharing across plain composition would put every copy in one
+  e-graph — the 194-class row — and is where the per-copy search collapses.
+  Hash-consing at link time (`link` splices into a hash-consed arena) is the
+  scoped form and already exists.
+- **The unit boundary is what protects the optimizer's budget**, independently
+  of whether a unit is emitted inline or called. `Apply` being expanded before
+  the unit walk (JP-110) forfeits it; holding the `Apply` as a unit until
+  after extraction, then expanding (the "expand" lowering, late), would keep
+  the budget per unit with no call at all. That is measurable with a small
+  change and is the next JP-19 step; the call lowering (L5) is only about the
+  bytes in §9.1.
