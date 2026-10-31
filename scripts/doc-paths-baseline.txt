@@ -37,3 +37,6 @@ docs/archive/plans/2026-09-06-uniform-slot-identity.md	ir_bridge.rs
 docs/archive/plans/2026-09-06-uniform-slot-identity.md	jit_manifold.rs
 docs/archive/plans/2026-09-06-uniform-slot-identity.md	pixelflow-compiler/src/jit_backend.rs
 docs/archive/plans/2026-09-06-uniform-slot-identity.md	pixelflow-graphics/src/animation.rs
+docs/process/2026-10-31-a-call-is-about-a-target.md	desloppify/tests/target.rs
+docs/process/2026-10-31-a-call-is-about-a-target.md	target.rs
+docs/process/2026-10-31-a-call-is-about-a-target.md	review/target.rs

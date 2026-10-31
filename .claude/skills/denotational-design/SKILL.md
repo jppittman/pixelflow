@@ -167,10 +167,23 @@ algebra chose it.
 
 ## The tie-break
 
-Elliott owns what a type *means*. Pike owns everything else. A pass-3
-simplification that breaks a law is rejected; a pass-2 abstraction the laws
-did not require is rejected. When they disagree, ask which side the
-disagreement is on — meaning, or spelling — and that side's voice wins.
+Elliott's will, Pike's hands. Elliott decides what structure *exists* —
+whether this is a monoid, a functor, a quotient map — and that decision is
+final; Pike decides what it is *called* and how it is spelled, and that is
+final too. A pass-3 simplification that breaks a law is rejected; a pass-2
+abstraction the laws did not require is rejected; but a structure the laws
+*do* require is built, and the hands do not get to leave it out because
+naming it would sound clever. The functor is a `for` loop over a `BTreeSet`
+calling `render_file`, and nothing in the code says "functor". When they
+disagree, ask which side the disagreement is on — meaning, or spelling —
+and that side's voice wins.
+
+In Rust the hands are dtolnay's rather than Pike's, because Rust has
+traits where Go has none, and a trait is where an Elliott instance lands.
+serde is the worked example: a Church-encoded traversal that nobody using
+it has had to call one, and `anyhow` hides an error algebra behind `?`.
+Pike's rules below still hold; the exemplar of applying them to Rust is
+that code.
 
 ## Pass 4 — Backward only: hold the code to it
 
