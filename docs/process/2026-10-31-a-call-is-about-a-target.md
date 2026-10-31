@@ -253,8 +253,9 @@ Each law names the structure it follows from and how it is held.
 | L6 nothing silent | `shown(r) ⊎ omitted(r) = cover(T)` | S6 | `render` partitions; test |
 | L7 determinism | `render(T, b)` is a function | S6 | signature; test replaces the golden comment |
 | L8 cluster = context | `module(φ) = module(target(φ))` | S3 | `Located` is read, never recomputed |
+| L9 section stable | `section_f(render(Crate c)) = section_f(render(File f))` | S6 | one `render_file`; test |
 
-Four laws are discharged by types and need no runtime guard; four are
+Four laws are discharged by types and need no runtime guard; five are
 pinned by one test each (pass 3). None is kept by a comment.
 
 ### Type class morphisms
@@ -273,9 +274,22 @@ have a second way of writing a header.
 
 `cover` is monotone: `cover(File(f, at)) = {f} ⊆ members(at.krate) =
 cover(Crate(at.krate))`. Targets are partially ordered by coverage and the
-crate target is the join of its file targets. Nothing today uses this
-order, but it is why a crate-wide call is the same sort of thing as a file
-call, one step up, and not a side path.
+crate target is the join of its file targets. `render` is monotone over
+the same order — a functor between the two posets — which is a law of its
+own:
+
+- **L9 (a file's section is the same section everywhere).**
+  `section_f(render(Crate(c), b)) = section_f(render(File(f, at), b_f))`
+  for every `f ∈ members(c)` not omitted. A file rendered alone and the
+  same file inside its crate are byte-identical, so a journal key or a
+  prompt cache for the one is a hit for the other. Pinned by a test
+  (`a_file_rendered_inside_its_crate_is_the_file_rendered_alone`). Today
+  `under_headers` and `shape` cannot satisfy it: they format independently.
+
+This is why a crate-wide call is the same sort of thing as a file call,
+one step up, and not a side path. The code will spell the functor as a
+`for` loop over a `BTreeSet` calling `render_file`; nothing in it says
+"functor", and nothing needs to.
 
 ### What is not a concept
 
@@ -417,6 +431,7 @@ Names: `Target`, `Located`, `Module`, `Rendering`, `resolve`, `render`,
 | L6 | `a_file_a_rendering_leaves_out_is_named_as_omitted` |
 | L7 | `two_targets_built_from_the_same_tree_render_byte_identical_text` |
 | L8 | `a_findings_module_is_the_module_of_the_target_it_was_found_in` |
+| L9 | `a_file_rendered_inside_its_crate_is_the_file_rendered_alone` |
 
 L4 and L7 were kept by the golden transcript and a comment; they become
 tests that say what they pin. The golden still holds every prompt, and it
@@ -453,7 +468,7 @@ calls having no context. All deleted.
 
 Net: `module.rs` (≈175 lines) and `plan.rs`'s crate path (≈30) go;
 `target.rs` is one walk, one render, two small enums — smaller than what it
-replaces. One golden change, eight law tests.
+replaces. One golden change, nine law tests.
 
 ### Signs
 
