@@ -329,12 +329,15 @@ fn a_baked_fold_is_its_terms_written_out() {
 /// The test above reads the unrolled path; this one must read the loop, so it
 /// asserts that the bake keeps it. If extraction comes to unroll this body
 /// too, that assertion fails, and the fix is a body it keeps as a loop — not
-/// deleting the assertion, which would leave the loop's pixels unread.
+/// deleting the assertion, which would leave the loop's pixels unread. A fold
+/// is priced at its trips (JP-15), which made the four-term body of this test
+/// unroll; sixty-four terms are past what the saturation budget writes out.
 #[test]
 fn a_baked_fold_is_its_terms_written_out_whichever_extraction_chooses() {
-    let raw = kernel_raw!(|| (0..4).map(|i| X * (i as f32) + Y).sum());
-    let optimized = kernel!(|| (0..4).map(|i| X * (i as f32) + Y).sum());
-    let written_out = kernel!(|| (X * 0.0 + Y) + (X * 1.0 + Y) + (X * 2.0 + Y) + (X * 3.0 + Y));
+    let raw = kernel_raw!(|| (0..64).map(|i| X * (i as f32) + Y).sum());
+    let optimized = kernel!(|| (0..64).map(|i| X * (i as f32) + Y).sum());
+    // Σ_{i<64} (X·i + Y) = 2016·X + 64·Y, every partial sum an exact integer.
+    let written_out = kernel!(|| X * 2016.0 + Y * 64.0);
 
     let (arena, root) = raw.parts();
     let baked = optimize_runtime_arena(arena, root, frame_shape()).expect("the runtime tier");
@@ -350,6 +353,6 @@ fn a_baked_fold_is_its_terms_written_out_whichever_extraction_chooses() {
     for k in [&raw, &optimized] {
         assert_eq!(lattice.bake(k).buffer(), unrolled.buffer());
     }
-    // Column 1 of row 2 samples X = 1, Y = 2: 6 · 1 + 4 · 2.
-    assert_eq!(unrolled.buffer()[2 * FRAME.0 + 1], 14.0);
+    // Column 1 of row 2 samples X = 1, Y = 2: 2016 · 1 + 64 · 2.
+    assert_eq!(unrolled.buffer()[2 * FRAME.0 + 1], 2144.0);
 }
