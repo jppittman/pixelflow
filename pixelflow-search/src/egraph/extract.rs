@@ -993,14 +993,14 @@ impl Selection {
     /// [`LatticeShape::POINT`] `ChoiceCost::dag` equals the latency-prior
     /// cost of the arena [`Self::to_arena`] builds from the same term, **when
     /// the term holds no fold**: a fold's body is a scope paid `trips` times
-    /// ([`Self::scope_price`]), which the arena's node count does not see.
+    /// ([`Self::dag_price`]), which the arena's node count does not see.
     ///
-    /// Approximation limits, recorded rather than hidden (JP-15): a fold body
-    /// gets no hoisting credit, so a binder-invariant node inside it is paid
-    /// per trip though codegen hoists it; an `If`'s arms are paid in full in
-    /// the DAG column, though the tree column averages them and the policy is
-    /// to average (an arm's exclusive block is the only part a guard skips,
-    /// and exclusivity is not in a reach set); and extraction is greedy
+    /// Approximation limits, recorded rather than hidden (JP-15, JP-112): a
+    /// fold body gets no hoisting credit, so a binder-invariant node inside it
+    /// is paid per trip though codegen hoists it; an `If`'s exclusivity is
+    /// judged against its own operands, so a node an outer parent also reads
+    /// is paid in full there and again at half inside the `If` (an
+    /// overcharge, never an undercharge); and extraction is greedy
     /// bottom-up, so a richer graph can still extract a worse term (E5).
     pub(crate) fn price<C: CostFunction>(
         &self,
@@ -1011,7 +1011,7 @@ impl Selection {
         let mut tree: Vec<usize> = Vec::with_capacity(self.len());
         let mut variance: Vec<Variance> = Vec::with_capacity(self.len());
         let mut owns: Vec<usize> = Vec::with_capacity(self.len());
-        let mut trips: Vec<Option<u64>> = Vec::with_capacity(self.len());
+        let mut shapes: Vec<Scoped> = Vec::with_capacity(self.len());
         for position in 0..self.len() {
             let node = self.node(egraph, position);
             let operands = self.operands_of(position);
@@ -1043,75 +1043,117 @@ impl Selection {
             tree.push(own.saturating_add(below));
             variance.push(node_variance);
             owns.push(own);
-            trips.push(match form {
-                ENode::Reduce { header, .. } => Some(header.priced_trips()),
-                _ => None,
+            shapes.push(match form {
+                ENode::Reduce { header, .. } => Scoped::Fold {
+                    trips: header.priced_trips(),
+                },
+                ENode::Op { op: OpKind::If, .. } => Scoped::If,
+                _ => Scoped::Plain,
             });
         }
-        let dag = self.scope_price(
-            self.len() - 1,
-            &owns,
-            &trips,
-            &mut alloc::vec![None; self.len()],
-        );
+        let dag = self.dag_price(&owns, &shapes);
         ChoiceCost {
             tree: *tree.last().expect("a selection holds at least its root"),
             dag,
         }
     }
 
-    /// The DAG price of the sub-term at `root`, with each fold's body a
-    /// **scope**: a node is paid once per scope that reaches it, and a fold
-    /// pays `trips` times its body's scope price.
+    /// The DAG price of the term: what each distinct node costs, paid once,
+    /// with two nodes opening a **scope**.
     ///
-    /// A fold body is a body, not a region of the enclosing graph: what it
-    /// shares with the outside is shared *inside* it, once, and the body runs
-    /// `trips` times however many other places read the same node. So a
-    /// subterm read both by a body and by the code around it is charged in
-    /// each, which is what [`shared_dag_dp_pass`] does too (it seals a fold's
-    /// body out of the reach set the fold passes to its parents). The two
-    /// agree because both are this one definition; no hoisting credit is
-    /// given, which is also what [`below`] does, so on a term with no sharing
-    /// the DAG price equals the tree price.
+    /// Every node has a *reach set* `R(n)`, the nodes its price covers, and an
+    /// effective own cost. `R(n)` is `n` and the reach sets of its operands,
+    /// except that
     ///
-    /// `memo` holds, by position, the price of the scope that position roots:
-    /// one fold node carries one body, and the body's price does not depend on
-    /// where the fold is read from.
-    fn scope_price(
-        &self,
-        root: usize,
-        owns: &[usize],
-        trips: &[Option<u64>],
-        memo: &mut Vec<Option<usize>>,
-    ) -> usize {
-        let mut seen = alloc::vec![false; self.len()];
-        let mut stack = alloc::vec![root];
-        let mut total = 0usize;
-        while let Some(position) = stack.pop() {
-            if core::mem::replace(&mut seen[position], true) {
-                continue;
+    /// - a **fold** leaves its body out of the set it hands up and pays
+    ///   `trips` times the body's price (the sum of the body's effective costs
+    ///   over `R(body)`): what a fold body shares with the code around it is
+    ///   shared inside it, and charged in both;
+    /// - an **`If`** hands up `R(m) ∪ (R(a) ∩ R(b))` and pays half the
+    ///   effective cost of what is exclusive to one arm, `R(a) ∖ (R(m) ∪ R(b))`
+    ///   and its mirror, rounded half up. A guard skips an arm's own block, and
+    ///   an arm owns what no other operand reads (CLAUDE.md, "`If` guards its
+    ///   arms"). What an arm shares with its mask or the other arm runs
+    ///   unguarded and is paid in full, once.
+    ///
+    /// The price is the sum of the effective costs over `R(root)`. This is the
+    /// one definition [`shared_dag_dp_pass`] settles by, so the claim and the
+    /// price agree, and on a term with no sharing it is the tree price
+    /// ([`below`]). Exclusivity is judged against the `If`'s own operands, not
+    /// the whole program: a node an outer parent also reads is left out of the
+    /// `If`'s set, so it is paid in full by that parent *and* at half inside
+    /// the `If`. That overcharges (it never undercharges) and is recorded as
+    /// the approximation limit. No node gets hoisting credit.
+    fn dag_price(&self, owns: &[usize], shapes: &[Scoped]) -> usize {
+        let words = self.len().div_ceil(REACH_WORD_BITS);
+        let mut reach: Vec<Vec<u64>> = Vec::with_capacity(self.len());
+        let mut effective: Vec<usize> = Vec::with_capacity(self.len());
+        let price_of = |set: &[u64], effective: &[usize]| {
+            let mut total = 0usize;
+            for (w, &word) in set.iter().enumerate() {
+                let mut bits = word;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    total = total.saturating_add(effective[w * REACH_WORD_BITS + bit]);
+                }
             }
-            total = total.saturating_add(owns[position]);
+            total
+        };
+        for position in 0..self.len() {
             let operands = self.operands_of(position);
-            let Some(fold_trips) = trips[position] else {
-                stack.extend_from_slice(operands);
-                continue;
-            };
-            let (&body, bounds) = operands.split_first().expect("a fold has a body");
-            let body_price = match memo[body] {
-                Some(price) => price,
-                None => {
-                    let price = self.scope_price(body, owns, trips, memo);
-                    memo[body] = Some(price);
-                    price
+            let mut set = alloc::vec![0u64; words];
+            let (word, bit) = (
+                position / REACH_WORD_BITS,
+                1u64 << (position % REACH_WORD_BITS),
+            );
+            set[word] |= bit;
+            let own = owns[position];
+            let eff = match shapes[position] {
+                Scoped::Plain => {
+                    for &operand in operands {
+                        set.iter_mut()
+                            .zip(&reach[operand])
+                            .for_each(|(s, r)| *s |= r);
+                    }
+                    own
+                }
+                Scoped::Fold { trips } => {
+                    let (&body, bounds) = operands.split_first().expect("a fold has a body");
+                    for &bound in bounds {
+                        set.iter_mut().zip(&reach[bound]).for_each(|(s, r)| *s |= r);
+                    }
+                    let work = usize::try_from(
+                        (price_of(&reach[body], &effective) as u64).saturating_mul(trips),
+                    )
+                    .unwrap_or(usize::MAX);
+                    own.saturating_add(work)
+                }
+                Scoped::If => {
+                    let [mask, if_true, if_false] = operands else {
+                        unreachable!("an If has a mask and two arms")
+                    };
+                    let (m, a, b) = (&reach[*mask], &reach[*if_true], &reach[*if_false]);
+                    let mut only_a = alloc::vec![0u64; words];
+                    let mut only_b = alloc::vec![0u64; words];
+                    for w in 0..words {
+                        set[w] |= m[w] | (a[w] & b[w]);
+                        only_a[w] = a[w] & !(m[w] | b[w]);
+                        only_b[w] = b[w] & !(m[w] | a[w]);
+                    }
+                    own.saturating_add(if_arms_price(
+                        price_of(&only_a, &effective),
+                        price_of(&only_b, &effective),
+                    ))
                 }
             };
-            let work = usize::try_from((body_price as u64).saturating_mul(fold_trips))
-                .unwrap_or(usize::MAX);
-            total = total.saturating_add(work);
-            stack.extend_from_slice(bounds);
+            effective.push(eff);
+            reach.push(set);
         }
-        total
+        price_of(
+            reach.last().expect("a selection holds its root"),
+            &effective,
+        )
     }
 }
 
@@ -1784,11 +1826,26 @@ fn below(node: &ENode, mut operand: impl Iterator<Item = usize>) -> usize {
             let mask = operand.next().expect("an If has a mask");
             let if_true = operand.next().expect("an If has a true arm");
             let if_false = operand.next().expect("an If has a false arm");
-            let arms = if_true.saturating_add(if_false).saturating_add(1) / 2;
+            let arms = if_arms_price(if_true, if_false);
             mask.saturating_add(arms)
         }
         _ => operand.fold(0usize, usize::saturating_add),
     }
+}
+
+/// What a chosen node opens in the DAG price: nothing, a fold's body scope
+/// paid `trips` times, or an `If`'s two arm scopes paid as their average.
+#[derive(Clone, Copy)]
+enum Scoped {
+    Plain,
+    Fold { trips: u64 },
+    If,
+}
+
+/// What an `If`'s two arm scopes cost together: their average, rounded half
+/// up, which is what [`below`] charges for the arms of a tree.
+fn if_arms_price(if_true: usize, if_false: usize) -> usize {
+    if_true.saturating_add(if_false).saturating_add(1) / 2
 }
 
 /// The two policy knobs the DP passes read, plus the trace they write.
@@ -2289,6 +2346,8 @@ pub(crate) fn shared_dag_dp_pass<C: CostFunction, T: TieBreak, R: StageRecorder>
             stamp: graph.table(0),
             epoch: 0,
             scratch: Vec::new(),
+            marks: alloc::vec![0; live],
+            walked: [Vec::new(), Vec::new(), Vec::new()],
             words: live.div_ceil(REACH_WORD_BITS),
             bytes: 0,
             budget,
@@ -2331,6 +2390,11 @@ struct ReachSets {
     /// `settle` appends the class itself before adding them to the largest
     /// child's set.
     scratch: Vec<u32>,
+    /// By live index, which of an `If`'s three operand sets hold the class
+    /// (bit 0 mask, 1 true arm, 2 false arm); all zero between `If`s.
+    marks: Vec<u8>,
+    /// The three operand sets' members, kept between `If`s so a walk allocates nothing.
+    walked: [Vec<u32>; 3],
     words: usize,
     bytes: usize,
     budget: usize,
@@ -2355,6 +2419,60 @@ impl ReachSets {
         self.scratch.iter().fold(base, |below, &member| {
             below.saturating_add(self.own[Live::from_index(member as usize)])
         })
+    }
+
+    /// An `If`'s scope: what its operands' sets hand up and what its arms'
+    /// exclusive parts cost ([`Selection::dag_price`] states the rule).
+    ///
+    /// Returns the half charge for what only one arm reads, and leaves in
+    /// `scratch` the members the `If`'s own set holds beyond itself: the mask's
+    /// set and what both arms read. The sum of their `own` is the second
+    /// return value. Walks the three sets; the marks are cleared before it
+    /// returns.
+    fn if_scope(&mut self, mask: Live, if_true: Live, if_false: Live) -> (usize, usize) {
+        const IN_MASK: u8 = 1;
+        const IN_TRUE: u8 = 2;
+        const IN_FALSE: u8 = 4;
+        let sets = [(mask, IN_MASK), (if_true, IN_TRUE), (if_false, IN_FALSE)];
+        let mut members = core::mem::take(&mut self.walked);
+        members.iter_mut().for_each(Vec::clear);
+        for (slot, &(live, bit)) in sets.iter().enumerate() {
+            let (reach, marks) = (&self.reach, &mut self.marks);
+            let list = &mut members[slot];
+            settled(reach, live).for_each(|member| {
+                marks[member as usize] |= bit;
+                list.push(member);
+            });
+        }
+        self.scratch.clear();
+        let own_of = |own: &LiveTable<usize>, member: u32| own[Live::from_index(member as usize)];
+        let (mut kept, mut only_true, mut only_false) = (0usize, 0usize, 0usize);
+        for &member in &members[0] {
+            self.scratch.push(member);
+            kept = kept.saturating_add(own_of(&self.own, member));
+        }
+        for &member in &members[1] {
+            match self.marks[member as usize] {
+                IN_TRUE => only_true = only_true.saturating_add(own_of(&self.own, member)),
+                marks if marks & IN_MASK == 0 && marks & IN_FALSE != 0 => {
+                    self.scratch.push(member);
+                    kept = kept.saturating_add(own_of(&self.own, member));
+                }
+                _ => {}
+            }
+        }
+        for &member in &members[2] {
+            if self.marks[member as usize] == IN_FALSE {
+                only_false = only_false.saturating_add(own_of(&self.own, member));
+            }
+        }
+        for list in &members {
+            for &member in list {
+                self.marks[member as usize] = 0;
+            }
+        }
+        self.walked = members;
+        (if_arms_price(only_true, only_false), kept)
     }
 
     /// Replace `scratch` with the classes the children's sets hold beyond
@@ -2443,7 +2561,7 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> SharedPricer<'_, '_, C, T, 
     /// body adds, and the children whose sub-DAGs enter the reach set it
     /// hands its parents.
     ///
-    /// A fold body is a scope ([`Selection::scope_price`]): its sub-DAG is paid
+    /// A fold body is a scope ([`Selection::dag_price`]): its sub-DAG is paid
     /// `trips` times and **not** merged into the set the fold passes up, so
     /// what the body shares with the code around it is charged in both. Any
     /// other node's scope is the whole row and adds no work. `node` names the
@@ -2458,28 +2576,62 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> SharedPricer<'_, '_, C, T, 
     ) -> Option<(usize, Vec<Child>)> {
         let (egraph, graph) = (self.problem.egraph(), self.problem.graph());
         let row = graph.children(candidate);
-        let (ENode::Reduce { header, .. }, Some((&body, bounds))) =
-            (form, node.children_slice().split_first())
-        else {
-            return None;
-        };
         let entry = |class: EClassId| {
             let class = egraph.find(class);
             *row.iter()
                 .find(|child| graph.class(child.live) == class)
                 .expect("an operand's class is in its candidate's row")
         };
-        let mut open: Vec<Child> = Vec::with_capacity(bounds.len());
-        for &bound in bounds {
-            let child = entry(bound);
+        let scope_total = |class: EClassId| self.sets.total[entry(class).live] as u64;
+        match (form, node.children_slice()) {
+            (ENode::Reduce { header, .. }, [body, bounds @ ..]) => {
+                let work =
+                    usize::try_from(scope_total(*body).saturating_mul(header.priced_trips()))
+                        .unwrap_or(usize::MAX);
+                Some((work, self.open_children(bounds, &entry)))
+            }
+            _ => None,
+        }
+    }
+
+    /// An `If`'s mask, true arm and false arm, as live classes.
+    fn if_operands(&self, candidate: Candidate, node: &ENode) -> Option<[Live; 3]> {
+        let (egraph, graph) = (self.problem.egraph(), self.problem.graph());
+        let ENode::Op {
+            op: OpKind::If,
+            children,
+        } = node
+        else {
+            return None;
+        };
+        let row = graph.children(candidate);
+        let live_of = |class: EClassId| {
+            let class = egraph.find(class);
+            row.iter()
+                .find(|child| graph.class(child.live) == class)
+                .expect("an operand's class is in its candidate's row")
+                .live
+        };
+        let [mask, if_true, if_false] = children.as_ref() else {
+            unreachable!("an If has a mask and two arms")
+        };
+        Some([live_of(*mask), live_of(*if_true), live_of(*if_false)])
+    }
+
+    /// The distinct row entries of `classes`, in first-occurrence order.
+    fn open_children(
+        &self,
+        classes: &[EClassId],
+        entry: &impl Fn(EClassId) -> Child,
+    ) -> Vec<Child> {
+        let mut open: Vec<Child> = Vec::with_capacity(classes.len());
+        for &class in classes {
+            let child = entry(class);
             if open.iter().all(|seen| seen.live != child.live) {
                 open.push(child);
             }
         }
-        let body_price = self.sets.total[entry(body).live] as u64;
-        let work =
-            usize::try_from(body_price.saturating_mul(header.priced_trips())).unwrap_or(usize::MAX);
-        Some((work, open))
+        open
     }
 }
 
@@ -2490,16 +2642,19 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for SharedPricer<'
         let twin = node.literal_twin(|class| self.chosen[egraph.find(class).index()]);
         let form = twin.as_ref().unwrap_or(node);
         let own = weighted_own(self.dp.costs, form, self.dp.shape.evals(var));
-        let scope = self.fold_scope(candidate, node, form);
-        // What a union pays when the class first enters it: its own cost, and
-        // for a fold the sealed body's work.
-        let (own, below) = match &scope {
-            None => (
-                own,
-                self.sets
-                    .cost_below(self.problem.graph().children(candidate)),
-            ),
-            Some((work, open)) => (own.saturating_add(*work), self.sets.cost_below(open)),
+        let (own, below) = match self.if_operands(candidate, node) {
+            Some([mask, if_true, if_false]) => {
+                let (half, kept) = self.sets.if_scope(mask, if_true, if_false);
+                (own.saturating_add(half), kept)
+            }
+            None => match self.fold_scope(candidate, node, form) {
+                None => (
+                    own,
+                    self.sets
+                        .cost_below(self.problem.graph().children(candidate)),
+                ),
+                Some((work, open)) => (own.saturating_add(work), self.sets.cost_below(&open)),
+            },
         };
         let cost = own.saturating_add(below);
         self.dp
@@ -2525,16 +2680,29 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for SharedPricer<'
         // before any of them settles, so a stored winner set would be a
         // second copy of the frontier's reach.
         let me = candidate.live();
-        let largest = match self.fold_scope(candidate, picked, picked) {
-            None => self.sets.residue(self.problem.graph().children(candidate)),
-            Some((_, open)) => self.sets.residue(&open),
+        let set = match self.if_operands(candidate, picked) {
+            Some([mask, if_true, if_false]) => {
+                self.sets.if_scope(mask, if_true, if_false);
+                self.sets.scratch.push(
+                    u32::try_from(me.index())
+                        .expect("a live index is below the e-graph's u32 class count"),
+                );
+                Reach::EMPTY.grown(&self.sets.scratch, self.sets.words)
+            }
+            None => {
+                let largest = match self.fold_scope(candidate, picked, picked) {
+                    None => self.sets.residue(self.problem.graph().children(candidate)),
+                    Some((_, open)) => self.sets.residue(&open),
+                };
+                self.sets.scratch.push(
+                    u32::try_from(me.index())
+                        .expect("a live index is below the e-graph's u32 class count"),
+                );
+                largest
+                    .map_or(&Reach::EMPTY, |child| settled(&self.sets.reach, child))
+                    .grown(&self.sets.scratch, self.sets.words)
+            }
         };
-        self.sets.scratch.push(
-            u32::try_from(me.index()).expect("a live index is below the e-graph's u32 class count"),
-        );
-        let set = largest
-            .map_or(&Reach::EMPTY, |child| settled(&self.sets.reach, child))
-            .grown(&self.sets.scratch, self.sets.words);
         self.sets.bytes = self.sets.bytes.saturating_add(set.bytes());
         if self.sets.bytes > self.sets.budget {
             return false;
@@ -5049,7 +5217,7 @@ mod tests {
     /// node once, so a fold over 40 trips of a body cost what one trip costs
     /// and the shared arm could not see that unrolling or keeping a fold
     /// changed anything. The body is a scope paid `trips` times
-    /// ([`Selection::scope_price`]), and the shared DP charges it the same way.
+    /// ([`Selection::dag_price`]), and the shared DP charges it the same way.
     #[test]
     fn a_fold_body_is_paid_per_trip_in_the_dag_price() {
         let costs = CostModel::latency_prior();
@@ -5078,5 +5246,63 @@ mod tests {
             }
             assert_eq!(shared.report.audit.expect("a DP ran").claimed, expected);
         }
+    }
+
+    /// **An `If`'s arms are paid as their average in the DAG price**, as the tree
+    /// price pays them: `If(X < 1, sin(X), cos(X))` costs the mask, the select
+    /// and half of each arm's scope, rounded half up. Both arms' claim is the
+    /// price of the term they return.
+    #[test]
+    fn an_if_pays_the_average_of_its_arm_scopes_in_the_dag_price() {
+        let costs = CostModel::latency_prior();
+        let mut egraph = EGraph::new();
+        let x = egraph.add(ENode::Var(0));
+        let one = egraph.add(ENode::constant(1.0));
+        let mask = egraph.add(ENode::apply(OpKind::Lt, &[x, one]));
+        let sin = egraph.add(ENode::apply(OpKind::Sin, &[x]));
+        let cos = egraph.add(ENode::apply(OpKind::Cos, &[x]));
+        let root = egraph.add(ENode::apply(OpKind::If, &[mask, sin, cos]));
+        egraph.rebuild();
+        let expected = costs.cost(OpKind::Lt)
+            + costs.cost(OpKind::If)
+            + (costs.cost(OpKind::Sin) + costs.cost(OpKind::Cos)).div_ceil(2);
+
+        let (tree, shared) = extract_dag_objectives(&egraph, root, &costs, LatticeShape::POINT);
+        for (label, dag) in [("tree arm", &tree), ("shared arm", &shared)] {
+            assert_eq!(dag.dag_cost, expected, "{label}");
+            let audit = dag.report.audit.expect("both arms run a DP");
+            assert_eq!(audit.claimed, audit.scale.of(dag.cost()), "{label}");
+        }
+        assert_eq!(shared.report.audit.expect("a DP ran").claimed, expected);
+    }
+
+    /// What an arm shares with the mask runs unguarded and is paid in full,
+    /// once: `If(sin(X) < 1, sin(X) * 2, sin(X) * 3)` shares `sin(X)` between
+    /// the mask and both arms, so the arms own only their `Mul`s. Pricing the
+    /// shared `Sin` per arm at half would have doubled it per nested `If`
+    /// (the SDF fixture's DAG price went from under 10^6 past 9·10^6).
+    #[test]
+    fn what_an_if_arm_shares_with_its_mask_is_paid_in_full_once() {
+        let costs = CostModel::latency_prior();
+        let mut egraph = EGraph::new();
+        let x = egraph.add(ENode::Var(0));
+        let one = egraph.add(ENode::constant(1.0));
+        let two = egraph.add(ENode::constant(2.0));
+        let three = egraph.add(ENode::constant(3.0));
+        let sin = egraph.add(ENode::apply(OpKind::Sin, &[x]));
+        let mask = egraph.add(ENode::apply(OpKind::Lt, &[sin, one]));
+        let a = egraph.add(ENode::apply(OpKind::Mul, &[sin, two]));
+        let b = egraph.add(ENode::apply(OpKind::Mul, &[sin, three]));
+        let root = egraph.add(ENode::apply(OpKind::If, &[mask, a, b]));
+        egraph.rebuild();
+        let mul = costs.cost(OpKind::Mul);
+        let expected = costs.cost(OpKind::Sin)
+            + costs.cost(OpKind::Lt)
+            + costs.cost(OpKind::If)
+            + (mul + mul).div_ceil(2);
+        let dag = extract_dag_scoped(&egraph, root, &costs, LatticeShape::POINT);
+        assert_eq!(dag.dag_cost, expected);
+        let audit = dag.report.audit.expect("a DP ran");
+        assert_eq!(audit.claimed, audit.scale.of(dag.cost()));
     }
 }

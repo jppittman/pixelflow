@@ -427,8 +427,10 @@ dimension and never a reason to emit a worse kernel.
    but both choose greedily bottom-up, so neither is an argmin. Sharing is
    priced (each distinct node once), with a fold body as a scope: paid `trips`
    times, sharing nothing with the code around it, no hoisting credit, so the
-   DAG price of a term without sharing equals its tree price. An `If`'s arms are
-   paid in full in the DAG price (the tree price averages them). Said so in
+   DAG price of a term without sharing equals its tree price. An `If` pays half of what only one
+   arm reads (rounded half up, as the tree price averages the arms) and the rest
+   once, in full; exclusivity is judged against the `If`'s own operands, so an
+   outer reader makes it overcharge, never undercharge. Said so in
    `extract.rs`; nothing may assume otherwise.
 
 Because rules are equalities of meaning, the optimizer may produce a
