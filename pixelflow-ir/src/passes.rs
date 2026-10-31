@@ -66,6 +66,10 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 mod guard;
+#[cfg(feature = "std")]
+mod lift;
+#[cfg(feature = "std")]
+pub use lift::{Lifted, lift_applies};
 
 /// The legalization that comes before a backend's traversal: names and
 /// derivatives. `expand_refs`, then `lower_dwrt`.
