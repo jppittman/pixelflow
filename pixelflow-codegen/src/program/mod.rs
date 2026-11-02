@@ -62,6 +62,11 @@ pub(crate) struct Def {
     pub(super) variance: Variance,
 }
 
+/// The trips a loop of unknown count is priced at: the cost model's pick, which
+/// the emitter's traffic report carries as an estimate. Named here, outside
+/// `emit`, which does not name the search crate.
+pub(crate) use pixelflow_search::egraph::DEFAULT_UNKNOWN_TRIPS;
+
 /// Info about an operation in the schedule.
 #[derive(Debug, Clone)]
 pub(crate) enum ScheduledOp {

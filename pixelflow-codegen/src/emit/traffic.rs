@@ -22,10 +22,10 @@
 use super::asm::Assembled;
 use super::regalloc::{Allocated, Origin};
 use super::{FileId, IsaBackend};
+use crate::program::DEFAULT_UNKNOWN_TRIPS;
 use crate::program::Scope;
 use alloc::vec::Vec;
 use core::fmt;
-use pixelflow_search::egraph::DEFAULT_UNKNOWN_TRIPS;
 
 /// Emitted traffic within one scope of the nest.
 ///
