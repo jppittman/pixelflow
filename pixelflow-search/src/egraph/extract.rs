@@ -991,7 +991,17 @@ impl Selection {
     /// nothing is priced once per call and an X-dependent one once per
     /// sample. Leaves are free (`CostModel::node_op_cost`), so under
     /// [`LatticeShape::POINT`] `ChoiceCost::dag` equals the latency-prior
-    /// cost of the arena [`Self::to_arena`] builds from the same term.
+    /// cost of the arena [`Self::to_arena`] builds from the same term, **when
+    /// the term holds no fold**: a fold's body is a scope paid `trips` times
+    /// ([`Self::scope_price`]), which the arena's node count does not see.
+    ///
+    /// Approximation limits, recorded rather than hidden (JP-15): a fold body
+    /// gets no hoisting credit, so a binder-invariant node inside it is paid
+    /// per trip though codegen hoists it; an `If`'s arms are paid in full in
+    /// the DAG column, though the tree column averages them and the policy is
+    /// to average (an arm's exclusive block is the only part a guard skips,
+    /// and exclusivity is not in a reach set); and extraction is greedy
+    /// bottom-up, so a richer graph can still extract a worse term (E5).
     pub(crate) fn price<C: CostFunction>(
         &self,
         egraph: &FrozenGraph,
@@ -1000,7 +1010,8 @@ impl Selection {
         let Pricing { costs, shape } = *pricing;
         let mut tree: Vec<usize> = Vec::with_capacity(self.len());
         let mut variance: Vec<Variance> = Vec::with_capacity(self.len());
-        let mut dag = 0usize;
+        let mut owns: Vec<usize> = Vec::with_capacity(self.len());
+        let mut trips: Vec<Option<u64>> = Vec::with_capacity(self.len());
         for position in 0..self.len() {
             let node = self.node(egraph, position);
             let operands = self.operands_of(position);
@@ -1031,12 +1042,76 @@ impl Selection {
             let below = below(form, operands.iter().map(|&operand| tree[operand]));
             tree.push(own.saturating_add(below));
             variance.push(node_variance);
-            dag = dag.saturating_add(own);
+            owns.push(own);
+            trips.push(match form {
+                ENode::Reduce { header, .. } => Some(header.priced_trips()),
+                _ => None,
+            });
         }
+        let dag = self.scope_price(
+            self.len() - 1,
+            &owns,
+            &trips,
+            &mut alloc::vec![None; self.len()],
+        );
         ChoiceCost {
             tree: *tree.last().expect("a selection holds at least its root"),
             dag,
         }
+    }
+
+    /// The DAG price of the sub-term at `root`, with each fold's body a
+    /// **scope**: a node is paid once per scope that reaches it, and a fold
+    /// pays `trips` times its body's scope price.
+    ///
+    /// A fold body is a body, not a region of the enclosing graph: what it
+    /// shares with the outside is shared *inside* it, once, and the body runs
+    /// `trips` times however many other places read the same node. So a
+    /// subterm read both by a body and by the code around it is charged in
+    /// each, which is what [`shared_dag_dp_pass`] does too (it seals a fold's
+    /// body out of the reach set the fold passes to its parents). The two
+    /// agree because both are this one definition; no hoisting credit is
+    /// given, which is also what [`below`] does, so on a term with no sharing
+    /// the DAG price equals the tree price.
+    ///
+    /// `memo` holds, by position, the price of the scope that position roots:
+    /// one fold node carries one body, and the body's price does not depend on
+    /// where the fold is read from.
+    fn scope_price(
+        &self,
+        root: usize,
+        owns: &[usize],
+        trips: &[Option<u64>],
+        memo: &mut Vec<Option<usize>>,
+    ) -> usize {
+        let mut seen = alloc::vec![false; self.len()];
+        let mut stack = alloc::vec![root];
+        let mut total = 0usize;
+        while let Some(position) = stack.pop() {
+            if core::mem::replace(&mut seen[position], true) {
+                continue;
+            }
+            total = total.saturating_add(owns[position]);
+            let operands = self.operands_of(position);
+            let Some(fold_trips) = trips[position] else {
+                stack.extend_from_slice(operands);
+                continue;
+            };
+            let (&body, bounds) = operands.split_first().expect("a fold has a body");
+            let body_price = match memo[body] {
+                Some(price) => price,
+                None => {
+                    let price = self.scope_price(body, owns, trips, memo);
+                    memo[body] = Some(price);
+                    price
+                }
+            };
+            let work = usize::try_from((body_price as u64).saturating_mul(fold_trips))
+                .unwrap_or(usize::MAX);
+            total = total.saturating_add(work);
+            stack.extend_from_slice(bounds);
+        }
+        total
     }
 }
 
@@ -2363,6 +2438,51 @@ struct SharedPricer<'a, 'c, C, T, R> {
     sets: ReachSets,
 }
 
+impl<C: CostFunction, T: TieBreak, R: StageRecorder> SharedPricer<'_, '_, C, T, R> {
+    /// A candidate's children split at its scope boundary: the work its fold
+    /// body adds, and the children whose sub-DAGs enter the reach set it
+    /// hands its parents.
+    ///
+    /// A fold body is a scope ([`Selection::scope_price`]): its sub-DAG is paid
+    /// `trips` times and **not** merged into the set the fold passes up, so
+    /// what the body shares with the code around it is charged in both. Any
+    /// other node's scope is the whole row and adds no work. `node` names the
+    /// classes (its body first, then its value bounds); `form` is the node as
+    /// priced (the literal twin, when its bounds were chosen as literals), whose
+    /// header holds the trips.
+    fn fold_scope(
+        &self,
+        candidate: Candidate,
+        node: &ENode,
+        form: &ENode,
+    ) -> Option<(usize, Vec<Child>)> {
+        let (egraph, graph) = (self.problem.egraph(), self.problem.graph());
+        let row = graph.children(candidate);
+        let (ENode::Reduce { header, .. }, Some((&body, bounds))) =
+            (form, node.children_slice().split_first())
+        else {
+            return None;
+        };
+        let entry = |class: EClassId| {
+            let class = egraph.find(class);
+            *row.iter()
+                .find(|child| graph.class(child.live) == class)
+                .expect("an operand's class is in its candidate's row")
+        };
+        let mut open: Vec<Child> = Vec::with_capacity(bounds.len());
+        for &bound in bounds {
+            let child = entry(bound);
+            if open.iter().all(|seen| seen.live != child.live) {
+                open.push(child);
+            }
+        }
+        let body_price = self.sets.total[entry(body).live] as u64;
+        let work =
+            usize::try_from(body_price.saturating_mul(header.priced_trips())).unwrap_or(usize::MAX);
+        Some((work, open))
+    }
+}
+
 impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for SharedPricer<'_, '_, C, T, R> {
     fn price(&mut self, candidate: Candidate, node: &ENode) -> Priced {
         let egraph = self.problem.egraph();
@@ -2370,9 +2490,17 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for SharedPricer<'
         let twin = node.literal_twin(|class| self.chosen[egraph.find(class).index()]);
         let form = twin.as_ref().unwrap_or(node);
         let own = weighted_own(self.dp.costs, form, self.dp.shape.evals(var));
-        let below = self
-            .sets
-            .cost_below(self.problem.graph().children(candidate));
+        let scope = self.fold_scope(candidate, node, form);
+        // What a union pays when the class first enters it: its own cost, and
+        // for a fold the sealed body's work.
+        let (own, below) = match &scope {
+            None => (
+                own,
+                self.sets
+                    .cost_below(self.problem.graph().children(candidate)),
+            ),
+            Some((work, open)) => (own.saturating_add(*work), self.sets.cost_below(open)),
+        };
         let cost = own.saturating_add(below);
         self.dp
             .rec
@@ -2397,7 +2525,10 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for SharedPricer<'
         // before any of them settles, so a stored winner set would be a
         // second copy of the frontier's reach.
         let me = candidate.live();
-        let largest = self.sets.residue(self.problem.graph().children(candidate));
+        let largest = match self.fold_scope(candidate, picked, picked) {
+            None => self.sets.residue(self.problem.graph().children(candidate)),
+            Some((_, open)) => self.sets.residue(&open),
+        };
         self.sets.scratch.push(
             u32::try_from(me.index()).expect("a live index is below the e-graph's u32 class count"),
         );
@@ -3076,10 +3207,14 @@ mod tests {
             let folds: Vec<_> = priced.iter().filter(|&&(c, ..)| c == class).collect();
             assert_eq!(folds.len(), 2, "{objective}: both twins are candidates");
             for &&(_, cost, own) in &folds {
-                assert_eq!(own, own_share, "{objective}: the combiner chain over 40");
-                if objective == "tree" {
-                    assert_eq!(cost, whole, "{objective}: the body 40 times");
-                }
+                // The shared arm's `own` is what a union pays when the class
+                // enters it: the combiner chain and the sealed body's 40 trips.
+                let expected_own = match objective {
+                    "shared" => whole,
+                    _ => own_share,
+                };
+                assert_eq!(own, expected_own, "{objective}: the combiner chain over 40");
+                assert_eq!(cost, whole, "{objective}: the body 40 times");
             }
         }
         let dag = extract_dag(&egraph, class, &costs);
@@ -4865,6 +5000,83 @@ mod tests {
                 dag.cost(),
                 "the reported pair must be the price of the returned term"
             );
+        }
+    }
+
+    /// The fold fixture the scope tests share: `Σ_{j<40} |sin(X) − j|`, beside
+    /// `sin(X)` read outside the fold when `outside` says so. Returns the graph,
+    /// the root, and the prices of the pieces.
+    fn fold_beside_its_subterm(outside: bool) -> (EGraph, EClassId, FoldPieces) {
+        use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
+        let binder = Binder::from_slot(0).expect("a live binder");
+        let fold = Fold::new(Monoid::SUM, binder);
+        let costs = CostModel::latency_prior();
+        let mut egraph = EGraph::new();
+        let x = egraph.add(ENode::Var(0));
+        let j = egraph.add(ENode::Var(binder.var()));
+        let sin = egraph.add(ENode::apply(OpKind::Sin, &[x]));
+        let diff = egraph.add(ENode::apply(OpKind::Sub, &[sin, j]));
+        let body = egraph.add(ENode::apply(OpKind::Abs, &[diff]));
+        let sum = egraph.add(ENode::reduce(fold, Bound::Lit(0), Bound::Lit(40), body));
+        let root = match outside {
+            true => egraph.add(ENode::apply(OpKind::Add, &[sum, sin])),
+            false => sum,
+        };
+        egraph.rebuild();
+        let header = costs.node_op_cost(&ENode::reduce(
+            fold,
+            Bound::Lit(0),
+            Bound::Lit(40),
+            EClassId::from_index(0),
+        ));
+        let pieces = FoldPieces {
+            header,
+            body: costs.cost(OpKind::Sub) + costs.cost(OpKind::Abs),
+            sin: costs.cost(OpKind::Sin),
+            add: costs.cost(OpKind::Add),
+        };
+        (egraph, root, pieces)
+    }
+
+    struct FoldPieces {
+        header: usize,
+        body: usize,
+        sin: usize,
+        add: usize,
+    }
+
+    /// **A fold's work is in the DAG price.** The DAG column used to sum each
+    /// node once, so a fold over 40 trips of a body cost what one trip costs
+    /// and the shared arm could not see that unrolling or keeping a fold
+    /// changed anything. The body is a scope paid `trips` times
+    /// ([`Selection::scope_price`]), and the shared DP charges it the same way.
+    #[test]
+    fn a_fold_body_is_paid_per_trip_in_the_dag_price() {
+        let costs = CostModel::latency_prior();
+        let (egraph, root, p) = fold_beside_its_subterm(false);
+        let dag = extract_dag(&egraph, root, &costs);
+        assert_eq!(dag.dag_cost, p.header + 40 * (p.sin + p.body));
+        assert_eq!(dag.total_cost, dag.dag_cost, "no sharing: tree equals dag");
+    }
+
+    /// **What a fold body shares with the code around it is paid in both.**
+    /// `Σ_{j<40} |sin(X) − j| + sin(X)` reads one `Sin` from inside the body
+    /// and from outside: the body is a scope, so it is charged in each, as it
+    /// would be if the two were separate bodies. Both arms and the final price
+    /// agree, and the shared arm's claim is the price of the term it returns.
+    #[test]
+    fn a_subterm_read_inside_and_outside_a_fold_body_is_paid_in_each_scope() {
+        let costs = CostModel::latency_prior();
+        let (egraph, root, p) = fold_beside_its_subterm(true);
+        let expected = p.add + p.header + 40 * (p.sin + p.body) + p.sin;
+        for shape in [LatticeShape::POINT] {
+            let (tree, shared) = extract_dag_objectives(&egraph, root, &costs, shape);
+            for (label, dag) in [("tree arm", &tree), ("shared arm", &shared)] {
+                assert_eq!(dag.dag_cost, expected, "{label}");
+                let audit = dag.report.audit.expect("both arms run a DP");
+                assert_eq!(audit.claimed, audit.scale.of(dag.cost()), "{label}");
+            }
+            assert_eq!(shared.report.audit.expect("a DP ran").claimed, expected);
         }
     }
 }
