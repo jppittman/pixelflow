@@ -30,6 +30,7 @@ use pixelflow_codegen::isa::{self, Isa};
 use pixelflow_codegen::jit_cache;
 use pixelflow_ir::fold::{Binder, Bound, Fold, Monoid};
 use pixelflow_ir::{ExprArena, ExprId, Kernel, LatticeShape, OpKind, Uniform};
+use pixelflow_search::egraph::DEFAULT_UNKNOWN_TRIPS;
 
 /// Wide enough for a main column fold at every lane count (4, 8 and 16), and
 /// several rows so the row fold is a loop around the columns.
@@ -711,7 +712,7 @@ fn a_fold_that_reads_no_coordinate_is_guarded_once_per_call() {
             .collect();
         assert_eq!(
             estimates,
-            [&Trips::Estimated(Fold::ESTIMATED_TRIPS)],
+            [&Trips::Estimated(DEFAULT_UNKNOWN_TRIPS)],
             "the one loop with a bound that is a value runs once per call: {:?}",
             traffic.trips
         );
@@ -765,8 +766,8 @@ fn a_bound_read_only_by_the_loop_reaches_its_latch() {
 }
 
 /// The depth at which a nest of per-call counts, each priced at
-/// [`Fold::ESTIMATED_TRIPS`], is priced past `u64`.
-const PAST_U64: usize = (u64::BITS / Fold::ESTIMATED_TRIPS.ilog2()) as usize + 1;
+/// [`DEFAULT_UNKNOWN_TRIPS`], is priced past `u64`.
+const PAST_U64: usize = (u64::BITS / DEFAULT_UNKNOWN_TRIPS.ilog2()) as usize + 1;
 
 /// `depth` folds, each `Σ_{i<n}` over one per-call count, around `X + Σ i`.
 fn nested_counts(depth: usize, n: &Uniform, acc: Kernel) -> Kernel {
