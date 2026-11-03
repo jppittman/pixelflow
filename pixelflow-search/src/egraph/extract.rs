@@ -1020,7 +1020,8 @@ impl Selection {
             // the fold over them, as the settlement priced it: the operands
             // are the classes' settled picks, so the claim and the price read
             // the same literals.
-            let twin = node.literal_twin(|class| self.node(egraph, pick_of(class)).literal());
+            let twin =
+                node.literal_twin(|class| self.node(egraph, pick_of(class)).priced_literal());
             let form = twin.as_ref().unwrap_or(node);
             let own = weighted_own(costs, form, shape.evals(node_variance));
             // Saturating throughout: a tree cost is exponential in the sharing
@@ -2157,7 +2158,7 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for TreePricer<'_,
             .problem
             .egraph()
             .node(self.problem.graph().node_id(candidate));
-        self.chosen[candidate.class().index()] = picked.literal();
+        self.chosen[candidate.class().index()] = picked.priced_literal();
         self.cost[candidate.live()] = Some(priced.cost);
         self.var[candidate.class().index()] = priced.var;
         self.dp.rec.settled(candidate.class(), candidate.idx());
@@ -2390,7 +2391,7 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for SharedPricer<'
             .problem
             .egraph()
             .node(self.problem.graph().node_id(candidate));
-        self.chosen[candidate.class().index()] = picked.literal();
+        self.chosen[candidate.class().index()] = picked.priced_literal();
         // Rebuild the winner's union rather than carrying one per class in
         // flight: the driver prices candidates for many unsettled classes
         // before any of them settles, so a stored winner set would be a
