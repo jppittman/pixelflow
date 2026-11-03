@@ -1044,7 +1044,7 @@ impl Selection {
             owns.push(own);
             shapes.push(match form {
                 ENode::Reduce { header, .. } => Scoped::Fold {
-                    trips: header.priced_trips(),
+                    trips: costs.trips(*header),
                 },
                 ENode::Op { op: OpKind::If, .. } => Scoped::If,
                 _ => Scoped::Plain,
@@ -2588,7 +2588,7 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> SharedPricer<'_, '_, C, T, 
         match (form, node.children_slice()) {
             (ENode::Reduce { header, .. }, [body, bounds @ ..]) => {
                 let work =
-                    usize::try_from(scope_total(*body).saturating_mul(header.priced_trips()))
+                    usize::try_from(scope_total(*body).saturating_mul(self.dp.costs.trips(*header)))
                         .unwrap_or(usize::MAX);
                 Some((work, self.open_children(bounds, &entry)))
             }
