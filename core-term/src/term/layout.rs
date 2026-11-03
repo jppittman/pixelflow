@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn pixels_to_cells_misses_when_only_one_axis_is_inside_the_padding() {
+    fn it_should_miss_when_only_one_axis_is_inside_the_padding() {
         let layout = Layout {
             cols: 80,
             rows: 24,

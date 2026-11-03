@@ -41,7 +41,12 @@ TYPESAFE_API_KEY=...  cargo run -p desloppify -- --system-one jev path/to/src  #
    reads every finding, every named thing with its description, and the
    outlines of their modules, and judges: for each thing, the model the code
    is missing and what falls out once the code has the thing's shape; the
-   roots beneath several diagnoses, across modules as well as within one;
+   roots beneath several diagnoses, across modules as well as within one,
+   each with a **brief** — the thing in its domain's words and the nouns,
+   noun categories, verbs and invariants the evidence exhibits, with no
+   identifier from the code — which is the input to the forward design
+   pass (`.claude/skills/denotational-design/SKILL.md`, pass 1): a root
+   is designed again from its meaning, not fixed finding by finding;
    and the review, leading with the roots, then the diagnoses, then the
    findings grouped by file, duplicates across rules merged, trivial or
    mistaken findings dropped and counted, recurring patterns called out.

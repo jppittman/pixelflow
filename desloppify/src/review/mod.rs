@@ -323,6 +323,11 @@ pub struct Root {
     /// With that model in place: what stops being special, what is deleted,
     /// and what follows from that, to closure.
     pub falls_out: String,
+    /// The hand-off to the forward pass (`.claude/skills/denotational-design`,
+    /// pass 1): the thing named, and the nouns, noun categories, verbs and
+    /// invariants the findings exhibit, drafted from the evidence so a
+    /// design session starts from them rather than from the code.
+    pub brief: String,
     /// The diagnoses it explains.
     pub explains: Vec<DiagnosisIx>,
 }
