@@ -1141,7 +1141,7 @@ async fn the_synthesis_sees_the_things_and_their_outlines_and_its_numbers_become
                     {"thing": 1, "diagnosis": "a label is a key", "falls_out": "names go", "explains": [1, 2]},
                     {"thing": 2, "diagnosis": "temps are predicted", "falls_out": "f", "explains": [3]}
                 ],
-                "roots": [{"root": "selection is a phase", "falls_out": "predictions go", "explains": [1, 2]}],
+                "roots": [{"root": "selection is a phase", "falls_out": "predictions go", "brief": "an instruction selector: …", "explains": [1, 2]}],
                 "review": "# Review\n"
             }"##
             .into())
@@ -1161,6 +1161,7 @@ async fn the_synthesis_sees_the_things_and_their_outlines_and_its_numbers_become
         written(&synthesis.roots[0].explains),
         serde_json::json!([0, 1])
     );
+    assert_eq!(synthesis.roots[0].brief, "an instruction selector: …");
 
     let brief = &lead.ask.asked()[0].prompt;
     assert!(brief.contains("### T1 — an assembler, c — "), "{brief}");
@@ -1487,7 +1488,7 @@ async fn a_zero_names_nothing_in_any_list() {
     .await;
     assert!(error.contains("T0"), "{error}");
     let error = synthesis_error("zero-diagnosis", |_| {
-        Ok(r#"{"diagnoses": [{"thing": 1, "diagnosis": "d", "falls_out": "f", "explains": []}], "roots": [{"root": "r", "falls_out": "f", "explains": [0]}], "review": "r"}"#.into())
+        Ok(r#"{"diagnoses": [{"thing": 1, "diagnosis": "d", "falls_out": "f", "explains": []}], "roots": [{"root": "r", "falls_out": "f", "brief": "b", "explains": [0]}], "review": "r"}"#.into())
     })
     .await;
     assert!(error.contains("D0"), "{error}");
@@ -1496,7 +1497,7 @@ async fn a_zero_names_nothing_in_any_list() {
 #[tokio::test]
 async fn a_root_numbers_the_replys_own_diagnoses_and_one_past_them_is_an_error() {
     let error = synthesis_error("past-diagnoses", |_| {
-        Ok(r#"{"diagnoses": [{"thing": 1, "diagnosis": "d", "falls_out": "f", "explains": []}], "roots": [{"root": "r", "falls_out": "f", "explains": [1, 2]}], "review": "r"}"#.into())
+        Ok(r#"{"diagnoses": [{"thing": 1, "diagnosis": "d", "falls_out": "f", "explains": []}], "roots": [{"root": "r", "falls_out": "f", "brief": "b", "explains": [1, 2]}], "review": "r"}"#.into())
     })
     .await;
     assert!(error.contains("D2"), "{error}");

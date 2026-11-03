@@ -593,7 +593,7 @@
   AVX2's selection puts in a block; `Inst` in `emit/aarch64.rs`. The encoders are
   written for the allocator's `Bound` stage, the only one with registers placed.
   ("Instructions: bytes written inline by ~236 functions, not values",
-  denotational-diagnosis, described the legacy `LegacyBackend` verbs, deleted
+  the denotational-design skill's pass 4, described the legacy `LegacyBackend` verbs, deleted
   at D1.)
 
 ### Branch
