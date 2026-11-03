@@ -16,7 +16,7 @@
 
 use super::node::ENode;
 use pixelflow_ir::kind::OpMap;
-use pixelflow_ir::{Fold, OpKind};
+use pixelflow_ir::{Fold, FoldHeader, KnownRange, OpKind};
 
 /// The price of a node only legalization can remove: a `Dwrt` the chain rule
 /// did not reach. The term is correct, the calculus left it symbolic, and
@@ -205,11 +205,39 @@ pub trait CostFunction {
     /// This allows for 'sliding window' optimizations (e.g. FMA detection).
     fn node_cost(&self, node: &ENode, parent: Option<OpKind>) -> usize;
 
+    /// How many times a fold's body is priced as running: its known range's
+    /// length, else the trips this model picks for a count nothing here knows
+    /// ([`DEFAULT_UNKNOWN_TRIPS`] unless the model chooses another).
+    ///
+    /// The one place an unknown count becomes a number, and it is a *choice of
+    /// the model*, not a property of the fold: nothing in the IR names it, so
+    /// choosing it later — at materialization, from the extent the call
+    /// supplies — changes this method's answer and no other code.
+    fn trips(&self, header: FoldHeader) -> u64 {
+        header
+            .known_range()
+            .map_or(DEFAULT_UNKNOWN_TRIPS, KnownRange::len)
+    }
+
     /// Get the cost of an operation by OpKind (optional, for interop).
     fn cost_by_kind(&self, _op: OpKind, _parent: Option<OpKind>) -> usize {
         panic!("CostFunction::cost_by_kind not implemented");
     }
 }
+
+/// The trips a fold is priced at when its range is not known: 32.
+///
+/// LLVM's `BranchProbabilityInfo` weights a loop's back edge 124 against its
+/// exit's 4 (`LBH_TAKEN_WEIGHT`, `LBH_NONTAKEN_WEIGHT`), a back-edge
+/// probability of 31/32, so a loop it knows nothing about runs
+/// `1 / (1 − 31/32) = 32` times. Policy, not a measurement of these kernels: the
+/// static model prices a fold before its bound has a value
+/// (docs/language/2026-10-20-a-bound-is-a-value.md §1.5), and a ranking at 32
+/// may differ from one at the real count (§4). A uniform's declared default is
+/// not a better pick: the kernel key excludes it (L9, one program serves every
+/// count), so a price read off it would make one key extract two programs.
+/// Nested folds whose ranges are not known multiply, as their trips do.
+pub const DEFAULT_UNKNOWN_TRIPS: u64 = 32;
 
 /// Cost model indexed by OpKind.
 ///
@@ -223,6 +251,8 @@ pub struct CostModel {
     pub depth_threshold: usize,
     /// Penalty per depth level beyond threshold.
     pub depth_penalty: usize,
+    /// Trips a fold with a value bound is priced at; see [`CostFunction::trips`].
+    unknown_trips: u64,
 }
 
 impl Default for CostModel {
@@ -254,6 +284,16 @@ impl CostModel {
             costs: latency_prior_cycles(),
             depth_threshold: 1024, // Effectively disabled
             depth_penalty: 0,
+            unknown_trips: DEFAULT_UNKNOWN_TRIPS,
+        }
+    }
+
+    /// This model, pricing a fold whose count is not known at `trips`.
+    #[must_use]
+    pub fn with_unknown_trips(self, trips: u64) -> Self {
+        Self {
+            unknown_trips: trips,
+            ..self
         }
     }
 
@@ -268,6 +308,7 @@ impl CostModel {
             costs: OpMap::splat(0),
             depth_threshold: 1024, // Effectively disabled
             depth_penalty: 0,
+            unknown_trips: DEFAULT_UNKNOWN_TRIPS,
         }
     }
 
@@ -389,8 +430,8 @@ impl CostModel {
             // fold afterwards now: codegen emits it as a loop.
             //
             // So the node's own share is `fold_cost` with the body free. Its
-            // trips are the header's (`FoldHeader::priced_trips`): the range's
-            // length, or the estimate when a bound is a value; the extractor
+            // trips are the model's ([`CostFunction::trips`]): the range's
+            // length, or the model's pick when a bound is a value; the extractor
             // prices a fold whose bounds it chose as literals through the fold
             // over them (`ENode::literal_twin`).
             //
@@ -399,7 +440,7 @@ impl CostModel {
             ENode::Reduce { header, .. } => {
                 let fold = header.fold();
                 match super::fold_rules::combiner_op(fold.monoid()) {
-                    Some(_) => self.fold_cost(fold, header.priced_trips(), 0),
+                    Some(_) => self.fold_cost(fold, self.trips(*header), 0),
                     None => usize::MAX / 4,
                 }
             }
@@ -417,11 +458,10 @@ impl CostModel {
     /// the combiner chain, and the DP multiplies the body's price by the trip
     /// count where it has that price in hand (`extract.rs`'s `below`).
     ///
-    /// `trips` is read off the node that holds the fold
-    /// ([`FoldHeader::priced_trips`](pixelflow_ir::FoldHeader::priced_trips)):
-    /// its range's length when the range is known, else
-    /// [`Fold::ESTIMATED_TRIPS`]; the extractor reads it off a fold's literal
-    /// twin when it chose the fold's bounds as literals.
+    /// `trips` is [`CostFunction::trips`] of the node that holds the fold:
+    /// its range's length when the range is known, else the model's pick; the
+    /// extractor reads it off a fold's literal twin when it chose the fold's
+    /// bounds as literals.
     ///
     /// Saturating: a nest of long folds over an expensive body is a price
     /// past any budget, not an overflow.
@@ -454,6 +494,12 @@ impl CostModel {
 // ============================================================================
 
 impl CostFunction for CostModel {
+    fn trips(&self, header: FoldHeader) -> u64 {
+        header
+            .known_range()
+            .map_or(self.unknown_trips, KnownRange::len)
+    }
+
     fn node_cost(&self, node: &ENode, _parent: Option<OpKind>) -> usize {
         self.node_op_cost(node)
     }
@@ -597,7 +643,7 @@ mod every_op_is_priceable {
 
 #[cfg(test)]
 mod cost_model_accessors {
-    use super::{CostFunction, CostModel};
+    use super::{CostFunction, CostModel, DEFAULT_UNKNOWN_TRIPS};
     use crate::egraph::{EGraph, ENode};
     use pixelflow_ir::OpKind;
     use pixelflow_ir::arena::{BufferDecl, BufferIdentity};
@@ -769,13 +815,13 @@ mod cost_model_accessors {
         );
     }
 
-    /// A fold bounded by a uniform is priced at the uniform's declared count,
-    /// not at the estimate: the node's own share is the combiner chain over
-    /// the declared 40, and the extractor totals `Σ_{j<u} |X − j|` at
-    /// `fold_cost(fold, 40, − + |·|)`. The uniform bound costs nothing, and no
-    /// rule here gives the fold another form.
+    /// A fold whose range is not known is priced at the estimate. The node's
+    /// own share is the combiner chain over `DEFAULT_UNKNOWN_TRIPS`, and the
+    /// extractor totals `Σ_{j<u} |X − j|` at `fold_cost(fold, 32, − + |·|)`:
+    /// the uniform bound costs nothing, and no rule here gives the fold
+    /// another form.
     #[test]
-    fn a_fold_over_a_uniform_count_is_priced_at_its_declared_count() {
+    fn a_fold_whose_range_is_not_known_is_priced_at_the_estimate() {
         use crate::egraph::extract::extract_dag;
         use crate::egraph::{Vocabulary, insert};
         use pixelflow_ir::ExprArena;
@@ -784,10 +830,9 @@ mod cost_model_accessors {
 
         let binder = Binder::from_slot(0).expect("a live binder");
         let fold = Fold::new(Monoid::SUM, binder);
-        let declared = 40;
         let decl = UniformDecl {
             id: UniformIdentity::mint(),
-            default: declared as f32,
+            default: 40.0,
         };
         let mut a = ExprArena::new();
         let u = a.declare_uniform(decl);
@@ -811,15 +856,31 @@ mod cost_model_accessors {
                 Bound::Value(uniform),
                 class
             )),
-            model.fold_cost(fold, Fold::ESTIMATED_TRIPS, 0),
-            "the node alone cannot see its bound, so its own share is the estimate's"
+            model.fold_cost(fold, DEFAULT_UNKNOWN_TRIPS, 0),
+            "the node's own share is the combiner chain over the estimate"
         );
         let dag = extract_dag(&egraph, class, &model);
         assert_eq!(
             dag.total_cost,
-            model.fold_cost(fold, declared, body_cost),
-            "the settled uniform's declared count prices the fold"
+            model.fold_cost(fold, DEFAULT_UNKNOWN_TRIPS, body_cost)
         );
+    }
+
+    /// The unknown count is the model's pick, not the fold's: a model that
+    /// picks another price moves a value-bounded fold and leaves a known one.
+    #[test]
+    fn a_model_picks_the_trips_of_a_count_it_does_not_know() {
+        use pixelflow_ir::fold::{Binder, Bound, Fold, FoldHeader, Monoid};
+
+        let fold = Fold::new(Monoid::SUM, Binder::from_slot(0).expect("a live binder"));
+        let unknown = FoldHeader::new(fold, Bound::Lit(0), Bound::Value(()));
+        let known = FoldHeader::new(fold, Bound::Lit(0), Bound::Lit(40));
+
+        let model = CostModel::latency_prior();
+        assert_eq!(model.trips(unknown), DEFAULT_UNKNOWN_TRIPS);
+        let picked = model.with_unknown_trips(7);
+        assert_eq!(picked.trips(unknown), 7);
+        assert_eq!(picked.trips(known), 40);
     }
 
     /// The `CostFunction` trait impl for `CostModel` is a thin delegation
