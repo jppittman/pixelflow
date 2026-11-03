@@ -332,7 +332,7 @@ its edge.
   inner bound is the rules' own, and exact.
 - **Pricing.** A known fold's `len` is read off the node. A value-bounded fold whose
   bound's chosen form is an in-domain integer literal is priced at that count — the price
-  of the literal twin `KnownBound` puts in its class — and any other at `ESTIMATED_TRIPS`
+  of the literal twin `KnownBound` puts in its class — and any other at `DEFAULT_UNKNOWN_TRIPS`
   (§4). So pricing reads the bound children's extracted picks: the DP prices a fold only
   after every child class has settled (`extract.rs`'s `Settlement`), and hands the count to
   `fold_cost` and `below` through the fold's literal twin. `below` adds its `Value` bound
@@ -612,7 +612,7 @@ Where each CL stands is tracked in Linear (project *Typed kernel construction*, 
   `BoundArithmetic` at `over_values`, L4 in both variance functions, L7, `KnownBound` (L8), the rules
   gated on known ranges, `FactorFold` factoring under a value bound (decision 5), the price of a
   value-bounded fold in `fold_cost` and `below` (its bound's chosen literal through the fold's
-  literal twin, else `ESTIMATED_TRIPS`), and `below`'s bound operands. Codegen refuses a `Value`
+  literal twin, else `DEFAULT_UNKNOWN_TRIPS`), and `below`'s bound operands. Codegen refuses a `Value`
   bound by name. Gate:
   byte_probe empty; pins for L2 (`over_values(5, 3)` is the identity, `Kernel::over(_, 5..3, _)`
   still refused), L3 (X, Y, own binder and an X-varying `Ref` refused; enclosing binder

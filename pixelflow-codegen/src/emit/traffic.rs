@@ -22,10 +22,10 @@
 use super::asm::Assembled;
 use super::regalloc::{Allocated, Origin};
 use super::{FileId, IsaBackend};
+use crate::program::DEFAULT_UNKNOWN_TRIPS;
 use crate::program::Scope;
 use alloc::vec::Vec;
 use core::fmt;
-use pixelflow_ir::fold::Fold;
 
 /// Emitted traffic within one scope of the nest.
 ///
@@ -72,7 +72,7 @@ impl ScopeTraffic {
 ///
 /// A fold whose bounds are literals runs a number of times the program states.
 /// One whose bound is a value runs a number the call decides, which nothing
-/// here knows: the static model prices it at [`Fold::ESTIMATED_TRIPS`], and
+/// here knows: the static model prices it at [`DEFAULT_UNKNOWN_TRIPS`], and
 /// that price is carried as an estimate, so that no measurement can read it as
 /// a count. A loop nested in an estimate is an estimate too, for it runs that
 /// many times that many times, and so is a nest of literals whose product
@@ -96,7 +96,7 @@ impl Trips {
     pub(in crate::emit) fn of(counted: Option<u64>) -> Self {
         match counted {
             Some(trips) => Self::Known(trips),
-            None => Self::Estimated(Fold::ESTIMATED_TRIPS),
+            None => Self::Estimated(DEFAULT_UNKNOWN_TRIPS),
         }
     }
 
