@@ -65,8 +65,7 @@ value](language/2026-10-20-a-bound-is-a-value.md)), each fixed before the
 lattice is traversed. Every program's cost is a closed-form function of values
 known before the traversal, computable without running it; nothing evaluates it
 per call, and the static model prices a fold whose range is not a known
-constant at its uniform's declared count, else at an estimate
-(`Fold::ESTIMATED_TRIPS`). "Estimatable by the cost
+constant at an estimate (`DEFAULT_UNKNOWN_TRIPS`). "Estimatable by the cost
 model", "a valid shader" and "`bake` terminates" are one property. Total is not
 cheap: totality gives a number, and a value-bounded program is priced at the
 estimate, never reported over budget.
@@ -424,9 +423,12 @@ dimension and never a reason to emit a worse kernel.
    whole extractions, never as a pass. The first half, "an additive cost
    makes `extract_dag` an argmin", is **violated**: extraction runs a tree
    DP and a shared-DAG DP (#1116) and keeps the cheaper by true DAG cost,
-   but both choose greedily bottom-up, so neither is an argmin and no
-   sharing is charged for. Said so in `extract.rs`; nothing may assume
-   otherwise.
+   but both choose greedily bottom-up, so neither is an argmin. Sharing is
+   priced (each distinct node once), with a fold body as a scope: paid `trips`
+   times, sharing nothing with the code around it, no hoisting credit, so the
+   DAG price of a term without sharing equals its tree price. An `If`'s arms are
+   paid in full in the DAG price (the tree price averages them). Said so in
+   `extract.rs`; nothing may assume otherwise.
 
 Because rules are equalities of meaning, the optimizer may produce a
 different answer than the unoptimized term wherever no value was promised
