@@ -33,54 +33,26 @@ use crate::library::{self, Terms};
 use crate::lit::Lit;
 use crate::shift::ShiftCount;
 
-/// One bit per placeholder index, set while that index is claimed by a binder
-/// under construction. Claims are taken and released in any order, so this is a
-/// set — not a depth counter. A counter would be correct only if every release
-/// were the most recent claim, which holds within one thread's nesting and
-/// fails the moment two threads build binders at once: thread A releases ticket
-/// 0 while B still holds 1, and the next claim hands out 1 again.
-static PLACEHOLDERS_IN_USE: AtomicU64 = AtomicU64::new(0);
+/// The next construction-scope identity. These identities never enter `Var`'s
+/// finite namespace and are never reissued, so a value kept past its closure
+/// cannot become the index of a later fold.
+static NEXT_PLACEHOLDER: AtomicU64 = AtomicU64::new(Placeholder::COUNT as u64);
 
-/// A [`Placeholder`] claimed for a binder under construction, released on
-/// drop.
-///
-/// The placeholder must be unique among binders that are *simultaneously*
-/// being built (see [`Placeholder`]), and kernels are built on many threads
-/// at once, so the claim is taken from a set every thread shares. It is
-/// released on drop, so the space is bounded by how many binders are open at
-/// this instant, not by how many kernels have ever been built: the
-/// [`Placeholder::COUNT`] placeholders admit that many binders under
-/// construction at once, however they nest across threads, and exhaustion
-/// panics rather than aliasing an index.
+/// The owned identity of one binder construction scope.
 struct BinderScope {
-    /// The bit of [`PLACEHOLDERS_IN_USE`] this claim holds.
-    bit: u32,
     placeholder: Placeholder,
 }
 
 impl BinderScope {
     fn enter() -> Self {
-        let mut in_use = PLACEHOLDERS_IN_USE.load(Ordering::Relaxed);
-        loop {
-            let bit = (!in_use).trailing_zeros();
-            let placeholder = Placeholder::nth(bit as usize)
-                .unwrap_or_else(|| panic!("too many kernel binders under construction at once"));
-            match PLACEHOLDERS_IN_USE.compare_exchange_weak(
-                in_use,
-                in_use | (1 << bit),
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Self { bit, placeholder },
-                Err(observed) => in_use = observed,
-            }
+        let identity = NEXT_PLACEHOLDER
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .unwrap_or_else(|_| panic!("kernel fold-index identity space exhausted"));
+        Self {
+            placeholder: Placeholder::from_identity(identity),
         }
-    }
-}
-
-impl Drop for BinderScope {
-    fn drop(&mut self) {
-        PLACEHOLDERS_IN_USE.fetch_and(!(1 << self.bit), Ordering::Relaxed);
     }
 }
 
@@ -780,11 +752,10 @@ impl Kernel {
     /// The closure receives the bound index as a `Kernel` of its own, so Rust's
     /// scoping is the binder's scoping for what the closure returns, and a
     /// repeated index in nested folds is a genuine contraction rather than an
-    /// accident. It is not a guarantee that the index stays there: a closure
-    /// can keep a clone of it, and a later fold that reclaims its placeholder
-    /// captures it, which no check sees (Linear JP-8). An index that
-    /// has escaped and is not captured is open, and `ExprArena::free_index`
-    /// says so. `range` is the literal spelling of a known
+    /// accident. Each invocation owns a never-reissued index identity. A clone
+    /// kept past the closure therefore remains open instead of being captured
+    /// by a later fold, and APIs requiring a closed kernel refuse it.
+    /// `range` is the literal spelling of a known
     /// range; a bound that is a value is [`Kernel::over_values`]'s. Either way
     /// no bound reads a coordinate, which is what keeps
     /// the language total and its cost closed-form — `|D|·cost(body) +
@@ -826,7 +797,7 @@ impl Kernel {
         let scope = BinderScope::enter();
         let index = {
             let mut b = Builder::new();
-            let r = b.push_var(scope.placeholder.var());
+            let r = b.push_placeholder(scope.placeholder.identity());
             Self::wrap(b.finish(&[r]), Environment::new(), BTreeMap::new())
         };
         let body = body(&index);
@@ -917,7 +888,7 @@ impl Kernel {
         let scope = BinderScope::enter();
         let index = {
             let mut b = Builder::new();
-            let r = b.push_var(scope.placeholder.var());
+            let r = b.push_placeholder(scope.placeholder.identity());
             Self::wrap(b.finish(&[r]), Environment::new(), BTreeMap::new())
         };
         let body = body(&index);
@@ -953,7 +924,7 @@ impl Kernel {
     /// a uniform, an index — and nothing computed (§1.4, until T6).
     fn user_bound(end: BoundEnd, bound: &Kernel) -> Result<(), BoundRefusal> {
         match *bound.root() {
-            ExprData::Var(_) | ExprData::Uniform(_) => Ok(()),
+            ExprData::Var(_) | ExprData::Placeholder(_) | ExprData::Uniform(_) => Ok(()),
             ExprData::Const(Lit::Mask(_)) => Err(BoundRefusal::BoundSort { end }),
             ExprData::Const(literal @ Lit::Real(real)) => Fold::count(literal)
                 .map(|_| ())
@@ -1912,7 +1883,9 @@ mod tests {
     #[should_panic(expected = "an index no fold in it binds")]
     fn an_argument_holding_a_placeholder_is_refused() {
         let placeholder = crate::fold::Placeholder::nth(0).expect("a placeholder");
-        let _refused = ExprArena::new().admit(&open_at(placeholder.var()));
+        let mut arena = ExprArena::new();
+        let root = arena.push_placeholder(placeholder.identity());
+        let _refused = ExprArena::new().admit(&Kernel::from_parts(arena, root));
     }
 
     /// And so would a binder no fold in it binds — a fold's body cut from
@@ -2062,6 +2035,30 @@ mod tests {
             crate::variance::compute_arena_variance(arena)[root.0 as usize],
             crate::Variance::X
         );
+    }
+
+    /// Nested folds may read an enclosing index, and the resulting kernel is
+    /// closed enough to name through the public API.
+    #[test]
+    fn nested_fold_capture_is_lawful() {
+        let nested = Kernel::sum_over(2, |i| Kernel::sum_over(3, |j| i.add(j)));
+        let _named = nested.by_ref();
+    }
+
+    /// Keeping an index past its fold does not let a later fold acquire that
+    /// index. The later result remains open and is refused where the public API
+    /// requires a closed kernel.
+    #[test]
+    #[should_panic(expected = "an index no fold in it binds")]
+    fn a_later_fold_refuses_an_escaped_index() {
+        let mut escaped = None;
+        let _first = Kernel::sum_over(2, |i| {
+            escaped = Some(i.clone());
+            i.clone()
+        });
+        let escaped = escaped.expect("the first fold supplies its index");
+        let captured = Kernel::sum_over(3, |j| j.add(&escaped));
+        let _refused = captured.by_ref();
     }
 
     /// Each end is read for itself: a uniform lower bound beside a constant
