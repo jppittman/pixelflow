@@ -20,6 +20,9 @@ impl Ir for ExprArena {
     fn project(&self, r: ExprId) -> Shape<'_, ExprId> {
         match self.node(r) {
             ExprNode::Var(i) => Shape::Var(i),
+            ExprNode::Placeholder(identity) => {
+                panic!("ExprArena::project: fold index scope {identity} escaped without its binder")
+            }
             ExprNode::Const(v) => Shape::Const(v),
             ExprNode::Param(i) => Shape::Param(i),
             ExprNode::Buffer(b) => Shape::Buffer(*self.buffer_decl(b)),

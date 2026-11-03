@@ -479,6 +479,9 @@ fn hash_cons(arena: &ExprArena, root: ExprId) -> (ExprArena, ExprId) {
             d
         };
         let (key, build): (Key, Build) = match arena.node(id) {
+            ExprNode::Placeholder(identity) => {
+                panic!("hash_cons: fold index scope {identity} escaped without its binder")
+            }
             ExprNode::Var(i) => (Key::Var(i), Box::new(move |a| a.push_var(i))),
             ExprNode::Const(v) => (Key::Const(v), Box::new(move |a| a.push_lit(v))),
             ExprNode::Param(i) => (Key::Param(i), Box::new(move |a| a.push_param(i))),
