@@ -1043,7 +1043,7 @@ impl Selection {
             variance.push(node_variance);
             owns.push(own);
             trips.push(match form {
-                ENode::Reduce { header, .. } => Some(header.priced_trips()),
+                ENode::Reduce { header, .. } => Some(costs.trips(*header)),
                 _ => None,
             });
         }
@@ -2479,8 +2479,8 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> SharedPricer<'_, '_, C, T, 
             }
         }
         let body_price = self.sets.total[entry(body).live] as u64;
-        let work =
-            usize::try_from(body_price.saturating_mul(header.priced_trips())).unwrap_or(usize::MAX);
+        let work = usize::try_from(body_price.saturating_mul(self.dp.costs.trips(*header)))
+            .unwrap_or(usize::MAX);
         Some((work, open))
     }
 }
