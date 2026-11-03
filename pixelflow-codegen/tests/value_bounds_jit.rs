@@ -543,16 +543,56 @@ fn a_value_lo_of_negative_zero_starts_the_fold_at_positive_zero() {
     }
 }
 
+/// Where an inner fold's range meets its enclosing fold's index `i`.
+#[derive(Clone, Copy)]
+enum InnerRange {
+    /// `[0, i)`.
+    BelowTheOuterIndex,
+    /// `[i, hi)`.
+    FromTheOuterIndexTo(u64),
+}
+
+/// `Σ_{i ∈ [0, outer_hi)} Σ_{j ∈ inner} (X + j)`, built on the arena: the
+/// public builder refuses an enclosing index as a bound, since a user fold is
+/// rectangular (§4 of docs/language/2026-10-25-kernel-staging-and-rectangular-folds.md),
+/// while the IR, and so codegen, still denotes one.
+fn over_the_outer_index(outer_hi: Bound<Kernel>, inner: InnerRange) -> Kernel {
+    let (inner_binder, outer_binder) = (
+        Binder::from_slot(0).expect("slot 0 exists"),
+        Binder::from_slot(1).expect("slot 1 exists"),
+    );
+    let mut a = ExprArena::new();
+    let outer_hi = match outer_hi {
+        Bound::Lit(n) => Bound::Lit(n),
+        Bound::Value(k) => {
+            let (arena, root) = k.parts();
+            Bound::Value(a.splice(arena, root))
+        }
+    };
+    let x = a.push_var(0);
+    let i = a.push_var(outer_binder.var());
+    let j = a.push_var(inner_binder.var());
+    let body = a.push_binary(OpKind::Add, x, j);
+    let (lo, hi) = match inner {
+        InnerRange::BelowTheOuterIndex => (Bound::Lit(0), Bound::Value(i)),
+        InnerRange::FromTheOuterIndexTo(hi) => (Bound::Value(i), Bound::Lit(hi)),
+    };
+    let inner_fold = a.push_reduce(Fold::new(Monoid::SUM, inner_binder), lo, hi, body);
+    let root = a.push_reduce(
+        Fold::new(Monoid::SUM, outer_binder),
+        Bound::Lit(0),
+        outer_hi,
+        inner_fold,
+    );
+    Kernel::from_parts(a, root)
+}
+
 /// `Σ_{i<8} Σ_{j<i} (X + j)`: the inner `hi` is the outer fold's index, so
 /// the guard runs once per outer trip. As written the inner bound stays a
 /// value; optimized, the outer fold may peel and make it known (L8).
 #[test]
 fn a_triangular_sum_runs_each_inner_fold_to_its_outer_index() {
-    let build = || {
-        Kernel::sum_over(8, |i| {
-            Kernel::over_values(Monoid::SUM, &zero(), i, |j| Kernel::x().add(j))
-        })
-    };
+    let build = || over_the_outer_index(Bound::Lit(8), InnerRange::BelowTheOuterIndex);
     let planes = both(SHAPE, build);
     assert_plane(SHAPE, planes, "Σ_i Σ_{j<i} (X + j)", |x, _| {
         fold_of(Monoid::SUM, 0, 8, |i| {
@@ -567,9 +607,7 @@ fn a_triangular_sum_runs_each_inner_fold_to_its_outer_index() {
 fn a_triangular_sum_under_a_count() {
     for n in [0.0f32, 5.0, f32::NAN, f32::INFINITY, TOP + 2.0] {
         let planes = both(SHAPE, move || {
-            Kernel::over_values(Monoid::SUM, &zero(), &count(n), |i| {
-                Kernel::over_values(Monoid::SUM, &zero(), i, |j| Kernel::x().add(j))
-            })
+            over_the_outer_index(Bound::Value(count(n)), InnerRange::BelowTheOuterIndex)
         });
         assert_plane(
             SHAPE,
@@ -668,13 +706,7 @@ fn a_literal_lo_beside_a_value_hi() {
 /// the outer fold starts the inner one at that trip's index.
 #[test]
 fn an_inner_fold_starting_at_the_outer_index() {
-    let build = || {
-        Kernel::sum_over(8, |i| {
-            Kernel::over_values(Monoid::SUM, i, &Kernel::constant(8.0), |j| {
-                Kernel::x().add(j)
-            })
-        })
-    };
+    let build = || over_the_outer_index(Bound::Lit(8), InnerRange::FromTheOuterIndexTo(8));
     let planes = both(SHAPE, build);
     assert_plane(SHAPE, planes, "Σ_i Σ_{j∈[i,8)} (X + j)", |x, _| {
         fold_of(Monoid::SUM, 0, 8, |i| {

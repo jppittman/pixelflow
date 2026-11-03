@@ -19,6 +19,9 @@ use super::analyze::{
 };
 use super::consts::{RangeScope, bound_names, folds_nested_too_deep, range_bounds};
 
+/// The ruling that a user fold's iteration space is rectangular.
+const RECTANGULAR_FOLDS: &str = "docs/language/2026-10-25-kernel-staging-and-rectangular-folds.md";
+
 /// The binding class of a symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SymbolKind {
@@ -313,8 +316,9 @@ impl<'a> FnAnalyzer<'a> {
         ))
     }
 
-    /// The bounds a fold's range may name: the block's `usize` consts,
-    /// enclosing indices and entry count parameters.
+    /// The bounds a fold's range may name: the block's `usize` consts and
+    /// entry count parameters. An enclosing fold's index is refused before
+    /// this scope is asked, by [`Self::type_of_fold`].
     fn range_scope(&self) -> RangeScope<'a> {
         RangeScope {
             consts: self.consts,
@@ -323,7 +327,8 @@ impl<'a> FnAnalyzer<'a> {
 
     /// `(a..b).map(|i| e).sum()` and its siblings: the bounds are constant
     /// and run forwards, and the body is a term of the fold's monoid, typed
-    /// in a scope of its own where the closure's parameter is the index. The
+    /// in a scope of its own where the closure's parameter is the index. No
+    /// bound is an enclosing fold's index: a user fold is rectangular. The
     /// body sees every enclosing binding, an enclosing fold's index among
     /// them, as a Rust closure does.
     fn type_of_fold(&mut self, fold: &FoldExpr) -> syn::Result<Ty> {
@@ -337,6 +342,18 @@ impl<'a> FnAnalyzer<'a> {
                     format!("`{name}` is not in scope as a range bound"),
                 ));
             };
+            if symbol.kind == SymbolKind::Index {
+                return Err(syn::Error::new(
+                    name.span(),
+                    format!(
+                        "`{name}` is a fold index used as a range bound\n\
+                         \n\
+                         note: a user fold's bound is a constant or an unchanged uniform count; \
+                         an enclosing index would make the iteration space non-rectangular (§4 of \
+                         {RECTANGULAR_FOLDS})"
+                    ),
+                ));
+            }
             if symbol.ty != Ty::Usize {
                 return Err(syn::Error::new(
                     name.span(),
