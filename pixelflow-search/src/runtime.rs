@@ -53,8 +53,12 @@
 //!    variance names the coordinates and nothing else, which the unit walk
 //!    asserts, so no binder of the context reaches into it. Nothing before
 //!    the link substitutes a coordinate — a reference under a warp is an
-//!    `Apply`, which is expanded before the units are walked and so is never
-//!    a unit; saturation substitutes binders only, and the lattice's
+//!    `Apply`, never a unit itself: its composite is named and held as a
+//!    leaf when the warp is closed over the coordinates
+//!    (`passes::lift_applies`), and linked to the `Apply` over its referent's
+//!    one optimized body; any other `Apply` is expanded before the units are
+//!    walked. Either way the substitution happens at the link, after the
+//!    boundary; saturation substitutes binders only, and the lattice's
 //!    folds are built by legalization, after the link. A fold around a unit
 //!    picks its binder slot without seeing inside, so after the link an outer
 //!    fold and one inside the unit may share a slot; the inner one rebinds
@@ -258,6 +262,11 @@ struct Program<'a> {
     root: ExprId,
     /// Every unit reachable from the term, through units too, by key.
     units: BTreeMap<KernelKey, Unit>,
+    /// The units that are an `Apply` held as a leaf: each stands, after
+    /// extraction, for the `Apply` over its referent's one optimized body
+    /// (`passes::lift_applies`), by the leaf's key. They are in `units` for
+    /// their variance and name, and are not optimized themselves.
+    applied: BTreeMap<KernelKey, (ExprArena, ExprId)>,
 }
 
 /// One unit: its body, itself with the references a `Dwrt` reaches linked,
@@ -291,14 +300,16 @@ impl<'a> Program<'a> {
     /// it leaves unbound, the test `Kernel::by_ref` makes.
     fn of(arena: &'a ExprArena, root: ExprId) -> Self {
         let mut units = BTreeMap::new();
+        let mut applied = BTreeMap::new();
         if !holds_a_ref(arena) {
             return Self {
                 outer: Cow::Borrowed(arena),
                 root,
                 units,
+                applied,
             };
         }
-        let (outer, root) = with_differentiated_refs_linked(arena, root);
+        let (outer, root) = with_differentiated_refs_linked(arena, root, &mut applied);
         let mut pending = refs_reachable(&outer, root);
         while let Some(key) = pending.pop() {
             if units.contains_key(&key) {
@@ -311,7 +322,7 @@ impl<'a> Program<'a> {
                 )
             });
             let (body, body_root) = referent.parts();
-            let (body, body_root) = with_differentiated_refs_linked(body, body_root);
+            let (body, body_root) = with_differentiated_refs_linked(body, body_root, &mut applied);
             let variance =
                 pixelflow_ir::variance::compute_arena_variance(&body)[body_root.0 as usize];
             assert!(
@@ -330,6 +341,12 @@ impl<'a> Program<'a> {
                 );
             }
             pending.extend(refs_reachable(&body, body_root));
+            if let Some((apply, apply_root)) = applied.get(&key) {
+                // The composite is only this leaf's name and variance; what
+                // it links to is the referent, optimized once, so the
+                // referent is a unit too.
+                pending.extend(refs_reachable(apply, *apply_root));
+            }
             units.insert(
                 key,
                 Unit {
@@ -339,7 +356,12 @@ impl<'a> Program<'a> {
                 },
             );
         }
-        Self { outer, root, units }
+        Self {
+            outer,
+            root,
+            units,
+            applied,
+        }
     }
 
     /// `L_s`: every unit and the term around them optimized by itself, then
@@ -364,8 +386,13 @@ impl<'a> Program<'a> {
 
         // The term around the units first, then each unit, in key order: the
         // order results land in, whatever order the workers finish in.
+        let optimized_units: Vec<(&KernelKey, &Unit)> = self
+            .units
+            .iter()
+            .filter(|(key, _)| !self.applied.contains_key(key))
+            .collect();
         let jobs: Vec<Job<'_>> = core::iter::once(outer)
-            .chain(self.units.values().map(|u| Job {
+            .chain(optimized_units.iter().map(|(_, u)| Job {
                 arena: &u.body,
                 root: u.root,
                 leaves: &leaves,
@@ -381,8 +408,18 @@ impl<'a> Program<'a> {
         let (mut program, program_root) = optimized
             .next()
             .expect("the term around the units is the first job");
-        let bodies: BTreeMap<KernelKey, (ExprArena, ExprId)> =
-            self.units.keys().copied().zip(optimized).collect();
+        let mut bodies: BTreeMap<KernelKey, (ExprArena, ExprId)> = optimized_units
+            .iter()
+            .map(|(key, _)| **key)
+            .zip(optimized)
+            .collect();
+        // A held `Apply` links to the `Apply` itself, which `link` resolves
+        // over the referent's one optimized body.
+        bodies.extend(
+            self.applied
+                .iter()
+                .map(|(leaf, (apply, root))| (*leaf, (apply.clone(), *root))),
+        );
 
         let linked_root = pixelflow_ir::passes::link(&mut program, program_root, &bodies);
         // `lower_dwrt` last, over the linked program, and that is the whole
@@ -411,7 +448,7 @@ fn refs_reachable(arena: &ExprArena, root: ExprId) -> Vec<KernelKey> {
         if core::mem::replace(&mut seen[id.0 as usize], true) {
             continue;
         }
-        if let ExprNode::Ref(key) = arena.node(id) {
+        if let ExprNode::Ref(key) | ExprNode::Apply(key, ..) = arena.node(id) {
             keys.push(key);
         }
         stack.extend(arena.children(id));
@@ -421,11 +458,12 @@ fn refs_reachable(arena: &ExprArena, root: ExprId) -> Vec<KernelKey> {
 
 /// `arena` with every reference a `Dwrt` reaches linked as written, from the
 /// store: a reference under a derivative is not a unit (module docs).
-fn with_differentiated_refs_linked(
-    arena: &ExprArena,
+fn with_differentiated_refs_linked<'a>(
+    arena: &'a ExprArena,
     root: ExprId,
-) -> (Cow<'_, ExprArena>, ExprId) {
-    let (arena, root) = with_applies_expanded(arena, root);
+    applied: &mut BTreeMap<KernelKey, (ExprArena, ExprId)>,
+) -> (Cow<'a, ExprArena>, ExprId) {
+    let (arena, root) = with_applies_held(arena, root, applied);
     let differentiated = differentiated_refs(&arena, root);
     if differentiated.is_empty() {
         return (arena, root);
@@ -444,21 +482,30 @@ fn with_differentiated_refs_linked(
     (Cow::Owned(linked), linked_root)
 }
 
-/// `arena` with every `Apply` expanded: a name read at a warp is not a unit.
-/// A unit is closed and read at its own coordinates, and the substitution an
-/// `Apply` stands for cannot cross the boundary a unit is optimized behind
-/// (Law U, step 2), so it is inlined — which is what `Kernel::at` did at
-/// construction before the choice was deferred to here
-/// (docs/language/2026-09-09-composition-is-linking.md §8). Borrowed when
-/// there is nothing to expand.
-fn with_applies_expanded(arena: &ExprArena, root: ExprId) -> (Cow<'_, ExprArena>, ExprId) {
+/// `arena` with every `Apply` held as a unit where it can be, expanded where
+/// it cannot. A name read at a warp is not itself a unit — a unit is closed
+/// and read at its own coordinates, and the substitution an `Apply` stands
+/// for cannot cross the boundary a unit is optimized behind (Law U, step 2) —
+/// but the composite is closed when its warp is, so it is named and held as a
+/// leaf (`passes::lift_applies`), and links after extraction to the `Apply`
+/// over its referent's one optimized body. What cannot be lifted is inlined,
+/// which is what `Kernel::at` did at construction before the choice was
+/// deferred to here (docs/language/2026-09-09-composition-is-linking.md §8,
+/// §9.2). Borrowed when there is nothing to hold or expand.
+fn with_applies_held<'a>(
+    arena: &'a ExprArena,
+    root: ExprId,
+    applied: &mut BTreeMap<KernelKey, (ExprArena, ExprId)>,
+) -> (Cow<'a, ExprArena>, ExprId) {
     let applies = arena.nodes().any(|(_, n)| matches!(n, ExprNode::Apply(..)));
     if !applies {
         return (Cow::Borrowed(arena), root);
     }
-    let mut expanded = arena.clone();
-    let expanded_root = pixelflow_ir::passes::expand_applies(&mut expanded, root);
-    (Cow::Owned(expanded), expanded_root)
+    let mut held = arena.clone();
+    let (held_root, lifted) = pixelflow_ir::passes::lift_applies(&mut held, root);
+    applied.extend(lifted.into_iter().map(|l| (l.leaf, l.apply)));
+    let expanded_root = pixelflow_ir::passes::expand_applies(&mut held, held_root);
+    (Cow::Owned(held), expanded_root)
 }
 
 /// The keys of the references reachable from the operand of a `Dwrt`
