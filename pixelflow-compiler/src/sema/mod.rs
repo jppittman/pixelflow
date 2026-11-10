@@ -25,8 +25,9 @@
 //!    read by field, and never computed (Phase D, D7).
 //! 4. **Calls**: a helper is called at its arity with arguments of its
 //!    parameters' types; an entry is not callable; recursion is refused.
-//! 5. **Folds**: bounds are known counts, enclosing fold
-//!    indices or entry count parameters ([`range_bounds`]); known bounds run
+//! 5. **Folds**: bounds are known counts or unchanged entry count
+//!    parameters ([`range_bounds`]) — never an enclosing fold's index, so a
+//!    user fold is rectangular; known bounds run
 //!    forwards, while dynamic order is guarded by the IR. The body is a term of its monoid, an `f32` or
 //!    a `bool`, in a scope where the closure's parameter is the index.
 //! 6. **Binding times** (plan §1.4): entry count parameters are per-call
