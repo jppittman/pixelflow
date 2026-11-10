@@ -1020,15 +1020,14 @@ impl Selection {
             // the fold over them, as the settlement priced it: the operands
             // are the classes' settled picks, so the claim and the price read
             // the same literals.
-            let twin =
-                node.literal_twin(|class| self.node(egraph, pick_of(class)).priced_literal());
+            let twin = node.literal_twin(|class| self.node(egraph, pick_of(class)).literal());
             let form = twin.as_ref().unwrap_or(node);
             let own = weighted_own(costs, form, shape.evals(node_variance));
             // Saturating throughout: a tree cost is exponential in the sharing
             // it refuses to price, so it reaches the ceiling on real inputs,
             // and a fold whose monoid has no combiner is priced
             // `usize::MAX / 4` (`CostModel::node_op_cost`).
-            let below = below(form, operands.iter().map(|&operand| tree[operand]));
+            let below = below(costs, form, operands.iter().map(|&operand| tree[operand]));
             tree.push(own.saturating_add(below));
             variance.push(node_variance);
             dag = dag.saturating_add(own);
@@ -1677,8 +1676,7 @@ fn weighted_own<C: CostFunction>(costs: &C, node: &ENode, weight: u64) -> usize 
 /// e-class, so after saturation one slot carries folds of many different
 /// lengths over one shared body and no per-slot number is right for it.
 ///
-/// The trips are the node's
-/// ([`FoldHeader::priced_trips`](pixelflow_ir::FoldHeader::priced_trips)), and
+/// The trips are the cost function's ([`CostFunction::trips`]), and
 /// a price site hands `below` a fold's priced form ([`ENode::literal_twin`]), so a
 /// fold whose value bounds were chosen as literals is multiplied by their
 /// count. Its operands are still those of the fold as written: the body, then
@@ -1694,11 +1692,15 @@ fn weighted_own<C: CostFunction>(costs: &C, node: &ENode, weight: u64) -> usize 
 /// extraction away from `If` toward computing both arms. The select itself
 /// is the node's own cost. This can price an `If` below one of its arms, so
 /// the settlement is no longer exact at an `If` — see [`Settling`].
-fn below(node: &ENode, mut operand: impl Iterator<Item = usize>) -> usize {
+fn below(
+    costs: &impl CostFunction,
+    node: &ENode,
+    mut operand: impl Iterator<Item = usize>,
+) -> usize {
     match node {
         ENode::Reduce { header, .. } => {
             let body = operand.next().expect("a fold has a body");
-            let body = usize::try_from((body as u64).saturating_mul(header.priced_trips()))
+            let body = usize::try_from((body as u64).saturating_mul(costs.trips(*header)))
                 .unwrap_or(usize::MAX);
             // Each value bound is evaluated once per evaluation of the fold:
             // `+ cost(lo) + cost(hi)` (docs/language/2026-10-20-a-bound-is-a-value.md
@@ -2138,7 +2140,7 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for TreePricer<'_,
                         .expect("an operand's class is in its candidate's row");
                     self.cost[child.live].expect("a priced candidate's children are settled")
                 });
-                own.saturating_add(below(form, settled))
+                own.saturating_add(below(self.dp.costs, form, settled))
             }
         };
         self.dp
@@ -2158,7 +2160,7 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for TreePricer<'_,
             .problem
             .egraph()
             .node(self.problem.graph().node_id(candidate));
-        self.chosen[candidate.class().index()] = picked.priced_literal();
+        self.chosen[candidate.class().index()] = picked.literal();
         self.cost[candidate.live()] = Some(priced.cost);
         self.var[candidate.class().index()] = priced.var;
         self.dp.rec.settled(candidate.class(), candidate.idx());
@@ -2391,7 +2393,7 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> Settling for SharedPricer<'
             .problem
             .egraph()
             .node(self.problem.graph().node_id(candidate));
-        self.chosen[candidate.class().index()] = picked.priced_literal();
+        self.chosen[candidate.class().index()] = picked.literal();
         // Rebuild the winner's union rather than carrying one per class in
         // flight: the driver prices candidates for many unsettled classes
         // before any of them settles, so a stored winner set would be a
@@ -2541,7 +2543,7 @@ mod tests {
     use super::*;
 
     use crate::egraph::and_or::AndOrGraph;
-    use crate::egraph::cost::CostModel;
+    use crate::egraph::cost::{CostModel, DEFAULT_UNKNOWN_TRIPS};
     use crate::egraph::shift::ShiftDirection;
     use pixelflow_ir::OpKind;
     use pixelflow_ir::ShiftCount;
@@ -3105,7 +3107,7 @@ mod tests {
 
     /// A bound whose chosen form names no count leaves the fold at the
     /// estimate: a fraction, a count past the domain and a mask each price the
-    /// fold as `Fold::ESTIMATED_TRIPS` trips of its body, as a bound that is no
+    /// fold as `DEFAULT_UNKNOWN_TRIPS` trips of its body, as a bound that is no
     /// literal at all does.
     #[test]
     fn a_bound_that_picks_no_count_is_priced_at_the_estimate() {
@@ -3121,10 +3123,10 @@ mod tests {
         let estimated = ENode::reduce(
             fold,
             Bound::Lit(0),
-            Bound::Lit(Fold::ESTIMATED_TRIPS),
+            Bound::Lit(DEFAULT_UNKNOWN_TRIPS),
             EClassId::from_index(0),
         );
-        let whole = costs.node_op_cost(&estimated) + Fold::ESTIMATED_TRIPS as usize * body_cost;
+        let whole = costs.node_op_cost(&estimated) + DEFAULT_UNKNOWN_TRIPS as usize * body_cost;
 
         for bound in [Lit::Real(2.5), Lit::Real(16_777_218.0), Lit::Mask(true)] {
             let mut egraph = EGraph::new();
