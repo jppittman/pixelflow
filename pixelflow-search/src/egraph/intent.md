@@ -58,7 +58,7 @@ under a cost. `Optimizer::run` is its one entry; the five laws of §8 are its co
   priced, but `extract_dag_over` also runs `shared_dag_dp_pass` and keeps the cheaper by `dag_cost`. Both arms
   are greedy (JP-15, E5: a richer graph can extract a worse term). A fold body is a priced *scope* in the DAG
   column and the shared DP alike (paid `trips` times, nothing shared across its boundary, no hoisting credit);
-  an `If`'s arms are paid in full in the DAG column while the tree column averages them; a fold over a known range ties its unrolling and insertion
+  an `If` hands up its mask's set and what both arms read, and pays half of what only one arm reads (judged against its own operands, so a node an outer parent also reads is overcharged, never undercharged; JP-112); a fold over a known range ties its unrolling and insertion
   order decides (E6); `Reranker` has no implementation outside tests.
 - A value bound's pick is unconstrained: a class read as a bound can settle on a member that reads a coordinate,
   and `ExprArena::push_reduce` refuses it by name; pinned in `fold_rules.rs`, left loud until a kernel hits it.
