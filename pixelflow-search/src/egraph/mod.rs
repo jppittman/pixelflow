@@ -74,7 +74,7 @@ pub use candidate::{
     CandidateFeatures, CandidateKey, ClassContentKey, Firing,
     REGISTERED_PRIMARY_BUDGET_APPLICATIONS,
 };
-pub use cost::{CostFunction, CostModel};
+pub use cost::{CostFunction, CostModel, DEFAULT_UNKNOWN_TRIPS};
 pub use derivative::{ChainRule, derivative_rules};
 pub use extract::{
     ChoiceCost, ClaimAudit, CostScale, ExtractedDAG, Extraction, ExtractionObjective,

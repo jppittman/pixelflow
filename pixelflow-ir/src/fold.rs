@@ -562,18 +562,6 @@ impl Fold {
     /// and no width lifts it.
     pub const EXACT_BOUND: u64 = 1 << f32::MANTISSA_DIGITS;
 
-    /// The trips a fold is priced at when its range is not known: 32.
-    ///
-    /// LLVM's `BranchProbabilityInfo` weights a loop's back edge 124 against
-    /// its exit's 4 (`LBH_TAKEN_WEIGHT`, `LBH_NONTAKEN_WEIGHT`), a back-edge
-    /// probability of 31/32, so a loop it knows nothing about runs
-    /// `1 / (1 − 31/32) = 32` times. Policy, not a measurement of these
-    /// kernels: the static model prices a fold before its bound has a value
-    /// (docs/language/2026-10-20-a-bound-is-a-value.md §1.5), and a ranking at
-    /// 32 may differ from one at the real count (§4). Nested folds whose
-    /// ranges are not known multiply, as their trips do.
-    pub const ESTIMATED_TRIPS: u64 = 32;
-
     /// The fold of `monoid` binding `binder`, visiting every index its bounds
     /// name — [`Fold::strided`] with a stride of `1`.
     #[must_use]
@@ -912,17 +900,6 @@ impl FoldHeader {
     #[must_use]
     pub fn known_range(self) -> Option<KnownRange> {
         KnownRange::of(self.fold(), self.lo(), self.hi())
-    }
-
-    /// The trips this fold is priced at by a reader holding only its header:
-    /// its known range's length, or [`Fold::ESTIMATED_TRIPS`] when a bound is a
-    /// value. The extractor prices a fold whose value bounds were chosen as
-    /// literals through the fold over those literals, whose header this is
-    /// (`pixelflow-search`'s `ENode::literal_twin`).
-    #[must_use]
-    pub fn priced_trips(self) -> u64 {
-        self.known_range()
-            .map_or(Fold::ESTIMATED_TRIPS, KnownRange::len)
     }
 
     /// How many children a node with this header has: its body, and one per
@@ -1996,9 +1973,8 @@ mod tests {
     }
 
     /// A fold over an arithmetic algebra takes a bound that is a value at
-    /// stride one: its header holds the mark of a child, knows no range, and is
-    /// priced at the estimate; the algebras whose sorts have no out-of-domain
-    /// answer (`ANY`, `ALL`) take none.
+    /// stride one: its header holds the mark of a child and knows no range; the algebras whose sorts have no
+    /// out-of-domain answer (`ANY`, `ALL`) take none.
     #[test]
     fn a_value_bound_takes_an_arithmetic_fold_at_stride_one() {
         for monoid in [Monoid::SUM, Monoid::PRODUCT, Monoid::MIN, Monoid::MAX] {
@@ -2007,7 +1983,6 @@ mod tests {
             assert_eq!(value.arity(), 2);
             assert_eq!(value.known_range(), None);
             assert_eq!(value.hi(), Bound::Value(()));
-            assert_eq!(value.priced_trips(), Fold::ESTIMATED_TRIPS);
         }
         for monoid in [Monoid::ANY, Monoid::ALL] {
             assert!(!monoid.takes_a_value_bound());
@@ -2053,16 +2028,6 @@ mod tests {
     #[should_panic(expected = "a fold's literal bound is at most 16777216 (2^24)")]
     fn a_literal_beside_a_value_is_in_the_domain() {
         let _refused = FoldHeader::new(sum(0), Bound::Lit(Fold::EXACT_BOUND + 1), Bound::Value(()));
-    }
-
-    /// A known range is priced at its length, an unknown one at the estimate.
-    #[test]
-    fn priced_trips_is_the_known_length_or_the_estimate() {
-        assert_eq!(header(sum(0), 0, 40).priced_trips(), 40);
-        assert_eq!(header(sum(0), 3, 3).priced_trips(), 0);
-        let value = FoldHeader::new(sum(0), Bound::Lit(0), Bound::Value(()));
-        assert_eq!(value.priced_trips(), 32);
-        assert_eq!(Fold::ESTIMATED_TRIPS, 32);
     }
 
     /// L3, stated once: a fold admits a bound that reads neither a coordinate

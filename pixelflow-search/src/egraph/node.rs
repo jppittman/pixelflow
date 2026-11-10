@@ -346,23 +346,6 @@ impl ENode {
         }
     }
 
-    /// The literal a fold bounded by this node is **priced** by: a constant's
-    /// own, or a uniform's declared default.
-    ///
-    /// A uniform count is the one multiplicity the program names without
-    /// stating: the call supplies it, and the declaration says what it is when
-    /// the call does not. Pricing at that value turns "some count" into the
-    /// count the kernel was written for, where a constant would say 32
-    /// whatever the kernel is. A price is not a rewrite: the e-graph never
-    /// learns this literal (`Self::literal` is what rules read), so no fold is
-    /// ever replaced by one at a count the call may not supply.
-    pub(crate) fn priced_literal(&self) -> Option<Lit> {
-        match self {
-            ENode::Uniform(decl) => Some(Lit::Real(decl.default)),
-            _ => self.literal(),
-        }
-    }
-
     /// The real, if this is a real constant.
     pub fn as_f32(&self) -> Option<f32> {
         self.literal().and_then(Lit::real)
