@@ -8,6 +8,8 @@ license = "Apache-2.0"
 
 [lib]
 proc-macro = true
+# libtest harness rejects Criterion's bencher flags under `cargo bench --benches`.
+bench = false
 
 [lints]
 workspace = true
