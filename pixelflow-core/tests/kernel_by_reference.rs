@@ -228,3 +228,39 @@ fn an_applied_name_renders_what_the_warped_body_renders() {
     assert_eq!(render(&named), render(&second(&first(&body))));
     assert_eq!(render(&named.dx()), render(&second(&first(&body)).dx()));
 }
+
+/// Copies of one name at different warps are each held as a unit and linked to
+/// the one optimized referent (`passes::lift_applies`), and the scene renders
+/// what the same copies composed by value render, to the optimizer's
+/// tolerance: the two are extracted from different terms. A fold in the unit
+/// and a `min` over the copies, so the unit is not trivially one expression.
+#[test]
+fn warped_copies_of_one_name_render_what_the_inlined_copies_render() {
+    const COPIES: u32 = 4;
+    const TOLERANCE: f32 = 1e-3;
+    let unit = Kernel::sum_over(3, |i| {
+        let dx = Kernel::x().sub(&i.mul(&Kernel::constant(0.5)));
+        dx.mul(&dx)
+            .add(&Kernel::y().mul(&Kernel::y()))
+            .add(&Kernel::constant(1.0))
+            .sqrt()
+    });
+    let scene = |unit: &Kernel| {
+        (0..COPIES)
+            .map(|c| {
+                let shift = Kernel::constant(c as f32 * 2.0);
+                unit.at(&Kernel::x().sub(&shift), &Kernel::y().sub(&shift))
+            })
+            .reduce(|a, b| a.min(&b))
+            .expect("COPIES is nonzero")
+    };
+    let by_name = render(&scene(&unit.by_ref()));
+    let by_value = render(&scene(&unit));
+    for (i, (named, inlined)) in by_name.iter().zip(&by_value).enumerate() {
+        let bound = TOLERANCE * inlined.abs().max(1.0);
+        assert!(
+            (named - inlined).abs() <= bound,
+            "sample {i}: named {named}, inlined {inlined}"
+        );
+    }
+}
