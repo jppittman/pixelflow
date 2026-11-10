@@ -2587,9 +2587,10 @@ impl<C: CostFunction, T: TieBreak, R: StageRecorder> SharedPricer<'_, '_, C, T, 
         let scope_total = |class: EClassId| self.sets.total[entry(class).live] as u64;
         match (form, node.children_slice()) {
             (ENode::Reduce { header, .. }, [body, bounds @ ..]) => {
-                let work =
-                    usize::try_from(scope_total(*body).saturating_mul(self.dp.costs.trips(*header)))
-                        .unwrap_or(usize::MAX);
+                let work = usize::try_from(
+                    scope_total(*body).saturating_mul(self.dp.costs.trips(*header)),
+                )
+                .unwrap_or(usize::MAX);
                 Some((work, self.open_children(bounds, &entry)))
             }
             _ => None,
