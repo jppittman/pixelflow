@@ -280,12 +280,16 @@ fn the_optimizer_selects_what_it_selected() {
 }
 
 /// `(pieces, side, digest)`, recorded at the commit before extraction's
-/// setup was shared.
+/// setup was shared. The forty-piece rows at sides 2 and 16 were re-recorded
+/// when an `If` began paying half of what only one arm reads (JP-112): the
+/// 16 px program went from 4034 nodes / 61,764 bytes to 3953 / 57,664 (−6.6%),
+/// the 2 px one from 3874 / 57,152 to 3953 / 57,664 (+0.9%), and the two now
+/// agree, which past a side of four they already did.
 const SELECTED_PROGRAM_DIGESTS: [(usize, u32, u64); 6] = [
     (2, 1, 0x3ca5_a4e1_9eb8_0b09),
     (2, 2, 0xe91d_3bf3_3c80_3ac0),
     (2, 16, 0x22ad_8819_7984_61a6),
     (40, 1, 0x43f2_b8d9_85a2_0ab3),
-    (40, 2, 0xba96_1387_b292_5647),
-    (40, 16, 0xe951_37a9_d464_391e),
+    (40, 2, 0x3aa3_8d75_abbf_a3c4),
+    (40, 16, 0x3aa3_8d75_abbf_a3c4),
 ];
