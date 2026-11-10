@@ -212,7 +212,7 @@ mod tests {
     use crate::HandlerError;
 
     #[test]
-    fn basic_sharded_drain() {
+    fn drain_delivers_every_message_from_every_producer() {
         let mut builder = InboxBuilder::new(16);
         let tx1 = builder.add_producer();
         let tx2 = builder.add_producer();
@@ -239,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn burst_limit_respected() {
+    fn drain_stops_at_the_limit_and_reports_more() {
         let mut builder = InboxBuilder::new(64);
         let tx = builder.add_producer();
         let mut inbox = builder.build();
@@ -261,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn round_robin_fairness() {
+    fn drain_does_not_starve_a_quiet_producer_behind_a_flooding_one() {
         let mut builder = InboxBuilder::new(64);
         let tx1 = builder.add_producer();
         let tx2 = builder.add_producer();
@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn all_producers_disconnect() {
+    fn drain_reports_disconnected_once_every_producer_is_dropped() {
         let mut builder = InboxBuilder::new(16);
         let tx1 = builder.add_producer();
         let tx2 = builder.add_producer();
@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_buffered_after_disconnect() {
+    fn drain_delivers_buffered_messages_after_the_producer_is_dropped() {
         let mut builder = InboxBuilder::new(16);
         let tx = builder.add_producer();
         let mut inbox = builder.build();
@@ -330,7 +330,7 @@ mod tests {
     }
 
     #[test]
-    fn handler_error_propagates() {
+    fn drain_returns_the_error_the_handler_failed_with() {
         let mut builder = InboxBuilder::new(16);
         let tx = builder.add_producer();
         let mut inbox = builder.build();
@@ -386,7 +386,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "at least one producer")]
-    fn panics_on_empty_build() {
+    fn build_panics_when_no_producer_was_added() {
         let builder = InboxBuilder::<u32>::new(16);
         let _inbox = builder.build();
     }
