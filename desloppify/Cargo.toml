@@ -6,6 +6,15 @@ description = "Rule-driven code review: tree-sitter finds the code, a tiered age
 license = "MIT"
 publish = false
 
+[lib]
+# libtest harness rejects Criterion's bencher flags under `cargo bench --benches`.
+bench = false
+
+[[bin]]
+name = "desloppify"
+path = "src/main.rs"
+bench = false
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
