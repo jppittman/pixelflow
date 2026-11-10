@@ -22,3 +22,18 @@ is paid in full there and at half inside the `If` (an overcharge, never an under
 The `FONT_PATH` the example reads is an LFS pointer in this checkout; the run used the committed
 `DejaVuSansMono-Fallback.ttf` through an uncommitted one-line edit. Reproduce with
 `cargo run --release -p pixelflow-pipeline --example glyph_phase_split` after that edit.
+
+## The font program does move (added with the digest re-record)
+
+The glyph walk above bakes each glyph's own kernel and is byte-identical under every option. The
+font's linked program (`program(40)`, `the_optimizer_selects_what_it_selected`) is a different
+shape, and the exclusive-part rule changes what extraction picks there:
+
+| pieces, side | before (nodes / bytes) | after (nodes / bytes) |
+|---|---|---|
+| 40, 2 px | 3874 / 57,152 | 3953 / 57,664 (+0.9%) |
+| 40, 16 px | 4034 / 61,764 | 3953 / 57,664 (−6.6%) |
+| 2 pieces, any side | unchanged | unchanged |
+
+The production size (16 px) shrinks; the 2 px row grows slightly, and the two sides now select the
+same program, as they did already past a side of four. The pinned digests were re-recorded.
