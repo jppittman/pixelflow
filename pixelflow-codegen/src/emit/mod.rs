@@ -1626,11 +1626,35 @@ mod tests {
         // More values live at once than any tier's vector file holds.
         const WALL: u32 = 48;
 
-        let (zero, eight) = (Kernel::constant(0.0), Kernel::constant(8.0));
+        let zero = Kernel::constant(0.0);
         let count = || Uniform::new(7.0).kernel();
-        let from_the_outer_index = Kernel::sum_over(8, |i| {
-            Kernel::over_values(Monoid::SUM, i, &eight, |j| Kernel::x().add(j))
-        });
+        // `Σ_{i<8} Σ_{j∈[i,8)} (X + j)`, built on the arena: the builder
+        // refuses an enclosing index as a bound (a user fold is rectangular),
+        // and the IR still denotes one.
+        let from_the_outer_index = {
+            use pixelflow_ir::fold::{Binder, Bound, Fold};
+            let (inner, outer) = (
+                Binder::from_slot(0).expect("slot 0 exists"),
+                Binder::from_slot(1).expect("slot 1 exists"),
+            );
+            let mut a = ExprArena::new();
+            let x = a.push_var(0);
+            let (i, j) = (a.push_var(outer.var()), a.push_var(inner.var()));
+            let body = a.push_binary(OpKind::Add, x, j);
+            let inner_fold = a.push_reduce(
+                Fold::new(Monoid::SUM, inner),
+                Bound::Value(i),
+                Bound::Lit(8),
+                body,
+            );
+            let root = a.push_reduce(
+                Fold::new(Monoid::SUM, outer),
+                Bound::Lit(0),
+                Bound::Lit(8),
+                inner_fold,
+            );
+            Kernel::from_parts(a, root)
+        };
         let a_wall = Kernel::over_values(Monoid::SUM, &zero, &count(), |k| {
             let terms: Vec<Kernel> = (1..=WALL)
                 .map(|m| Kernel::x().add(k).mul(&Kernel::constant(m as f32)))
