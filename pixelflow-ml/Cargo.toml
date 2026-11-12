@@ -14,11 +14,11 @@ bench = false
 [features]
 default = ["graphics"]
 # Enable graphics integration (harmonic attention, SH features) - requires pixelflow-core
-graphics = ["dep:pixelflow-core"]
+graphics = ["dep:pixelflow-core", "dep:libm"]
 
 [dependencies]
 pixelflow-core = { path = "../pixelflow-core", optional = true }
-libm = "0.2.15"
+libm = { version = "0.2.15", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"

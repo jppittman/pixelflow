@@ -28,8 +28,11 @@ must_use_candidate = "warn"
 
 [workspace.lints.cargo]
 # A dependency nothing uses is a build cost and a supply-chain surface for
-# nothing (Rust 1.100).
-unused_dependencies = "deny"
+# nothing (Rust 1.100). `warn`, not `deny`: a feature-gated dependency used
+# only by benches or tests (pixelflow-graphics' `freetype-rs`; Cargo has no
+# optional dev-dependencies) is reported by every lib-only check, and an
+# exception can't be scoped to one crate under `workspace = true`.
+unused_dependencies = "warn"
 
 # Normal release - fast compile, good perf
 [profile.release]
