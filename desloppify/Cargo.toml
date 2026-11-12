@@ -2,6 +2,7 @@
 name = "desloppify"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 description = "Rule-driven code review: tree-sitter finds the code, a tiered agent reviews it."
 license = "MIT"
 publish = false

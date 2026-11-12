@@ -10,7 +10,6 @@ use pixelflow_ir::arena::{
 };
 use pixelflow_ir::library;
 use pixelflow_ir::{Bound, Monoid, OpKind};
-use std::convert::Infallible;
 use syn::Ident;
 
 /// The default a uniform is declared with here, where no call has supplied
@@ -65,7 +64,7 @@ impl Expansion {
 impl Site for Expansion {
     type Term = ExprId;
     /// There is no argument at expansion.
-    type Argument = Infallible;
+    type Argument = !;
 
     fn constant(&mut self, value: f32) -> ExprId {
         self.arena.push_const(value)
@@ -114,7 +113,7 @@ impl Site for Expansion {
         self.arena.push_uniform(slot)
     }
 
-    fn kernel_parameter(&mut self, name: &Ident) -> syn::Result<Infallible> {
+    fn kernel_parameter(&mut self, name: &Ident) -> syn::Result<!> {
         Err(syn::Error::new(
             name.span(),
             format!(
@@ -161,8 +160,8 @@ impl Site for Expansion {
             .expect("lowering refuses a fold nested past the binders, so one is always free")
     }
 
-    fn apply(&mut self, kernel: Infallible, _at: [ExprId; 2]) -> ExprId {
-        match kernel {}
+    fn apply(&mut self, kernel: !, _at: [ExprId; 2]) -> ExprId {
+        kernel
     }
 
     fn warp(&mut self, field: ExprId, at: [ExprId; 2]) -> ExprId {

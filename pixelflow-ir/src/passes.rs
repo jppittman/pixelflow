@@ -158,14 +158,9 @@ fn rebuild_arena<F>(arena: &mut ExprArena, root: ExprId, mut lower: F) -> ExprId
 where
     F: FnMut(&mut ExprArena, &ExprNode, &dyn Fn(ExprId) -> ExprId) -> Option<ExprId>,
 {
-    match try_rebuild_arena::<Never, _>(arena, root, |arena, node, m| Ok(lower(arena, node, m))) {
-        Ok(id) => id,
-        Err(never) => match never {},
-    }
+    let Ok(id) = try_rebuild_arena::<!, _>(arena, root, |arena, node, m| Ok(lower(arena, node, m)));
+    id
 }
-
-/// Uninhabited error type for the infallible [`rebuild_arena`] wrapper.
-enum Never {}
 
 /// Fallible core of [`rebuild_arena`]: the hook may reject a node (e.g. an
 /// operator [`lower_dwrt`] cannot differentiate), aborting the whole pass.

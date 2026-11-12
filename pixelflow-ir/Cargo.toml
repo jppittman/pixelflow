@@ -2,6 +2,7 @@
 name = "pixelflow-ir"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 description = "Unified Intermediate Representation and SIMD Backends for PixelFlow"
 
 [lib]
