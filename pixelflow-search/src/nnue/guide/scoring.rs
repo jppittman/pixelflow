@@ -275,33 +275,27 @@ impl SaturationHead {
         let scale_proj = sqrtf(2.0 / HIDDEN_DIM as f32);
 
         // Mask MLP: MASK_INPUT_DIM → MLP_HIDDEN → EMBED_DIM
-        for i in 0..MASK_INPUT_DIM {
-            for j in 0..MLP_HIDDEN {
-                self.mask_mlp_w1[i][j] = next_f32() * scale_mask_input;
-            }
+        for w in self.mask_mlp_w1.as_flattened_mut() {
+            *w = next_f32() * scale_mask_input;
         }
         for b in &mut self.mask_mlp_b1 {
             *b = next_f32().abs() * 0.1;
         }
-        for j in 0..MLP_HIDDEN {
-            for k in 0..EMBED_DIM {
-                self.mask_mlp_w2[j][k] = next_f32() * scale_hidden;
-            }
+        for w in self.mask_mlp_w2.as_flattened_mut() {
+            *w = next_f32() * scale_hidden;
         }
         self.mask_mlp_b2.fill(0.0);
 
         // Rule Projection: RULE_CONCAT_DIM → EMBED_DIM
-        for i in 0..RULE_CONCAT_DIM {
-            for k in 0..EMBED_DIM {
-                self.rule_proj_w[i][k] = next_f32() * scale_concat;
-            }
+        for w in self.rule_proj_w.as_flattened_mut() {
+            *w = next_f32() * scale_concat;
         }
         self.rule_proj_b.fill(0.0);
 
         // Interaction matrix: start near identity
-        for i in 0..EMBED_DIM {
-            for j in 0..EMBED_DIM {
-                self.interaction[i][j] = if i == j { 1.0 } else { next_f32() * 0.1 };
+        for (i, row) in self.interaction.iter_mut().enumerate() {
+            for (j, w) in row.iter_mut().enumerate() {
+                *w = if i == j { 1.0 } else { next_f32() * 0.1 };
             }
         }
 
@@ -309,49 +303,41 @@ impl SaturationHead {
         self.mask_bias_proj.fill(0.0);
 
         // Graph backbone: GRAPH_INPUT_DIM → HIDDEN_DIM
-        for row in 0..GRAPH_INPUT_DIM {
-            for col in 0..HIDDEN_DIM {
-                self.graph_w1[row][col] = next_f32() * scale_graph;
-            }
+        for w in self.graph_w1.as_flattened_mut() {
+            *w = next_f32() * scale_graph;
         }
         for b in &mut self.graph_b1 {
             *b = next_f32().abs() * 0.1;
         }
 
         // Graph projection: HIDDEN_DIM → EMBED_DIM
-        for j in 0..HIDDEN_DIM {
-            for k in 0..EMBED_DIM {
-                self.graph_proj_w[j][k] = next_f32() * scale_proj;
-            }
+        for w in self.graph_proj_w.as_flattened_mut() {
+            *w = next_f32() * scale_proj;
         }
         for b in &mut self.graph_proj_b {
             *b = next_f32().abs() * 0.1;
         }
 
         // Candidate tower: CANDIDATE_INPUT_DIM → HIDDEN_DIM
-        for row in 0..CANDIDATE_INPUT_DIM {
-            for col in 0..HIDDEN_DIM {
-                self.candidate_w1[row][col] = next_f32() * scale_candidate;
-            }
+        for w in self.candidate_w1.as_flattened_mut() {
+            *w = next_f32() * scale_candidate;
         }
         for b in &mut self.candidate_b1 {
             *b = next_f32().abs() * 0.1;
         }
 
         // Candidate projection: HIDDEN_DIM → EMBED_DIM
-        for j in 0..HIDDEN_DIM {
-            for k in 0..EMBED_DIM {
-                self.candidate_proj_w[j][k] = next_f32() * scale_proj;
-            }
+        for w in self.candidate_proj_w.as_flattened_mut() {
+            *w = next_f32() * scale_proj;
         }
         for b in &mut self.candidate_proj_b {
             *b = next_f32().abs() * 0.1;
         }
 
         // Trunk: identity + small noise (near-identity preserves tower signal).
-        for i in 0..HIDDEN_DIM {
-            for j in 0..HIDDEN_DIM {
-                self.trunk_w[i][j] = if i == j { 1.0 } else { 0.0 } + next_f32() * 0.01;
+        for (i, row) in self.trunk_w.iter_mut().enumerate() {
+            for (j, w) in row.iter_mut().enumerate() {
+                *w = if i == j { 1.0 } else { 0.0 } + next_f32() * 0.01;
             }
         }
         self.trunk_b.fill(0.0);
@@ -628,13 +614,11 @@ mod tests {
         // Manual verification: score = dot(mask @ interaction + bias_proj, rule)
         // With all-ones vectors: sum of interaction matrix + sum of bias_proj
         let mut expected = 0.0f32;
-        for i in 0..EMBED_DIM {
-            for j in 0..EMBED_DIM {
-                expected += randomized.interaction[i][j];
-            }
+        for w in randomized.interaction.as_flattened() {
+            expected += w;
         }
-        for k in 0..EMBED_DIM {
-            expected += randomized.mask_bias_proj[k];
+        for b in &randomized.mask_bias_proj {
+            expected += b;
         }
         assert!(
             (score - expected).abs() < 1e-4,
@@ -661,9 +645,9 @@ mod tests {
             }
         }
         // Interaction matrix should be near identity diagonal.
-        for i in 0..EMBED_DIM {
+        for (i, row) in a.interaction.iter().enumerate() {
             assert!(
-                (a.interaction[i][i] - 1.0).abs() < 0.5,
+                (row[i] - 1.0).abs() < 0.5,
                 "Diagonal of interaction should be near 1.0"
             );
         }
@@ -723,12 +707,9 @@ mod tests {
                 (head.trunk_w[i][i] - 1.0).abs() < 0.05,
                 "trunk diagonal near 1.0"
             );
-            for j in 0..HIDDEN_DIM {
+            for (j, w) in head.trunk_w[i].iter().enumerate() {
                 if i != j {
-                    assert!(
-                        head.trunk_w[i][j].abs() < 0.05,
-                        "trunk off-diagonal near 0.0"
-                    );
+                    assert!(w.abs() < 0.05, "trunk off-diagonal near 0.0");
                 }
             }
             assert_eq!(head.trunk_b[i], 0.0);
@@ -751,8 +732,8 @@ mod tests {
     /// pre-trunk hidden value without also having to hand-verify the trunk.
     fn identity_trunk_head() -> SaturationHead {
         let mut head = SaturationHead::new();
-        for i in 0..HIDDEN_DIM {
-            head.trunk_w[i][i] = 1.0;
+        for (i, row) in head.trunk_w.iter_mut().enumerate() {
+            row[i] = 1.0;
         }
         head
     }
@@ -795,9 +776,7 @@ mod tests {
     fn forward_graph_should_match_a_hand_computed_value_when_node_count_is_positive() {
         let mut head = identity_trunk_head();
         head.graph_b1 = [10.0; HIDDEN_DIM];
-        for i in 0..GRAPH_ACC_DIM {
-            head.graph_w1[i] = [3.0; HIDDEN_DIM];
-        }
+        head.graph_w1[..GRAPH_ACC_DIM].fill([3.0; HIDDEN_DIM]);
         head.graph_w1[GRAPH_ACC_DIM] = [100.0; HIDDEN_DIM]; // edge_count row
         head.graph_w1[GRAPH_ACC_DIM + 1] = [200.0; HIDDEN_DIM]; // node_count row
         head.graph_w1[GRAPH_ACC_DIM + 2] = [300.0; HIDDEN_DIM]; // node_budget row
@@ -1256,8 +1235,8 @@ mod tests {
         // negated-without-clamping becomes positive and survives the trunk's
         // own ReLU.
         let mut head = SaturationHead::new();
-        for i in 0..HIDDEN_DIM {
-            head.trunk_w[i][i] = -1.0;
+        for (i, row) in head.trunk_w.iter_mut().enumerate() {
+            row[i] = -1.0;
         }
         head.graph_b1 = [-1.0; HIDDEN_DIM];
 
@@ -1282,8 +1261,8 @@ mod tests {
         let (z_lhs, z_rhs) = sample_rule_embeddings();
 
         let mut head = SaturationHead::new();
-        for k in 0..EMBED_DIM {
-            head.rule_proj_b[k] = k as f32 + 1.0;
+        for (k, b) in head.rule_proj_b.iter_mut().enumerate() {
+            *b = k as f32 + 1.0;
         }
 
         let out = head.encode_rule(&z_lhs, &z_rhs);
@@ -1414,9 +1393,7 @@ mod tests {
             emb.e[op] = [1.0; K];
         }
         let mut head = identity_trunk_head();
-        for i in 0..K {
-            head.candidate_w1[i] = [1.0; HIDDEN_DIM];
-        }
+        head.candidate_w1[..K].fill([1.0; HIDDEN_DIM]);
 
         let hidden = head.forward_candidate(&emb, &summary(&ops, 0.0, [0.0; EMBED_DIM]));
 

@@ -378,10 +378,10 @@ impl OpEmbeddings {
             self.e[op][0] = squashed.min(1.0);
 
             // Dimensions 1..K: small random for learning interactions
-            for dim in 1..K {
+            for e in &mut self.e[op][1..] {
                 rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
                 let uniform = (rng_state >> 33) as f32 / (1u64 << 31) as f32;
-                self.e[op][dim] = (uniform * 2.0 - 1.0) * small_scale;
+                *e = (uniform * 2.0 - 1.0) * small_scale;
             }
         }
     }
@@ -392,14 +392,14 @@ impl OpEmbeddings {
         let mut rng_state = seed.wrapping_add(1);
 
         for op in OpKind::all() {
-            for dim in 0..K {
+            for e in &mut self.e[op] {
                 // LCG for no_std compatibility
                 rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
 
                 // Convert to [-1, 1] and scale
                 let uniform = (rng_state >> 33) as f32 / (1u64 << 31) as f32;
                 let centered = uniform * 2.0 - 1.0;
-                self.e[op][dim] = centered * scale;
+                *e = centered * scale;
             }
         }
     }

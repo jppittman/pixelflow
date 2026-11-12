@@ -1085,9 +1085,9 @@ fn bake_eigen() {
 
         // Spline coeffs (flattened: 3 × K × 16)
         let mut flat_splines = Vec::with_capacity(3 * s.k * 16);
-        for subpatch in 0..3 {
-            for basis in 0..s.k {
-                flat_splines.extend_from_slice(&s.spline_coeffs[subpatch][basis]);
+        for subpatch in &s.spline_coeffs[..3] {
+            for basis in &subpatch[..s.k] {
+                flat_splines.extend_from_slice(basis);
             }
         }
         out.push_str(&format!(

@@ -538,10 +538,9 @@ impl TerminalApp {
         let font = self.loaded_font.font();
         let blank = self.atlas.blank_uv();
         let mut cells = Vec::with_capacity(cols * rows * pixelflow_core::CELL_STRIDE);
-        for row in 0..rows {
-            let line = &snapshot.lines[row];
-            for col in 0..cols {
-                let (uv, fg, bg): ((f32, f32), Color, Color) = match &line.cells[col] {
+        for line in &snapshot.lines[..rows] {
+            for cell in &line.cells[..cols] {
+                let (uv, fg, bg): ((f32, f32), Color, Color) = match cell {
                     Glyph::Single(cc) | Glyph::WidePrimary(cc) => {
                         let fg = if cc.attr.fg == Color::Default {
                             default_fg
