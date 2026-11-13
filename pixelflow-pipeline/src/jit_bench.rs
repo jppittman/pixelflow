@@ -728,6 +728,7 @@ impl BenchResult {
     /// `BenchSession`) carries no drift information, so it cannot be
     /// corrected into a value comparable with session-minted ones. `context`
     /// names the call site in the panic message.
+    #[must_use]
     pub fn corrected_session_ns(&self, context: &str) -> (SessionNs, DriftFactor) {
         let calibration = self.sentinel.unwrap_or_else(|| {
             panic!(
@@ -1871,7 +1872,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "sentinel calibration must be positive")]
     fn sentinel_drift_rejects_bad_calibration() {
-        let _ = sentinel_drift_exceeded(0.0, 100.0, SENTINEL_REGIME_CHANGE_FRAC);
+        let _refused = sentinel_drift_exceeded(0.0, 100.0, SENTINEL_REGIME_CHANGE_FRAC);
     }
 
     #[test]
@@ -1906,7 +1907,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "non-positive sentinel reading")]
     fn sentinel_normalization_rejects_zero_reading() {
-        let _ = SentinelContext {
+        let _refused = SentinelContext {
             local_sentinel_ns: 0.0,
             calibration_ns: 100.0,
         }
@@ -1987,7 +1988,7 @@ mod tests {
             outputs: Vec::new(),
             sentinel: None,
         };
-        let _ = CostLabel::mint(&bench, BenchPosition(0), "unit test");
+        let _refused = CostLabel::mint(&bench, BenchPosition(0), "unit test");
     }
 
     #[test]

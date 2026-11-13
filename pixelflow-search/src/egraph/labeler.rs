@@ -100,6 +100,7 @@ pub struct RuleStats {
 impl RuleStats {
     /// Firings that were not load-bearing. Always `fired - load_bearing`;
     /// exposed so callers don't have to re-derive the subtraction.
+    #[must_use]
     pub fn wasted(&self) -> usize {
         self.fired - self.load_bearing
     }
@@ -109,6 +110,7 @@ impl RuleStats {
     /// zero firings has no evidence either way, and the Guide should treat
     /// "no evidence" and "never paid off" differently upstream, not collapse
     /// them into a propagating `NaN`.
+    #[must_use]
     pub fn load_bearing_ratio(&self) -> f64 {
         if self.fired == 0 {
             0.0
@@ -152,6 +154,7 @@ impl EpisodeLabels {
     /// label for a node that was never really "chosen," corrupting the
     /// training signal instead of surfacing the extractor bug that produced
     /// an inconsistent `choices` map.
+    #[must_use]
     pub fn compute(egraph: &EGraph, root: EClassId, choices: &[Option<usize>]) -> Self {
         let chosen_nodes = chosen_tagged_nodes(egraph, root, choices);
         let load_bearing = egraph.derivation_ancestors(&chosen_nodes);
@@ -227,6 +230,7 @@ impl EpisodeLabels {
     /// `load_bearing_ratio` (ties broken by `rule_idx` for determinism).
     ///
     /// Rule names are resolved through the rule set the episode ran under.
+    #[must_use]
     pub fn format_rule_report(&self, rules: &RuleSet) -> String {
         use std::fmt::Write;
 
@@ -338,6 +342,7 @@ pub struct EpisodeResult {
 /// future episode collector, not the collector itself. Callers supply the
 /// rule set explicitly (mirroring [`RuleSet::new`] everywhere else in
 /// this crate); use [`super::all_rules`] for the full library.
+#[must_use]
 pub fn run_episode(
     arena: &pixelflow_ir::ExprArena,
     root: pixelflow_ir::ExprId,

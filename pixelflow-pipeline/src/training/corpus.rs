@@ -865,7 +865,9 @@ mod tests {
         write_corpus(&tmp, &entries).expect("write");
         let loaded = read_corpus(&tmp).expect("read");
         assert!(loaded.is_empty());
-        let _ = std::fs::remove_file(&tmp);
+        if let Err(error) = std::fs::remove_file(&tmp) {
+            eprintln!("leaving {}: {error}", tmp.display());
+        }
     }
 
     #[test]
@@ -895,7 +897,9 @@ mod tests {
             "round-tripped arena is not structurally equal to the original"
         );
 
-        let _ = std::fs::remove_file(&tmp);
+        if let Err(error) = std::fs::remove_file(&tmp) {
+            eprintln!("leaving {}: {error}", tmp.display());
+        }
     }
 
     #[test]
@@ -921,7 +925,9 @@ mod tests {
             other => panic!("expected Const, got {other:?}"),
         }
 
-        let _ = std::fs::remove_file(&tmp);
+        if let Err(error) = std::fs::remove_file(&tmp) {
+            eprintln!("leaving {}: {error}", tmp.display());
+        }
     }
 
     #[test]
@@ -944,7 +950,9 @@ mod tests {
             other => panic!("expected Ternary(If,...), got {other:?}"),
         }
 
-        let _ = std::fs::remove_file(&tmp);
+        if let Err(error) = std::fs::remove_file(&tmp) {
+            eprintln!("leaving {}: {error}", tmp.display());
+        }
     }
 
     #[test]
@@ -970,7 +978,9 @@ mod tests {
             other => panic!("expected Nary(Tuple,...), got {other:?}"),
         }
 
-        let _ = std::fs::remove_file(&tmp);
+        if let Err(error) = std::fs::remove_file(&tmp) {
+            eprintln!("leaving {}: {error}", tmp.display());
+        }
     }
 
     // Header-rejection tests drive the reader through its public entry point:
@@ -984,7 +994,9 @@ mod tests {
         let tmp = unique_tmp(name);
         std::fs::write(&tmp, data).expect("write fixture");
         let result = read_corpus(&tmp);
-        let _ = std::fs::remove_file(&tmp);
+        if let Err(error) = std::fs::remove_file(&tmp) {
+            eprintln!("leaving {}: {error}", tmp.display());
+        }
         result
     }
 
@@ -1165,7 +1177,9 @@ mod tests {
         let tmp = unique_tmp("dead_nodes");
         write_corpus(&tmp, &entries).expect("write");
         let loaded = read_corpus(&tmp).expect("read");
-        let _ = std::fs::remove_file(&tmp);
+        if let Err(error) = std::fs::remove_file(&tmp) {
+            eprintln!("leaving {}: {error}", tmp.display());
+        }
 
         assert_eq!(loaded.len(), 1);
         let (_, loaded_arena, loaded_root) = &loaded[0];
@@ -1195,7 +1209,7 @@ mod tests {
             height: 8,
         });
         let root = arena.push_buffer(buf);
-        let _ = reachable_subtree(&arena, root);
+        let _refused = reachable_subtree(&arena, root);
     }
 
     #[test]
@@ -1225,6 +1239,8 @@ mod tests {
         assert_eq!(loaded[0].1.len(), 3);
         assert_eq!(loaded[1].1.len(), 2);
 
-        let _ = std::fs::remove_file(&tmp);
+        if let Err(error) = std::fs::remove_file(&tmp) {
+            eprintln!("leaving {}: {error}", tmp.display());
+        }
     }
 }

@@ -487,154 +487,161 @@ fn write_json_report(path: &str, report: &Report) {
 
 fn write_md_report(path: &str, report: &Report) {
     use std::fmt::Write as _;
-    let mut md = String::new();
-    md.push_str("# Bilinear Guide cold-start training report (strict-v1 labels)\n\n");
-    let _ = writeln!(
-        md,
-        "Model class: **{}**. Registration: \
-         `docs/archive/plans/2026-09-02-bilinear-guide-registration.md`.\n",
-        report.model_class
-    );
-    let _ = writeln!(
-        md,
-        "TRAIN: {} samples, {} families, positive rate {:.4}% \
-         ({} dedup_repeat rows excluded).\n",
-        report.train_samples,
-        report.train_families,
-        report.train_positive_rate * 100.0,
-        report.train_dedup_repeats_excluded
-    );
-    let _ = writeln!(
-        md,
-        "DEV (held out, never trained on, never used to select a hyperparameter): \
-         {} samples, {} families, positive rate {:.4}% ({} dedup_repeat rows excluded).\n",
-        report.dev_samples,
-        report.dev_families,
-        report.dev_positive_rate * 100.0,
-        report.dev_dedup_repeats_excluded
-    );
-    let _ = writeln!(
-        md,
-        "**Loss weighting**: pos_weight = {:.3} ({}).\n",
-        report.pos_weight, report.pos_weight_rationale
-    );
-    md.push_str("## Held-out DEV ranking quality, against the zero-predictor floor\n\n");
-    md.push_str("| metric | bilinear | constant-predictor floor |\n|---|---:|---:|\n");
-    let _ = writeln!(
-        md,
-        "| AUC-ROC | {:.4} | {:.4} |\n| PR-AUC (average precision) | {:.4} | {:.4} |",
-        report.dev_auc, report.zero_predictor_auc, report.dev_pr_auc, report.zero_predictor_pr_auc
-    );
-    if let Some(a) = report.dev_auc_within_expression {
-        let _ = writeln!(
+    let md = (|| -> Result<String, std::fmt::Error> {
+        let mut md = String::new();
+        md.push_str("# Bilinear Guide cold-start training report (strict-v1 labels)\n\n");
+        writeln!(
             md,
-            "\nWithin-expression AUC (the move-ordering question a deployed guide is \
-             actually asked), macro-averaged over the {} expressions whose candidate set \
-             holds both classes: **{a:.4}**.\n",
-            report.dev_within_expression_groups
-        );
-    }
-
-    md.push_str("\n## Learning-rate selection (TRAIN-internal holdout only)\n\n");
-    let _ = writeln!(
-        md,
-        "{:.0}% of TRAIN families ({} of them) held out; DEV was not read.\n",
-        report.holdout_fraction * 100.0,
-        report.holdout_families
-    );
-    md.push_str("| lr | holdout AUC | holdout PR-AUC |\n|---:|---:|---:|\n");
-    for t in &report.lr_trials {
-        let _ = writeln!(
+            "Model class: **{}**. Registration: \
+             `docs/archive/plans/2026-09-02-bilinear-guide-registration.md`.\n",
+            report.model_class
+        )?;
+        writeln!(
             md,
-            "| {:.4} | {} | {} |",
-            t.lr,
-            t.holdout_auc.map_or("-".into(), |v| format!("{v:.4}")),
-            t.holdout_pr_auc.map_or("-".into(), |v| format!("{v:.4}"))
-        );
-    }
-    let _ = writeln!(md, "\nSelected lr = {:.4}.\n", report.lr_selected);
-
-    md.push_str("\n## Training curve (final fit, all TRAIN families)\n\n");
-    md.push_str("| epoch | lr | train weighted loss | clip rate | DEV AUC | DEV PR-AUC |\n");
-    md.push_str("|---:|---:|---:|---:|---:|---:|\n");
-    for p in &report.training_curve {
-        let _ = writeln!(
+            "TRAIN: {} samples, {} families, positive rate {:.4}% \
+             ({} dedup_repeat rows excluded).\n",
+            report.train_samples,
+            report.train_families,
+            report.train_positive_rate * 100.0,
+            report.train_dedup_repeats_excluded
+        )?;
+        writeln!(
             md,
-            "| {} | {:.5} | {:.6} | {:.3} | {} | {} |",
-            p.epoch,
-            p.lr,
-            p.train_mean_weighted_loss,
-            p.clip_rate,
-            p.dev_auc.map_or(String::new(), |v| format!("{v:.4}")),
-            p.dev_pr_auc.map_or(String::new(), |v| format!("{v:.4}")),
-        );
-    }
-
-    md.push_str("\n## Rule encoder\n\n");
-    let _ = writeln!(
-        md,
-        "The rule embedding is trained through `encode_rule`'s \
-         `[LHS | RHS | LHS-RHS | LHS*RHS]` projection (registration §4), over \
-         depth-bound poolings of each rule's own templates. Rank of the \
-         concatenation matrix: **{} of {} rules**. A rank equal to the rule count \
-         means the projection can realize any per-rule embedding assignment — i.e. \
-         this arm is not handicapped against the additive arm's free per-rule \
-         scalar.\n",
-        report.rule_encoding_rank, report.rule_count
-    );
-    if report.indistinguishable_rule_pairs.is_empty() {
-        md.push_str("No two rules share an encoding.\n");
-    } else {
-        let _ = writeln!(
+            "DEV (held out, never trained on, never used to select a hyperparameter): \
+             {} samples, {} families, positive rate {:.4}% ({} dedup_repeat rows excluded).\n",
+            report.dev_samples,
+            report.dev_families,
+            report.dev_positive_rate * 100.0,
+            report.dev_dedup_repeats_excluded
+        )?;
+        writeln!(
             md,
-            "**Recorded limitation.** {} rule pair(s) encode identically and therefore \
-             score identically in every context, at any weights: {:?}. All of them are \
-             rules that define no template on either side ({:?}), so the registered \
-             encoding has nothing to encode for them.\n",
-            report.indistinguishable_rule_pairs.len(),
-            report.indistinguishable_rule_pairs,
-            report.templateless_rules
-        );
-    }
-    let _ = writeln!(
-        md,
-        "\nWrite-side train/deploy skew: max |trainer-in-memory - deployed-from-file| = \
-         {:.3e} over {} DEV records (bar 1e-6).\n",
-        report.write_side_skew_max_abs_diff, report.write_side_skew_records
-    );
-    let _ = writeln!(
-        md,
-        "\nTrained rule-by-context second difference (trig-shaped vs \
-         polynomial-shaped neighborhood, two rules): **{:.6}**. The additive arm pins \
-         this at exactly zero by construction; a value of zero here would mean \
-         training collapsed this head into that model class.\n",
-        report.trained_second_difference
-    );
-
-    md.push_str(
-        "\n## Per-rule: learned priority (DEV mean predicted score) vs measured \
-         strict-bound rate\n\n",
-    );
-    md.push_str(
-        "| rule | id | train fired | train rate | DEV fired | DEV measured rate | \
-         DEV mean predicted P |\n",
-    );
-    md.push_str("|---|---|---:|---:|---:|---:|---:|\n");
-    for r in &report.per_rule {
-        let _ = writeln!(
+            "**Loss weighting**: pos_weight = {:.3} ({}).\n",
+            report.pos_weight, report.pos_weight_rationale
+        )?;
+        md.push_str("## Held-out DEV ranking quality, against the zero-predictor floor\n\n");
+        md.push_str("| metric | bilinear | constant-predictor floor |\n|---|---:|---:|\n");
+        writeln!(
             md,
-            "| {} | {} | {} | {:.5} | {} | {:.5} | {:.5} |",
-            r.rule_name,
-            r.rule_id,
-            r.train_fired,
-            r.train_positive_rate,
-            r.dev_fired,
-            r.dev_positive_rate,
-            r.dev_mean_predicted
-        );
-    }
+            "| AUC-ROC | {:.4} | {:.4} |\n| PR-AUC (average precision) | {:.4} | {:.4} |",
+            report.dev_auc,
+            report.zero_predictor_auc,
+            report.dev_pr_auc,
+            report.zero_predictor_pr_auc
+        )?;
+        if let Some(a) = report.dev_auc_within_expression {
+            writeln!(
+                md,
+                "\nWithin-expression AUC (the move-ordering question a deployed guide is \
+                 actually asked), macro-averaged over the {} expressions whose candidate set \
+                 holds both classes: **{a:.4}**.\n",
+                report.dev_within_expression_groups
+            )?;
+        }
 
-    let _ = writeln!(md, "\nCheckpoint written to `{}`.", report.checkpoint_path);
+        md.push_str("\n## Learning-rate selection (TRAIN-internal holdout only)\n\n");
+        writeln!(
+            md,
+            "{:.0}% of TRAIN families ({} of them) held out; DEV was not read.\n",
+            report.holdout_fraction * 100.0,
+            report.holdout_families
+        )?;
+        md.push_str("| lr | holdout AUC | holdout PR-AUC |\n|---:|---:|---:|\n");
+        for t in &report.lr_trials {
+            writeln!(
+                md,
+                "| {:.4} | {} | {} |",
+                t.lr,
+                t.holdout_auc.map_or("-".into(), |v| format!("{v:.4}")),
+                t.holdout_pr_auc.map_or("-".into(), |v| format!("{v:.4}"))
+            )?;
+        }
+        writeln!(md, "\nSelected lr = {:.4}.\n", report.lr_selected)?;
+
+        md.push_str("\n## Training curve (final fit, all TRAIN families)\n\n");
+        md.push_str("| epoch | lr | train weighted loss | clip rate | DEV AUC | DEV PR-AUC |\n");
+        md.push_str("|---:|---:|---:|---:|---:|---:|\n");
+        for p in &report.training_curve {
+            writeln!(
+                md,
+                "| {} | {:.5} | {:.6} | {:.3} | {} | {} |",
+                p.epoch,
+                p.lr,
+                p.train_mean_weighted_loss,
+                p.clip_rate,
+                p.dev_auc.map_or(String::new(), |v| format!("{v:.4}")),
+                p.dev_pr_auc.map_or(String::new(), |v| format!("{v:.4}")),
+            )?;
+        }
+
+        md.push_str("\n## Rule encoder\n\n");
+        writeln!(
+            md,
+            "The rule embedding is trained through `encode_rule`'s \
+             `[LHS | RHS | LHS-RHS | LHS*RHS]` projection (registration §4), over \
+             depth-bound poolings of each rule's own templates. Rank of the \
+             concatenation matrix: **{} of {} rules**. A rank equal to the rule count \
+             means the projection can realize any per-rule embedding assignment — i.e. \
+             this arm is not handicapped against the additive arm's free per-rule \
+             scalar.\n",
+            report.rule_encoding_rank, report.rule_count
+        )?;
+        if report.indistinguishable_rule_pairs.is_empty() {
+            md.push_str("No two rules share an encoding.\n");
+        } else {
+            writeln!(
+                md,
+                "**Recorded limitation.** {} rule pair(s) encode identically and therefore \
+                 score identically in every context, at any weights: {:?}. All of them are \
+                 rules that define no template on either side ({:?}), so the registered \
+                 encoding has nothing to encode for them.\n",
+                report.indistinguishable_rule_pairs.len(),
+                report.indistinguishable_rule_pairs,
+                report.templateless_rules
+            )?;
+        }
+        writeln!(
+            md,
+            "\nWrite-side train/deploy skew: max |trainer-in-memory - deployed-from-file| = \
+             {:.3e} over {} DEV records (bar 1e-6).\n",
+            report.write_side_skew_max_abs_diff, report.write_side_skew_records
+        )?;
+        writeln!(
+            md,
+            "\nTrained rule-by-context second difference (trig-shaped vs \
+             polynomial-shaped neighborhood, two rules): **{:.6}**. The additive arm pins \
+             this at exactly zero by construction; a value of zero here would mean \
+             training collapsed this head into that model class.\n",
+            report.trained_second_difference
+        )?;
+
+        md.push_str(
+            "\n## Per-rule: learned priority (DEV mean predicted score) vs measured \
+             strict-bound rate\n\n",
+        );
+        md.push_str(
+            "| rule | id | train fired | train rate | DEV fired | DEV measured rate | \
+             DEV mean predicted P |\n",
+        );
+        md.push_str("|---|---|---:|---:|---:|---:|---:|\n");
+        for r in &report.per_rule {
+            writeln!(
+                md,
+                "| {} | {} | {} | {:.5} | {} | {:.5} | {:.5} |",
+                r.rule_name,
+                r.rule_id,
+                r.train_fired,
+                r.train_positive_rate,
+                r.dev_fired,
+                r.dev_positive_rate,
+                r.dev_mean_predicted
+            )?;
+        }
+
+        writeln!(md, "\nCheckpoint written to `{}`.", report.checkpoint_path)?;
+        Ok(md)
+    })()
+    .expect("formatting into a String cannot fail");
     std::fs::write(path, md)
         .unwrap_or_else(|e| panic!("train_guide_bilinear: cannot write {path}: {e}"));
     eprintln!("train_guide_bilinear: wrote {path}");

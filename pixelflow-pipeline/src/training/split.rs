@@ -934,7 +934,7 @@ mod tests {
     #[should_panic(expected = "holdout fence cannot be built")]
     fn fence_refuses_to_build_from_a_missing_tier_file() {
         let dir = scratch_dir("missing");
-        let _ = Fence::<DevSide>::build(&dir);
+        let _refused = Fence::<DevSide>::build(&dir);
     }
 
     #[test]
@@ -946,7 +946,7 @@ mod tests {
         // fix commit for PR #1019).
         let dir = scratch_dir("empty_tier");
         write_tier(&dir, Tier::Dev, &[]);
-        let _ = Fence::<DevSide>::build(&dir);
+        let _refused = Fence::<DevSide>::build(&dir);
     }
 
     #[test]

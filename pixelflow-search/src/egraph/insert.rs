@@ -626,7 +626,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "BoundSort")]
     fn insert_refuses_a_mask_bound() {
-        let _ = insert(
+        let _refused = insert(
             &ValueBounded::Mask,
             1,
             &mut EGraph::new(),

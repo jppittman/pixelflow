@@ -75,6 +75,7 @@ pub struct SaturationResult {
 
 impl SaturationResult {
     /// Calculate the improvement ratio (how much the e-graph grew).
+    #[must_use]
     pub fn growth_ratio(&self) -> f64 {
         if self.classes_before == 0 {
             1.0
@@ -84,6 +85,7 @@ impl SaturationResult {
     }
 
     /// Whether the budget was exhausted (saturation was cut off).
+    #[must_use]
     pub fn budget_exhausted(&self) -> bool {
         !self.saturated && self.iterations >= self.budget
     }
@@ -267,11 +269,13 @@ impl SaturationConfig {
     }
 
     /// Trivial expressions (≤10 nodes): minimal budget.
+    #[must_use]
     pub fn blitz() -> Self {
         Self::tier(20, 500)
     }
 
     /// Normal complexity (11-50 nodes): balanced.
+    #[must_use]
     pub fn rapid() -> Self {
         Self::tier(50, 2_000)
     }
@@ -281,6 +285,7 @@ impl SaturationConfig {
     /// [`Self::classical_for`]; this is what that resolves to for any input
     /// of at most 625 inserted classes, and what every offline caller that
     /// names "the classical budget" without an input gets.
+    #[must_use]
     pub fn classical() -> Self {
         Self::tier(100, CLASSICAL_CLASS_FLOOR)
     }
@@ -297,6 +302,7 @@ impl SaturationConfig {
     /// the ceiling its extraction is 42% dearer (the sweep's chrome rows); by
     /// inserted classes it keeps the floor it had. (An `ExprArena` interns,
     /// so its reachable count is already the hash-consed one.)
+    #[must_use]
     pub fn classical_for(inserted_classes: usize) -> Self {
         let classes = inserted_classes
             .saturating_mul(CLASSICAL_CLASSES_PER_INSERTED_CLASS)
@@ -332,6 +338,7 @@ impl SaturationConfig {
     ///     ..SaturationConfig::compatibility(100)
     /// }
     /// ```
+    #[must_use]
     pub fn compatibility(max_iterations: usize) -> Self {
         Self {
             max_iterations,
@@ -435,6 +442,7 @@ impl Band {
 /// | 0-10 | blitz | Trivial expressions need minimal optimization |
 /// | 11-50 | rapid | Normal complexity, balanced approach |
 /// | 51+ | classical, sized by the same count | Complex expressions need thorough search, and a cap the input itself does not fill |
+#[must_use]
 pub fn config_for_input(input: InputSize) -> SaturationConfig {
     tier_for_input(input).1
 }
@@ -444,6 +452,7 @@ pub fn config_for_input(input: InputSize) -> SaturationConfig {
 /// sizes classical from the inserted class count; this is what an offline
 /// caller that has only an arena's node count gets, and what every tier
 /// resolves to for an input of at most 625 inserted classes.
+#[must_use]
 pub fn config_for_node_count(node_count: usize) -> SaturationConfig {
     Band::of(node_count).config(0)
 }

@@ -81,6 +81,7 @@ impl FunctionInverse for Exp2Log2 {
 pub struct ForwardBackward<T: FunctionInverse>(PhantomData<T>);
 
 impl<T: FunctionInverse> ForwardBackward<T> {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self(PhantomData))
     }
@@ -151,6 +152,7 @@ impl<T: FunctionInverse> Rewrite for ForwardBackward<T> {
 pub struct BackwardForward<T: FunctionInverse>(PhantomData<T>);
 
 impl<T: FunctionInverse> BackwardForward<T> {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self(PhantomData))
     }
@@ -278,6 +280,7 @@ impl Homomorphism for LnHomomorphism {
 pub struct HomomorphismRule<T: Homomorphism>(PhantomData<T>);
 
 impl<T: Homomorphism> HomomorphismRule<T> {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self(PhantomData))
     }
@@ -361,6 +364,7 @@ impl<T: Homomorphism> Rewrite for HomomorphismRule<T> {
 pub struct PowerCombine;
 
 impl PowerCombine {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self)
     }
@@ -440,6 +444,7 @@ impl PowerCombine {
 ///
 /// Inf/NaN inputs are UB in this language — these rules are sound
 /// over the well-defined domain.
+#[must_use]
 pub fn exp_rules() -> Vec<Box<dyn Rewrite>> {
     vec![
         // Inverse cancellation

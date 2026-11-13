@@ -71,17 +71,20 @@ impl<'g> Extraction<'g> {
     }
 
     /// The e-graph this extraction selects nodes from.
+    #[must_use]
     pub fn egraph(&self) -> &'g EGraph {
         self.egraph
     }
 
     /// The extraction's (canonical) root e-class.
+    #[must_use]
     pub fn root(&self) -> EClassId {
         self.root
     }
 
     /// The chosen node index for `class`, if `class` is reachable from
     /// [`Self::root`]. `None` for classes outside the extraction.
+    #[must_use]
     pub fn choice(&self, class: EClassId) -> Option<usize> {
         let idx = self.egraph.find(class).index();
         self.choices.get(idx).copied().flatten()

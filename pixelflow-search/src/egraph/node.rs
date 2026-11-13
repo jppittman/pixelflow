@@ -51,6 +51,7 @@ impl EClassId {
     /// Get the index of this e-class ID.
     ///
     /// This is useful for using EClassId as a key in external data structures.
+    #[must_use]
     pub fn index(self) -> usize {
         // Lossless: `usize` is 64 bits on both supported targets.
         self.0 as usize
@@ -334,11 +335,13 @@ pub enum ENode {
 
 impl ENode {
     /// A real constant.
+    #[must_use]
     pub fn constant(val: f32) -> Self {
         ENode::Const(Lit::Real(val))
     }
 
     /// The literal, if this is a `Const` node.
+    #[must_use]
     pub fn literal(&self) -> Option<Lit> {
         match self {
             ENode::Const(lit) => Some(*lit),
@@ -354,12 +357,14 @@ impl ENode {
     /// Whether this node is the real constant `val`, as `f32::eq` sees it:
     /// `0.0` matches `-0.0`, NaN matches nothing. The sense a rule pattern's
     /// literal has always had.
+    #[must_use]
     pub fn is_const(&self, val: f32) -> bool {
         self.as_f32() == Some(val)
     }
 
     /// Whether this node is the literal `lit`: a real as [`Self::is_const`]
     /// reads it, a mask by its truth.
+    #[must_use]
     pub fn is_lit(&self, lit: Lit) -> bool {
         match lit {
             Lit::Real(val) => self.is_const(val),
@@ -461,6 +466,7 @@ impl ENode {
 
     /// The operation this node performs, if it is one: an `Op`'s own, or the
     /// shift a [`ENode::Shift`] names.
+    #[must_use]
     pub fn op(&self) -> Option<OpKind> {
         match self {
             ENode::Op { op, .. } => Some(*op),
@@ -502,6 +508,7 @@ impl ENode {
     /// # Panics
     ///
     /// Panics if this is not a [`ENode::Reduce`]: only a fold has a range.
+    #[must_use]
     pub fn known_range(&self) -> Option<KnownRange> {
         match self {
             ENode::Reduce { header, .. } => header.known_range(),
@@ -516,11 +523,13 @@ impl ENode {
     /// extraction hot path should prefer. This owned form stays for callers
     /// (training/eval tooling outside this crate) that want a `Vec` to hold
     /// past the node's borrow.
+    #[must_use]
     pub fn children(&self) -> Vec<EClassId> {
         self.children_slice().to_vec()
     }
 
     /// Borrow this node's children with no allocation.
+    #[must_use]
     pub fn children_slice(&self) -> &[EClassId] {
         match self {
             ENode::Var(_)
@@ -550,6 +559,7 @@ impl ENode {
     }
 
     /// Get binary operands if this is a binary operation.
+    #[must_use]
     pub fn binary_operands(&self) -> Option<(EClassId, EClassId)> {
         match self {
             ENode::Op { children, .. } if children.len() == 2 => Some((children[0], children[1])),
@@ -636,7 +646,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "a class id past u32::MAX")]
     fn a_class_id_past_u32_max_is_refused() {
-        let _ = EClassId::from_index(u32::MAX as usize + 1);
+        let _refused = EClassId::from_index(u32::MAX as usize + 1);
     }
 
     /// An operand count that is not the op's arity is a bug in whoever built
@@ -644,14 +654,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "Add takes 2 operands")]
     fn an_operation_applied_to_too_few_operands_is_refused() {
-        let _ = ENode::apply(OpKind::Add, &classes(1));
+        let _refused = ENode::apply(OpKind::Add, &classes(1));
     }
 
     /// A leaf kind has no operands to apply, so it is not an operation node.
     #[test]
     #[should_panic(expected = "Const takes 0 operands")]
     fn a_leaf_kind_is_not_an_operation() {
-        let _ = ENode::apply(OpKind::Const, &[]);
+        let _refused = ENode::apply(OpKind::Const, &[]);
     }
 
     /// A shift's count is a parameter of [`ENode::Shift`], so no operand list
@@ -659,7 +669,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Shl is a shift")]
     fn a_shift_is_not_an_operation_over_operand_classes() {
-        let _ = ENode::apply(OpKind::Shl, &classes(2));
+        let _refused = ENode::apply(OpKind::Shl, &classes(2));
     }
 
     /// A shift has its one operand as its only child, and its op is the one
@@ -689,7 +699,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "got 4")]
     fn an_operation_applied_to_too_many_operands_is_refused() {
-        let _ = ENode::apply(OpKind::MulAdd, &classes(4));
+        let _refused = ENode::apply(OpKind::MulAdd, &classes(4));
     }
 
     /// The operands are the live prefix and nothing else: the slice view

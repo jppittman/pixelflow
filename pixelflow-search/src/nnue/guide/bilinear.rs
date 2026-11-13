@@ -834,7 +834,7 @@ mod tests {
         let mut c = candidate(&trainer, r0, vec![OpKind::Add]);
         c.rule_embed[0] += 1.0;
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = trainer.forward(&c);
+            let _refused = trainer.forward(&c);
         }));
         assert!(
             panicked.is_err(),

@@ -242,8 +242,5 @@ name = "extraction_witnesses"
 path = "src/bin/extraction_witnesses.rs"
 bench = false
 
-# Deliberately not `workspace = true` yet: inheriting turns on the deny-level
-# `let_underscore_must_use`, which this crate violates at ~75 discarded
-# `#[must_use]` results (mostly `let _ = writeln!` into a String and test
-# cleanup). Inherit once those are handled; the empty table records intent.
 [lints]
+workspace = true

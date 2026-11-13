@@ -329,7 +329,7 @@ mod tests {
     fn ops_from_histogram_panics_loudly_on_an_unknown_op_name() {
         let mut hist = BTreeMap::new();
         hist.insert("NotARealOp".to_string(), 1usize);
-        let _ = ops_from_histogram(&hist);
+        let _refused = ops_from_histogram(&hist);
     }
 
     fn checkpoint() -> BilinearGuideCheckpoint {
@@ -384,7 +384,7 @@ mod tests {
     fn to_weights_should_refuse_a_checkpoint_whose_weights_were_edited() {
         let mut c = checkpoint();
         c.parameters[7] += 1.0;
-        let _ = c.to_weights(&RuleSet::production());
+        let _refused = c.to_weights(&RuleSet::production());
     }
 
     #[test]
@@ -392,7 +392,7 @@ mod tests {
     fn to_weights_should_refuse_a_checkpoint_from_another_schema() {
         let mut c = checkpoint();
         c.schema_identity = "0000000000000000".into();
-        let _ = c.to_weights(&RuleSet::production());
+        let _refused = c.to_weights(&RuleSet::production());
     }
 
     #[test]
@@ -404,6 +404,6 @@ mod tests {
         let mut chars: Vec<char> = c.rule_fingerprint.chars().collect();
         chars[0] = if chars[0] == 'a' { 'b' } else { 'a' };
         c.rule_fingerprint = chars.into_iter().collect();
-        let _ = c.to_weights(&RuleSet::production());
+        let _refused = c.to_weights(&RuleSet::production());
     }
 }

@@ -296,7 +296,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "no sentinel context")]
     fn missing_sentinel_is_a_loud_error_not_a_skipped_correction() {
-        let _ = normalized_label_ns(&bench(42.0, None), "unit test");
+        let _refused = normalized_label_ns(&bench(42.0, None), "unit test");
     }
 
     /// The point of item 6: with a drift profile applied to the measurements,
@@ -368,6 +368,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "no normalization factors")]
     fn normalization_stats_refuse_empty() {
-        let _ = NormalizationStats::summarize(&[]);
+        let _refused = NormalizationStats::summarize(&[]);
     }
 }

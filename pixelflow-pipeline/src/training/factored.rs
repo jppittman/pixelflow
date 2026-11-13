@@ -20,6 +20,7 @@ use pixelflow_ir::{ExprArena, ExprId, Lit, OpKind};
 /// Test-only helper for older logged repros in `OpName(child1, child2, ...)`
 /// form such as `Add(Mul(Var(0), Var(1)), Var(2))`.
 #[cfg(test)]
+#[must_use]
 pub fn parse_expr(s: &str) -> Option<(ExprArena, ExprId)> {
     let mut arena = ExprArena::new();
     let root = parse_expr_into(s, &mut arena)?;
@@ -540,6 +541,7 @@ impl<'a> ArenaKernelParser<'a> {
 /// [`ExprId`]s (or the same leaf value).
 ///
 /// Returns `None` if the input fails to parse.
+#[must_use]
 pub fn parse_kernel_code_arena(s: &str) -> Option<(ExprArena, ExprId)> {
     ArenaKernelParser::new(s.trim()).parse()
 }
@@ -567,6 +569,7 @@ fn parse_ident(input: &str) -> Option<(&str, &str)> {
 // ============================================================================
 
 /// Convert an [`ExprArena`] subtree into kernel code syntax.
+#[must_use]
 pub fn arena_to_kernel_code(arena: &ExprArena, root: ExprId) -> String {
     enum Task {
         Visit(ExprId),

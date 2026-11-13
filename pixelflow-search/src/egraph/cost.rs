@@ -270,6 +270,7 @@ impl CostModel {
     /// zero-cost is never a useful baseline for real extraction. Use
     /// [`CostModel::zero`] explicitly if you actually want all-zero costs
     /// (e.g. to test structural properties independent of cost).
+    #[must_use]
     pub fn new() -> Self {
         Self::latency_prior()
     }
@@ -279,6 +280,7 @@ impl CostModel {
     /// Source of truth: `latency_prior_cycles`, shared with
     /// `nnue::factored::OpEmbeddings::init_with_latency_prior` so the static
     /// table and the Guide's op-embedding prior cannot drift apart.
+    #[must_use]
     pub fn latency_prior() -> Self {
         Self {
             costs: latency_prior_cycles(),
@@ -303,6 +305,7 @@ impl CostModel {
     /// equivalent forms on cost alone. Only useful for tests that check
     /// structural extraction behavior (DAG sharing, cycle handling, etc.)
     /// independent of any particular cost table.
+    #[must_use]
     pub fn zero() -> Self {
         Self {
             costs: OpMap::splat(0),
@@ -313,6 +316,7 @@ impl CostModel {
     }
 
     /// Create with aggressive depth penalty for complex kernels.
+    #[must_use]
     pub fn shallow() -> Self {
         Self {
             depth_threshold: 16,
@@ -327,6 +331,7 @@ impl CostModel {
 
     /// Get cost for an OpKind.
     #[inline]
+    #[must_use]
     pub fn cost(&self, op: OpKind) -> usize {
         self.costs[op]
     }
@@ -338,6 +343,7 @@ impl CostModel {
     }
 
     /// Get the raw costs array.
+    #[must_use]
     pub fn costs(&self) -> &OpMap<usize> {
         &self.costs
     }
@@ -349,6 +355,7 @@ impl CostModel {
 
     /// Calculate the hinge penalty for a given depth.
     #[inline]
+    #[must_use]
     pub fn depth_cost(&self, depth: usize) -> usize {
         // `>` is an equivalent mutant to `>=` under cargo-mutants: at
         // `depth == self.depth_threshold` the multiplier `(depth -
@@ -363,6 +370,7 @@ impl CostModel {
     }
 
     /// Get cost for an ENode.
+    #[must_use]
     pub fn node_op_cost(&self, node: &ENode) -> usize {
         match node {
             // Buffer is a leaf like Var/Const: the cost of the read lives on
@@ -482,6 +490,7 @@ impl CostModel {
     /// an unrecognized name to `Add`'s cost would let typos and stale
     /// callers pass through with a wrong-but-plausible number — fail loud
     /// instead.
+    #[must_use]
     pub fn cost_by_name(&self, name: &str) -> usize {
         let op = OpKind::from_name(name)
             .unwrap_or_else(|| panic!("CostModel::cost_by_name: unknown op name {name:?}"));
@@ -574,12 +583,12 @@ mod every_op_is_priceable {
         let mut model = CostModel::latency_prior();
 
         for op in [OpKind::Gather, OpKind::RawGather, OpKind::Reduce] {
-            let _ = model.cost(op);
+            let _priced = model.cost(op);
             model.set_cost(op, 1);
         }
 
         for op in OpKind::all() {
-            let _ = model.cost(op);
+            let _priced = model.cost(op);
             model.set_cost(op, 1);
         }
     }

@@ -1069,6 +1069,7 @@ impl R2gCheckpoint {
         )
     }
 
+    #[must_use]
     pub fn weights_fingerprint(&self) -> String {
         let mut buf = String::new();
         buf.push_str(&format!("{:.9}\n", self.bias));

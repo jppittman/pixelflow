@@ -105,6 +105,7 @@ pub use trig::{
 ///
 /// For the full set including fusion (FMA, rsqrt) and differentiation rules,
 /// use [`all_rules`] which returns 62 rules.
+#[must_use]
 pub fn all_math_rules() -> Vec<Box<dyn Rewrite>> {
     let mut rules = Vec::new();
     rules.extend(algebra_rules());
@@ -121,6 +122,7 @@ pub fn all_math_rules() -> Vec<Box<dyn Rewrite>> {
 /// and production optimization where all rules should be available. The
 /// differentiation rule is inert unless the expression contains a `Dwrt`
 /// node, so it costs nothing for derivative-free kernels.
+#[must_use]
 pub fn all_rules() -> Vec<Box<dyn Rewrite>> {
     let mut rules = all_math_rules();
     rules.extend(fusion_rules());
