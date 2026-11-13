@@ -2,6 +2,7 @@
 name = "pixelflow-search"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 description = "A generic graph search framework for algebraic optimization and scheduling"
 
 [lib]
@@ -58,3 +59,9 @@ saturation-telemetry = []
 # `pixelflow-compiler`, `pixelflow-codegen`, `pixelflow-runtime`, or
 # `core-term` — pinned by `scripts/check-provenance-journal-scope.sh` in CI.
 provenance-journal = []
+
+# Deliberately not `workspace = true` yet: inheriting turns on the deny-level
+# `let_underscore_must_use`, which this crate violates at ~75 discarded
+# `#[must_use]` results (mostly `let _ = writeln!` into a String and test
+# cleanup). Inherit once those are handled; the empty table records intent.
+[lints]

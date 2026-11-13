@@ -156,16 +156,16 @@ pub(crate) fn range_bounds(range: &RangeExpr, scope: RangeScope<'_>) -> syn::Res
     let hi = scope.eval_usize(&range.hi)?;
     let (Count::Known(first), Count::Known(last)) = (&lo, &hi) else {
         for (end, count) in [("first", &lo), ("last", &hi)] {
-            if let Count::Known(value) = count {
-                if *value > Fold::EXACT_BOUND {
-                    return Err(syn::Error::new(
-                        range.span,
-                        format!(
-                            "the {end} fold bound {value} reaches past {} (2^24): a fold's index is an exact `f32` only through that count",
-                            Fold::EXACT_BOUND
-                        ),
-                    ));
-                }
+            if let Count::Known(value) = count
+                && *value > Fold::EXACT_BOUND
+            {
+                return Err(syn::Error::new(
+                    range.span,
+                    format!(
+                        "the {end} fold bound {value} reaches past {} (2^24): a fold's index is an exact `f32` only through that count",
+                        Fold::EXACT_BOUND
+                    ),
+                ));
             }
         }
         return Ok([lo, hi]);

@@ -368,20 +368,19 @@ impl<'a> FnAnalyzer<'a> {
         if matches!(
             fold.reduction,
             crate::ast::Reduction::Any | crate::ast::Reduction::All
-        ) {
-            if let Some(name) = bounds.iter().find_map(super::consts::Count::name) {
-                return Err(syn::Error::new(
-                    name.span(),
-                    format!(
-                        "`{}` over a range bounded by `{name}`, a value: `any` and `all` require bounds known at expansion",
-                        if fold.reduction == crate::ast::Reduction::Any {
-                            "any"
-                        } else {
-                            "all"
-                        }
-                    ),
-                ));
-            }
+        ) && let Some(name) = bounds.iter().find_map(super::consts::Count::name)
+        {
+            return Err(syn::Error::new(
+                name.span(),
+                format!(
+                    "`{}` over a range bounded by `{name}`, a value: `any` and `all` require bounds known at expansion",
+                    if fold.reduction == crate::ast::Reduction::Any {
+                        "any"
+                    } else {
+                        "all"
+                    }
+                ),
+            ));
         }
         if self.folds_open >= KERNEL_BINDER_CAPACITY {
             return Err(folds_nested_too_deep(fold.span));

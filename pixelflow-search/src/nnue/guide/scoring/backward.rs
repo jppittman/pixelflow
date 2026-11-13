@@ -844,57 +844,57 @@ mod tests {
         // while testing nothing. `every_relu_on_the_path_should_be_open_at_
         // the_fixture_point` pins that this is still true.
         let bias = |j: usize, salt: usize| -> f32 { f(j, 0, salt).abs() + 0.25 };
-        for i in 0..CANDIDATE_INPUT_DIM {
-            for j in 0..HIDDEN_DIM {
-                head.candidate_w1[i][j] = f(i, j, 1);
+        for (i, row) in head.candidate_w1.iter_mut().enumerate() {
+            for (j, w) in row.iter_mut().enumerate() {
+                *w = f(i, j, 1);
             }
         }
         for (j, b) in head.candidate_b1.iter_mut().enumerate() {
             *b = bias(j, 2);
         }
-        for i in 0..HIDDEN_DIM {
-            for j in 0..HIDDEN_DIM {
-                head.trunk_w[i][j] = f(i, j, 3);
+        for (i, row) in head.trunk_w.iter_mut().enumerate() {
+            for (j, w) in row.iter_mut().enumerate() {
+                *w = f(i, j, 3);
             }
         }
         for (j, b) in head.trunk_b.iter_mut().enumerate() {
             *b = bias(j, 4);
         }
-        for j in 0..HIDDEN_DIM {
-            for k in 0..EMBED_DIM {
-                head.candidate_proj_w[j][k] = f(j, k, 5);
+        for (j, row) in head.candidate_proj_w.iter_mut().enumerate() {
+            for (k, w) in row.iter_mut().enumerate() {
+                *w = f(j, k, 5);
             }
         }
         for (k, b) in head.candidate_proj_b.iter_mut().enumerate() {
             *b = f(k, 0, 6);
         }
-        for i in 0..EMBED_DIM {
-            for j in 0..MLP_HIDDEN {
-                head.mask_mlp_w1[i][j] = f(i, j, 7);
+        for (i, row) in head.mask_mlp_w1.iter_mut().enumerate() {
+            for (j, w) in row.iter_mut().enumerate() {
+                *w = f(i, j, 7);
             }
         }
         for (j, b) in head.mask_mlp_b1.iter_mut().enumerate() {
             *b = bias(j, 8);
         }
-        for j in 0..MLP_HIDDEN {
-            for k in 0..EMBED_DIM {
-                head.mask_mlp_w2[j][k] = f(j, k, 9);
+        for (j, row) in head.mask_mlp_w2.iter_mut().enumerate() {
+            for (k, w) in row.iter_mut().enumerate() {
+                *w = f(j, k, 9);
             }
         }
         for (k, b) in head.mask_mlp_b2.iter_mut().enumerate() {
             *b = f(k, 0, 10);
         }
-        for i in 0..EMBED_DIM {
-            for j in 0..EMBED_DIM {
-                head.interaction[i][j] = f(i, j, 11);
+        for (i, row) in head.interaction.iter_mut().enumerate() {
+            for (j, w) in row.iter_mut().enumerate() {
+                *w = f(i, j, 11);
             }
         }
         for (k, b) in head.mask_bias_proj.iter_mut().enumerate() {
             *b = f(k, 0, 12);
         }
-        for i in 0..RULE_CONCAT_DIM {
-            for k in 0..EMBED_DIM {
-                head.rule_proj_w[i][k] = f(i, k, 13);
+        for (i, row) in head.rule_proj_w.iter_mut().enumerate() {
+            for (k, w) in row.iter_mut().enumerate() {
+                *w = f(i, k, 13);
             }
         }
         for (k, b) in head.rule_proj_b.iter_mut().enumerate() {

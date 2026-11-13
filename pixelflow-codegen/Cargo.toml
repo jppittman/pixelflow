@@ -2,6 +2,7 @@
 name = "pixelflow-codegen"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 description = "Expression graphs to machine code: per-ISA emitters, executable memory, and the compile cache"
 
 [lib]

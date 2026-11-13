@@ -11,6 +11,11 @@ opt-level = 0
 panic = "abort"
 
 # Workspace-wide lints - prevents swallowing errors with `let _ = `
+[workspace.package]
+# The never type `!` and the Cargo lint and cooldown settings in this
+# workspace are stable as of 1.100.
+rust-version = "1.100"
+
 [workspace.lints.rust]
 # Treat unused Results as errors - forces explicit handling
 unused_must_use = "deny"
@@ -20,6 +25,14 @@ unused_must_use = "deny"
 let_underscore_must_use = "deny"
 # Warns about functions that should probably be #[must_use]
 must_use_candidate = "warn"
+
+[workspace.lints.cargo]
+# A dependency nothing uses is a build cost and a supply-chain surface for
+# nothing (Rust 1.100). `warn`, not `deny`: a feature-gated dependency used
+# only by benches or tests (pixelflow-graphics' `freetype-rs`; Cargo has no
+# optional dev-dependencies) is reported by every lib-only check, and an
+# exception can't be scoped to one crate under `workspace = true`.
+unused_dependencies = "warn"
 
 # Normal release - fast compile, good perf
 [profile.release]

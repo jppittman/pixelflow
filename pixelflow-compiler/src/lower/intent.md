@@ -33,7 +33,7 @@ walk run at expansion or when the host function is called, or the first refusal.
 `pub(crate) use`d there.
 
 ## Enforced by
-- Types: `Expansion`'s `Site::Argument` is `Infallible`, so no entry taking a
+- Types: `Expansion`'s `Site::Argument` is `!`, so no entry taking a
   kernel lowers at expansion; `Scopes<Binding>` holds every name, so a binding
   resolves before a coordinate; `FoldBound` keeps known and value
   counts distinct until a site builds a `Reduce`.

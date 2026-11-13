@@ -375,7 +375,7 @@ impl Stage for Observed {
 /// The stage allocation builds, one instruction at a time as the scan places
 /// it: borrowed tokens, slots as descriptors, block arguments already placed
 /// as moves, and the frame's size as a handle the scan fills when it ends.
-struct Bound<'m, B>(core::convert::Infallible, PhantomData<&'m fn() -> B>);
+struct Bound<'m, B>(!, PhantomData<&'m fn() -> B>);
 
 impl<'m, B: IsaBackend> Stage for Bound<'m, B> {
     type Write<C: Class> = Out<'m, B, C>;

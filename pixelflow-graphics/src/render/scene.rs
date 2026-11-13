@@ -557,10 +557,10 @@ mod tests {
         let mut device_frame = Frame::<Rgba8>::new(32, 32);
         Scene::Packed(device.bind(&[])).render(&mut device_frame, 1);
 
-        for x in 0..32usize {
+        for (x, px) in device_frame.data[..32].iter().enumerate() {
             let expected = (((x as f32 + 0.5) * 0.5 / 16.0) * 255.0) as u8;
             assert_eq!(
-                device_frame.data[x].r(),
+                px.r(),
                 expected,
                 "device column {x} does not sample point space"
             );

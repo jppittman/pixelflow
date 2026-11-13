@@ -18,3 +18,10 @@ target-dir = "target.noindex"
 rustflags = [
     "-C", "llvm-args=-fp-contract=fast",
 ]
+
+[registry]
+# Dependency cooldown (Rust 1.100): the resolver ignores a version published
+# less than a week ago unless it is already in Cargo.lock. Most malicious
+# crate releases are found and yanked within days; a week of lag on new
+# versions costs us nothing.
+global-min-publish-age = "7 days"
