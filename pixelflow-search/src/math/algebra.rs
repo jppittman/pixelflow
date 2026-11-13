@@ -94,6 +94,7 @@ impl InversePair for MulRecip {
 pub struct Canonicalize<T: InversePair>(PhantomData<T>);
 
 impl<T: InversePair> Canonicalize<T> {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self(PhantomData))
     }
@@ -149,6 +150,7 @@ impl<T: InversePair> Rewrite for Canonicalize<T> {
 pub struct Involution<T: InversePair>(PhantomData<T>);
 
 impl<T: InversePair> Involution<T> {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self(PhantomData))
     }
@@ -214,6 +216,7 @@ impl<T: InversePair> Rewrite for Involution<T> {
 pub struct Cancellation<T: InversePair>(PhantomData<T>);
 
 impl<T: InversePair> Cancellation<T> {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self(PhantomData))
     }
@@ -278,6 +281,7 @@ impl<T: InversePair> Rewrite for Cancellation<T> {
 pub struct InverseAnnihilation<T: InversePair>(PhantomData<T>);
 
 impl<T: InversePair> InverseAnnihilation<T> {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self(PhantomData))
     }
@@ -350,6 +354,7 @@ pub struct Associative {
 }
 
 impl Associative {
+    #[must_use]
     pub fn new(op: OpKind) -> Box<Self> {
         Box::new(Self { op })
     }
@@ -414,6 +419,7 @@ pub struct ReverseAssociative {
 }
 
 impl ReverseAssociative {
+    #[must_use]
     pub fn new(op: OpKind) -> Box<Self> {
         Box::new(Self { op })
     }
@@ -479,6 +485,7 @@ pub struct Commutative {
 }
 
 impl Commutative {
+    #[must_use]
     pub fn new(op: OpKind) -> Box<Self> {
         Box::new(Self { op })
     }
@@ -528,6 +535,7 @@ pub struct Distributive {
 }
 
 impl Distributive {
+    #[must_use]
     pub fn new(outer: OpKind, inner: OpKind) -> Box<Self> {
         Box::new(Self { outer, inner })
     }
@@ -591,6 +599,7 @@ pub struct Factor {
 }
 
 impl Factor {
+    #[must_use]
     pub fn new(outer: OpKind, inner: OpKind) -> Box<Self> {
         Box::new(Self { outer, inner })
     }
@@ -669,6 +678,7 @@ pub struct Identity {
 }
 
 impl Identity {
+    #[must_use]
     pub fn new(op: OpKind) -> Box<Self> {
         Box::new(Self { op })
     }
@@ -725,6 +735,7 @@ pub struct Annihilator {
 }
 
 impl Annihilator {
+    #[must_use]
     pub fn new(op: OpKind) -> Box<Self> {
         Box::new(Self { op })
     }
@@ -776,6 +787,7 @@ pub struct Idempotent {
 }
 
 impl Idempotent {
+    #[must_use]
     pub fn new(op: OpKind) -> Box<Self> {
         Box::new(Self { op })
     }
@@ -838,6 +850,7 @@ impl Rewrite for Idempotent {
 pub struct Doubling;
 
 impl Doubling {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self)
     }
@@ -891,6 +904,7 @@ impl Rewrite for Doubling {
 pub struct Halving;
 
 impl Halving {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self)
     }
@@ -959,6 +973,7 @@ const MAX_FOLD_ARGUMENTS: usize = 3;
 pub struct ConstantFold;
 
 impl ConstantFold {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self)
     }
@@ -1075,6 +1090,7 @@ fn reals_of<'a>(args: &[Lit], out: &'a mut [f32; MAX_FOLD_ARGUMENTS]) -> Option<
 // ============================================================================
 
 /// All algebraic rules derived from InversePair trait.
+#[must_use]
 pub fn inverse_pair_rules() -> Vec<Box<dyn Rewrite>> {
     vec![
         // AddNeg: a - b → a + neg(b), neg(neg(x)) → x, etc.
@@ -1091,6 +1107,7 @@ pub fn inverse_pair_rules() -> Vec<Box<dyn Rewrite>> {
 }
 
 /// Basic algebraic rules (commutativity, identity, annihilator, etc.).
+#[must_use]
 pub fn basic_algebra_rules() -> Vec<Box<dyn Rewrite>> {
     vec![
         // Constant folding: op(const, ...) → const
@@ -1130,6 +1147,7 @@ pub fn basic_algebra_rules() -> Vec<Box<dyn Rewrite>> {
 }
 
 /// All algebra rules combined.
+#[must_use]
 pub fn algebra_rules() -> Vec<Box<dyn Rewrite>> {
     let mut rules = inverse_pair_rules();
     rules.extend(basic_algebra_rules());

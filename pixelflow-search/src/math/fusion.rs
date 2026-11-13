@@ -27,6 +27,7 @@ use pixelflow_ir::arena::{ExprArena, ExprId};
 pub struct FmaFusion;
 
 impl FmaFusion {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self)
     }
@@ -97,6 +98,7 @@ impl Rewrite for FmaFusion {
 pub struct RecipSqrt;
 
 impl RecipSqrt {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self)
     }
@@ -203,6 +205,7 @@ fn extract_sqrt(egraph: &EGraph, class: EClassId) -> Option<EClassId> {
 /// These are performance optimization rules, not mathematical identities:
 /// - FMA: `a * b + c` → `muladd(a, b, c)` (FmaFusion)
 /// - Rsqrt: `1/sqrt(x)` → `rsqrt(x)` (RecipSqrt)
+#[must_use]
 pub fn fusion_rules() -> Vec<Box<dyn Rewrite>> {
     vec![FmaFusion::new(), RecipSqrt::new()]
 }

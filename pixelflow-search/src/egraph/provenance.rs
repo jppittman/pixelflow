@@ -88,6 +88,7 @@ pub struct ENodeId(pub(crate) u64);
 
 impl ENodeId {
     /// Raw numeric value, useful for logging/debugging.
+    #[must_use]
     pub fn as_u64(self) -> u64 {
         self.0
     }
@@ -100,6 +101,7 @@ pub struct ApplicationId(pub(crate) u64);
 
 impl ApplicationId {
     /// Raw numeric value, useful for logging/debugging.
+    #[must_use]
     pub fn as_u64(self) -> u64 {
         self.0
     }
@@ -269,6 +271,7 @@ pub(crate) struct OpenApplication {
 
 impl Provenance {
     /// Create an empty provenance store.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -360,12 +363,14 @@ impl Provenance {
 
     /// Look up the origin of a node, if known.
     #[cfg(feature = "provenance-journal")]
+    #[must_use]
     pub fn origin(&self, id: ENodeId) -> Option<Origin> {
         self.origins.get(&id).copied()
     }
 
     /// Look up an application record by id.
     #[cfg(feature = "provenance-journal")]
+    #[must_use]
     pub fn application(&self, id: ApplicationId) -> Option<&ApplicationRecord> {
         self.applications.get(id.0 as usize)
     }
@@ -379,24 +384,28 @@ impl Provenance {
     /// one is named `recorded_count` rather than `application_count` so the
     /// two are never mistaken for the same quantity at a call site.
     #[cfg(feature = "provenance-journal")]
+    #[must_use]
     pub fn recorded_count(&self) -> usize {
         self.applications.len()
     }
 
     /// Number of union events recorded.
     #[cfg(feature = "provenance-journal")]
+    #[must_use]
     pub fn union_count(&self) -> usize {
         self.unions.len()
     }
 
     /// Number of e-node origins recorded.
     #[cfg(feature = "provenance-journal")]
+    #[must_use]
     pub fn origin_count(&self) -> usize {
         self.origins.len()
     }
 
     /// All union events (in chronological order).
     #[cfg(feature = "provenance-journal")]
+    #[must_use]
     pub fn union_events(&self) -> &[UnionEvent] {
         &self.unions
     }
@@ -668,6 +677,7 @@ pub struct TightWalk<'a> {
 /// bound's name. `EGraph::derivation_ancestors_tight` passes the same
 /// slice for both, which is right when the seeds ARE the whole extraction.
 #[cfg(feature = "provenance-journal")]
+#[must_use]
 pub fn derivation_ancestors_tight(
     graph: GraphView<'_>,
     provenance: &Provenance,

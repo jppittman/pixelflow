@@ -536,6 +536,7 @@ impl Saturation {
     ///
     /// Returns only targets where the rule actually matches (produces an action).
     /// Much more efficient than enumerating all combinations - only scores real matches.
+    #[must_use]
     pub fn find_rewrite_matches(&self) -> Vec<RewriteTarget> {
         let mut matches = Vec::new();
 

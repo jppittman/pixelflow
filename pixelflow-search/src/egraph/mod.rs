@@ -149,6 +149,7 @@ pub use crate::math::{
 /// All rewrite rules: 40 math + 2 fusion = 42 total.
 ///
 /// This is the complete rule set for optimization, training, and production.
+#[must_use]
 pub fn all_rules() -> Vec<Box<dyn Rewrite>> {
     crate::math::all_rules()
 }

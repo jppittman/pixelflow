@@ -143,8 +143,10 @@ fn main() {
             let text_path = "/tmp/egraph_profile.txt";
             if let Ok(mut file) = std::fs::File::create(text_path) {
                 use std::io::Write;
-                let _ = writeln!(file, "{report:?}");
-                println!("[PPROF] text report written to {text_path}");
+                match writeln!(file, "{report:?}") {
+                    Ok(()) => println!("[PPROF] text report written to {text_path}"),
+                    Err(error) => eprintln!("[PPROF] cannot write {text_path}: {error}"),
+                }
             }
         }
     }

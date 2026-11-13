@@ -404,7 +404,9 @@ mod tests {
         let mut dir = std::env::temp_dir();
         dir.push(format!("pf_journal_test_{}", std::process::id()));
         let path = dir.join("nested/journal.jsonl");
-        let _ = fs::remove_dir_all(&dir);
+        if let Err(error) = fs::remove_dir_all(&dir) {
+            eprintln!("leaving {}: {error}", dir.display());
+        }
 
         append_record(&path, &Rec { n: 1 });
         append_record(&path, &Rec { n: 2 });
@@ -413,7 +415,9 @@ mod tests {
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines, vec!["{\"n\":1}", "{\"n\":2}"]);
 
-        let _ = fs::remove_dir_all(&dir);
+        if let Err(error) = fs::remove_dir_all(&dir) {
+            eprintln!("leaving {}: {error}", dir.display());
+        }
     }
 
     #[test]

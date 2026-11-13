@@ -548,6 +548,7 @@ fn pin_to_a_core() {
 ///
 /// # Panics
 /// If any kernel fails to compile or is too narrow for this tier's batch.
+#[must_use]
 pub fn run_corpus(kernels: &[CollapseKernel], passes: u32) -> Vec<Row> {
     let order = shuffled(kernels.len());
     let mut session = CollapseSession::open();

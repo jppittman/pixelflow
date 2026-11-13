@@ -110,6 +110,7 @@ impl AngleAddition for CosAngleAddition {
 pub struct AngleAdditionRule<T: AngleAddition>(PhantomData<T>);
 
 impl<T: AngleAddition> AngleAdditionRule<T> {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self(PhantomData))
     }
@@ -218,6 +219,7 @@ impl<T: AngleAddition> Rewrite for AngleAdditionRule<T> {
 pub struct Pythagorean;
 
 impl Pythagorean {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self)
     }
@@ -361,6 +363,7 @@ impl Pythagorean {
 pub struct ReverseAngleAddition;
 
 impl ReverseAngleAddition {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self)
     }
@@ -545,6 +548,7 @@ impl ReverseAngleAddition {
 pub struct HalfAngleProduct;
 
 impl HalfAngleProduct {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self)
     }
@@ -648,6 +652,7 @@ impl HalfAngleProduct {
 ///
 /// This means sin(x)*cos(x) and sin(2x)/2 end up in the same equivalence class
 /// WITHOUT needing an explicit "double angle" rule.
+#[must_use]
 pub fn trig_rules() -> Vec<Box<dyn Rewrite>> {
     vec![
         // Angle addition formulas (forward direction)

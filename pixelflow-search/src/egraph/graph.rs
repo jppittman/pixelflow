@@ -208,6 +208,7 @@ impl EGraph {
     /// With `provenance-journal` the mutation log is kept, so every direct
     /// caller keeps what it had. Rules are the runner's: see
     /// [`Saturation::over`].
+    #[must_use]
     pub fn new() -> Self {
         Self {
             graph: FrozenGraph {
@@ -269,6 +270,7 @@ impl EGraph {
         }
     }
 
+    #[must_use]
     pub fn find(&self, id: EClassId) -> EClassId {
         self.graph.find(id)
     }
@@ -650,6 +652,7 @@ impl EGraph {
     }
 
     /// Number of pending worklist items (classes needing rebuild).
+    #[must_use]
     pub fn pending_rebuilds(&self) -> usize {
         self.worklist.len()
     }
@@ -710,6 +713,7 @@ impl EGraph {
     /// The mutation log (origins, application log, union journal), or `None`
     /// for a graph built [`without_journal`](Self::without_journal). See the
     /// `provenance` module for details.
+    #[must_use]
     pub fn provenance(&self) -> Option<&Provenance> {
         self.journal.as_ref()
     }
@@ -722,6 +726,7 @@ impl EGraph {
     ///
     /// On a graph built without a journal.
     #[cfg(feature = "provenance-journal")]
+    #[must_use]
     pub fn journal(&self) -> &Provenance {
         self.journal.as_ref().expect(NO_JOURNAL)
     }
@@ -729,12 +734,14 @@ impl EGraph {
     /// The node `tag` names, if it is a member of `id`'s class now: `None`
     /// for a node another class holds, a retired node (law 7), or a tag past
     /// this graph's end. O(1).
+    #[must_use]
     pub fn node_for_tag(&self, id: EClassId, tag: ENodeId) -> Option<&ENode> {
         self.graph.node_for_tag(id, tag)
     }
 
     /// Whether node `tag` is a member of a class now: false exactly for a
     /// retired node (law 7) and for a tag past this graph's end.
+    #[must_use]
     pub fn is_member(&self, tag: ENodeId) -> bool {
         self.graph.columns.class_of(tag).is_some() && !self.graph.columns.is_retired(tag)
     }
@@ -755,6 +762,7 @@ impl EGraph {
     /// pass selected). See [`super::provenance::derivation_ancestors`] for
     /// the exact over-approximation made.
     #[cfg(feature = "provenance-journal")]
+    #[must_use]
     pub fn derivation_ancestors(
         &self,
         chosen_nodes: &[(EClassId, ENodeId)],
@@ -777,6 +785,7 @@ impl EGraph {
     /// `derivation_ancestors` computes, so both can be run on the same
     /// episode for comparison.
     #[cfg(feature = "provenance-journal")]
+    #[must_use]
     pub fn derivation_ancestors_tight(
         &self,
         chosen_nodes: &[(EClassId, ENodeId)],
@@ -791,6 +800,7 @@ impl EGraph {
     /// only the seeds as the choice map degrades the walk back to the loose
     /// bound for every class it descends into.
     #[cfg(feature = "provenance-journal")]
+    #[must_use]
     pub fn derivation_ancestors_tight_from(
         &self,
         seeds: &[(EClassId, ENodeId)],
@@ -818,6 +828,7 @@ impl EGraph {
     /// Ids are never reclaimed — a union repoints a slot rather than freeing
     /// it — so this is the count [`Limits::minted`] bounds, not the number of
     /// live classes ([`Self::class_ids`] yields those).
+    #[must_use]
     pub fn num_classes(&self) -> usize {
         self.graph.num_classes()
     }
@@ -867,15 +878,18 @@ impl EGraph {
 
     /// Nodes minted and not retired (law 7), duplicates counted: every member
     /// of every live class.
+    #[must_use]
     pub fn node_count(&self) -> usize {
         self.graph.columns.len() - self.graph.columns.retired_count()
     }
 
+    #[must_use]
     pub fn contains_const(&self, id: EClassId, val: f32) -> bool {
         self.contains_lit(id, Lit::Real(val))
     }
 
     /// Whether `id` holds the literal `lit`, as [`ENode::is_lit`] reads it.
+    #[must_use]
     pub fn contains_lit(&self, id: EClassId, lit: Lit) -> bool {
         self.nodes(id).any(|n| n.is_lit(lit))
     }

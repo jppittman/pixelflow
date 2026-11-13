@@ -184,6 +184,7 @@ fn pow_special_value_rules() -> Vec<Box<dyn Rewrite>> {
 pub struct PowerRecurrence;
 
 impl PowerRecurrence {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self)
     }
@@ -248,9 +249,11 @@ pub struct LogPower {
 }
 
 impl LogPower {
+    #[must_use]
     pub fn ln() -> Box<Self> {
         Box::new(Self { log_op: OpKind::Ln })
     }
+    #[must_use]
     pub fn log2() -> Box<Self> {
         Box::new(Self {
             log_op: OpKind::Log2,
@@ -329,6 +332,7 @@ impl Rewrite for LogPower {
 pub struct ExpandSquare;
 
 impl ExpandSquare {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self)
     }
@@ -404,6 +408,7 @@ impl Rewrite for ExpandSquare {
 pub struct DiffOfSquares;
 
 impl DiffOfSquares {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self)
     }
@@ -477,6 +482,7 @@ impl DiffOfSquares {
 /// - 2 LogPower (ln, log2)
 /// - 1 ExpandSquare
 /// - 1 DiffOfSquares
+#[must_use]
 pub fn power_rules() -> Vec<Box<dyn Rewrite>> {
     let mut rules = pow_special_value_rules();
     // Tower rule

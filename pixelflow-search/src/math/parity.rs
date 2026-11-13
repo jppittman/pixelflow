@@ -120,6 +120,7 @@ impl Parity for AbsParity {
 pub struct ParityNegation<T: Parity>(PhantomData<T>);
 
 impl<T: Parity> ParityNegation<T> {
+    #[must_use]
     pub fn new() -> Box<Self> {
         Box::new(Self(PhantomData))
     }
@@ -210,6 +211,7 @@ impl<T: Parity> Rewrite for ParityNegation<T> {
 // ============================================================================
 
 /// All parity-based rules for trig and other functions.
+#[must_use]
 pub fn parity_rules() -> Vec<Box<dyn Rewrite>> {
     vec![
         // Odd functions: Op(neg(x)) → neg(Op(x))

@@ -1353,6 +1353,7 @@ impl Rewrite for DivByLiteral {
 /// text estimate of "31" undercounted N24r, which the design also lists as
 /// a registered index; the family count and every N-numbered identity match
 /// exactly).
+#[must_use]
 pub fn experimental_rules() -> Vec<Box<dyn Rewrite>> {
     let mut rules: Vec<Box<dyn Rewrite>> = Vec::new();
     rules.extend(min_max_duality_rules()); // N1, N2

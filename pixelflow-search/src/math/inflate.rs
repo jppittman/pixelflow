@@ -1146,7 +1146,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be >= the base rule count")]
     fn order_matched_base_rejects_a_total_below_the_base_count() {
-        let _ = order_matched_base(DEFAULT_INTERLEAVE_SEED, 10);
+        let _refused = order_matched_base(DEFAULT_INTERLEAVE_SEED, 10);
     }
 
     #[test]
