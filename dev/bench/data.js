@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1794342893151,
+  "lastUpdate": 1794588926865,
   "repoUrl": "https://github.com/jppittman/pixelflow",
   "entries": {
     "Benchmark": [
@@ -171448,6 +171448,744 @@ window.BENCHMARK_DATA = {
             "name": "traverse/dag_descendants_in_scratch_reused",
             "value": 100545,
             "range": "± 2145",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "166569057+jppittman@users.noreply.github.com",
+            "name": "JP Pittman",
+            "username": "jppittman"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "379e8ce9a46b4dab6e079fb49dc83bb22187b007",
+          "message": "chore: adopt Rust 1.100 never type, Cargo lints and cooldown (#1499)\n\nCI already tracks `stable`, so it picks up 1.100 by itself. This PR\nmakes the workspace pass under it and uses the parts of 1.100 that\ndelete code or add a check.\n\n**Never type `!`**\n- `pixelflow-ir/src/passes.rs`: the hand-rolled `enum Never {}` is gone.\n`rebuild_arena` now uses an irrefutable `let Ok(id) =\ntry_rebuild_arena::<!, _>(…)`.\n- `pixelflow-compiler/src/lower/site.rs`: `Site::Argument = !`, and\n`apply(kernel: !)` just returns `kernel`. `intent.md` is updated to\nmatch.\n- `pixelflow-codegen/src/emit/mod.rs`: the uninhabited `Bound` stage\nmarker holds `!`.\n\n**Clippy 1.100.** `needless_range_loop` now also fires on diagonal\nindexing and partial ranges, and `collapsible_if` reaches two more\nsites. Together they turned `-D warnings` red on every crate. I rewrote\n34 loops to iterate over what they index (`as_flattened_mut`,\n`iter_mut().enumerate()`, sub-slices); I did not add an `allow`. The\nrandom-initialisation loops draw values in the same row-major order, so\nthe weights don't change.\n\n**Cargo**\n- `[workspace.lints.cargo] unused_dependencies = \"warn\"`. The Feature\nmatrix job found one real case: `pixelflow-ml`'s `libm` is used only\nunder `graphics`, so it is now optional behind that feature. The lint is\nnot `deny` because of `freetype-rs`. It is an optional normal dependency\nonly because Cargo has no optional dev-dependencies, and only benches\nand tests use it, so every lib-only check reports it. Cargo also can't\nscope an exception to one crate under `workspace = true`.\n- `pixelflow-search` and `pixelflow-pipeline` never inherited the\nworkspace lints; 1.100's `missing_lints_inheritance` warning surfaced\nthis. Inheriting them trips about 75 deny-level `let _ = <must_use>`\ndiscards. Until those are fixed, each crate has an explicit, commented,\nempty `[lints]` table instead of silently omitting it.\n- `.cargo/config.toml` sets `registry.global-min-publish-age = \"7\ndays\"`, a dependency cooldown. It affects only new resolutions, not what\nis already in `Cargo.lock`.\n- `rust-version = \"1.100\"` for the whole workspace. `pixelflow-compiler`\nclaimed 1.85.\n\n**Assessed and left alone**\n- Allocator API: there are no polyfill crates, and the arenas are index\ntables. JIT memory needs the RW→RX `mprotect`, which an `Allocator`\ncan't express.\n- `extern \"custom\"`: there are no naked functions or `global_asm!`, and\nJIT code really is called through `extern \"C\"`.\n- Compatibility notes (x86 Rust-ABI SSE, `min`/`max` `Ord`, `box`\npatterns, `repr`): nothing here is affected.\n- `DropGuard`: every guard here is either a named type with its own\ncontract or an RAII owner.\n- `Vec::from_fn`: about 110 cosmetic sites.\n\n**Local verification**\n- `cargo clippy --workspace --all-targets --all-features -- -D\nwarnings`: clean on x86_64 Linux. Also clean for `aarch64-apple-darwin`,\nexcluding the crates with C build dependencies, which can't\ncross-compile here.\n- `cargo test --workspace --all-features`: 3,081 passed, 0 failed.\n- `xtask isa-matrix --clippy --smoke` passes on AVX2 and AVX-512.\n- The three Feature matrix commands that failed now pass.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nhttps://claude.ai/code/session_01WjvQDqMFPH8wuYcCz4xBav\n\n---------\n\nCo-authored-by: Claude <noreply@anthropic.com>",
+          "timestamp": "2026-11-13T08:28:14-08:00",
+          "tree_id": "6704c6ea6ce758ac9e13ef52e6ac2274dc8575ea",
+          "url": "https://github.com/jppittman/pixelflow/commit/379e8ce9a46b4dab6e079fb49dc83bb22187b007"
+        },
+        "date": 1794588925826,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "data_throughput_under_control_flood",
+            "value": 60452678,
+            "range": "± 83738",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "burst_limit_vs_unlimited",
+            "value": 50364893,
+            "range": "± 30017",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "four_control_flooders_vs_data",
+            "value": 62019370,
+            "range": "± 1395564",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "slow_receiver_backpressure",
+            "value": 63469351,
+            "range": "± 186868",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "control_latency_steady_state/buffer/10",
+            "value": 15887,
+            "range": "± 1591",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "control_latency_steady_state/buffer/32",
+            "value": 16257,
+            "range": "± 1650",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "control_latency_steady_state/buffer/100",
+            "value": 16374,
+            "range": "± 1565",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "control_latency_under_data_flood",
+            "value": 4477,
+            "range": "± 1321",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "management_latency_steady_state/buffer/10",
+            "value": 16069,
+            "range": "± 1553",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "management_latency_steady_state/buffer/32",
+            "value": 16107,
+            "range": "± 2175",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "management_latency_steady_state/buffer/100",
+            "value": 16365,
+            "range": "± 1472",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "management_latency_under_control_flood",
+            "value": 1984,
+            "range": "± 2659",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dispatch/actor_sends/1000",
+            "value": 16236,
+            "range": "± 41",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dispatch/transducer_returns/1000",
+            "value": 16531,
+            "range": "± 99",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dispatch/actor_sends/10000",
+            "value": 181330,
+            "range": "± 1728",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dispatch/transducer_returns/10000",
+            "value": 186065,
+            "range": "± 1710",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dispatch/actor_sends/100000",
+            "value": 1697372,
+            "range": "± 23600",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dispatch/transducer_returns/100000",
+            "value": 1744563,
+            "range": "± 15447",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pipeline_3_stage/three_threads/1000",
+            "value": 146666,
+            "range": "± 2446",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pipeline_3_stage/one_thread/1000",
+            "value": 28064,
+            "range": "± 2244",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pipeline_3_stage/three_threads/10000",
+            "value": 994334,
+            "range": "± 14859",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pipeline_3_stage/one_thread/10000",
+            "value": 309233,
+            "range": "± 2479",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pipeline_3_stage/three_threads/100000",
+            "value": 9084718,
+            "range": "± 398046",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pipeline_3_stage/one_thread/100000",
+            "value": 2939366,
+            "range": "± 60213",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "priority/data_uncontended",
+            "value": 21839,
+            "range": "± 2310",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "priority/data_under_control_flood",
+            "value": 29568,
+            "range": "± 240",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "single_producer_throughput/mpsc/10000",
+            "value": 188263,
+            "range": "± 25455",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "single_producer_throughput/spsc/10000",
+            "value": 69108,
+            "range": "± 2419",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "single_producer_throughput/mpsc/100000",
+            "value": 1600096,
+            "range": "± 26837",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "single_producer_throughput/spsc/100000",
+            "value": 633806,
+            "range": "± 8873",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "single_producer_throughput/mpsc/1000000",
+            "value": 15286473,
+            "range": "± 180158",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "single_producer_throughput/spsc/1000000",
+            "value": 5060301,
+            "range": "± 263389",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "multi_producer_throughput/mpsc/2",
+            "value": 1576607,
+            "range": "± 27891",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "multi_producer_throughput/sharded_spsc/2",
+            "value": 804159,
+            "range": "± 12821",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "multi_producer_throughput/mpsc/4",
+            "value": 4482088,
+            "range": "± 127056",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "multi_producer_throughput/sharded_spsc/4",
+            "value": 1531452,
+            "range": "± 24451",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "multi_producer_throughput/mpsc/8",
+            "value": 8802526,
+            "range": "± 846900",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "multi_producer_throughput/sharded_spsc/8",
+            "value": 2883692,
+            "range": "± 465278",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "send_latency_ns/mpsc",
+            "value": 16,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "send_latency_ns/spsc",
+            "value": 7,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "send_latency_contended/mpsc/2",
+            "value": 11,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "send_latency_contended/sharded_spsc/2",
+            "value": 3,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "send_latency_contended/mpsc/4",
+            "value": 17,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "send_latency_contended/sharded_spsc/4",
+            "value": 5,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "roundtrip_latency/mpsc",
+            "value": 17697,
+            "range": "± 3101",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "roundtrip_latency/spsc",
+            "value": 1076,
+            "range": "± 186",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "data_throughput/messages/1000",
+            "value": 52348,
+            "range": "± 1592",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "data_throughput/messages/10000",
+            "value": 461329,
+            "range": "± 84129",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "data_throughput/messages/100000",
+            "value": 5339814,
+            "range": "± 738608",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "control_throughput/messages/100",
+            "value": 50937,
+            "range": "± 957",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "control_throughput/messages/1000",
+            "value": 83937,
+            "range": "± 6977",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "control_throughput/messages/10000",
+            "value": 409100,
+            "range": "± 13163",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mixed_lanes_10k_each",
+            "value": 1597740,
+            "range": "± 191987",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/ascii_text/1024",
+            "value": 408,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/csi_heavy/1024",
+            "value": 14349,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/sgr_256_colors/1024",
+            "value": 10871,
+            "range": "± 106",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/cursor_movement/1024",
+            "value": 8752,
+            "range": "± 60",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/unicode_heavy/1024",
+            "value": 9119,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/scrolling/1024",
+            "value": 1515,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/ascii_text/4096",
+            "value": 1500,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/csi_heavy/4096",
+            "value": 56422,
+            "range": "± 122",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/sgr_256_colors/4096",
+            "value": 42473,
+            "range": "± 223",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/cursor_movement/4096",
+            "value": 34167,
+            "range": "± 158",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/unicode_heavy/4096",
+            "value": 36071,
+            "range": "± 287",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/scrolling/4096",
+            "value": 5315,
+            "range": "± 60",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/ascii_text/16384",
+            "value": 5690,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/csi_heavy/16384",
+            "value": 222821,
+            "range": "± 657",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/sgr_256_colors/16384",
+            "value": 165905,
+            "range": "± 1133",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/cursor_movement/16384",
+            "value": 135027,
+            "range": "± 643",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/unicode_heavy/16384",
+            "value": 144235,
+            "range": "± 354",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/scrolling/16384",
+            "value": 20301,
+            "range": "± 245",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/ascii_text/65536",
+            "value": 23034,
+            "range": "± 201",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/csi_heavy/65536",
+            "value": 895797,
+            "range": "± 6190",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/sgr_256_colors/65536",
+            "value": 669578,
+            "range": "± 3891",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/cursor_movement/65536",
+            "value": 553021,
+            "range": "± 5205",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/unicode_heavy/65536",
+            "value": 602873,
+            "range": "± 2609",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "ansi_parser/scrolling/65536",
+            "value": 81361,
+            "range": "± 1435",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "vtebench_scenarios/alt_screen_random_write",
+            "value": 501168,
+            "range": "± 5732",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "vtebench_scenarios/scrolling",
+            "value": 82231,
+            "range": "± 1277",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "vtebench_scenarios/unicode_random_write",
+            "value": 592194,
+            "range": "± 7837",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "vtebench_scenarios/osc_heavy",
+            "value": 675479,
+            "range": "± 12962",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "end_to_end/ascii_text",
+            "value": 246226,
+            "range": "± 3022",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "end_to_end/scrolling",
+            "value": 562523,
+            "range": "± 3177",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "end_to_end/csi_heavy",
+            "value": 1069314,
+            "range": "± 22672",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "end_to_end/unicode_heavy",
+            "value": 1153673,
+            "range": "± 19646",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "end_to_end/alt_screen_random_write",
+            "value": 687967,
+            "range": "± 12626",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "keybindings/lookup_map_size_10",
+            "value": 19,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "keybindings/lookup_vec_size_10",
+            "value": 14,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "keybindings/lookup_binsearch_size_10",
+            "value": 13,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "keybindings/lookup_map_size_100",
+            "value": 19,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "keybindings/lookup_vec_size_100",
+            "value": 133,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "keybindings/lookup_binsearch_size_100",
+            "value": 24,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "keybindings/lookup_map_size_1000",
+            "value": 19,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "keybindings/lookup_vec_size_1000",
+            "value": 1262,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "keybindings/lookup_binsearch_size_1000",
+            "value": 36,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "jit_collapse_call/one_call_fills_the_plane",
+            "value": 3704,
+            "range": "± 202",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pixelflow_single_char/A_linear",
+            "value": 39307,
+            "range": "± 290",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pixelflow_single_char/O_quadratic",
+            "value": 31243,
+            "range": "± 169",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pixelflow_single_char/S_complex",
+            "value": 29953,
+            "range": "± 640",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pixelflow_single_char/8_complex",
+            "value": 32722,
+            "range": "± 167",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pixelflow_text_sizes/sum/5",
+            "value": 71350,
+            "range": "± 1021",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pixelflow_text_sizes/sum/10",
+            "value": 134370,
+            "range": "± 1039",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pixelflow_text_sizes/sum/26",
+            "value": 397221,
+            "range": "± 5873",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pixelflow_text_sizes/sum/50",
+            "value": 794071,
+            "range": "± 11424",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pixelflow_caching/uncached_HELLO",
+            "value": 1743623,
+            "range": "± 22548",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pixelflow_caching/cached_HELLO",
+            "value": 11105,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "pixelflow_caching/cache_warmup_alphabet",
+            "value": 11840337,
+            "range": "± 66409",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "packed_kernel_hot_loop",
+            "value": 35650204,
+            "range": "± 245290",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "packed_vs_four_plane_2560x1584/four_plane_per_pixel_pack",
+            "value": 112835273,
+            "range": "± 351907",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "packed_vs_four_plane_2560x1584/packed_kernel_direct_write",
+            "value": 35572050,
+            "range": "± 61886",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "build/no_sharing/arena_push",
+            "value": 35563907,
+            "range": "± 4229421",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "build/no_sharing/dag_intern",
+            "value": 25921595,
+            "range": "± 1446769",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "build/no_sharing/dag_push_unique",
+            "value": 414770,
+            "range": "± 5553",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "build/naive_sharing/arena_push",
+            "value": 10946170,
+            "range": "± 356264",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "build/naive_sharing/dag_intern",
+            "value": 6777832,
+            "range": "± 235342",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "build/naive_sharing/dag_push_unique",
+            "value": 565400,
+            "range": "± 1881",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "traverse/arena_node_count_subtree",
+            "value": 1158051,
+            "range": "± 45514",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "traverse/dag_descendants_alloc",
+            "value": 167504,
+            "range": "± 4243",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "traverse/dag_descendants_in_scratch_reused",
+            "value": 182340,
+            "range": "± 757",
             "unit": "ns/iter"
           }
         ]
