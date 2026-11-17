@@ -334,7 +334,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn send_recv_basic() {
+    fn deliver_messages_in_the_order_they_were_sent() {
         let (tx, mut rx) = spsc_channel::<u32>(4);
         tx.try_send(1).unwrap();
         tx.try_send(2).unwrap();
@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn full_then_drain() {
+    fn refuse_a_send_when_full_and_accept_again_after_a_receive() {
         let (tx, mut rx) = spsc_channel::<u32>(2);
         // Capacity rounds up to 2
         tx.try_send(10).unwrap();
@@ -366,21 +366,21 @@ mod tests {
     }
 
     #[test]
-    fn producer_disconnect() {
+    fn report_disconnected_on_receive_when_the_sender_is_dropped() {
         let (tx, mut rx) = spsc_channel::<u32>(4);
         drop(tx);
         assert_eq!(rx.try_recv(), Err(TryRecvError::Disconnected));
     }
 
     #[test]
-    fn consumer_disconnect() {
+    fn hand_the_message_back_when_the_receiver_is_dropped() {
         let (tx, rx) = spsc_channel::<u32>(4);
         drop(rx);
         assert!(matches!(tx.try_send(1), Err(TrySendError::Disconnected(1))));
     }
 
     #[test]
-    fn drain_after_producer_disconnect() {
+    fn deliver_buffered_messages_before_reporting_the_sender_dropped() {
         let (tx, mut rx) = spsc_channel::<u32>(4);
         tx.try_send(1).unwrap();
         tx.try_send(2).unwrap();
@@ -394,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_thread_throughput() {
+    fn deliver_every_message_in_order_across_threads() {
         let (tx, mut rx) = spsc_channel::<u64>(1024);
         let count = 100_000u64;
 
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn power_of_two_rounding() {
+    fn hold_at_least_the_requested_capacity_when_it_is_not_a_power_of_two() {
         // Capacity 3 should round up to 4
         let (tx, mut rx) = spsc_channel::<u32>(3);
         tx.try_send(1).unwrap();
@@ -452,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn wrapping_indices() {
+    fn keep_delivering_after_the_buffer_wraps_many_times() {
         // Small buffer, many messages — tests index wrapping
         let (tx, mut rx) = spsc_channel::<u32>(2);
         for i in 0..1000 {
