@@ -45,6 +45,16 @@ jobs:
         run: |
           set -euo pipefail
 
+          # A run concludes 'failure' when a runner is cancelled with no steps
+          # run (macOS runner loss, 2026-11-24, #1503). Only a job that itself
+          # failed is evidence against the commit.
+          FAILED_JOBS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${{ github.event.workflow_run.id }}/jobs" \
+            --paginate --jq '[.jobs[] | select(.conclusion == "failure")] | length' | paste -sd+ | bc)
+          if [ "$FAILED_JOBS" -eq 0 ]; then
+            echo "No job failed (cancelled or skipped only); not reverting."
+            exit 0
+          fi
+
           SUBJECT=$(git log -1 --format=%s "$FAILING_SHA")
           AUTHOR=$(git log -1 --format=%an "$FAILING_SHA")
           BRANCH_NAME="revert-failed-postsubmit-${FAILING_SHA:0:7}"
