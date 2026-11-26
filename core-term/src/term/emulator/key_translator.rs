@@ -184,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn named_keys_send_their_sequence_whatever_text_the_platform_attached() {
+    fn it_should_send_a_named_keys_sequence_whatever_text_the_platform_attached() {
         let modes = DecPrivateModes::default();
         let with_text = |symbol, text: &'static str| {
             translate_key_input(
@@ -383,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn macos_private_use_area_characters_ignored_for_arrow_keys() {
+    fn it_should_ignore_macos_private_use_area_text_attached_to_arrow_keys() {
         // macOS sends U+F700-F703 for arrow keys in the `characters` field
         // These should be ignored and the KeySymbol should be used instead
         let modes = DecPrivateModes::default();
